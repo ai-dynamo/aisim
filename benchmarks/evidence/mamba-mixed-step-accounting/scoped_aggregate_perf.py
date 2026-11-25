@@ -118,8 +118,11 @@ def main():
                 {"order": list(order)}
                 | {
                     side: {
-                        metric: statistics.median(sample[metric] for sample in samples[side])
-                        for metric in ("miss_us", "hit_us")
+                        "samples": samples[side],
+                        **{
+                            metric: statistics.median(sample[metric] for sample in samples[side])
+                            for metric in ("miss_us", "hit_us")
+                        },
                     }
                     for side in order
                 }

@@ -25,6 +25,8 @@ pub const FPM_VERSION: u32 = 1;
 pub struct ScheduledRequestMetrics {
     /// Exact prefill groups `[requests, new_tokens_per_request, prefix_tokens_per_request]`.
     /// Optional: op-level qualified Mamba uses these instead of balanced totals.
+    /// Supplying groups also makes token-major ops use the full `sum_prefill_tokens`,
+    /// including scheduled padding, while qualified Mamba uses only the prompt chunks.
     /// Together with explicit query padding, these must agree with prefill totals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_chunks: Option<Vec<[u32; 3]>>,

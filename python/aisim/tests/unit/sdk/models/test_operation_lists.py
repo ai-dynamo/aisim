@@ -299,6 +299,61 @@ def test_native_family_setter_expires_a_memoized_graph_identity(graph_estimator)
 
 
 @pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("edit", ["replace_op", "replace_phase", "native_setter"])
+def test_non_mamba_edits_replace_compiled_handle_and_reprice(phase, edit):
+    import aisim_core
+    from aisim_core.sdk import common, config, rust_engine_step
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import GEMM
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = get_model("Qwen/Qwen3-0.6B", config.ModelConfig(tp_size=1), "vllm")
+    for name in ("context", "generation"):
+        model_ops = [GEMM(f"{name}_projection", 1, 64, 64, common.GEMMQuantMode.bfloat16)]
+        # Direct native leaves must have the same invalidation as SDK shells.
+        setattr(model, f"{name}_ops", [aisim_core.op_from_spec_json(op._spec_json()) for op in model_ops])
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    runtime = config.RuntimeConfig(batch_size=1, isl=16, osl=2)
+
+    def estimate():
+        context, generation, *_ = rust_engine_step.estimate_static_latency_breakdown_with_rust(
+            model, database, runtime, mode="static", stride=1, latency_correction_scale=1.0
+        )
+        return sum((context if phase == "context" else generation).values())
+
+    rust_engine_step._engine_handle_cache_clear()
+    try:
+        before = estimate()
+        handle = rust_engine_step._cached_engine_handle(model, database)
+        assert rust_engine_step._cached_engine_handle(model, database) is handle
+        original = getattr(model, f"{phase}_ops")[0]
+        if edit == "native_setter":
+            original._scale_factor = 2
+        else:
+            replacement = GEMM(f"{phase}_projection", 1, 128, 64, common.GEMMQuantMode.bfloat16)
+            replacement = aisim_core.op_from_spec_json(replacement._spec_json())
+            if edit == "replace_phase":
+                setattr(model, f"{phase}_ops", [replacement])
+            else:
+                getattr(model, f"{phase}_ops")[0] = replacement
+        after = estimate()
+        updated = rust_engine_step._cached_engine_handle(model, database)
+        assert updated is not handle
+        assert after > before
+        assert rust_engine_step._cached_engine_handle(model, database) is updated
+        assert estimate() == after
+        if edit == "native_setter":
+            original._scale_factor = 1
+        else:
+            getattr(model, f"{phase}_ops")[0] = original
+        # Content identity preserves reuse when an edit restores the old graph.
+        assert rust_engine_step._cached_engine_handle(model, database) is handle
+        assert estimate() == before
+    finally:
+        rust_engine_step._engine_handle_cache_clear()
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
 @pytest.mark.parametrize("operation", ["add", "multiply"])
 def test_property_augmented_assignment_keeps_installed_list(graph_estimator, phase, operation):
     model, estimate = graph_estimator

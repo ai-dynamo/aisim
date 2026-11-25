@@ -633,7 +633,7 @@ def test_engine_identity_keeps_fpm_wrapped_mamba_ops_distinct():
     database = _hybrid_trtllm_database()
     first = fpm(conv1d="float16", ssm="float16")
     second = fpm(conv1d="float32", ssm="float16")
-    assert rust_engine_step._mamba_qualification_identity(first)
+    assert rust_engine_step._operation_graph_identity(first)
     assert rust_engine_step.engine_identity(first, database) != rust_engine_step.engine_identity(second, database)
 
 

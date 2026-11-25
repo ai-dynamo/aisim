@@ -608,24 +608,34 @@ def test_non_mamba_hybrid_rebuild_refreshes_engine_identity(model_name):
     assert rust_engine_step.engine_identity(model, database) == key
 
 
-def test_plain_graph_identity_does_not_compile_operation_specs(monkeypatch):
+def test_plain_graph_identity_serializes_specs_only_on_memo_miss(monkeypatch):
     from aisim_core.sdk import engine, operations
     from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
 
-    def unexpected_conversion(_op):
-        pytest.fail("ordinary non-hybrid leaves need no qualification spec serialization")
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    convert = engine._as_engine_op
+    converted = []
 
-    monkeypatch.setattr(engine, "_as_engine_op", unexpected_conversion)
-    for _ in range(2):
-        model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
-        assert rust_engine_step._mamba_qualification_identity(model) == []
+    def record_conversion(op):
+        converted.append(op)
+        return convert(op)
+
+    monkeypatch.setattr(engine, "_as_engine_op", record_conversion)
+    key = rust_engine_step.engine_identity(model, database)
+    count = len(converted)
+    assert count == len(model.context_ops) + len(model.generation_ops)
+    assert rust_engine_step.engine_identity(model, database) == key
+    assert len(converted) == count
     # Also cover directly constructed native leaves, not just SDK shells.
     import aisim_core
 
     model = SimpleNamespace(
         context_ops=[aisim_core.op_from_spec_json(operations.ElementWise("norm", 1, 8, 8, 1)._spec_json())]
     )
-    assert rust_engine_step._mamba_qualification_identity(model) == []
+    identity = rust_engine_step._operation_graph_identity(model)
+    assert identity == [["context_ops", 0, model.context_ops[0]._spec_json()]]
 
 
 @pytest.mark.parametrize("composite", [False, True])
@@ -650,7 +660,7 @@ def test_qualification_identity_keeps_native_and_nested_mamba(composite):
     native = aisim_core.op_from_spec_json(scan._spec_json())
     op = operations.OverlapOp("context_nested", [native], []) if composite else native
     model = SimpleNamespace(context_ops=[op])
-    identity = rust_engine_step._mamba_qualification_identity(model)
+    identity = rust_engine_step._operation_graph_identity(model)
     assert len(identity) == 1
     assert '"Mamba2"' in identity[0][2]
 

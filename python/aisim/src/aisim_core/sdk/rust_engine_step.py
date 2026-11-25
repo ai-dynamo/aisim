@@ -1835,7 +1835,10 @@ def engine_identity(model: Any, database: Any) -> str:
     them, so identity checks detect a change without rebuilding either key on
     this per-query path.
     Structural edits to either model operation list advance a shared revision;
-    checking it keeps in-place graph edits from reusing a previous compilation.
+    checking it invalidates the memo. On a miss, operation specs from both lists
+    enter the key for every graph, including non-Mamba graphs, so an edited graph
+    cannot reuse a handle compiled from its earlier contents. Equivalent graphs
+    still share a handle.
     Native spec setters advance a process-wide clock, including edits through
     raw native objects. Check it in constant time rather than scanning the graph.
     """
@@ -1880,29 +1883,21 @@ def engine_identity(model: Any, database: Any) -> str:
     return key
 
 
-def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
-    """The compiled spec of every op, by op list and position, for a graph that holds a Mamba2 op.
+def _operation_graph_identity(model: Any) -> list[list[Any]]:
+    """The compiled spec of every op, by phase list and position.
 
     The model config does not carry the qualification fields: one config can
     compile qualified or legacy ops, or assign different state dtypes to each
     op. The spec is the representation ``Engine::build`` validates, so it keeps
     a legacy op explicit, a draft query width's ``TokenScale`` wrapper, and a
-    Mamba2 op nested in a composite. It runs only when the memo misses.
+    Mamba2 op nested in a composite. Non-Mamba specs also participate so edits
+    to any compiled graph cannot reuse a stale handle. Serialization runs only
+    when the identity memo misses, never on an unchanged warm query.
     """
     # Lazy import: ``sdk.engine`` imports from this module at top level.
-    from aisim_core._native import FallbackOp, Mamba2Kernel, OverlapOp
     from aisim_core.sdk.engine import _as_engine_op
     from aisim_core.sdk.operations import FPMForwardOp
     from aisim_core.sdk.operations.base import Operation
-
-    if getattr(model, "_hybrid_config", None) is None and not any(
-        isinstance(op, (Mamba2Kernel, FPMForwardOp, FallbackOp, OverlapOp)) or type(op) is Operation
-        for ops_name in ("context_ops", "generation_ops")
-        for op in getattr(model, ops_name, ())
-    ):
-        # Base-wrapped native ops may hold staged children or TokenScale;
-        # ordinary typed leaves cannot contain Mamba and need no conversion.
-        return []
 
     entries = []
     for ops_name in ("context_ops", "generation_ops"):
@@ -1911,16 +1906,12 @@ def _mamba_qualification_identity(model: Any) -> list[list[Any]]:
                 # A whole-model FPM op also serializes its op-level graph.
                 spec = _as_engine_op(op)._spec_json()
             else:
-                # Keep unsupported neighbors in a Mamba graph's key so a warm
+                # Keep unsupported neighbors in the graph's key so a warm
                 # valid handle cannot hide them. Normal compilation will reject
-                # and cache this identity; non-Mamba graphs keep their old key.
+                # and cache this identity.
                 spec = json.dumps({"unsupported_op": [type(op).__module__, type(op).__qualname__, id(op)]})
             entries.append([ops_name, index, spec])
-    # Hybrid setters can rebuild the graph without changing ModelConfig.
-    # Build validation of a Mamba graph also reads its neighbors' names/stages.
-    if getattr(model, "_hybrid_config", None) is not None or any('"Mamba2"' in entry[2] for entry in entries):
-        return entries
-    return []
+    return entries
 
 
 def _cached_engine_handle(model: Any, database: Any) -> Any:
@@ -1939,9 +1930,8 @@ def _cached_engine_handle(model: Any, database: Any) -> Any:
     # The identity JSON is a hot-path cost: the engine-step helpers call this
     # per step and `_engine_config_json` runs ~2-3us of getattr + json.dumps
     # (which the perf regression gate measures against a ~20us step). The
-    # identity is immutable for a given (model, database) pair, so memoize the
-    # computed key on the model object and only recompute when the database
-    # object changes.
+    # memo keeps unchanged (model, database) lookups constant-time; graph edits
+    # and changes to database mode/transfer policy invalidate it.
     key = engine_identity(model, database)
     entry = _engine_handle_cache_get(key)
     if isinstance(entry, _CachedUnsupported):
@@ -2107,7 +2097,7 @@ def _engine_config_json(model: Any, database: Any) -> str:
                         "enable_shared_layer": bool(getattr(database, "enable_shared_layer", False)),
                         "strict_provenance": bool(getattr(database, "strict_provenance", False)),
                     },
-                    "mamba_qualification": _mamba_qualification_identity(model),
+                    "operation_graph": _operation_graph_identity(model),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
