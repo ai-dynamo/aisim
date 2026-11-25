@@ -20,6 +20,7 @@ pytestmark = pytest.mark.unit
     [
         (lambda ops: ops.append(3), [2, 1, 3]),
         (lambda ops: ops.extend([3, 4]), [2, 1, 3, 4]),
+        (lambda ops: ops.extend(ops), [2, 1, 2, 1]),
         (lambda ops: ops.insert(1, 3), [2, 3, 1]),
         (lambda ops: ops.pop(), [2]),
         (lambda ops: ops.remove(2), [1]),
@@ -31,6 +32,7 @@ pytestmark = pytest.mark.unit
         (lambda ops: operator.delitem(ops, 0), [1]),
         (lambda ops: operator.delitem(ops, slice(None)), []),
         (lambda ops: operator.iadd(ops, [3]), [2, 1, 3]),
+        (lambda ops: operator.iadd(ops, ops), [2, 1, 2, 1]),
         (lambda ops: operator.imul(ops, 2), [2, 1, 2, 1]),
     ],
 )
@@ -128,6 +130,7 @@ def test_estimate_during_iterable_edit_is_invalidated_on_exit(graph_estimator, p
         yield first
         intermediate.append(estimate(model))
         yield second
+        intermediate.append(estimate(model))
         if fail:
             raise ValueError("incomplete edit")
 
@@ -140,7 +143,7 @@ def test_estimate_during_iterable_edit_is_invalidated_on_exit(graph_estimator, p
     # Both yielded scans remain after a failed extend. An estimate taken
     # between yields must not hide the second scan from subsequent queries.
     actual = estimate(model)
-    assert initial < intermediate[0] < actual
+    assert initial < intermediate[0] < intermediate[1] == actual
     assert actual == estimate(cold)
 
 

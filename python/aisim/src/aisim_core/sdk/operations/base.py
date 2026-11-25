@@ -194,6 +194,24 @@ class OpShellKit:
     # ``None`` (default) = not reachable through the kwarg mapping.
     _ENGINE_QUERY_SHAPE: ClassVar[str | None] = None
 
+    @property
+    def _draft_token_width(self):
+        return self.__dict__.get("_aic_draft_token_width")
+
+    @_draft_token_width.setter
+    def _draft_token_width(self, value):
+        # The adapter compiles this Python-owned marker as TokenScale. Share
+        # the native clock so warm identity checks remain constant time.
+        if value != self._draft_token_width:
+            self.__dict__["_aic_draft_token_width"] = value
+            self._mark_mutated()
+
+    @_draft_token_width.deleter
+    def _draft_token_width(self):
+        if "_aic_draft_token_width" in self.__dict__:
+            del self.__dict__["_aic_draft_token_width"]
+            self._mark_mutated()
+
     def _engine_query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Evaluate this op through the compiled engine's single-op plumbing.
 

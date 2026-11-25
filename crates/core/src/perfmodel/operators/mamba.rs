@@ -97,6 +97,17 @@ impl Mamba2Op {
         if self.state_dtype == "unrecorded" {
             return None;
         }
+        if !self.is_conv() {
+            for (field, value) in [
+                ("d_state", self.d_state),
+                ("nheads", self.nheads),
+                ("head_dim", self.head_dim),
+            ] {
+                if value == 0 {
+                    return Some(format!("qualified SSM {field} must be positive"));
+                }
+            }
+        }
         match kernel_phase {
             None => Some(format!(
                 "unsupported kernel {:?} for a qualified Mamba2 op",
@@ -791,6 +802,27 @@ mod tests {
         assert!(op.field_error().unwrap().contains("unsupported kernel"));
         op.state_dtype = "unrecorded".into();
         assert_eq!(op.field_error(), None);
+
+        op.phase = "generation".into();
+        op.kernel_source = "selective_state_update_flashinfer".into();
+        op.token_width = 4;
+        op.state_dtype = "float32".into();
+        assert_eq!(op.field_error(), None);
+        for field in ["d_state", "nheads", "head_dim"] {
+            let mut invalid = op.clone();
+            match field {
+                "d_state" => invalid.d_state = 0,
+                "nheads" => invalid.nheads = 0,
+                _ => invalid.head_dim = 0,
+            }
+            assert_eq!(
+                invalid.field_error(),
+                Some(format!("qualified SSM {field} must be positive"))
+            );
+            invalid.state_dtype = "unrecorded".into();
+            invalid.token_width = 1;
+            assert_eq!(invalid.field_error(), None);
+        }
     }
 
     /// Census anchor for the capability-major-10 sglang GDN FlashInfer decode lane

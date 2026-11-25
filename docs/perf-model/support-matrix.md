@@ -60,7 +60,10 @@ because the export declares a vision encoder that AISim does not
 model; the SDK tests cover the text path.
 
 A Mamba2 operation reads measured `mamba2_perf` rows only in `SILICON` and
-`HYBRID` modes, and it uses the analytic SOL estimate on a table miss. A
+`HYBRID` modes. Once constructed, a model uses the analytic SOL estimate for a
+query-time shape miss. `SILICON` op-level construction still requires rows for
+each Mamba kernel, including width-four decode kernels that use SOL at query
+time; SOL does not bypass that construction check. A
 measured decode row prices one token per request. A qualified Mamba2
 operation records its state dtype. Under MTP, its decode `token_width` is
 above one, because it verifies several tokens per request. No measured row

@@ -1121,9 +1121,13 @@ class TestFPMStaticAndMixed:
             assert small[field] == pytest.approx(large[field])
 
     @pytest.mark.parametrize("width", [1, 4])
-    @pytest.mark.parametrize("xpu", [False, True])
-    @pytest.mark.parametrize("prefix", [0, 3000])
-    def test_cached_aggregate_schedules_fpm_target_and_draft_requests(self, tmp_path, xpu, prefix, width, monkeypatch):
+    @pytest.mark.parametrize(
+        "xpu,prefix,tight",
+        [(False, 0, False), (False, 3000, False), (True, 0, False), (True, 3000, False), (True, 0, True)],
+    )
+    def test_cached_aggregate_schedules_fpm_target_and_draft_requests(
+        self, tmp_path, xpu, prefix, tight, width, monkeypatch
+    ):
         from aisim.sdk.inference_session import InferenceSession
         from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
         from aisim_core.sdk.operations import Mamba2Kernel
@@ -1163,6 +1167,16 @@ class TestFPMStaticAndMixed:
             _row("prefill", 4, 4096 + width, 12000, 33.0, model_path=model.model_path, identity=identity),
             _row("prefill", 1, 4096 + width, 0, 22.0, model_path=model.model_path, identity=identity),
             _row("prefill", 1, 4096, 0, 21.0, model_path=model.model_path, identity=identity),
+            # At budget 4097, width four reserves four slots: the native
+            # sequence is (4093 new, prefix 0), then (3 new, prefix 4093).
+            *(
+                [
+                    _row("prefill", 1, 4097, 0, 22.0, model_path=model.model_path, identity=identity),
+                    _row("prefill", 1, 7, 4093, 6.0, model_path=model.model_path, identity=identity),
+                ]
+                if width == 4
+                else []
+            ),
         ] + [
             _row("decode", b * width, 0, kv, ms, model_path=model.model_path, identity=identity)
             for b, kv, ms in [(1, 4098, 3.0), (2, 8196, 5.0), (1, 0, 2.0), (2, 0, 4.0)]
@@ -1176,15 +1190,37 @@ class TestFPMStaticAndMixed:
         runtime = sdk_config.RuntimeConfig(batch_size=2, isl=4096, osl=2, prefix=prefix)
         # The total XPU budget reserves the decoder's full verification width.
         # Cold prefill still schedules exactly 4096 new tokens at either width.
-        budget = 4096 + (width if xpu and not prefix else 0)
+        budget = 4097 if tight else 4096 + (width if xpu and not prefix else 0)
         summary = InferenceSession(model, database, backend).run_agg(runtime, ctx_tokens=budget)
         ops = summary.get_per_ops_data()["mix_step"]
-        assert ops["fpm_forward_prefill"] == pytest.approx(12.0 if prefix else 22.0)
+        chunked = tight and width == 4
+        assert ops["fpm_forward_prefill"] == pytest.approx(14.0 if chunked else 12.0 if prefix else 22.0)
         # Independent SOL traffic for this scan: 18,560 bytes/new token,
         # plus a read and write of the 1 MiB state for each physical request.
         new_tokens = 1096 if prefix else 4096
-        expected_ms = (new_tokens * 18_560 + 2_097_152) / database.system_spec["gpu"]["mem_bw"] * 1000
+        chunks = 2 if chunked else 1
+        expected_ms = (new_tokens * 18_560 / chunks + 2_097_152) / database.system_spec["gpu"]["mem_bw"] * 1000
         assert ops["draft_scan"] == pytest.approx(expected_ms, rel=1e-9)
+        if chunked:
+            evidence = summary.get_step_estimates()
+            assert "mixed" not in evidence
+            assert "mix_context_tokens" not in evidence["scheduling"]
+            assert evidence["scheduling"]["num_mix_steps"] == 4
+            # Independently price both native anchors; a one-slot reservation
+            # would price just (4096, 0), at 22 ms and one state transfer.
+            from aisim_core.sdk.rust_engine_step import _cached_engine_handle
+
+            handle = _cached_engine_handle(model, database)
+            anchors = [
+                handle.mixed_step_breakdown_per_op(n, 1, past + n, 2, past) for n, past in [(4093, 0), (3, 4093)]
+            ]
+            target_ms = [
+                next(row[1] for group in anchor for row in group if row[0] == "fpm_forward_prefill")
+                for anchor in anchors
+            ]
+            assert target_ms == pytest.approx([22.0, 6.0])
+            assert ops["fpm_forward_prefill"] == pytest.approx(sum(target_ms) / 2)
+            return
         mixed = summary.get_step_estimates()["mixed"]
         assert mixed.context_tokens == new_tokens
         assert mixed.num_decode_query_tokens == width
@@ -1196,6 +1232,66 @@ class TestFPMStaticAndMixed:
             assert direct.per_op_latency_ms["fpm_forward_prefill"] == pytest.approx(33.0)
             expected_direct = (4096 * 18_560 + 4 * 2_097_152) / database.system_spec["gpu"]["mem_bw"] * 1000
             assert direct.per_op_latency_ms["draft_scan"] == pytest.approx(expected_direct, rel=1e-9)
+
+    @pytest.mark.parametrize("width,budget,decoders,fresh", [(4, 4, 0, 4), (4, 5, 1, 1), (1, 4, 1, 3)])
+    def test_xpu_fpm_minimum_prefill_margin(self, tmp_path, monkeypatch, width, budget, decoders, fresh):
+        from aisim.sdk.inference_session import InferenceSession
+        from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+        from aisim_core.sdk.speculation import SpeculationConfig
+
+        model = models.get_model(
+            "Qwen/Qwen3-0.6B",
+            _model_config(
+                forward_model="fpm",
+                speculation=SpeculationConfig(kind="ngram", params={"num_speculative_tokens": width - 1})
+                if width > 1
+                else None,
+            ),
+            BACKEND,
+        )
+        identity = dict(zip(_CELL_MATCH_COLUMNS, model.context_ops[0]._match_identity, strict=True))
+        # An eight-token cached suffix exceeds every budget. These invented
+        # exact anchors price the real sequence, including the short tail.
+        shapes = [(min(fresh, 16 - past), past) for past in range(8, 16, fresh)]
+        rows = [
+            _row(
+                "prefill", 1, new + decoders * width, past, 10.0 + index, model_path=model.model_path, identity=identity
+            )
+            for index, (new, past) in enumerate(shapes)
+        ]
+        rows += [
+            _row("decode", b * width, 0, kv, ms, model_path=model.model_path, identity=identity)
+            for b in (1, 2)
+            for kv, ms in [(0, 2.0), (b * 21, 3.0)]
+        ]
+        shutil.copy(Path(_CORE_SYSTEMS) / f"{SYSTEM}.yaml", tmp_path / f"{SYSTEM}.yaml")
+        _write_pair(str(tmp_path / "data" / SYSTEM / BACKEND / VERSION), rows)
+        database = PerfDatabase(SYSTEM, BACKEND, VERSION, systems_root=str(tmp_path))
+        backend = VLLMXPUBackend()
+        monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **kw: 2)
+        monkeypatch.setattr(backend, "_compute_ttft", lambda *a, **kw: 1.0)
+        scheduled = []
+        from aisim_core.sdk.backends import base_backend
+
+        native = base_backend.estimate_mixed_step_breakdown_with_rust
+
+        def record(*args, **kwargs):
+            scheduled.append((kwargs["ctx_tokens"], kwargs["gen_tokens"]))
+            return native(*args, **kwargs)
+
+        monkeypatch.setattr(base_backend, "estimate_mixed_step_breakdown_with_rust", record)
+        summary = InferenceSession(model, database, backend).run_agg(
+            sdk_config.RuntimeConfig(batch_size=2, isl=16, prefix=8, osl=8),
+            ctx_tokens=budget,
+        )
+        assert scheduled == [(fresh, decoders)]
+        assert summary.get_per_ops_data()["mix_step"]["fpm_forward_prefill"] == pytest.approx(
+            sum(10.0 + i for i in range(len(shapes))) / len(shapes)
+        )
+        row = summary.get_summary_df().iloc[0]
+        assert row["num_gen_reqs"] == decoders
+        if decoders == 0:
+            assert summary.get_step_estimates()["scheduling"]["num_genonly_steps"] == 7
 
     def test_fpm_result_counts_follow_executed_schedule_and_keep_memory_reservation(self, tmp_path, monkeypatch):
         from aisim.sdk.inference_session import InferenceSession

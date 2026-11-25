@@ -35,7 +35,8 @@ def measure(backend, model, database, runtime):
     miss_us = (time.perf_counter_ns() - start) / 1000
     start = time.perf_counter_ns()
     for _ in range(200):
-        assert backend.run_agg(model, database, runtime, ctx_tokens=512) is summary
+        cached = backend.run_agg(model, database, runtime, ctx_tokens=512)
+        assert cached is summary
     hit_us = (time.perf_counter_ns() - start) / 200_000
     row = summary.get_result_dict()
     group = summary.get_aggregate_energy_breakdown()["mix_step"]

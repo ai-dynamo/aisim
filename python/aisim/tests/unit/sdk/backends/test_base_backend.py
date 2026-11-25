@@ -1746,6 +1746,11 @@ def test_batched_fpm_visual_overlay_preserves_fractional_requests(
     assert group.per_op_energy_wms["visual_attention"] == pytest.approx(100 * expected)
     assert group.covered_latency_ms == pytest.approx(expected)
     assert batches == ([1, 2] if fresh_tokens == 2000 else [2])
+    evidence = summary.get_step_estimates()
+    assert ("mixed" in evidence) == (fresh_tokens == 2192)
+    assert ("mix_context_tokens" in evidence["scheduling"]) == (fresh_tokens == 2192)
+    if fresh_tokens == 2192:
+        assert evidence["mixed"].context_tokens == 2192
     # A public scheduled query has ceil(fresh/suffix) real requests. It must
     # retain the native batch-two overlay rather than aggregate weighting.
     direct = backend.run_mixed(
@@ -2070,8 +2075,8 @@ def test_qualified_aggregate_caps_prefill_at_remaining_request_slots(monkeypatch
     assert direct.per_op_latency_ms["norm"] == pytest.approx((2 * (4096 - prefix) + 1) * 2 / bw * 1000)
 
 
-@pytest.mark.parametrize("prefix,chunks", [(3072, 2), (3000, 3), (0, 8)])
-def test_qualified_batched_aggregate_weights_uncached_chunks(monkeypatch, prefix, chunks):
+@pytest.mark.parametrize("prefix,budget,chunks", [(3072, 512, 2), (3000, 512, 3), (3000, 1096, 1), (0, 512, 8)])
+def test_qualified_batched_aggregate_weights_uncached_chunks(monkeypatch, prefix, budget, chunks):
     from aisim_core.sdk.backends.factory import get_backend
     from aisim_core.sdk.perf_database import get_database_view
 
@@ -2081,7 +2086,7 @@ def test_qualified_batched_aggregate_weights_uncached_chunks(monkeypatch, prefix
     assert database is not None
     monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
     summary = backend.run_agg(
-        model, database, RuntimeConfig(batch_size=4, isl=4096, prefix=prefix, osl=64), ctx_tokens=512
+        model, database, RuntimeConfig(batch_size=4, isl=4096, prefix=prefix, osl=64), ctx_tokens=budget
     )
     scheduling = summary.get_step_estimates()["scheduling"]
     assert scheduling["num_mix_steps"] == 4 * chunks
@@ -2105,6 +2110,9 @@ def test_qualified_batched_aggregate_weights_uncached_chunks(monkeypatch, prefix
     assert result["ttft"] == pytest.approx(ttft)
     assert result["tpot"] == pytest.approx(tpot)
     assert result["tokens/s"] == pytest.approx(expected_rate)
+    row = summary.get_summary_df().iloc[0]
+    assert row["num_ctx_reqs"] == 1
+    assert row["num_gen_reqs"] == 3
 
 
 def test_aggregate_cache_tracks_memory_only_mamba_config(monkeypatch):

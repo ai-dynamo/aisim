@@ -689,6 +689,103 @@ def test_decode_bridge_retains_native_coverage_of_a_folded_name(monkeypatch):
     assert result.covered_latency_ms == 3.0
 
 
+def test_native_decode_bridge_retains_coverage_of_folded_powered_pair():
+    from aisim_core.sdk import operations
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.22.0", database_mode="HYBRID")
+    # The checked-in vLLM attention row carries measured power; the norm's
+    # empirical estimate has none. Calibrate repetitions with independent
+    # single-op native queries to obtain the requested exact 3/7 ms split.
+    powered = next(op for op in model.generation_ops if isinstance(op, operations.GenerationAttention))
+    powered._name = "same"
+    unpowered = operations.ElementWise("same", 1, 4096, 4096)
+    model.context_ops = []
+    model.generation_ops = [powered, unpowered]
+    handle = rust_engine_step._cached_engine_handle(model, database)
+    queries = handle.evaluate_generation_ops([0, 1], batch_size=8, s=2050)
+    assert queries[0][2] > 0 and queries[1][2] == 0
+    powered._scale_factor *= 3.0 / queries[0][1]
+    unpowered._scale_factor *= 7.0 / queries[1][1]
+    result = rust_engine_step._estimate_decode_step_with_rust(model, database, gen_tokens=8, isl=2048, osl=2)
+    assert result.latency_ms == pytest.approx(10.0)
+    assert result.covered_latency_ms == pytest.approx(3.0)
+    assert result.per_op_latency_ms == {"same": pytest.approx(10.0)}
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_draft_width_edit_invalidates_warm_identity_and_handle(phase):
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import Mamba2Kernel
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
+    scan = Mamba2Kernel(
+        f"{phase}_scan",
+        1,
+        "mamba_chunk_scan_combined" if phase == "context" else "selective_state_update",
+        phase,
+        4096,
+        64,
+        64,
+        128,
+        4,
+        4,
+        128,
+    )
+    model.context_ops = [scan] if phase == "context" else []
+    model.generation_ops = [scan] if phase == "generation" else []
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    original = rust_engine_step.engine_identity(model, database)
+    handle = rust_engine_step._cached_engine_handle(model, database)
+    scan._draft_token_width = (1, 4)
+    changed = rust_engine_step.engine_identity(model, database)
+    assert changed != original
+    assert rust_engine_step._cached_engine_handle(model, database) is not handle
+    epoch = scan._mutation_epoch()
+    scan._draft_token_width = (1, 4)
+    assert scan._mutation_epoch() == epoch
+    assert rust_engine_step.engine_identity(model, database) is changed
+    del scan._draft_token_width
+    assert rust_engine_step.engine_identity(model, database) == original
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_mamba_engine_spec_fields_survive_native_bincode_roundtrip(explicit):
+    import aisim_core
+    from aisim_core.sdk import engine
+    from aisim_core.sdk.operations import Mamba2Kernel
+
+    model = _dense_model()
+    model.context_ops = []
+    scan = Mamba2Kernel("scan", 1, "selective_state_update", "generation", 4096, 64, 64, 128, 4, 4, 128)
+    model.generation_ops = [scan]
+    spec = json.loads(
+        engine.build_engine_spec_json(
+            model,
+            model_path=model.model_path,
+            system="b200_sxm",
+            backend="vllm",
+            backend_version="0.24.0",
+            kv_block_size=None,
+            systems_path=None,
+            nextn=3 if explicit else 0,
+            database=None,
+        )
+    )
+    fields = spec["generation_ops"][0]["Mamba2"]
+    if explicit:
+        fields.update(state_dtype="float32", token_width=4)
+    else:
+        del fields["state_dtype"], fields["token_width"]
+    encoded = aisim_core.engine_spec_bincode_from_json(json.dumps(spec))
+    restored = json.loads(aisim_core._native.engine_spec_json_from_bincode(encoded))
+    fields = restored["generation_ops"][0]["Mamba2"]
+    assert (fields["state_dtype"], fields["token_width"]) == (("float32", 4) if explicit else ("unrecorded", 1))
+
+
 def test_decode_step_breakdown_folds_per_op_entries(monkeypatch) -> None:
     """The decode bridge returns latency, energy, per-op data, and executed
     fallback provenance from ``EngineHandle.decode_step_per_op``."""

@@ -78,11 +78,8 @@ class _OperationList(list):
             self._changed()
 
     def __iadd__(self, values):
-        self._changed()
-        try:
-            return super().__iadd__(values)
-        finally:
-            self._changed()
+        self.extend(values)
+        return self
 
     def __imul__(self, count):
         self._changed()
@@ -99,7 +96,12 @@ class _OperationList(list):
         # Iteration can estimate an intermediate graph, then yield more or raise.
         self._changed()
         try:
-            return super().extend(values)
+            # Snapshot self-extension, as list.extend does, without copying
+            # ordinary iterables or hiding their reentrant estimates.
+            if values is self:
+                values = list(self)
+            for value in values:
+                self.append(value)
         finally:
             self._changed()
 

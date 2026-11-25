@@ -770,14 +770,15 @@ def test_public_mixed_duplicate_draft_names_merge_sources_and_metadata(real_data
         ],
         [
             ("generation_attention", 7.0, 70.0, "silicon"),
-            ("draft_eagle_fc", 11.0, 110.0, "sol", (generation_fallback, [])),
-            # Unpowered: native coverage drops it, though its folded row stays powered.
-            ("draft_eagle_fc", 13.0, 0.0, "silicon", (generation_fallback, [])),
+            # Native folding combines powered 11 ms and unpowered 13 ms
+            # queries. Coverage must retain only the powered contribution.
+            ("draft_eagle_fc", 24.0, 110.0, "mixed", (generation_fallback, [])),
         ],
         28.0,
     )
     handle = SimpleNamespace(
-        _mixed_step_breakdown_per_op_with_metadata=lambda *args, **kwargs: native, last_provenance=lambda: None
+        _mixed_step_breakdown_per_op_with_decode_coverage=lambda *args, **kwargs: (*native, 18.0),
+        last_provenance=lambda: None,
     )
     monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *args: handle)
     model = get_model("Qwen/Qwen3-8B", _model_config(), "vllm")

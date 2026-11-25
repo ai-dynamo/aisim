@@ -783,7 +783,8 @@ pub(crate) fn get_mix_step_ops<'a>(
             // the step keeps every chunk off cold-state scan rows, even when
             // the integer mean prefix rounds to zero.
             let prefix = mamba_cached_prefix(op, prefix_per_req, combined_prefix > 0);
-            let balanced = [[n - r, q, prefix], [r, q + 1, prefix]];
+            // q can be u32::MAX when n=1. The second group is then empty.
+            let balanced = [[n - r, q, prefix], [r, q.saturating_add(1), prefix]];
             for &[batch, tokens, prefix] in prefill_chunks.as_deref().unwrap_or(&balanced) {
                 if batch == 0 {
                     continue;

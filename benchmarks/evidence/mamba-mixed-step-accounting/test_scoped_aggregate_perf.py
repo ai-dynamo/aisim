@@ -14,6 +14,33 @@ import scoped_aggregate_perf as driver
 from scoped_aggregate_perf import verify_source
 
 
+@pytest.mark.parametrize("optimize", [0, 1])
+def test_timed_cache_hits_execute_with_assertions_disabled(optimize):
+    # Compile the actual measured function with each interpreter mode, using
+    # a counting backend so an optimized-away call cannot look like a speedup.
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(driver.__file__).read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "measure")
+    namespace = dict(driver.__dict__)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), driver.__file__, "exec", optimize=optimize), namespace)
+    calls = []
+    summary = SimpleNamespace(
+        get_result_dict=lambda: {"ttft": 1, "tpot": 2, "tokens/s": 3},
+        get_aggregate_energy_breakdown=lambda: {"mix_step": SimpleNamespace(per_op_latency_ms={})},
+        get_step_estimates=lambda: {"scheduling": {"num_mix_steps": 4}},
+    )
+
+    def run(*args, **kwargs):
+        calls.append(kwargs)
+        return summary
+
+    backend = SimpleNamespace(_agg_cache={}, run_agg=run)
+    namespace["measure"](backend, None, None, None)
+    assert calls == [{"ctx_tokens": 512}] * 201
+
+
 def test_backend_source_matches_pinned_git_blob(tmp_path, monkeypatch):
     source = tmp_path / "python/aisim/src/aisim_core/sdk/backends/base_backend.py"
     source.parent.mkdir(parents=True)

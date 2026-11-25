@@ -2306,6 +2306,12 @@ class BaseBackend:
                 model, database, runtime_config, MixedStepInput(num_mix_ctx_tokens, num_mix_gen_tokens)
             )
         if b > 1:
+            # Preserve admitted coordinates before replacing a chunk walk
+            # with its coordinate-free mean.
+            qualified_request_counts = (
+                math.ceil(mix_step_estimate.context_tokens / isl),
+                mix_step_estimate.num_decode_requests,
+            )
             if (_is_fpm_model(model) or qualified_prefill) and isl > prefix:
                 # Read the actual fresh-token query after backend scheduling
                 # (including XPU decode caps and budget reservation). A query
@@ -2335,7 +2341,13 @@ class BaseBackend:
                 prefill_chunks = chunks
                 ttft_steps_to_finish_ctx = steps_to_finish_ctx
             num_mix_steps = steps_to_finish_ctx
-            if steps_to_finish_ctx >= decode_iterations:
+            if mix_step_estimate.num_decode_requests == 0:
+                # Prefill-only steps commit no decode progress, even when
+                # their count exceeds the number of decode iterations.
+                num_genonly_steps = max(decode_iterations - 1.0, 0.0)
+                num_genonly_tokens = b
+                num_mix_steps_for_tpot_calc = 0
+            elif steps_to_finish_ctx >= decode_iterations:
                 num_genonly_steps = 0
                 num_genonly_tokens = 0
                 num_mix_steps_for_tpot_calc = num_mix_steps
@@ -2356,14 +2368,19 @@ class BaseBackend:
                 )
             )
         if qualified_prefill:
-            scheduled_request_counts = (
-                math.ceil(mix_step_estimate.context_tokens / isl),
-                mix_step_estimate.num_decode_requests,
-            )
+            scheduled_request_counts = qualified_request_counts
         # Native FPM may also average several uncached chunks inside one
         # run_mixed call. Neither kind of mean is a single query coordinate.
         averages_mixed_shapes = averages_text_chunks or (
-            _is_fpm_model(model) and 0 < mix_step_estimate.context_tokens < isl - prefix
+            _is_fpm_model(model)
+            and (
+                0 < mix_step_estimate.context_tokens < isl - prefix
+                or (
+                    b > 1
+                    and self._has_visual_context_work(model, runtime_config)
+                    and mix_step_estimate.context_tokens % (isl - prefix) != 0
+                )
+            )
         )
         if averages_mixed_shapes and mix_step_estimate.context_tokens:
             mix_step_estimate = dataclasses.replace(mix_step_estimate, context_tokens=0)

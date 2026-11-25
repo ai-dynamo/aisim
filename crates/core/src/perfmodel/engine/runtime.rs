@@ -2764,7 +2764,8 @@ impl Engine {
         // Qualified Mamba and the shared token-major ops compute the same new
         // prefill tokens. Cache the graph classification in the plan and split
         // the budget once per step, rather than once per Mamba operation.
-        let mamba_prefill = if self.mix_plan.qualified_mamba {
+        let mamba_prefill = if self.mix_plan.qualified_mamba || self.mix_plan.qualified_decode_mamba
+        {
             let per_request = isl.saturating_sub(prefix).max(1);
             let (mut full, mut partial) = (ctx_tokens / isl, ctx_tokens % isl);
             if partial > per_request {
@@ -5220,6 +5221,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn qualified_mamba_balanced_groups_handle_u32_boundary() {
+        let engine = qualified_mamba_engine(0);
+        for (tokens, requests, expected) in [
+            (u32::MAX, 1, vec![(1, u32::MAX)]),
+            (5, 2, vec![(1, 2), (1, 3)]),
+        ] {
+            let mut shapes = Vec::new();
+            let ms = crate::session::get_mix_step_ops(
+                &engine.context_ops,
+                &[],
+                None,
+                None,
+                None,
+                &engine.db,
+                tokens,
+                0,
+                tokens / requests,
+                requests,
+                0,
+                0,
+                0,
+                0,
+                None,
+                |_, _, _, runtime, _, _| shapes.push((runtime.batch_size, runtime.s)),
+            )
+            .unwrap();
+            assert!(ms.is_finite() && ms > 0.0);
+            assert_eq!(shapes, expected);
+        }
+    }
+
+    #[test]
     fn qualified_mamba_static_generation_rejects_beams() {
         let db = build_engine(None).db;
         for (dtype, width) in [
@@ -5572,6 +5605,42 @@ pub(crate) mod tests {
         assert!(
             legacy
                 .mixed_step_latency(150, 1, 100, 2, 60, 1.0, 1.0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn generation_only_qualified_mamba_bounds_prefill_and_shared_tokens() {
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(Some(3)),
+            vec![Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
+            vec![qualified_mamba(false, 4)],
+        );
+        spec.engine.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec.clone(), build_engine(None).db).unwrap();
+        let (shared, _, _) = engine
+            .mixed_step_breakdown_per_op(140, 2, 100, 8, 60, 1.0, 1.0)
+            .unwrap();
+        // One complete 40-token suffix, another 40-token partial extend,
+        // and two width-four decoders: exactly 88 shared positions.
+        let expected = 88.0 * 2.0 / engine.db.system_spec.gpu.mem_bw * 1000.0;
+        assert!((shared[0].1 - expected).abs() < 1e-12);
+        assert!(
+            engine
+                .mixed_step_latency(150, 2, 100, 8, 60, 1.0, 1.0)
+                .unwrap_err()
+                .to_string()
+                .contains("partial prefill extend")
+        );
+        let Op::Mamba2(scan) = &mut spec.generation_ops[0] else {
+            unreachable!()
+        };
+        scan.state_dtype = "unrecorded".into();
+        scan.token_width = 1;
+        let legacy = Engine::build(spec, Arc::clone(&engine.db)).unwrap();
+        assert!(
+            legacy
+                .mixed_step_latency(150, 2, 100, 8, 60, 1.0, 1.0)
                 .is_ok()
         );
     }

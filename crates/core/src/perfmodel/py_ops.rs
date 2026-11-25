@@ -320,6 +320,12 @@ impl PyOperation {
         OPERATION_MUTATION_EPOCH.load(Ordering::Relaxed)
     }
 
+    /// Invalidate compiled identities after Python-owned graph metadata edits.
+    #[staticmethod]
+    fn _mark_mutated() {
+        OPERATION_MUTATION_EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Shim call-shape label (`None` on the base; each family overrides).
     /// Read by `OpShellKit._engine_query` and the composite phase walker
     /// (`overlap._infer_phase`), which sees Rust-wrapped children.

@@ -26,6 +26,8 @@ from committed_sources import package_inventory
 
 if len(sys.argv) != 8:
     sys.exit(__doc__)
+if "AICONFIGURATOR_MODEL_CONFIGS_PATH" in os.environ:
+    sys.exit("AICONFIGURATOR_MODEL_CONFIGS_PATH must be unset for canonical provenance")
 python, base_sdk, rounds, output = (
     sys.argv[1],
     sys.argv[2],

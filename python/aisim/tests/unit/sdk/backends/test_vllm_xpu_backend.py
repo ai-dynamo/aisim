@@ -413,12 +413,16 @@ def test_agg_decode_admission_fits_packed_tokens(monkeypatch, width, budget):
 
 @pytest.mark.parametrize("budget,decoders", [(4, 0), (5, 1), (8, 1), (9, 2)])
 def test_agg_decode_admission_prices_the_native_scheduled_work(monkeypatch, budget, decoders):
+    from collections import OrderedDict
+
+    from aisim_core.sdk import rust_engine_step
     from aisim_core.sdk.config import ModelConfig, RuntimeConfig
     from aisim_core.sdk.models import get_model
     from aisim_core.sdk.operations import ElementWise
     from aisim_core.sdk.perf_database import get_database_view
     from aisim_core.sdk.speculation import SpeculationConfig
 
+    monkeypatch.setattr(rust_engine_step, "_ENGINE_HANDLE_CACHE", OrderedDict())
     backend = VLLMXPUBackend()
     model = get_model(
         "Qwen/Qwen3-0.6B",
@@ -463,6 +467,43 @@ def test_prefill_heavy_boundary_prices_decode_steps() -> None:
     )
     assert r.tpot > 0
     assert r.request_latency > r.ttft  # decode time included
+
+
+@pytest.mark.parametrize("budget,decode_steps", [(4, 7), (5, 1)])
+def test_aggregate_prices_generation_after_admitting_no_mixed_decoders(monkeypatch, budget, decode_steps):
+    from aisim_core.sdk.config import ModelConfig, RuntimeConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import ElementWise
+    from aisim_core.sdk.perf_database import get_database_view
+    from aisim_core.sdk.speculation import SpeculationConfig
+
+    backend = VLLMXPUBackend()
+    model = get_model(
+        "Qwen/Qwen3-0.6B",
+        ModelConfig(
+            tp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=1,
+            speculation=SpeculationConfig(kind="ngram", params={"num_speculative_tokens": 3}),
+        ),
+        "vllm",
+    )
+    model.context_ops = [ElementWise("norm", 1, 1, 0)]
+    model.generation_ops = [ElementWise("norm", 1, 1, 0)]
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **kw: 100)
+    summary = backend.run_agg(model, database, RuntimeConfig(batch_size=2, isl=16, osl=8), ctx_tokens=budget)
+    scheduling = summary.get_step_estimates()["scheduling"]
+    assert scheduling["num_genonly_steps"] == decode_steps
+    groups = summary.get_aggregate_energy_breakdown()
+    # Each of the two decoders verifies four tokens; the norm moves two
+    # bytes/token. At budget 4, all seven output iterations follow prefill.
+    expected_ms = decode_steps * 2 * 4 * 2 / database.system_spec["gpu"]["mem_bw"] * 1000
+    assert groups["genonly_step"].latency_ms == pytest.approx(expected_ms)
+    if budget == 4:
+        assert summary.get_step_estimates()["mixed"].num_decode_requests == 0
+    else:
+        assert summary.get_step_estimates()["mixed"].num_decode_requests == 1
 
 
 @pytest.mark.parametrize("raises", [False, True])

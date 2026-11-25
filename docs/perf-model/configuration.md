@@ -792,7 +792,10 @@ both runs as one forward and takes the correction of that mixed iteration.
 
 Replay prices a pass this way only while `decode_speedup_ratio` is 1, its
 default and the only value MTP (`nextn > 0`) accepts: the shared time then
-takes `speedup_ratio` whatever work it holds. With another decode speedup,
+takes `speedup_ratio` whatever work it holds. Qualified Mamba prefill graphs
+also require `decode_speedup_ratio: 1`; Replay rejects another value during
+construction because phase fallback cannot preserve their observed chunk
+shapes. With another decode speedup on supported graphs,
 each rank prices its own phases, prefill at `speedup_ratio` and decode at
 `speedup_ratio * decode_speedup_ratio`, and the pass ends with the slowest
 rank, exactly as before the canonical query. A pass on which no rank computes

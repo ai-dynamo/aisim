@@ -139,8 +139,12 @@ prefix. The base backend's TTFT path uses the complete prefill latency and
 its uncached chunk count in the existing queuing heuristic. XPU's single-request
 path instead sums prefill, encoder and dispatch latency without a queuing factor.
 Both paths support unqualified operation graphs and whole-model FPM.
-Visual context retains its existing mean-field
-step pricing, with the prefill iteration count applied to the aggregate totals.
+Supported visual workloads retain mean-field step pricing, with the prefill
+iteration count applied to the aggregate totals. For an op-level graph with
+qualified Mamba and visual context, `run_agg` raises `ValueError` when a positive
+prefill budget is smaller than one request's uncached suffix; it returns no
+power totals for that unsupported chunk geometry. A budget that fits the
+suffix remains supported.
 
 For a disaggregated deployment, the prefill and decode roles are combined by
 the same sums:

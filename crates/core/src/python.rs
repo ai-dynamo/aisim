@@ -1141,6 +1141,18 @@ impl AicTimingModel {
         self.fitted().is_some()
     }
 
+    fn require_decode_speedup(&self, ratio: f64) -> Result<()> {
+        ensure!(
+            ratio == 1.0
+                || !self
+                    .iteration
+                    .as_ref()
+                    .is_some_and(|pricing| pricing.uses_prefill_chunks),
+            "qualified Mamba replay requires decode_speedup_ratio=1.0 to preserve per-request prefill chunks"
+        );
+        Ok(())
+    }
+
     /// Phase pricing is never a fallback for an estimator fitted to whole
     /// iterations, which would otherwise price work it was not fitted on.
     fn require_phase_pricing(&self) -> Result<()> {
@@ -3283,6 +3295,7 @@ fn resolve_role_timing(
         resources.require_memory()?;
     }
     let mut timing = AicTimingModel::build(&mut config, worker_type, role.rank.vision)?;
+    timing.require_decode_speedup(role.rank.decode_speedup_ratio)?;
     if let Some(fitted) = timing.fitted() {
         // The identity may not record attention DP; the engine's width decides.
         fitted.require_replay_role(role.dp_size, role.rank.decode_speedup_ratio)?;
@@ -10251,6 +10264,46 @@ mod tests {
         assert_eq!(fractions(IterationKind::Mixed, None), [0.75; 3]);
         passes.remove("generation_attention");
         assert_eq!(fractions(IterationKind::Mixed, Some(&passes)), [0.75; 3]);
+    }
+
+    #[test]
+    fn qualified_mamba_replay_rejects_phase_fallback_for_heterogeneous_chunks() {
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        pyo3::prepare_freethreaded_python();
+        // AR, so this rejection is independent of the existing MTP guard.
+        let native = Arc::new(crate::perfmodel::engine::runtime::tests::qualified_mamba_engine(0));
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::with_gil(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        let mut rank = prefill_work(0, 2, 17, 64);
+        rank.prefill.as_mut().unwrap().requests = vec![(1, 0, 1), (16, 64, 80)];
+        for ratio in [0.0, 0.5, 2.0] {
+            let error = timing
+                .require_decode_speedup(ratio)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("qualified Mamba replay requires decode_speedup_ratio=1.0"));
+        }
+        timing.require_decode_speedup(1.0).unwrap();
+        // Unit speedup preserves both physical states and all 17 new tokens.
+        let expected = (17.0 * 18_560.0 + 2.0 * 2_097_152.0)
+            / native.database().system_spec.gpu.mem_bw
+            * 1000.0;
+        assert!(close(iteration_ms(&timing, &[rank]), expected));
+        // Providers without a qualified prefill graph retain phase fallback.
+        let mut legacy = timing;
+        legacy.iteration = None;
+        legacy.require_decode_speedup(0.5).unwrap();
     }
 
     #[test]
