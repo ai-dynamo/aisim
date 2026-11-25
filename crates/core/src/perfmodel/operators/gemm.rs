@@ -1047,9 +1047,7 @@ mod tests {
 
     #[test]
     fn ascend_950dt_fp8_sol_rejects_unconfirmed_compute_tier() {
-        let systems_root = PathBuf::from(REPO_ROOT_HINT)
-            .join("../..")
-            .join("python/aisim/src/aisim_core/systems");
+        let systems_root = crate::test_systems::path("");
         let mut db = PerfDatabase::load_with_sources_opts(
             &systems_root,
             "ascend_950dt",

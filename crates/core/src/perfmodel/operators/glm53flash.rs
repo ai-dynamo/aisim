@@ -1167,8 +1167,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn ascend_950dt_rejects_unverified_fp32_throughput() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisim/src/aisim_core/systems/ascend_950dt.yaml");
+        let path = crate::test_systems::path("ascend_950dt.yaml");
         let spec = SystemSpec::load(&path).unwrap();
         for kind in ["kda", "sparse_mla"] {
             let error = attention(kind)
