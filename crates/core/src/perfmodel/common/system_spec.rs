@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::common::enums::{ComputeDtype, QuantMapping};
 use crate::common::error::AicError;
@@ -31,9 +31,37 @@ pub struct SystemSpec {
     pub misc: MiscSpec,
 }
 
+/// Explicit device vendor, normalized like Python's `_gpu_vendor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuVendor {
+    Nvidia,
+    Intel,
+    Ascend,
+}
+
+fn deserialize_gpu_vendor<'de, D>(deserializer: D) -> Result<Option<GpuVendor>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Deserialize a string, not an Option: an explicit null is invalid.
+    // Only an absent key may use the field's serde default (None).
+    let declared = String::deserialize(deserializer)?;
+    match declared.trim().to_ascii_lowercase().as_str() {
+        "nvidia" => Ok(Some(GpuVendor::Nvidia)),
+        "intel" => Ok(Some(GpuVendor::Intel)),
+        "ascend" => Ok(Some(GpuVendor::Ascend)),
+        _ => Err(serde::de::Error::custom(format!(
+            "gpu.vendor must be one of nvidia, intel, ascend, got {declared:?}"
+        ))),
+    }
+}
+
 /// GPU hardware spec.
 #[derive(Clone, Debug, Deserialize)]
 pub struct GpuSpec {
+    /// Validated explicit declaration; None preserves legacy vendor-less specs.
+    #[serde(default, deserialize_with = "deserialize_gpu_vendor")]
+    pub vendor: Option<GpuVendor>,
     /// HBM memory bandwidth, bytes/s.
     pub mem_bw: f64,
     /// Empirical scaling factor applied to `mem_bw`.
@@ -287,6 +315,82 @@ mod tests {
         crate::test_systems::path("")
     }
 
+    fn load_vendor_fixture(vendor_field: &str) -> Result<SystemSpec, AicError> {
+        let file = tempfile::NamedTempFile::new().expect("create system YAML");
+        let yaml = format!(
+            "data_dir: data/synthetic\ngpu:\n  mem_bw: 1.0\n{vendor_field}\n\
+             node:\n  num_gpus_per_node: 1\n  inter_node_bw: 1.0\n  intra_node_bw: 1.0\n"
+        );
+        fs::write(file.path(), yaml).expect("write system YAML");
+        SystemSpec::load(file.path())
+    }
+
+    #[test]
+    fn load_rejects_invalid_gpu_vendor() {
+        for value in [
+            "acme", "null", "~", "", "7", "true", "[]", "{}", "\"\"", "\"   \"",
+        ] {
+            let error = load_vendor_fixture(&format!("  vendor: {value}"))
+                .expect_err(&format!("gpu.vendor: {value} must fail"));
+            assert!(matches!(error, AicError::Yaml { .. }), "{error}");
+            assert!(error.to_string().contains("gpu.vendor"), "{error}");
+        }
+    }
+
+    #[test]
+    fn load_normalizes_gpu_vendor() {
+        for (declared, expected) in [
+            (" NVIDIA ", GpuVendor::Nvidia),
+            ("\tInTeL\n", GpuVendor::Intel),
+            (" AsCeNd ", GpuVendor::Ascend),
+        ] {
+            let spec = load_vendor_fixture(&format!("  vendor: {declared:?}"))
+                .expect("normalized gpu.vendor must load");
+            assert_eq!(spec.gpu.vendor, Some(expected));
+        }
+    }
+
+    #[test]
+    fn load_legacy_spec_without_gpu_vendor() {
+        let spec = load_vendor_fixture("").expect("legacy spec without vendor or SM must load");
+        assert_eq!(spec.gpu.vendor, None);
+        assert_eq!(spec.gpu.sm_version, None);
+    }
+
+    #[test]
+    fn parse_non_nvidia_systems() {
+        for (system, expected) in [
+            ("ascend_950dt", GpuVendor::Ascend),
+            ("b60", GpuVendor::Intel),
+        ] {
+            let spec = SystemSpec::load(&systems_root().join(format!("{system}.yaml")))
+                .expect("non-NVIDIA system YAML must load");
+            assert_eq!(spec.gpu.vendor, Some(expected));
+            assert_eq!(spec.gpu.sm_version, None);
+        }
+    }
+
+    #[test]
+    fn ascend_950dt_rejects_unverified_int8_throughput() {
+        let spec = SystemSpec::load(&systems_root().join("ascend_950dt.yaml")).unwrap();
+        let error = quant_tc_flops(&spec, crate::common::enums::GemmQuantMode::Sq.mapping())
+            .expect_err("unverified INT8 throughput must not enable estimates");
+        assert!(matches!(error, AicError::MissingSystemFlops(_)), "{error}");
+        assert!(error.to_string().contains("int8_tc_flops"), "{error}");
+    }
+
+    #[test]
+    fn ascend_950dt_rejects_unverified_bfloat16_tier() {
+        let spec = SystemSpec::load(&systems_root().join("ascend_950dt.yaml")).unwrap();
+        let error = quant_tc_flops(
+            &spec,
+            crate::common::enums::GemmQuantMode::Bfloat16.mapping(),
+        )
+        .expect_err("an unconfirmed Cube-Core tier must not enable BF16 estimates");
+        assert!(matches!(error, AicError::MissingSystemFlops(_)), "{error}");
+        assert!(error.to_string().contains("bfloat16_tc_flops"), "{error}");
+    }
+
     #[test]
     fn parse_b200_sxm() {
         let spec = SystemSpec::load(&systems_root().join("b200_sxm.yaml"))
@@ -298,6 +402,7 @@ mod tests {
         assert_eq!(spec.gpu.mem_bw_empirical_scaling_factor, 0.8);
         assert_eq!(spec.gpu.bfloat16_tc_flops, Some(2_250_000_000_000_000.0));
         assert_eq!(spec.gpu.sm_version, Some(100));
+        assert_eq!(spec.gpu.vendor, None); // Legacy NVIDIA spec.
         assert_eq!(spec.node.num_gpus_per_node, 8);
         assert!(spec.node.num_gpus_per_rack.is_none()); // b200_sxm has no rack tier
         // InferenceX CX7 400GbE reference, single-direction bandwidth per GPU.
@@ -326,6 +431,7 @@ mod tests {
         let spec = SystemSpec {
             data_dir: PathBuf::from("data/synthetic"),
             gpu: GpuSpec {
+                vendor: None,
                 fp32_flops: None,
                 mem_bw: 1.0,
                 mem_bw_empirical_scaling_factor: 1.0,
@@ -366,6 +472,7 @@ mod tests {
         let spec = SystemSpec {
             data_dir: PathBuf::from("data/synthetic"),
             gpu: GpuSpec {
+                vendor: None,
                 fp32_flops: None,
                 mem_bw: 1.0,
                 mem_bw_empirical_scaling_factor: 1.0,

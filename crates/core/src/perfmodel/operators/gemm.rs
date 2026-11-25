@@ -1045,6 +1045,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ascend_950dt_fp8_sol_rejects_unconfirmed_compute_tier() {
+        let systems_root = crate::test_systems::path("");
+        let mut db = PerfDatabase::load_with_sources_opts(
+            &systems_root,
+            "ascend_950dt",
+            "vllm",
+            "estimate",
+            &crate::config::PerfDbSources::default(),
+            true,
+        )
+        .expect("spec-only Ascend SOL database must load");
+        db.database_mode = DatabaseMode::Sol;
+        // Previously, the unsupported 1e15 FLOP/s peak priced an 8192^3 GEMM
+        // at 1.099511627776 ms (2 * 8192^3 operations / 1e15 * 1000).
+        // Without a confirmed compute tier, every FP8 mode must fail instead.
+        for quant in [
+            GemmQuantMode::Fp8,
+            GemmQuantMode::Fp8Static,
+            GemmQuantMode::Fp8Block,
+            GemmQuantMode::Fp8Ootb,
+        ] {
+            let error = GemmOp::new("gemm", 8192, 8192, quant)
+                .query(&db, 8192, None)
+                .expect_err("an unconfirmed Cube-Core tier must not enable FP8 SOL estimates");
+            assert!(matches!(error, AicError::MissingSystemFlops(_)), "{error}");
+            assert!(error.to_string().contains("fp8_tc_flops"), "{error}");
+        }
+    }
+
     /// SOL mode (and the retired SOL_FULL alias) returns the pure roofline
     /// tagged `Source::Sol` with zero energy — Python `_query_gemm_table` /
     /// `_query_compute_scale_table` / `_query_scale_matrix_table` SOL branches.

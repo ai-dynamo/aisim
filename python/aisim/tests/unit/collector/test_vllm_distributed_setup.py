@@ -130,6 +130,25 @@ def test_explicit_device_selects_local_rank_without_launcher_inference(harness, 
     assert worker.events[0][1]["local_rank"] == local_rank
 
 
+@pytest.mark.parametrize("device,local_rank", [("npu", 0), ("npu:0", 0), ("npu:4", 4)])
+def test_npu_setup_explicitly_uses_hccl_with_single_rank_filestore(harness, device, local_rank):
+    build, cleanups = harness
+    worker = build()
+    worker.setup(device)
+    worker.setup(device)
+
+    assert worker.events[0][1] == {
+        "world_size": 1,
+        "rank": 0,
+        "local_rank": local_rank,
+        "distributed_init_method": worker.events[0][2].as_uri(),
+        "backend": "hccl",
+    }
+    assert worker.events[1:] == [("model_parallel", 1, 1)]
+    assert not worker.contexts
+    assert len(cleanups) == 1
+
+
 def test_store_lives_past_setup_and_garbage_collection_until_exit_cleanup(harness):
     build, cleanups = harness
     worker = build()
@@ -143,11 +162,12 @@ def test_store_lives_past_setup_and_garbage_collection_until_exit_cleanup(harnes
 
 
 @pytest.mark.parametrize("fail_at", ["init", "model_parallel"])
-def test_native_failures_propagate_without_retry_and_keep_partial_store_alive(harness, fail_at):
+@pytest.mark.parametrize("device", ["cuda:0", "npu:0"])
+def test_native_failures_propagate_without_retry_and_keep_partial_store_alive(harness, fail_at, device):
     build, cleanups = harness
     worker = build(fail_at=fail_at)
     with pytest.raises(RuntimeError) as caught:
-        worker.setup("cuda:0")
+        worker.setup(device)
     assert caught.value is worker.error
     assert len(worker.events) == (1 if fail_at == "init" else 2)
     assert not worker.contexts

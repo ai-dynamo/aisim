@@ -1166,6 +1166,18 @@ pub(crate) mod tests {
             .with_mode(mode, TransferPolicy::ALL)
     }
     #[test]
+    fn ascend_950dt_rejects_unverified_fp32_throughput() {
+        let path = crate::test_systems::path("ascend_950dt.yaml");
+        let spec = SystemSpec::load(&path).unwrap();
+        for kind in ["kda", "sparse_mla"] {
+            let error = attention(kind)
+                .sol(&spec, 1.0, 1.0, 0.0)
+                .expect_err("unverified scalar FP32 throughput must not enable estimates");
+            assert!(matches!(error, AicError::MissingSystemFlops(_)), "{error}");
+            assert!(error.to_string().contains("fp32_flops"), "{error}");
+        }
+    }
+    #[test]
     fn physical_cache_payload_and_pool_publication() {
         let kda = attention("kda");
         // TP2:32 heads*128*128*4 +3 conv histories*32*128*3*2.

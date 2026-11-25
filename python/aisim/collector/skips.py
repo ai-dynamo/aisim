@@ -56,6 +56,10 @@ _MSA_MODULE_OPS = ["msa_context_module", "msa_generation_module"]
 _ATTENTION_OPS = ["attention_context", "attention_generation"]
 
 SKIPS: list[dict] = [
+    # vllm/collect_gemm_npu.py:run_gemm builds only an unquantized BF16 linear
+    # (quant_config=None); every quantized case would fail its dtype guard or
+    # mislabel a BF16 measurement. Quantized Ascend paths remain unverified.
+    {"backend": "vllm_npu", "op": "gemm", "gemm_type": ["fp8", "fp8_block", "nvfp4"]},
     # SGLang shards DeepSeek-V4 attention by its published parallel context only
     # (MQALayer reads get_parallel().attn_tp_size; srt/models/deepseek_v4.py), which a
     # single-process collector cannot publish, so collect_dsv4_attn refuses every TP>1

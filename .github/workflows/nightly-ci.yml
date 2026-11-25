@@ -294,6 +294,8 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
     timeout-minutes: 15
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -385,6 +387,7 @@ jobs:
       run:
         shell: bash
     env:
+      HOME: /__w/aisim/aisim
       UV_VERSION: "0.12.6"
       RUSTUP_VERSION: "1.29.0"
       RUST_TOOLCHAIN: "1.98.0"

@@ -38,6 +38,22 @@ def test_nvfp4_unchanged_on_blackwell():
     assert mc.moe_quant_mode == common.MoEQuantMode.nvfp4
 
 
+@pytest.mark.parametrize("gpu_yaml", ["null", "[]"])
+def test_malformed_gpu_block_fails_before_nvfp4_remapping(tmp_path, monkeypatch, gpu_yaml):
+    (tmp_path / "malformed.yaml").write_text(f"gpu: {gpu_yaml}\n", encoding="utf-8")
+    monkeypatch.setattr("aisimulate_core.sdk.perf_database.get_systems_paths", lambda: [str(tmp_path)])
+    mc = _model_config(
+        gemm_quant_mode=common.GEMMQuantMode.nvfp4,
+        moe_quant_mode=common.MoEQuantMode.nvfp4,
+    )
+
+    with pytest.raises(ValueError, match="Cannot resolve GPU spec"):
+        resolve_nvfp4_for_system(mc, "malformed")
+
+    assert mc.gemm_quant_mode == common.GEMMQuantMode.nvfp4
+    assert mc.moe_quant_mode == common.MoEQuantMode.nvfp4
+
+
 def test_bfloat16_unchanged_on_hopper():
     mc = _model_config(
         gemm_quant_mode=common.GEMMQuantMode.bfloat16,

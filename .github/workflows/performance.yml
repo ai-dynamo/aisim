@@ -58,6 +58,8 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -81,6 +83,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends build-essential util-linux
+
+      - name: Set Cargo home outside the checkout
+        run: echo "CARGO_HOME=${CARGO_HOME:-${RUNNER_TEMP}/cargo}" >> "${GITHUB_ENV}"
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 

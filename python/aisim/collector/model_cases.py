@@ -374,8 +374,13 @@ def _backend_registry_ops(backend: str) -> set[str] | None:
 
     Registries import only ``collector.registry_types``, so loading them here
     is framework-free. Returns None for a backend without a registry module,
-    leaving validation to the executor.
+    leaving validation to the executor. The NPU lane has its own registry and
+    does not include CUDA, XPU or wideep ops.
     """
+    if backend == "vllm_npu":
+        from collector.vllm.registry import REGISTRY_NPU
+
+        return {entry.op for entry in REGISTRY_NPU}
     try:
         registry = importlib.import_module(f"collector.{backend}.registry")
     except ImportError:
@@ -394,6 +399,8 @@ def _backend_registry_ops(backend: str) -> set[str] | None:
 def build_collection_case_plan(
     *,
     backend: str,
+    collector_framework: str | None = None,
+    requested_ops: list[str] | None = None,
     model_path: str | None = None,
     model_architecture: str | None = None,
     gpu_type: str | None = None,
@@ -403,7 +410,13 @@ def build_collection_case_plan(
     full: bool = False,
     include_long_context: bool = False,
 ) -> CollectionCasePlan:
-    """Build a model-aware op plan for one backend."""
+    """Build a model-aware op plan, validating against the selected device lane.
+
+    ``backend`` selects and validates the model's YAML sections.
+    ``collector_framework`` additionally checks device-lane support, limited to
+    ``requested_ops`` when supplied. This runtime subset does not narrow the
+    returned plan; the executor applies it.
+    """
     base_path = Path(base_cases_path).expanduser().resolve() if base_cases_path else BASE_OP_CASES_DIR
     base_data_files = _load_base_case_files(base_path)
     requested_model_path = model_path
@@ -429,9 +442,14 @@ def build_collection_case_plan(
     if registry_ops is not None:
         unknown = selected - registry_ops
         if unknown:
+            raise ValueError(f"Model case files declare ops unknown to the {backend} registry: {sorted(unknown)}")
+
+    if collector_framework and collector_framework != backend:
+        lane_ops = _backend_registry_ops(collector_framework)
+        selected_for_run = selected if requested_ops is None else selected.intersection(requested_ops)
+        if lane_ops is not None and (unknown := selected_for_run - lane_ops):
             raise ValueError(
-                f"Model case files declare ops unknown to the {backend} registry "
-                f"(including its wideep registry): {sorted(unknown)}"
+                f"Model case files declare ops unknown to the {collector_framework} registry: {sorted(unknown)}"
             )
 
     resolved_sm_version = resolve_sm_version(gpu_type=gpu_type, sm_version=sm_version)

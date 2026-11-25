@@ -179,6 +179,8 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -288,6 +290,7 @@ jobs:
         HOME: /__w/aisim/aisim
         USER: runner
     env:
+      HOME: /__w/aisim/aisim
       BASE_SHA: ${{ needs.select.outputs.base_sha }}
       HEAD_SHA: ${{ needs.select.outputs.head_sha }}
     steps:

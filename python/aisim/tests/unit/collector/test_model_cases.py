@@ -1311,6 +1311,67 @@ def test_plan_rejects_model_declared_ops_unknown_to_backend_registry(tmp_path):
         build_collection_case_plan(backend="vllm", model_cases_path=str(case_file))
 
 
+@pytest.mark.parametrize("framework_specific", [False, True])
+def test_npu_plan_rejects_cuda_only_model_ops(tmp_path, framework_specific):
+    case_file = tmp_path / "model_cases.yaml"
+    case_file.write_text(
+        "architecture: FakeArchForCausalLM\n"
+        "model_path: fake/model\n"
+        "include_base: false\n"
+        "model_ops: [gemm]\n"
+        + (
+            "framework_specific_op_cases:\n  vllm:\n    attention_context:\n      cases: all\n"
+            if framework_specific
+            else "all_frameworks_op_cases:\n  attention_context:\n    cases: all\n"
+        )
+    )
+    # The declaration is valid for CUDA vLLM, but cannot be dispatched on NPU.
+    assert build_collection_case_plan(backend="vllm", model_cases_path=str(case_file)).ops == [
+        "attention_context",
+        "gemm",
+    ]
+    with pytest.raises(ValueError, match="vllm_npu registry.*attention_context"):
+        build_collection_case_plan(backend="vllm", collector_framework="vllm_npu", model_cases_path=str(case_file))
+
+
+def test_npu_plan_accepts_gemm(tmp_path):
+    case_file = tmp_path / "model_cases.yaml"
+    case_file.write_text("model_path: fake/model\ninclude_base: false\nmodel_ops: [gemm]\n")
+
+    plan = build_collection_case_plan(backend="vllm", collector_framework="vllm_npu", model_cases_path=str(case_file))
+
+    assert plan.backend == "vllm"
+    assert plan.ops == ["gemm"]
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_npu_plan_validates_only_requested_ops_against_device_lane(full):
+    plan = build_collection_case_plan(
+        backend="vllm",
+        collector_framework="vllm_npu",
+        model_path=None if full else "Qwen/Qwen3-0.6B",
+        full=full,
+        requested_ops=["gemm"],
+    )
+
+    # Keep the model declaration intact; the executor applies its runtime subset.
+    assert plan.has_op("gemm")
+    assert plan.has_op("attention_context")
+
+
+def test_npu_subset_still_validates_unrequested_declarations(tmp_path):
+    case_file = tmp_path / "model_cases.yaml"
+    case_file.write_text("include_base: false\nmodel_ops: [gemm, attention_contxt_typo]\n")
+
+    with pytest.raises(ValueError, match="vllm registry.*attention_contxt_typo"):
+        build_collection_case_plan(
+            backend="vllm",
+            collector_framework="vllm_npu",
+            model_cases_path=str(case_file),
+            requested_ops=["gemm"],
+        )
+
+
 def test_dsv4_plan_only_uses_backend_specific_case_plan():
     model_path = "deepseek-ai/DeepSeek-V4-Pro"
     expected_ops = build_collection_case_plan(backend="sglang", model_path=model_path).ops

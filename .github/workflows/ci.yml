@@ -497,6 +497,8 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -548,6 +550,8 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -703,6 +707,8 @@ jobs:
             container_image: quay.io/pypa/manylinux_2_28_aarch64@sha256:29a6ceb78de5b00494e6e7456a72782a4cb54238de102e7491d15fe47789b4d1
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
     timeout-minutes: ${{ matrix.build_timeout_minutes }}
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ matrix.container_image }}
       env:
@@ -765,6 +771,8 @@ jobs:
           - {suite: cli-build, group: 1, groups: 1}
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
     timeout-minutes: 15
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
       env:
@@ -1093,6 +1101,8 @@ jobs:
             # quay.io/pypa/manylinux_2_28_aarch64:2026.08.24-1
             container_image: quay.io/pypa/manylinux_2_28_aarch64@sha256:29a6ceb78de5b00494e6e7456a72782a4cb54238de102e7491d15fe47789b4d1
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
+    env:
+      HOME: /__w/aisim/aisim
     container:
       image: ${{ matrix.container_image }}
       env:

@@ -235,6 +235,25 @@ def test_forward_perf_selects_before_allocating_the_benchmark_runner():
     assert "${BASE_SRC}/python/aisim/tools/forward_perf_gate/run.py" in _run_commands(compare)
 
 
+@pytest.mark.parametrize("image_cargo_home", [None, "", "/opt/image-cargo"])
+def test_forward_perf_cargo_home_is_isolated_before_rust_setup(tmp_path, image_cargo_home):
+    steps = _workflow("performance.yml")["jobs"]["compare"]["steps"]
+    bootstrap = next(step for step in steps if step.get("name") == "Set Cargo home outside the checkout")
+    rust = next(step for step in steps if step.get("uses", "").startswith("dtolnay/rust-toolchain@"))
+    assert steps.index(bootstrap) < steps.index(rust)
+    runner_temp = tmp_path / "runner-temp"
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    env_file = tmp_path / "github-env"
+    env = {**os.environ, "RUNNER_TEMP": str(runner_temp), "GITHUB_ENV": str(env_file)}
+    env.pop("CARGO_HOME", None)
+    if image_cargo_home is not None:
+        env["CARGO_HOME"] = image_cargo_home
+    subprocess.run(["bash", "-euc", bootstrap["run"]], cwd=checkout, env=env, check=True, timeout=10)
+    expected = image_cargo_home or str(runner_temp / "cargo")
+    assert env_file.read_text() == f"CARGO_HOME={expected}\n"
+
+
 def test_forward_perf_validates_the_pr_controller_without_replacing_the_base_comparison():
     steps = _workflow("performance.yml")["jobs"]["compare"]["steps"]
     revisions = next(step for step in steps if step.get("id") == "revisions")
@@ -2600,6 +2619,24 @@ def test_omitted_wheel_base_preserves_dockerfile_default() -> None:
     build = next(step for step in action["runs"]["steps"] if step["name"] == "Build Linux wheel")
     omitted_input_arguments = build["with"]["build-args"].replace("${{ inputs.wheel_base }}", wheel_base["default"])
     assert omitted_input_arguments == f"WHEEL_BUILD_BASE={docker_default}"
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name"),
+    [
+        (path.name, job_name)
+        for path in sorted(WORKFLOW_ROOT.glob("*.yml"))
+        for job_name, job in _workflow(path.name)["jobs"].items()
+        if isinstance(job.get("container"), dict) and "HOME" in job["container"].get("env", {})
+    ],
+)
+def test_container_home_is_set_for_steps_after_runner_override(workflow_name: str, job_name: str) -> None:
+    job = _workflow(workflow_name)["jobs"][job_name]
+    # The runner replaces container.env.HOME with /github/home before startup.
+    # Job env is passed to each step and must restore the intended writable home.
+    assert job.get("env", {}).get("HOME") == job["container"]["env"]["HOME"]
+    if workflow_name == "runner-canary.yml":
+        assert 'test "${HOME}" = /__w/aisim/aisim' in _run_commands(job)
 
 
 def test_containerized_workflows_do_not_require_git_lfs_during_checkout() -> None:
