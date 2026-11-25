@@ -104,6 +104,27 @@ def test_initialization_has_a_separate_deadline(tmp_path):
     assert result["reason"] == "execution initialization timed out"
 
 
+def test_a_dataset_download_restarts_the_initialization_deadline(tmp_path):
+    from aisim_core.data.default_systems import DOWNLOAD_MARKER_ENV
+
+    result = _run_script(
+        tmp_path,
+        f"""
+import os, time
+from pathlib import Path
+marker = Path(os.environ[{DOWNLOAD_MARKER_ENV!r}])
+marker.touch()
+time.sleep(1.5)
+marker.unlink()
+time.sleep(30)
+""",
+        policy=_policy(initialization_timeout_seconds=1.0),
+    )
+    assert result["status"] == "timed_out"
+    assert result["reason"] == "execution initialization timed out"
+    assert result["wall_seconds"] > 2.0  # 1.5 s of download, then a fresh 1 s deadline
+
+
 def test_child_exit_code_is_preserved(tmp_path):
     result = _run_script(tmp_path, "raise SystemExit(3)")
     assert result["status"] == "resource_limited"

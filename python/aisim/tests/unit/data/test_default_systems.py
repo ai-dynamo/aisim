@@ -113,6 +113,28 @@ def test_default_download_transport_is_a_base_dependency():
     assert "huggingface_hub" in base
 
 
+def test_a_first_use_download_is_announced_and_marked_for_the_supervisor(published, tmp_path, monkeypatch, capsys):
+    marker = tmp_path / "downloading"
+    monkeypatch.setenv(ds.DOWNLOAD_MARKER_ENV, str(marker))
+    marked = []
+
+    class Watched(DirTransport):
+        def open_file(self, repo, sha, path):
+            marked.append(marker.exists())
+            return super().open_file(repo, sha, path)
+
+    with pytest.raises(MissingDataError):
+        ds.default_systems_path(transport=Watched(tmp_path / "absent"))
+    assert marked and not marker.exists()  # released when the fetch fails
+    ds.default_systems_path(transport=Watched(published))
+    assert all(marked) and not marker.exists()  # in place for the whole transfer
+    assert f"fetching op-latency data o/n@{SHA}" in capsys.readouterr().err
+
+    ds.clear_default_systems_cache()
+    ds.default_systems_path(transport=Watched(published))
+    assert capsys.readouterr().err == ""  # warm cache: nothing to announce
+
+
 @pytest.fixture
 def cold_offline(monkeypatch):
     """No default data anywhere: composing the default root would raise, so success proves it was not touched."""
