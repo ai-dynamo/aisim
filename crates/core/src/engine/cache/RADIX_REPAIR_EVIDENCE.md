@@ -123,8 +123,67 @@ The small control has slight added ownership overhead. Larger-context medians
 improve, including overlap reconciliation. Process peak RSS was 36,300 KiB on
 both sides, but that coarse measure includes launcher overhead and does not
 establish exact retained-memory parity. Reproduce a single microbenchmark
-sample with `cargo test --release --locked --lib radix_growth_measurement --
---ignored`; run the same probe at the pinned head for the paired comparison.
+sample using the archived probe from
+`f2254e0d6e47bea54c5fe0af7a6db5cbf736493e`, with SHA-256
+`a83069941bdad532ec2c8e4532eded72670f380db907771e20da2b3b090dfb38`.
+This is the probe recorded in the JSON: 50 lifecycles for each of the six
+context/overlap combinations above, with two growth pages for the control and
+128 for the larger contexts. Overlay exactly these bytes on both recorded
+production revisions; their source and lockfiles otherwise remain unchanged.
+From the repository root, with `TMPDIR` outside the checkout:
+
+```bash
+set -euo pipefail
+growth_work=$(mktemp -d "${TMPDIR:?}/radix-growth.XXXXXXXX")
+growth_targets="${CARGO_TARGET_DIR:-$growth_work/target}/$(basename "$growth_work")"
+probe_revision=f2254e0d6e47bea54c5fe0af7a6db5cbf736493e
+probe_path=crates/core/src/engine/kv_manager/radix_lifecycle_evidence.rs
+git show "$probe_revision:$probe_path" > "$growth_work/probe.rs"
+printf '%s  %s\n' \
+  a83069941bdad532ec2c8e4532eded72670f380db907771e20da2b3b090dfb38 \
+  "$growth_work/probe.rs" | sha256sum --check
+
+for side in baseline candidate; do
+  if [ "$side" = baseline ]; then
+    revision=9664b5ba9bc33ac02e7e0f727679c00587b08733
+  else
+    revision=f2254e0d6e47bea54c5fe0af7a6db5cbf736493e
+  fi
+  snapshot="$growth_work/$side"
+  mkdir "$snapshot"
+  git archive "$revision" Cargo.toml Cargo.lock crates/core \
+    python/aisimulate/tests/fixtures | tar -x -C "$snapshot"
+  cp "$growth_work/probe.rs" "$snapshot/$probe_path"
+  module="$snapshot/crates/core/src/engine/kv_manager/sglang_backend.rs"
+  if ! grep -q '^mod radix_lifecycle_evidence;$' "$module"; then
+    printf '\n#[cfg(test)]\n#[path = "radix_lifecycle_evidence.rs"]\nmod radix_lifecycle_evidence;\n' >> "$module"
+  fi
+  (cd "$snapshot"
+    CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+      CARGO_TARGET_DIR="$growth_targets/$side" \
+      cargo test --release --locked --lib radix_growth_measurement --no-run \
+      > "$growth_work/$side-build.log" 2>&1)
+done
+
+# Build both optimized binaries before timing either side.
+for side in baseline candidate; do
+  (cd "$growth_work/$side"
+    CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+      CARGO_TARGET_DIR="$growth_targets/$side" \
+      AISIM_EVICTION_EVIDENCE_OUTPUT="$growth_work/$side.json" \
+      cargo test --release --locked --lib radix_growth_measurement -- \
+      --ignored --nocapture > "$growth_work/$side-run.log" 2>&1)
+done
+printf 'Growth observations and build/run logs: %s\n' "$growth_work"
+```
+
+This produces one fresh sample per side, with the historical lifecycle
+assertions intact. To compare timings, use the matched affinity/resources,
+warmup and alternating paired sampling described above; the historical timing
+values are host-specific. The current checkout's `radix_growth_measurement` is
+a separate benchmark: it uses 20 repetitions, initial contexts of 64 and 4096
+tokens, and growth sizes of 2, 128, 512 and 2048 pages. Running it directly does
+not reproduce this historical table.
 
 ## Production CLI comparison
 
