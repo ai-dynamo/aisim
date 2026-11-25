@@ -207,7 +207,7 @@ def test_speculative_launch_and_mismatch_query_enforce_same_controls(local_targe
 @pytest.mark.parametrize(
     "kind,params",
     [
-        ("mtp", {"depth": 6}),
+        ("mtp", {"depth": 8}),
         ("eagle3", {"tree_shape": [1, 2], "verify_token_budget": 4}),
         ("eagle3", {"tree_shape": [1, 1], "verify_token_budget": 4}),
     ],
@@ -228,6 +228,25 @@ def test_speculative_launch_and_mismatch_query_reject_unsupported_chain(local_ta
         RustForwardPassPerfModel.config_engine_launch_mismatches({"engine": engine}, config=timing)
     with pytest.raises(ValueError, match="speculative replay requires"):
         _native_launch(engine)
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang"])
+@pytest.mark.parametrize("depth", [6, 7])
+def test_expanded_mtp_depth_survives_native_launch_and_mismatch_query(local_target, backend, depth):
+    cost = {"kind": "mtp", "params": {"depth": depth}}
+    timing = {**_timing_config(local_target, backend), "speculation": cost}
+    engine = {
+        "backend": backend,
+        "worker_type": "decode",
+        "num_gpu_blocks": 64,
+        "aic_nextn_accept_rates": ",".join(["1"] * depth),
+        "timing_model": {"type": "external", "provider": "ais", "config": timing},
+    }
+    restored = _native_launch(engine)
+    assert restored["engine"]["aic_nextn"] == depth
+    assert restored["engine"]["timing_model"]["config"]["speculation"] == cost
+    assert RustForwardPassPerfModel.config_engine_launch_mismatches(restored, config=timing) == []
+    assert _native_launch(restored["engine"]) == restored
 
 
 @pytest.mark.parametrize("kind", ["ngram", "mtp", "eagle3"])

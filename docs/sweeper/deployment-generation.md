@@ -132,6 +132,12 @@ those choices. It rejects combinations it cannot lower, including analytical
 AFD/EPD and heterogeneous P/D hardware. AFD predictions instead produce their
 own analytical artifacts; see [AFD topology](../replay/engine/analytical.md#afd).
 
+The generator cannot currently render searched prefill intervals. Candidates
+with `prefill_schedule_interval` other than 1 (vLLM) or
+`prefill_decode_interval` other than 0 (SGLang) are rejected before artifact
+generation. Replay these candidates with their saved prediction YAML; generated
+serving artifacts would otherwise lose the schedule used to rank them.
+
 Deployment token budgets must be multiples of 64. Ordinary generator requests
 round them upward, but an already evaluated candidate with an unaligned budget
 is rejected: changing the budget would invalidate its prediction and ranking.

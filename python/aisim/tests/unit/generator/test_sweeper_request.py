@@ -319,6 +319,52 @@ def test_candidate_gpu_count_must_match_lowered_topology():
         )
 
 
+@pytest.mark.parametrize(
+    "backend,backend_version,field",
+    [
+        ("vllm", "0.24.0", "prefill_schedule_interval"),
+        ("sglang", "0.5.14", "prefill_decode_interval"),
+    ],
+)
+def test_candidate_rejects_unrepresentable_prefill_interval_before_artifact_emission(
+    tmp_path, backend, backend_version, field
+):
+    output_dir = tmp_path / "deployment"
+    with pytest.raises(SweeperCandidateError, match=rf"cannot preserve candidate.config.{field}=8.*prediction YAML"):
+        request = from_sweeper_candidate(
+            _agg_candidate(
+                backend=backend,
+                backend_version=backend_version,
+                attention_dp=2,
+                replicas=2,
+                **{field: 8},
+            ),
+            workload={"isl": 4000, "osl": 1000},
+            output_dir=str(output_dir),
+            model_facts=ModelFacts(is_moe=False, architecture="Qwen3ForCausalLM"),
+        )
+        generate_from_request(request)
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("backend,backend_version", [("vllm", "0.24.0"), ("sglang", "0.5.14")])
+def test_candidate_default_prefill_intervals_still_generate_artifacts(backend, backend_version):
+    request = from_sweeper_candidate(
+        _agg_candidate(
+            backend=backend,
+            backend_version=backend_version,
+            attention_dp=2,
+            replicas=2,
+            prefill_schedule_interval=1,
+            prefill_decode_interval=0,
+        ),
+        workload={"isl": 4000, "osl": 1000},
+        model_facts=ModelFacts(is_moe=False, architecture="Qwen3ForCausalLM"),
+    )
+    artifacts = generate_from_request(request)
+    assert "k8s_deploy.yaml" in artifacts
+
+
 @pytest.mark.parametrize("mode", ["agg", "disagg"])
 def test_afd_candidate_rejects_native_generation_with_analytical_artifact_path(mode):
     with pytest.raises(
