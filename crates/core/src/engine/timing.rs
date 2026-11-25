@@ -227,6 +227,15 @@ impl TimingOperationEvidence {
             self.energy_wms,
             self.covered_latency_ms,
         )?;
+        self.check_details()?;
+        self.energy_wms = self.energy_wms.filter(|energy| *energy > 0.0);
+        if self.energy_wms.is_none() {
+            self.covered_latency_ms = 0.0;
+        }
+        Ok(self)
+    }
+
+    fn check_details(&self) -> Result<()> {
         if let Some(details) = &self.details {
             ensure!(
                 details.sol.is_some() != details.sol_unavailable_reason.is_some(),
@@ -260,11 +269,7 @@ impl TimingOperationEvidence {
                 );
             }
         }
-        self.energy_wms = self.energy_wms.filter(|energy| *energy > 0.0);
-        if self.energy_wms.is_none() {
-            self.covered_latency_ms = 0.0;
-        }
-        Ok(self)
+        Ok(())
     }
 
     fn accumulate(&mut self, other: Self) -> Result<()> {
@@ -447,16 +452,9 @@ impl ValidatedTimingPhase {
                 .any(|previous| previous.name == operation.name)
         }));
         // Same validation and error order as `try_from_operations`.
-        let operations = operations
-            .into_iter()
-            .map(|operation| {
-                if operation.details.is_some() {
-                    operation.canonicalized()
-                } else {
-                    Ok(operation)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
+        for operation in &operations {
+            operation.check_details()?;
+        }
         debug_assert!(operations.iter().all(|operation| {
             matches!(operation.clone().canonicalized(), Ok(canonical) if canonical == *operation)
         }));
