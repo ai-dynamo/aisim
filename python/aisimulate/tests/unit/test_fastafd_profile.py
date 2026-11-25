@@ -64,6 +64,7 @@ def _payload(entries=None):
             "boundary": "split AFD MoE stage",
             "boundary_components": ["dispatch", "experts", "return", "combine"],
             "timed_span": "all_moe_layers_and_microbatches",
+            "microbatch_split": "equal_padded",
         },
         "entries": [_entry()] if entries is None else entries,
     }
@@ -389,7 +390,8 @@ def test_inspection_and_canonical_model_agree_on_flat_parquet_schema(tmp_path, n
 
 @pytest.mark.parametrize("span", [None, "one_microbatch", "one_moe_layer", 1])
 @pytest.mark.parametrize("suffix", ["json", "parquet"])
-def test_inspection_and_native_loading_require_complete_timed_span(tmp_path, span, suffix):
+@pytest.mark.parametrize("field", ["timed_span", "microbatch_split"])
+def test_inspection_and_native_loading_require_capture_contract(tmp_path, span, suffix, field):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -397,9 +399,9 @@ def test_inspection_and_native_loading_require_complete_timed_span(tmp_path, spa
 
     payload = _payload()
     if span is None:
-        del payload["source"]["timed_span"]
+        del payload["source"][field]
     else:
-        payload["source"]["timed_span"] = span
+        payload["source"][field] = span
     if suffix == "json":
         path = _write(tmp_path, payload)
     else:
@@ -410,9 +412,9 @@ def test_inspection_and_native_loading_require_complete_timed_span(tmp_path, spa
         index = table.schema.get_field_index("source_json")
         table = table.set_column(index, "source_json", pa.array([json.dumps(payload["source"])]))
         pq.write_table(table, path)
-    with pytest.raises(ValueError, match="timed_span"):
+    with pytest.raises(ValueError, match=field):
         FastAFDMoEStageProfile.load(path)
-    with pytest.raises(ValueError, match="timed_span|invalid type"):
+    with pytest.raises(ValueError, match=f"{field}|invalid type"):
         RustForwardPassPerfModel.best_available(_canonical_config(path))
 
 

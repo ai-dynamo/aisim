@@ -27,6 +27,7 @@ def _colocated(tokens, *, routing="balanced", stable=True, p50=12.0, correctness
         "measurement_boundary": "colocated MoE stage",
         "measurement_boundary_components": ["dispatch", "experts", "return", "combine"],
         "measurement_timed_span": "all_moe_layers_and_microbatches",
+        "measurement_microbatch_split": "equal_padded",
         "primary_backend": "mega",
         "model_profile": _MODEL,
         "topology": {"ep_size": 8},
@@ -46,6 +47,7 @@ def _split(sequences):
         "measurement_boundary": "split AFD MoE stage",
         "measurement_boundary_components": ["dispatch", "experts", "return", "combine"],
         "measurement_timed_span": "all_moe_layers_and_microbatches",
+        "measurement_microbatch_split": "equal_padded",
         "moe_backend": "megamoe",
         "model_profile": _MODEL,
         "topology": {"ag_size": 16, "eg_size": 8},
@@ -88,6 +90,7 @@ def test_builds_colocated_profile_and_skips_unqualified_results(tmp_path):
         "boundary": "colocated MoE stage",
         "boundary_components": ["dispatch", "experts", "return", "combine"],
         "timed_span": "all_moe_layers_and_microbatches",
+        "microbatch_split": "equal_padded",
     }
     entry = profile["entries"][0]
     assert entry["key"] == {
@@ -312,7 +315,8 @@ def test_builder_rejects_unverified_or_incompatible_boundary(tmp_path, component
 
 @pytest.mark.parametrize("span", [None, "one_microbatch", "one_moe_layer", "", 1])
 @pytest.mark.parametrize("suffix", ["json", "parquet"])
-def test_builder_rejects_unverified_or_partial_timed_span_without_publication(tmp_path, span, suffix):
+@pytest.mark.parametrize("field", ["timed_span", "microbatch_split"])
+def test_builder_rejects_unverified_capture_contract_without_publication(tmp_path, span, suffix, field):
     payload = _split(64)
     capture = _write(tmp_path, "capture.json", payload)
     output = tmp_path / f"profile.{suffix}"
@@ -320,10 +324,10 @@ def test_builder_rejects_unverified_or_partial_timed_span_without_publication(tm
     assert main(args) == 0
     original = output.read_bytes()
     if span is None:
-        del payload["measurement_timed_span"]
+        del payload[f"measurement_{field}"]
     else:
-        payload["measurement_timed_span"] = span
+        payload[f"measurement_{field}"] = span
     capture.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="timed_span"):
+    with pytest.raises(ValueError, match=field):
         main(args)
     assert output.read_bytes() == original

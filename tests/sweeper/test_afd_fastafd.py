@@ -90,6 +90,7 @@ def _profile(tmp_path, entries=None) -> str:
                     "boundary": "split AFD MoE stage",
                     "boundary_components": ["dispatch", "experts", "return", "combine"],
                     "timed_span": "all_moe_layers_and_microbatches",
+                    "microbatch_split": "equal_padded",
                 },
                 "entries": [_entry()] if entries is None else entries,
             }
@@ -185,6 +186,18 @@ def test_stage_latency_is_spread_over_layer_microbatch_units(tmp_path):
     assert provenance["attention"]["components"] == COMPONENTS
     assert provenance["attention"]["provider"] == "aic"
     assert set(provenance["composition"]) == {"attention_ms", "ffn_ms", "a_to_f_ms", "f_to_a_ms"}
+
+
+@pytest.mark.parametrize("batch", [128, 129])
+def test_stage_composition_preserves_declared_equal_padded_split(tmp_path, batch):
+    path = _profile(tmp_path, [_entry(logical_batch_per_source_rank=batch)])
+    attention = _Attention()
+    (measurement,) = _provider(tmp_path, attention, profile_path=path).measure(_request(_topology(a_batch_size=batch)))
+    assert attention.requests[0].topology.a_batch_size == batch
+    assert attention.requests[0].topology.num_microbatches == 2
+    assert measurement.provenance["stage"]["key"]["logical_batch_per_source_rank"] == batch
+    assert measurement.provenance["stage"]["microbatch_split"] == "equal_padded"
+    assert measurement.ffn_ms == pytest.approx(STAGE_MS / (LAYERS * 2))
 
 
 @pytest.mark.parametrize("attention_kind", ["builtin", "custom"])

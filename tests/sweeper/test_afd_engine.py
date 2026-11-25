@@ -12,7 +12,7 @@ from aisimulate.sweeper.afd_engine import (
     AFDStage,
     evaluate_afd_phase,
 )
-from aisimulate.sweeper.afd_parallel import AFDPipelineModel, AFDTopology
+from aisimulate.sweeper.afd_parallel import AFDInfeasible, AFDPipelineModel, AFDTopology
 from aisimulate.sweeper.afd_perfmodel import AFDLayerTimes
 
 
@@ -42,6 +42,17 @@ def _times(phase: str = "decode", **overrides) -> AFDLayerTimes:
     }
     values.update(overrides)
     return AFDLayerTimes(**values)
+
+
+@pytest.mark.parametrize("field", ["input_length", "isl"])
+def test_input_length_mismatch_leaves_foreground_pass_state_unchanged(field):
+    engine = AFDForegroundEngine(_topology(), (_times(provenance={field: 128}),))
+    with pytest.raises(AFDInfeasible, match="recorded at isl=128, not replay isl=256"):
+        engine.execute_pass(phase="decode", now_ms=0.0, input_length=256, output_length=16)
+    assert engine.in_flight is None
+    planned = engine.execute_pass(phase="decode", now_ms=0.0, input_length=128, output_length=16)
+    assert planned.pass_id == 0
+    assert engine.in_flight is planned
 
 
 def test_pipeline_evaluator_matches_legacy_optimistic_formula():

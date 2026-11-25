@@ -778,11 +778,12 @@ def _run_afd_replay(
         raise ValueError("AFD engine replay requires at least one request")
     input_length = _positive_int(spec.workload.get("isl"), "isl")
     for index, measurement in enumerate(measurements):
-        measured_isl = measurement.provenance.get("isl")
-        if measured_isl is not None and measured_isl != input_length:
-            raise ValueError(
-                f"AFD measurement {index} was recorded at isl={measured_isl}, not replay isl={input_length}"
-            )
+        for length_key in ("input_length", "isl"):
+            measured_isl = measurement.provenance.get(length_key)
+            if measured_isl is not None and measured_isl != input_length:
+                raise ValueError(
+                    f"AFD measurement {index} was recorded at isl={measured_isl}, not replay isl={input_length}"
+                )
     output_length = _positive_int(spec.workload.get("osl"), "osl")
     engine = AFDForegroundEngine(topology, measurements)
 

@@ -349,7 +349,9 @@ class AICAFDPerformanceModel:
                                 if isinstance(components, Mapping)
                                 else {}
                             ),
-                            **({"decode_samples": item["decode_samples"]} if "decode_samples" in item else {}),
+                            **(
+                                {"decode_samples": deepcopy(item["decode_samples"])} if "decode_samples" in item else {}
+                            ),
                         },
                     )
                 )

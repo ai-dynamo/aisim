@@ -62,6 +62,7 @@ class FastAFDProfileSource:
     boundary: str
     boundary_components: tuple[str, ...]
     timed_span: str
+    microbatch_split: str
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,7 @@ class FastAFDMoEStageMeasurement:
             "boundary": self.source.boundary,
             "boundary_components": list(self.source.boundary_components),
             "timed_span": self.source.timed_span,
+            "microbatch_split": self.source.microbatch_split,
             "model_profile": self.model_profile,
             "method": self.method,
             "method_version": self.method_version,
@@ -215,7 +217,7 @@ class FastAFDMoEStageProfile:
             raise ValueError("FastAFD profile lookup_policy must be 'exact-only'")
         origin = _object(
             root["source"],
-            {"repository", "commit", "benchmark", "boundary", "boundary_components", "timed_span"},
+            {"repository", "commit", "benchmark", "boundary", "boundary_components", "timed_span", "microbatch_split"},
             "source",
         )
         # A complete stage includes the A-side combine and excludes the router,
@@ -225,6 +227,8 @@ class FastAFDMoEStageProfile:
             raise ValueError("source.boundary_components must be dispatch, experts, return, combine (no router)")
         if origin["timed_span"] != "all_moe_layers_and_microbatches":
             raise ValueError("source.timed_span must be all_moe_layers_and_microbatches")
+        if origin["microbatch_split"] != "equal_padded":
+            raise ValueError("source.microbatch_split must be equal_padded")
         source = FastAFDProfileSource(
             repository=_text(origin["repository"], "source.repository"),
             commit=_digest(origin["commit"], _SHA1, "source.commit"),
@@ -232,6 +236,7 @@ class FastAFDMoEStageProfile:
             boundary=_text(origin["boundary"], "source.boundary"),
             boundary_components=tuple(origin["boundary_components"]),
             timed_span=origin["timed_span"],
+            microbatch_split=origin["microbatch_split"],
         )
         if not isinstance(root["entries"], list) or not root["entries"]:
             raise ValueError("FastAFD profile entries must be a non-empty list")

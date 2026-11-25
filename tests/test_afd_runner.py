@@ -20,6 +20,7 @@ from aisimulate.sweeper import (
     ReplayOutputRequirements,
     ReplaySpec,
 )
+from aisimulate.sweeper.afd_perfmodel import AICAFDPerformanceModel, attach_afd_measurements
 from aisimulate_core.sdk.errors import PerfDataNotAvailableError
 
 
@@ -118,13 +119,14 @@ def test_factory_advertises_afd_only_after_executable_runner_exists():
 
 @pytest.mark.parametrize("phase,sampled", [("prefill", False), ("decode", False), ("decode", True)])
 @pytest.mark.parametrize("measured_isl", [None, 8, 16])
-def test_afd_replay_checks_recorded_input_length(phase, sampled, measured_isl):
+@pytest.mark.parametrize("field", ["input_length", "isl"])
+def test_afd_replay_checks_recorded_input_length(phase, sampled, measured_isl, field):
     spec = _spec(_topology())
     measurements = spec.backend_deployment.performance_model_metadata["afd"]["measurements"]
     for measurement in measurements:
         if measurement["phase"] == phase:
             if measured_isl is not None:
-                measurement["provenance"]["isl"] = measured_isl
+                measurement["provenance"][field] = measured_isl
             if sampled:
                 measurement["decode_attention_samples"] = [[0.5, 1], [1.5, 1]]
     runner = EngineReplayRunnerFactory().create(0)
@@ -136,6 +138,37 @@ def test_afd_replay_checks_recorded_input_length(phase, sampled, measured_isl):
         report = runner.run(spec)
         assert report.metrics["completed_requests"] == 4.0
         assert report.metrics["mean_tpot_ms"] > 0
+
+
+def test_aic_measurement_rejects_replay_at_another_input_length(monkeypatch):
+    from aisimulate.sweeper.afd_engine import AFDForegroundEngine
+
+    topology = _topology()
+    spec = _spec(topology)
+    payload = {item["phase"]: item for item in _metadata("prefill", "decode")["afd"]["measurements"]}
+    provider = AICAFDPerformanceModel(lambda *args, **kwargs: SimpleNamespace(raw={"afd_layer_measurements": payload}))
+    deployment = attach_afd_measurements(
+        spec.backend_deployment,
+        sample={
+            "model_name": "example/model",
+            "hardware_sku": "example_sku",
+            "backend": "vllm",
+            "backend_version": "test",
+            "afd": topology.provenance()["topology"],
+        },
+        workload=spec.workload,
+        performance_model=provider,
+    )
+    saved = replace(spec, backend_deployment=deployment)
+    assert EngineReplayRunnerFactory().create(0).run(saved).metrics["completed_requests"] == 4.0
+
+    def unexpected_pass(*args, **kwargs):
+        pytest.fail("input-length validation must precede foreground scheduling")
+
+    monkeypatch.setattr(AFDForegroundEngine, "execute_pass", unexpected_pass)
+    mismatched = replace(saved, workload={**saved.workload, "isl": 16})
+    with pytest.raises(ValueError, match="recorded at isl=8, not replay isl=16"):
+        EngineReplayRunnerFactory().create(0).run(mismatched)
 
 
 def test_pure_both_phase_afd_runs_without_native_aggregate_fallback():

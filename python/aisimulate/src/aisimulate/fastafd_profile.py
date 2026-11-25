@@ -79,6 +79,7 @@ def build_profile(
             "boundary": payload["measurement_boundary"],
             "boundary_components": payload.get("measurement_boundary_components"),
             "timed_span": payload.get("measurement_timed_span"),
+            "microbatch_split": payload.get("measurement_microbatch_split"),
         }
         if source is None:
             source = current

@@ -124,6 +124,32 @@ def test_attach_measurements_replaces_unresolved_metadata():
     assert measured.performance_model_metadata["afd"]["measurements"][0]["phase"] == "decode"
 
 
+def test_aic_decode_trace_is_snapshotted_before_attaching_measurements():
+    trace = [{"repeat": 31, "components": {"attention_compute_ms": 1.0}}]
+    item = {
+        "attention_ms": 1.0,
+        "ffn_ms": 2.0,
+        "a_to_f_ms": 0.1,
+        "f_to_a_ms": 0.2,
+        "num_layers": 32,
+        "decode_samples": trace,
+    }
+    result = SimpleNamespace(raw={"afd_layer_measurements": {"decode": item}})
+    provider = AICAFDPerformanceModel(lambda *args, **kwargs: result)
+    deployment = attach_afd_measurements(
+        BackendDeploymentSpec(deployment_mode="afd", backend="vllm", backend_version="test-version"),
+        sample=_sample(_topology()),
+        workload={"isl": 128, "osl": 32},
+        performance_model=provider,
+    )
+    trace[0]["components"]["attention_compute_ms"] = 99.0
+    trace[0]["repeat"] = 1
+    trace.append({"repeat": 30, "components": {"attention_compute_ms": 99.0}})
+    (saved,) = deployment.performance_model_metadata["afd"]["measurements"]
+    assert saved["attention_ms"] == 1.0
+    assert saved["provenance"]["decode_samples"] == [{"repeat": 31, "components": {"attention_compute_ms": 1.0}}]
+
+
 def test_measurement_boundary_rejects_trace_without_concrete_lengths():
     with pytest.raises(AFDInfeasible, match="concrete positive workload isl and osl"):
         measurement_request_from_candidate(

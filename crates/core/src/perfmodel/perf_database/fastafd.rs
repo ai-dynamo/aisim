@@ -194,6 +194,7 @@ struct Source {
     boundary: String,
     boundary_components: Vec<String>,
     timed_span: String,
+    microbatch_split: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,6 +318,9 @@ impl Document {
             return Err(invalid(
                 "FastAFD timed_span must be all_moe_layers_and_microbatches",
             ));
+        }
+        if s.microbatch_split != "equal_padded" {
+            return Err(invalid("FastAFD microbatch_split must be equal_padded"));
         }
         if !text(&s.repository)
             || !digest(&s.commit, 40)
@@ -551,7 +555,7 @@ impl FastAfdTable {
             ffn_ms: e.latency_ms / (f64::from(e.key.moe_layers) * f64::from(e.key.microbatches)),
             num_layers: e.key.moe_layers,
             stage: json!({"profile_path":self.path,"profile_sha256":self.sha256,"key":e.key,"latency_ms":e.latency_ms,
-                "provider":"fastafd","schema":"aisimulate.fastafd-moe-stage.v1","repository":s.repository,"source_commit":s.commit,"benchmark":s.benchmark,"boundary":s.boundary,"boundary_components":s.boundary_components,"timed_span":s.timed_span,
+                "provider":"fastafd","schema":"aisimulate.fastafd-moe-stage.v1","repository":s.repository,"source_commit":s.commit,"benchmark":s.benchmark,"boundary":s.boundary,"boundary_components":s.boundary_components,"timed_span":s.timed_span,"microbatch_split":s.microbatch_split,
                 "model_profile":e.model_profile,"method":c.method,"method_version":c.method_version,"statistic":c.statistic,"sample_count":c.sample_count,
                 "cv_percent":c.cv_percent,"routing":c.routing,"source_tree_sha256":c.source_tree_sha256,"raw_artifact":c.raw_artifact,"raw_sha256":c.raw_sha256,"correctness":e.validation.correctness}),
         })
@@ -569,7 +573,7 @@ mod tests {
         // Each of the six pipeline units therefore costs exactly 2 ms.
         let document = json!({
             "schema":"aisimulate.fastafd-moe-stage.v1", "lookup_policy":"exact-only",
-            "source":{"repository":"https://example.invalid/fixture","commit":"0".repeat(40),"benchmark":"synthetic","boundary":"complete stage","boundary_components":["dispatch","experts","return","combine"],"timed_span":"all_moe_layers_and_microbatches"},
+            "source":{"repository":"https://example.invalid/fixture","commit":"0".repeat(40),"benchmark":"synthetic","boundary":"complete stage","boundary_components":["dispatch","experts","return","combine"],"timed_span":"all_moe_layers_and_microbatches","microbatch_split":"equal_padded"},
             "entries":[{"key":{"model_path":"synthetic","system":"gb200","stage":"afd","topology":"4A8F","logical_batch_per_source_rank":128,"mtp_nextn":0,"microbatches":2,"moe_layers":3,"routed_topk":8,"moe_precision":"fp8","moe_backend":"megamoe"},
                 "latency_ms":12.0,"model_profile":"synthetic",
                 "measurement":{"scope":"complete_moe_stage","method":"synthetic","method_version":"1","statistic":"p50","sample_count":40,"cv_percent":0.5,"routing":"balanced","source_tree_sha256":"a".repeat(64),"raw_artifact":"fixture.json","raw_sha256":"b".repeat(64)},
@@ -963,6 +967,42 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_stage_requires_the_attention_microbatch_split() {
+        let (file, mut config) = fixture();
+        // The capture asserts two padded units of 65 sequences for batch 129.
+        config.afd.as_mut().unwrap().logical_batch_per_source_rank = 129;
+        let mut document = fixture_document();
+        document["entries"][0]["key"]["logical_batch_per_source_rank"] = json!(129);
+        for split in [None, Some(json!("balanced_uneven")), Some(Value::Null)] {
+            let mut invalid_document = document.clone();
+            if let Some(split) = split {
+                invalid_document["source"]["microbatch_split"] = split;
+            } else {
+                invalid_document["source"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("microbatch_split");
+            }
+            std::fs::write(file.path(), parquet_snapshot(&invalid_document)).unwrap();
+            let error = ForwardPassPerfModel::best_available(config.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("microbatch_split") || error.contains("invalid type"),
+                "{error}"
+            );
+        }
+        std::fs::write(file.path(), parquet_snapshot(&document)).unwrap();
+        let estimate = ForwardPassPerfModel::best_available(config)
+            .unwrap()
+            .estimate_fastafd_stage(129)
+            .unwrap();
+        // The synthetic timer is still 12 ms across three layers and two units.
+        assert_eq!(estimate.ffn_ms, 2.0);
+        assert_eq!(estimate.stage["microbatch_split"], "equal_padded");
     }
 
     #[test]

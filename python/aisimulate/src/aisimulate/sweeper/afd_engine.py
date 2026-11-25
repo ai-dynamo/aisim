@@ -137,6 +137,13 @@ def evaluate_afd_phase(
     _positive_int("input_length", input_length)
     _positive_int("output_length", output_length)
     _positive_finite("latency_correction", latency_correction)
+    for field in ("input_length", "isl"):
+        measured_isl = times.provenance.get(field)
+        if measured_isl is not None and measured_isl != input_length:
+            raise AFDInfeasible(
+                AFDReasonCategory.INVALID_MEASUREMENT,
+                f"AFD measurement was recorded at isl={measured_isl}, not replay isl={input_length}",
+            )
     if topology.phase is not AFDPhase.BOTH and topology.phase is not times.phase:
         raise AFDInfeasible(
             AFDReasonCategory.INCOMPATIBLE_PHASE,

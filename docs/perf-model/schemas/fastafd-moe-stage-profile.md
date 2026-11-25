@@ -53,7 +53,8 @@ Their `entries` tuple is read-only so cached exact lookups retain their identity
     "benchmark": "fastafd.megamoe-colocated-model-benchmark.v2",
     "boundary": "<the benchmark's own description of what the measured interval covers>",
     "boundary_components": ["dispatch", "experts", "return", "combine"],
-    "timed_span": "all_moe_layers_and_microbatches"
+    "timed_span": "all_moe_layers_and_microbatches",
+    "microbatch_split": "equal_padded"
   },
   "entries": [
     {
@@ -102,9 +103,10 @@ visible as a tree that differs from the commit.
 | `boundary` | Nonempty description | Preserves the benchmark's own interval description as provenance. |
 | `boundary_components` | `["dispatch", "experts", "return", "combine"]` | Explicit ordered interval contract. Includes A-side combine and excludes the router, which attention charges separately. Missing or incompatible metadata is rejected before prediction. |
 | `timed_span` | `all_moe_layers_and_microbatches` | Each timed iteration covers every microbatch across every measured MoE layer of one decode step. Missing metadata or a partial span is rejected. Retained in stage provenance. |
+| `microbatch_split` | `equal_padded` | Every microbatch on a source rank contains `ceil(logical_batch_per_source_rank / microbatches)` sequences, including padding. Missing metadata or a different split is rejected by inspection and native loading. Retained in stage provenance. |
 
 The description alone cannot establish the interval contract. Existing import
-documents without `boundary_components` or `timed_span` must be annotated from
+documents without `boundary_components`, `timed_span`, or `microbatch_split` must be annotated from
 verified capture evidence before conversion; do not infer coverage from `scope`,
 workload counts, or benchmark names.
 
@@ -120,6 +122,14 @@ routing distribution the benchmark used; `cv_percent` is the dispersion of those
 iterations. `stable` is the benchmark's own stability gate and must be true;
 `correctness` is the matched-output check against a reference backend, `null` when
 the benchmark ran no reference.
+
+The split applies before expanding sequences by `mtp_nextn + 1` tokens.
+For batch 129 with two microbatches, both measured microbatches must contain
+65 sequences, matching the attention provider's pricing of 130 total rows.
+A 65/64 capture is incompatible and must not be labeled `equal_padded`.
+Batch 128 uses two microbatches of 64 without padding. The loader accepts
+only the declared equal padded split; it never infers a capture's split from
+divisibility or silently reprices an incompatible measurement.
 
 | Key field | Required value | Behavior |
 | --- | --- | --- |
@@ -175,6 +185,10 @@ values. This metadata is a required capture assertion, not proof of measurement
 accuracy. Synthetic fixtures establish validation and normalization only. A real
 capture with multiple microbatches and its recorded benchmark tree are needed to
 verify the timer's actual coverage.
+Raw results must also record `measurement_microbatch_split: "equal_padded"`;
+the builder preserves it as `source.microbatch_split` and rejects missing or
+incompatible values. Verify the capture's actual splitting and padding before
+adding this assertion to an older capture.
 For older captures, verify the measured interval from the recorded benchmark tree
 before annotating this metadata. The builder never assumes a complete boundary.
 The raw results, the benchmark revision, and the procedure stay with the profile so
