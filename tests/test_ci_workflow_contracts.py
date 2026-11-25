@@ -155,9 +155,12 @@ def test_forward_perf_isolates_cargo_config_and_preserves_download_caches(tmp_pa
         (source_home / cache / "cached-download").write_text(cache)
     runner_temp = tmp_path / "runner-temp"
     output = tmp_path / "github-env"
+    # Preserve rustup's toolchain location before HOME points at the checkout.
+    rustup_home = os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
     env = {
         **os.environ,
         "HOME": str(checkout),
+        "RUSTUP_HOME": rustup_home,
         "RUNNER_TEMP": str(runner_temp),
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "1",
