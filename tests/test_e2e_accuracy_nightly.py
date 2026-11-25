@@ -737,6 +737,10 @@ def test_nightly_accuracy_is_independent_from_release_staging_and_keeps_preview_
     assert shards["strategy"] == {"fail-fast": "false", "max-parallel": "4", "matrix": {"shard": ["0", "1", "2", "3"]}}
     assert "continue-on-error" not in shards
     predictor = next(step for step in shards["steps"] if step.get("name") == "Run both predictors for this shard")
+    prepare_op_data = next(step for step in shards["steps"] if step.get("id") == "op_latency")
+    assert shards["steps"].index(prepare_op_data) < shards["steps"].index(predictor)
+    assert prepare_op_data["env"]["AISIM_DATA_OFFLINE"] == "1"
+    assert predictor["env"]["AISIM_E2E_SYSTEMS_ROOT"] == "${{ steps.op_latency.outputs.systems_root }}"
     assert '--shard-index "${SHARD_INDEX}" --shard-count 4' in predictor["run"]
     assert "--workers 2" in predictor["run"]
     assert any(step.get("run", "").startswith("test -s ") for step in shards["steps"])

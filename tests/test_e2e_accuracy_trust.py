@@ -109,7 +109,7 @@ def test_token_steps_run_only_main_code_in_the_trusted_environment(name):
         seen += 1
         assert "uses" not in step, f"{name}:{job_id}: a secret must not reach an action ({step.get('name')})"
         lines = [ln.strip() for ln in step["run"].splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        launches = [ln for ln in lines if "python" in ln]
+        launches = [ln for ln in lines if re.search(r"\bpython(?!/)", ln)]
         assert launches, f"{name}:{job_id}: token step {step.get('name')!r} runs nothing"
         for line in launches:
             assert line.startswith(TRUSTED_PYTHON), f"{name}:{job_id}: {line}"
@@ -143,6 +143,47 @@ def test_every_job_that_seals_or_opens_artifacts_uses_the_same_key_secret():
     # Every producer has a consumer in another job (the environments differ between them).
     assert {"measurements", "shards", "agentx"} <= seen["seal"]
     assert {"shards", "campaign", "qualify-agentx"} <= seen["open"]
+
+
+@pytest.mark.parametrize(
+    "repo,revision",
+    [(None, None), ("ai-dynamo/aisim-data", "a" * 40), ("foreign/data", "a" * 40), ("ai-dynamo/aisim-data", "main")],
+)
+def test_op_latency_download_uses_the_evaluated_pin_as_data(tmp_path, repo, revision):
+    job_steps = load("e2e-accuracy-branch.yml")["jobs"]["measurements"]["steps"]
+    checkout = next(step["with"] for step in job_steps if step.get("with", {}).get("path") == "evaluated-pin")
+    assert checkout["ref"] == "${{ inputs.sha }}"
+    pin = tmp_path / "evaluated-pin" / checkout["sparse-checkout"]
+    if repo is not None:
+        pin.parent.mkdir(parents=True)
+        pin.write_text(json.dumps({"repo_id": repo, "revision": revision}))
+
+    trusted_python = tmp_path / "trusted-venv/bin/python"
+    trusted_python.parent.mkdir(parents=True)
+    trusted_python.write_text('#!/bin/sh\nprintf "%s\\n" "$AISIM_OP_LATENCY_DATASET" "$@"\n')
+    trusted_python.chmod(0o755)
+    run = next(step["run"] for step in job_steps if "op_latency_handoff.py pack" in step.get("run", ""))
+    result = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", run],
+        check=False,
+        cwd=tmp_path,
+        env=os.environ | {"RUNNER_TEMP": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    if repo is None:
+        assert result.returncode == 0 and "packages its operation tables" in result.stdout
+    elif repo == "ai-dynamo/aisim-data" and len(revision) == 40:
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == [
+            f"{repo}@{revision}",
+            "trusted/scripts/ci/op_latency_handoff.py",
+            "pack",
+            "--output",
+            str(tmp_path / "accuracy-measurements/op-latency-data.tar"),
+        ]
+    else:
+        assert result.returncode != 0 and "Expected a full revision" in result.stdout
 
 
 def test_credentialed_jobs_declare_the_environment_and_check_out_main():
