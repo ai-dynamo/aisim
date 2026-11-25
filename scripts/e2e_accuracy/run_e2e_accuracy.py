@@ -1035,6 +1035,8 @@ def main():
             os.dup2(logs.fileno(), 1)
             os.dup2(logs.fileno(), 2)
             with redirect_stdout(logs), redirect_stderr(logs):
+                if systems_root := os.environ.get("AISIM_E2E_SYSTEMS_ROOT"):
+                    importlib.import_module("aisim_core.sdk.perf_database").set_systems_paths([systems_root])
                 result = predict_point(point)
             sys.stdout.flush()
             os.dup2(saved, 1)

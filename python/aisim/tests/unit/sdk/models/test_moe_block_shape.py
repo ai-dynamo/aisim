@@ -4,13 +4,14 @@
 """Unit tests for MoEBlockShape and the derived MoE fields in ``_get_model_info``.
 
 The expectations are pinned against the shipped HF ``config.json`` fixtures in
-``aisim_core/model_configs`` (loaded by model path, same as the other
-model-config tests). DeepSeek-R1 is the parity oracle: 61 hidden layers with
+``aisim_core/model_configs`` (loaded as local checkpoints, including models
+outside DefaultHFModels). DeepSeek-R1 is the parity oracle: 61 hidden layers with
 ``first_k_dense_replace=3`` and ``n_shared_experts=1`` must derive to 58 MoE
 layers and 1 shared expert.
 """
 
 import dataclasses
+from importlib.resources import files
 
 import pytest
 
@@ -51,8 +52,10 @@ class TestGetModelInfoDerivedMoeFields:
             ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", 1, 23),
         ],
     )
-    def test_derived_fields_match_fixture_configs(self, hf_id, expected_shared, expected_moe_layers):
-        info = _get_model_info(hf_id)
+    def test_derived_fields_match_fixture_configs(self, tmp_path, hf_id, expected_shared, expected_moe_layers):
+        fixture = files("aisim_core") / "model_configs" / f"{hf_id.replace('/', '--')}_config.json"
+        (tmp_path / "config.json").write_bytes(fixture.read_bytes())
+        info = _get_model_info(str(tmp_path))
         assert info["num_shared_experts"] == expected_shared
         assert info["num_moe_layers"] == expected_moe_layers
 

@@ -737,6 +737,10 @@ def test_nightly_accuracy_is_independent_from_release_staging_and_keeps_preview_
     assert shards["strategy"] == {"fail-fast": "false", "max-parallel": "4", "matrix": {"shard": ["0", "1", "2", "3"]}}
     assert "continue-on-error" not in shards
     predictor = next(step for step in shards["steps"] if step.get("name") == "Run both predictors for this shard")
+    prepare_op_data = next(step for step in shards["steps"] if step.get("id") == "op_latency")
+    assert shards["steps"].index(prepare_op_data) < shards["steps"].index(predictor)
+    assert prepare_op_data["env"]["AISIM_DATA_OFFLINE"] == "1"
+    assert predictor["env"]["AISIM_E2E_SYSTEMS_ROOT"] == "${{ steps.op_latency.outputs.systems_root }}"
     assert '--shard-index "${SHARD_INDEX}" --shard-count 4' in predictor["run"]
     assert "--workers 2" in predictor["run"]
     assert any(step.get("run", "").startswith("test -s ") for step in shards["steps"])
@@ -1332,6 +1336,60 @@ def test_predictor_layout_rejects_multiple_baseline_apis(adapters):
     files += [name + "/sdk/config_adapter/__init__.py" for name in adapters]
     with pytest.raises(ValueError, match="ambiguous"):
         campaign.predictor_module_names(files)
+
+
+@pytest.mark.parametrize("systems_root", [None, "", "composed"])
+def test_point_mode_applies_systems_root_before_prediction(tmp_path, monkeypatch, systems_root):
+    pytest.importorskip("aisim_core.sdk.perf_database")
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    composed_root = tmp_path / "composed"
+    composed_root.mkdir()
+    if systems_root is None:
+        monkeypatch.delenv("AISIM_E2E_SYSTEMS_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("AISIM_E2E_SYSTEMS_ROOT", str(composed_root) if systems_root else "")
+
+    # Point mode redirects native stdout/stderr descriptors. Isolate that in a
+    # child process while exercising the installed database's real path setter.
+    program = """
+import os
+import sys
+from aisim_core.sdk import perf_database
+from scripts.e2e_accuracy import run_e2e_accuracy as campaign
+
+original_root = sys.argv[1]
+systems_root = os.environ.get("AISIM_E2E_SYSTEMS_ROOT")
+perf_database.set_systems_paths([original_root])
+set_paths = perf_database.set_systems_paths
+calls = []
+
+def record_paths(paths):
+    calls.append(paths)
+    set_paths(paths)
+
+def predict(point):
+    assert point == {"id": "test-point"}
+    assert calls == ([[systems_root]] if systems_root else [])
+    assert perf_database.get_systems_paths() == [systems_root or original_root]
+    print("private predictor diagnostics")
+    return {"id": point["id"], "outcome": "success"}
+
+perf_database.set_systems_paths = record_paths
+campaign.predict_point = predict
+sys.argv = ["run_e2e_accuracy.py", "point"]
+campaign.main()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(original_root)],
+        cwd=ROOT,
+        input=json.dumps({"id": "test-point"}),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == campaign.encoded({"id": "test-point", "outcome": "success"}).decode()
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize(
