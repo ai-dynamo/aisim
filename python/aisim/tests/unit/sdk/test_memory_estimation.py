@@ -1308,6 +1308,103 @@ def test_estimate_kv_cache_keeps_the_naive_fallback_for_a_valid_dense_gemma4_che
     assert out["source"] == "naive_fallback"
 
 
+def _fallback_without_database(monkeypatch):
+    """Make the perf DB unavailable so `estimate_kv_cache` routes to the naive path."""
+    from aisim_core.sdk import perf_database
+
+    def _missing_database(*args, **kwargs):
+        raise RuntimeError("perf DB not available")
+
+    monkeypatch.setattr(perf_database, "get_database", _missing_database)
+
+
+def test_estimate_kv_cache_naive_fallback_prices_an_omitted_moe_pair_like_the_explicit_layout(monkeypatch):
+    # The fallback shards expert weights by moe_tp_size * moe_ep_size. It used
+    # to substitute 1 for both omitted dims while the native build resolved
+    # tp_size=4, so the same request produced a different capacity depending on
+    # which path ran. Both now resolve the pair to pure tensor parallelism.
+    _fallback_without_database(monkeypatch)
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    omitted = memory.estimate_kv_cache("deepseek-ai/DeepSeek-V3", "h200_sxm", "vllm", **kwargs)
+    explicit = memory.estimate_kv_cache(
+        "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        moe_tp_size=4,
+        moe_ep_size=1,
+        **kwargs,
+    )
+    assert omitted["source"] == explicit["source"] == "naive_fallback"
+    assert omitted["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension(monkeypatch):
+    # tp_size=4 with moe_tp_size=2 and no moe_ep_size is the same layout as the
+    # explicit (2, 2) pair. The fallback must infer it from the attention width
+    # instead of defaulting the omitted value to 1.
+    _fallback_without_database(monkeypatch)
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    inferred = memory.estimate_kv_cache("deepseek-ai/DeepSeek-V3", "h200_sxm", "vllm", moe_tp_size=2, **kwargs)
+    explicit = memory.estimate_kv_cache(
+        "deepseek-ai/DeepSeek-V3",
+        "h200_sxm",
+        "vllm",
+        moe_tp_size=2,
+        moe_ep_size=2,
+        **kwargs,
+    )
+    assert inferred["source"] == explicit["source"] == "naive_fallback"
+    assert inferred["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_estimate_kv_cache_rejects_a_moe_width_mismatch_before_the_database(monkeypatch):
+    # A routed layout whose width contradicts the attention width must raise
+    # before the perf-DB lookup. Otherwise an unavailable database plus
+    # allow_naive_fallback=True would price a topology the engine rejects.
+    from aisim_core.sdk import perf_database
+
+    def _unreachable(*args, **kwargs):
+        pytest.fail("an invalid MoE layout must be rejected before the database lookup")
+
+    monkeypatch.setattr(perf_database, "get_database", _unreachable)
+    monkeypatch.setattr(
+        memory.NaiveKVCacheEstimator,
+        "from_model_path",
+        classmethod(lambda *args, **kwargs: pytest.fail("naive fallback must not price an unsupported config")),
+    )
+    with pytest.raises(InvalidEngineConfigurationError, match="Parallelism width mismatch"):
+        memory.estimate_kv_cache(
+            "deepseek-ai/DeepSeek-V3",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            tp_size=4,
+            moe_tp_size=1,
+            moe_ep_size=1,
+            gpu_memory_capacity_bytes_override=800 * _GIB,
+            allow_naive_fallback=True,
+        )
+
+
 def test_estimate_kv_cache_rejects_dense_gemma4_moe_ep_before_the_database(monkeypatch):
     # Gemma4MixModel rejects an explicit moe_ep_size>1 for a dense checkpoint,
     # but that build runs after the perf-DB lookup. Without a pre-database

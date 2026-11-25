@@ -54,6 +54,7 @@ from aisim_core.sdk.errors import InvalidEngineConfigurationError
 from aisim_core.sdk.fpm_profile import FpmModelProfile, _load_fpm_timing_profile
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.helpers import (
+    check_is_moe,
     resolve_sglang_mla_compute,
     resolve_trtllm_mla_compute,
     validate_dense_gemma4_moe_ep,
@@ -250,6 +251,58 @@ def _apply_tolerance(estimate: dict[str, Any], tolerance_fraction: float | None)
     return estimate
 
 
+def _resolve_moe_dimensions(
+    *,
+    tp_size: int,
+    attention_dp_size: int,
+    cp_size: int,
+    moe_tp_size: int | None,
+    moe_ep_size: int | None,
+) -> tuple[int, int]:
+    """Resolve the MoE tensor/expert widths a request implies.
+
+    Mirrors :meth:`ModelConfig.resolve_moe_parallelism` so the native build and
+    the naive fallback price the same layout:
+
+    - both omitted: pure tensor parallelism at the attention width
+      (``tp_size * attention_dp_size * cp_size``, ``1``), because an omitted
+      pair carries no layout to infer;
+    - one omitted: inferred from that width, as every other SDK path does;
+    - both given: returned unchanged for ``ModelConfig`` to validate.
+
+    :class:`NaiveKVCacheEstimator` shards expert weights by
+    ``moe_tp_size * moe_ep_size`` and never sees ``ModelConfig``, so resolving
+    once here is what keeps the two paths from returning different capacities
+    for the same request.
+    """
+    attn_width = int(tp_size) * int(attention_dp_size) * int(cp_size)
+
+    def _positive(name: str, value: int) -> int:
+        if value <= 0:
+            raise InvalidEngineConfigurationError(f"{name} must be positive, got {value}.")
+        return int(value)
+
+    if moe_tp_size is None:
+        if moe_ep_size is None:
+            return attn_width, 1
+        moe_ep = _positive("moe_ep_size", int(moe_ep_size))
+        if attn_width % moe_ep != 0:
+            raise InvalidEngineConfigurationError(
+                f"Cannot infer moe_tp_size: tp_size({tp_size}) * attention_dp_size({attention_dp_size}) * "
+                f"cp_size({cp_size}) = {attn_width} is not divisible by moe_ep_size({moe_ep})."
+            )
+        return attn_width // moe_ep, moe_ep
+    if moe_ep_size is None:
+        moe_tp = _positive("moe_tp_size", int(moe_tp_size))
+        if attn_width % moe_tp != 0:
+            raise InvalidEngineConfigurationError(
+                f"Cannot infer moe_ep_size: tp_size({tp_size}) * attention_dp_size({attention_dp_size}) * "
+                f"cp_size({cp_size}) = {attn_width} is not divisible by moe_tp_size({moe_tp})."
+            )
+        return moe_tp, attn_width // moe_tp
+    return _positive("moe_tp_size", int(moe_tp_size)), _positive("moe_ep_size", int(moe_ep_size))
+
+
 # --------------------------------------------------------------------------- #
 # Native path: AIC's full backend memory model.
 #
@@ -341,24 +394,14 @@ class KVCacheEstimator:
 
         Raises when AIC cannot build the model/backend or the system spec is missing --
         the signal for the caller to fall back to the naive estimator.
+
+        Omitted MoE widths are resolved here rather than by ``ModelConfig`` alone so
+        the naive fallback in :func:`estimate_kv_cache` can share the rule: an
+        omitted ``moe_tp_size``/``moe_ep_size`` pair means pure tensor parallelism at
+        the attention width (``tp_size * attention_dp_size * cp_size``, ``1``), and a
+        single omitted dimension is inferred from that width. Dense checkpoints never
+        read these dimensions.
         """
-        if moe_tp_size is None and moe_ep_size is None:
-            # No MoE layout was requested: use pure tensor parallelism at the
-            # attention width, which is what an omitted pair means for the
-            # engine's other entry points. Filling the pair with 1 is not a
-            # layout a MoE model can serve -- the width invariant is
-            # tp*dp*cp == moe_tp*moe_ep -- and the re-raise above makes that
-            # mismatch terminal instead of fallback-eligible. A dense model
-            # never reads these dims.
-            resolved_moe_tp = tp_size * attention_dp_size * cp_size
-            resolved_moe_ep = 1
-        else:
-            # Leave a single omitted dimension unset so ModelConfig infers it
-            # from the attention width, as every other SDK path does. Filling
-            # it with 1 here would turn a valid, inferable request into a
-            # width mismatch that the native path rejects.
-            resolved_moe_tp = moe_tp_size
-            resolved_moe_ep = moe_ep_size
         validate_moe_controls(
             model_path=model_path,
             enable_eplb=enable_eplb,
@@ -380,6 +423,16 @@ class KVCacheEstimator:
             raise
         except Exception:
             pass
+        # Resolve the MoE widths after the dense diagnostic above: a dense
+        # checkpoint with explicit expert parallelism must hear that rule, not a
+        # width-inference error about dims it never reads.
+        resolved_moe_tp, resolved_moe_ep = _resolve_moe_dimensions(
+            tp_size=tp_size,
+            attention_dp_size=attention_dp_size,
+            cp_size=cp_size,
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=moe_ep_size,
+        )
         # A hosted tower is sharded unless dp is asked for, as SGLang lays it out.
         encoder_layout = (
             {"enable_encoder_dp": encoder_parallel == "dp"} if encoder_parallel is not None or colocated_encoder else {}
@@ -404,6 +457,23 @@ class KVCacheEstimator:
             dcp_size=dcp_size,
             **encoder_layout,
         )
+        # Enforce the MoE width invariant the model build applies, but before the
+        # perf-DB lookup. A routed layout the engine would reject must not reach
+        # the caller's naive fallback just because the database is unavailable:
+        # the fallback would price a topology the native path refuses. Dense
+        # checkpoints never read these dimensions, and unavailable metadata is
+        # left for the build below to report with its own error, as before.
+        try:
+            is_moe = check_is_moe(model_path)
+        except InvalidEngineConfigurationError:
+            raise
+        except Exception:
+            is_moe = False
+        if is_moe:
+            try:
+                model_config.resolve_moe_parallelism()
+            except (ValueError, TypeError, KeyError) as exc:
+                raise InvalidEngineConfigurationError(str(exc)) from exc
         # Apply nextn/MTP onto the config BEFORE get_model so the built model is
         # spec-decode aware (e.g. for any draft-module weights). This does NOT scale
         # the capacity activation by (nextn+1); that multiplier is suppressed below
@@ -1181,6 +1251,13 @@ def estimate_kv_cache(
     checkpoint metadata, and invalid caller controls, must not be re-estimated by
     a fallback that parses the same metadata.
 
+    Omitted MoE widths resolve the same way on both paths: one omitted dimension
+    is inferred from the attention width (``tp_size * attention_dp_size *
+    cp_size``), and an omitted ``moe_tp_size``/``moe_ep_size`` pair means pure
+    tensor parallelism at that width. The naive fallback shares that rule with
+    :meth:`KVCacheEstimator.from_request`; without it, it would shard expert
+    weights by ``1 * 1`` while the native build resolved a different pair.
+
     Args:
         memory_fraction_kind: ``"of_total"`` (vLLM / SGLang) or ``"of_free"``
             (TRT-LLM); validated against ``backend`` BEFORE any model build.
@@ -1445,13 +1522,24 @@ def estimate_kv_cache(
                 f"unsupported model/backend/GPU for KV-cache estimation: "
                 f"model={model_path}, backend={backend}, gpu_sku={system}: {exc}"
             ) from exc
+        # Price the layout the native build would have resolved. The fallback
+        # shards expert weights by moe_tp_size * moe_ep_size and never sees
+        # ModelConfig, so leaving the raw values here would shard an omitted
+        # width by 1 and disagree with a native build of the same request.
+        fallback_moe_tp, fallback_moe_ep = _resolve_moe_dimensions(
+            tp_size=int(tp_size),
+            attention_dp_size=int(attention_dp_size),
+            cp_size=int(cp_size),
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=moe_ep_size,
+        )
         estimate = NaiveKVCacheEstimator.from_model_path(
             model_path,
             tp_size=int(tp_size),
             pp_size=int(pp_size),
             allow_hf_config_download=allow_hf_config_download,
-            moe_ep_size=int(moe_ep_size or 1),
-            moe_tp_size=int(moe_tp_size or 1),
+            moe_ep_size=fallback_moe_ep,
+            moe_tp_size=fallback_moe_tp,
         ).estimate(
             capacity=gpu_memory_capacity_bytes_override,
             naive_kv_reservation=float(naive_kv_reservation),
