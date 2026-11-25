@@ -121,6 +121,9 @@ When a provider also supplies typed `decode_attention_samples`, each value and
 repeat count must match the provenance trace before boundary recomposition.
 The serialized measurement's `decode_attention_samples` contains the resulting
 `[attention_ms, repeat]` pairs; its headline A time is their weighted mean.
+Loading a saved FastAFD measurement with `provenance.attention.decode_samples`
+requires matching typed pairs for every recomposed sample and repeat count;
+missing or inconsistent pairs are rejected before replay.
 The trace's repeat total must equal `max(output_length - 1, 1)` at evaluation,
 including serial replay. A saved trace cannot price a different decode length.
 The saved FastAFD stage key must also match the replay's pool sizes, per-A-rank

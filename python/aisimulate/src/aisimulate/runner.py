@@ -658,6 +658,45 @@ def _afd_topology(deployment) -> AFDTopology:
     return topology
 
 
+def _validate_saved_fastafd_decode_trace(measurement: AFDLayerTimes, index: int) -> None:
+    attention = measurement.provenance.get("attention")
+    if (
+        measurement.provenance.get("provider") != "fastafd"
+        or not isinstance(attention, Mapping)
+        or "decode_samples" not in attention
+    ):
+        # Custom providers with neither trace describe constant attention.
+        return
+    raw_samples = attention["decode_samples"]
+    typed_samples = measurement.decode_attention_samples
+    error = (
+        f"AFD measurement {index} decode_attention_samples must match "
+        "provenance.attention.decode_samples after FastAFD boundary recomposition"
+    )
+    if not isinstance(raw_samples, (list, tuple)) or not raw_samples or len(raw_samples) != len(typed_samples):
+        raise ValueError(error)
+    # Check once at reconstruction, before the engine can replace the sampled
+    # cadence with constant attention or consume a conflicting same-mean trace.
+    for raw, (ms, repeat) in zip(raw_samples, typed_samples, strict=True):
+        components = raw.get("components") if isinstance(raw, Mapping) else None
+        if not isinstance(components, Mapping):
+            raise ValueError(error)
+        compute = components.get("attention_compute_ms")
+        router = components.get("a_router_ms")
+        if (
+            any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+                for value in (compute, router)
+            )
+            or router <= 0
+            or isinstance(raw.get("repeat"), bool)
+            or not isinstance(raw.get("repeat"), int)
+            or raw["repeat"] != repeat
+            or not math.isclose(compute + router, ms, rel_tol=1e-9, abs_tol=1e-12)
+        ):
+            raise ValueError(error)
+
+
 def _afd_layer_measurements(deployment) -> tuple[AFDLayerTimes, ...]:
     metadata = deployment.performance_model_metadata.get("afd")
     if not isinstance(metadata, Mapping):
@@ -672,20 +711,20 @@ def _afd_layer_measurements(deployment) -> tuple[AFDLayerTimes, ...]:
         if not isinstance(raw, Mapping):
             raise TypeError(f"AFD measurement {index} must be a mapping")
         try:
-            measurements.append(
-                AFDLayerTimes(
-                    phase=raw["phase"],
-                    attention_ms=raw["attention_ms"],
-                    ffn_ms=raw["ffn_ms"],
-                    a_to_f_ms=raw["a_to_f_ms"],
-                    f_to_a_ms=raw["f_to_a_ms"],
-                    num_layers=raw["num_layers"],
-                    provenance=raw.get("provenance", {}),
-                    decode_attention_samples=raw.get("decode_attention_samples", ()),
-                )
+            measurement = AFDLayerTimes(
+                phase=raw["phase"],
+                attention_ms=raw["attention_ms"],
+                ffn_ms=raw["ffn_ms"],
+                a_to_f_ms=raw["a_to_f_ms"],
+                f_to_a_ms=raw["f_to_a_ms"],
+                num_layers=raw["num_layers"],
+                provenance=raw.get("provenance", {}),
+                decode_attention_samples=raw.get("decode_attention_samples", ()),
             )
         except KeyError as exc:
             raise ValueError(f"AFD measurement {index} is missing {exc.args[0]!r}") from exc
+        _validate_saved_fastafd_decode_trace(measurement, index)
+        measurements.append(measurement)
     return tuple(measurements)
 
 

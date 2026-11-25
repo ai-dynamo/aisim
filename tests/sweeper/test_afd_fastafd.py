@@ -1311,6 +1311,85 @@ def test_fastafd_crossing_trace_survives_replay_serialization(tmp_path, pipeline
     assert report.metrics["completed_requests"] == 1
 
 
+def _saved_fastafd_decode_spec(tmp_path, *, pipeline_model="optimistic", with_trace=True):
+    (attention,) = _Attention().measure(_request(_topology()))
+    if with_trace:
+        components = {**COMPONENTS, "attention_compute_ms": 0.098}
+        attention = replace(
+            attention,
+            attention_ms=0.104,
+            provenance={
+                "components": components,
+                "decode_samples": [
+                    {"repeat": 32, "components": {**components, "attention_compute_ms": ms}} for ms in (0.048, 0.148)
+                ],
+            },
+        )
+    profile = _profile(tmp_path, [{**_entry(), "latency_ms": 18.8}])
+    raw = _prediction(profile)
+    raw["engine"]["afd"]["pipeline_model"] = pipeline_model
+    raw["traffic"]["source"]["output_tokens"] = 65
+    raw["traffic"]["load"]["concurrency"] = 1
+    raw["traffic"]["stop"]["requests"] = 1
+    spec = prediction_to_replay_spec(
+        CorePredictionConfig.model_validate(raw),
+        afd_performance_model=SimpleNamespace(measure=lambda _: (attention,)),
+    )
+    deployment = spec.backend_deployment
+    saved = json.loads(json.dumps(deployment.performance_model_metadata))
+    Path(profile).unlink()
+    return replace(spec, backend_deployment=replace(deployment, performance_model_metadata=saved))
+
+
+@pytest.mark.parametrize("corruption", ["missing", "empty", "same_mean", "reordered", "split_repeat", "boundary"])
+def test_saved_fastafd_rejects_missing_or_inconsistent_typed_trace(tmp_path, corruption):
+    spec = _saved_fastafd_decode_spec(tmp_path)
+    (saved,) = spec.backend_deployment.performance_model_metadata["afd"]["measurements"]
+    if corruption == "missing":
+        del saved["decode_attention_samples"]
+    elif corruption == "empty":
+        saved["decode_attention_samples"] = []
+    elif corruption == "same_mean":
+        # The same mean can give a different max(A, F) cadence.
+        saved["decode_attention_samples"] = [[0.1, 32], [0.1, 32]]
+    elif corruption == "reordered":
+        saved["decode_attention_samples"].reverse()
+    elif corruption == "split_repeat":
+        saved["decode_attention_samples"] = [[0.05, 16], [0.05, 16], [0.15, 32]]
+    else:
+        saved["provenance"]["attention"]["decode_samples"][0]["components"] = None
+
+    with pytest.raises(ValueError, match="decode_attention_samples.*provenance.attention.decode_samples"):
+        _afd_layer_measurements(spec.backend_deployment)
+    with pytest.raises(ValueError, match="decode_attention_samples.*provenance.attention.decode_samples"):
+        EngineReplayRunnerFactory().create(0).run(spec)
+
+
+@pytest.mark.parametrize(
+    "pipeline_model,with_trace,expected",
+    [
+        ("optimistic", True, 23.575),
+        ("conservative", True, 23.575),
+        ("serial", True, 37.6),
+        ("optimistic", False, 18.892),
+        ("conservative", False, 18.892),
+        ("serial", False, 36.096),
+    ],
+)
+def test_saved_fastafd_replays_traced_and_constant_custom_attention(tmp_path, pipeline_model, with_trace, expected):
+    spec = _saved_fastafd_decode_spec(tmp_path, pipeline_model=pipeline_model, with_trace=with_trace)
+    (saved,) = spec.backend_deployment.performance_model_metadata["afd"]["measurements"]
+    if not with_trace:
+        assert "decode_attention_samples" not in saved
+        assert "decode_samples" not in saved["provenance"]["attention"]
+    # F = 18.8 / (94 * 2) = 0.1 ms. Constant custom A = 0.09 + 0.002:
+    # overlap = 0.192 + 187 * 0.1; serial = 188 * 0.192.
+    # Traced A = 0.05 and 0.15, so overlap averages 18.85 and 28.30 ms.
+    report = EngineReplayRunnerFactory().create(0).run(spec)
+    assert report.metrics["mean_tpot_ms"] == pytest.approx(expected)
+    assert report.metrics["completed_requests"] == 1
+
+
 @pytest.mark.parametrize("pipeline_model", ["optimistic", "conservative", "serial"])
 @pytest.mark.parametrize("output_length", [1, 2, 34, 67])
 def test_saved_fastafd_trace_rejects_different_replay_workload(tmp_path, pipeline_model, output_length):
