@@ -78,12 +78,15 @@ one request's uncached suffix instead of dropping its excess tokens. Aggregate
 callers first translate their capacity to a scheduled shape, leaving excess
 space unused. Complete prompts retain their packed prefix coordinates.
 
-Single-request op-level aggregates with visual tokens reject chunked prefill
+Op-level aggregates with visual tokens reject chunked prefill at every batch size
 when either phase contains qualified Mamba. The visual mean-field schedule
 amortizes whole-prefill attention; multiplying its scan price by that weight
 would overcount fresh tokens and recurrent-state transfers. Use a budget that
-fits the uncached suffix or a text-only workload. Whole-model FPM visual
-overlays follow the uncached chunk schedule and sum to one whole overlay.
+fits the uncached suffix after any backend decode reservation, or a text-only
+workload.
+Budget sweeps skip unsupported chunked candidates and continue to larger budgets.
+Whole-model FPM visual overlays follow the uncached chunk schedule and sum to one
+whole overlay.
 
 Single-request op-level aggregates with visual tokens retain mean-field pricing
 when the uncached prompt exceeds the prefill budget. Native context attention

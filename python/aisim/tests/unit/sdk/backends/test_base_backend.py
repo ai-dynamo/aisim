@@ -1769,8 +1769,9 @@ def test_batched_fpm_visual_overlay_preserves_fractional_requests(
 @pytest.mark.parametrize("native_op", [False, True])
 @pytest.mark.parametrize("phase", ["context", "generation"])
 @pytest.mark.parametrize("prefix", [0, 3000])
+@pytest.mark.parametrize("batch_size", [1, 4])
 def test_run_agg_rejects_chunked_visual_qualified_mamba(
-    backend, model, database, monkeypatch, native_op, phase, prefix
+    backend, model, database, monkeypatch, native_op, phase, prefix, batch_size
 ):
     from aisim_core import _native
     from aisim_core.sdk.operations import Mamba2Kernel
@@ -1800,7 +1801,7 @@ def test_run_agg_rejects_chunked_visual_qualified_mamba(
             model,
             database,
             RuntimeConfig(
-                batch_size=1, isl=3072, prefix=prefix, osl=1, num_images_per_request=1, num_image_tokens=1024
+                batch_size=batch_size, isl=3072, prefix=prefix, osl=1, num_images_per_request=1, num_image_tokens=1024
             ),
             ctx_tokens=512,
         )
@@ -1965,6 +1966,78 @@ def test_visual_qualified_sweep_reaches_a_budget_that_fits_the_suffix(monkeypatc
     )
     assert calls[0] == first_supported_budget
     assert all(budget >= 4096 - prefix for budget in calls)
+    assert not summary.get_summary_df().empty
+    assert not summary.check_oom()
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_batched_visual_mamba_sweep_continues_after_xpu_decode_reservation(monkeypatch, phase):
+    from aisim_core.sdk.backends.vllm_backend import VLLMBackend
+    from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = VLLMXPUBackend()
+    model = _qualified_scan_model("vllm")
+    if phase == "generation":
+        # The unsupported visual chunk contract also covers decode-only
+        # qualification; the prefill phase then keeps its legacy coordinates.
+        from aisim_core.sdk.operations import Mamba2Kernel
+
+        model.context_ops = []
+        model.generation_ops = [
+            Mamba2Kernel(
+                "generation_scan",
+                1,
+                "selective_state_update",
+                "generation",
+                4096,
+                64,
+                64,
+                128,
+                4,
+                4,
+                128,
+                state_dtype="float16",
+            )
+        ]
+    model.encoder_config = _vision_encoder_config()
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    monkeypatch.setattr(backend, "_mix_step_gen_tokens", lambda *a: 2)
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
+    # The 1096-token total budget fits the suffix before decode reservation.
+    # Two admitted decoders leave only 1094 tokens; 1536 is a fitting control.
+    monkeypatch.setattr(backend, "_get_ctx_tokens_list_for_agg_sweep", lambda *a: [1096, 1536, 4096])
+    runtime = RuntimeConfig(
+        batch_size=4,
+        isl=3072,
+        prefix=3000,
+        osl=64,
+        ttft=float("inf"),
+        tpot=float("inf"),
+        num_images_per_request=1,
+        num_image_tokens=1024,
+    )
+    calls, priced = [], []
+    run_agg, run_mixed = backend.run_agg, VLLMBackend.run_mixed
+
+    def record_candidate(**kwargs):
+        calls.append((kwargs["runtime_config"].batch_size, kwargs["ctx_tokens"]))
+        return run_agg(**kwargs)
+
+    def record_native(self, model, database, runtime, step):
+        priced.append((step.context_tokens, step.num_decode_requests))
+        assert step.context_tokens >= 1096
+        return run_mixed(self, model, database, runtime, step)
+
+    monkeypatch.setattr(backend, "run_agg", record_candidate)
+    monkeypatch.setattr(VLLMBackend, "run_mixed", record_native)
+    summary = backend.find_best_agg_result_under_constraints(
+        model, database, runtime, max_batch_size=4, enable_chunked_prefill=True, top_k=0
+    )
+    assert (4, 1096) in calls and (4, 1536) in calls
+    assert calls.index((4, 1536)) > calls.index((4, 1096))
+    assert any(decoders == 2 for _, decoders in priced)
     assert not summary.get_summary_df().empty
     assert not summary.check_oom()
 
@@ -2225,6 +2298,43 @@ def test_completed_qualified_prefill_retains_whole_request_attention(monkeypatch
     assert group.per_op_latency_ms["context_attention (scaled)"] == pytest.approx(expected)
     full = backend.run_agg(model, database, runtime, ctx_tokens=4096)
     assert summary.get_result_dict()["ttft"] == pytest.approx(full.get_result_dict()["ttft"])
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+@pytest.mark.parametrize("budget", [512, 2048, 4096])
+def test_cached_batched_attention_counts_qualified_chunks_and_preserves_legacy(monkeypatch, qualified, budget):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = _qualified_scan_model("vllm")
+    attention = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    if not qualified:
+        model.context_ops = []
+    model.context_ops += [op for op in attention.context_ops if op._name == "context_attention"]
+    backend = get_backend("vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(batch_size=4, isl=4096, prefix=3000, osl=64)
+    name = "context_attention (scaled)"
+    if qualified and budget < 1096:
+        # Independent native queries for the 512, 512, 72 suffix walk. Each
+        # full chunk coordinate prices that extend's attention without a divisor.
+        expected = 0.0
+        for past, end in [(3000, 3512), (3512, 4024), (4024, 4096)]:
+            chunk = RuntimeConfig(batch_size=1, isl=end, prefix=past, osl=64)
+            expected += 4 * backend.run_mixed(model, database, chunk, MixedStepInput(end, 3)).per_op_latency_ms[name]
+        steps = 12
+    else:
+        full = backend.run_mixed(model, database, runtime, MixedStepInput(4096, 3))
+        # Qualified one-step suffixes pay four full attention queries. Legacy
+        # mean-field attention still cancels ceil(isl/budget) against its full-
+        # prompt iteration count: (4*isl/budget)/(isl/budget) = four requests.
+        expected = 4 * full.per_op_latency_ms[name]
+        steps = 4 if qualified else 4 * 4096 / budget
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    assert summary.get_step_estimates()["scheduling"]["num_mix_steps"] == steps
+    assert summary.get_aggregate_energy_breakdown()["mix_step"].per_op_latency_ms[name] == pytest.approx(expected)
 
 
 def test_fixed_decode_coverage_uses_native_subtotals_before_name_fold(monkeypatch):

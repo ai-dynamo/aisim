@@ -46,6 +46,10 @@ logger = logging.getLogger(__name__)
 QWEN_SMART_RESIZE_MAX_RATIO = 200
 
 
+class _UnsupportedVisualMambaPrefill(ValueError):
+    """An aggregate candidate needs visual chunk geometry we cannot price."""
+
+
 def _has_draft_scheme(model: BaseModel) -> bool:
     """Whether ``model`` carries a draft speculation scheme (not MTP or Null)."""
     from aisim_core.sdk.speculation import NullScheme, SpecSchemeBase
@@ -2043,6 +2047,18 @@ class BaseBackend:
 
     def _schedule_qualified_mamba_prefill(self, model, runtime_config, step: MixedStepInput) -> MixedStepInput:
         """Drop unused aggregate capacity before querying a scheduled Mamba step."""
+        if not _is_fpm_model(model) and isinstance(getattr(model, "encoder_config", None), common.VisionEncoderConfig):
+            visual_tokens = self._visual_context_tokens(model, runtime_config)
+            if (
+                visual_tokens > 0
+                and 0 < step.context_tokens < runtime_config.isl + visual_tokens - runtime_config.prefix
+                and _has_qualified_mamba(model)
+            ):
+                # XPU admission may reserve decode tokens after run_agg's initial
+                # budget check. Validate the resolved prefill shape as well.
+                raise _UnsupportedVisualMambaPrefill(
+                    "qualified Mamba with chunked visual prefill is unsupported in run_agg"
+                )
         if not _is_fpm_model(model) and _has_qualified_mamba(model, phases=("context_ops",)):
             isl = runtime_config.isl + self._visual_context_tokens(model, runtime_config)
             if isl > runtime_config.prefix:
@@ -2135,8 +2151,7 @@ class BaseBackend:
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
         if (
-            b == 1
-            and img_ctx_tokens > 0
+            img_ctx_tokens > 0
             and not _is_fpm_model(model)
             and 0 < ctx_tokens < isl - prefix
             and _has_qualified_mamba(model)
@@ -2144,7 +2159,9 @@ class BaseBackend:
             # The visual mean-field weight restores amortized attention, but
             # cannot multiply a qualified scan's per-chunk state transfer.
             # Exact visual chunk geometry is not represented by this path.
-            raise ValueError("qualified Mamba with chunked visual prefill is unsupported in run_agg")
+            raise _UnsupportedVisualMambaPrefill(
+                "qualified Mamba with chunked visual prefill is unsupported in run_agg"
+            )
         # None (or an omitted kwarg) means the caller did not model speculative
         # progress here; the summary then stays eligible for the upper-layer
         # post-hoc projection (SpeculativeDecodingProfile.project_summary).
@@ -2746,7 +2763,7 @@ class BaseBackend:
         # inner loop when the system is oom.
         b_list = [b for b in b_list_default if b <= max_batch_size]
         ctx_tokens_list = self._get_ctx_tokens_list_for_agg_sweep(isl_eff, ctx_stride, enable_chunked_prefill)
-        # run_agg rejects qualified single-slot visual chunks. Skip those
+        # run_agg rejects qualified visual chunks. Skip those
         # budgets before pricing so a later budget can fit the fresh suffix.
         min_visual_ctx_tokens = (
             isl_eff - runtime_config.prefix
@@ -2761,7 +2778,7 @@ class BaseBackend:
         all_oom = True
         for b in b_list:
             for ctx_tokens in ctx_tokens_list:
-                if b == 1 and 0 < ctx_tokens < min_visual_ctx_tokens:
+                if 0 < ctx_tokens < min_visual_ctx_tokens:
                     continue
                 if b - np.ceil(ctx_tokens / isl_eff) < 0:  # allow b==1
                     break
@@ -2773,20 +2790,28 @@ class BaseBackend:
 
                 # filter out repeated records for balance score correction
                 balance_score = isl_eff * b / ctx_tokens / osl
+                pending_capped_b = None
                 if balance_score > 1:
                     gen_tokens = b // balance_score
                     if gen_tokens > 1 and gen_tokens in capped_b:
                         continue
                     else:
-                        capped_b.append(gen_tokens)
+                        pending_capped_b = gen_tokens
 
-                summary = self.run_agg(
-                    model=model,
-                    database=database,
-                    runtime_config=self._runtime_config_for_agg_candidate(runtime_config, b),
-                    ctx_tokens=ctx_tokens,
-                    **sweep_extra,
-                )
+                try:
+                    summary = self.run_agg(
+                        model=model,
+                        database=database,
+                        runtime_config=self._runtime_config_for_agg_candidate(runtime_config, b),
+                        ctx_tokens=ctx_tokens,
+                        **sweep_extra,
+                    )
+                except _UnsupportedVisualMambaPrefill:
+                    # Backend decode reservations can turn an otherwise fitting
+                    # budget into a chunk. A later budget may still fit.
+                    continue
+                if pending_capped_b is not None:
+                    capped_b.append(pending_capped_b)
 
                 if summary.check_oom() or summary.check_kv_cache_oom():
                     break  # larger ctx tokens will cause oom

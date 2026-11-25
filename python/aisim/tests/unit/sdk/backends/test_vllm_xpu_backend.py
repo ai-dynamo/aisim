@@ -712,7 +712,14 @@ def test_batched_ttft_prices_native_uncached_chunks(
     monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
     monkeypatch.setattr(backend, "_effective_decode_bs", lambda *_: 4 if regime == "burst" else 2)
     monkeypatch.setattr(backend, "_get_genonly_step_latency", lambda *_: (1.0, 0.0, {}, {}, ()))
-    monkeypatch.setattr(backend, "_decode_tpot_ms", lambda *a, **k: 1.5)
+    decode_tpot_inputs = []
+    real_decode_tpot = backend._decode_tpot_ms
+
+    def decode_tpot(*args, **kwargs):
+        decode_tpot_inputs.append((args, kwargs))
+        return real_decode_tpot(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_decode_tpot_ms", decode_tpot)
     calls = []
     estimates = []
     native_run_mixed = VLLMBackend.run_mixed
@@ -746,7 +753,23 @@ def test_batched_ttft_prices_native_uncached_chunks(
         factor = 1 + BURST_A * math.log2(4) ** BURST_BS_EXP * (budget / 4096) ** BURST_CTX_EXP
         expected = own_ms * min(factor, 4)
     else:
-        expected = own_ms + (4 - 2) / 2 * (own_ms + 64 * 1.5)
+        # Admission wait retains the initial scheduled probe's latency, not
+        # one request's summed chunk latency or the short final chunk. This
+        # preserves the existing mean-field TPOT policy independently of the
+        # exact own-prefill walk above.
+        steps = _ttft_kwargs()["steps_to_finish_ctx"]
+        assert decode_tpot_inputs == [
+            (
+                (estimates[0].latency_ms, _ttft_kwargs()["genonly_step_latency_ms"], 2, 4096, 64, budget, steps),
+                {"all_mix": False},
+            )
+        ]
+        # For these three mixed iterations, one prefill slot leaves half the
+        # effective batch decoding. Budget 4098 adds a 2/4096 fractional
+        # prefiller; the remaining decode iterations cost the fixture's 1 ms.
+        mixed_decode_steps = 1.5 if budget <= 4096 else 1.5 - 3 / 4096
+        decode_time = estimates[0].latency_ms * mixed_decode_steps + 1.0 * (64 - mixed_decode_steps)
+        expected = own_ms + (4 - 2) / 2 * (own_ms + decode_time)
     assert ttft == pytest.approx(expected, rel=1e-9)
     prompt_budget = budget - 2 * width
     full, partial = divmod(prompt_budget, 4096)

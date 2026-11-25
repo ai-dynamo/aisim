@@ -11,8 +11,11 @@ process: it builds every handle, primes it with a query of another shape, then t
 unseen query (cold) and 100 repeats after 10 warmup calls (warm median) with the forward
 perf gate's measure_cold_and_warm. OUT.json holds each round's order and maps
 build -> case -> per-round cold, warm median, raw warm samples and returned value.
+Every worker verifies its SDK and native build against the selected checkout before
+timing. OUT.json retains the verified identities for every build and round.
 """
 
+import hashlib
 import inspect
 import json
 import os
@@ -20,6 +23,52 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
+
+from committed_sources import package_inventory, require_committed, verify_imported_packages
+
+
+def verified_worker_build(src):
+    """Bind imported packages and native build inputs to the selected checkout."""
+    import aisim
+    import aisim_core
+    from aisim import _runtime
+
+    src = Path(src).resolve()
+    inventory = package_inventory(src, "HEAD")
+    identity = verify_imported_packages(inventory, [aisim, aisim_core])
+    native_path = Path(_runtime.__file__).resolve()
+    allowed_roots = (src / "python/aisim/src", src.parent / "venv")
+    for path in [*(Path(p) for p in identity["package_paths"].values()), native_path]:
+        if not any(path.is_relative_to(root.resolve()) for root in allowed_roots):
+            raise ValueError(f"imported path {path} is outside selected build {src.parent}")
+    inputs = [src / name for name in ("Cargo.toml", "Cargo.lock", "crates/core/Cargo.toml", "crates/core/build.rs")]
+    inputs += [path for path in (src / "crates/core/src").rglob("*") if path.is_file()]
+    require_committed(src, inventory["revision"], inputs)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(src),
+            "diff",
+            "--exit-code",
+            inventory["revision"],
+            "--",
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/core",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    native = {path.relative_to(src).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
+    if json.loads(_runtime._build_source_files_json()) != native:
+        raise ValueError(f"imported native extension {native_path} does not match {inventory['revision']}")
+    return {
+        **identity,
+        "native_path": str(native_path),
+        "native_sha256": hashlib.sha256(native_path.read_bytes()).hexdigest(),
+        "native_sources_sha256": hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest(),
+    }
 
 
 def qualifying_constructor(constructor, qualify):
@@ -37,6 +86,7 @@ def qualifying_constructor(constructor, qualify):
 
 
 def worker(src):
+    identity = verified_worker_build(src)
     sys.path.insert(0, os.path.join(src, "python/aisim"))
     sys.path.insert(0, os.path.join(src, "python/aisim/tests/unit/sdk"))
     from tools.forward_perf_gate.measurement import measure_cold_and_warm
@@ -156,7 +206,7 @@ def worker(src):
             "warm_samples_us": warm_samples,
         }
     shutil.rmtree(root)
-    sys.stdout.write("\n" + json.dumps(out) + "\n")
+    sys.stdout.write("\n" + json.dumps({"build": identity, "results": out}) + "\n")
 
 
 if __name__ == "__main__":
@@ -172,6 +222,7 @@ if __name__ == "__main__":
     if rounds <= 0:
         sys.exit(f"ROUNDS must be positive, got {rounds}")
     res, orders = {b: {} for b in builds}, []
+    identities = {b: [] for b in builds}
     for r in range(rounds):
         order = builds[r % len(builds) :] + builds[: r % len(builds)]
         orders.append(order)
@@ -188,14 +239,16 @@ if __name__ == "__main__":
                 text=True,
                 check=True,
             )
-            for name, row in json.loads(proc.stdout.splitlines()[-1]).items():
+            response = json.loads(proc.stdout.splitlines()[-1])
+            identities[b].append(response["build"])
+            for name, row in response["results"].items():
                 cell = res[b].setdefault(name, {"cold": [], "warm": [], "warm_samples_us": [], "value": []})
                 cell["cold"].append(row["cold_us"])
                 cell["warm"].append(row["warm_us"])
                 cell["warm_samples_us"].append(row["warm_samples_us"])
                 cell["value"].append(row["value"])
     with open(out, "w") as f:
-        json.dump({"orders": orders, "results": res}, f, indent=1)
+        json.dump({"orders": orders, "results": res, "build_identities": identities}, f, indent=1)
     for name in res[builds[0]]:
         cells = [res[b][name] for b in builds]
         print(
