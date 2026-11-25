@@ -884,6 +884,57 @@ fn grouped_destination_partial_state_copies_do_not_stall_replay() {
 }
 
 #[test]
+fn grouped_destination_defers_its_own_state_copy_until_a_peer_finishes() {
+    // A one-token load holds two blocks and has no state copy at a hash
+    // unit of four. The next load takes three blocks for 20 of 21 tokens.
+    // In block mode its partial state needs a fourth block in the first
+    // pass, so it must wait for the peer to finish on this five-block pool.
+    // Byte mode publishes no cached state and can admit both loads at once.
+    for version in ["0.31.0", "0.32.0"] {
+        for async_scheduling in [false, true] {
+            for block_mode in [false, true] {
+                let label = format!("{version} async={async_scheduling} block={block_mode}");
+                let mut first = request("first", 0.0, 1, 2);
+                first.input_token_ids = Some(vec![99]);
+                let mut second = request("second", 0.0, 21, 2);
+                second.input_token_ids = Some((1000..1021).collect());
+                let max_model_len = block_mode.then_some(32);
+                let mut spec = small_grouped_pd_spec(vec![first, second], 5, max_model_len);
+                let rank = &mut spec.engine["rank"];
+                if block_mode {
+                    rank["prefix_match_unit"] = 4.into();
+                }
+                rank["vllm_version"] = version.into();
+                rank["async_scheduling"] = async_scheduling.into();
+                rank["kv_cache_groups"][1]["prefill_checkpoint_blocks"] = 0.into();
+                let mut prefill = rank.clone();
+                prefill["enable_prefix_caching"] = false.into();
+                prefill["prefix_match_unit"] = serde_json::Value::Null;
+                prefill["kv_cache_capacity_bytes"] = 1_600.into();
+                spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+                let report = run_within_60_s(spec);
+                assert_eq!(report.request_counts.completed_requests, 2, "{label}");
+                let (first, second) = (record(&report, "first"), record(&report, "second"));
+                assert_eq!(first.destination_reserved_ms, Some(10.0), "{label}");
+                if block_mode {
+                    assert!(
+                        second.destination_reserved_ms.unwrap() >= first.terminal_time_ms,
+                        "{label}"
+                    );
+                } else {
+                    assert_eq!(second.destination_reserved_ms, Some(10.0), "{label}");
+                }
+                assert_eq!(
+                    (first.readmission_count, second.readmission_count),
+                    (0, 0),
+                    "{label}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn grouped_destination_keeps_room_for_a_first_pass_in_byte_mode_too() {
     // A first prompt of 33 tokens and a distinct second prompt of 34 tokens on
     // a decode pool of 7 pages. A prefill rank without prefix caching and with

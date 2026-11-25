@@ -2126,8 +2126,9 @@ impl VllmKvManager {
     /// load (V32 `vllm/v1/core/kv_cache_manager.py:522-539`, `:561-579`, V31
     /// `:519-536`, `:558-576`). The whole prompt, with the loaded tokens
     /// computed, must fit the free capacity. The loaded tokens must fit the
-    /// free capacity less what the first passes of the other loads in flight
-    /// take. Without the second test, two loads can take the blocks that
+    /// free capacity less its activation's state copy and what the first
+    /// passes of the other loads in flight take. Without the second test,
+    /// two loads can take the blocks that
     /// each first pass needs, and neither request computes its last prompt
     /// token.
     /// Byte mode charges the projected bytes. Block mode pins the local
@@ -2164,9 +2165,11 @@ impl VllmKvManager {
                     coordinator.empty_hit()
                 };
                 let free = pool.capacity_blocks() - pool.active_blocks();
+                let state_copy = coordinator.destination_state_copy_blocks(lease, prompt, transfer);
                 if coordinator.destination_admission_blocks(pool, &hit, transfer, prompt) > free
                     || (coordinator.destination_load_blocks(pool, &hit, transfer, prompt) as u64)
                         .saturating_add(self.grouped_inflight_need)
+                        .saturating_add(state_copy as u64)
                         > free as u64
                 {
                     return VllmAcquire::CapacityExhausted;
@@ -2213,9 +2216,7 @@ impl VllmKvManager {
                     transfer,
                     prompt,
                     self.step,
-                ) + coordinator
-                    .destination_state_copy_blocks(lease, prompt, transfer))
-                    as u64;
+                ) + state_copy) as u64;
                 grouped_lease.block_lease = Some(block_lease);
                 (
                     grouped_lease,

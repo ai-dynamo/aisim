@@ -3014,6 +3014,65 @@ fn grouped_destination_with_a_local_prefix_inside_a_block_takes_no_copy_source()
 }
 
 #[test]
+fn grouped_destination_requires_room_for_its_own_partial_state_copy() {
+    // Loading 20 of 21 tokens takes two attention blocks and one state
+    // block. Activation publishes a partial state, so the first pass needs
+    // a fourth block. A held one-token peer takes two blocks and needs no
+    // copy at a hash unit of four. Defer atomically with three free blocks,
+    // and admit with exactly four, on pools large enough for max_model_len.
+    for version in ["0.31.0", "0.32.0"] {
+        for max_concurrent_batches in [1, 2] {
+            for free in [3, 4] {
+                let label = format!("{version} {max_concurrent_batches} {free}");
+                let mut groups = full_and_state_transfer_groups();
+                groups[1].prefill_checkpoint_blocks = Some(0);
+                let mut args = prefix_core(groups, (free + 2) * 100, 8192, 4, version).args;
+                args.worker_type = WorkerType::Decode;
+                args.max_model_len = Some(32);
+                args.max_concurrent_batches = max_concurrent_batches;
+                let mut core = VllmCore::new(args);
+                let peer = HandoffId::new(Uuid::from_u128(2200));
+                assert_eq!(
+                    reserve_grouped(&mut core, peer, one_token_load(1200, 99)),
+                    Some(1),
+                    "{label}"
+                );
+                assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{label}");
+                let handoff_id = HandoffId::new(Uuid::from_u128(2201));
+                let reserved = reserve_grouped(&mut core, handoff_id, pd_request(1201, 21, 2));
+                if free == 3 {
+                    assert_eq!(reserved, None, "{label}");
+                    assert_eq!(block_pool(&core).active_blocks(), 2, "{label}");
+                    assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{label}");
+                    assert!(core.retry_pending_destinations().is_empty(), "{label}");
+                } else {
+                    assert_eq!(reserved, Some(2), "{label}");
+                    assert_eq!(block_pool(&core).active_blocks(), 5, "{label}");
+                    assert_eq!(core.kv_manager.grouped_inflight_need(), 1, "{label}");
+                    activate(&mut core, handoff_id);
+                    let mut now = 0.0;
+                    let pass = async_step(&mut core, &mut now);
+                    assert_eq!(pass.output_signals.len(), 1, "{label}");
+                    assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0, "{label}");
+                    assert_eq!(block_pool(&core).active_blocks(), 6, "{label}");
+                    assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{label}");
+                }
+                // Both a deferred reservation and an activated request can
+                // be canceled without retaining blocks or first-pass need.
+                core.apply_command(SchedulerCommand::CancelDestination { handoff_id })
+                    .unwrap();
+                assert_eq!(block_pool(&core).active_blocks(), 2, "{label}");
+                core.apply_command(SchedulerCommand::CancelDestination { handoff_id: peer })
+                    .unwrap();
+                assert!(core.is_drained(), "{label}");
+                assert_eq!(block_pool(&core).active_blocks(), 0, "{label}");
+                assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{label}");
+            }
+        }
+    }
+}
+
+#[test]
 fn grouped_destination_keeps_room_for_the_copy_published_by_activation() {
     // Each cold 21-token prompt loads 20 tokens into two attention blocks
     // and one state block. Activation publishes the state inside its block,
