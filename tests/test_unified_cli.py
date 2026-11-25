@@ -2843,7 +2843,17 @@ def test_energy_detail_reports_missing_adapter_export(tmp_path, monkeypatch, cap
 def test_snapshot_seed_override_reaches_the_existing_predict_path(tmp_path, monkeypatch, capsys, profile) -> None:
     import os
 
+    import aisim.resources as resources
     from aisim.runner import EngineReplayRunnerFactory
+
+    # Model the child and supervisor memory as well as their budget. Reusing
+    # pytest's PID for both must not count prior tests' accumulated RSS twice.
+    monkeypatch.setattr(
+        resources,
+        "discover_host",
+        lambda: resources.HostResources(8 * resources.GB, 6 * resources.GB, 2, 64 * resources.MIB),
+    )
+    monkeypatch.setattr(resources.psutil.Process, "memory_info", lambda self: SimpleNamespace(rss=64 * resources.MIB))
 
     class SnapshotFactory(_Factory):
         def capabilities(self):
