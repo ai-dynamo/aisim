@@ -934,6 +934,45 @@ replay copies the state, so a full pool with nothing to evict skips the
 boundary. This model needs inferred geometry: with `bytes_per_request` set,
 DeepSeek V4 falls back to one recurrent-style checkpoint per request.
 
+Gemma 4 on vLLM gets a sliding-window state automatically; leave `state_cache`
+unset. vLLM keeps only the last `sliding_window` tokens (1,024) of the sliding
+layers. It unifies every layer's page size by growing the block of the smaller
+pages, then splits the layers into equal groups: for Gemma-4-26B-A4B, one global
+group and five sliding groups of five layers each. Token KV then covers the
+global group only, and each request holds a fixed state of
+`cdiv(1024, 64) + 1 = 17` blocks per sliding group, 85 in all. At TP2 with BF16
+KV, the 64-token request block grows to 128 tokens of 10,240 bytes per token,
+and the state takes 111,411,200 bytes per rank. Prefix hits resume at block
+boundaries that keep a window snapshot, as with DeepSeek V4. A fixed
+`capacity.blocks` counts these resolved blocks (128 tokens of global-layer KV at
+TP2), not 64-token blocks of every layer, and each request also takes its state
+from the same pool. An FP8-KV checkpoint, such as Gemma-4-26B-A4B-NVFP4, sizes
+in FP8 as vLLM's `--kv-cache-dtype auto` does. A worker with a grouped
+`engine.fpm_profile`, or with a profile that records no `runtime_memory`, keeps
+its existing capacity path.
+
+The full window is charged even to a request shorter than it, so below about
+1,024 tokens replay reserves more than vLLM, which holds only `cdiv(L, 64)`
+blocks per sliding group. Each feature below would resume a prefix hit without
+its window snapshot, so a Gemma 4 vLLM worker rejects it:
+
+- `g3_offload`: replay models G3 only behind vLLM 0.24's connector, which
+  stores no window state.
+- `kvcr`: a peer fetch carries no window snapshot.
+- `host_offload.connector: simple_cpu_v0_32`: replay does not model how that
+  connector stores sliding-window groups; use `offloading_v0_32`.
+- Speculative decoding and an explicit `bytes_per_token`: sizing does not model
+  draft tokens in the window, and token bytes follow vLLM's cache groups.
+
+`recommend` sizes Gemma 4 vLLM candidates the same way, so a saved candidate and
+`predict` agree.
+
+DeepSeek V4 and Kimi K3 still have this bug. Their state cache is opt-in
+(`state_cache: {}`), so a worker without it, and every `recommend` candidate
+(which rejects `state_cache`), uses the uniform pool. That pool charges every
+token at one rate and reserves no fixed per-request state, so it misstates
+capacity the way it did for Gemma 4 before this change.
+
 Kimi K3's recurrent state resumes only from a stored snapshot, so it does not
 land on every matching token. With `block_size: 1536` and `prefix_match_unit: 128`, a cold
 24,300-token prompt keeps snapshots at 23,040 and 24,192 tokens. A later request
@@ -942,6 +981,11 @@ with one difference: when a prompt ends on a block boundary, replay also keeps
 the state one block earlier (two under the EAGLE block drop), so an identical
 resend resumes there. vLLM keeps a state there only if a prefill chunk ended
 there.
+
+Without an `engine.fpm_profile`, Gemma 4's automatic state cache with default
+capacity takes the analytical KV budget that other workers use (memory fraction minus weights,
+activations and overheads), in whole blocks of the resolved geometry:
+`budget // (block_size * bytes_per_token)`.
 
 ### State pool from recorded runtime memory
 

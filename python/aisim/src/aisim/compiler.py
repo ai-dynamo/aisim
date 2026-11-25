@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from dataclasses import replace
@@ -31,6 +32,7 @@ from .config.engine import (
     FrontendMeasurementConfig,
     FrontendPredictionConfig,
     HostWorkerPredictionConfig,
+    StateCachePredictionConfig,
     VisionPredictionConfig,
     WorkerPredictionConfig,
     fpm_profile_deployment,
@@ -40,7 +42,7 @@ from .config.engine import (
 )
 from .config.traffic import SyntheticSessionSource, SyntheticSource, TraceSource
 from .estimator_readiness import unready_estimator_message
-from .state_size import resolve_state_size, runtime_memory_blocks
+from .state_size import analytical_memory_blocks, resolve_state_size, runtime_memory_blocks
 from .sweeper.afd_parallel import AFDTopology, validate_afd_model
 from .sweeper.kv_estimate import resolve_backend_version
 from .sweeper.model_hw import resolve_model_hardware
@@ -396,6 +398,13 @@ def _resolve_state_cache(
 ) -> tuple[WorkerPredictionConfig, dict[str, Any] | None]:
     """Return the worker with resolved state geometry and its sizing report."""
     cache = worker.kv_cache
+    if (
+        cache.state_cache is None
+        and _vllm_sliding_window_model(engine)
+        and _window_state_pool_known(engine, worker, role)
+    ):
+        cache = _with_gemma4_window_state(engine, cache)
+        worker = worker.model_copy(update={"kv_cache": cache})
     if cache.state_cache is None:
         return worker, None
     size = resolve_state_size(engine, worker, role)
@@ -413,6 +422,80 @@ def _resolve_state_cache(
         }
     )
     return worker.model_copy(update={"kv_cache": resolved}), size
+
+
+def _window_state_pool_known(engine: EnginePredictionConfig, worker: WorkerPredictionConfig, role: str) -> bool:
+    """Whether the state pool can be sized: from memory, or from a linear profile's recorded pool.
+
+    A grouped FPM profile already models vLLM's sliding-window groups, and a profile without
+    recorded runtime memory has no pool to divide; both keep their existing capacity paths.
+    """
+    if engine.fpm_profile is None:
+        return True
+    resources = fpm_profile_deployment(engine, worker, role).resources
+    return resources is not None and resources.cache_layout != "grouped" and resources.runtime_memory is not None
+
+
+def _vllm_sliding_window_model(engine: EnginePredictionConfig) -> bool:
+    """Whether vLLM keeps this model's sliding-window layers as fixed per-request state."""
+    if engine.backend != "vllm":
+        return False
+    return _is_gemma4(engine.model)
+
+
+@functools.lru_cache(maxsize=64)
+def _is_gemma4(model: str) -> bool:
+    from aisim_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY
+    from aisim_core.sdk.utils import HuggingFaceDownloadError, _load_model_config_from_model_path
+
+    if os.path.isdir(model) and not os.path.isfile(os.path.join(model, "config.json")):
+        return False
+    try:
+        # The raw config only: synthetic test models need not be in the model zoo.
+        architectures = _load_model_config_from_model_path(model).get("architectures") or [None]
+    except HuggingFaceDownloadError:
+        # A model without a loadable config (e.g. fixed timing and capacity) has no geometry to size.
+        return False
+    return ARCHITECTURE_TO_MODEL_FAMILY.get(architectures[0]) == "GEMMA4MIX"
+
+
+def _with_gemma4_window_state(engine: EnginePredictionConfig, cache):
+    """Model Gemma 4's sliding-window layers as one fixed state per request (vLLM's cache groups)."""
+    reject_gemma4_window_conflicts(
+        g3_offload=cache.g3_offload is not None,
+        kvcr=cache.kvcr is not None,
+        host_connector=cache.host_offload.connector if cache.host_offload is not None else None,
+        speculative=engine.speculation is not None or bool(engine.nextn),
+        explicit_bytes_per_token=cache.bytes_per_token != "auto",
+    )
+    return cache.model_copy(update={"state_cache": StateCachePredictionConfig()})
+
+
+def reject_gemma4_window_conflicts(
+    *, g3_offload: bool, kvcr: bool, host_connector: str | None, speculative: bool, explicit_bytes_per_token: bool
+) -> None:
+    """Refuse each feature that would resume a prefix hit without its window snapshot.
+
+    The compiler and the sweeper share these checks. (prefix_match_unit needs an
+    authored state_cache, so it never reaches automatic activation.)
+    """
+    prefix = "vLLM keeps Gemma 4's sliding-window layers as per-request state; replay does not support"
+    if g3_offload:
+        raise ValueError(
+            f"{prefix} kv_cache.g3_offload: replay models G3 only behind vLLM 0.24's connector, "
+            "which stores no window state"
+        )
+    if kvcr:
+        raise ValueError(f"{prefix} kv_cache.kvcr: a KVCR peer fetch carries no window snapshot")
+    if host_connector == "simple_cpu_v0_32":
+        raise ValueError(
+            f"{prefix} host_offload.connector=simple_cpu_v0_32: replay does not model how that connector "
+            "stores sliding-window groups; use offloading_v0_32"
+        )
+    if speculative:
+        raise ValueError(f"{prefix} speculative decoding: sizing does not model draft tokens in the window")
+    if explicit_bytes_per_token:
+        raise ValueError(f"{prefix} an explicit kv_cache.bytes_per_token: token bytes follow vLLM's cache groups")
 
 
 def _state_metadata(
@@ -991,11 +1074,15 @@ def _worker_engine_args(
             if getattr(cache.state_cache, flag):
                 payload["state_cache"][flag] = True
         payload["kv_cache_bytes_per_token"] = cache.bytes_per_token
-    if capacity.type == "default" and cache.state_cache is not None:
+    analytical_state_pool = capacity.type == "default" and cache.state_cache is not None and engine.fpm_profile is None
+    if capacity.type == "default" and cache.state_cache is not None and not analytical_state_pool:
         assert isinstance(cache.bytes_per_token, int)
         # Derived from the profile's recorded pool, so the runner must not treat it as a user-fixed capacity.
         payload["num_gpu_blocks"] = runtime_memory_blocks(engine, worker, role, block_size * cache.bytes_per_token)
         payload["num_gpu_blocks_is_explicit"] = False
+    elif analytical_state_pool:
+        # Sized from the analytical byte budget once the capacity inputs are complete (below).
+        assert memory_fraction is not None
     elif capacity.type == "fixed":
         if capacity.blocks is not None:
             payload["num_gpu_blocks"] = capacity.blocks
@@ -1023,6 +1110,8 @@ def _worker_engine_args(
     if worker.timing.type != "default":
         if capacity.type == "default" and cache.state_cache is None:
             payload = materialize_aic_num_gpu_blocks(payload)
+        elif analytical_state_pool:
+            _size_analytical_state_pool(payload, backend, memory_fraction, capacity, block_size, cache.bytes_per_token)
         for name in (
             "systems_path",
             "aic_backend_version",
@@ -1179,7 +1268,24 @@ def _worker_engine_args(
             sglang.setdefault("chunked_prefill_size", worker.scheduler.max_batched_tokens)
         if isinstance(sglang, dict) and isinstance(chunk := sglang.get("chunked_prefill_size"), int):
             sglang["chunked_prefill_size"] = max(block_size, chunk // block_size * block_size)
+    if analytical_state_pool and worker.timing.type == "default":
+        # The canonical timing config is complete only now.
+        _size_analytical_state_pool(payload, backend, memory_fraction, capacity, block_size, cache.bytes_per_token)
     return payload
+
+
+def _size_analytical_state_pool(payload, backend, memory_fraction, capacity, block_size, bytes_per_token) -> None:
+    """Size a state-cache pool without an FPM profile from the analytical KV byte budget."""
+    assert isinstance(bytes_per_token, int)
+    payload["num_gpu_blocks"] = analytical_memory_blocks(
+        payload,
+        backend=backend,
+        memory_fraction=memory_fraction,
+        cuda_graph_reserved_bytes=capacity.cuda_graph_reserved_bytes,
+        block_bytes=block_size * bytes_per_token,
+    )
+    # Derived from memory, so the runner must not treat it as a user-fixed capacity.
+    payload["num_gpu_blocks_is_explicit"] = False
 
 
 _SWA_PREFIX_ARCHITECTURES = frozenset({"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"})
