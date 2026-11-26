@@ -157,10 +157,10 @@ PYCODE
 done
 ```
 
-The adjacent JSON's `model_provenance.generated_model` is the complete synthetic
-model config. Write it to a scratch `tiny-model/config.json` and replace only the
-absolute model path in each `cli_rows[].config` before invoking its recorded CLI
-command. Preserve the traffic, cache, timing and resource settings, and the
+Copy `tests/e2e/configs/unified_cli/fixtures/tiny-model/config.json` to a scratch
+`tiny-model/config.json` and set `max_position_embeddings` to 131072, as recorded
+in `model_provenance.modification`. Replace only the absolute model path in each
+`cli_rows[].config` before invoking its recorded CLI command. Preserve the traffic, cache, timing and resource settings, and the
 `cli_canonical_exclusions` list. No weights or numerical goldens are required.
 
 Earlier setup/resource failures remain in the scratch logs: the initial wheel

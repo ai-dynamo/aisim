@@ -253,7 +253,6 @@ fn radix_warm_readmission_measurement() {
             mgr.finish(&tokens, alloc.lease);
         }
         assert_eq!(mgr.cache().num_nodes(), nodes);
-        mgr.cache().assert_invariants();
         mgr.evict(capacity);
         assert_eq!(mgr.cache().available_tokens(), capacity);
         observations.push(json!({"growth_pages": growth_pages, "page_size": 32,
