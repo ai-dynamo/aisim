@@ -396,16 +396,17 @@ def _profile_parallel_configs(
             and deployment.worker_type in (None, role)
         }
 
-    prefix_errors = []
+    first_prefix_error = None
+    unavailable_prefix = (GroupedPrefixEvidenceError, GroupedPrefixGeometryError)
 
     @cache
-    def supports_prefix(role, shape):
+    def prefix_requirement(role, shape):
         if not prefix_caching[0 if role == "prefill" else 1]:
-            return True
+            return None
         system = (decode_hardware_sku or hardware_sku) if role == "decode" else hardware_sku
         deployment = shapes_for(system, role)[shape]
         if deployment.resources.cache_layout != "grouped":
-            return True
+            return None
         try:
             grouped_prefix_caching_requirements(
                 deployment,
@@ -416,9 +417,17 @@ def _profile_parallel_configs(
                 field=f"{role}_enable_prefix_caching",
                 pd_rank=True,
             )
-        except (GroupedPrefixEvidenceError, GroupedPrefixGeometryError) as error:
-            prefix_errors.append(error)
+        except ValueError as error:
+            return error
+        return None
+
+    def supports_prefix(error):
+        nonlocal first_prefix_error
+        if isinstance(error, unavailable_prefix):
+            first_prefix_error = first_prefix_error or error
             return False
+        if error is not None:
+            raise error
         return True
 
     def replicas(shape, budget):
@@ -455,7 +464,7 @@ def _profile_parallel_configs(
                 ReplicaParallelConfig(shape, count) for shape in shapes for count in allowed_counts("agg", shape)
             ]
         if worker_type in ("prefill", "decode"):
-            configs = [config for config in configs if supports_prefix(worker_type, config.shape)]
+            configs = [config for config in configs if supports_prefix(prefix_requirement(worker_type, config.shape))]
     elif deployment_mode == "disagg":
         prefill_shapes = shapes_for(hardware_sku, "prefill")
         decode_shapes = shapes_for(decode_hardware_sku or hardware_sku, "decode")
@@ -463,7 +472,14 @@ def _profile_parallel_configs(
 
         def compatible(prefill_shape, decode_shape):
             prefill, decode = prefill_shapes[prefill_shape], decode_shapes[decode_shape]
-            requirement = grouped_pd_pair_requirement(prefill, decode, prefix_caching=prefix_caching)
+            prefill_error = prefix_requirement("prefill", prefill_shape)
+            decode_error = prefix_requirement("decode", decode_shape)
+            # A pair lacking warm geometry still has to pass the ordinary transfer checks. Only a viable warm
+            # pair needs the feature-specific installed version on either rank.
+            unavailable = next((e for e in (prefill_error, decode_error) if isinstance(e, unavailable_prefix)), None)
+            requirement = grouped_pd_pair_requirement(
+                prefill, decode, prefix_caching=(False, False) if unavailable else prefix_caching
+            )
             if requirement:
                 requirements[requirement] = None
                 return False
@@ -471,7 +487,7 @@ def _profile_parallel_configs(
                 return True
             if validate_transfer:
                 grouped_pd_transfer_requirements(prefill, decode, backend_version=backend_version, kv_transfer=None)
-            return supports_prefix("prefill", prefill_shape) and supports_prefix("decode", decode_shape)
+            return supports_prefix(unavailable or prefill_error or decode_error)
 
         if candidate_configs is not None:
             # Replica counts do not change a deployment's transfer geometry.
@@ -527,12 +543,12 @@ def _profile_parallel_configs(
                         minimum = max(1, (needed + width - 1) // width)
                         for count in range(minimum, available // width + 1):
                             configs.append(DisaggParallelConfig(prefill=replica, decode=decode_replica(dest, count)))
-        if requirements and not configs and not prefix_errors:
+        if requirements and not configs and first_prefix_error is None:
             raise NoViableParallelConfig(f"no prefill/decode deployment pair with {' and '.join(requirements)}")
     else:
         raise ValueError("FPM profiles support only agg or disagg deployment modes")
-    if not configs and prefix_errors:
-        raise prefix_errors[0]
+    if not configs and first_prefix_error is not None:
+        raise first_prefix_error
     if deployment_mode == "disagg" or candidate_configs is not None or min_gpu_budget is None:
         return configs
     return [config for config in configs if config.total_gpus >= min_gpu_budget]

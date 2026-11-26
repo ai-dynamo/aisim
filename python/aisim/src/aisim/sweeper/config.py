@@ -1311,9 +1311,8 @@ class SearchSpace(BaseModel):
                     if self.kv_transfer_bytes_per_token is not None
                     else None
                 )
-                # The enumeration keeps only compatible deployment pairs. The other checks hold for
-                # every pair of the search.
-                enumerated_shapes = ((c.prefill.shape, c.decode.shape) for c in configs)
+                # All pins must support the transfer. Only enumerated pairs can use the requested prefix policy.
+                enumerated_shapes = dict.fromkeys((c.prefill.shape, c.decode.shape) for c in configs)
                 for prefill_shape, decode_shape in dict.fromkeys(chain(pinned_shapes(), enumerated_shapes)):
                     try:
                         prefill, decode = select("prefill", prefill_shape), select("decode", decode_shape)
@@ -1325,7 +1324,9 @@ class SearchSpace(BaseModel):
                             decode,
                             backend_version=backend_version,
                             kv_transfer=transfer,
-                            prefix_caching=(self.prefill_enable_prefix_caching, self.decode_enable_prefix_caching),
+                            prefix_caching=(self.prefill_enable_prefix_caching, self.decode_enable_prefix_caching)
+                            if (prefill_shape, decode_shape) in enumerated_shapes
+                            else (False, False),
                         )
         return self
 

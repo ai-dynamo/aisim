@@ -1632,9 +1632,7 @@ mod tests {
         assert_eq!(w.gpu_cache_layout, Layouts::named("BLHNC"));
         assert!(w.requires_hma);
         let mut mixed = row.clone();
-        mixed["cache"]["groups"][0]["layer_classes"]["b"] = json!(
-            "vllm.model_executor.layers.attention.prefill_prefix_lm_attention.PrefillPrefixLMAttention"
-        );
+        mixed["cache"]["groups"][0]["layer_classes"]["b"] = json!("custom.UnknownAttention");
         let w = Worker::observed(&mixed).unwrap();
         assert_eq!(w.use_mla, None);
         assert_eq!(w.gpu_cache_layout, Layouts::named("BLHNC"));
@@ -1659,6 +1657,9 @@ mod tests {
             "cache":{"groups":[{"kind":"attention","layer_names":["a","b"],"layer_classes":{"a":subclass,"b":subclass}}],
                 "tensor_allocations":[{"layers":["a","b"],"host_resident":false,"layer_stride":4096}],
                 "layer_tensors":{"a":[view],"b":[view]}}});
+        let class_only = Worker::observed(&rank).unwrap();
+        assert_eq!(class_only.use_mla, Some(false));
+        assert_eq!(class_only.gpu_cache_layout, Layouts::named("BLHNC"));
         for (spec, ordinary) in [
             ("FullAttentionSpec", true),
             ("SlidingWindowSpec", true),
@@ -1666,19 +1667,27 @@ mod tests {
             ("MLAAttentionSpec", false),
             ("SlidingWindowMLASpec", false),
             ("HiddenStateCacheSpec", false),
+            ("UniformTypeKVCacheSpecs", false),
         ] {
-            let spec = json!({"spec_type":format!("vllm.v1.kv_cache_interface.{spec}")});
-            rank["cache"]["groups"][0]["layer_specs"] = json!({"a":spec,"b":spec});
-            let worker = Worker::observed(&rank).unwrap();
-            assert_eq!(worker.use_mla, ordinary.then_some(false));
-            assert_eq!(
-                worker.gpu_cache_layout,
-                if ordinary {
-                    Layouts::named("BLHNC")
+            let spec = format!("vllm.v1.kv_cache_interface.{spec}");
+            for wrapped in [false, true] {
+                let group = &mut rank["cache"]["groups"][0];
+                if wrapped {
+                    group["spec_type"] =
+                        json!("vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs");
+                    group["layer_specs"] = json!({"a":{"spec_type":spec},"b":{"spec_type":spec}});
                 } else {
-                    None
+                    group["spec_type"] = json!(spec);
+                    group.as_object_mut().unwrap().remove("layer_specs");
                 }
-            );
+                let worker = Worker::observed(&rank).unwrap();
+                assert_eq!(worker.use_mla, ordinary.then_some(false));
+                if ordinary {
+                    assert_eq!(worker.gpu_cache_layout, Layouts::named("BLHNC"));
+                } else {
+                    assert_eq!(worker.gpu_cache_layout, None);
+                }
+            }
         }
     }
 

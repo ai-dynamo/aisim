@@ -1512,15 +1512,23 @@ def test_vllm_032_layer_strided_plan_imports_every_layout(tmp_path, layout, grou
 
 @pytest.mark.parametrize("field", ["cache", "raw_cache_config"])
 @pytest.mark.parametrize("heads,named,valid", [(2, "LBHNC", False), (2, "LBNHC", True), (1, "LBHNC", True)])
-def test_nixl_compaction_checks_named_and_physical_layouts(tmp_path, field, heads, named, valid):
+@pytest.mark.parametrize("prefix_lm", [False, True])
+def test_nixl_compaction_checks_named_and_physical_layouts(tmp_path, field, heads, named, valid, prefix_lm):
     from aisim import _runtime
     from aisim.support.finalization import _merge_resources
 
     path, launch = _strided_fixture(tmp_path, layout="LBNHC", heads=heads)
 
     def name_worker_layout(row):
+        if prefix_lm:
+            row["resolved_config"]["cache_config"]["enable_prefix_caching"] = False
+            row["resolved_config"]["scheduler_config"]["enable_chunked_prefill"] = False
         if row["kind"] == "worker":
             row.setdefault(field, {})["kv_cache_layout"] = named
+            if prefix_lm:
+                cls = "vllm.model_executor.layers.attention.prefill_prefix_lm_attention.PrefillPrefixLMAttention"
+                for group in row["cache"]["groups"]:
+                    group["layer_classes"] = dict.fromkeys(group["layer_names"], cls)
 
     _mutate(path, name_worker_layout)
     result = validate_observations(path, launch)["tp2"]

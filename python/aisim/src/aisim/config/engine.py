@@ -1817,7 +1817,6 @@ def grouped_prefix_caching_requirements(
         raise GroupedPrefixEvidenceError(f"grouped FPM cache requires {field}=false for cold replay")
     if backend_version not in GROUPED_PREFIX_CACHING_VERSIONS:
         raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only")
-    require_runtime_version(memory, backend_version=backend_version, feature="prefix caching")
     if any(group.prefix_cacheable is None for group in groups):
         raise ValueError(
             "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
@@ -1867,6 +1866,7 @@ def grouped_prefix_caching_requirements(
             )
         except ValueError as error:
             raise GroupedPrefixGeometryError(str(error)) from error
+    require_runtime_version(memory, backend_version=backend_version, feature="prefix caching")
     return hash_block
 
 

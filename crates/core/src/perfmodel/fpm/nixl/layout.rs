@@ -366,9 +366,8 @@ fn view_dimensions(
         .then_some(dims)
 }
 
-/// A stock decoder can subclass Attention without changing its cache. The per-layer spec
-/// identifies its logical axes even inside a UniformTypeKVCacheSpecs group. Older probes
-/// may only name the concrete layer class.
+/// UniformTypeKVCacheSpecs records each layer's spec. Older probes can record a shared
+/// attention spec only on the group, or name a stock decoder class without its spec.
 pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)> {
     let names = group["layer_names"].as_array();
     let legacy = group["layer_classes"]
@@ -385,7 +384,10 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
                 .flat_map(|layers| layers.keys().map(String::as_str)),
         )
         .map(move |name| {
-            let ordinary = match group["layer_specs"][name]["spec_type"].as_str() {
+            let spec = group["layer_specs"][name]["spec_type"]
+                .as_str()
+                .or_else(|| group["spec_type"].as_str());
+            let ordinary = match spec {
                 Some(spec) => matches!(
                     spec,
                     "vllm.v1.kv_cache_interface.FullAttentionSpec"
@@ -397,6 +399,7 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
                     Some(
                         "vllm.model_executor.layers.attention.Attention"
                             | "vllm.model_executor.layers.attention.attention.Attention"
+                            | "vllm.model_executor.layers.attention.prefill_prefix_lm_attention.PrefillPrefixLMAttention"
                     )
                 ),
             };

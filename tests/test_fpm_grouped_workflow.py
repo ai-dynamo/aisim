@@ -2290,7 +2290,9 @@ def test_direct_grouped_pd_prefix_policy_checks_each_role(grouped_case, pinned, 
         assert candidates("prefill") == candidates("decode") == [rank]
 
 
-def test_warm_grouped_pd_search_keeps_the_supported_shape(grouped_case):
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("runtime_version,hash_block", [("0.31.0", None), ("0.31.0+cu130", None), ("0.31.0+cu130", 3)])
+def test_warm_grouped_pd_search_keeps_the_supported_shape(grouped_case, role, runtime_version, hash_block):
     from aisim.sweeper.config import SmartSearchConfig
     from aisim.sweeper.model_hw import NoViableParallelConfig
     from aisim.sweeper.search_space import enumerate_branches
@@ -2299,10 +2301,18 @@ def test_warm_grouped_pd_search_keeps_the_supported_shape(grouped_case):
     profile = _with_transfer_markers(_with_prefix_evidence(profile))
     cold, warm = profile["deployments"]
     memory = cold["resources"]["runtime_memory"]
-    memory.update(enable_prefix_caching=False, mamba_cache_mode="none")
-    memory.pop("hash_block_size_tokens")
+    memory["runtime_framework_version"] = runtime_version
+    if hash_block is None:
+        memory.update(enable_prefix_caching=False, mamba_cache_mode="none")
+        memory.pop("hash_block_size_tokens")
+    else:
+        memory["hash_block_size_tokens"] = hash_block
     _write_timings(root, profile, version="0.31.0")
-    search = {**_pd_search(profile, root), "prefill_enable_prefix_caching": True}
+    search = {
+        **_pd_search(profile, root),
+        "prefill_enable_prefix_caching": role == "prefill",
+        "decode_enable_prefix_caching": role == "decode",
+    }
 
     def recommend(*rows):
         choices = dict(search)
