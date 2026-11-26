@@ -75,6 +75,21 @@ pub struct MsaModuleOp {
     pub index_head_dim: u32,
     pub index_topk: u32,
     pub block_size: u32,
+    /// Output width (per rank) of a sigmoid output gate fused into the
+    /// module's own q projection, in columns. Qwen3.8-Flash-Next QSA fuses
+    /// q_proj with its gate (`2 * heads * head_dim` wide); MiniMax-M3's q
+    /// projection has no gate, so its ops keep the default 0.
+    #[serde(default)]
+    pub output_gate_dim: u32,
+    /// Output width (per rank) of the indexer K half fused into the module's
+    /// own index_qk projection, in columns. Qwen3.8-Flash-Next QSA fuses the
+    /// index query and key halves (`index_n_heads + indexer_kv_heads` heads
+    /// at `index_head_dim`); MiniMax-M3 relies on a constant fill for its
+    /// index-K rows, so its ones are the default 0: its SOL is the anchor the
+    /// accepted M3 rows were calibrated against, and adding a term there
+    /// would move a table already in the dataset.
+    #[serde(default)]
+    pub indexer_k_dim: u32,
     pub kv_cache_dtype: KvCacheQuantMode,
     pub fmha_quant_mode: FmhaQuantMode,
     pub gemm_quant_mode: GemmQuantMode,
@@ -279,6 +294,8 @@ impl MsaModuleOp {
                 self.index_head_dim as i128,
                 self.index_topk as i128,
                 self.block_size as i128,
+                self.output_gate_dim as i128,
+                self.indexer_k_dim as i128,
                 self.kv_cache_dtype,
                 self.fmha_quant_mode,
                 self.gemm_quant_mode,
@@ -320,6 +337,8 @@ impl MsaModuleOp {
                 self.index_head_dim as i128,
                 self.index_topk as i128,
                 self.block_size as i128,
+                self.output_gate_dim as i128,
+                self.indexer_k_dim as i128,
                 self.kv_cache_dtype,
                 self.fmha_quant_mode,
                 self.gemm_quant_mode,
@@ -360,6 +379,8 @@ impl MsaModuleOp {
             self.index_head_dim as i128,
             self.index_topk as i128,
             self.block_size as i128,
+            self.output_gate_dim as i128,
+            self.indexer_k_dim as i128,
             self.kv_cache_dtype,
             self.fmha_quant_mode,
             self.gemm_quant_mode,
@@ -490,6 +511,8 @@ fn msa_attention_sol_ms(
     index_head_dim: i128,
     index_topk: i128,
     block_size: i128,
+    output_gate_dim: i128,
+    indexer_k_dim: i128,
     kv_quant: KvCacheQuantMode,
     fmha_quant: FmhaQuantMode,
     gemm_quant: GemmQuantMode,
@@ -510,6 +533,8 @@ fn msa_attention_sol_ms(
         index_head_dim,
         index_topk,
         block_size,
+        output_gate_dim,
+        indexer_k_dim,
         kv_quant,
         fmha_quant,
         gemm_quant,
@@ -534,6 +559,8 @@ fn msa_attention_sol_ms_with(
     index_head_dim: i128,
     index_topk: i128,
     block_size: i128,
+    output_gate_dim: i128,
+    indexer_k_dim: i128,
     kv_quant: KvCacheQuantMode,
     fmha_quant: FmhaQuantMode,
     gemm_quant: GemmQuantMode,
@@ -547,10 +574,18 @@ fn msa_attention_sol_ms_with(
     let kv_len = if is_context { full_s } else { (s - 1).max(0) };
 
     // ── GEMM group (Q / GQA-KV / O / indexer-Q projections) ──────────────
+    // `output_gate_dim` and `indexer_k_dim` are the fused halves this
+    // architecture's own module adds to those projections (Qwen3.8-Flash-Next
+    // QSA fuses the sigmoid gate into q_proj and the key half into
+    // index_qk_proj). They are priced here, in the module that is measured,
+    // rather than as separate GEMMs outside it: SILICON/HYBRID return the
+    // whole module's measured latency, so an outside GEMM would be charged
+    // twice once the rows resolve.
     let gemm_ops = 2 * tokens * hidden_size * (num_heads * qk_head_dim)
         + 2 * tokens * hidden_size * (2 * num_kv_heads * head_dim)
         + 2 * tokens * (num_heads * v_head_dim) * hidden_size
-        + 2 * tokens * hidden_size * (index_n_heads * index_head_dim);
+        + 2 * tokens * hidden_size * (index_n_heads * index_head_dim)
+        + 2 * tokens * hidden_size * (output_gate_dim + indexer_k_dim);
 
     // ── sparse attention: top-k saturated causal (query, kv) pair count ──
     let (pairs, score_len) = if is_context {
@@ -586,7 +621,8 @@ fn msa_attention_sol_ms_with(
     let gemm_weight_elems = hidden_size * num_heads * qk_head_dim
         + hidden_size * 2 * num_kv_heads * head_dim
         + num_heads * v_head_dim * hidden_size
-        + hidden_size * index_n_heads * index_head_dim;
+        + hidden_size * index_n_heads * index_head_dim
+        + hidden_size * (output_gate_dim + indexer_k_dim);
     let gemm_weight_bytes = gemm_weight_elems as f64 * gemm_quant.mapping().memory;
     let kv_cache_bytes = (b * num_kv_heads * effective_kv * (qk_head_dim + v_head_dim)) as f64
         * kv_quant.mapping().memory;
@@ -641,6 +677,8 @@ mod tests {
             index_head_dim: 128,
             index_topk: 2048,
             block_size: 128,
+            output_gate_dim: 0,
+            indexer_k_dim: 0,
             kv_cache_dtype: KvCacheQuantMode::Bfloat16,
             fmha_quant_mode: FmhaQuantMode::Bfloat16,
             gemm_quant_mode: GemmQuantMode::Bfloat16,
@@ -784,6 +822,70 @@ mod tests {
         );
     }
 
+    /// QSA's fused projection halves are priced INSIDE the module SOL, not as
+    /// GEMMs beside it. SILICON/HYBRID return the measured whole-module
+    /// latency, so a supplementary GEMM would be charged twice once the QSA
+    /// rows resolve; including the columns here keeps SOL and the measured
+    /// unit the same arithmetic module.
+    #[test]
+    fn msa_sol_prices_the_fused_projection_halves_inside_the_module() {
+        const GATE: u32 = 1024; // sigmoid output-gate width (columns)
+        const IDX_K: u32 = 128; // the fused index_qk key half
+        let mut db = db("vllm", "0.24.0");
+        db.database_mode = DatabaseMode::Sol;
+        let flops = msa_sol_flops(
+            &db.system_spec,
+            GemmQuantMode::Bfloat16,
+            FmhaQuantMode::Bfloat16,
+        )
+        .expect("bf16 flops");
+        let gemm_mem = GemmQuantMode::Bfloat16.mapping().memory;
+
+        let m3 = msa_op();
+        let mut qsa = msa_op();
+        qsa.output_gate_dim = GATE;
+        qsa.indexer_k_dim = IDX_K;
+
+        // One context point (math-bound: 1024 tokens make the added GEMM work
+        // dwarf the added weight read) and one generation point (memory-bound:
+        // one query token re-reads the whole weight block). Each delta is
+        // exactly its dominant resource's added work — the terms are charged
+        // once, inside the module.
+        let cases = [
+            (true, 1024u32, 0u32),  // context: 1024 tokens, math-bound
+            (false, 4097u32, 0u32), // generation: 1 token, memory-bound
+        ];
+        for (is_context, s, prefix) in cases {
+            let tokens = if is_context { s as f64 } else { 1.0 };
+            let delta_math =
+                2.0 * tokens * m3.hidden_size as f64 * (GATE + IDX_K) as f64 / flops.gemm * 1000.0;
+            let delta_mem = m3.hidden_size as f64 * (GATE + IDX_K) as f64 * gemm_mem
+                / db.system_spec.gpu.mem_bw
+                * 1000.0;
+            let base = if is_context {
+                m3.query_context(&db, 1, s, prefix).unwrap().latency_ms
+            } else {
+                m3.query_generation(&db, 1, s).unwrap().latency_ms
+            };
+            let fused = if is_context {
+                qsa.query_context(&db, 1, s, prefix).unwrap().latency_ms
+            } else {
+                qsa.query_generation(&db, 1, s).unwrap().latency_ms
+            };
+            assert!(fused > base, "fused halves must add work, not replace it");
+            if is_context {
+                assert!(delta_math > delta_mem, "context point must be math-bound");
+                approx(fused - base, delta_math);
+            } else {
+                assert!(
+                    delta_mem > delta_math,
+                    "generation point must be memory-bound"
+                );
+                approx(fused - base, delta_mem);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Own silicon tables (msa_context_module / msa_generation_module).
     // No parquet writer in the test deps, so the loaded-grid layer is
@@ -885,6 +987,35 @@ mod tests {
         }
     }
 
+    /// SILICON/HYBRID return the measured whole-module latency, which already
+    /// contains the fused q+gate and indexer-K work. The fused widths feed the
+    /// SOL only; on a measured row they must not move the answer, or they
+    /// would be charged a second time.
+    #[test]
+    fn msa_silicon_row_is_not_recharged_for_the_fused_projection_halves() {
+        let mut db = db("vllm", "0.24.0");
+        db.database_mode = DatabaseMode::Silicon;
+        inject_msa_grids(&db);
+        let mut qsa = msa_op();
+        qsa.output_gate_dim = 1024;
+        qsa.indexer_k_dim = 128;
+
+        // The M3 row measured the whole module; the fused widths change only
+        // the analytical SOL, so the measured answer stays the row's value.
+        approx(
+            qsa.query_context(&db, 1, 1024, 0)
+                .expect("context silicon hit")
+                .latency_ms,
+            10.0,
+        );
+        approx(
+            qsa.query_generation(&db, 1, 4097)
+                .expect("generation silicon hit")
+                .latency_ms,
+            0.5,
+        );
+    }
+
     /// Silicon lookup keys on the op's own architecture, not the M3 default:
     /// Qwen3.8-Flash-Next QSA rows are keyed by
     /// `Qwen4ExpForConditionalGeneration`, and reading the wrong slice would
@@ -932,13 +1063,16 @@ mod tests {
     #[test]
     fn msa_op_json_without_architecture_defaults_to_m3() {
         let mut value = serde_json::to_value(msa_op()).expect("serialize msa op");
-        value
-            .as_object_mut()
-            .expect("object")
-            .remove("architecture");
+        let fields = value.as_object_mut().expect("object");
+        fields.remove("architecture");
+        // Specs serialized before the fused-half widths existed must stay
+        // readable, on M3's (no fused half) pricing.
+        fields.remove("output_gate_dim");
+        fields.remove("indexer_k_dim");
         let restored: MsaModuleOp =
             serde_json::from_value(value).expect("deserialize legacy msa op");
         assert_eq!(restored.architecture, MSA_ARCHITECTURE);
+        assert_eq!((restored.output_gate_dim, restored.indexer_k_dim), (0, 0));
     }
 
     /// A quant slice absent from the injected table is a typed silicon miss:

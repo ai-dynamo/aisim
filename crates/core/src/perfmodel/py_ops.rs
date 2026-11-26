@@ -3442,7 +3442,7 @@ macro_rules! msa_class {
                 if $is_context { "context" } else { "generation" };
 
             #[new]
-            #[pyo3(signature = (name, scale_factor, num_heads, num_kv_heads, hidden_size, head_dim, v_head_dim, index_n_heads, index_head_dim, index_topk, block_size, kvcache_quant_mode, fmha_quant_mode, gemm_quant_mode, dsa_architecture="GlmMoeDsaForCausalLM", dsa_scale_k=1.0, architecture="MiniMaxM3ForCausalLM"))]
+            #[pyo3(signature = (name, scale_factor, num_heads, num_kv_heads, hidden_size, head_dim, v_head_dim, index_n_heads, index_head_dim, index_topk, block_size, kvcache_quant_mode, fmha_quant_mode, gemm_quant_mode, dsa_architecture="GlmMoeDsaForCausalLM", dsa_scale_k=1.0, architecture="MiniMaxM3ForCausalLM", output_gate_dim=0, indexer_k_dim=0))]
             #[allow(clippy::too_many_arguments)]
             fn new(
                 name: String,
@@ -3462,6 +3462,8 @@ macro_rules! msa_class {
                 dsa_architecture: &str,
                 dsa_scale_k: f64,
                 architecture: &str,
+                output_gate_dim: u32,
+                indexer_k_dim: u32,
             ) -> PyResult<PyClassInitializer<Self>> {
                 let module = crate::operators::MsaModuleOp {
                     name,
@@ -3476,6 +3478,8 @@ macro_rules! msa_class {
                     index_head_dim,
                     index_topk,
                     block_size,
+                    output_gate_dim,
+                    indexer_k_dim,
                     kv_cache_dtype: kv_quant(kvcache_quant_mode)?,
                     fmha_quant_mode: fmha_quant(fmha_quant_mode)?,
                     gemm_quant_mode: gemm_quant(gemm_quant_mode)?,
@@ -3511,6 +3515,8 @@ macro_rules! msa_class {
                 kwargs.set_item("dsa_architecture", o.dsa_architecture.clone())?;
                 kwargs.set_item("dsa_scale_k", o.dsa_scale_k)?;
                 kwargs.set_item("architecture", o.architecture.clone())?;
+                kwargs.set_item("output_gate_dim", o.output_gate_dim)?;
+                kwargs.set_item("indexer_k_dim", o.indexer_k_dim)?;
                 Ok((args, kwargs))
             }
 
@@ -3574,6 +3580,16 @@ macro_rules! msa_class {
             #[getter(_block_size)]
             fn block_size(slf: PyRef<'_, Self>) -> PyResult<u32> {
                 Ok(slf.as_super().msa()?.block_size)
+            }
+
+            #[getter(_output_gate_dim)]
+            fn output_gate_dim(slf: PyRef<'_, Self>) -> PyResult<u32> {
+                Ok(slf.as_super().msa()?.output_gate_dim)
+            }
+
+            #[getter(_indexer_k_dim)]
+            fn indexer_k_dim(slf: PyRef<'_, Self>) -> PyResult<u32> {
+                Ok(slf.as_super().msa()?.indexer_k_dim)
             }
 
             #[getter(_kvcache_quant_mode)]

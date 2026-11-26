@@ -41,11 +41,14 @@ gate), and the indexer is 4 query / 1 KV head at 128 dims (``index_qk_proj``
 Modeling caveats that gate accuracy qualification (see
 ``model_configs/QWEN38_FLASH_NEXT_PROVENANCE.md``):
 
-* The MSA module op prices its own projections from a fixed formula
-  (Q, K+V, O, indexer-Q). QSA's fused q+gate GEMM and indexer K slice are not in
-  that formula, so this class adds one supplementary GEMM per group. The split
-  is FLOPS-exact but shape-inexact: one ``m=12288`` GEMM becomes ``m=6144``
-  inside the module plus ``m=6144`` outside it.
+* The MSA module op prices its own projections from a formula
+  (Q, K+V, O, indexer-Q). Qwen4-Exp fuses two more halves into those
+  projections: the sigmoid output gate that shares q_proj's weight, and the
+  indexer K half of ``index_qk_proj``. The op carries their widths
+  (``output_gate_dim`` / ``indexer_k_dim``) so the formula prices them inside
+  the module that is measured, rather than as GEMMs outside it. That matters
+  because SILICON/HYBRID return the whole module's measured latency: an
+  outside GEMM would be charged twice once the QSA rows resolve.
 * The MSA analytic path assumes an FP8 indexer. This checkpoint keeps the
   indexer in BF16 (it is listed in ``modules_to_not_convert``), so the analytic
   graph under-predicts index time; the measured QSA module rows are the anchor
@@ -313,12 +316,16 @@ class Qwen4ExpModel(Qwen35Model):
         ]
 
     def _qsa_ops(self, phase: str, prefix: str, count: float, cfg: common.Qwen4ExpConfig) -> list:
-        """QSA block: the MSA module plus the two projections MSA cannot price.
+        """QSA block: the MSA module op, priced with the checkpoint's fused halves.
 
-        The MSA module op prices Q, K+V, O and indexer-Q from its own SOL
-        formula. Qwen4-Exp's fused ``q+gate`` GEMM is twice as wide as Q, and its
-        fused indexer projection carries a K slice the formula omits, so both are
-        emitted as supplementary GEMMs. See the module docstring.
+        The MSA module op prices Q, K+V, O, indexer-Q and — through
+        ``output_gate_dim`` / ``indexer_k_dim`` — the two halves Qwen4-Exp fuses
+        into those projections: the sigmoid output gate that shares q_proj's
+        weight (``2 * heads * head_dim`` wide) and the indexer K half of the
+        fused ``index_qk_proj`` (``indexer_kv_heads * indexer_head_dim``). Both
+        stay inside the op because the module is what the collector measures:
+        SILICON and HYBRID return the whole module's latency, so a separate
+        GEMM outside it would be charged twice. See the module docstring.
         """
         tp = self.config.tp_size
         local_heads = max(1, self._num_heads // tp)
@@ -342,27 +349,14 @@ class Qwen4ExpModel(Qwen35Model):
             # QSA rows live under the checkpoint's own architecture in the msa
             # tables; the op must not read the M3 slice.
             architecture="Qwen4ExpForConditionalGeneration",
+            # Fused projection halves the M3 formula has no slot for.
+            output_gate_dim=local_heads * self._head_size,
+            indexer_k_dim=cfg.indexer_kv_heads * cfg.indexer_head_dim,
         )
         return [
             # q/k RMSNorm plus the fused residual add.
             ops.ElementWise(f"{prefix}_norm", count, 2 * self._hidden_size, 2 * self._hidden_size, 0.8),
             module,
-            # Output-gate half of the fused q_proj (sigmoid gate, shape-neutral).
-            ops.GEMM(
-                f"{prefix}_output_gate_gemm",
-                count,
-                local_heads * self._head_size,
-                self._hidden_size,
-                self._projection_gemm_quant_mode,
-            ),
-            # Indexer K half of the fused index_qk_proj.
-            ops.GEMM(
-                f"{prefix}_indexer_k_gemm",
-                count,
-                cfg.indexer_kv_heads * cfg.indexer_head_dim,
-                self._hidden_size,
-                self._projection_gemm_quant_mode,
-            ),
         ]
 
     def _ple_ops(self, phase: str, prefix: str, count: float, cfg: common.Qwen4ExpConfig) -> list:

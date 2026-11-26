@@ -119,16 +119,24 @@ def test_qsa_maps_onto_msa_with_checkpoint_geometry():
     assert (msa._index_n_heads, msa._index_head_dim) == (4, 128)
 
 
-def test_qsa_supplements_the_projections_msa_cannot_price():
-    """QSA's fused q+gate and indexer-K slices are outside MSA's SOL formula."""
+def test_qsa_fused_projection_halves_stay_inside_the_module():
+    """QSA's fused q+gate and indexer-K slices are priced by the module op.
+
+    They are the module's own GEMM columns, so SILICON/HYBRID — which return
+    the measured whole-module latency — must not see a second charge for them.
+    """
     ctx = _by_name(_build().context_ops)
 
-    gate = ctx["context_qsa_output_gate_gemm"]
-    indexer_k = ctx["context_qsa_indexer_k_gemm"]
-    # q_proj is 12288 = 2 x 24 x 256, so the gate slice is one 6144 chunk.
-    assert (gate._n, gate._k) == (24 * 256 // 8, 2560)
-    # index_qk_proj is 640 = (4 + 1) x 128; MSA prices only the query half.
-    assert (indexer_k._n, indexer_k._k) == (128, 2560)
+    msa = ctx["context_qsa_attention"]
+    # q_proj is 12288 = 2 x 24 x 256, so the gate slice is one 6144 chunk
+    # (6144 / tp 8 = 768 per rank).
+    assert msa._output_gate_dim == 24 * 256 // 8
+    # index_qk_proj is 640 = (4 + 1) x 128; MSA prices only the query half, so
+    # the op carries the key half's width (1 x 128, replicated).
+    assert msa._indexer_k_dim == 128
+    # No supplementary GEMMs outside the module: they would be double-charged.
+    assert "context_qsa_output_gate_gemm" not in ctx
+    assert "context_qsa_indexer_k_gemm" not in ctx
 
 
 def test_hyper_connection_blocks_replace_the_absent_layer_norms():

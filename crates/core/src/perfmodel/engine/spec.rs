@@ -532,6 +532,8 @@ pub(crate) mod tests {
             index_head_dim: 128,
             index_topk: 2048,
             block_size: 64,
+            output_gate_dim: 0,
+            indexer_k_dim: 0,
             kv_cache_dtype: KvCacheQuantMode::Bfloat16,
             fmha_quant_mode: FmhaQuantMode::Bfloat16,
             gemm_quant_mode: GemmQuantMode::Fp8Block,
