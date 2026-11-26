@@ -72,12 +72,14 @@ def verified_worker_build(src):
 
 
 def qualifying_constructor(constructor, qualify):
-    """Inject qualification only when this build's native signature accepts it."""
+    """Require native support before constructing a requested qualified case."""
     parameters = inspect.signature(constructor).parameters
     supported = {"state_dtype", "token_width"} <= parameters.keys()
 
     def wrapped(name, scale, kernel, phase, *args, **kwargs):
-        if qualify["on"] and supported:
+        if qualify["on"]:
+            if not supported:
+                raise ValueError("qualified Mamba case requires native state_dtype and token_width parameters")
             kwargs.setdefault("state_dtype", "bfloat16")
             kwargs.setdefault("token_width", 1)
         return constructor(name, scale, kernel, phase, *args, **kwargs)

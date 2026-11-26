@@ -52,7 +52,7 @@ def test_retains_warm_samples_for_every_rotated_round(tmp_path, monkeypatch):
         assert saved["value"] == [row["value"] for row in expected]
 
 
-def test_shim_calls_old_and_new_native_signatures():
+def test_shim_requires_qualification_support_but_keeps_legacy_controls():
     from affected_perf import qualifying_constructor
 
     def old(name, scale, kernel, phase):
@@ -61,9 +61,22 @@ def test_shim_calls_old_and_new_native_signatures():
     def new(name, scale, kernel, phase, *, state_dtype="unrecorded", token_width=1):
         return state_dtype, token_width
 
-    qualify = {"on": True}
+    def dtype_only(name, scale, kernel, phase, *, state_dtype="unrecorded"):
+        return name, scale, kernel, phase
+
+    def width_only(name, scale, kernel, phase, *, token_width=1):
+        return name, scale, kernel, phase
+
+    qualify = {"on": False}
     arguments = ("scan", 1, "selective_state_update", "generation")
-    assert qualifying_constructor(old, qualify)(*arguments) == arguments
+    for unsupported in (old, dtype_only, width_only):
+        wrapped = qualifying_constructor(unsupported, qualify)
+        assert wrapped(*arguments) == arguments
+        qualify["on"] = True
+        with pytest.raises(ValueError, match="requires native state_dtype and token_width"):
+            wrapped(*arguments)
+        qualify["on"] = False
+    qualify["on"] = True
     wrapped = qualifying_constructor(new, qualify)
     assert wrapped(*arguments) == ("bfloat16", 1)
     assert wrapped(*arguments, state_dtype="float16", token_width=4) == ("float16", 4)
