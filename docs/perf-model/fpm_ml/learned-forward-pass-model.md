@@ -100,7 +100,9 @@ decode GPU time at equal batch and KV size is 12% higher with overlap off on
 both 0.5.20 and 0.5.23, and a model trained on overlap-off steps over-predicts
 overlap-on decode by 14%. On SGLang before 0.5.23, overlap off avoids merged
 records at the cost of that offset. The same applies to the SGLang
-simulator's own collection hook.
+simulator's own collection hook. This was checked with NEXTN speculation and
+without speculation; other speculative algorithms (for example STANDALONE)
+were not tested with FPM under overlap, so run a short smoke capture first.
 
 ### Per-request fields
 

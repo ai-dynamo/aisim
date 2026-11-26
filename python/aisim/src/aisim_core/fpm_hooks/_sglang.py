@@ -142,6 +142,9 @@ def step_fields(reporter, batch, num_requests: int) -> dict[str, Any]:
         spec = snapshot()
         step["spec_num_steps"] = int(spec.get("num_steps", 0) or 0)
         step["spec_num_draft_tokens"] = int(spec.get("num_draft_tokens", 0) or 0)
+    width = _result_verify_width(result)
+    if width:
+        step["spec_num_draft_tokens"] = width
     accepted = accept_lengths(result, num_requests)
     if accepted is not None:
         step["spec_accept_lengths"] = accepted
@@ -169,13 +172,38 @@ def fill_decode_seq_lens(batch, context) -> bool:
     return True
 
 
-def speculative_pairs(batch, pairs: list[tuple[int, int]], step: dict[str, Any]) -> list[tuple[int, int]]:
+def _result_verify_width(result) -> int:
+    """The verify width the forward ran with, from its own result (0 when the result does not carry it).
+
+    Adaptive speculative decoding can switch the active width before a delayed
+    result is processed, so the result's width wins over the live configuration.
+    """
+    width = getattr(result, "speculative_num_draft_tokens", None)
+    return width if type(width) is int and width > 0 else 0
+
+
+def verify_width(reporter, result) -> int:
+    """Verify width (``1 + k``) of the forward behind ``result``; 0 without speculation.
+
+    Read from the result when it carries the width, else from the active
+    speculative configuration. Kept apart from the optional step diagnostics so
+    a diagnostics failure never changes the required decode extend.
+    """
+    width = _result_verify_width(result)
+    if width:
+        return width
+    snapshot = getattr(reporter, "_active_spec_config_snapshot", None)
+    if snapshot is None:
+        return 0
+    return int(snapshot().get("num_draft_tokens", 0) or 0)
+
+
+def speculative_pairs(batch, pairs: list[tuple[int, int]], width: int) -> list[tuple[int, int]]:
     """Decode pairs of a speculative step carry the verify width (``1 + k``) as the extend.
 
     A decode batch with speculation active runs one target verify over
-    ``spec_num_draft_tokens`` tokens per request; prefill (extend) batches are unchanged.
+    ``width`` tokens per request; prefill (extend) batches are unchanged.
     """
-    width = int(step.get("spec_num_draft_tokens", 0) or 0)
     mode = getattr(batch, "forward_mode", None)
     if width <= 1 or mode is None or not mode.is_decode():
         return pairs
@@ -347,7 +375,13 @@ def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
             step = {}
         if pairs is None:
             return metrics
-        return with_pairs(extended, metrics, speculative_pairs(batch, pairs, step), step)
+        try:
+            context = getattr(self, _STEP_CONTEXT, None)
+            width = verify_width(self, result if result is not None else (context[0] if context else None))
+        except Exception:
+            # The live configuration is unreadable; fall back to what diagnostics recorded.
+            width = int(step.get("spec_num_draft_tokens", 0) or 0)
+        return with_pairs(extended, metrics, speculative_pairs(batch, pairs, width), step)
 
     setattr(wrapped, _PATCHED, True)
     wrapped.__wrapped__ = build  # type: ignore[attr-defined]

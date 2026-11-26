@@ -307,6 +307,84 @@ def test_sglang_step_diagnostics_failure_keeps_lists(fake_sglang, caplog):
     assert "step diagnostics failed" in caplog.text
 
 
+def test_sglang_decode_extend_uses_the_forward_result_width(fake_sglang):
+    """Adaptive speculation can switch the live width before a delayed result is recorded."""
+    _, reporter = fake_sglang
+    sglang.patch_sglang_metrics_reporter(reporter)
+    mixin = reporter.SchedulerMetricsReporter(spec=(1, 2))  # controller already moved to width 2
+    batch = types.SimpleNamespace(forward_mode=_Mode("decode"), reqs=[_Req(seqlen=11)], seq_lens_cpu=[10])
+    mixin.forward_pass_device_timer.finish(0.004, "target_verify")
+    mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(speculative_num_draft_tokens=4, accept_lens=None))
+    _, m = mixin.published[-1]
+    assert m.extend_lengths == [4] and m.spec_num_draft_tokens == 4
+
+
+def test_sglang_decode_extend_survives_a_diagnostics_failure(fake_sglang, monkeypatch, caplog):
+    _, reporter = fake_sglang
+    sglang.patch_sglang_metrics_reporter(reporter)
+    mixin = reporter.SchedulerMetricsReporter(spec=(3, 4))
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("diagnostics broke")
+
+    monkeypatch.setattr(sglang, "step_fields", broken)
+    batch = types.SimpleNamespace(forward_mode=_Mode("decode"), reqs=[_Req(seqlen=11)], seq_lens_cpu=[10])
+    mixin.forward_pass_device_timer.finish(0.004, "target_verify")
+    mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(accept_lens=None))
+    _, m = mixin.published[-1]
+    assert m.extend_lengths == [4] and m.past_kv_lengths == [10]
+    assert "step diagnostics failed" in caplog.text
+
+
+def test_record_stops_while_frames_keep_arriving(monkeypatch):
+    """A publisher faster than the writer must not keep the recorder from stopping."""
+    from aisim_core.fpm_hooks import _record
+
+    class Again(Exception):
+        pass
+
+    class Socket:
+        def setsockopt(self, *_args):
+            pass
+
+        def connect(self, _endpoint):
+            pass
+
+        def recv_multipart(self, flags=0):
+            return [b"", (0).to_bytes(8, "big"), b"\x80"]  # never empty
+
+        def close(self, linger=0):
+            pass
+
+    class Context:
+        def socket(self, _kind):
+            return Socket()
+
+        def term(self):
+            pass
+
+    class Poller:
+        def register(self, *_args):
+            pass
+
+        def poll(self, _timeout):
+            return [1]
+
+    fake = types.SimpleNamespace(
+        Context=Context, Poller=Poller, Again=Again, SUB=0, RCVHWM=0, SUBSCRIBE=0, POLLIN=0, NOBLOCK=0
+    )
+    monkeypatch.setitem(sys.modules, "zmq", fake)
+    received = 0
+
+    def stop():
+        return received >= 5
+
+    for _frame in _record._zmq_frames("ipc:///x.0", stop, None):
+        received += 1
+        assert received <= 5
+    assert received == 5
+
+
 def test_sglang_hook_is_noop_when_native(fake_sglang):
     fpm, reporter = fake_sglang
     fpm.ScheduledRequestMetrics = request_fields.extend_struct(fpm.ScheduledRequestMetrics)

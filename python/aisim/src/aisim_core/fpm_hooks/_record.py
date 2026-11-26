@@ -80,11 +80,16 @@ def _zmq_frames(endpoint: str, stop: Callable[[], bool], deadline: float | None)
     socket.connect(endpoint)
     poller = zmq.Poller()
     poller.register(socket, zmq.POLLIN)
+
+    def running() -> bool:
+        return not stop() and (deadline is None or time.monotonic() < deadline)
+
     try:
-        while not stop() and (deadline is None or time.monotonic() < deadline):
+        while running():
             if not poller.poll(200):
                 continue
-            while True:
+            # Re-check between frames: a publisher at least as fast as the writer keeps the queue nonempty.
+            while running():
                 try:
                     parts = socket.recv_multipart(flags=zmq.NOBLOCK)
                 except zmq.Again:
