@@ -744,9 +744,13 @@ class NaiveKVCacheEstimator:
     def _dtype_bytes(hf_config: dict) -> int:
         """dtype byte width from ``torch_dtype``/``dtype``. Defaults to 2 (bf16)."""
         value = hf_config.get("torch_dtype")
-        if not isinstance(value, str) or not value:
+        if not isinstance(value, str) or not value.strip():
             value = hf_config.get("dtype")
-        dtype_str = value.lower() if isinstance(value, str) else ""
+        if not isinstance(value, str) or not value.strip():
+            if "torch_dtype" in hf_config or "dtype" in hf_config:
+                raise ValueError("HF config torch_dtype or dtype must be a nonempty string")
+            return 2
+        dtype_str = value.strip().lower()
         if dtype_str in ("float32", "fp32"):
             return 4
         if dtype_str in ("bfloat16", "float16", "bf16", "fp16", "half"):
@@ -817,6 +821,7 @@ class NaiveKVCacheEstimator:
         keys directly (unsupported architecture). Missing values stay ``None`` /
         ``0`` so the formulas can fail closed.
         """
+        sliding_window, num_swa_layers, num_global_layers = cls._swa_layout(hf_config)
         if parsed is not None:
             extra = parsed.get("extra_params")
             if isinstance(extra, dict):
@@ -840,11 +845,9 @@ class NaiveKVCacheEstimator:
                 "inter": parsed.get("inter_size"),
                 "num_experts": parsed.get("num_experts") or 0,
                 "moe_inter": parsed.get("moe_inter_size") or 0,
-                # Supported (native-capable) archs do not take the naive path, so the
-                # sliding-window split is only mined from the HF config (below).
-                "sliding_window": None,
-                "num_swa_layers": None,
-                "num_global_layers": None,
+                "sliding_window": sliding_window,
+                "num_swa_layers": num_swa_layers,
+                "num_global_layers": num_global_layers,
             }
 
         dimension = cls._raw_dimension
@@ -874,7 +877,6 @@ class NaiveKVCacheEstimator:
         # explicit KV-head count instead.
         if hf_config.get("multi_query") and not hf_config.get("new_decoder_architecture"):
             num_kv_heads = 1
-        sliding_window, num_swa_layers, num_global_layers = cls._swa_layout(hf_config)
         return {
             "layers": layers,
             "num_kv_heads": num_kv_heads or heads,
@@ -896,8 +898,6 @@ class NaiveKVCacheEstimator:
     def _deepseek_v4_pool(self) -> dict[str, Any]:
         from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
 
-        if self.pp_size != 1:
-            raise ValueError("DeepSeek V4 cache sizing requires PP=1")
         return deepseek_v4_state_cache(self.geometry["deepseek_v4"], indexer_cache_dtype="auto")
 
     def kv_bytes_per_token(self) -> float | None:
@@ -998,6 +998,8 @@ class NaiveKVCacheEstimator:
         and assigns the remaining budget in whole compressed-KV blocks.
         """
         if "deepseek_v4" in self.geometry:
+            if self.pp_size != 1:
+                raise ValueError("DeepSeek V4 cache sizing requires PP=1")
             pool = self._deepseek_v4_pool()
             # Reserve one request's window and compressor state before assigning whole compressed-KV blocks.
             blocks = max(0, int(kv_budget_bytes - pool["bytes_per_request"]) // pool["bytes_per_block"])

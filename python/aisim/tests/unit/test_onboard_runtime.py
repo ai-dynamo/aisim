@@ -2505,31 +2505,66 @@ def test_glm_campaign_with_wrong_median_repeats_cannot_be_finalized(tmp_path, ca
         validation_workflow._collection_source(request, root)
 
 
-@pytest.mark.parametrize(
-    ("reader", "refusal"),
-    [
-        ("finalization", "formal FPM rows differ from the verified native collection or include unrelated cells"),
-        ("validation", "published formal rows differ from verified native collection"),
-    ],
-)
-def test_glm_producer_campaign_is_compared_under_the_label_of_its_sidecar(
-    tmp_path, capsys, monkeypatch, reader, refusal
-):
+@pytest.mark.parametrize("historical", [False, True], ids=["frozen-producer", "before-frozen-digests"])
+def test_glm_publication_policy_uses_frozen_cells_and_checkpoint_rows(tmp_path, capsys, monkeypatch, historical):
+    from functools import partial
+
     from collector.fpm_forward import database
+    from collector.fpm_forward.planner import GlmProducerDigests
+    from collector.fpm_forward.repeatability import load_repeatability_source
 
     from aisim.support import validation_workflow
     from aisim.support.finalization import finalize
 
-    # Rows of the single-sample label differ from the published median rows, so each reader must take the label of the
-    # sidecar.
+    # Publish the pair under the former single-sample label. Only the historical plan omitted producer digests.
+    with monkeypatch.context() as old_writer:
+        if historical:
+            read_digests = GlmProducerDigests.from_runtime
+            old_writer.setattr(
+                GlmProducerDigests,
+                "from_runtime",
+                staticmethod(lambda directory=None: read_digests(directory) if directory else None),
+            )
+        old_writer.setattr(database, "aggregate_cell", partial(database.aggregate_cell, median_policy=False))
+        _, request, _, root = _glm_producer_collection(tmp_path, capsys, receipts=False)
+    plan = load_repeatability_source(next((root / "fpm-artifacts").iterdir()))
+    path = next((root / "fpm-checkpoint").rglob("fpm_forward.json"))
+    checkpoint = json.loads(path.read_bytes())
+    publication = checkpoint["database"]
+    # The collecting runner sealed the canonical rows independently of the database sidecar.
+    pair = database.validate_formal_database_commit(Path(publication["parquet"]), Path(publication["metadata"]), plan)
+    assert pair["measurement_policy"] == database.SINGLE_SAMPLE_MEASUREMENT_POLICY
+    publication["cell_rows"] = pair["cell_rows"]
+    _write(path, checkpoint)
+    if historical:
+        validation_workflow._collection_source(request, root)
+        finalize(request, root, tmp_path / "historical")
+        del publication["cell_rows"]
+        _write(path, checkpoint)
+    with pytest.raises(ValueError, match="rows differ"):
+        finalize(request, root, tmp_path / "refused")
+    with pytest.raises(ValueError, match="rows differ"):
+        validation_workflow._collection_source(request, root)
+
+
+def test_glm_publication_reads_the_hash_block_of_the_accepted_deployment(tmp_path, capsys):
+    from aisim.support import validation_workflow
+    from aisim.support.finalization import finalize
+
     _, request, _, root = _glm_producer_collection(tmp_path, capsys)
-    monkeypatch.setattr(database, "published_median_policy", lambda metadata: False)
-    with pytest.raises(ValueError) as error:
-        if reader == "finalization":
-            finalize(request, root, tmp_path / "finalized")
-        else:
-            validation_workflow._collection_source(request, root)
-    assert str(error.value) == refusal
+    assert request.profile_deployment().resources.runtime_memory.hash_block_size_tokens == 2176
+    artifact = next(root.glob("fpm-artifacts/*/cells/*/raw/*/benchmark.json"))
+    payload = json.loads(artifact.read_bytes())
+    payload["serving_config"].update(block_size=1088, hash_block_size=1088)
+    _write(artifact, payload)
+    with pytest.raises(
+        ValueError, match="hash_block_size differs from the accepted deployment: expected 2176, found 1088"
+    ):
+        finalize(request, root, tmp_path / "refused")
+    with pytest.raises(
+        ValueError, match="hash_block_size differs from the accepted deployment: expected 2176, found 1088"
+    ):
+        validation_workflow._collection_source(request, root)
 
 
 @pytest.mark.parametrize("receipts", [True, False], ids=["receipts", "no-receipts"])

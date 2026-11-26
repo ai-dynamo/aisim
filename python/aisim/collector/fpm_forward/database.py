@@ -14,7 +14,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -33,6 +33,9 @@ from .native_artifact import (
     validate_native_collection,
 )
 from .planner import FPMCell, FPMCollectionPlan, backend_identity_columns
+
+if TYPE_CHECKING:
+    from aisim_core.sdk.fpm_profile import FpmDeploymentProfile
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +236,7 @@ def aggregate_cell(
     expected_attempt_id: str,
     dense_synthetic_kv: bool = True,
     median_policy: bool = True,
+    deployment: FpmDeploymentProfile | None = None,
 ) -> list[dict[str, Any]]:
     """Validate native rank artifacts and take max-rank latency per grid point.
 
@@ -242,18 +246,20 @@ def aggregate_cell(
     measurement protocol and records, because its retained timing can move
     together with its totals, which native validation alone accepts.
     A row of a GLM-5.3-Flash producer cell carries the vLLM median policy with
-    its counts, state protocol and timing boundary. Revalidating a publication
-    that was sealed with the single-sample label passes ``median_policy=False``.
+    its counts, state protocol and timing boundary. Readers pass ``median_policy=False``
+    for a historical single-sample publication verified against the collector checkpoint.
     """
 
     if not expected_attempt_id:
         raise ValueError(f"cannot aggregate {cell.cell_id} without an expected Collector attempt identity")
     _validate_backend_markers(cell, cell_dir)
+    plan_deployment = plan.deployment_profile(cell) if getattr(plan, "fpm_profile", None) is not None else None
     collection = validate_native_collection(
         cell,
         cell_dir / "raw",
         expected_plan_sha256=plan.sha256,
         expected_attempt_id=expected_attempt_id,
+        deployment=deployment or plan_deployment,
     )
     if collection.execution_mode == "native_graph_policy":
         # Raises on a malformed or contradictory record. A gap that the reader reports, such as prompt hashes that
@@ -262,10 +268,9 @@ def aggregate_cell(
     runtime_version = getattr(plan, "runtime_backend_version", None)
     if runtime_version is not None and collection.backend_version != runtime_version:
         raise ValueError("observed backend version differs from the frozen runtime version")
-    deployment = plan.deployment_profile(cell) if getattr(plan, "fpm_profile", None) is not None else None
     backend_version = (
-        deployment.backend_version
-        if deployment is not None
+        plan_deployment.backend_version
+        if plan_deployment is not None
         else getattr(plan, "backend_version", None) or collection.backend_version
     )
     capability = plan.capability
@@ -478,9 +483,14 @@ def published_dense_synthetic_cells(metadata: dict[str, Any]) -> frozenset[str]:
     return frozenset(cells)
 
 
-def published_median_policy(metadata: dict[str, Any]) -> bool:
-    """Whether the sidecar of a publication names the median policy of GLM-5.3-Flash producer rows."""
-    return metadata.get("measurement_policy") == VLLM_PREFIX_SEED_MEDIAN_POLICY
+def published_median_policy(metadata: dict[str, Any], cell: FPMCell, checkpoint_rows: dict[str, str] | None) -> bool:
+    """Only a pre-digest cell with independently sealed single-sample rows can use the historical label."""
+    return (
+        cell.glm_producer_digests is not None
+        or metadata.get("measurement_policy") != SINGLE_SAMPLE_MEASUREMENT_POLICY
+        or not checkpoint_rows
+        or checkpoint_rows.get(cell.cell_id) != metadata["cell_rows"][cell.cell_id]
+    )
 
 
 def _validate_median_publication(metadata: dict[str, Any], rows: list[dict[str, Any]], backend: str) -> None:

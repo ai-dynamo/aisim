@@ -994,13 +994,25 @@ def test_naive_estimate_of_an_unknown_wrapper_reads_its_decoder(key):
     assert (named.architecture, named.geometry) == ("UnknownDecoderForCausalLM", flat.geometry)
 
 
+@pytest.mark.parametrize("dtype", [{"torch_dtype": 5}, {"dtype": {}}, {"torch_dtype": 5, "dtype": []}])
 @pytest.mark.parametrize("nested", [False, True], ids=["flat", "decoder"])
-def test_naive_estimate_reads_a_dtype_that_is_no_string_as_the_default_width(nested):
-    # The width of a dtype that names no known type is 2 bytes, and so is the width of a value that is no string.
-    decoder = {**_UNKNOWN_DECODER, "torch_dtype": 5}
-    config = {"architectures": [_UNKNOWN_WRAPPER], **({"text_config": decoder} if nested else decoder)}
-    estimator = NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
-    assert (estimator.dtype_bytes, estimator.kv_bytes_per_token()) == (2, _UNKNOWN_DECODER_KV_BYTES)
+def test_naive_estimate_refuses_malformed_decoder_precision(nested, dtype):
+    decoder = {key: value for key, value in _UNKNOWN_DECODER.items() if key != "torch_dtype"} | dtype
+    config = (
+        {"architectures": [_UNKNOWN_WRAPPER], "torch_dtype": "float32", "text_config": decoder} if nested else decoder
+    )
+    with pytest.raises(ValueError, match="torch_dtype or dtype must be a nonempty string"):
+        NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
+
+
+def test_wrapped_gpt_oss_retains_its_sliding_window(tmp_path):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    decoder = _load_pre_downloaded_hf_config("openai/gpt-oss-20b")
+    wrapped = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": decoder})
+    estimator = NaiveKVCacheEstimator.from_model_path(wrapped, tp_size=1, pp_size=1, allow_hf_config_download=False)
+    # 12 global layers grow at 2,048 bytes per token each, 12 sliding layers retain only 128 tokens.
+    assert estimator.get_kvcache_max_tokens(96 * 1024**2) == (96 * 1024**2) // (12 * 2048) - 128 == 3968
 
 
 def test_malformed_torch_dtype_keeps_the_explicit_decoder_dtype():
@@ -1017,8 +1029,9 @@ def test_wrapped_deepseek_v4_uses_the_decoders_compressed_cache(tmp_path):
     config = _load_pre_downloaded_hf_config(model)
     wrapper = {"architectures": [_UNKNOWN_WRAPPER], "text_config": config}
     wrapped = _write_config(tmp_path, wrapper)
-    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == 3_915
-    assert estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=1) == 3_915
+    for pp_size in (1, 4):
+        assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=pp_size) == 3_915
+        assert estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=pp_size) == 3_915
     # The packed Flash pool uses 26 fixed rows of 1,002,240 bytes for one request and one row per 256 tokens.
     state = 26 * 1_002_240
     for raw in (config, wrapper):
@@ -1026,6 +1039,9 @@ def test_wrapped_deepseek_v4_uses_the_decoders_compressed_cache(tmp_path):
         assert [estimator.get_kvcache_max_tokens(budget) for budget in (3_915, state, state + 1_002_239)] == [0, 0, 0]
         assert estimator.get_kvcache_max_tokens(state + 1_002_240) == 256
         assert estimator.get_kvcache_max_tokens(state + 2 * 1_002_240) == 512
+        pipeline = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=1, pp_size=4)
+        with pytest.raises(ValueError, match="DeepSeek V4 cache sizing requires PP=1"):
+            pipeline.get_kvcache_max_tokens(state + 1_002_240)
     with pytest.raises(ValueError, match="DeepSeek V4 stores fp8_ds_mla KV"):
         estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=1, kvcache_quant_mode="bfloat16")
 

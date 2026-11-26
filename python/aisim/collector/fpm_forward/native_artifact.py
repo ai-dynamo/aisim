@@ -12,13 +12,13 @@ import logging
 import math
 import os
 import re
+import secrets
 import statistics
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aisim.fpm_contract import (
     FPM_BENCHMARK_RESULT_GLOB,
@@ -35,9 +35,12 @@ from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
 from collector import glm53flash_attention_tokens
 from collector.glm53flash_runtime_identity import BASELINE_VERSIONS
 
-from .glm53flash_points import MAX_BATCH, MAX_CONTEXT
+from .glm53flash_points import CHUNK_ALIGN, MAX_BATCH, MAX_CONTEXT
 from .planner import FPMCell, GlmProducerDigests
 from .types import KVWARM_STRATEGIES
+
+if TYPE_CHECKING:
+    from aisim_core.sdk.fpm_profile import FpmDeploymentProfile
 
 logger = logging.getLogger(__name__)
 
@@ -408,8 +411,9 @@ def write_producer_receipt(cell: FPMCell, cell_dir: Path, *, plan_sha256: str, a
         "schema_version": 1,
     }
     path = cell_dir / PRODUCER_RECEIPT_FILENAME
-    descriptor, name = tempfile.mkstemp(dir=cell_dir, prefix=f".{path.name}.")
-    temporary = Path(name)
+    temporary = cell_dir / f".{path.name}.{secrets.token_hex(16)}"
+    # The receipt follows the campaign's umask, like the other cell metadata.
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
@@ -490,6 +494,10 @@ def _validate_glm_repetitions(
     )
     raw = measurement.get("raw_fpms") if isinstance(measurement, dict) else None
     scheduled = _expected_scheduled(point)
+    steps = [scheduled]
+    if point["point_type"] == "decode":
+        # The first decode advances every request by one token before the measured step.
+        steps.insert(0, {**scheduled, "sum_decode_kv_tokens": scheduled["sum_decode_kv_tokens"] - point["batch_size"]})
     previous_attempt = previous_forward = -1
     for index, repetition in enumerate(repetitions):
         role = "warmup" if index < warmups else "measurement"
@@ -504,33 +512,31 @@ def _validate_glm_repetitions(
             raise ValueError(f"{error}: invalid accepted {role} at repetition {index}: {path}")
         previous_attempt = repetition["attempt"]
         fpms = repetition.get("fpms")
-        fpm = fpms[-1] if isinstance(fpms, list) and fpms else None
-        if (
-            not isinstance(fpm, dict)
-            or not _same(fpm.get("dp_rank"), rank)
-            or not _same(fpm.get("counter_id"), point["benchmark_id"])
-            or type(fpm.get("wall_time")) not in {int, float}
-            or not math.isfinite(fpm["wall_time"])
-            or fpm["wall_time"] <= 0
-            or not isinstance(fpm.get("scheduled_requests"), dict)
-            or any(not _same(fpm["scheduled_requests"].get(key), value) for key, value in scheduled.items())
-        ):
+        if not isinstance(fpms, list) or len(fpms) != len(steps):
             raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
-        sample = fpm.get("benchmark_sample")
-        forward = sample.get("forward_index") if isinstance(sample, dict) else None
-        if type(forward) is not int or forward <= previous_forward:
-            raise ValueError(f"{error}: missing, repeated or unordered forward at repetition {index}: {path}")
-        previous_forward = forward
-        if index >= warmups and isinstance(raw, list) and len(raw) == measured:
-            observed = raw[index - warmups]
-            if isinstance(observed, dict) and (
-                observed.get("wall_time") != fpm["wall_time"]
-                or (
-                    isinstance(observed.get("benchmark_sample"), dict)
-                    and observed["benchmark_sample"].get("forward_index") != previous_forward
-                )
+        for step, (fpm, expected) in enumerate(zip(fpms, steps, strict=True)):
+            if (
+                not isinstance(fpm, dict)
+                or not _same(fpm.get("dp_rank"), rank)
+                or not _same(fpm.get("counter_id"), point["benchmark_id"])
+                or type(fpm.get("wall_time")) not in {int, float}
+                or not math.isfinite(fpm["wall_time"])
+                or fpm["wall_time"] <= 0
+                or not isinstance(fpm.get("scheduled_requests"), dict)
+                or any(not _same(fpm["scheduled_requests"].get(key), value) for key, value in expected.items())
             ):
-                raise ValueError(f"{error}: measurement {index - warmups} differs from its saved raw sample: {path}")
+                raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
+            sample = fpm.get("benchmark_sample")
+            forward = sample.get("forward_index") if isinstance(sample, dict) else None
+            if type(forward) is not int or forward <= previous_forward or not _same(sample.get("sample_index"), step):
+                raise ValueError(f"{error}: missing, repeated or unordered forward at repetition {index}: {path}")
+            previous_forward = forward
+        if index >= warmups and isinstance(raw, list) and len(raw) == measured:
+            position = index - warmups
+            fpm = fpms[-1]
+            expected_raw = {**fpm, "benchmark_sample": {**fpm["benchmark_sample"], "sample_index": position}}
+            if json.dumps(raw[position], sort_keys=True) != json.dumps(expected_raw, sort_keys=True):
+                raise ValueError(f"{error}: measurement {position} differs from its saved raw sample: {path}")
 
 
 def _validate_glm_provenance(
@@ -635,9 +641,8 @@ def _validate_glm_provenance(
     # prefill chunks that the scheduler splits at block boundaries.
     if not _same(serving.get("mamba_cache_mode"), "align"):
         raise lacks("serving_config.mamba_cache_mode")
-    if type(serving.get("block_size")) is not int or not _same(
-        serving.get("hash_block_size"), serving.get("block_size")
-    ):
+    block = serving.get("block_size")
+    if type(block) is not int or block <= 0 or block % CHUNK_ALIGN or not _same(serving.get("hash_block_size"), block):
         raise lacks("serving_config.block_size")
     if serving.get("need_mamba_block_aligned_split") is not True:
         raise lacks("serving_config.need_mamba_block_aligned_split")
@@ -1142,6 +1147,7 @@ def validate_native_collection(
     *,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
+    deployment: FpmDeploymentProfile | None = None,
 ) -> NativeCollection:
     """Validate a complete native rank set and return synchronized measurements."""
 
@@ -1226,6 +1232,14 @@ def validate_native_collection(
             raise ValueError(f"native DP ranks disagree on input provenance: {path}")
         # One launch shares one scheduler configuration, so the ranks must agree on the checkpoint evidence of it.
         serving = payload.get("serving_config")
+        if execution_mode == "native_graph_policy" and deployment is not None:
+            memory = deployment.resources.runtime_memory
+            expected_block = memory.hash_block_size_tokens if memory is not None else None
+            if expected_block is not None and serving["hash_block_size"] != expected_block:
+                raise ValueError(
+                    f"native GLM-5.3-Flash serving_config.hash_block_size differs from the accepted deployment: "
+                    f"expected {expected_block}, found {serving['hash_block_size']}: {path}"
+                )
         checkpoint = (
             serving.get("mamba_prefill_checkpoint", _NO_CHECKPOINT_EVIDENCE)
             if isinstance(serving, dict)

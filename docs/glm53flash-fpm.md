@@ -193,12 +193,16 @@ this producer. The cell selects these rules, not the artifact:
   rows. The `repetition_evidence_sha256` of each row must be the SHA-256 of
   the line of that file with the `benchmark_id` of the row. Each line must
   record five accepted warmups followed by ten measurements of that point.
-  Each repetition has its own index and an increasing attempt number. Its
-  last forward must have the rank and scheduled work of the point and a
-  positive wall time. The ten measured forwards match their saved raw samples.
+  Each repetition has its own index and an increasing attempt number. Prefill
+  records one forward. Decode records two forwards for the full batch, with
+  one fewer KV token per request in the first. The reader verifies each
+  forward's rank, scheduled work, positive wall time and order. The ten
+  measured forwards match their saved raw samples in every field except the
+  sample index, which the producer renumbers for publication.
 - `serving_config` must record prefix caching, synchronous scheduling, the
-  Mamba cache mode `align`, an integer `block_size`, a `hash_block_size`
-  equal to it, and the block-aligned split of prefill chunks.
+  Mamba cache mode `align`, the block-aligned split of prefill chunks, and
+  equal scheduler and hash block sizes in positive multiples of four tokens.
+  An accepted deployment's `hash_block_size_tokens` must match the observed size.
 - The measurement protocol must be present. It must hold the producer's record
   of 5 warmups, 10 measurements and their reduction, the `seeded_tokens`
   content and Dynamo's execution evidence contract. It must record a global
@@ -559,8 +563,10 @@ another policy or rows without a policy, in either order, and it leaves the
 existing pair unchanged. A database root holds one pair for each system,
 backend and backend version, so publish a GLM-5.3-Flash collection to a clean
 destination, or to a root whose pair for them holds no rows of another policy
-and no rows without a policy. Finalization and collection validation read the
-policy from the sidecar of the publication that they check.
+and no rows without a policy. Finalization and collection validation require
+the median policy for cells with frozen producer digests. For older cells,
+they accept a single-sample publication when each cell's rows match the hash
+sealed independently in the collector checkpoint.
 
 Align-4 constrains collection only. The consumer answers queries for any
 prefix length.

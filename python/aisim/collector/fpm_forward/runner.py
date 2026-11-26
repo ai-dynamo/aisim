@@ -1885,6 +1885,7 @@ def _runtime_collection_summary(
     *,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
+    plan: FPMCollectionPlan | None = None,
 ) -> dict[str, Any]:
     """Return auditable unique-axis counts from a validated native grid."""
 
@@ -1893,6 +1894,7 @@ def _runtime_collection_summary(
         raw_root,
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
+        deployment=plan.deployment_profile(cell) if getattr(plan, "fpm_profile", None) is not None else None,
     )
     points = tuple(measurement.point for measurement in collection.points)
     summary = {
@@ -2057,6 +2059,7 @@ def _recover_completed_attempt(
             cell,
             cell_dir / "raw",
             expected_plan_sha256=plan.sha256,
+            plan=plan,
             expected_attempt_id=attempt_id,
         )
     except (OSError, TypeError, ValueError) as error:
@@ -2408,6 +2411,7 @@ def _run_collection_impl(
                     cell,
                     root / "cells" / cell.cell_id / "raw",
                     expected_plan_sha256=plan.sha256,
+                    plan=plan,
                     expected_attempt_id=_required_attempt_id(entry, cell.cell_id),
                 )
             )
@@ -2607,6 +2611,7 @@ def _run_collection_impl(
                 cell,
                 cell_dir / "raw",
                 expected_plan_sha256=plan.sha256,
+                plan=plan,
                 expected_attempt_id=attempt_id,
             )
             write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id=attempt_id)

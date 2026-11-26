@@ -13,8 +13,11 @@ import copy
 import functools
 import hashlib
 import json
+import multiprocessing
+import os
 import re
 import shutil
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -242,24 +245,30 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
         forward = -1
         for index in range(15):
             observed = raw[index - 5] if isinstance(raw, list) and 5 <= index < 5 + len(raw) else None
+            steps = 2 if point["point_type"] == "decode" else 1
             observed = observed if isinstance(observed, dict) else {}
             sample = observed.get("benchmark_sample")
-            forward = sample.get("forward_index", forward + 1) if isinstance(sample, dict) else forward + 1
-            repetitions.append(
-                {
-                    "attempt": index,
-                    "repetition": index,
-                    "role": "warmup" if index < 5 else "measurement",
-                    "fpms": [
-                        {
-                            "counter_id": point["benchmark_id"],
-                            "dp_rank": payload["dp"]["rank"],
-                            "scheduled_requests": _expected_scheduled(point),
-                            "wall_time": observed.get("wall_time", fpm["wall_time"]),
-                            "benchmark_sample": {"forward_index": forward},
-                        }
-                    ],
+            sample = sample if isinstance(sample, dict) else {}
+            forward = sample.get("forward_index", forward + steps)
+            measured = {
+                "counter_id": point["benchmark_id"],
+                "dp_rank": payload["dp"]["rank"],
+                "scheduled_requests": _expected_scheduled(point),
+                "wall_time": fpm["wall_time"],
+                **observed,
+                "benchmark_sample": {**sample, "forward_index": forward, "sample_index": steps - 1},
+            }
+            fpms = [measured]
+            if steps == 2:
+                first = copy.deepcopy(measured)
+                first["scheduled_requests"] = {
+                    **_expected_scheduled(point),
+                    "sum_decode_kv_tokens": point["total_kv_read_tokens"] - point["batch_size"],
                 }
+                first["benchmark_sample"].update(sample_index=0, forward_index=forward - 1)
+                fpms.insert(0, first)
+            repetitions.append(
+                {"attempt": index, "repetition": index, "role": "warmup" if index < 5 else "measurement", "fpms": fpms}
             )
         record = {"benchmark_id": point["benchmark_id"], "point_type": point["point_type"], "repetitions": repetitions}
         lines.append(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
@@ -323,7 +332,7 @@ def _glm_producer_shape(tmp_path, breakage=None):
             walls = [fpm["wall_time"] * (1 + 0.01 * (index - 4)) for index in range(10)]
             tokens = row["point"]["total_prefill_tokens"] or row["point"]["batch_size"]
             samples = []
-            forward += 10 if phase == "decode" else 5
+            forward += 11 if phase == "decode" else 5
             for index, wall in enumerate(walls):
                 sample = copy.deepcopy(templates[phase])
                 start = 100.0 * position + index
@@ -593,6 +602,13 @@ def _rewrite_sidecar(payload: dict, sidecar: Path, lines: list[bytes]) -> None:
             "invalid accepted warmup",
         ),
         (lambda record: record["repetitions"][4].update(fpms=[]), "invalid forward for warmup"),
+        (lambda record: record["repetitions"][4]["fpms"].append({}), "invalid forward for warmup"),
+        (
+            lambda record: record["repetitions"][5]["fpms"][-1]["benchmark_sample"]["cudagraph"].update(
+                runtime_mode="NONE"
+            ),
+            "differs from its saved raw sample",
+        ),
         (
             lambda record: record["repetitions"][4]["fpms"][-1]["scheduled_requests"].update(sum_prefill_tokens=0),
             "invalid forward for warmup",
@@ -613,6 +629,27 @@ def test_glm_publication_checks_the_contents_of_each_repetition(tmp_path, change
     payload = glm_native_payload("prefill", points=[PREFILL_COLD])
     _glm_producer_shape(tmp_path)("prefill", payload)
     artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    _check_altered_repetition(tmp_path, cell, payload, artifact, change, expected)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda record: record["repetitions"][4]["fpms"].pop(0),
+        lambda record: record["repetitions"][4]["fpms"][0]["scheduled_requests"].update(num_decode_requests=2),
+        lambda record: record["repetitions"][4]["fpms"][0]["scheduled_requests"].update(sum_decode_kv_tokens=4096),
+    ],
+    ids=["missing-first-step", "wrong-first-batch", "wrong-first-kv-count"],
+)
+def test_glm_publication_requires_both_decode_steps(tmp_path, change):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[DECODE_POINTS[0]])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    _check_altered_repetition(tmp_path, cell, payload, artifact, change, "invalid forward for warmup")
+
+
+def _check_altered_repetition(tmp_path, cell, payload, artifact, change, expected):
     sidecar = artifact.with_suffix(".repetitions.jsonl")
     record = json.loads(sidecar.read_bytes())
     change(record)
@@ -883,6 +920,14 @@ REFUSALS = [
         lambda p, _: p["serving_config"].update(mamba_cache_mode="none"),
         id="mamba-mode",
     ),
+    *[
+        pytest.param(
+            "serving_config.block_size",
+            lambda p, _, size=size: p["serving_config"].update(block_size=size, hash_block_size=size),
+            id=f"invalid-block-size-{size}",
+        )
+        for size in (0, -4, 3)
+    ],
     pytest.param(
         "serving_config.block_size",
         lambda p, _: p["serving_config"].update(block_size=16),
@@ -1513,19 +1558,22 @@ def test_glm_publication_refuses_a_producer_record_whose_retained_median_moved(t
 
 
 def _publication_refusal(tmp_path, phase, tamper) -> str:
-    """Shape a GLM-5.3-Flash artifact as the producer writes it, apply ``tamper``, and return publication's refusal.
+    """Verify publication refuses the artifact and return the measurement reader's diagnosis.
 
-    The native validator must accept the tampered artifact, so that the refusal comes from the measurement record.
+    A raw sample can also disagree with the independent, unmodified repetition sidecar.
     """
     cell = glm_cell(phase)
     points = [PREFILL_COLD, PREFILL_CACHED] if phase == "prefill" else DECODE_POINTS
     payload = glm_native_payload(phase, points=points)
     _glm_producer_shape(tmp_path)(phase, payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    collection = _validate(tmp_path, cell)
     tamper(payload)
-    write_glm_rank(_pod(tmp_path, cell), payload)
-    _validate(tmp_path, cell)
-    with pytest.raises(ValueError) as error:
+    artifact.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
         database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
+    with pytest.raises(ValueError) as error:
+        database.extract_measurement_evidence(tmp_path / "raw", collection)
     return str(error.value)
 
 
@@ -2043,18 +2091,17 @@ def test_glm_rows_cannot_join_rows_without_a_measurement_policy(tmp_path):
     assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
 
 
-@pytest.mark.parametrize(
-    ("policy", "median"),
-    [
-        ("dynamo_native_single_sample_v1", False),
-        ("dynamo_native_single_sample_power_window_v1", False),
-        ("vllm_native_fpm_prefix_seed_median_v1", True),
-        (None, False),
-    ],
-    ids=["single-sample", "power-window", "median", "none"],
-)
-def test_only_the_median_label_of_a_sidecar_selects_the_median_rows(policy, median):
-    assert database.published_median_policy({"measurement_policy": policy}) is median
+def test_only_verified_old_single_sample_rows_can_select_the_historical_policy():
+    cell = glm_cell("prefill")
+    old = replace(cell, glm_producer_digests=None)
+    hashes = {cell.cell_id: "a" * 64}
+    metadata = {"measurement_policy": database.SINGLE_SAMPLE_MEASUREMENT_POLICY, "cell_rows": hashes}
+    assert not database.published_median_policy(metadata, old, hashes)
+    assert database.published_median_policy(metadata, cell, hashes)
+    assert database.published_median_policy(metadata, old, None)
+    assert database.published_median_policy(metadata, old, {cell.cell_id: "b" * 64})
+    metadata["measurement_policy"] = database.VLLM_PREFIX_SEED_MEDIAN_POLICY
+    assert database.published_median_policy(metadata, old, hashes)
 
 
 @pytest.mark.parametrize(
@@ -2137,23 +2184,27 @@ def test_median_writer_rejects_rows_that_violate_the_native_contract(tmp_path, f
 
 
 @pytest.mark.parametrize("case", ["single-sample-label", "median-label"])
-def test_publication_verifies_with_the_label_of_its_sidecar(tmp_path, case):
+def test_publication_verifies_with_its_frozen_cells_and_sealed_checkpoint_rows(tmp_path, case):
     import pyarrow.parquet as pq
 
     plan = _glm_plan()
     cells = _producer_cells(tmp_path)
     median = case == "median-label"
+    if not median:
+        cells = {
+            phase: (replace(cell, glm_producer_digests=None), directory) for phase, (cell, directory) in cells.items()
+        }
     rows = [
         row
         for cell, cell_dir in cells.values()
         for row in database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID, median_policy=median)
     ]
     parquet, metadata, _skipped = database.write_formal_database(plan, rows, systems_root=tmp_path / "systems")
-    # As finalization and collection validation read a publication: the sidecar selects the label of the rows.
+    # The runner saves these hashes independently in the terminal collection checkpoint.
     published = database.validate_formal_database_commit(
         parquet, metadata, plan, required_cells=tuple(cell for cell, _cell_dir in cells.values())
     )
-    assert database.published_median_policy(published) is median
+    checkpoint_rows = published["cell_rows"]
     again = [
         row
         for cell, cell_dir in cells.values()
@@ -2162,7 +2213,7 @@ def test_publication_verifies_with_the_label_of_its_sidecar(tmp_path, case):
             cell,
             cell_dir,
             expected_attempt_id=ATTEMPT_ID,
-            median_policy=database.published_median_policy(published),
+            median_policy=database.published_median_policy(published, cell, checkpoint_rows),
         )
     ]
     canonical = lambda row: json.dumps(row, sort_keys=True, allow_nan=False)
@@ -2171,7 +2222,7 @@ def test_publication_verifies_with_the_label_of_its_sidecar(tmp_path, case):
 
 def test_publication_and_readiness_aggregate_with_the_label_of_the_producer_contract():
     """Publication and readiness aggregate with the label of the producer contract. Finalization and collection
-    validation take the label of the sidecar; tests/unit/test_onboard_runtime.py runs both on a producer campaign."""
+    validation consult the frozen cell and checkpoint; tests/unit/test_onboard_runtime.py exercises both readers."""
     import ast
 
     import collector.fpm_forward
@@ -2470,6 +2521,22 @@ def test_matching_receipt_and_artifact_cannot_replace_the_frozen_producer(tmp_pa
     _receipt(tmp_path, cell)
     with pytest.raises(ValueError, match="producer digests differ from the producer expected for this collection plan"):
         _validate(tmp_path, cell)
+
+
+@pytest.mark.parametrize(("mask", "mode"), [(0o022, 0o644), (0o002, 0o664), (0o077, 0o600)])
+def test_producer_receipt_respects_the_campaign_umask(tmp_path, mask, mode):
+    cell = glm_cell("prefill")
+
+    def write():
+        os.umask(mask)
+        native_artifact.write_producer_receipt(cell, tmp_path, plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID)
+
+    process = multiprocessing.get_context("fork").Process(target=write)
+    process.start()
+    process.join()
+    assert process.exitcode == 0
+    receipt = tmp_path / native_artifact.PRODUCER_RECEIPT_FILENAME
+    assert stat.S_IMODE(receipt.stat().st_mode) == mode
 
 
 def test_concurrent_receipt_writers_use_their_own_file(tmp_path, monkeypatch):
