@@ -479,3 +479,43 @@ def test_an_unpersistable_row_aborts_the_sweep_with_the_real_cause(monkeypatch):
         )
     assert "Conflicting retained performance file" in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, mod.PerfLogError)
+
+
+def test_a_zero_prefix_point_prices_no_gather_workspace(monkeypatch):
+    """Same total length, different transient: only the prefixed point gathers.
+
+    The extend path concatenates the cached prefix with the new chunk, so the
+    two gather copies exist for ``prefix_len > 0`` only. Charging them to a
+    zero-prefix point refused points the device holds (the C3.3 grid had
+    215 mid-sweep OOMs to bound, not extra refusals to add). TP1 keeps both
+    native KV heads, so the workspace is measurable here.
+    """
+    # 1.5 GiB of device: a 1 x 262140 zero-prefix point fits its pool, while the
+    # same length taken as prefix + 1 does not fit its gather.
+    device = int(1.5 * 2**30)
+    mod = _import_module(monkeypatch, cuda_memory=device)
+    page_size, bytes_per_token, workspace_bytes = mod._kv_cost_estimate("qsa", NATIVE_Q_HEADS, "bfloat16", MODEL_PATH)
+    assert workspace_bytes > 0
+
+    def reason(shape):
+        return mod._qsa_footprint_refusal(
+            shape,
+            page_size=page_size,
+            bytes_per_token=bytes_per_token,
+            workspace_bytes=workspace_bytes,
+            total_memory=device,
+        )
+
+    assert reason((1, 262140, 0)) is None
+    refused = reason((1, 1, 262140))
+    assert refused is not None and refused.startswith(mod.KERNEL_LIMIT)
+    assert "does not fit: the pool plus the" in refused and "prefix gather" in refused
+    # The zero-prefix message names the pool alone when it does refuse.
+    zero_prefix = mod._qsa_footprint_refusal(
+        (3, 262140, 0),
+        page_size=page_size,
+        bytes_per_token=bytes_per_token,
+        workspace_bytes=workspace_bytes,
+        total_memory=device,
+    )
+    assert zero_prefix is not None and "prefix gather" not in zero_prefix

@@ -479,7 +479,7 @@ def _qsa_footprint_refusal(
     workspace_bytes: int,
     total_memory: int,
 ) -> str | None:
-    """Why a prefixed QSA point's pool plus its per-shape gather workspace cannot fit, or None.
+    """Why a QSA point's pool plus its per-shape gather workspace cannot fit, or None.
 
     The pool is sized from the case's largest runnable point and stays resident
     for the whole sweep, while the prefixed extend path allocates another two
@@ -490,15 +490,23 @@ def _qsa_footprint_refusal(
     measured peer. This is a capacity refusal, so the worker raises it before
     allocating the point (layer_permissions.md: "refuse at run time, before
     allocation").
+
+    The gather is the *prefixed* extend path's workspace: it concatenates each
+    request's cached context (already in the pool) with the new chunk. A
+    ``prefix_len == 0`` chunk writes its own K/V and attends over it directly,
+    so it materialises no gather copy — charging one there refused points the
+    device holds and left real gaps in the collected grid.
     """
     batch, seq_len, prefix_len = shape
-    per_token = (bytes_per_token * _PLAN_POOL_SLACK + workspace_bytes) * _QSA_PLAN_FOOTPRINT_MARGIN
+    workspace = workspace_bytes if prefix_len else 0
+    per_token = (bytes_per_token * _PLAN_POOL_SLACK + workspace) * _QSA_PLAN_FOOTPRINT_MARGIN
     needed = required_kv_alloc_tokens(batch, seq_len, prefix_len, page_size, is_prefill=True) * per_token
     allowed = int(total_memory * _MEMORY_BUDGET_SAFETY_FACTOR)
     if needed <= allowed:
         return None
+    footprint = "the pool" + (f" plus the {workspace_bytes} B/token prefix gather" if workspace else "")
     return (
-        f"{KERNEL_LIMIT}: does not fit: the pool plus the {workspace_bytes} B/token prefix gather "
+        f"{KERNEL_LIMIT}: does not fit: {footprint} "
         f"needs {needed / 2**30:.1f} GiB, the device allows {allowed / 2**30:.1f} GiB "
         f"({_MEMORY_BUDGET_SAFETY_FACTOR:g} of its memory)"
     )
