@@ -295,3 +295,102 @@ Full-only and Full+Mamba receipts. Sanity assertions remain enabled. Initial
 Python line-length and patch-context whitespace check failures were corrected
 before publication. Failed-attempt logs and successful reruns remain in the
 repair run's scratch directory; none is represented as a final passing test.
+
+## Public CLI reuse under pressure
+
+Addresses `PRRT_kwDOT0t9uc67wy1x`. The
+[integrated comparison](radix-reuse-pressure-comparison.json) runs the public
+`predict --stack engine` consumer on legacy main
+`8288046ac88fccaee124714cd60e62b2ad4e184d` and native corrective source
+`3c800f55ba78ccb1e90d999df5174935807d14a2`. Both optimized wheels use Rust
+1.91.1, opt-level 3, codegen-units 1, thin LTO, and the explicit features
+`extension-module,python`. Each wheel runs twice in separate processes, pinned
+to CPU 0, after all compilation has finished. The report verifies each loaded
+extension against the corresponding wheel and records both hashes and sizes.
+
+The six locally authored Mooncake rows repeat three distinct prompts, with
+block hashes `[10,20,30]`, `[40,50]`, `[60,70]`, then the same sequence again.
+One SGLang worker uses LRU, concurrency one, one sequence, 32-token pages, and
+six cache blocks. Every run completes six requests, 448 input tokens, and six
+output tokens. No trace sampling or model weights are involved. The report
+contains the exact rows, trace checksum, configuration, tiny-model metadata,
+and all emitted summary fields.
+
+| Summary field | Legacy main | Native |
+| --- | --- | --- |
+| `prefix_cache_reused_ratio` | 0.2857142857142857 | 0.0 |
+| `first_admission_prefix_cache_reused_ratio` | 0.2857142857142857 | 0.0 |
+| `committed_prefill_tokens` | 320 | 448 |
+| Mean and p99 TTFT, ms | 1 | 1 |
+| Modeled duration, ms | 6 | 6 |
+| Modeled request throughput, requests/s | 1000 | 1000 |
+
+Legacy suffix reclamation retains 128 tokens that later requests reuse. Native
+whole-leaf reclamation removes the compressed prompts, so their repeats miss.
+Those 128 tokens account for the complete difference in committed prefill work.
+This fixture exercises the whole-leaf policy; the separate partial-match
+fixture above establishes split-recency behavior. Fixed 1 ms prefill/decode
+timing does not depend on prefill token count, so this comparison establishes
+no TTFT or serving-throughput change. Every other summary field matches.
+
+Each revision's two summaries are byte-stable after excluding only
+`wall_time_ms`, `processed_tokens_per_s`, and `processed_output_tokens_per_s`;
+their digests are recorded. Those three host-cost fields vary and are retained
+in the report. Two tiny CLI runs are not a simulator-speed qualification. The
+native `wall_time_ms` interval includes replay setup through collector
+finalization, excluding model construction, Python startup, trace loading,
+and output serialization.
+
+### Downstream release note: Dynamo and Mocker
+
+SGLang replay now uses the pinned native tree's whole-leaf LRU reclamation and
+split-recency policy. Dynamo and Mocker consumers can observe different prefix
+residency, reuse ratios, and prefill work at cache-capacity boundaries. With
+token-dependent timing, those changes can also affect simulated TTFT and
+throughput. Requalify affected replay expectations against the native policy;
+do not assume legacy suffix eviction or unchanged replay output. The synthetic
+case above measures a reuse change, with unchanged fixed-timing TTFT and
+throughput. It is not a production accuracy claim or a Dynamo runtime test.
+
+### Reproduce the integrated case
+
+Use isolated snapshots and release wheels for the two immutable revisions.
+The wheel build/install/hash procedure in
+[growth qualification](RADIX_EXCLUSIVE_GROWTH_EVIDENCE.md#verification-and-reproduction)
+applies, substituting the two revisions in this section. Match Python and the
+locked runtime dependencies between arms. Do not build while executing either
+arm. Set `pressure_work` to a fresh scratch directory outside the checkout and
+materialize the inputs directly from the committed report:
+
+```bash
+pressure_work=$(mktemp -d "${TMPDIR:?}/radix-pressure.XXXXXXXX")
+python3 - "$pressure_work" <<'PYCODE'
+import hashlib, json, pathlib, sys
+work = pathlib.Path(sys.argv[1])
+report = json.loads(pathlib.Path(
+    "crates/core/src/engine/cache/radix-reuse-pressure-comparison.json"
+).read_text())
+trace = "".join(json.dumps(row) + "\n" for row in report["trace_rows"])
+assert hashlib.sha256(trace.encode()).hexdigest() == report["trace_sha256"]
+(work / "trace.jsonl").write_text(trace)
+(work / "tiny-model").mkdir()
+(work / "tiny-model/config.json").write_text(json.dumps(report["model_provenance"]["config"]))
+config = report["config"]
+config["engine"]["model"] = str(work / "tiny-model")
+config["traffic"]["source"]["paths"] = [str(work / "trace.jsonl")]
+(work / "config.json").write_text(json.dumps(config))
+PYCODE
+# Set pressure_python to each isolated venv's Python, with its verified wheel.
+# Execute twice per arm, using a fresh output directory for each invocation.
+taskset -c 0 "$pressure_python" -m aisimulate predict --stack engine \
+  --config "$pressure_work/config.json" \
+  --output-dir "$pressure_work/$side-$repeat" --format json
+```
+
+Read each `prediction.json` as the summary (or its `summary` member if wrapped); verify completion and token totals,
+then compare all summary keys with exactly the three host-metric exclusions
+above. A setup attempt incorrectly supplied `traffic.stop.requests` for trace
+traffic and was rejected by normal validation. Removing that unsupported stop
+condition makes both arms consume the complete six-row trace. The recorded
+comparison contains only that successful rerun; the rejected setup log remains
+in the repair scratch directory.

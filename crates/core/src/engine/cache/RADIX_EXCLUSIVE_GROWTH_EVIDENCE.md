@@ -173,5 +173,5 @@ compilation was rejected by the host-headroom guard; every final CLI run passed
 after compilation with the same budget. No measured sample was discarded.
 
 Hosted workflow-log access returned HTTP 403. The live PR still reports main
-conflicts, which this comment-repair scope excludes merging. Fresh CI, bot review,
+conflicts; these scoped comment fixes do not require a main merge. Fresh CI, bot review,
 and technical reapproval remain required after publication.

@@ -1,0 +1,961 @@
+{
+  "baseline": "8288046ac88fccaee124714cd60e62b2ad4e184d",
+  "profile": "release (opt-level=3, codegen-units=1, lto=thin)",
+  "features": [],
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "cpu": 0,
+  "probe_sha256": "9d1182aa5d96e111beb458483f662a52275ebe8ca4032a8b5e7d48f2611b0267",
+  "timing_scope": "100 cache admission checkpoints including snapshot destruction, separately 100 completed-prompt warm admissions including manager checkpoint and commit; finish outside the warm timer. Growth and initial population excluded.",
+  "probe_revision": "e1c69bdb17a0c48dd653e8558c36ec9c58c5110c",
+  "host_limits": {
+    "memory_gib": 5,
+    "cpu_quota": 2,
+    "affinity": [
+      0
+    ]
+  },
+  "cpu_model": "Intel(R) Core(TM) i9-14900K",
+  "candidate": "3c800f55ba78ccb1e90d999df5174935807d14a2",
+  "native_before": "e1c69bdb17a0c48dd653e8558c36ec9c58c5110c",
+  "artifacts": {
+    "native_before": {
+      "sha256": "d06cd768f3703dd80e5d5af62c331a67f6ca60d929737de943d051ceb69bd61c",
+      "bytes": 24315064,
+      "size": "text\t   data\t    bss\t    dec\t    hex\tfilename\n21131696\t 941872\t   2936\t22076504\t150dc58\t$SCRATCH/before-cow-radix-tests"
+    },
+    "baseline": {
+      "sha256": "d73cec692a5ee041e10591e3c0e42b052042adae27845ccad4ed61634bb624d8",
+      "bytes": 22788856,
+      "size": "text\t   data\t    bss\t    dec\t    hex\tfilename\n19807048\t 868432\t   4360\t20679840\t13b8ca0\t$SCRATCH/legacy-target/release/deps/aisimulate_core-3a2924e26ade6423"
+    },
+    "candidate": {
+      "sha256": "f8707e38cec045f0d5742f68ec00d417449c75238d07a780968aa9cef933ec08",
+      "bytes": 24330064,
+      "size": "text\t   data\t    bss\t    dec\t    hex\tfilename\n21144564\t 943184\t   1048\t22088796\t1510c5c\t$SCRATCH/cargo-target/release/deps/aisimulate_core-dc56fbd73c1120c6"
+    }
+  },
+  "samples": [
+    {
+      "pair": 0,
+      "warmup": true,
+      "side": "baseline",
+      "observations": [
+        {
+          "checkpoint_ns": 21571,
+          "growth_pages": 2,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 23083
+        },
+        {
+          "checkpoint_ns": 7829,
+          "growth_pages": 128,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 81820
+        },
+        {
+          "checkpoint_ns": 7922,
+          "growth_pages": 512,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 262509
+        },
+        {
+          "checkpoint_ns": 7953,
+          "growth_pages": 2048,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 896769
+        }
+      ],
+      "peak_rss_kib": 16108
+    },
+    {
+      "pair": 0,
+      "warmup": true,
+      "side": "native_before",
+      "observations": [
+        {
+          "checkpoint_ns": 62811,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 84353
+        },
+        {
+          "checkpoint_ns": 950432,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1597979
+        },
+        {
+          "checkpoint_ns": 3645021,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 5771902
+        },
+        {
+          "checkpoint_ns": 21397105,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 25073857
+        }
+      ],
+      "peak_rss_kib": 15936
+    },
+    {
+      "pair": 0,
+      "warmup": true,
+      "side": "candidate",
+      "observations": [
+        {
+          "checkpoint_ns": 60407,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 96322
+        },
+        {
+          "checkpoint_ns": 568340,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1184809
+        },
+        {
+          "checkpoint_ns": 2298375,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 4451242
+        },
+        {
+          "checkpoint_ns": 10321649,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 19189699
+        }
+      ],
+      "peak_rss_kib": 15692
+    },
+    {
+      "pair": 1,
+      "warmup": false,
+      "side": "candidate",
+      "observations": [
+        {
+          "checkpoint_ns": 56718,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 76101
+        },
+        {
+          "checkpoint_ns": 577628,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1194639
+        },
+        {
+          "checkpoint_ns": 2249597,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 4642687
+        },
+        {
+          "checkpoint_ns": 10278327,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 19191735
+        }
+      ],
+      "peak_rss_kib": 15724
+    },
+    {
+      "pair": 1,
+      "warmup": false,
+      "side": "native_before",
+      "observations": [
+        {
+          "checkpoint_ns": 48030,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 82395
+        },
+        {
+          "checkpoint_ns": 954322,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1543929
+        },
+        {
+          "checkpoint_ns": 3722176,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 6617201
+        },
+        {
+          "checkpoint_ns": 17029020,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 25205563
+        }
+      ],
+      "peak_rss_kib": 15852
+    },
+    {
+      "pair": 1,
+      "warmup": false,
+      "side": "baseline",
+      "observations": [
+        {
+          "checkpoint_ns": 16888,
+          "growth_pages": 2,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 22737
+        },
+        {
+          "checkpoint_ns": 7888,
+          "growth_pages": 128,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 84556
+        },
+        {
+          "checkpoint_ns": 7887,
+          "growth_pages": 512,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 262766
+        },
+        {
+          "checkpoint_ns": 7974,
+          "growth_pages": 2048,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 908979
+        }
+      ],
+      "peak_rss_kib": 15584
+    },
+    {
+      "pair": 2,
+      "warmup": false,
+      "side": "baseline",
+      "observations": [
+        {
+          "checkpoint_ns": 17429,
+          "growth_pages": 2,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 23073
+        },
+        {
+          "checkpoint_ns": 8015,
+          "growth_pages": 128,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 82789
+        },
+        {
+          "checkpoint_ns": 7956,
+          "growth_pages": 512,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 261893
+        },
+        {
+          "checkpoint_ns": 7888,
+          "growth_pages": 2048,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 886978
+        }
+      ],
+      "peak_rss_kib": 15988
+    },
+    {
+      "pair": 2,
+      "warmup": false,
+      "side": "native_before",
+      "observations": [
+        {
+          "checkpoint_ns": 49658,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 83483
+        },
+        {
+          "checkpoint_ns": 963260,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1613660
+        },
+        {
+          "checkpoint_ns": 4511669,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 6085708
+        },
+        {
+          "checkpoint_ns": 17791323,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 26558195
+        }
+      ],
+      "peak_rss_kib": 15804
+    },
+    {
+      "pair": 2,
+      "warmup": false,
+      "side": "candidate",
+      "observations": [
+        {
+          "checkpoint_ns": 57664,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 77642
+        },
+        {
+          "checkpoint_ns": 572964,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1206974
+        },
+        {
+          "checkpoint_ns": 2249544,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 4465548
+        },
+        {
+          "checkpoint_ns": 10541641,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 19323436
+        }
+      ],
+      "peak_rss_kib": 15988
+    },
+    {
+      "pair": 3,
+      "warmup": false,
+      "side": "candidate",
+      "observations": [
+        {
+          "checkpoint_ns": 81481,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 153369
+        },
+        {
+          "checkpoint_ns": 880920,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 2086247
+        },
+        {
+          "checkpoint_ns": 2495356,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 5353316
+        },
+        {
+          "checkpoint_ns": 12798665,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 23047108
+        }
+      ],
+      "peak_rss_kib": 15992
+    },
+    {
+      "pair": 3,
+      "warmup": false,
+      "side": "native_before",
+      "observations": [
+        {
+          "checkpoint_ns": 51244,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 84497
+        },
+        {
+          "checkpoint_ns": 1028727,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1669222
+        },
+        {
+          "checkpoint_ns": 3990833,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 6899784
+        },
+        {
+          "checkpoint_ns": 18878636,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 27938887
+        }
+      ],
+      "peak_rss_kib": 15664
+    },
+    {
+      "pair": 3,
+      "warmup": false,
+      "side": "baseline",
+      "observations": [
+        {
+          "checkpoint_ns": 17495,
+          "growth_pages": 2,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 23499
+        },
+        {
+          "checkpoint_ns": 8074,
+          "growth_pages": 128,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 85082
+        },
+        {
+          "checkpoint_ns": 8079,
+          "growth_pages": 512,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 254415
+        },
+        {
+          "checkpoint_ns": 8095,
+          "growth_pages": 2048,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 975550
+        }
+      ],
+      "peak_rss_kib": 16004
+    },
+    {
+      "pair": 4,
+      "warmup": false,
+      "side": "baseline",
+      "observations": [
+        {
+          "checkpoint_ns": 18236,
+          "growth_pages": 2,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 39224
+        },
+        {
+          "checkpoint_ns": 8135,
+          "growth_pages": 128,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 84513
+        },
+        {
+          "checkpoint_ns": 8153,
+          "growth_pages": 512,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 272101
+        },
+        {
+          "checkpoint_ns": 20475,
+          "growth_pages": 2048,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 983003
+        }
+      ],
+      "peak_rss_kib": 15992
+    },
+    {
+      "pair": 4,
+      "warmup": false,
+      "side": "native_before",
+      "observations": [
+        {
+          "checkpoint_ns": 50248,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 73149
+        },
+        {
+          "checkpoint_ns": 1006447,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1651755
+        },
+        {
+          "checkpoint_ns": 3922543,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 6768004
+        },
+        {
+          "checkpoint_ns": 18611759,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 26229434
+        }
+      ],
+      "peak_rss_kib": 16128
+    },
+    {
+      "pair": 4,
+      "warmup": false,
+      "side": "candidate",
+      "observations": [
+        {
+          "checkpoint_ns": 58336,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 78847
+        },
+        {
+          "checkpoint_ns": 587196,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1266838
+        },
+        {
+          "checkpoint_ns": 2384726,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 5445570
+        },
+        {
+          "checkpoint_ns": 11788672,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 22115976
+        }
+      ],
+      "peak_rss_kib": 16216
+    },
+    {
+      "pair": 5,
+      "warmup": false,
+      "side": "candidate",
+      "observations": [
+        {
+          "checkpoint_ns": 58747,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 104360
+        },
+        {
+          "checkpoint_ns": 726650,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1510008
+        },
+        {
+          "checkpoint_ns": 3023936,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 5705204
+        },
+        {
+          "checkpoint_ns": 10861368,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 23693800
+        }
+      ],
+      "peak_rss_kib": 15988
+    },
+    {
+      "pair": 5,
+      "warmup": false,
+      "side": "native_before",
+      "observations": [
+        {
+          "checkpoint_ns": 50691,
+          "growth_pages": 2,
+          "nodes": 4,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 83862
+        },
+        {
+          "checkpoint_ns": 993798,
+          "growth_pages": 128,
+          "nodes": 130,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 1648858
+        },
+        {
+          "checkpoint_ns": 3864325,
+          "growth_pages": 512,
+          "nodes": 514,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 7380618
+        },
+        {
+          "checkpoint_ns": 18006440,
+          "growth_pages": 2048,
+          "nodes": 2050,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 28967761
+        }
+      ],
+      "peak_rss_kib": 15896
+    },
+    {
+      "pair": 5,
+      "warmup": false,
+      "side": "baseline",
+      "observations": [
+        {
+          "checkpoint_ns": 21460,
+          "growth_pages": 2,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 128,
+          "repetitions": 100,
+          "warm_admission_ns": 26579
+        },
+        {
+          "checkpoint_ns": 7759,
+          "growth_pages": 128,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 4160,
+          "repetitions": 100,
+          "warm_admission_ns": 82359
+        },
+        {
+          "checkpoint_ns": 7732,
+          "growth_pages": 512,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 16448,
+          "repetitions": 100,
+          "warm_admission_ns": 268345
+        },
+        {
+          "checkpoint_ns": 8065,
+          "growth_pages": 2048,
+          "nodes": 2,
+          "page_size": 32,
+          "prompt_tokens": 65600,
+          "repetitions": 100,
+          "warm_admission_ns": 966095
+        }
+      ],
+      "peak_rss_kib": 15964
+    }
+  ],
+  "schedule": "one warmup per arm then five measured triplets; arm order alternates forward/reverse; no builds during sampling",
+  "memory_scope": "Peak binary process RSS from a fresh wait4-based Python wrapper; includes population, checkpoints, admission and cleanup, not compilation",
+  "lockfiles": {
+    "baseline": "247a715c52b7d1256d7776e9e2572f63462ed60e29bf33133cff5e30ac982707",
+    "native_before": "0b7c0821753c8b2ffed2783cb6bb38a531e71b511fae4cf89b0a11312cad7c8e",
+    "candidate": "0b7c0821753c8b2ffed2783cb6bb38a531e71b511fae4cf89b0a11312cad7c8e"
+  },
+  "candidate_only_packages": [
+    [
+      "hashbrown",
+      "0.16.1",
+      "registry+https://github.com/rust-lang/crates.io-index"
+    ],
+    [
+      "sha2-asm",
+      "0.6.4",
+      "registry+https://github.com/rust-lang/crates.io-index"
+    ],
+    [
+      "thiserror",
+      "1.0.69",
+      "registry+https://github.com/rust-lang/crates.io-index"
+    ],
+    [
+      "thiserror-impl",
+      "1.0.69",
+      "registry+https://github.com/rust-lang/crates.io-index"
+    ]
+  ],
+  "dependency_notes": "Every shared registry package has the same locked version and checksum. Native additionally enables sha2 asm and adds the listed packages. Native-before and candidate lockfiles are identical.",
+  "rss_method": "Python resource.getrusage(RUSAGE_CHILDREN).ru_maxrss in a fresh wrapper with one child; Linux wait4 peak for that process subtree",
+  "medians": [
+    {
+      "growth_pages": 2,
+      "native_before": {
+        "nodes": [
+          4
+        ],
+        "checkpoint_us_per_call": 0.50248,
+        "warm_admission_us_per_call": 0.8348300000000001
+      },
+      "baseline": {
+        "nodes": [
+          2
+        ],
+        "checkpoint_us_per_call": 0.17495,
+        "warm_admission_us_per_call": 0.23499
+      },
+      "candidate": {
+        "nodes": [
+          4
+        ],
+        "checkpoint_us_per_call": 0.58336,
+        "warm_admission_us_per_call": 0.78847
+      }
+    },
+    {
+      "growth_pages": 128,
+      "native_before": {
+        "nodes": [
+          130
+        ],
+        "checkpoint_us_per_call": 9.93798,
+        "warm_admission_us_per_call": 16.488580000000002
+      },
+      "baseline": {
+        "nodes": [
+          2
+        ],
+        "checkpoint_us_per_call": 0.08015,
+        "warm_admission_us_per_call": 0.84513
+      },
+      "candidate": {
+        "nodes": [
+          130
+        ],
+        "checkpoint_us_per_call": 5.87196,
+        "warm_admission_us_per_call": 12.668379999999999
+      }
+    },
+    {
+      "growth_pages": 512,
+      "native_before": {
+        "nodes": [
+          514
+        ],
+        "checkpoint_us_per_call": 39.22543,
+        "warm_admission_us_per_call": 67.68003999999999
+      },
+      "baseline": {
+        "nodes": [
+          2
+        ],
+        "checkpoint_us_per_call": 0.07956,
+        "warm_admission_us_per_call": 2.6276599999999997
+      },
+      "candidate": {
+        "nodes": [
+          514
+        ],
+        "checkpoint_us_per_call": 23.84726,
+        "warm_admission_us_per_call": 53.53316
+      }
+    },
+    {
+      "growth_pages": 2048,
+      "native_before": {
+        "nodes": [
+          2050
+        ],
+        "checkpoint_us_per_call": 180.0644,
+        "warm_admission_us_per_call": 265.58195
+      },
+      "baseline": {
+        "nodes": [
+          2
+        ],
+        "checkpoint_us_per_call": 0.08065,
+        "warm_admission_us_per_call": 9.660950000000001
+      },
+      "candidate": {
+        "nodes": [
+          2050
+        ],
+        "checkpoint_us_per_call": 108.61367999999999,
+        "warm_admission_us_per_call": 221.15976
+      }
+    }
+  ]
+}
