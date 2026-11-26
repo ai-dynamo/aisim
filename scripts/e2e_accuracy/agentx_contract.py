@@ -12,6 +12,7 @@ from pathlib import Path
 
 from scripts.e2e_accuracy.agentx_comparison import validate as validate_comparison
 from scripts.e2e_accuracy.agentx_inputs import safe_path
+from scripts.e2e_accuracy.agentx_metrics import REQUEST_METRICS, STEP_KINDS, point_metrics
 from scripts.e2e_accuracy.benchmark_features import IncompleteSiliconEvidence
 from scripts.e2e_accuracy.benchmark_features import validate as validate_features
 from scripts.e2e_accuracy.simulation_features import validate as validate_simulation
@@ -71,6 +72,8 @@ def driver_digest(read_file=None):
         names += ("simulation_features.py",)
     if b'"../release/package_identity.py"' in read_file("scripts/e2e_accuracy/agentx_contract.py"):
         names += ("../release/package_identity.py",)
+    if b'"agentx_metrics.py"' in read_file("scripts/e2e_accuracy/agentx_contract.py"):
+        names += ("agentx_metrics.py", "agentx_learned.py")
     return hashlib.sha256(
         canonical(
             {
@@ -470,6 +473,25 @@ def validate_public(value):
         "sha256",
         "feature_metadata",
         "simulation_features",
+        "performance_model",
+        "accuracy_metrics",
+        "n",
+        "excluded",
+        "e2e",
+        "e2e_se",
+        "quantile",
+        "quantile_se",
+        "step",
+        "seed",
+        "dropped_unattributed",
+        "decode",
+        "prefill",
+        "sum_sq_ape",
+        "cpu_overhead",
+        "tokenization",
+        "extra_cpu_overhead",
+        "base_ms",
+        "per_input_token_ms",
     }
 
     def walk(item, key=None):
@@ -678,7 +700,15 @@ def validate_result(run):
         "pairs",
         "report",
     }
-    if set(run) - {"op_data", "feature_metadata", "simulation_features"} != expected or run["outcome"] not in {
+    optional = {
+        "op_data",
+        "feature_metadata",
+        "simulation_features",
+        "performance_model",
+        "accuracy_metrics",
+        "cpu_overhead",
+    }
+    if set(run) - optional != expected or run["outcome"] not in {
         "completed",
         "failed",
         "unsupported",
@@ -686,6 +716,7 @@ def validate_result(run):
         raise ValueError("Invalid AgentX result fields")
     if "simulation_features" in run:
         validate_simulation(run["simulation_features"], run["id"])
+    validate_performance_model(run)
     for item in run.get("op_data", []):
         if (
             set(item) != {"file", "sha256"}
@@ -776,3 +807,89 @@ def validate_result(run):
     elif complete_features:
         raise IncompleteSiliconEvidence("New self-collected publications require silicon feature metadata")
     return run
+
+
+PERFORMANCE_MODELS = ("op_level", "fpm_learned")
+
+
+def result_key(run):
+    """Results are unique per measured run and performance model; historical results are op-based."""
+    return run["id"], run.get("performance_model", "op_level")
+
+
+def detail_path(run):
+    if "performance_model" not in run:
+        return f"details/{run['id']}.json"
+    return f"details/{run['id']}-{run['performance_model'].replace('_', '-')}.json"
+
+
+def _number(value, *, optional=False):
+    return (optional and value is None) or finite(value)
+
+
+def validate_performance_model(run):
+    """Performance-model identity and agreed metrics; point estimates reconcile with the published pairs."""
+    fields = {"performance_model", "accuracy_metrics", "cpu_overhead"} & set(run)
+    if not fields:
+        return  # Historical op-level publications predate these fields.
+    if fields != {"performance_model", "accuracy_metrics", "cpu_overhead"}:
+        raise ValueError("Incomplete performance-model record")
+    if run["performance_model"] not in PERFORMANCE_MODELS:
+        raise ValueError("Unknown AgentX performance model")
+    estimation = [item["value"] for item in run["config_summary"] if item.get("name") == "Estimation"]
+    if estimation != [run["performance_model"]]:
+        raise ValueError("Estimation label differs from the performance model")
+    metrics = run["accuracy_metrics"]
+    if not isinstance(metrics, dict) or set(metrics) != {*REQUEST_METRICS, "step"}:
+        raise ValueError("Invalid AgentX accuracy metrics")
+    for metric in REQUEST_METRICS:
+        value = metrics[metric]
+        if run["outcome"] != "completed":
+            if value is not None:
+                raise ValueError("Unavailable runs cannot publish accuracy")
+            continue
+        if not isinstance(value, dict) or set(value) != {"n", "excluded", "e2e", "e2e_se", "quantile", "quantile_se"}:
+            raise ValueError("Invalid request metric")
+        if any(not _number(value[k], optional=True) for k in ("e2e_se", "quantile_se")):
+            raise ValueError("Invalid request metric standard error")
+        if {k: value[k] for k in ("n", "excluded", "e2e", "quantile")} != point_metrics(run["pairs"], metric):
+            raise ValueError("Request metrics do not reconcile with the published pairs")
+    step = metrics["step"]
+    if step is not None:
+        if not isinstance(step, dict) or set(step) != {"seed", "dropped_unattributed", *STEP_KINDS}:
+            raise ValueError("Invalid step metrics")
+        if (
+            type(step["seed"]) is not int
+            or type(step["dropped_unattributed"]) is not int
+            or step["dropped_unattributed"] < 0
+        ):
+            raise ValueError("Invalid step provenance")
+        for kind in STEP_KINDS:
+            item = step[kind]
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"n", "sum_ape", "sum_sq_ape"}
+                or type(item["n"]) is not int
+                or item["n"] < 0
+                or not finite(item["sum_ape"])
+                or not finite(item["sum_sq_ape"])
+            ):
+                raise ValueError("Invalid step accumulator")
+    overhead = run["cpu_overhead"]
+    if overhead is not None:
+        if not isinstance(overhead, dict) or set(overhead) != {"tokenization", "extra_cpu_overhead"}:
+            raise ValueError("Invalid CPU overhead record")
+        tokenization, extra = overhead["tokenization"], overhead["extra_cpu_overhead"]
+        if tokenization is not None and (
+            set(tokenization) != {"workers", "base_ms", "per_input_token_ms"}
+            or not _number(tokenization["workers"], optional=True)
+            or not _number(tokenization["base_ms"], optional=True)
+            or not _number(tokenization["per_input_token_ms"], optional=True)
+        ):
+            raise ValueError("Invalid tokenization overhead")
+        if extra is not None and (
+            set(extra) != {"base_ms", "per_input_token_ms"}
+            or not _number(extra["base_ms"], optional=True)
+            or not _number(extra["per_input_token_ms"], optional=True)
+        ):
+            raise ValueError("Invalid unqueued CPU overhead")

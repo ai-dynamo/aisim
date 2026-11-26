@@ -25,7 +25,8 @@ from test_benchmark_features import metadata as feature_fixture
 from test_benchmark_features import silicon_metadata
 
 from scripts.e2e_accuracy.agentx_comparison import build as build_comparison
-from scripts.e2e_accuracy.agentx_contract import canonical
+from scripts.e2e_accuracy.agentx_contract import canonical, detail_path
+from scripts.e2e_accuracy.agentx_metrics import request_metrics, step_accumulator
 from scripts.pages.agentx_pages import write_assets
 from scripts.pages.prepare_e2e_accuracy_pages import artifact_key
 
@@ -46,7 +47,9 @@ def fixtures(site, weka=False):
     write_assets(ROOT, source)
     runs = []
     for point, lanes in ((446063, 1), (446068, 4), (446069, 8), (446060, 10), (446061, 13), (446062, 14)):
+        # One result per performance model, interleaved as the producer writes them.
         runs.append(result(id=f"agentx-{point}", lanes=lanes))
+        runs.append(result(id=f"agentx-{point}", lanes=lanes, performance_model="fpm_learned"))
     for length in (4096, 32768):
         for lanes in (1, 4, 16):
             for cache in ("cold", "warm"):
@@ -178,13 +181,28 @@ def fixtures(site, weka=False):
     )
     summary = json.loads(bundle()["summary.json"])
     summary["runs"] = []
-    for run in runs:
-        run["config_summary"] = [{"name": "Estimation", "value": "op_level"}]
+    for index, run in enumerate(runs):
+        run.setdefault("performance_model", "op_level")
+        run["config_summary"] = [{"name": "Estimation", "value": run["performance_model"]}]
+        learned = run["performance_model"] == "fpm_learned"
+        run["accuracy_metrics"] = {
+            **request_metrics(run["pairs"]),
+            "step": {
+                "seed": 7,
+                "dropped_unattributed": 3 if run["backend"] == "sglang" else 0,
+                "decode": step_accumulator([1.0, 3.0] if learned else [20.0, 24.0]),
+                "prefill": step_accumulator([5.0, 7.0] if learned else [30.0, 34.0]),
+            },
+        }
+        run["cpu_overhead"] = {
+            "tokenization": {"workers": 1, "base_ms": 0.0, "per_input_token_ms": 0.001217},
+            "extra_cpu_overhead": {"base_ms": 12.6, "per_input_token_ms": 0.000342},
+        }
         run["measured_backend_version"] = "0.31.0" if run["backend"] == "vllm" else "0.5.20"
         run["prediction_backend_version"] = "0.31.0" if run["backend"] == "vllm" else "0.5.21"
         run["report"] = report
         entry = {k: v for k, v in run.items() if k not in {"pairs", "report"}}
-        entry["detail_path"] = f"details/{run['id']}.json"
+        entry["detail_path"] = detail_path(run)
         summary["runs"].append(entry)
         target = source / "branches" / artifact_key("main") / entry["detail_path"]
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -221,7 +239,7 @@ def fixtures(site, weka=False):
 
 
 async def check_timeline_windows(page, site, port):
-    path = site / "e2e-accuracy/agentx/branches" / artifact_key("main") / "details/agentx-446063.json"
+    path = site / "e2e-accuracy/agentx/branches" / artifact_key("main") / "details/agentx-446063-op-level.json"
     detail = json.loads(path.read_bytes())
     phase = detail["report"]["comparison"]["phases"]["profile"]
     template = phase["requests"][0]
@@ -323,53 +341,92 @@ async def check():
                     "Beta · check the AgentX feature support matrix ↗."
                 )
                 table = page.locator(".agentx-table")
-                await expect(table.locator("tr[data-agentx-parent]:visible")).to_have_count(9)
-                await expect(table.locator("thead th")).to_have_count(9)
-                hardware = table.locator(".agentx-model td:first-of-type")
+                # Entries are folded by default and grouped per performance model.
+                await expect(table.locator("tr[data-agentx-parent]:visible")).to_have_count(0)
+                await expect(table.locator("thead tr").first.locator("th")).to_have_text(
+                    [
+                        "Model / concurrency",
+                        "SpecDec",
+                        "Hardware / backend",
+                        "Performance model",
+                        "CPU overhead",
+                        "Step error",
+                        "e2e error",
+                        "Per-request quantile error (p5\u2013p95)",
+                    ]
+                )
+                await expect(table.locator("thead tr").nth(1).locator("th")).to_have_text(
+                    ["Decode", "Prefill", "TPOT", "TTFT", "TPOT", "TTFT"]
+                )
+                models = table.locator(".agentx-model")
+                await expect(models).to_have_count(3)
+                for index, colour in enumerate(("agentx-op", "agentx-learned", "agentx-op")):
+                    await expect(models.nth(index)).to_have_class(re.compile(rf"\b{colour}\b"))
+                await expect(table.locator(".agentx-model .agentx-perf-model")).to_have_text(
+                    ["Op-based", "Learned FPM", "Op-based"]
+                )
+                await expect(table.locator(".agentx-model td:nth-of-type(1)")).to_have_text(["None"] * 3)
+                hardware = table.locator(".agentx-model td:nth-of-type(2)")
                 await expect(hardware.nth(0)).to_contain_text("B300 · sglang 0.5.20")
                 await expect(hardware.nth(0)).not_to_contain_text("sglang 0.5.21")
-                await expect(hardware.nth(1)).to_contain_text("B300 · vllm 0.31.0")
-                await expect(table.locator("tr[data-agentx-parent] .agentx-perf-model")).to_have_text(
-                    ["Op-based (sglang 0.5.21)"] * 6 + ["Op-based (vllm 0.31.0)"] * 3
+                await expect(hardware.nth(2)).to_contain_text("B300 · vllm 0.31.0")
+                cpu = models.nth(0).locator(".agentx-cpu")
+                await expect(cpu).to_have_text(
+                    ["Tokenizer (queued, 1 worker): 1.217 µs/token", "Unqueued: 12.6 ms + 0.342 µs/token"]
                 )
-                await expect(table.locator("thead th").nth(2)).to_have_text("Performance model")
-                await expect(table.locator(".agentx-model .agentx-perf-model")).to_have_text(
-                    ["Op-based (sglang 0.5.21)", "Op-based (vllm 0.31.0)"]
+                # Steps pool exactly over the six points; requests average the runs.
+                metrics = models.nth(1).locator("td.agentx-metric")
+                await expect(metrics).to_have_count(6)
+                await expect(metrics.nth(0)).to_contain_text("2.0% ± 0.3n=12 steps")
+                await expect(metrics.nth(1)).to_contain_text("6.0% ± 0.3n=12 steps")
+                await expect(metrics.nth(2)).to_contain_text("50.0%n=6 req · 6 runs")
+                await expect(metrics.nth(3)).to_contain_text("20.0%n=6 req · 6 runs")
+                await expect(models.nth(0).locator("td.agentx-metric").nth(0)).to_contain_text("22.0% ± 0.6")
+                for label, text in (
+                    ("About point TTFT and TPOT error", "compares mean latency over the matched requests"),
+                    ("About per-request quantile error", "p5, p10, …, p95"),
+                    ("About step error", "held-out seed-7 step capture"),
+                ):
+                    info = page.get_by_role("button", name=label)
+                    tooltip = page.locator("#" + await info.get_attribute("aria-describedby"))
+                    await info.hover()
+                    await expect(tooltip).to_be_visible()
+                    await expect(tooltip).to_contain_text(text)
+                    await tooltip.hover()
+                    await expect(tooltip).to_be_visible()
+                    await page.mouse.move(5, 5)
+                    await expect(tooltip).to_be_hidden()
+                    await info.focus()
+                    await expect(tooltip).to_be_visible()
+                    await page.keyboard.press("Escape")
+                    await expect(tooltip).to_be_hidden()
+                    await info.click()
+                    await expect(tooltip).to_be_visible()
+                    await page.mouse.click(5, 5)
+                    await expect(tooltip).to_be_hidden()
+                await expect(table.locator(".source-tag")).to_have_text(
+                    ["AgentX official", "AgentX official", "Self-collected"]
                 )
-                await expect(table.locator("tr[data-agentx-parent] th .agentx-perf-model")).to_have_count(0)
-                info = page.get_by_role("button", name="About point TTFT and TPOT error")
-                tooltip = page.get_by_role("tooltip")
-                await expect(table.locator("thead th").nth(3)).to_have_text("Point TPOT error")
-                await info.hover()
-                await expect(tooltip).to_be_visible()
-                await expect(tooltip).to_contain_text(
-                    "aggregate result across the benchmark\u2019s conversation requests"
+                glm = models.nth(0)
+                await glm.locator("button").click()
+                await expect(table.locator("tr[data-agentx-parent]:visible")).to_have_count(6)
+                await expect(table.locator("tr[data-agentx-parent]:visible .agentx-perf-model")).to_have_text(
+                    ["Op-based"] * 6
                 )
-                await expect(tooltip).to_contain_text("compare requests individually, then average their errors")
-                await expect(tooltip).to_contain_text("Tool-call waits are excluded from TTFT/TPOT calculations")
-                await expect(tooltip).to_contain_text("over- and under-predictions cancel when averaged")
-                await tooltip.hover()
-                await expect(tooltip).to_be_visible()
-                await page.mouse.move(5, 5)
-                await expect(tooltip).to_be_hidden()
-                await info.focus()
-                await expect(tooltip).to_be_visible()
-                await page.keyboard.press("Escape")
-                await expect(tooltip).to_be_hidden()
-                await info.click()
-                await expect(tooltip).to_be_visible()
-                await page.mouse.click(5, 5)
-                await expect(tooltip).to_be_hidden()
-                await expect(table.locator(".source-tag")).to_have_text(["AgentX official", "Self-collected"])
-                qwen = table.locator(".agentx-model").nth(1)
+                await expect(table.locator("tr[data-agentx-parent]:visible").first).to_have_class(
+                    re.compile(r"\bagentx-op\b")
+                )
+                await glm.locator("button").click()
+                qwen = models.nth(2)
                 await qwen.locator("button").focus()
                 await page.keyboard.press("Enter")
-                await expect(table.locator("tr[data-agentx-parent]:visible")).to_have_count(6)
+                await expect(table.locator("tr[data-agentx-parent]:visible")).to_have_count(3)
                 await page.keyboard.press("Enter")
-                await expect(table.locator("tr[data-agentx-parent]:visible")).to_have_count(9)
+                await expect(table.locator("tr[data-agentx-parent]:visible")).to_have_count(0)
+                await page.keyboard.press("Enter")
                 await expect(table).to_contain_text("AISim self-collected dataset: coming soon")
                 assert "huggingface.co" not in await table.inner_html()
-                await table.locator("tr[data-agentx-parent]").nth(6).locator("a").first.click()
+                await table.locator("tr[data-agentx-parent]:visible").first.locator("a").first.click()
                 await expect(page.locator(".agentx-beta")).to_have_count(0)
                 await expect(page.locator("#length")).to_have_value("4096")
                 await expect(page.locator("#cache")).to_have_value("cold")
@@ -385,28 +442,43 @@ async def check():
                 await expect(frame.locator(".agentx-summary-main > p").first).to_contain_text(
                     "requests matched · Op-based perf model (vllm 0.31.0)"
                 )
-                await expect(frame.locator("#profile-accuracy .agentx-summary-table")).to_have_count(1)
+                await expect(frame.locator("#profile-accuracy .agentx-summary-table")).to_have_count(2)
+                summary_table = frame.locator(".agentx-summary-table:not(.agentx-metrics-table)")
                 await expect(frame.locator("#profile-accuracy .agentx-feature-table")).to_have_count(1)
-                await expect(frame.locator(".agentx-summary-table thead th")).to_have_text(
+                await expect(summary_table.locator("thead th")).to_have_text(
                     ["Metric", "Silicon", "AISim", "Error", "Samples"]
                 )
-                await expect(frame.locator(".agentx-summary-table tbody tr")).to_have_count(5)
+                await expect(summary_table.locator("tbody tr")).to_have_count(3)
+                # Agreed metrics for this performance model only: steps pool over runs, requests average them.
+                metrics_table = frame.locator(".agentx-metrics-table")
+                await expect(metrics_table.locator("thead th")).to_have_text(["Metric", "Error", "Stderr", "Samples"])
+                await expect(metrics_table.locator("tbody th")).to_have_text(
+                    [
+                        "Step error, decode (held-out steps)",
+                        "Step error, prefill (held-out steps)",
+                        "TPOT e2e error (request-average)",
+                        "TTFT e2e error (request-average)",
+                        "TPOT per-request quantile error, p5\u2013p95",
+                        "TTFT per-request quantile error, p5\u2013p95",
+                    ]
+                )
+                await expect(metrics_table.locator('tr[data-metric="step-decode"] td')).to_have_text(
+                    ["22.00%", "± 0.42%", "24 steps"]
+                )
+                await expect(metrics_table.locator('tr[data-metric="e2e-tpot_ms"] td')).to_have_text(
+                    ["50.00%", "—", "12 requests"]
+                )
                 await expect(frame.locator("#profile-accuracy")).not_to_contain_text("Selected run accuracy")
                 for metric, silicon, prediction in [
                     ("point-tpot_ms", "10", "15"),
                     ("point-ttft_ms", "100", "120"),
-                    ("request-ttft_ms", "100", "120"),
-                    ("request-tpot_ms", "10", "15"),
                 ]:
                     row = frame.locator(f'tr[data-metric="{metric}"]')
                     await expect(row.locator("td").nth(0)).to_have_text(silicon)
                     await expect(row.locator("td").nth(1)).to_have_text(prediction)
-                await expect(frame.locator('tr[data-metric="request-ttft_ms"] .agentx-samples')).to_have_text(
-                    "12 requests"
-                )
                 await expect(frame.locator(".comparison-source-dot.silicon")).to_have_count(1)
                 await expect(frame.locator(".comparison-source-dot.aisim")).to_have_count(1)
-                concurrency_summary = await frame.locator(".agentx-summary-table").text_content()
+                concurrency_summary = await summary_table.text_content()
                 await expect(frame.locator(".agentx-summary-main ul")).to_have_count(0)
                 await expect(frame.locator("#agentx-features-title")).to_have_text("Feature Parity")
                 await expect(frame.locator('[data-source="silicon"] .agentx-feature-status.unknown')).to_have_count(8)
@@ -567,7 +639,7 @@ async def check():
                 await page.locator("#cache").select_option("warm")
                 await page.locator("#repeat").select_option("2")
                 await expect(page.locator("#selected-run-label")).to_contain_text("warm · repeat 2")
-                await expect(frame.locator(".agentx-summary-table")).to_have_text(concurrency_summary)
+                await expect(summary_table).to_have_text(concurrency_summary)
                 assert "length=32768" in page.url and "repeat=2" in page.url
                 await page.reload()
                 await expect(page.locator("#repeat")).to_have_value("2")
@@ -602,9 +674,9 @@ async def check():
                 assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
                 await frame.locator('[data-view="dashboard"]').click()
                 await expect(frame.locator(".agentx-summary-table .agentx-samples:visible")).to_have_count(0)
-                await expect(frame.locator(".agentx-inline-count:visible")).to_have_count(5)
-                assert await frame.locator("#profile-accuracy .table-scroll").evaluate(
-                    "node => node.scrollWidth <= node.clientWidth + 1"
+                await expect(frame.locator(".agentx-inline-count:visible")).to_have_count(3)
+                assert await frame.locator("#profile-accuracy .table-scroll").evaluate_all(
+                    "nodes => nodes.length === 2 && nodes.every(node => node.scrollWidth <= node.clientWidth + 1)"
                 )
                 await page.locator("#back").click()
                 await expect(page.locator("#agentx-view")).to_be_visible()
@@ -619,9 +691,10 @@ async def check():
                 await check_timeline_windows(page, site, server.server_port)
                 fixtures(site, weka=True)
                 await page.goto(f"http://127.0.0.1:{server.server_port}/e2e-accuracy/?tab=agentx&branch=main")
-                await expect(page.locator(".agentx-table tr[data-agentx-parent]")).to_have_count(12)
+                # Six GLM points under two performance models and six Qwen points, folded by default.
+                await expect(page.locator(".agentx-table tr[data-agentx-parent]")).to_have_count(18)
                 qwen = page.locator(".agentx-model").filter(has_text="Qwen/")
-                await expect(qwen.locator("button")).to_have_attribute("aria-expanded", "true")
+                await expect(qwen.locator("button")).to_have_attribute("aria-expanded", "false")
                 await page.goto(
                     f"http://127.0.0.1:{server.server_port}/e2e-accuracy/agentx/point.html?branch=main&category=self_collected&model=Qwen%2FQwen3.5-397B-A17B&lanes=14"
                 )
@@ -645,7 +718,8 @@ async def check():
                 original_summary = summary_path.read_bytes()
                 summary = json.loads(original_summary)
                 records = []
-                for run in summary["runs"]:
+                # Silicon feature records are per measured run, shared by its performance models.
+                for run in {run["id"]: run for run in summary["runs"]}.values():
                     feature = feature_fixture()
                     feature["benchmark_id"] = run["id"]
                     if run["repeat"] == 1:
