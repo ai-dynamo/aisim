@@ -274,6 +274,33 @@ def test_dummy_fill_skips_the_rotary_table_and_seeds_before_processing():
     assert finalize_kwargs("_create_qsa_attention_module") == {}
 
 
+def test_qsa_builder_installs_servings_skinny_gemm_plans_before_processing_weights():
+    """Serving swaps in its measured GEMM plans at the end of model __init__.
+
+    ``Qwen4ExpForCausalLM.__init__`` (and ``Qwen4ExpMTP``) call
+    ``enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)``
+    (model.py:747, mtp.py @v0.32.0). That replaces the quant method of every
+    unquantized linear whose ``(N, K)`` has a plan, so those shapes run the
+    skinny kernel rather than ``F.linear``. The plans key on exact widths (the
+    TP4 fused QKV among them), so a module built without the call times a
+    different kernel than serving and labels the row as serving's.
+    """
+    build = _function("_create_qsa_attention_module")
+    (constructed,) = _call_lines(build, "Qwen4ExpQSAAttention")
+    (selected,) = _call_lines(build, "enable_qwen4_exp_low_latency_gemm")
+    (finalized,) = _call_lines(build, "_finalize_module_weights")
+    assert constructed < selected < finalized
+
+    (call,) = [
+        node
+        for node in ast.walk(build)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).split(".")[-1] == "enable_qwen4_exp_low_latency_gemm"
+    ]
+    # Same module and the dtype serving passes.
+    assert ast.unparse(call.args[0]) == "attn_module"
+    assert ast.unparse(call.args[1]) == "vllm_config.model_config.dtype"
+
+
 def test_history_is_written_after_the_dtype_check_and_before_the_first_forward():
     run = _function("run_msa_module")
     (checked,) = _call_lines(run, "_check_msa_kv_precision")

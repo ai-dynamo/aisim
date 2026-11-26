@@ -802,6 +802,9 @@ def _create_qsa_attention_module(
     # Build inside set_current_vllm_config(): the module reads the current
     # config in its constructor and registers itself plus its two side caches
     # in compilation_config.static_forward_context.
+    from vllm.models.qwen4_exp.nvidia.low_latency_gemm import (
+        enable_qwen4_exp_low_latency_gemm,
+    )
     from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
     from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -814,6 +817,18 @@ def _create_qsa_attention_module(
             reduce_results=True,
             prefix="model.layers.0.self_attn",
         )
+
+    # Serving ends its model __init__ with
+    # ``enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)``
+    # (model.py:747, mtp.py @v0.32.0). It swaps the quant method of every
+    # unquantized linear whose (N, K) has a measured SkinnyGemm plan, so those
+    # shapes run the skinny kernel instead of ``F.linear``. Called at the same
+    # point here — after construction, before the loader's
+    # ``process_weights_after_loading`` — so the methods this installs are the
+    # ones that process the dummy weights, as they are in serving. A no-op when
+    # no plan matches (the fused widths at TP8 have none; the plans are the TP4
+    # shapes), and on non-BF16 builds, exactly as in serving.
+    enable_qwen4_exp_low_latency_gemm(attn_module, vllm_config.model_config.dtype)
 
     attn_module = _finalize_module_weights(attn_module, vllm_config, device)
 
