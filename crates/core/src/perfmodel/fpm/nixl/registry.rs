@@ -55,11 +55,10 @@ pub(super) fn select<'a>(
 ) -> Option<Registration> {
     at_release(release, |minor| {
         if !require_native && !names.clone().flatten().any(|n| lookup(n, minor).is_some()) {
-            // Neither pinned Transformers release exports the nonliteral generation
-            // aliases that normalize to our six native decoders. Without a dynamic
-            // AutoModel mapping its lookup fails and vLLM continues with these names.
+            // Auto first checks the literal first name in Transformers. If it is absent or
+            // incompatible, and there is no dynamic mapping, vLLM tries every native candidate.
             let first = names.clone().next().flatten()?;
-            if !stock_model_lookup || normalize(first, minor)?.decoder().is_none() {
+            if !stock_model_lookup || possible_transformers_backend(first, minor) {
                 return None;
             }
         }
@@ -70,6 +69,29 @@ pub(super) fn select<'a>(
         }
         None
     })
+}
+
+fn possible_transformers_backend(name: &str, minor: u8) -> bool {
+    use std::{collections::HashMap, sync::LazyLock};
+    static MODELS: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
+        let mut names = HashMap::new();
+        for row in include_str!("transformers_models.txt")
+            .lines()
+            .filter(|s| !s.starts_with('#'))
+        {
+            let mut fields = row.split_ascii_whitespace();
+            let mask = fields.next().unwrap().parse::<u8>().unwrap();
+            let suffix = fields.next().unwrap();
+            let suffix = if suffix == "-" { "" } else { suffix };
+            for prefix in fields {
+                names.insert(format!("{prefix}{suffix}"), mask);
+            }
+        }
+        names
+    });
+    MODELS
+        .get(name)
+        .is_some_and(|mask| mask & (1 << (minor - 31)) != 0)
 }
 
 /// The native registry tries an exact class first. For generation it can

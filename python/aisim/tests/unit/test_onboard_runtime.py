@@ -300,7 +300,9 @@ def test_snapshot_acceptance_survives_unrelated_probe_progress_but_detects_raw_t
 
 
 def test_draft_verifies_bound_geometry_from_its_staged_checkpoint(tmp_path):
+    from aisim.support.finalization import _merge_resources
     from aisim.support.runtime import runtime_probe_manifest, verify_runtime_profile
+    from collector.fpm_forward.runtime_observations import validate_observations
 
     from .collector.test_runtime_observations import _mutate
 
@@ -312,8 +314,14 @@ def test_draft_verifies_bound_geometry_from_its_staged_checkpoint(tmp_path):
     workers = manifest["nixl_observation"]["worker_observations"]
     assert any(row.get("model_heads", {}).get("num_kv_heads") == 4 for row in workers)
     expected = verify_runtime_profile(request)
+    cell = validate_observations(index, {"tp2": launch})["tp2"]["resources"]
 
+    def finalized():
+        return _merge_resources([cell], {"runtime_probe": manifest}, source_references=True)
+
+    original = finalized()
     Path(launch["model_config"]["path"]).rename(tmp_path / "moved-original.json")
+    assert finalized() == original
     assert verify_runtime_profile(request) == expected
     staged = Path(manifest["observations_index"]).with_name("model-config.json")
     staged.write_text("{}")

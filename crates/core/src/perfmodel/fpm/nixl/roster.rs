@@ -172,13 +172,30 @@ fn record_limits(expected: &mut Value, resources: &Value, entry: &Value) -> Resu
     for key in ["max_num_tokens", "max_batch_size"] {
         record_memory_field(expected, resources, key)?;
     }
-    for settings in [&entry["runtime_settings"], &entry["resolved_config"]] {
+    let limits = [
+        ("max_num_tokens", "max_num_batched_tokens"),
+        ("max_batch_size", "max_num_seqs"),
+    ];
+    let artifacts = entry["artifacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| &r["evidence"])
+        .filter(|r| matches!(r["kind"].as_str(), Some("worker" | "scheduler")));
+    for settings in [&entry["runtime_settings"], &entry["resolved_config"]]
+        .into_iter()
+        .chain(artifacts.clone().map(|r| &r["resolved_config"]))
+    {
         record_memory_field(expected, &settings["model_config"], "max_model_len")?;
-        for (key, serving) in [
-            ("max_num_tokens", "max_num_batched_tokens"),
-            ("max_batch_size", "max_num_seqs"),
-        ] {
+        for (key, serving) in limits {
             record_field(expected, key, &settings["scheduler_config"][serving])?;
+        }
+    }
+    for launch in std::iter::once(&entry["launch"]).chain(artifacts.map(|r| &r["launch"])) {
+        let collection = &launch["collection"];
+        record_memory_field(expected, collection, "max_model_len")?;
+        for (key, serving) in limits {
+            record_field(expected, key, &collection[serving])?;
         }
     }
     Ok(())

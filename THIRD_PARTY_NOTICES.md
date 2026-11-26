@@ -881,8 +881,26 @@ text, and no upstream source file is vendored.
 
 The checkpoint projection in `crates/core/src/perfmodel/fpm/nixl/heads.rs` is a modified Rust adaptation of the Qwen2-VL and Qwen2.5-VL text configuration constructors. Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved. Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved. Both upstream configuration files use Apache-2.0. Neither Transformers revision has a root NOTICE file.
 
-The NemotronH model layer list and its computed layer count follow the stock Transformers configuration. Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved. The loader fallback uses the public model names of the same Transformers versions.
+The ordinary Qwen2, Qwen3, Llama, Mistral, Falcon and NemotronH checkpoint projections in the same Rust module follow the corresponding stock Transformers configuration constructors. The Llama configuration is copyright 2022 EleutherAI and the HuggingFace Inc. team. The Mistral configuration is copyright 2023 Mistral AI and the HuggingFace Inc. team. The Falcon configuration is copyright 2023 the Falcon authors and HuggingFace Inc. team. All rights reserved. These sources use Apache-2.0.
 
+The NemotronH model layer list and its computed layer count follow the stock Transformers configuration. Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved. The ordered native loader fallback uses the public Transformers modeling classes from the published wheels allowed by each tagged vLLM release, from Transformers 5.10.4 through 5.20.2. The table in `crates/core/src/perfmodel/fpm/nixl/transformers_models.txt` includes every exported modeling class whose stock `is_backend_compatible` or `_can_set_attn_implementation` can succeed, including classes whose compatibility is unknown. A class present in any permitted Transformers version retains the corresponding vLLM release bit. The underlying class names are factual package metadata.
+
+- https://github.com/huggingface/transformers/blob/v5.10.4/src/transformers/modeling_utils.py
+- https://github.com/huggingface/transformers/blob/v5.20.2/src/transformers/modeling_utils.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/requirements/common.txt
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/requirements/common.txt
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/requirements/common.txt
+
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen2/configuration_qwen2.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen3/configuration_qwen3.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/llama/configuration_llama.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/mistral/configuration_mistral.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/falcon/configuration_falcon.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/qwen2/configuration_qwen2.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/qwen3/configuration_qwen3.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/llama/configuration_llama.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/mistral/configuration_mistral.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/falcon/configuration_falcon.py
 - https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/nemotron_h/configuration_nemotron_h.py
 - https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/nemotron_h/configuration_nemotron_h.py
 - https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen2_vl/configuration_qwen2_vl.py

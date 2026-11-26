@@ -262,7 +262,20 @@ def _merge_resources(
                     if not isinstance(cell, str) or not cell or cell in formal_cells:
                         raise ValueError("missing or duplicate formal cell in grouped worker roster")
                     formal_cells.add(cell)
-                evidence["worker_observations"] = _worker_observations(evidence)
+                # Formal observations can retain the original relative launch path.
+                # The verified probe archives the matching checkpoint beside its index.
+                digest = ((evidence.get("launch") or {}).get("model_config") or {}).get("sha256")
+                staged = next(
+                    (
+                        Path(item["path"])
+                        for item in (manifest.get("runtime_probe") or {}).get("source_artifacts", [])
+                        if digest and item.get("kind") == "model_config" and item.get("sha256") == digest
+                    ),
+                    None,
+                )
+                evidence["worker_observations"] = _worker_observations(
+                    evidence, checkpoint=staged if staged is not None and staged.is_file() else None
+                )
             evidence["artifacts"] = [
                 {
                     **{key: value for key, value in artifact.items() if key != "evidence"},

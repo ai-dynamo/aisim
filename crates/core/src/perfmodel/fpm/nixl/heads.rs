@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-FileCopyrightText: Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023 Mistral AI and the HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023 the Falcon authors and HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -63,7 +66,8 @@ impl HeadGeometry {
 }
 
 /// An override contains only the changed fields. A missing higher-priority field
-/// can still come from the checkpoint. A saved effective HF config is complete.
+/// can still come from the checkpoint. A saved effective config or a known
+/// stock constructor establishes the complete set of geometry fields.
 #[derive(Clone, Copy)]
 pub(super) struct HfConfig<'a> {
     pub(super) fields: &'a Value,
@@ -160,9 +164,71 @@ pub(super) fn hybrid_pattern(config: &Value) -> Option<Cow<'_, str>> {
         .map(Cow::Borrowed)
 }
 
+fn stock_decoder(config: &Value) -> Option<Decoder> {
+    if config["auto_map"].get("AutoConfig").is_some() {
+        return None;
+    }
+    let family = config["model_type"].as_str()?;
+    Decoder::from_family(family).filter(|decoder| decoder.family() == family)
+}
+
+/// Ordinary HF constructors distinguish omitted arguments from explicit nulls.
+/// Values assigned in __post_init__ retain their initial value across later updates.
+fn initialize_decoder(config: &Value, top: &mut serde_json::Map<String, Value>, decoder: Decoder) {
+    let falcon = decoder == Decoder::Falcon;
+    if falcon && let Some(size) = config.get("n_embed").filter(|v| !v.is_null()) {
+        // Falcon consumes this legacy checkpoint argument only during construction.
+        top.insert("hidden_size".into(), size.clone());
+    }
+    top.entry("hidden_size")
+        .or_insert_with(|| Value::from(if falcon { 4544 } else { 4096 }));
+    top.entry("num_attention_heads")
+        .or_insert_with(|| Value::from(if falcon { 71 } else { 32 }));
+    if decoder != Decoder::NemotronH {
+        top.entry("num_hidden_layers").or_insert(Value::from(32));
+    }
+    let query_heads = top["num_attention_heads"].clone();
+    let (kv_field, default) = match decoder {
+        Decoder::Falcon => ("num_kv_heads", Value::Null),
+        Decoder::Llama => ("num_key_value_heads", Value::Null),
+        Decoder::Qwen2 | Decoder::Qwen3 => ("num_key_value_heads", Value::from(32)),
+        Decoder::Mistral | Decoder::NemotronH => ("num_key_value_heads", Value::from(8)),
+    };
+    let kv_heads = top.entry(kv_field).or_insert(default);
+    if kv_heads.is_null() && !matches!(decoder, Decoder::Mistral | Decoder::NemotronH) {
+        *kv_heads = query_heads;
+    }
+    match decoder {
+        Decoder::Llama | Decoder::Mistral if top.get("head_dim").is_none_or(Value::is_null) => {
+            if let Some(width) = divided_head_size(&top["hidden_size"], &top["num_attention_heads"])
+            {
+                top.insert("head_dim".into(), Value::from(width));
+            }
+        }
+        Decoder::Qwen3 | Decoder::NemotronH => {
+            top.entry("head_dim").or_insert(Value::from(128));
+        }
+        Decoder::Falcon => {
+            top.entry("new_decoder_architecture")
+                .or_insert(Value::Bool(false));
+            top.entry("multi_query").or_insert(Value::Bool(true));
+        }
+        _ => {}
+    }
+}
+
+fn divided_head_size(hidden_size: &Value, query_heads: &Value) -> Option<u64> {
+    positive(hidden_size)?
+        .checked_div(positive(query_heads)?)
+        .filter(|&size| size > 0)
+}
+
 /// Project the authenticated HF checkpoint before vLLM applies its serving overrides.
 fn checkpoint_geometry(config: &Value) -> Value {
     let mut top = geometry_config(config);
+    if let Some(decoder) = stock_decoder(config) {
+        initialize_decoder(config, &mut top, decoder);
+    }
     if let Some(family) = qwen2_vl_text_type(config) {
         // Both Qwen2 VL constructors consume these flat kwargs, even when an
         // explicit text_config supplies the actual values. Other flat attributes
@@ -224,7 +290,12 @@ impl CheckpointKey {
     }
 }
 
-pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Value> {
+pub(super) struct Checkpoint {
+    fields: Value,
+    plain_decoder: bool,
+}
+
+pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Checkpoint> {
     // An omitted override table is different from an explicitly empty one:
     // a historical writer may not have captured the serving overrides.
     let overrides = model.get("hf_overrides").filter(|v| v.is_object())?;
@@ -278,6 +349,16 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Value> {
         })
         .ok()
         .flatten()?;
+    let decoder = stock_decoder(&saved);
+    if decoder.is_some()
+        && let Some(family) = overrides["model_type"].as_str()
+        && saved["model_type"] != family
+        && stock_decoder(overrides).is_none()
+    {
+        // vLLM can select a registered config class before loading the checkpoint.
+        // The original stock constructor does not establish the new class's defaults.
+        return None;
+    }
     let mut effective = (*saved).clone();
     if let Some(key) = text_field(&saved).or_else(|| text_field(overrides)) {
         if effective[key].is_null() {
@@ -286,7 +367,12 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Value> {
         apply_geometry(&mut effective[key], &overrides[key]);
     }
     apply_geometry(&mut effective, overrides);
-    if saved["model_type"] == "nemotron_h" && saved["auto_map"].get("AutoConfig").is_none() {
+    if decoder == Some(Decoder::Falcon) {
+        // Falcon exposes head_dim as a read-only property of the current scalars.
+        effective["head_dim"] =
+            divided_head_size(&effective["hidden_size"], &effective["num_attention_heads"]).into();
+    }
+    if decoder == Some(Decoder::NemotronH) {
         // Stock NemotronHConfig computes both properties from the same list. Its
         // compatibility setter for num_hidden_layers ignores scalar updates.
         let pattern = hybrid_pattern(overrides)
@@ -301,15 +387,20 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Value> {
             Value::from(pattern.as_ref()),
         );
     }
-    Some(effective)
+    Some(Checkpoint {
+        fields: effective,
+        plain_decoder: decoder.is_some(),
+    })
 }
 
 impl<'a> HfConfig<'a> {
-    pub(super) fn observed(model: &'a Value, checkpoint: Option<&'a Value>) -> Self {
+    pub(super) fn observed(model: &'a Value, checkpoint: Option<&'a Checkpoint>) -> Self {
         let saved = model.get("hf_config").filter(|v| v.is_object());
         Self {
-            fields: saved.or(checkpoint).unwrap_or(&model["hf_overrides"]),
-            complete: saved.is_some(),
+            fields: saved
+                .or_else(|| checkpoint.map(|c| &c.fields))
+                .unwrap_or(&model["hf_overrides"]),
+            complete: saved.is_some() || checkpoint.is_some_and(|c| c.plain_decoder),
             verified: checkpoint.is_some(),
         }
     }
@@ -336,7 +427,7 @@ impl<'a> HfConfig<'a> {
         if let Some(key) = nested {
             Self {
                 fields: &self.fields[key],
-                complete: self.complete || (self.verified && qwen_vl),
+                complete: (self.complete && !self.verified) || (self.verified && qwen_vl),
                 verified: self.verified,
             }
         } else if referenced
@@ -365,9 +456,10 @@ impl<'a> HfConfig<'a> {
     }
 
     fn divided_head_size(self) -> Option<u64> {
-        positive(&self.fields["hidden_size"])?
-            .checked_div(positive(&self.fields["num_attention_heads"])?)
-            .filter(|&size| size > 0)
+        divided_head_size(
+            &self.fields["hidden_size"],
+            &self.fields["num_attention_heads"],
+        )
     }
 
     fn base_kv_heads(self) -> Option<u64> {
@@ -403,6 +495,13 @@ impl<'a> HfConfig<'a> {
     }
 
     fn base_head_size(self) -> Option<u64> {
+        // A serialized FalconConfig omits its read-only head_dim property.
+        if self.complete
+            && self.fields.get("head_dim").is_none()
+            && stock_decoder(self.fields) == Some(Decoder::Falcon)
+        {
+            return self.divided_head_size();
+        }
         if let Some(size) = positive(&self.fields["head_dim"]) {
             return Some(size);
         }
@@ -419,9 +518,11 @@ impl<'a> HfConfig<'a> {
     }
 
     fn flag(self, name: &str) -> Option<bool> {
-        self.fields[name]
-            .as_bool()
-            .or_else(|| (self.complete && self.fields.get(name).is_none()).then_some(false))
+        match self.fields.get(name) {
+            Some(Value::Null) if self.complete => Some(false),
+            Some(value) => value.as_bool(),
+            None => self.complete.then_some(false),
+        }
     }
 
     pub(super) fn model_geometry(
