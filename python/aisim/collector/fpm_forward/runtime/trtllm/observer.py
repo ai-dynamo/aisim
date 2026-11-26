@@ -87,27 +87,42 @@ def device_uuid(executor):
 
 
 def nvml_reader(uuids):
-    """Resolve only the UUIDs reported by the two participating CUDA ranks."""
+    """Open NVML once for the two rank-reported UUIDs; each read only samples the counters.
+
+    Initialization and handle lookup stay outside the energy window, so neither
+    their idle time nor their latency enters the measured interval.
+    """
     try:
         import pynvml as nvml
     except ImportError:
         raise EnergyError("nvml_error") from None
 
+    def translate(error):
+        return EnergyError("nvml_permission" if isinstance(error, nvml.NVMLError_NoPermission) else "nvml_error")
+
+    try:
+        nvml.nvmlInit()
+    except nvml.NVMLError as error:
+        raise translate(error) from None
+    try:
+        handles = {uuid: nvml.nvmlDeviceGetHandleByUUID(uuid) for uuid in uuids}
+    except nvml.NVMLError as error:
+        nvml.nvmlShutdown()
+        raise translate(error) from None
+
     def read():
         try:
-            nvml.nvmlInit()
-            try:
-                return {
-                    uuid: nvml.nvmlDeviceGetTotalEnergyConsumption(nvml.nvmlDeviceGetHandleByUUID(uuid))
-                    for uuid in uuids
-                }
-            finally:
-                nvml.nvmlShutdown()
-        except nvml.NVMLError_NoPermission:
-            raise EnergyError("nvml_permission") from None
-        except nvml.NVMLError:
-            raise EnergyError("nvml_error") from None
+            return {uuid: nvml.nvmlDeviceGetTotalEnergyConsumption(handle) for uuid, handle in handles.items()}
+        except nvml.NVMLError as error:
+            raise translate(error) from None
 
+    def close():
+        try:
+            nvml.nvmlShutdown()
+        except nvml.NVMLError:
+            pass
+
+    read.close = close
     return read
 
 
@@ -164,6 +179,7 @@ class Observer:
         self.steps = []
         self.anchor = self.sample = self.previous = self.snapshot = None
         self.reading = self.finish_reading = None
+        self.reader = None
         self.reason = None
         self.finished = False
         self.published = False
@@ -213,6 +229,10 @@ class Observer:
                 return
             if math.isfinite(step.wall_s) and step.wall_s > 0:
                 self.sample = step
+                if self.rank == 0:
+                    # Open NVML in the pass before the anchor: its stall stays out
+                    # of the latency sample, the energy window and its step times.
+                    self.prepare_energy()
             return
         if self.anchor is None:
             self.anchor = step
@@ -230,9 +250,9 @@ class Observer:
         elif len(self.steps) >= 4096:
             self.finish("window_below_minimum")
 
-    def read_energy(self):
-        if self.reason:
-            return None
+    def prepare_energy(self):
+        if self.reader is not None or self.reason:
+            return
         try:
             devices = [json.loads((self.scope / f"device-{rank}.json").read_text()) for rank in (0, 1)]
             uuids = [device["gpu_uuid"] for device in devices]
@@ -240,19 +260,35 @@ class Observer:
                 raise EnergyError("gpu_mapping_unavailable")
             if any(device["serving_config"] != self.settings for device in devices):
                 raise EnergyError("rank_settings_mismatch")
-            before = self.clock()
-            values = self.energy(uuids)()
-            return {"before_s": before, "after_s": self.clock(), "energy_mj": values}
+            self.reader = self.energy(uuids)
         except EnergyError as error:
             self.reason = str(error)
         except FileNotFoundError:
             self.reason = "gpu_mapping_unavailable"
+
+    def read_energy(self):
+        self.prepare_energy()
+        if self.reason or self.reader is None:
+            return None
+        try:
+            # The bracket covers only the counter reads.
+            before = self.clock()
+            values = self.reader()
+            return {"before_s": before, "after_s": self.clock(), "energy_mj": values}
+        except EnergyError as error:
+            self.reason = str(error)
         return None
+
+    def close_energy(self):
+        reader, self.reader = self.reader, None
+        if close := getattr(reader, "close", None):
+            close()
 
     def finish(self, reason):
         if self.finished:
             return
         self.finished = True
+        self.close_energy()
         write_json(
             self.scope / f"rank-{self.rank}.json",
             {

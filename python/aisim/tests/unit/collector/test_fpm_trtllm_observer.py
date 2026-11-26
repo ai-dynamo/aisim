@@ -67,13 +67,22 @@ def run(
     count=16,
     omit_peer=False,
     phase="decode",
+    setup_cost=0.0,
+    setups=None,
 ):
     current = [0.0]
     readings = iter((1000, 621_000))
     settings = {**observer.SETTINGS, "max_batch_size": 4}
 
     def energy(uuids):
+        # Model NVML init and handle lookup as wall time on the observer's clock.
+        current[0] += setup_cost
+        if setups is not None:
+            setups.append(("setup", observer_steps()))
+
         def read():
+            if setups is not None:
+                setups.append(("read", observer_steps()))
             if energy_failure in {"nvml_permission", "nvml_error"}:
                 raise observer.EnergyError(energy_failure)
             value = next(readings)
@@ -97,6 +106,11 @@ def run(
     monkeypatch.setattr(observer, "effective_settings", lambda _: settings)
     observer.install_hooks(Executor, context(phase), tmp_path)
     ranks = [Executor(rank) for rank in range(2)]
+
+    def observer_steps():
+        leader = ranks[0]._aisim_trtllm_observer
+        return ("anchor" if leader.anchor else "sample" if leader.sample else "none", len(leader.steps))
+
     for i in range(count):
         for executor in ranks:
             executor.iter_counter = i
@@ -156,6 +170,39 @@ def test_prefill_observer_reports_zero_cached_kv(tmp_path, monkeypatch):
     }
     assert result["power"]["status"] == "measured"
     assert result["power"]["kv_drift_tokens"] == 0
+
+
+def test_nvml_setup_stays_outside_the_energy_window(tmp_path, monkeypatch):
+    setups = []
+    result = run(tmp_path, monkeypatch, setup_cost=0.5, setups=setups)
+    (leader,) = (json.loads(path.read_text()) for path in tmp_path.glob("trtllm-*/rank-0.json"))
+    # NVML opens once, in the sample pass; the anchor and closing passes only read counters.
+    assert setups == [("setup", ("sample", 0)), ("read", ("anchor", 0)), ("read", ("anchor", 10))]
+    for reading in (leader["energy_start"], leader["energy_end"]):
+        assert reading["after_s"] == reading["before_s"]
+    assert result["power"]["status"] == "measured"
+    assert result["power"]["window_iterations"] == 10
+
+
+def test_nvml_reader_initializes_once(monkeypatch):
+    calls = []
+
+    class NVMLError(Exception):
+        pass
+
+    fake = SimpleNamespace(
+        NVMLError=NVMLError,
+        NVMLError_NoPermission=type("NVMLError_NoPermission", (NVMLError,), {}),
+        nvmlInit=lambda: calls.append("init"),
+        nvmlShutdown=lambda: calls.append("shutdown"),
+        nvmlDeviceGetHandleByUUID=lambda uuid: calls.append("handle") or uuid,
+        nvmlDeviceGetTotalEnergyConsumption=lambda handle: calls.append("read") or len(handle),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "pynvml", fake)
+    read = observer.nvml_reader(["GPU-a", "GPU-bb"])
+    assert read() == read() == {"GPU-a": 5, "GPU-bb": 6}
+    read.close()
+    assert calls == ["init", "handle", "handle", "read", "read", "read", "read", "shutdown"]
 
 
 @pytest.mark.parametrize("reason", ["nvml_permission", "nvml_error", "counter_wrap", "counter_not_advancing"])
