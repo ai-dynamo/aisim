@@ -144,6 +144,21 @@ SOURCE_MANIFESTS: dict[str, dict[str, str]] = {
     },
 }
 
+# Optional NIXL pull-transfer sources at vLLM v0.33.0 (4ba787ec9959e566d3b587a796dff07673324da5).
+# The installed files qualify transfer bytes independently of the sources required for physical-memory observation.
+_NIXL_V1 = "vllm/distributed/kv_transfer/kv_connector/v1/"
+NIXL_TRANSFER_SOURCE_HASHES = {
+    _NIXL_V1 + "nixl/base_worker.py": "db9cc20aafb0be220b0d9ddbc94ac1f6495f02956c7e480901b394d6bfff5cd9",
+    _NIXL_V1 + "nixl/connector.py": "36dbc6a182ba753caf06fb40d40baa3b218371c62323f3ade29f8dd50514bd8a",
+    _NIXL_V1 + "nixl/pull_worker.py": "9fec5faaca6080d00e4292f3a2f7cb55b084c56f60f732785fded6800302d53a",
+    _NIXL_V1 + "nixl/tp_mapping.py": "2f27b29a4c1e7e5bf894f7c228e0c2f36c91e54c54a8b63d631a8e5c32fece3e",
+    _NIXL_V1 + "nixl/utils.py": "26323d314dfe204749f12399c8af940bd52a9518bc0017dbd0bd593d4393ac5d",
+    _NIXL_V1 + "ssm_conv_transfer_utils.py": "5185497db060df2a16b067121c14cd27a37c04d7b2e6322c9d4140a06e724cf5",
+    "vllm/model_executor/layers/mamba/mamba_utils.py": "9fddeca9fe0ebdde3ca718d11d31aaba68a09eba8ce2d2ea9c7c922f16f02439",  # noqa: E501
+    "vllm/envs.py": "a9f665c49da1d8852c19a192f5d5848f0e38f4f56c76b5fafe0c17398945b357",
+    **{path: SOURCE_MANIFESTS["0.33.0"][path] for path in ("vllm/v1/worker/utils.py", "vllm/v1/kv_cache_interface.py")},
+}
+
 _SOURCE_PROBLEMS: dict[str, str | None] = {}
 
 

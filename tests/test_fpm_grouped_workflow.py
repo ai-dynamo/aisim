@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import logging
 import os
 import re
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -2789,3 +2791,76 @@ def test_nixl_transfer_evidence_of_vllm_0330_holds_the_region_table_of_the_live_
     assert sum(lengths) == measured["attention"]
     assert sum(lengths[index] for index in table["scratch_region_indices"]) == measured["ring"]
     assert len(table["ssm_region_indices"]) * sum(table["mamba_ssm_size"]) == measured["kda_group_0"]
+
+
+def test_nixl_captures_reproduce_the_28_request_deltas_and_allocated_gpu_seconds():
+    captures = _EVIDENCE / _EVIDENCE_0330 / "captures"
+    provenance = json.loads((captures / "provenance.json").read_text())
+    for name, digest in provenance["files_sha256"].items():
+        assert hashlib.sha256((captures / name).read_bytes()).hexdigest() == digest
+    layout_lines = (captures / "ssm-conv-layout.txt").read_text().splitlines()
+    assert len(layout_lines) == 6
+    assert all(line.endswith("Setting SSM conv state layout to DS.") for line in layout_lines)
+    with (captures / "counter-samples.csv").open() as stream:
+        snapshots = {(row["arm"], row["request"], row["sample"]): row for row in csv.DictReader(stream)}
+    assert len(snapshots) == 56
+    accounting = provenance["gpu_accounting"]
+    gpus = accounting["gpus_in_allocation"]
+    assert gpus == 8
+    for arm, results in _evidence_versions(_EVIDENCE_0330)["0.33.0"]["arms"].items():
+        requests = [json.loads(line) for line in (captures / f"requests-{arm.lower()}.jsonl").read_text().splitlines()]
+        usage = accounting["arms"][arm]
+        assert usage["valid_requests"] == len(requests)
+        assert usage["wall_seconds"] == sum(usage["phase_wall_seconds"].values())
+        assert usage["allocated_gpu_seconds"] == usage["wall_seconds"] * gpus
+        for request, row in zip(requests, results["rows"], strict=True):
+            before, after = (snapshots.pop((arm, request["label"], stage)) for stage in ("before", "after"))
+            assert before["source_sha256"] != after["source_sha256"]
+            assert request["valid"] and request["usage_prompt_tokens"] == row["prompt_tokens"]
+            assert request["remote_num_tokens"] == row["transferred_tokens"]
+            assert request["remote_block_counts"][4] == row["prefill_attention_blocks"]
+            deltas = {}
+            for counter in ("nixl_bytes_transferred_count", "nixl_bytes_transferred_sum", "nixl_num_descriptors_sum"):
+                deltas[counter] = Decimal(after[counter]) - Decimal(before[counter])
+                assert deltas[counter] == request["decode_delta"][f"vllm:{counter}"]
+            assert deltas["nixl_bytes_transferred_count"] == 4
+            assert deltas["nixl_bytes_transferred_sum"] == 4 * row["bytes_per_rank"]
+            assert deltas["nixl_num_descriptors_sum"] == 4 * row["descriptors_per_rank"]
+    assert not snapshots
+    job = accounting["capture"]
+    assert job["state_at_capture"] == "RUNNING" and job["final_job_wall_seconds"] is None
+    assert job["allocated_gpu_seconds_at_capture"] == job["elapsed_at_capture_seconds"] * gpus
+
+
+def test_nixl_ds_connector_records_reproduce_every_group_on_the_four_decode_ranks():
+    directory = _EVIDENCE / _EVIDENCE_0330
+    captures = directory / "captures"
+    records = [
+        json.loads(line.split(" NIXL_BYTESPLIT ")[1])
+        for line in (captures / "connector-ranks.txt").read_text().splitlines()
+    ]
+    table = json.loads((directory / "region-table.json").read_text())
+    registrations = [record for record in records if record["kind"] == "registration"]
+    assert sorted(record["tp_rank"] for record in registrations) == list(range(4))
+    for registration in registrations:
+        assert registration["conv_offsets"] == [[0, 12_288], [12_288, 12_288], [24_576, 12_288]]
+        for key in table.keys() - {"source", "schema", "vllm_version"}:
+            assert registration[key] == table[key]
+    requests = [json.loads(line) for line in (captures / "requests-c.jsonl").read_text().splitlines()]
+    rows = _evidence_versions(_EVIDENCE_0330)["0.33.0"]["arms"]["C"]["rows"]
+    transfers = [record for record in records if record["kind"] == "transfer"]
+    assert len(transfers) == 4 * len(requests) == 24
+    for request, row in zip(requests, rows, strict=True):
+        prefix = "cmpl-" + request["proxy"]["request_id"] + "-"
+        ranks = [record for record in transfers if record["request_id"].startswith(prefix)]
+        assert sorted(record["tp_rank"] for record in ranks) == list(range(4))
+        for rank in ranks:
+            assert rank["concat_equal_in_order"] and rank["lengths_from"] == "src_blocks_data"
+            assert rank["bytes_total"] == row["bytes_per_rank"]
+            assert rank["descs_total"] == row["descriptors_per_rank"]
+            names = [*(f"kda_group_{i}" for i in range(4)), "attention", "ring"]
+            assert [group["group"] for group in rank["groups"]] == list(range(6))
+            for name, group in zip(names, rank["groups"], strict=True):
+                measured = sum(int(length) * count for length, count in group["lengths"].items())
+                assert sum(group["lengths"].values()) == group["descs"]
+                assert measured == group["bytes"] == row["group_bytes"][name]

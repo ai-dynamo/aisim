@@ -22,6 +22,7 @@ from aisim.fpm_contract import FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION,
 from aisim_core.decoder_config import decoder_config_key
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY
 
+from . import sglang_native_fpm
 from .capabilities import GENERIC_RUNTIME_TEMPLATE_ID
 from .measurement_evidence import GLM_PRODUCER_PROTOCOL, extract_measurement_evidence
 from .native_artifact import (
@@ -77,6 +78,14 @@ POWER_WINDOW_MEASUREMENT_POLICY = "dynamo_native_single_sample_power_window_v1"
 # point ten times and each row holds the upper median of the repetitions after the first
 # (measurement_evidence.GLM_PRODUCER_PROTOCOL). The FPM table loader of crates/core admits it for schema 7 and vLLM.
 VLLM_PREFIX_SEED_MEDIAN_POLICY = "vllm_native_fpm_prefix_seed_median_v1"
+_MEDIAN_PROTOCOLS = {
+    VLLM_PREFIX_SEED_MEDIAN_POLICY: ("vllm", GLM_PRODUCER_PROTOCOL["state_protocol"], GLM_TIMING_BOUNDARY),
+    "sglang_native_fpm_radix_seed_median_v1": (
+        "sglang",
+        sglang_native_fpm.STATE_PROTOCOL,
+        sglang_native_fpm.TIMING_BOUNDARY,
+    ),
+}
 
 
 def _dotted_get(payload: object, path: str) -> object:
@@ -474,6 +483,35 @@ def published_median_policy(metadata: dict[str, Any]) -> bool:
     return metadata.get("measurement_policy") == VLLM_PREFIX_SEED_MEDIAN_POLICY
 
 
+def _validate_median_publication(metadata: dict[str, Any], rows: list[dict[str, Any]], backend: str) -> None:
+    """Enforce the native median contract before accepting or republishing a sealed pair."""
+    policy = metadata.get("measurement_policy")
+    if not isinstance(policy, str) or policy not in _MEDIAN_PROTOCOLS:
+        row_policies = (row.get("measurement_policy") for row in rows)
+        if any(isinstance(label, str) and label in _MEDIAN_PROTOCOLS for label in row_policies):
+            raise ValueError("FPM median rows must match the sidecar measurement_policy")
+        return
+    expected_backend, protocol, boundary = _MEDIAN_PROTOCOLS[policy]
+    schema = metadata.get("schema_version")
+    if type(schema) is not int or schema != 7 or metadata.get("backend") != backend or backend != expected_backend:
+        raise ValueError(f"FPM median sidecar measurement_policy={policy!r} requires schema 7 and {expected_backend}")
+    repeats = {key: GLM_PRODUCER_PROTOCOL[key] for key in ("warmup_repeats", "measurement_repeats")}
+    for key, expected in repeats.items():
+        if type(metadata.get(key)) is not int or metadata[key] != expected:
+            raise ValueError(f"FPM median sidecar {key} must be the integer {expected}")
+    counts = {"global_warmup_iterations": 0, **repeats}
+    for row in rows:
+        if row.get("measurement_policy") != policy or row.get("backend") != backend:
+            raise ValueError("FPM median rows must match the sidecar measurement_policy and backend")
+        if row.get("kv_seed_regime") == "fake_fallback":
+            raise ValueError("FPM median rows cannot use fake_fallback KV state")
+        if row.get("state_protocol") != protocol or row.get("timing_boundary") != boundary:
+            raise ValueError(f"FPM median rows must match the state protocol and timing boundary of {policy!r}")
+        for key, expected in counts.items():
+            if type(row.get(key)) is not int or row[key] != expected:
+                raise ValueError(f"FPM median row {key} must be the integer {expected}")
+
+
 def _validate_kv_seed_classification(metadata: dict[str, Any], rows: list[dict[str, Any]]) -> None:
     promoted = {row["cell_id"] for row in rows if row.get("kv_seed_regime") == "skip:dense_model_content_insensitive"}
     if published_dense_synthetic_cells(metadata) != promoted:
@@ -571,6 +609,7 @@ def validate_formal_database_commit(
             f"parquet={parquet.metadata.num_rows}, metadata={row_count!r}"
         )
     rows = parquet.read().to_pylist()
+    _validate_median_publication(payload, rows, plan.backend)
     if payload["schema_version"] == 8:
         _validate_power_rows(rows)
     _validate_kv_seed_classification(payload, rows)
@@ -849,6 +888,7 @@ def write_formal_database(
                 )
             _validate_power_schema(committed, table.schema)
             existing_rows = table.to_pylist()
+            _validate_median_publication(committed, existing_rows, plan.backend)
             if committed.get("schema_version") == 8:
                 _validate_power_rows(existing_rows)
             _validate_kv_seed_classification(committed, existing_rows)
@@ -896,11 +936,11 @@ def write_formal_database(
                 f"destination, or collect every cell with the same --fpm-measure-power setting: {parquet_path}"
             )
         # The loader reads the measurement policy of the sidecar, and the median policy binds every row to it.
-        median = VLLM_PREFIX_SEED_MEDIAN_POLICY in policies
-        if median and policies != {VLLM_PREFIX_SEED_MEDIAN_POLICY}:
+        median = next((policy for policy in _MEDIAN_PROTOCOLS if policy in policies), None)
+        if median and policies != {median}:
             raise ValueError(
                 "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
-                f"measurement_policy, and {VLLM_PREFIX_SEED_MEDIAN_POLICY!r} binds every row. Publish to a clean "
+                f"measurement_policy, and {median!r} binds every row. Publish to a clean "
                 f"destination: {parquet_path}"
             )
         if powered:
@@ -955,11 +995,7 @@ def write_formal_database(
                 "schema_version": 8 if powered else 7,
                 "coordinate_system": "iteration_totals_balanced_v1",
                 "measurement_policy": (
-                    VLLM_PREFIX_SEED_MEDIAN_POLICY
-                    if median
-                    else POWER_WINDOW_MEASUREMENT_POLICY
-                    if powered
-                    else SINGLE_SAMPLE_MEASUREMENT_POLICY
+                    median or (POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY)
                 ),
                 "warmup_repeats": GLM_PRODUCER_PROTOCOL["warmup_repeats"] if median else 0,
                 "measurement_repeats": GLM_PRODUCER_PROTOCOL["measurement_repeats"] if median else 1,
@@ -975,6 +1011,7 @@ def write_formal_database(
                 "backend": plan.backend,
                 "backend_version": version,
             }
+            _validate_median_publication(metadata, merged, plan.backend)
             dense_cells = sorted(
                 {
                     row["cell_id"]

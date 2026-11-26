@@ -9,6 +9,7 @@ The import runs them last, so a refusal of one of its own checks keeps its text.
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -107,14 +108,21 @@ def _check_audited_class(name: Any, source_files: Mapping[str, str], role: str) 
 # v1/engine/core.py:337-352).
 # The startup concurrency check skips a layout with a sliding-window group, so this check refuses a concurrency that
 # is no positive finite number itself, with the text of that check.
-def _check_size_tokens(record: dict[str, Any]) -> None:
-    cache = record["cache"]
-    label = f"{record['phase']} scheduler of DP rank {record['dp_rank']}"
-    concurrency = cache.get("kv_cache_max_concurrency")
-    if isinstance(concurrency, bool) or not isinstance(concurrency, (int, float)) or not 0 < concurrency < math.inf:
+def scheduler_concurrency(record: dict[str, Any], label: str) -> int | float:
+    concurrency = record["cache"].get("kv_cache_max_concurrency")
+    if type(concurrency) not in (int, float) or not 0 < concurrency <= sys.float_info.max:
         raise ValueError(f"{label} lacks a positive kv_cache_max_concurrency")
-    value = cache.get("kv_cache_size_tokens")
-    expected = int(concurrency * record["resolved_config"]["model_config"]["max_model_len"])
+    return concurrency
+
+
+def _check_size_tokens(record: dict[str, Any]) -> None:
+    label = f"{record['phase']} scheduler of DP rank {record['dp_rank']}"
+    concurrency = scheduler_concurrency(record, label)
+    value = record["cache"].get("kv_cache_size_tokens")
+    product = float(concurrency) * record["resolved_config"]["model_config"]["max_model_len"]
+    if not math.isfinite(product):
+        raise ValueError(f"{label} kv_cache_max_concurrency and max_model_len exceed the finite token capacity")
+    expected = int(product)
     if type(value) is not int or value != expected:
         raise ValueError(
             f"{label} records kv_cache_size_tokens {value!r}, "

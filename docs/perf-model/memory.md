@@ -325,8 +325,7 @@ read `transfer_bytes_per_block`.
   [`ssm_conv_transfer_utils.py:155-156`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L155-L156).
 
   The import writes the field only for a record that meets all of these
-  conditions. They describe the structure of the cache. They do not name the
-  TP size, the GPU type or the KV cache data type.
+  conditions on the observed cache, phase and connector.
 
   1. It is a vLLM 0.33.0 record with hybrid evidence.
   2. One storage holds every block row, and every allocation uses the same
@@ -338,6 +337,14 @@ read `transfer_bytes_per_block`.
   5. Every Mamba group holds two or more layers, and all Mamba layers hold the
      same two state tensors.
   6. The record comes from a probe phase with prefix caching on.
+  7. The worker reports the installed source hashes of the audited vLLM 0.33.0
+     NIXL pull connector and its layout and state-split dependencies. Each
+     digest must match the pinned source.
+  8. The worker observes DS convolution state layout and the connector's
+     native split of its actual Mamba specs at the launch TP. The split's
+     dimensions and two byte counts must match the observed state tensors.
+     The audited release defaults to SD. Set `VLLM_SSM_CONV_STATE_LAYOUT=DS`
+     in the worker environment for a DS deployment.
 
   A probe can hold two phases and several TP ranks. The import computes the
   value from each worker record of each phase with prefix caching on, and a
@@ -353,9 +360,7 @@ read `transfer_bytes_per_block`.
   the record lacks or holds in a form that the import does not know, or worker
   records that give different values.
 
-  The record does not hold four facts that the connector reads. A reading of
-  the vLLM source shows that the value does not depend on them inside the
-  conditions:
+  The pinned connector and worker code establish three further properties of this cache layout.
 
   - The ratio between the manager block and the kernel block of the
     connector. Storage of whole block rows starts only with a ratio of 1. vLLM
@@ -365,13 +370,6 @@ read `transfer_bytes_per_block`.
     the conditions holds two or more layers.
   - The layout that the connector asks for, which follows `use_mla`. The
     connector asks for another layout only for a model without MLA.
-  - The `mamba_type` of a Mamba layer. The connector starts only for Mamba1,
-    Mamba2 and GDN layers. For each of them it reads the two state tensors
-    whole. For Mamba2 this holds because vLLM makes the TP size divide the
-    group columns; see vLLM v0.33.0
-    [`mamba_mixer2.py:320-341`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/mamba/mamba_mixer2.py#L320-L341)
-    and
-    [`mamba_utils.py:197-205`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/mamba/mamba_utils.py#L197-L205).
 
   The connector orders the regions of a ring model by the manager views. vLLM
   builds these views in the order of the allocation plan, which the record
@@ -388,16 +386,16 @@ read `transfer_bytes_per_block`.
   and
   [`:155-208`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L155-L208).
 
-  A live run of GLM-5.3-Flash at TP 4 with an fp8 KV cache on GB300 measured
-  21,978,496 bytes per block per TP rank for the attention group, 92,288 for
-  the single ring group and 9,768,960 for each KDA state group. The import of
-  a probe record of the same model, TP size, data type and GPU type gives
-  these values. Its region table equals the table that the connector logged. See
-  [`nixl-pd-transfer-bytes-20261117`](../../benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md).
-  For another TP size or KV cache data type of the same cache shape, the
-  import computes the value from that record by the same rule. No run
-  measured such a value. The value describes the probe launch with the
-  connector added and no other change.
+  The DS P/D run of GLM-5.3-Flash at TP 4 with an fp8 KV cache on GB300
+  measured 21,978,496 bytes per block per rank for the attention group, 92,288
+  for the ring and 9,768,960 for each KDA group. The independent archived
+  prefill probe recorded an SD convolution tensor of shape `[3, 6144]`.
+  Import preserves that probe's physical memory and prefix-cache evidence
+  and leaves transfer bytes unset. Its allocation dimensions yield the same
+  region lengths, but the pinned connector requires DS before registration.
+  For another launch meeting all eight conditions, import derives its values
+  from the launch's own records. The hardware measurements cover the DS
+  configuration in the [P/D evidence](../../benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md).
 
   A claim in `resource_overrides.cache_groups` that states this field must
   state the value of the import. If the probe evidence holds no value, the

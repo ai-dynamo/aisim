@@ -4446,13 +4446,13 @@ def test_power_window_cannot_be_set_through_the_environment(name, source):
     # as off, "-1" as on, and a value that int() cannot read ("", "true", "0.0", "0x0") stops vLLM. None leaves the
     # variable unset.
     [
-        *[("slurm_probe", value, True) for value in ("1", "2", "-1", "true", "", "0.0", "0x0")],
-        *[("slurm_probe", value, False) for value in (None, "0", "00", " 0", "\u0660")],
+        *[("slurm_probe", value, True) for value in ("true", "", "0.0", "0x0")],
+        *[("slurm_probe", value, False) for value in (None, "0", "00", " 0", "\u0660", "1", "2", "-1")],
         ("kubernetes_probe", "1", False),
         ("slurm_collection", "1", False),
     ],
 )
-def test_slurm_probe_refuses_vllm_batch_invariant_in_the_collector_environment(
+def test_slurm_v033_probe_validates_the_inherited_batch_invariant_integer(
     tmp_path, monkeypatch, launch, value, refused
 ):
     from collector.fpm_forward.runtime_probe import build_runtime_probe_plan, probe_generator_overrides
@@ -4478,12 +4478,7 @@ def test_slurm_probe_refuses_vllm_batch_invariant_in_the_collector_environment(
         monkeypatch.setenv("VLLM_BATCH_INVARIANT", value)
 
     if refused:
-        text = (
-            f"VLLM_BATCH_INVARIANT is set to {value!r} in the environment of the collector, and srun can pass it to "
-            "vLLM in the step of a runtime probe; when vLLM reads it as on, it turns prefix caching off in a worker of "
-            "the TRITON_MLA or FLASHINFER backend while its scheduler keeps it on, and the import refuses such "
-            "records; unset it"
-        )
+        text = f"vLLM 0.33.0 requires an integer VLLM_BATCH_INVARIANT; Slurm would pass {value!r}"
         for cell in plan.cells:
             with pytest.raises(ValueError, match=f"^{re.escape(text)}$"):
                 _cell_generator_overrides(plan, cell, base)
@@ -4491,6 +4486,18 @@ def test_slurm_probe_refuses_vllm_batch_invariant_in_the_collector_environment(
     # A Kubernetes probe does not get the environment of the collector, and a collection launch is outside this rule:
     # both are built as without the variable.
     assert [_cell_generator_overrides(plan, cell, base) for cell in plan.cells] == without
+
+
+def test_slurm_batch_invariance_allows_cold_single_gpu_decode(monkeypatch):
+    cell = _cell(phase="decode", strategy="single")
+    plan = _plan(cell)
+    plan.capability.architecture = "Qwen3ForCausalLM"
+    plan.options.executor = "slurm"
+    plan.probe_sampling = {"max_new_token_samples": 1, "max_kv_read_token_samples": 1, "max_batch_size_samples": 1}
+    plan.runtime_backend_version = "0.33.0"
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    args = _cell_generator_overrides(plan, cell, {})["params"]["agg"]["extra_cli_args"]
+    assert "--no-enable-prefix-caching" in args
 
 
 def test_historical_plans_without_measure_power_render_no_power_window():

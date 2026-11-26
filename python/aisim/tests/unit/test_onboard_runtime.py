@@ -1035,30 +1035,70 @@ def test_following_the_linear_hint_gives_a_linear_profile(tmp_path, capsys):
     assert resources.cache_layout == "linear" and resources.kv_bytes_per_token == 16 and not resources.cache_groups
 
 
-def test_each_configuration_of_an_import_gets_its_own_linear_hint(tmp_path, capsys):
-    # A second configuration measures the same groups and types a claim; a third has no observations.
-    checkpoint, index, _ = _campaign(tmp_path)
+def _copy_observation_configuration(index, name):
     document = json.loads(index.read_text())
-    claimed_entry = copy.deepcopy(document["configurations"]["tp2"])
+    entry = copy.deepcopy(document["configurations"]["tp2"])
 
     def relabel(value):
         if isinstance(value, dict):
-            return {key: "claimed" if key == "configuration" else relabel(item) for key, item in value.items()}
+            return {key: name if key == "configuration" else relabel(item) for key, item in value.items()}
         return [relabel(item) for item in value] if isinstance(value, list) else value
 
-    # The records name their configuration, so the second configuration gets relabelled copies of them.
-    for phase in claimed_entry["attempts"][0]["phases"].values():
+    for phase in entry["attempts"][0]["phases"].values():
         for ref in [phase["launch_manifest"], *phase["artifacts"]]:
             source = index.parent / ref["path"]
-            target = index.parent / "claimed" / ref["path"]
+            target = index.parent / name / ref["path"]
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.suffix == ".json":
                 _write(target, relabel(json.loads(source.read_text())))
             else:
                 shutil.copyfile(source, target)
-            ref.update(path=str(Path("claimed") / ref["path"]), sha256=hashlib.sha256(target.read_bytes()).hexdigest())
-    document["configurations"]["claimed"] = claimed_entry
+            ref.update(
+                path=str(target.relative_to(index.parent)), sha256=hashlib.sha256(target.read_bytes()).hexdigest()
+            )
+    document["configurations"][name] = entry
     _write(index, document)
+
+
+@pytest.mark.parametrize(
+    ("concurrency", "window", "error"),
+    [
+        (1e308, True, "finite token capacity"),
+        (10**400, True, "positive kv_cache_max_concurrency"),
+        (10**400, False, "positive kv_cache_max_concurrency"),
+    ],
+    ids=["overflowing-product", "oversized-window-concurrency", "oversized-startup-concurrency"],
+)
+def test_import_keeps_valid_configuration_after_out_of_range_concurrency(tmp_path, capsys, concurrency, window, error):
+    from .collector.test_runtime_observations import _window_attention
+
+    checkpoint, index, _ = _campaign(tmp_path, layout="mamba_hybrid")
+    _copy_observation_configuration(index, "incomplete")
+
+    def edit(record):
+        if window:
+            _window_attention(record)
+        if record["kind"] == "scheduler":
+            record["cache"]["kv_cache_max_concurrency"] = concurrency
+            if type(concurrency) is int:
+                record["cache"]["kv_cache_size_tokens"] = concurrency * record["launch"]["collection"]["max_model_len"]
+
+    _mutate(index, edit, configuration="incomplete")
+    status = _import(checkpoint, index, tmp_path / "drafts", configurations=["incomplete", "tp2"])
+    results = json.loads(capsys.readouterr().out)["configurations"]
+    assert status == 1
+    assert results["incomplete"]["status"] == "incomplete"
+    assert error in results["incomplete"]["diagnostics"][0]
+    assert results["tp2"]["status"] == "complete"
+    state = _load(checkpoint)
+    assert state.configurations["incomplete"].progress.status == "blocked"
+    assert SupportRequest.model_validate(state.configurations["tp2"].draft_request).profile_deployment()
+
+
+def test_each_configuration_of_an_import_gets_its_own_linear_hint(tmp_path, capsys):
+    # A second configuration measures the same groups and types a claim; a third has no observations.
+    checkpoint, index, _ = _campaign(tmp_path)
+    _copy_observation_configuration(index, "claimed")
     state = _load(checkpoint)
     claimed = copy.deepcopy(state.configurations["tp2"].model_dump(mode="json"))
     claimed["inputs"]["resource_overrides"] = {"cache_layout": "linear"}
@@ -2445,6 +2485,24 @@ def test_glm_producer_campaign_finalizes_and_validates(tmp_path, capsys):
     assert finalization_manifest(resolved)["runtime_compatibility"]["status"] == "compatible"
     verify_runtime_profile(resolved)
     check_plan(resolved, target)
+
+
+def test_glm_campaign_with_wrong_median_repeats_cannot_be_finalized(tmp_path, capsys):
+    from aisim.support import validation_workflow
+    from aisim.support.finalization import finalize
+
+    _, request, _, root = _glm_producer_collection(tmp_path, capsys)
+    metadata = next((root / "systems/data").rglob("fpm_forward_perf.metadata.json"))
+    sidecar = json.loads(metadata.read_text())
+    sidecar["measurement_repeats"] = 9
+    _write(metadata, sidecar)
+
+    target = tmp_path / "finalized"
+    with pytest.raises(ValueError, match="median sidecar measurement_repeats must be the integer 10"):
+        finalize(request, root, target)
+    assert not target.exists()
+    with pytest.raises(ValueError, match="median sidecar measurement_repeats must be the integer 10"):
+        validation_workflow._collection_source(request, root)
 
 
 @pytest.mark.parametrize(

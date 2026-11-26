@@ -51,6 +51,7 @@ from .runtime.fpm_memory_observer import (
     _WINDOW_SPECS,
     HYBRID_EVIDENCE_VERSION,
     MEMORY_SUPPORTED_VERSIONS,
+    NIXL_TRANSFER_SOURCE_HASHES,
     audited_release,
 )
 from .runtime_instrumentation import (
@@ -1510,9 +1511,7 @@ def _validate_startup_concurrency(record: dict[str, Any]) -> None:
         else:
             blocks += -(-context // group["block_size_tokens"])
     label = f"{record['phase']} scheduler of DP rank {record['dp_rank']}"
-    concurrency = cache.get("kv_cache_max_concurrency")
-    if isinstance(concurrency, bool) or not isinstance(concurrency, (int, float)) or not 0 < concurrency < math.inf:
-        raise ValueError(f"{label} lacks a positive kv_cache_max_concurrency")
+    concurrency = runtime_evidence.scheduler_concurrency(record, label)
     # vLLM keeps the quotient as a float. The tolerance covers its rounding, far below the change of one block.
     if not math.isclose(concurrency, cache["num_blocks"] / blocks, rel_tol=1e-9):
         raise ValueError(
@@ -1544,6 +1543,9 @@ _TRANSFER_EVIDENCE_GAP = (
     "the record lacks a field that the transfer rule reads, or holds a value that the import does not know"
 )
 _TRANSFER_HYBRID_REFUSAL = f"the record holds no hybrid cache evidence of vLLM {HYBRID_EVIDENCE_VERSION}"
+_TRANSFER_LAYOUT_REFUSAL = "the worker did not establish the DS convolution state layout required by NIXL"
+_TRANSFER_SOURCE_REFUSAL = "the worker lacks matching hashes for the audited vLLM 0.33.0 NIXL transfer sources"
+_TRANSFER_SPLIT_REFUSAL = "the NIXL DS convolution split is missing or contradicts the observed Mamba state"
 _RING_SPEC = _SPEC_MODULE + "CircularBufferSpec"
 _MLA_SPEC = _SPEC_MODULE + "MLAAttentionSpec"
 
@@ -1562,19 +1564,16 @@ _MLA_SPEC = _SPEC_MODULE + "MLAAttentionSpec"
 # - For one block, a ring group reads its scratch regions, every other attention group reads every region, and a
 #   Mamba group reads its state bytes in every SSM region (bw:237-278). The state bytes are the two state tensors
 #   without padding (vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py:155-156).
-# The record does not hold four facts that the connector reads. The conditions settle three of them. Storage of
+# The pinned worker and connector source establish further properties of this layout. Storage of
 # whole block rows starts only with one kernel block for one manager block (bw:1611-1615, :1670-1672, :1720-1730),
 # because vLLM never splits the block of a group whose layers share block rows (vllm/v1/worker/utils.py:663-675).
 # A ring model accepts a tp_replicated state only in a group of one layer (bw:680-697). The connector asks for
 # another layout only for a model without MLA (vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:148-166).
-# The fourth fact is the mamba_type. The connector starts only for Mamba1, Mamba2 and GDN
-# (ssm_conv_transfer_utils.py:127-136), and their projections fill the whole convolution state (:158-208; for
-# Mamba2 because vllm/model_executor/layers/mamba/mamba_mixer2.py:320-341 and
-# vllm/model_executor/layers/mamba/mamba_utils.py:197-205 make the TP size divide the group columns), so the state
-# bytes do not depend on it.
+# The worker separately verifies DS convolution layout and calls the pinned connector's native split for its actual
+# Mamba specs (bw:699-720, ssm_conv_transfer_utils.py:127-208). The split must cover the observed state tensors.
 # benchmarks/evidence/nixl-pd-transfer-bytes-20261117 holds the measured bytes and the region table of a live run.
 def _transfer_shape_refusal(cache: dict[str, Any], runtime_version: str) -> str | None:
-    """The text of the first transfer-writer condition that the cache does not meet, or None when it meets all six.
+    """The text of the first transfer-writer condition that the cache does not meet, or None when it meets them all.
 
     After condition 1, layer specs or an allocation plan that lack a field of the rule give _TRANSFER_EVIDENCE_GAP,
     which is the text of no condition. After condition 5, a Mamba state of an unknown data type gives it too.
@@ -1617,10 +1616,25 @@ def _transfer_shape_refusal(cache: dict[str, Any], runtime_version: str) -> str 
         or not all(isinstance(part, list) and len(part) == 2 for part in tensors[0])
     ):
         return "a Mamba group holds fewer than two layers, or the Mamba layers do not hold the same two state tensors"
-    if _state_sizes(mamba[0]["state"]) is None:
+    state = mamba[0]["state"]
+    sizes = _state_sizes(state)
+    if sizes is None:
         return _TRANSFER_EVIDENCE_GAP
     if _record_prefix_caching(cache) is not True:
         return _TRANSFER_PHASE_REFUSAL
+    evidence = cache.get("nixl_transfer")
+    if not isinstance(evidence, dict):
+        return _TRANSFER_LAYOUT_REFUSAL
+    if evidence.get("source_files") != NIXL_TRANSFER_SOURCE_HASHES:
+        return _TRANSFER_SOURCE_REFUSAL
+    if evidence.get("conv_state_layout") != "DS":
+        return _TRANSFER_LAYOUT_REFUSAL
+    if (
+        "error" in evidence
+        or canonical_json(evidence.get("conv_shape")) != canonical_json(state["shapes"][0])
+        or canonical_json(evidence.get("state_bytes")) != canonical_json(sizes)
+    ):
+        return _TRANSFER_SPLIT_REFUSAL
     return None
 
 

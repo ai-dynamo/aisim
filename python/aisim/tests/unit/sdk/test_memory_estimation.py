@@ -985,13 +985,13 @@ def test_naive_estimate_of_an_unknown_wrapper_reads_its_decoder(key):
         {"architectures": [name], "torch_dtype": "float32", key: decoder}, tp_size=1, pp_size=1
     )
     assert inherited.dtype_bytes == 4
-    # A decoder that names its own class leaves the architecture of the document that was passed in.
+    # A decoder that names its own class supplies the cache architecture as well as the dimensions.
     named = NaiveKVCacheEstimator.from_hf_config(
         {"architectures": [name], key: {**_UNKNOWN_DECODER, "architectures": ["UnknownDecoderForCausalLM"]}},
         tp_size=1,
         pp_size=1,
     )
-    assert (named.architecture, named.geometry) == (name, flat.geometry)
+    assert (named.architecture, named.geometry) == ("UnknownDecoderForCausalLM", flat.geometry)
 
 
 @pytest.mark.parametrize("nested", [False, True], ids=["flat", "decoder"])
@@ -1001,6 +1001,26 @@ def test_naive_estimate_reads_a_dtype_that_is_no_string_as_the_default_width(nes
     config = {"architectures": [_UNKNOWN_WRAPPER], **({"text_config": decoder} if nested else decoder)}
     estimator = NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
     assert (estimator.dtype_bytes, estimator.kv_bytes_per_token()) == (2, _UNKNOWN_DECODER_KV_BYTES)
+
+
+def test_malformed_torch_dtype_keeps_the_explicit_decoder_dtype():
+    decoder = {**_UNKNOWN_DECODER, "torch_dtype": 5, "dtype": "float32"}
+    estimator = NaiveKVCacheEstimator.from_hf_config(decoder, tp_size=1, pp_size=1)
+    assert estimator.kv_bytes_per_token() == 2_048
+
+
+def test_wrapped_deepseek_v4_uses_the_decoders_compressed_cache(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    model = "deepseek-ai/DeepSeek-V4-Flash"
+    config = _load_pre_downloaded_hf_config(model)
+    wrapper = {"architectures": [_UNKNOWN_WRAPPER], "text_config": config}
+    wrapped = _write_config(tmp_path, wrapper)
+    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == 3_915
+    assert estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=1) == 3_915
+    with pytest.raises(ValueError, match="DeepSeek V4 stores fp8_ds_mla KV"):
+        estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=1, kvcache_quant_mode="bfloat16")
 
 
 def test_naive_estimate_reads_the_first_architecture_name_and_the_text_config_of_any_unknown_document():

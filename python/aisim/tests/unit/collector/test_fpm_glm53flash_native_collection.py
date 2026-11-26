@@ -1994,6 +1994,85 @@ def test_only_the_median_label_of_a_sidecar_selects_the_median_rows(policy, medi
     assert database.published_median_policy({"measurement_policy": policy}) is median
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("warmup_repeats", 5.0),
+        ("warmup_repeats", True),
+        ("measurement_repeats", 9),
+        ("measurement_repeats", None),
+        ("measurement_policy", "sglang_native_fpm_radix_seed_median_v1"),
+        ("measurement_policy", "unknown"),
+        ("backend", "sglang"),
+        ("schema_version", 6),
+        ("schema_version", 7.0),
+    ],
+)
+def test_invalid_median_sidecar_cannot_be_reopened_or_republished(tmp_path, field, value):
+    plan = _glm_plan()
+    (prefill, prefill_dir), (decode, decode_dir) = _producer_cells(tmp_path).values()
+    plan.cells = (prefill,)
+    rows = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    incoming = database.aggregate_cell(plan, decode, decode_dir, expected_attempt_id=ATTEMPT_ID)
+    systems = tmp_path / "systems"
+    parquet, metadata, _ = database.write_formal_database(plan, rows, systems_root=systems)
+    sidecar = json.loads(metadata.read_text())
+    if value is None:
+        del sidecar[field]
+    else:
+        sidecar[field] = value
+    metadata.write_text(json.dumps(sidecar))
+    before = (parquet.read_bytes(), metadata.read_bytes())
+    with pytest.raises(ValueError, match="median|frozen plan|historical schema-6"):
+        database.validate_formal_database_commit(parquet, metadata, plan)
+    with pytest.raises(ValueError, match="median"):
+        database.write_formal_database(plan, incoming, systems_root=systems)
+    assert (parquet.read_bytes(), metadata.read_bytes()) == before
+
+
+def test_sealed_sglang_median_publication_keeps_its_native_policy(tmp_path):
+    from collector.fpm_forward import sglang_native_fpm
+
+    plan = _glm_plan()
+    (prefill, prefill_dir), _ = _producer_cells(tmp_path).values()
+    plan.cells = (prefill,)
+    rows = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    plan.backend = "sglang"
+    for row in rows:
+        row.update(
+            backend="sglang",
+            measurement_policy="sglang_native_fpm_radix_seed_median_v1",
+            state_protocol=sglang_native_fpm.STATE_PROTOCOL,
+            timing_boundary=sglang_native_fpm.TIMING_BOUNDARY,
+        )
+    parquet, metadata, _ = database.write_formal_database(plan, rows, systems_root=tmp_path / "systems")
+    assert json.loads(metadata.read_text())["measurement_policy"] == "sglang_native_fpm_radix_seed_median_v1"
+    database.validate_formal_database_commit(parquet, metadata, plan)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("global_warmup_iterations", False),
+        ("warmup_repeats", 4),
+        ("measurement_repeats", 10.0),
+        ("state_protocol", "other-producer"),
+        ("timing_boundary", "other-timer"),
+        ("kv_seed_regime", "fake_fallback"),
+    ],
+)
+def test_median_writer_rejects_rows_that_violate_the_native_contract(tmp_path, field, value):
+    plan = _glm_plan()
+    (prefill, prefill_dir), _ = _producer_cells(tmp_path).values()
+    rows = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    for row in rows:
+        row[field] = value
+    destination = tmp_path / "systems"
+    with pytest.raises(ValueError, match="FPM median row"):
+        database.write_formal_database(plan, rows, systems_root=destination)
+    assert not list(destination.rglob("*.parquet"))
+
+
 @pytest.mark.parametrize("case", ["single-sample-label", "median-label"])
 def test_publication_verifies_with_the_label_of_its_sidecar(tmp_path, case):
     import pyarrow.parquet as pq

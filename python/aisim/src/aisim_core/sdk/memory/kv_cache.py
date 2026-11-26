@@ -48,7 +48,7 @@ from typing import Any
 from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
 from aisim_core.sdk import perf_database
 from aisim_core.sdk.backends.factory import get_backend
-from aisim_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, DefaultHFModels
+from aisim_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, DeepSeekV4Config, DefaultHFModels
 from aisim_core.sdk.config import validate_parallel_size
 from aisim_core.sdk.config_builders import apply_nextn, build_model_config, validate_moe_controls, validate_nextn
 from aisim_core.sdk.fpm_model_metadata import inherit_decoder_precision
@@ -706,6 +706,10 @@ class NaiveKVCacheEstimator:
                 if problem is not None:
                     raise ValueError(f"HF config: {problem}") from error
                 raw_config = inherit_decoder_precision(hf_config, hf_config[key])[0]
+                if raw_config.get("architectures"):
+                    return cls.from_hf_config(
+                        raw_config, tp_size=tp_size, pp_size=pp_size, moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size
+                    )
         estimator = cls(
             cls._geometry(raw_config, parsed),
             dtype_bytes=cls._dtype_bytes(raw_config),
@@ -739,7 +743,9 @@ class NaiveKVCacheEstimator:
     @staticmethod
     def _dtype_bytes(hf_config: dict) -> int:
         """dtype byte width from ``torch_dtype``/``dtype``. Defaults to 2 (bf16)."""
-        value = hf_config.get("torch_dtype") or hf_config.get("dtype")
+        value = hf_config.get("torch_dtype")
+        if not isinstance(value, str) or not value:
+            value = hf_config.get("dtype")
         dtype_str = value.lower() if isinstance(value, str) else ""
         if dtype_str in ("float32", "fp32"):
             return 4
@@ -819,13 +825,11 @@ class NaiveKVCacheEstimator:
             else:
                 # Some supported archs carry a dataclass extra_params (e.g. NemotronH,
                 # Gemma4Mix, DeepSeek-V4); read MLA latent fields by attribute when
-                # present. Archs whose latent geometry is NOT a simple
-                # (kv_lora_rank + qk_rope_head_dim) sum -- notably DeepSeek-V4's sparse
-                # attention -- expose neither and fall through to the standard branch,
-                # a rough approximation acceptable for this naive fallback.
+                # present. V4's compressed cache uses its own geometry below.
                 kv_lora = getattr(extra, "kv_lora_rank", None)
                 qk_rope = getattr(extra, "qk_rope_head_dim", None)
             return {
+                **({"deepseek_v4": extra} if isinstance(extra, DeepSeekV4Config) else {}),
                 "layers": parsed.get("layers"),
                 "num_kv_heads": parsed.get("n_kv") or parsed.get("n"),
                 "head_dim": parsed.get("d"),
@@ -903,6 +907,10 @@ class NaiveKVCacheEstimator:
           dtype_bytes``.
         """
         geom = self.geometry
+        if "deepseek_v4" in geom:
+            from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
+
+            return deepseek_v4_state_cache(geom["deepseek_v4"], indexer_cache_dtype="auto")["kv_bytes_per_token"]
         layers = geom.get("layers")
         if not layers:
             return None

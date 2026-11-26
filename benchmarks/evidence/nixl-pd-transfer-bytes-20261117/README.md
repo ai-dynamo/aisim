@@ -6,14 +6,15 @@ SPDX-License-Identifier: Apache-2.0
 # NIXL P/D transfer bytes of GLM-5.3-Flash on vLLM 0.33.0
 
 This run measured the bytes that vLLM's NIXL connector moves for one request
-in a prefill/decode (P/D) pair on vLLM 0.33.0. It is the evidence for the
-`transfer_bytes_per_block` values computed by the GLM-5.3-Flash runtime
-probe import on vLLM 0.33.0. The run of
-[`nixl-pd-transfer-bytes-20261115`](../nixl-pd-transfer-bytes-20261115/README.md)
-measured vLLM 0.31.0 and 0.32.0 with the same method. `measurements.json`
-holds every request of this run, and its `sources` object marks each number
-as measured or derived. `region-table.json` holds the region table of the
-connector, as the group log of arm C recorded it.
+in a prefill/decode (P/D) pair on vLLM 0.33.0. Both servers ran with DS
+convolution state. The independent archived GLM prefill probe used SD
+(shape `[3, 6144]`), which this connector refuses. The P/D run supplies the
+per-group transfer oracle for a DS probe with the audited connector. The SD
+probe preserves its [worker and scheduler observations](../../../python/aisim/tests/unit/collector/fixtures/glm53flash_vllm_0330_probe/observations.json).
+[Measurements](measurements.json) mark each reported number as measured or
+derived. The [region table](region-table.json) records the connector's
+registration in arm C. The [earlier P/D run](../nixl-pd-transfer-bytes-20261115/README.md)
+measured vLLM 0.31.0 and 0.32.0.
 
 ## Setup
 
@@ -62,6 +63,39 @@ number of descriptors and the sum of their lengths for each cache group. It
 changed no descriptor and no return value. It also wrapped
 `register_kv_caches`, to log the region table after the registration, and
 `_read_blocks`, to tag each record with its request.
+
+## Captures and GPU accounting
+
+The verbatim driver logs retain each request ID, prompt length, block counts
+and counter deltas for [arm A](captures/requests-a.jsonl),
+[arm B](captures/requests-b.jsonl) and [arm C](captures/requests-c.jsonl).
+Subtract the before sample from the after sample for each arm and request
+in the [56 Prometheus samples](captures/counter-samples.csv). Dividing the
+byte and descriptor deltas by the transfer-count delta gives the per-rank
+values below. The sample table retains the original numeric literals and
+source snapshot hashes and omits deployment-specific metric labels.
+
+Arm C also logged the registration tables on four decode ranks and each
+rank's six transfers, including the descriptor lengths and counts per group.
+The six layout lines are in arm A, B, C order, prefill then decode. The
+provenance lists SHA-256 digests for the public captures, original source
+logs and job kit, including the measurement driver and logging hook.
+[Connector records](captures/connector-ranks.txt), [resolved layouts](captures/ssm-conv-layout.txt), [run provenance and Slurm accounting](captures/provenance.json).
+
+All three arms completed their two four-GPU Slurm steps. Each used eight
+GB300 GPUs. There were zero arm retries in this job. Times are seconds.
+
+| Arm | Setup, load and engine warmup | Driver measurement | Teardown | Slurm entry and exit | Arm wall | Allocated GPU-seconds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 592 | 62 | 5 | 16 | 675 | 5,400 |
+| B | 196 | 24 | 7 | 16 | 243 | 1,944 |
+| C | 236 | 17 | 5 | 17 | 275 | 2,200 |
+
+Setup includes engine warmup. The driver sent zero warmup requests. No
+separate engine warmup duration was recorded. The job accounting snapshot
+at 1,218 seconds showed `RUNNING` and 9,744 allocated GPU-seconds. The final
+job duration is unavailable. The two role-step durations differed by up to
+two seconds in B and C. Their summed GPU-seconds were 1,936 and 2,196.
 
 ## Result
 

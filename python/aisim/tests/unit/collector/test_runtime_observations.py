@@ -323,7 +323,7 @@ def _v033_records(layout, *, prefix_caching, dp, max_model_len=4096, checkpoint=
                     "state",
                     None,
                     "vllm.models.glm5next.common.kda.Glm5NextLinearAttention",
-                    mamba_state([[3, 6144], [16, 128, 128]], ["torch.bfloat16", "torch.float32"], 1_085_440),
+                    mamba_state([[6144, 3], [16, 128, 128]], ["torch.bfloat16", "torch.float32"], 1_085_440),
                 )
                 for names in members
             ),
@@ -368,7 +368,7 @@ def _v033_records(layout, *, prefix_caching, dp, max_model_len=4096, checkpoint=
             for position, name in enumerate(names):
                 region = position * 1_114_112
                 views[name] = [
-                    view(region, [blocks, 3, 6144], [page, 12_288, 2], 2, mamba_block),
+                    view(region, [blocks, 6144, 3], [page, 6, 2], 2, mamba_block),
                     view(region + 36_864, [blocks, 16, 128, 128], [page, 65_536, 512, 4], 4, mamba_block),
                 ]
         place(indexers, 0, 71_808, page)
@@ -575,6 +575,14 @@ def _v033_records(layout, *, prefix_caching, dp, max_model_len=4096, checkpoint=
         "model_runner": {"class": "vllm.v1.worker.gpu.model_runner.GPUModelRunner", "kernel_block_sizes": kernels},
         "layer_tensors": views,
     }
+    if layout == "glm_tp4":
+        # This synthetic record follows the DS launch of the NIXL measurement. The archived probe used SD.
+        worker["nixl_transfer"] = {
+            "conv_state_layout": "DS",
+            "conv_shape": [6144, 3],
+            "state_bytes": [36_864, 1_048_576],
+            "source_files": dict(runtime_observations.NIXL_TRANSFER_SOURCE_HASHES),
+        }
     scheduler = {
         "num_blocks": blocks,
         "initial_free_blocks": free,
@@ -911,9 +919,9 @@ def stage_model_config(index_path):
     index_path.write_text(json.dumps(index))
 
 
-def _mutate(index_path, edit, *, derive=True):
+def _mutate(index_path, edit, *, derive=True, configuration="tp2"):
     index = json.loads(index_path.read_text())
-    attempt = index["configurations"]["tp2"]["attempts"][0]
+    attempt = index["configurations"][configuration]["attempts"][0]
     first_workers: dict = {}
     for phase in attempt["phases"].values():
         for artifact in phase["artifacts"]:
@@ -1803,7 +1811,7 @@ def _evidence(result):
 
 
 def glm_tp4_cache_groups():
-    """The imported cache groups of GLM-5.3-Flash at TP 4, as the import of its live vLLM 0.33.0 record gives them.
+    """GLM-5.3-Flash groups with the audited DS layout of the vLLM 0.33.0 P/D run.
 
     The four KDA groups come first, each with one prefill checkpoint block aligned to 16 tokens, then the attention
     group and the tail group. Every page is one 13,516,800-byte pool block.
@@ -5574,17 +5582,43 @@ def test_the_live_glm53flash_record_of_vllm_0330_passes_the_grouped_prefix_cachi
         gate("0.32.0")
 
 
-def test_import_writes_the_transfer_bytes_of_the_live_glm53flash_record(tmp_path):
+def test_archived_sd_glm_probe_imports_memory_without_nixl_transfer_bytes(tmp_path):
     result = _import(_campaign_from_fixture(tmp_path, FIXTURES / "glm53flash_vllm_0330_probe"))
     groups = result["resources"]["cache_groups"]
-    # The marker and the transfer bytes of every group: the four KDA groups and the attention group take part in
-    # prefix caching, the ring does not.
-    assert [(group["name"], group["prefix_cacheable"], group["transfer_bytes_per_block"]) for group in groups] == [
-        *((f"runtime_group_{index}", True, 9_768_960) for index in range(4)),
-        ("runtime_group_4", True, 21_978_496),
-        (LIVE_RING_GROUP, False, 92_288),
-    ]
-    assert "transfer_bytes_reason" not in result
+    assert result["status"] == "complete"
+    assert [group["prefix_cacheable"] for group in groups] == [True] * 5 + [False]
+    assert all("transfer_bytes_per_block" not in group for group in groups)
+    assert "DS convolution state layout" in result["transfer_bytes_reason"]
+    assert _live_worker_caches()[0]["groups"][0]["state"]["shapes"][0] == [3, 6144]
+
+
+@pytest.mark.parametrize("fault", ["sd", "missing-source", "patched-source", "wrong-shape", "wrong-size"])
+def test_nixl_requires_observed_ds_state_and_audited_sources_on_each_worker(tmp_path, fault):
+    path, launches = observation_fixture(tmp_path, layout="glm_tp4")
+
+    def edit(record):
+        if (record["kind"], record["tp_rank"], record["phase"]) != ("worker", 1, "prefill"):
+            return
+        evidence = record["cache"].setdefault("nixl_transfer", {})
+        if fault == "sd":
+            evidence["conv_state_layout"] = "SD"
+        elif fault == "wrong-shape":
+            evidence["conv_shape"] = [3, 6144]
+        elif fault == "wrong-size":
+            evidence["state_bytes"] = [36_865, 1_048_576]
+        else:
+            sources = evidence.setdefault("source_files", {})
+            name = "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py"
+            if fault == "missing-source":
+                sources.pop(name, None)
+            else:
+                sources[name] = "b" * 64
+
+    _mutate(path, edit)
+    result = validate_observations(path, launches)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    assert all("transfer_bytes_per_block" not in group for group in result["resources"]["cache_groups"])
+    assert ("source" if fault.endswith("source") else "DS convolution") in result["transfer_bytes_reason"]
 
 
 def test_import_writes_no_transfer_bytes_for_a_cache_outside_the_measured_shape(tmp_path):
@@ -5600,8 +5634,7 @@ def test_import_writes_no_transfer_bytes_for_a_cache_outside_the_measured_shape(
     assert result["transfer_bytes_reason"] == "the cache groups hold no Mamba group or no ring group"
 
 
-# The bytes that the NIXL connector of vLLM 0.33.0 reads for one block of each group of the live record on one TP
-# rank: the four KDA groups, the attention group and the ring. A live P/D run measured them
+# The vLLM 0.33.0 DS P/D run measured these block bytes per TP rank for the KDA, attention and ring groups
 # (benchmarks/evidence/nixl-pd-transfer-bytes-20261117).
 LIVE_TRANSFER_BYTES = [9_768_960] * 4 + [21_978_496, 92_288]
 _REGION_TABLE = (
@@ -5635,7 +5668,10 @@ def test_region_table_of_the_live_glm53flash_record_equals_the_table_of_the_live
     caches = _live_worker_caches()
     assert len(caches) == 4
     for cache in caches:
-        assert runtime_observations._transfer_shape_refusal(cache, "0.33.0") is None
+        assert (
+            runtime_observations._transfer_shape_refusal(cache, "0.33.0")
+            == runtime_observations._TRANSFER_LAYOUT_REFUSAL
+        )
         table = runtime_observations._nixl_region_table(cache)
         assert table == logged
         assert runtime_observations._region_table_bytes(table) == LIVE_TRANSFER_BYTES
@@ -5778,7 +5814,6 @@ def test_region_table_sorts_the_scratch_regions_as_the_connector_does():
     # (base_worker.py:1820).
     cache = _live_worker_caches()[0]
     cache["tensor_allocations"][-1]["offset"] = 787_840
-    assert runtime_observations._transfer_shape_refusal(cache, "0.33.0") is None
     table = runtime_observations._nixl_region_table(cache)
     assert table["scratch_region_indices"] == [19, *range(30, 40)]
     assert runtime_observations._region_table_bytes(table)[5] == 1_134_592
@@ -5791,7 +5826,6 @@ def test_region_table_skips_an_allocated_layer_without_a_spec():
         logged.pop(key)
     cache = _live_worker_caches()[0]
     cache["tensor_allocations"][0]["layers"].append("language_model.model.layers.99.self_attn")
-    assert runtime_observations._transfer_shape_refusal(cache, "0.33.0") is None
     assert runtime_observations._nixl_region_table(cache) == logged
 
 
@@ -5817,7 +5851,7 @@ def test_region_table_of_a_cache_without_its_evidence_is_empty(edit):
 
 @pytest.mark.parametrize("decode_prefix_caching", [True, False])
 def test_import_takes_the_transfer_bytes_from_the_phases_with_prefix_caching(tmp_path, decode_prefix_caching):
-    # The records have the cache shape of the live record, in a launch of two TP ranks.
+    # These synthetic records have the DS cache shape of the P/D run, in a launch of two TP ranks.
     path, launches = observation_fixture(tmp_path, layout="glm_tp4", decode_prefix_caching=decode_prefix_caching)
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "complete", result["diagnostics"]
@@ -5937,7 +5971,7 @@ def _without_prefix_caching(cache):
     [
         ((_without_prefix_caching, _storage_beyond_the_block_rows), _TRANSFER_REFUSALS[5]),
         ((_storage_beyond_the_block_rows,), _TRANSFER_REFUSALS[1]),
-        ((), LIVE_TRANSFER_BYTES),
+        ((), runtime_observations._TRANSFER_LAYOUT_REFUSAL),
         ((_plain, _without_prefix_caching), _TRANSFER_REFUSALS[0]),
     ],
     ids=["no_prefix_caching_and_a_storage_tail", "a_storage_tail", "live_record", "no_hybrid_evidence"],

@@ -219,6 +219,43 @@ def _layer_specs(spec: Any) -> list[Any]:
     return list(spec.kv_cache_specs.values()) if legacy._class_name(spec) == legacy._UNIFORM_SPEC else [spec]
 
 
+def _nixl_transfer(owner: Any, config: Any) -> dict:
+    """Observe the native DS convolution split without initializing a connector or allocating a KV cache."""
+    evidence = {}
+    try:
+        specs = {
+            spec
+            for group in config.kv_cache_groups
+            for spec in _layer_specs(group.kv_cache_spec)
+            if legacy._class_name(spec) == legacy._MAMBA_SPEC
+        }
+        if not specs:
+            return evidence
+        sources = evidence["source_files"] = {}
+        for name in legacy.NIXL_TRANSFER_SOURCE_HASHES:
+            sources[name] = hashlib.sha256(_installed_file(name).read_bytes()).hexdigest()
+        if sources != legacy.NIXL_TRANSFER_SOURCE_HASHES:
+            return evidence
+        from vllm.model_executor.layers.mamba.mamba_utils import get_conv_state_layout
+
+        evidence["conv_state_layout"] = get_conv_state_layout()
+        if evidence["conv_state_layout"] != "DS" or any(spec.tp_replicated for spec in specs):
+            return evidence
+        # The pull worker calls the same routine after checking the layout (nixl/base_worker.py:699-720).
+        from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import derive_mamba_conv_split
+
+        tp = owner.vllm_config.parallel_config.tensor_parallel_size
+        splits = [derive_mamba_conv_split(spec, tp) for spec in specs]
+        sizes = {(split.local_conv_dim, split.conv_rows, *split.ssm_sizes) for split in splits}
+        if len(sizes) == 1:
+            dim, rows, conv_bytes, temporal_bytes = sizes.pop()
+            evidence.update(conv_shape=[dim, rows], state_bytes=[conv_bytes, temporal_bytes])
+    except Exception as error:
+        # Connector support is optional. Preserve the worker's physical memory observations.
+        evidence["error"] = f"{type(error).__name__}: {error}"
+    return evidence
+
+
 def _retention(spec: Any) -> tuple[Any, Any]:
     # vLLM 0.33.0 SlidingWindowSpec and its subclasses declare extra_retained_tokens
     # with the default 0 (kv_cache_interface.py:908); its absence there is an
@@ -592,6 +629,8 @@ def observe(
             capture("cache.prefix_caching", lambda: cache.update(prefix_caching=_prefix_caching(owner, cache, kind)))
         capture("cache.groups", lambda: _groups(cache, config, version, pool_id))
         if kind == "worker":
+            if hybrid and (transfer := _nixl_transfer(owner, config)):
+                cache["nixl_transfer"] = transfer
             capture("cache.semantics", lambda: _semantics(owner, payload))
             capture(
                 "cache.layer_tensors",
