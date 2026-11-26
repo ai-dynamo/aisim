@@ -67,6 +67,11 @@ _RUN_IDENTITY_FIELDS = (
 SINGLE_SAMPLE_MEASUREMENT_POLICY = "dynamo_native_single_sample_v1"
 # Schema-8 sidecar and row policy of runs measured with the power window.
 POWER_WINDOW_MEASUREMENT_POLICY = "dynamo_native_single_sample_power_window_v1"
+TRTLLM_POWER_MEASUREMENT_POLICY = "trtllm_observer_single_sample_power_window_v1"
+_POWER_POLICIES = {
+    "vllm": POWER_WINDOW_MEASUREMENT_POLICY,
+    "trtllm": TRTLLM_POWER_MEASUREMENT_POLICY,
+}
 
 
 def _dotted_get(payload: object, path: str) -> object:
@@ -136,7 +141,8 @@ def _dense_synthetic_kv_eligible(
     """Corroborate the producer's deliberate dense skip with initialized cache evidence."""
     meta = collection.kvwarm_meta or {}
     if (
-        meta.get("enabled") is not True
+        plan.backend != "vllm"
+        or meta.get("enabled") is not True
         or meta.get("warm_eligible") is not False
         or meta.get("skip_reason") != "dense_model_content_insensitive"
         or plan.capability.is_moe is not False
@@ -229,6 +235,12 @@ def aggregate_cell(
     collection = validate_native_collection(
         cell,
         cell_dir / "raw",
+        expected_backend=plan.backend,
+        expected_bundle_sha256=(
+            getattr(getattr(plan, "runtime_instrumentation", None), "sha256", None)
+            if plan.backend == "trtllm"
+            else None
+        ),
         expected_plan_sha256=plan.sha256,
         expected_attempt_id=expected_attempt_id,
     )
@@ -269,7 +281,7 @@ def aggregate_cell(
     )
     # Only a validated schema-3 collection selects the power policy (P4).
     powered = collection.artifact_schema_version == FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION
-    if powered and not getattr(plan.options, "measure_power", False):
+    if powered and (plan.backend not in _POWER_POLICIES or not getattr(plan.options, "measure_power", False)):
         # An image-level DYN_BENCHMARK_POWER_WINDOW_S bypasses the plan's identity.
         raise ValueError(f"{cell.cell_id} wrote power-window artifacts under a plan without measure_power")
 
@@ -368,7 +380,7 @@ def aggregate_cell(
                 "global_warmup_iterations": plan.options.warmup_iterations,
                 "warmup_repeats": 0,
                 "measurement_repeats": 1,
-                "measurement_policy": POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
+                "measurement_policy": _POWER_POLICIES[plan.backend] if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
                 "model_support_level": capability.support_level,
                 "model_template_id": capability.template_id,
                 "model_template_version": capability.template_version,
@@ -440,18 +452,17 @@ def _validate_power_schema(metadata: dict[str, Any], schema: Any) -> None:
         return
     import pyarrow as pa
 
-    if metadata.get("measurement_policy") != POWER_WINDOW_MEASUREMENT_POLICY:
+    policy = _POWER_POLICIES.get(metadata.get("backend"))
+    if policy is None or metadata.get("measurement_policy") != policy:
         raise ValueError("schema-8 FPM sidecar measurement_policy must be the power-window policy")
     if not pa.types.is_float64(schema.field("power_w").type):
         raise ValueError("schema-8 FPM power_w must be a nullable Parquet DOUBLE column")
 
 
-def _validate_power_rows(rows: list[dict[str, Any]]) -> None:
+def _validate_power_rows(rows: list[dict[str, Any]], policy: str) -> None:
     for row in rows:
-        if row.get("measurement_policy") != POWER_WINDOW_MEASUREMENT_POLICY:
-            raise ValueError(
-                f"schema-8 FPM database has rows without measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}"
-            )
+        if row.get("measurement_policy") != policy:
+            raise ValueError(f"schema-8 FPM database has rows without measurement_policy={policy!r}")
         power = row.get("power_w")
         if power is not None and (
             isinstance(power, bool) or not isinstance(power, int | float) or not math.isfinite(power) or power <= 0
@@ -526,7 +537,7 @@ def validate_formal_database_commit(
         )
     rows = parquet.read().to_pylist()
     if payload["schema_version"] == 8:
-        _validate_power_rows(rows)
+        _validate_power_rows(rows, payload["measurement_policy"])
     _validate_kv_seed_classification(payload, rows)
     identities = _run_identities_by_cell(rows, source="committed")
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -804,7 +815,7 @@ def write_formal_database(
             _validate_power_schema(committed, table.schema)
             existing_rows = table.to_pylist()
             if committed.get("schema_version") == 8:
-                _validate_power_rows(existing_rows)
+                _validate_power_rows(existing_rows, committed["measurement_policy"])
             _validate_kv_seed_classification(committed, existing_rows)
             if committed.get("schema_version") == 6:
                 for row in existing_rows:
@@ -842,17 +853,18 @@ def write_formal_database(
         # cannot hold power-window and latency-only rows. Refuse the merge
         # before anything is written; the existing pair stays as committed.
         policies = {row.get("measurement_policy") for row in [*merged, *rows]}
-        powered = POWER_WINDOW_MEASUREMENT_POLICY in policies
-        if powered and policies != {POWER_WINDOW_MEASUREMENT_POLICY}:
+        policy = _POWER_POLICIES.get(plan.backend)
+        powered = bool(policies.intersection(_POWER_POLICIES.values()))
+        if powered and (policy is None or policies != {policy}):
             raise ValueError(
                 "cannot mix power-window and latency-only FPM rows in one database: schema 8 requires every "
-                f"row to carry measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}. Publish to a clean "
+                f"row to carry measurement_policy={policy!r}. Publish to a clean "
                 f"destination, or collect every cell with the same --fpm-measure-power setting: {parquet_path}"
             )
         if powered:
             for row in [*merged, *rows]:
                 row.setdefault("power_w", None)
-            _validate_power_rows(rows)
+            _validate_power_rows(rows, _POWER_POLICIES[plan.backend])
         index = {tuple(row[key] for key in _ROW_KEY): row for row in merged}
         if len(index) != len(merged):
             raise ValueError(f"existing FPM database contains duplicate physical keys: {parquet_path}")
@@ -900,7 +912,7 @@ def write_formal_database(
                 "schema_name": "aic_fpm_forward_perf",
                 "schema_version": 8 if powered else 7,
                 "coordinate_system": "iteration_totals_balanced_v1",
-                "measurement_policy": POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
+                "measurement_policy": _POWER_POLICIES[plan.backend] if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
                 "warmup_repeats": 0,
                 "measurement_repeats": 1,
                 "row_count": len(merged),
