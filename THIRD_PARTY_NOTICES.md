@@ -2791,11 +2791,8 @@ Original paths and what follows them:
   `_kvwarm_order_decode_points`), the text of the infeasible-point error
   (`_bench_raise_explicit_infeasible`), the key names and the status rule of the result
   envelope, the upper median of the kept decode steps, the text of the failed-point
-  error (`_bench_skip_point`), the name and default of the content seed
-  (`ENV_BENCH_CONTENT_SEED`) and, in the simulated driver of
-  `test_fpm_sglbench_producer.py`, the seed, warm shot, measured shot and single re-stage
-  procedure (`_bench_realseed_stage_point`, `_bench_realseed_pending_step`) with two of
-  its failure reason strings. For dataset text: the dataset resolution
+  error (`_bench_skip_point`) and the name and default of the content seed
+  (`ENV_BENCH_CONTENT_SEED`). For dataset text: the dataset resolution
   (`_kvwarm_resolve_dataset`) with the default URL (`_KVWARM_DEFAULT_DATASET_URL`), its
   pinned SHA-256 (`_KVWARM_DEFAULT_DATASET_SHA256`) and the download timeout
   (`_KVWARM_DOWNLOAD_TIMEOUT_S`), the text recipe and the dataset record
@@ -2829,12 +2826,12 @@ https://github.com/ai-dynamo/dynamo/blob/b20fe6fe94021b854597965c7305931175e8f48
 The feasibility rules and the first step of the prefill new-token axis in repository-root
 `python/aisim/collector/fpm_forward/runtime/sglbench_grid.py`, the admission,
 graph-size and graph-replay models in
-`python/aisim/tests/unit/collector/test_fpm_sglbench_grid.py`, the graph-replay model in
-`python/aisim/tests/unit/collector/test_fpm_sglbench_producer.py`, and the prefix-cache
-model `PageCacheModel` in
+`python/aisim/tests/unit/collector/test_fpm_sglbench_grid.py`, whose graph sizes
+`python/aisim/tests/unit/collector/test_fpm_sglbench_producer.py` also uses, and the
+prefix-cache model `PageCacheModel` in
 `python/aisim/tests/unit/collector/test_fpm_sglbench_content.py`, which
-`python/aisim/tests/unit/collector/test_fpm_sglbench_producer.py` also uses, are modified
-behavioral adaptations of SGLang v0.5.22 at commit
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{driver,launcher}.py` also use, are
+modified behavioral adaptations of SGLang v0.5.22 at commit
 `baa9befa381511cd4d56f83980951e5a45fffc6d` and SGLang v0.5.23 at commit
 `297e54fd105e974cdf401e5b4d20253a22c16f90`:
 https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
@@ -2887,12 +2884,9 @@ arguments and environment variables under their upstream names and sets one of t
 (`SGLANG_ENABLE_COLOCATED_BATCH_GEN`) for a run with DP attention; these two import no
 SGLang. The tests model those interfaces with fakes. One test of
 `test_fpm_sglbench_launcher.py` also looks up, in a local checkout of each release when
-one is given, the SGLang names of the fields the launcher hides in its dump and of the
-check behind an environment variable it refuses; it holds names only. One test of
-`test_fpm_sglbench_recorder.py` looks up, in the same checkouts, the names by which the
-model runner gets its KV-cache dtype and the scheduler its model runner, and holds the
-return annotation of `configure_kv_cache_dtype` and one return statement of
-`TpModelWorker` as strings.
+one is given, the SGLang names of the fields the launcher hides in its dump; it holds
+names only. `sglbench_recorder.py` and `sglbench_driver.py` name
+`configure_kv_cache_dtype` and `TpModelWorker` in comments and docstrings only.
 
 The collector path that starts the launcher follows the same two revisions.
 `python/aisim/collector/fpm_forward/sglang_fpm_builder.py`, with the test
@@ -2908,8 +2902,7 @@ and `sglbench_recorder.py` list in `SGLANG_SEAM_NAMES`.
 that SGLang kills the process tree of its engine when a scheduler process fails and again
 when the engine shuts down. The tests `python/aisim/tests/unit/collector/test_fpm_exec.py`
 and `python/aisim/tests/unit/collector/test_fpm_sglbench_gate.py` model that with a FAKE
-engine that lists and kills its own descendants, and the second repeats the short texts of
-two SGLang log lines.
+engine that lists and kills its own descendants.
 `python/aisim/collector/fpm_forward/native_artifact.py` holds two things a result file
 records against its cell: the sizes, under SGLang's meaning of `tp_size` and
 `attn_dp_size`, and the dtype of the KV pool, under the names of the torch dtypes SGLang
@@ -2952,8 +2945,9 @@ exists. The upstream license is at
 https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/LICENSE
 
 No upstream function is copied and nothing is vendored. `test_fpm_sglang_builder.py`
-holds single expressions of `handle_data_parallelism`, `handle_deprecated_dp_attention`,
-`resolve_max_num_reqs`, `derive_attn_tp_size`, `derive_parallel_widths` and
-`parallel_widths_of` as strings and compares them with a local checkout of each release
-when one is given. SGLang is not a dependency of AISim:
+holds single expressions of `handle_data_parallelism` and `resolve_max_num_reqs` as
+strings and compares them with a local checkout of each release when one is given.
+`sglang_fpm_builder.py` and `sglbench_launcher.py` name `handle_deprecated_dp_attention`,
+`derive_attn_tp_size` and `derive_parallel_widths` in comments and docstrings only.
+SGLang is not a dependency of AISim:
 these files run inside an SGLang container, where SGLang is already installed.

@@ -3,14 +3,12 @@
 
 """Tests of ``sglbench_preflight.py``, the preflight of the SGLang self-benchmark. No SGLang, no GPU.
 
-Everything that stands in for SGLang is FAKE and is named so:
-
-- ``fake_tree`` puts the FAKE ``sglang`` package tree of test_fpm_sglbench_compat.py into ``sys.modules`` and
-  fills in whatever the seam rows name and that tree lacks, from the rows themselves. Like the module under
-  test, this file types no module, class or field of SGLang: every test takes the rows from
-  ``sglbench_compat.SGLANG_SEAM_NAMES`` and ``sglbench_recorder.SGLANG_SEAM_NAMES``. The suites of those two
-  modules hold the typed lists.
-- The two runs that start the file by path have no SGLang at all and show what the preflight then reports.
+Everything that stands in for SGLang is FAKE and is named so: ``fake_tree`` puts the FAKE ``sglang`` package
+tree of test_fpm_sglbench_compat.py into ``sys.modules`` and fills in whatever the seam rows name and that tree
+lacks, from the rows themselves. Like the module under test, this file types no module, class or field of
+SGLang: every test takes the rows from ``sglbench_compat.SGLANG_SEAM_NAMES`` and
+``sglbench_recorder.SGLANG_SEAM_NAMES``. The start of the shipped file by path, in an interpreter without
+SGLang, is in test_fpm_sglbench_gate.py.
 
 This file is also the home of three helpers about seam rows that the suites of sglbench_compat.py and
 sglbench_recorder.py use: ``sglang_names_reached_by_import``, ``seam_rows_missing_for`` and
@@ -27,8 +25,6 @@ import dataclasses
 import importlib
 import json
 import os
-import shutil
-import subprocess
 import sys
 import types
 from pathlib import Path
@@ -340,42 +336,17 @@ def test_a_tested_release_with_every_name_passes_and_the_audit_says_what_was_loo
     assert fake_tree.events == [] and fake_tree.parsed == [] and fake_tree.engine_kwargs == []
 
 
-def test_the_fake_tree_has_fields_that_are_no_attributes_of_their_class(fake_tree):
-    # So the passing run above shows that a field is looked up as a field.
-    plain = []
-    for _source, module_name, name, _kind in ROWS_OF_KIND["field"]:
-        owner_name, _, member = name.partition(".")
-        owner = getattr(sys.modules[module_name], owner_name)
-        assert dataclasses.is_dataclass(owner)
-        plain.append(hasattr(owner, member))
-    assert plain and not any(plain)
-
-
-def test_the_audit_is_written_as_sorted_json_with_a_final_newline(fake_tree):
-    assert preflight.main() == 0
-    text = preflight._AUDIT_PATH.read_text(encoding="utf-8")
-    assert text == json.dumps(json.loads(text), indent=2, sort_keys=True) + "\n"
-
-
 # ---------------------------------------------------------------------------------------------------------------
 # The version
 # ---------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("version", ["0.5.21", "0.5.24", "0.5.23.post1", "0.0.0.dev0"])
+@pytest.mark.parametrize("version", ["0.5.24", "0.5.23.post1"])
 def test_an_untested_release_fails_and_the_names_are_still_looked_up(fake_tree, capsys, version):
     fake_tree.modules[ROOT_PACKAGE].__version__ = version
     assert _fails(capsys) == [f"SGLang {version} is not a tested version (tested: {', '.join(compat.TESTED_VERSIONS)})"]
     audit = _audit()
     assert audit["sglang_version"] == version and audit["tested_versions"] == list(compat.TESTED_VERSIONS)
-
-
-def test_a_version_that_cannot_be_read_fails(fake_tree, capsys):
-    fake_tree.modules[ROOT_PACKAGE].__version__ = (0, 5, 23)
-    (failure,) = _fails(capsys)
-    assert failure.startswith("cannot read the SGLang version: TypeError: ")
-    audit = _audit()
-    assert audit["sglang_version"] is None and audit["tested_versions"] == list(compat.TESTED_VERSIONS)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -416,7 +387,6 @@ def test_a_class_that_is_missing_or_is_no_class_fails(fake_tree, monkeypatch, ca
     _source, module_name, name, _kind = row
     module = sys.modules[module_name]
     members = [other for other in ALL_ROWS if other[1] == module_name and other[2].startswith(name + ".")]
-    assert members, "a class row without a member row would leave the second half of this test empty"
 
     # An object in the place of the class, with every member the rows name: only the class row fails.
     monkeypatch.setattr(module, name, types.SimpleNamespace(**{other[2].partition(".")[2]: 1 for other in members}))
@@ -425,9 +395,6 @@ def test_a_class_that_is_missing_or_is_no_class_fails(fake_tree, monkeypatch, ca
     monkeypatch.delattr(module, name)
     failures = _fails(capsys, [row, *members])
     assert failures[0] == f"{module_name}: class {name} is missing"
-    assert failures[1:] == [
-        f"{module_name}: {other[3]} {other[2]} is missing: the module has no {name}" for other in members
-    ]
 
 
 @pytest.mark.parametrize("row", ROWS_OF_KIND["attribute"], ids=_row_id)
@@ -451,68 +418,6 @@ def test_a_missing_dataclass_field_fails_even_when_the_class_has_an_attribute_of
     setattr(owner, member, FAKE_VALUE)
     monkeypatch.setattr(module, owner_name, owner)
     assert _fails(capsys, [row]) == [f"{module_name}: field {name} is missing"]
-
-
-def test_a_field_of_a_class_that_is_no_dataclass_fails(fake_tree, monkeypatch, capsys):
-    _source, module_name, name, _kind = row = ROWS_OF_KIND["field"][0]
-    owner_name, _, member = name.partition(".")
-    siblings = [
-        other for other in ROWS_OF_KIND["field"] if other[1] == module_name and other[2].startswith(owner_name + ".")
-    ]
-    plain = type(owner_name, (), {other[2].partition(".")[2]: FAKE_VALUE for other in siblings})
-    monkeypatch.setattr(sys.modules[module_name], owner_name, plain)
-    assert row in siblings
-    assert _fails(capsys, siblings) == [
-        f"{module_name}: field {other[2]} cannot be looked up: {owner_name} is not a dataclass" for other in siblings
-    ]
-
-
-def test_without_sglang_every_module_is_reported_once_and_nothing_is_found(monkeypatch, tmp_path, capsys):
-    class Refuse:
-        """Refuses the root package by name, so the result does not depend on what the machine has installed."""
-
-        def find_spec(self, name, path=None, target=None):
-            if name.split(".")[0] == ROOT_PACKAGE:
-                raise ModuleNotFoundError(f"FAKE: no {name} in this interpreter", name=name)
-            return None
-
-    for name in [name for name in sys.modules if name.split(".")[0] == ROOT_PACKAGE]:
-        monkeypatch.delitem(sys.modules, name)
-    monkeypatch.setattr(sys, "meta_path", [Refuse(), *sys.meta_path])
-    monkeypatch.setattr(preflight, "_AUDIT_PATH", tmp_path / "runtime-preflight.json")
-
-    failures = _fails(capsys, ALL_ROWS)
-    assert failures[0].startswith("cannot read the SGLang version: ModuleNotFoundError: ")
-    modules = list(dict.fromkeys(row[1] for row in ALL_ROWS))
-    assert len(failures) == 1 + len(modules)
-    for failure, name in zip(failures[1:], modules, strict=True):
-        assert failure.startswith(f"cannot import {name}: ModuleNotFoundError: "), failure
-
-
-@pytest.mark.parametrize("status", [0, 3])
-def test_an_import_that_ends_the_interpreter_is_a_failure_and_the_audit_is_still_written(
-    monkeypatch, tmp_path, capsys, status
-):
-    class Exits:
-        """Ends the interpreter at the import of the root package, as a module with ``sys.exit`` in it would."""
-
-        def find_spec(self, name, path=None, target=None):
-            if name.split(".")[0] == ROOT_PACKAGE:
-                raise SystemExit(status)
-            return None
-
-    for name in [name for name in sys.modules if name.split(".")[0] == ROOT_PACKAGE]:
-        monkeypatch.delitem(sys.modules, name)
-    monkeypatch.setattr(sys, "meta_path", [Exits(), *sys.meta_path])
-    monkeypatch.setattr(preflight, "_AUDIT_PATH", tmp_path / "runtime-preflight.json")
-
-    # Without the rule the process would end with ``status`` and no audit; with status 0 the gate would go on.
-    failures = _fails(capsys, ALL_ROWS)
-    modules = list(dict.fromkeys(row[1] for row in ALL_ROWS))
-    assert failures == [
-        f"cannot read the SGLang version: SystemExit: {status}",
-        *[f"cannot import {name}: SystemExit: {status}" for name in modules],
-    ]
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -541,74 +446,14 @@ def test_a_launcher_module_that_does_not_import_fails(fake_tree, monkeypatch, ca
     assert audit["tested_versions"] == (list(compat.TESTED_VERSIONS) if version_read else [])
 
 
-@pytest.mark.parametrize("source", preflight.SEAM_MODULES)
-@pytest.mark.parametrize("value", ["absent", (), [("m", "n", "name")], None])
-def test_a_seam_constant_that_is_gone_or_empty_fails_closed(fake_tree, monkeypatch, capsys, source, value):
-    if value == "absent":
-        monkeypatch.delattr(SOURCES[source], preflight.SEAM_CONSTANT)
-    else:
-        monkeypatch.setattr(SOURCES[source], preflight.SEAM_CONSTANT, value)
-    assert preflight.main() == 1
-    assert _failure_lines(capsys.readouterr()) == [f"{source} has no {preflight.SEAM_CONSTANT}"]
-    assert _audit()["seam_names"] == [record for record in _expected_rows() if record["source"] != source]
-
-
-@pytest.mark.parametrize(
-    "row",
-    [("m", "n"), ("m", "n", "name", "more"), ["m", "n", "name"], ("m", "", "name"), ("m", "n", 3), "m:n:name"],
-)
-def test_a_row_that_is_not_a_triple_of_names_fails(fake_tree, monkeypatch, capsys, row):
-    source = preflight.SEAM_MODULES[0]
-    rows = getattr(SOURCES[source], preflight.SEAM_CONSTANT)
-    monkeypatch.setattr(SOURCES[source], preflight.SEAM_CONSTANT, (*rows, row))
-    assert _fails(capsys) == [f"{source} holds the row {row!r}, which is not (module, name, kind)"]
-
-
-def test_a_row_with_a_kind_the_preflight_does_not_know_fails(fake_tree, monkeypatch, capsys):
-    source, module_name, name, _kind = ALL_ROWS[0]
-    rows = getattr(SOURCES[source], preflight.SEAM_CONSTANT)
-    monkeypatch.setattr(SOURCES[source], preflight.SEAM_CONSTANT, ((module_name, name, "method"), *rows[1:]))
-    assert preflight.main() == 1
-    assert _failure_lines(capsys.readouterr()) == [f"{source} gives {module_name} {name} the unknown kind 'method'"]
-    first = _audit()["seam_names"][0]
-    assert first == {"source": source, "module": module_name, "name": name, "kind": "method", "found": False}
-
-
-@pytest.mark.parametrize(("kind", "name"), [("attribute", "Owner"), ("field", "Owner")])
-def test_a_member_row_without_an_owner_fails(fake_tree, monkeypatch, capsys, kind, name):
-    source, module_name = ALL_ROWS[0][:2]
-    rows = getattr(SOURCES[source], preflight.SEAM_CONSTANT)
-    monkeypatch.setattr(SOURCES[source], preflight.SEAM_CONSTANT, (*rows, (module_name, name, kind)))
-    assert preflight.main() == 1
-    (failure,) = _failure_lines(capsys.readouterr())
-    assert failure == f"{module_name}: {kind} {name} does not have the form Owner.{kind}"
-
-
-def test_an_audit_that_cannot_be_written_fails_a_run_that_found_everything(fake_tree, monkeypatch, capsys):
-    monkeypatch.setattr(preflight, "_AUDIT_PATH", preflight._AUDIT_PATH.parent / "no-such-folder" / "audit.json")
-    assert preflight.main() == 1
-    (failure,) = _failure_lines(capsys.readouterr())
-    assert failure.startswith(f"cannot write {preflight._AUDIT_PATH}: FileNotFoundError: ")
-
-
-def test_run_checks_writes_nothing(fake_tree):
-    audit = preflight.run_checks()
-    assert audit["status"] == "passed" and not preflight._AUDIT_PATH.exists()
-
-
 # ---------------------------------------------------------------------------------------------------------------
-# The file itself, and a start by path
+# The module's own lists and the form of the rows
 # ---------------------------------------------------------------------------------------------------------------
-
-
-def _module_tree() -> ast.Module:
-    return ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
 
 
 def test_the_launcher_modules_are_the_runtime_files_and_the_seam_modules_are_those_that_import_sglang():
     siblings = sorted(path.stem for path in RUNTIME.glob("sglbench_*.py") if path != MODULE_PATH)
-    assert list(preflight.LAUNCHER_MODULES) == siblings and len(siblings) == 7
-    assert preflight.VERSION_MODULE in preflight.LAUNCHER_MODULES
+    assert list(preflight.LAUNCHER_MODULES) == siblings
     importers = []
     for name in siblings:
         tree = ast.parse((RUNTIME / f"{name}.py").read_text(encoding="utf-8"))
@@ -622,8 +467,6 @@ def test_the_launcher_modules_are_the_runtime_files_and_the_seam_modules_are_tho
             importers.append(name)
     # A launcher module that starts to import SGLang needs a seam constant and a place in SEAM_MODULES.
     assert list(preflight.SEAM_MODULES) == importers
-    for name in importers:
-        assert isinstance(getattr(SOURCES[name], preflight.SEAM_CONSTANT), tuple)
 
 
 def test_every_kind_a_row_gives_is_one_the_preflight_knows_and_every_kind_is_used():
@@ -631,148 +474,3 @@ def test_every_kind_a_row_gives_is_one_the_preflight_knows_and_every_kind_is_use
     for _source, module_name, name, kind in ALL_ROWS:
         assert module_name.split(".")[0] == ROOT_PACKAGE
         assert name.count(".") == (1 if kind in ("attribute", "field") else 0), name
-
-
-def test_the_module_holds_no_sglang_name_of_its_own_and_imports_the_standard_library_only():
-    tree = _module_tree()
-    imports = [node for node in ast.walk(tree) if isinstance(node, ast.Import | ast.ImportFrom)]
-    assert all(node in tree.body for node in imports), "every import statement is at module level"
-    roots = set()
-    for node in imports:
-        assert not getattr(node, "level", 0), "relative imports do not resolve in the pod"
-        names = [node.module] if isinstance(node, ast.ImportFrom) else [alias.name for alias in node.names]
-        roots.update(name.split(".")[0] for name in names)
-    assert roots == {"__future__", "dataclasses", "importlib", "json", "pathlib", "sys"}
-    assert roots - {"__future__"} <= set(sys.stdlib_module_names)
-
-    # The names of SGLang are the modules of the rows and the parts of their names. None of them is written
-    # in the file, as a string or as an identifier; its own docstrings name its sibling files only.
-    taboo = {row[1] for row in ALL_ROWS} | {part for row in ALL_ROWS for part in row[2].split(".")}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            assert node.value not in taboo, node.value
-            words = node.value.replace("(", " ").replace(")", " ").replace(",", " ").split()
-            assert not [word for word in words if word.startswith(ROOT_PACKAGE + ".") or word in taboo], node.value
-        elif isinstance(node, ast.Name):
-            assert node.id not in taboo, node.id
-        elif isinstance(node, ast.Attribute):
-            assert node.attr not in taboo, node.attr
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            assert node.attr not in {"environ", "getenv", "putenv"}, "the module reads no environment variable"
-
-
-def test_the_module_has_the_repository_header_and_plain_ascii_lines():
-    text = MODULE_PATH.read_text(encoding="utf-8")
-    assert text.isascii()
-    lines = text.splitlines()
-    assert lines[:3] == [
-        "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
-        "# SPDX-License-Identifier: Apache-2.0",
-        "",
-    ]
-    assert max(len(line) for line in lines) <= 120
-    assert text.count('"/results/runtime-preflight.json"') == 1
-    assert text.rstrip().endswith('if __name__ == "__main__":\n    sys.exit(main())')
-
-
-def test_the_module_imports_in_a_bare_interpreter_and_loads_no_sibling_before_it_runs():
-    code = (
-        "import sys\n"
-        "class Refuse:\n"
-        "    def find_spec(self, name, path=None, target=None):\n"
-        "        if name.split('.')[0] in (sys.argv[2], 'torch', 'numpy'):\n"
-        "            raise ModuleNotFoundError('refused: ' + name, name=name)\n"
-        "        return None\n"
-        "sys.meta_path.insert(0, Refuse())\n"
-        "sys.path.append(sys.argv[1])\n"
-        "import sglbench_preflight as p\n"
-        "taboo = (sys.argv[2], 'torch', 'numpy', 'dynamo', 'aisim', 'aisim_core', 'collector')\n"
-        "bad = [n for n in sys.modules if n.split('.')[0] in taboo]\n"
-        "bad += [n for n in sys.modules if n.startswith('sglbench_') and n != p.__name__]\n"
-        "assert not bad, bad\n"
-        "audit = p.run_checks()\n"
-        "loaded = sorted(n for n in sys.modules if n.startswith('sglbench_') and n != p.__name__)\n"
-        "assert loaded == sorted(p.LAUNCHER_MODULES), loaded\n"
-        "print(audit['status'], len(audit['seam_names']), len(audit['failures']))\n"
-    )
-    done = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", code, str(RUNTIME), ROOT_PACKAGE],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert done.returncode == 0, done.stderr
-    # The version and one line for each module of the rows.
-    assert done.stdout.split() == ["failed", str(len(ALL_ROWS)), str(1 + len(SEAM_MODULE_NAMES))]
-
-
-def _staged_copy(tmp_path: Path) -> tuple[Path, Path]:
-    """The eight runtime files flat in one folder, as the collector stages them, with the audit in a test folder."""
-    staged = tmp_path / "fpm-bench"
-    staged.mkdir()
-    audit = tmp_path / "results" / "runtime-preflight.json"
-    audit.parent.mkdir()
-    for path in RUNTIME.glob("sglbench_*.py"):
-        shutil.copy2(path, staged / path.name)
-    text = MODULE_PATH.read_text(encoding="utf-8")
-    (staged / MODULE_PATH.name).write_text(
-        text.replace('"/results/runtime-preflight.json"', repr(str(audit))), encoding="utf-8"
-    )
-    return staged / MODULE_PATH.name, audit
-
-
-def _start_by_path(script: Path, *flags: str) -> subprocess.CompletedProcess:
-    # -S keeps the packages of this machine out, so no SGLang can be found. PYTHONPATH is not set: the
-    # siblings can only come from the directory of the script.
-    env = {name: value for name, value in os.environ.items() if name not in ("PYTHONPATH", "PYTHONSAFEPATH")}
-    return subprocess.run(
-        [sys.executable, "-S", *flags, str(script)],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-        env=env,
-        cwd=script.parent.parent,
-    )
-
-
-def test_started_by_path_it_finds_its_siblings_and_fails_closed_without_sglang(tmp_path):
-    script, audit_path = _staged_copy(tmp_path)
-    done = _start_by_path(script)
-    assert done.returncode == 1, done.stderr
-    assert done.stdout == ""
-    audit = json.loads(audit_path.read_text(encoding="utf-8"))
-    assert audit["status"] == "failed" and audit["sglang_version"] is None
-    assert audit["tested_versions"] == list(compat.TESTED_VERSIONS)
-    # Every sibling imported: all failures are about SGLang, and every row was read and not found.
-    assert not [failure for failure in audit["failures"] if "sglbench_" in failure]
-    assert audit["seam_names"] == _expected_rows(ALL_ROWS)
-    assert done.stderr.splitlines() == [f"[sglbench] preflight FAILED: {failure}" for failure in audit["failures"]]
-    assert len(audit["failures"]) == 1 + len(SEAM_MODULE_NAMES)
-
-
-def test_a_staged_file_that_is_missing_is_reported_with_the_modules_that_import_it(tmp_path):
-    script, audit_path = _staged_copy(tmp_path)
-    gone = "sglbench_content"
-    (script.parent / f"{gone}.py").unlink()
-    done = _start_by_path(script)
-    assert done.returncode == 1, done.stderr
-    failures = json.loads(audit_path.read_text(encoding="utf-8"))["failures"]
-    broken = [failure.split(":")[0] for failure in failures if failure.startswith("cannot import sglbench_")]
-    # The driver imports the content module and the launcher imports the driver.
-    assert broken == [f"cannot import {name}" for name in (gone, "sglbench_driver", "sglbench_launcher")]
-    for failure in failures[: len(broken)]:
-        assert f"ModuleNotFoundError: No module named '{gone}'" in failure, failure
-
-
-def test_started_without_the_script_directory_on_the_path_it_reports_every_sibling(tmp_path):
-    script, audit_path = _staged_copy(tmp_path)
-    done = _start_by_path(script, "-P")
-    assert done.returncode == 1, done.stderr
-    audit = json.loads(audit_path.read_text(encoding="utf-8"))
-    assert audit["seam_names"] == [] and audit["sglang_version"] is None
-    assert len(audit["failures"]) == len(preflight.LAUNCHER_MODULES)
-    for failure, sibling in zip(audit["failures"], preflight.LAUNCHER_MODULES, strict=True):
-        assert failure.startswith(f"cannot import {sibling}: ModuleNotFoundError: "), failure

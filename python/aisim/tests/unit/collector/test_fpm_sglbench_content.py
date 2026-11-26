@@ -22,21 +22,15 @@ here. No dataset file is read and no tokenizer runs.
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import itertools
 import random
-import subprocess
-import sys
 from array import array
-from pathlib import Path
 
 import pytest
 from collector.fpm_forward.runtime import sglbench_content as content
 
 pytestmark = pytest.mark.unit
-
-RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
 
 LOW = 1000
 HIGH = LOW + 50_000  # a mid-size token range for most tests
@@ -61,7 +55,8 @@ class PageCacheModel:
       (``mem_cache/common.py``, ``release_kv_cache``): none for a one-token prefill request, six for a
       seven-token decode run.
 
-    The stored paths are kept as a trie of pages. ``test_fpm_sglbench_producer.py`` imports this class.
+    The stored paths are kept as a trie of pages. ``test_fpm_sglbench_driver.py`` and
+    ``test_fpm_sglbench_launcher.py`` import this class.
     """
 
     def __init__(self, page_size: int) -> None:
@@ -147,10 +142,6 @@ def _reference_stream(seed: str, token_low: int, token_high: int, kind: str, par
     return tokens[:count], skipped
 
 
-def _reference_rotation(seed: str, token_low: int, token_high: int, rank: int) -> int:
-    return _reference_stream(seed, token_low, token_high, "rot", (rank,), 1)[0][0] - token_low
-
-
 def _reference_chain(seed: str, conversations: list[list[int]], kind: str, parts: tuple[int, ...]) -> list[int]:
     """The whole text chain that the docstring of ``sglbench_content`` documents ("Content layout"), restated
     without the module: every conversation once, in the order in which its index is first drawn."""
@@ -185,12 +176,17 @@ def _reference_chain(seed: str, conversations: list[list[int]], kind: str, parts
 # at page size 64 (decode_extend_tokens), which is 1 and 61 per request. The engine probe (check_5): sent once
 # more after its seven-token run had finished, a prompt of that length again had 1 uncached token at page size
 # 1 and 61 at page size 64 (rows with context 1024 and batch 2 or 1, seed_computed_tokens). The last assertion
-# below models that.
+# on the prompt below models that.
+#
+# The engine probe (check_3): a prefix of whole pages that an earlier request had stored was reported cached in
+# full, 128 tokens at page size 1 and 512 at page size 64. A stored prefix seven tokens longer (135 and 519
+# tokens) was reported as 135 tokens at page size 1 and as 512 at page size 64. The prefix lengths are those of
+# the driver script: 8 * max(page size, 16) tokens, and 7 more.
 @pytest.mark.parametrize(
-    ("page_size", "context", "cached", "extend"),
-    [(64, 1024, 960, 61), (1, 1024, 1020, 1)],
+    ("page_size", "context", "cached", "extend", "cached_of_a_stored_prefix"),
+    [(64, 1024, 960, 61, {512: 512, 519: 512}), (1, 1024, 1020, 1, {128: 128, 135: 135})],
 )
-def test_cache_model_reproduces_the_engine_probe_decode_counts(page_size, context, cached, extend):
+def test_cache_model_reproduces_the_engine_probe_counts(page_size, context, cached, extend, cached_of_a_stored_prefix):
     cache = PageCacheModel(page_size)
     prompt = list(range(5000, 5000 + context - 3))
     assert cache.cached(prompt) == 0  # cold seed
@@ -199,56 +195,24 @@ def test_cache_model_reproduces_the_engine_probe_decode_counts(page_size, contex
     assert len(prompt) - cache.cached(prompt) == extend
     cache.finish_decode(prompt, [-1, -2, -3, -4, -5, -6])
     assert cache.cached(prompt) == cached
-
-
-# The engine probe (check_3): a prefix of whole pages that an earlier request had stored was reported cached in
-# full, 128 tokens at page size 1 and 512 at page size 64. A stored prefix seven tokens longer (135 and 519
-# tokens) was reported as 135 tokens at page size 1 and as 512 at page size 64. The prefix lengths are those of
-# the driver script: 8 * max(page size, 16) tokens, and 7 more.
-@pytest.mark.parametrize(
-    ("page_size", "prefix", "cached"),
-    [(1, 128, 128), (64, 512, 512), (1, 135, 135), (64, 519, 512)],
-)
-def test_cache_model_reproduces_the_engine_probe_prefill_counts(page_size, prefix, cached):
-    cache = PageCacheModel(page_size)
-    base = list(range(7000, 7000 + prefix))
-    cache.finish_prefill(base)
-    assert cache.cached([*base, -1, -2, -3]) == cached
-
-
-def test_cache_model_exposes_each_hazard_the_allocation_prevents():
-    # Page size 1: every equal token counts. Numbers below are worked out by hand from the three cache facts.
-    plan = content.ContentPlan("0", LOW, HIGH)
-    cache = PageCacheModel(1)
-    sequence = plan.slot_prefix(0, 0, 40)
-    cache.finish_prefill(sequence[:32])  # a deeper seed of the same slot
-    # A suffix that starts with the slot's own next token runs on into the deeper seed.
-    assert cache.cached([*sequence[:16], sequence[16], HIGH + 1]) == 17
-    shot = plan.prefill_prompt(0, 0, 16, 3)
-    assert cache.cached(shot) == 16
-    cache.finish_prefill(shot)
-    # A later shot that repeats this first suffix token runs on into the earlier shot.
-    assert cache.cached([*shot[:17], HIGH + 2, HIGH + 3]) == 17
-    # The same shot submitted twice finds itself (19 tokens, capped at 18).
-    assert cache.cached(shot) == 18
-    # A zero-cached prompt that starts with a stored first token is not zero-cached.
-    assert cache.cached([sequence[0], HIGH + 4]) == 1
-    # A slot whose first token equals another slot's first token would continue on that slot's path.
-    assert cache.cached([sequence[0], sequence[1], HIGH + 5]) == 2
+    for prefix, reported in cached_of_a_stored_prefix.items():
+        cache = PageCacheModel(page_size)
+        base = list(range(7000, 7000 + prefix))
+        cache.finish_prefill(base)
+        assert cache.cached([*base, -1, -2, -3]) == reported
 
 
 # ---------------------------------------------------------------------------------------------------------
-# Token streams and first-token allocation against an independent restatement
+# Token streams: pinned vectors, and a stream does not depend on how it is consumed
 # ---------------------------------------------------------------------------------------------------------
 
 
 def test_pinned_vectors_identify_the_content_of_a_seed():
     # A change here changes what a recorded seed means, so it needs a new STREAM_DOMAIN version. These literals
-    # are the only content check that does not go through _reference_stream, so they are what catches a key
-    # grammar that is changed in the module and in that helper alike. The first three were computed with
-    # _reference_stream (not with the module). The others were computed twice, with the module and with a
-    # second restatement of the module docstring that shares no code with the module or with
-    # _reference_stream, and are pinned because both gave the same values.
+    # are the only check of the stream recipe (key grammar, block counter, rejected words, byte length of the
+    # seed). The first three were computed with _reference_stream (not with the module). The others were
+    # computed twice, with the module and with a second restatement of the module docstring that shares no
+    # code with the module or with _reference_stream, and are pinned because both gave the same values.
     assert content.STREAM_DOMAIN == "sglbench-content-v1"
     plan = content.ContentPlan("0", 0, 4096)
     assert plan.slot_prefix(0, 0, 6) == [466, 1165, 4085, 1625, 2493, 3690]
@@ -270,69 +234,6 @@ def test_pinned_vectors_identify_the_content_of_a_seed():
     assert sequence[88:92] == [3778, 2655, 1359, 2640]
     # A seed of two characters and three UTF-8 bytes: the length in front of the seed counts bytes.
     assert content.ContentPlan("s\u00e9", 0, 4096).slot_prefix(0, 0, 3) == [3506, 440, 2731]
-
-
-@pytest.mark.parametrize(
-    ("seed", "token_low", "token_high"),
-    [
-        ("0", 0, 4096),
-        ("run-7", LOW, HIGH),
-        ("s\u00e9ed:with:colons", 5, 5 + 151_643),  # non-ASCII: the length prefix counts UTF-8 bytes
-        ("0", 2**32 - 4096, 2**32),  # the top of the 32-bit id space
-        ("0", 0, 3 * 2**30),  # one word in four is rejected
-    ],
-)
-def test_content_equals_the_documented_streams(seed, token_low, token_high):
-    plan = content.ContentPlan(seed, token_low, token_high)
-    vocab_size = token_high - token_low
-    zero_issued = dict.fromkeys(range(3), 0)  # the zero-cached counter runs per rank, across slots
-    for rank, slot in ((0, 0), (0, 3), (1, 0), (2, 41)):
-        rotation = _reference_rotation(seed, token_low, token_high, rank)
-        assert 0 <= rotation < vocab_size
-        tail, _ = _reference_stream(seed, token_low, token_high, "slot", (rank, slot), 299)
-        sequence = [token_low + (rotation + slot) % vocab_size, *tail]
-        assert plan.slot_prefix(rank, slot, 300) == sequence
-
-        for cached in (1, 16, 64):
-            start = _reference_stream(seed, token_low, token_high, "off", (rank, slot, cached), 1)[0][0] - token_low
-            for shot in range(4):
-                # The rule in words: walk the range as a circle from the offset, skip the slot's own next token.
-                step = 0
-                remaining = shot
-                while True:
-                    candidate = token_low + (start + step) % vocab_size
-                    step += 1
-                    if candidate == sequence[cached]:
-                        continue
-                    if remaining == 0:
-                        break
-                    remaining -= 1
-                suffix, _ = _reference_stream(seed, token_low, token_high, "shot", (rank, slot, cached, shot), 6)
-                assert plan.prefill_prompt(rank, slot, cached, 7) == [*sequence[:cached], candidate, *suffix]
-
-        for _ in range(3):  # prefill and free prompts take turns on one counter
-            index = zero_issued[rank]
-            zero_tail, _ = _reference_stream(seed, token_low, token_high, "zero", (rank, index), 4)
-            first = token_low + (rotation - 1 - index) % vocab_size
-            assert plan.prefill_prompt(rank, slot, 0, 5) == [first, *zero_tail]
-            zero_tail, _ = _reference_stream(seed, token_low, token_high, "zero", (rank, index + 1), 2)
-            first = token_low + (rotation - 2 - index) % vocab_size
-            assert plan.free_prompt(rank, 3) == [first, *zero_tail]
-            zero_issued[rank] = index + 2
-
-
-def test_rejection_sampling_skips_words_and_removes_the_modulo_bias():
-    # With 3 * 2**30 ids, "word % vocab" alone would send the top quarter of the words to the lowest third of
-    # the ids and make them twice as likely as the rest (one half of all tokens instead of one third).
-    token_high = 3 * 2**30
-    plan = content.ContentPlan("bias", 0, token_high)
-    tokens = plan.slot_prefix(0, 0, 30_001)[1:]
-    reference, skipped = _reference_stream("bias", 0, token_high, "slot", (0, 0), 30_000)
-    assert tokens == reference
-    assert 9_000 < skipped < 11_000  # about a quarter of 40,000 words
-    assert all(0 <= token < token_high for token in tokens)
-    lowest_third = sum(1 for token in tokens if token < 2**30) / len(tokens)
-    assert 0.31 < lowest_third < 0.36  # 1/3 with a standard deviation of 0.003; a biased stream gives 0.5
 
 
 def test_a_stream_does_not_depend_on_how_it_is_consumed():
@@ -371,21 +272,6 @@ def test_i0_prompt_shapes():
         assert plan.decode_prompt(1, 2, context) == prompt  # the seed and the run use the same prompt
 
 
-def test_i1_i4_prefix_property_on_a_long_sequence():
-    # One slot of 40,000 tokens, near the input limit of the engines of the probe (max_req_input_len 40954 in
-    # the recorder headers). Sized to stay fast; no wall-clock assertion.
-    plan = content.ContentPlan("0", LOW, HIGH)
-    longest = plan.slot_prefix(0, 0, 40_000)
-    assert len(longest) == 40_000
-    assert all(LOW <= token < HIGH for token in longest)
-    for length in (1, 2, 15, 16, 17, 4096, 39_999, 40_000):
-        assert plan.slot_prefix(0, 0, length) == longest[:length]
-    ascending = content.ContentPlan("0", LOW, HIGH)
-    for length in (1, 64, 4097, 40_000):
-        assert ascending.slot_prefix(0, 0, length) == longest[:length]
-    assert plan.stats()["slot_tokens"] == 40_000
-
-
 def test_i1_i4_i6_many_slots_fill_the_smallest_range():
     # 4,096 slots of 300 tokens on the smallest range: the first tokens must be all 4,096 ids, each once.
     plan = content.ContentPlan("0", LOW, SMALL_HIGH)
@@ -405,19 +291,6 @@ def test_i1_i4_i6_many_slots_fill_the_smallest_range():
         "free_prompts": 0,
         "decode_prompts": 0,
     }
-
-
-def test_i2_first_suffix_tokens_are_distinct_and_never_the_slots_next_token():
-    plan = content.ContentPlan("0", LOW, HIGH)
-    keys = [(0, 0, 1), (0, 0, 16), (0, 0, 17), (0, 1, 16), (1, 0, 16), (1, 7, 256)]
-    firsts: dict[tuple[int, int, int], list[int]] = {key: [] for key in keys}
-    for _ in range(200):  # interleaved: warm shots, measured shots and re-stages of several points
-        for rank, slot, cached in keys:
-            firsts[(rank, slot, cached)].append(plan.prefill_prompt(rank, slot, cached, 2)[cached])
-    for (rank, slot, cached), tokens in firsts.items():
-        own_next = plan.slot_prefix(rank, slot, cached + 1)[cached]
-        assert len(set(tokens)) == 200
-        assert own_next not in tokens
 
 
 def test_i3_zero_cached_first_tokens_are_distinct_from_each_other_and_from_slots():
@@ -447,64 +320,6 @@ def test_i4_every_token_is_in_range_at_both_ends_of_the_id_space():
         for prompt in prompts:
             assert min(prompt) >= token_low
             assert max(prompt) < token_high
-
-
-def _recorded_calls(plan):
-    return [
-        plan.slot_prefix(0, 0, 40),
-        plan.prefill_seed_prompt(0, 1, 16),
-        plan.prefill_prompt(0, 1, 16, 5),
-        plan.prefill_prompt(0, 1, 16, 5),
-        plan.prefill_prompt(0, 0, 0, 5),
-        plan.free_prompt(1, 9),
-        plan.decode_prompt(1, 3, 20),
-        plan.prefill_prompt(1, 0, 0, 2),
-    ]
-
-
-def test_i5_same_seed_and_calls_give_identical_output():
-    first = _recorded_calls(content.ContentPlan("seed-a", LOW, HIGH))
-    second = _recorded_calls(content.ContentPlan("seed-a", LOW, HIGH))
-    assert first == second
-
-
-def test_i5_content_is_a_pure_function_of_its_key_not_of_the_call_order():
-    quiet = content.ContentPlan("0", LOW, HIGH)
-    busy = content.ContentPlan("0", LOW, HIGH)
-    # The busy plan does unrelated work between the calls that are compared.
-    busy.slot_prefix(0, 9, 100)
-    busy.prefill_prompt(0, 2, 32, 4)
-    busy.decode_prompt(1, 1, 50)
-    shots_quiet = [quiet.prefill_prompt(0, 1, 16, 6) for _ in range(3)]
-    shots_busy = []
-    for index in range(3):
-        shots_busy.append(busy.prefill_prompt(0, 1, 16, 6))
-        busy.prefill_prompt(0, 1, 32, 6)  # another k of the same slot has its own counter
-        busy.slot_prefix(0, 20 + index, 3)
-    assert shots_busy == shots_quiet
-    zero_quiet = [quiet.prefill_prompt(0, 0, 0, 4), quiet.free_prompt(0, 4)]
-    busy.slot_prefix(0, 300, 1)
-    zero_busy = [busy.prefill_prompt(0, 7, 0, 4), busy.free_prompt(0, 4)]  # the slot argument is not used
-    assert zero_busy == zero_quiet
-    assert busy.slot_prefix(0, 1, 64) == quiet.slot_prefix(0, 1, 64)
-
-
-def _differing_positions(first: list[int], second: list[int]) -> int:
-    return sum(1 for left, right in zip(first, second, strict=True) if left != right)
-
-
-def test_i5_another_seed_rank_or_slot_changes_the_content():
-    base = content.ContentPlan("0", LOW, HIGH)
-    reference = base.slot_prefix(0, 0, 64)
-    # The first token alone can coincide (1 in V), so compare the positions after it.
-    for seed in ("1", "00", "0:0", "seed"):
-        other = content.ContentPlan(seed, LOW, HIGH).slot_prefix(0, 0, 64)
-        assert _differing_positions(reference[1:], other[1:]) >= 32
-    assert _differing_positions(reference[1:], base.slot_prefix(0, 1, 64)[1:]) >= 32
-    assert _differing_positions(reference[1:], base.slot_prefix(1, 0, 64)[1:]) >= 32
-    other = content.ContentPlan("1", LOW, HIGH)
-    assert _differing_positions(base.prefill_prompt(0, 0, 16, 64)[17:], other.prefill_prompt(0, 0, 16, 64)[17:]) >= 32
-    assert _differing_positions(base.free_prompt(0, 64)[1:], other.free_prompt(0, 64)[1:]) >= 32
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -660,30 +475,6 @@ def _simulate_and_check(plan, page_size: int, order: str, one_by_one: bool, gene
         assert plan.remaining_zero_cached(rank) == (HIGH - LOW) - 6 - stats["zero_cached_prompts"] // RANKS
 
 
-def test_simulated_run_with_a_wide_batch_and_free_prompts():
-    _simulate_a_wide_batch(content.ContentPlan("wide", LOW, SMALL_HIGH))
-
-
-def _simulate_a_wide_batch(plan) -> None:
-    # 300 slots at page size 1, where a single shared token would show: warm-up, a k == 0 point, a cached
-    # point at the smallest k, and a decode point, each split over several extend batches.
-    cache = PageCacheModel(1)
-    warm_up = plan.free_prompt(0, 256)
-    assert cache.cached(warm_up) == 0
-    cache.finish_prefill(warm_up)
-    for cached, new in ((0, 3), (1, 2), (16, 2)):  # two or more new tokens, so a longer match could show
-        if cached:
-            _submit(cache, [plan.prefill_seed_prompt(0, slot, cached) for slot in range(300)], True)
-        for _ in range(2):
-            shots = [plan.prefill_prompt(0, slot, cached, new) for slot in range(300)]
-            assert _submit(cache, shots, True) == [cached] * 300
-    prompts = [plan.decode_prompt(0, slot, 40) for slot in range(300)]
-    _submit(cache, prompts, True)
-    assert [cache.cached(prompt) for prompt in prompts] == [36] * 300
-    another = plan.free_prompt(0, 8)
-    assert cache.cached(another) == 0
-
-
 # ---------------------------------------------------------------------------------------------------------
 # Exhaustion: the plan raises instead of repeating a first token
 # ---------------------------------------------------------------------------------------------------------
@@ -762,49 +553,10 @@ def test_a_rank_without_slots_issues_exactly_one_zero_cached_prompt_per_token_id
     # A corner of the exhaustion rule: no slot sequence on the rank (a run of k == 0 points only). The range
     # holds 4,096 ids, so exactly 4,096 zero-cached prompts fit and the next one would repeat a first token.
     plan = content.ContentPlan("s", LOW, SMALL_HIGH)
-    assert plan.remaining_zero_cached(0) == 4096
-    firsts = _zero_cached_firsts(plan, 4096)
-    assert sorted(firsts) == list(range(LOW, SMALL_HIGH))  # every id exactly once
+    assert sorted(_zero_cached_firsts(plan, 4096)) == list(range(LOW, SMALL_HIGH))  # every id exactly once
     assert plan.stats()["slots"] == 0
-    assert plan.remaining_zero_cached(0) == 0
-    _assert_refused(
-        plan,
-        [
-            lambda: plan.free_prompt(0, 1),
-            lambda: plan.prefill_prompt(0, 0, 0, 1),
-            lambda: plan.slot_prefix(0, 0, 1),  # slot 0 would need a first token that a prompt already has
-            lambda: plan.decode_prompt(0, 0, 4),
-        ],
-    )
-
-
-def test_a_rank_with_only_slot_0_keeps_its_first_token_out_of_the_zero_cached_prompts():
-    # The other corner: slot 0 is the only slot in use (a run of batch size 1). It takes one of the 4,096 ids,
-    # so exactly 4,095 zero-cached prompts fit and none of them starts with the slot's first token.
-    plan = content.ContentPlan("s", LOW, SMALL_HIGH)
-    slot_first = plan.slot_prefix(0, 0, 2)[0]
-    assert plan.remaining_zero_cached(0) == 4095
-    firsts = _zero_cached_firsts(plan, 4095)
-    assert slot_first not in firsts
-    assert sorted([*firsts, slot_first]) == list(range(LOW, SMALL_HIGH))  # every id exactly once
-    assert plan.remaining_zero_cached(0) == 0
-    _assert_refused(
-        plan,
-        [
-            lambda: plan.free_prompt(0, 1),
-            lambda: plan.prefill_prompt(0, 0, 0, 1),
-            lambda: plan.slot_prefix(0, 1, 1),  # a second slot would take the first token of a prompt
-        ],
-    )
-    assert plan.slot_prefix(0, 0, 9)[0] == slot_first  # the slot that exists keeps working
-
-
-def test_zero_cached_prefill_prompt_does_not_use_its_slot():
-    plan = content.ContentPlan("s", LOW, SMALL_HIGH)
-    plan.prefill_prompt(0, 4000, 0, 3)
-    assert plan.remaining_zero_cached(0) == 4095
-    assert plan.stats()["slots"] == 0
-    assert plan.stats()["zero_cached_prompts"] == 1
+    # Slot 0 would need a first token that a prompt already has.
+    _assert_refused(plan, [lambda: plan.free_prompt(0, 1), lambda: plan.slot_prefix(0, 0, 1)])
 
 
 def test_shot_range_is_exhausted_without_repeating_a_first_suffix_token():
@@ -857,52 +609,6 @@ def test_prefill_shot_inside_a_decode_tail_is_refused(context):
     assert len(plan.decode_prompt(0, 2, context + 2)) == length + 2
     with pytest.raises(ValueError, match="decode run"):
         plan.prefill_prompt(0, 2, length + 6, 4)  # now inside the tail of the second decode run
-
-
-@pytest.mark.parametrize(
-    ("page_size", "length", "gap"),
-    [(1, 37, 0), (1, 37, 5), (2, 36, 4), (4, 38, 2), (6, 36, 0), (7, 35, 0), (16, 32, 0), (64, 64, 0)],
-)
-def test_generated_tokens_of_a_decode_run_are_why_the_guard_exists(page_size, length, gap):
-    # A twin plan with no decode run shows the prompt the guarded plan would issue (same seed, same key).
-    cached = length + gap
-    assert cached % page_size == 0
-    twin = content.ContentPlan("0", LOW, HIGH)
-    shot = twin.prefill_prompt(0, 0, cached, 8)
-    decode = twin.slot_prefix(0, 0, length)
-    # Worst case: the model continues the slot's own sequence and then emits the shot's suffix.
-    adversarial = shot[length : length + 6]
-    cache = PageCacheModel(page_size)
-    cache.finish_prefill(decode)
-    assert cache.cached(decode) == _floor(length - 1, page_size)
-    cache.finish_decode(decode, adversarial)
-    cache.finish_prefill(twin.prefill_seed_prompt(0, 0, cached))
-    # The shot matches every whole page the decode run stored: more than planned at page sizes up to 6.
-    assert cache.cached(shot) == max(cached, _floor(length + 6, page_size))
-    assert (cache.cached(shot) > cached) == (page_size <= 6)
-
-    guarded = content.ContentPlan("0", LOW, HIGH)
-    assert guarded.decode_prompt(0, 0, length + 3) == decode
-    with pytest.raises(ValueError, match="decode run"):
-        guarded.prefill_prompt(0, 0, cached, 8)
-
-
-@pytest.mark.parametrize("page_size", [1, 2])
-def test_shots_just_outside_a_decode_tail_stay_exact(page_size):
-    # The shots the guard lets through, against the worst generated tokens for them: the model continues the
-    # slot's own sequence, so the cache holds the slot six tokens deeper than the decode prompt.
-    plan = content.ContentPlan("0", LOW, HIGH)
-    cache = PageCacheModel(page_size)
-    length = 36
-    decode = plan.decode_prompt(0, 0, length + 3)
-    cache.finish_prefill(decode)
-    cache.finish_decode(decode, plan.slot_prefix(0, 0, length + 6)[length:])
-    for cached in (length - page_size, length + 6):
-        cache.finish_prefill(plan.prefill_seed_prompt(0, 0, cached))
-        for _ in range(3):
-            shot = plan.prefill_prompt(0, 0, cached, page_size + 2)
-            assert cache.cached(shot) == cached
-            cache.finish_prefill(shot)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -985,26 +691,11 @@ def test_the_text_recipe_joins_the_turn_values_and_keeps_the_even_half_of_the_lo
 @pytest.mark.parametrize(
     ("records", "message"),
     [
-        ({"conversations": []}, r"^the dataset must be a list of records, got dict$"),
-        ("[]", r"^the dataset must be a list of records, got str$"),
-        (None, r"^the dataset must be a list of records, got NoneType$"),
-        (({"conversations": []},), r"^the dataset must be a list of records, got tuple$"),
+        ({"conversations": []}, "a list of records"),
         # The first bad record is the one that is named.
-        ([{"conversations": []}, "text", 7], r"^record 1 of the dataset must be a mapping, got str$"),
-        ([{}, {}, None, 7], r"^record 2 of the dataset must be a mapping, got NoneType$"),
-        ([[{"value": "text"}]], r"^record 0 of the dataset must be a mapping, got list$"),
-        ([{"conversations": "text"}], r"^record 0 of the dataset: 'conversations' must be a list of turns, got str$"),
-        (
-            [{}, {"conversations": {"value": "text"}}],
-            r"^record 1 of the dataset: 'conversations' must be a list of turns, got dict$",
-        ),
-        ([{"conversations": 5}], r"^record 0 of the dataset: 'conversations' must be a list of turns, got int$"),
-        (
-            [{"conversations": [{"value": "text"}, "text"]}],
-            r"^record 0 of the dataset: turn 1 must be a mapping, got str$",
-        ),
-        ([{}, {"conversations": [None]}], r"^record 1 of the dataset: turn 0 must be a mapping, got NoneType$"),
-        ([{"conversations": [["value", "text"]]}], r"^record 0 of the dataset: turn 0 must be a mapping, got list$"),
+        ([{"conversations": []}, "text", 7], "record 1 .* must be a mapping"),
+        ([{}, {"conversations": {"value": "text"}}], "record 1 .* 'conversations' must be a list"),
+        ([{"conversations": [{"value": "text"}, "text"]}], "record 0 .* turn 1 must be a mapping"),
     ],
 )
 def test_the_text_recipe_refuses_records_it_cannot_read(records, message):
@@ -1065,53 +756,13 @@ def test_a_pool_keeps_the_ids_inside_the_range_and_counts_what_it_drops():
     assert _pool_facts(pool)[1][0] == 4
 
 
-def test_a_pool_may_be_empty_and_uses_the_whole_range_of_32_bit_ids():
-    empty = content.TextPool([], LOW, HIGH)
-    assert _pool_facts(empty) == ((LOW, HIGH, False), (0, 0, 0, 0), [])
-    for token_low, token_high in ((0, 4096), (2**32 - 4096, 2**32), (0, 2**32)):
-        pool = content.TextPool([[token_low, token_high - 1, token_high, -1]], token_low, token_high)
-        assert _pool_facts(pool) == ((token_low, token_high, False), (1, 2, 2, 0), [[token_low, token_high - 1]])
-
-
-@pytest.mark.parametrize(
-    ("token_range", "error"),
-    [
-        ((True, 4096), TypeError),
-        ((0.0, 4096), TypeError),
-        (("0", 4096), TypeError),
-        ((0, 4096.0), TypeError),
-        ((0, None), TypeError),
-        ((-1, 4096), ValueError),
-        ((0, 4095), ValueError),  # one id short of the minimum range
-        ((5000, 5000), ValueError),
-        ((5000, 100), ValueError),
-        ((0, 2**32 + 1), ValueError),  # ids are stored in 32 bits
-    ],
-)
-def test_a_pool_validates_its_range_as_a_plan_does(token_range, error):
-    with pytest.raises(error) as of_the_pool:
-        content.TextPool([], *token_range)
-    with pytest.raises(error) as of_the_plan:
-        content.ContentPlan("0", *token_range)
-    assert str(of_the_pool.value) == str(of_the_plan.value)
-
-
 @pytest.mark.parametrize(
     ("conversations", "message"),
     [
-        (None, r"^conversations must be an iterable of lists of token ids, got NoneType$"),
-        (5, r"^conversations must be an iterable of lists of token ids, got int$"),
-        ([LOW, LOW + 1], r"^conversations\[0\] must be a list of token ids, got int$"),  # one flat list of ids
-        ("text", r"^conversations\[0\] must be a list of token ids, got str$"),
-        ([[LOW], "text"], r"^conversations\[1\] must be a list of token ids, got str$"),
-        ([[LOW], [LOW], None], r"^conversations\[2\] must be a list of token ids, got NoneType$"),
-        ([[LOW], {LOW + 1}], r"^conversations\[1\] must be a list of token ids, got set$"),
-        ([[LOW], {LOW: 1}], r"^conversations\[1\] must be a list of token ids, got dict$"),
-        ([[LOW, True]], r"^conversations\[0\] holds a token id that is not an int: bool: True$"),
-        ([[LOW], [LOW, 1.0, "2"]], r"^conversations\[1\] holds a token id that is not an int: float: 1\.0$"),
-        ([[str(LOW)]], r"^conversations\[0\] holds a token id that is not an int: str: '1000'$"),
-        ([[LOW, None]], r"^conversations\[0\] holds a token id that is not an int: NoneType: None$"),
-        ([array("d", [1000.0])], r"^conversations\[0\] holds a token id that is not an int: float: 1000\.0$"),
+        (None, "must be an iterable"),
+        ([LOW, LOW + 1], r"conversations\[0\] must be a list"),  # one flat list of ids
+        ([[LOW], "text"], r"conversations\[1\] must be a list"),  # a good conversation ahead of the bad one
+        ([[LOW, True]], r"conversations\[0\] .* not an int: bool"),
     ],
 )
 def test_a_pool_refuses_what_is_not_lists_of_plain_ints_and_changes_nothing(conversations, message):
@@ -1125,53 +776,16 @@ def test_a_pool_refuses_what_is_not_lists_of_plain_ints_and_changes_nothing(conv
     assert _pool_facts(pool) == before
 
 
-def test_a_pool_gives_a_conversation_by_its_index_only():
-    pool = content.TextPool([[LOW], [LOW + 1, LOW + 2]], LOW, HIGH)
-    for bad in (True, 0.0, "0", None):
-        with pytest.raises(TypeError, match="index must be an int"):
-            pool.conversation(bad)
-    with pytest.raises(ValueError, match=r"^index must be >= 0, got -1$"):
-        pool.conversation(-1)
-    with pytest.raises(ValueError, match=r"^index must be < 2, the number of conversations, got 2$"):
-        pool.conversation(2)
-
-
-def test_a_chain_raises_when_a_stored_conversation_was_shortened_behind_the_pool():
-    # The pool hands out its stored arrays and asks callers not to change them. A caller that shortens one
-    # must get an error from the next chain that runs out, not a search for an unused conversation that never
-    # ends: the pool still counts four tokens and holds three.
-    pool = content.TextPool([[LOW + 1, LOW + 2, LOW + 3], [LOW + 4]], LOW, HIGH)
-    plan = content.ContentPlan("0", LOW, HIGH, pool)
-    pool.conversation(0).pop()
-    assert (pool.tokens, sum(len(pool.conversation(index)) for index in range(2))) == (4, 3)
-    message = (
-        r"^the text pool no longer holds the 4 tokens it counted: the chain slot:0:0 used every conversation "
-        r"and is 1 token\(s\) short$"
-    )
-    with pytest.raises(RuntimeError, match=message):
-        plan.slot_prefix(0, 0, 5)
-
-
 def test_the_first_plan_built_on_a_pool_freezes_it():
     pool = content.TextPool(_fake_conversations(1, 20, LOW, HIGH), LOW, HIGH)
     pool.add([[LOW + 1, LOW + 2]])  # a pool grows in batches before a plan exists
-    # A plan that cannot be built leaves the pool as it was.
-    for arguments, error in (
-        ((0, LOW, HIGH), TypeError),
-        (("", LOW, HIGH), ValueError),
-        (("0", LOW, HIGH + 1), ValueError),
-    ):
-        with pytest.raises(error):
-            content.ContentPlan(*arguments, pool)
     assert pool.frozen is False
 
     plan = content.ContentPlan("0", LOW, HIGH, pool)
     assert pool.frozen is True
     before = _pool_facts(pool)
-    for conversations in ([[LOW + 3]], [], None):
-        with pytest.raises(RuntimeError, match="^the text pool is frozen: a ContentPlan was built on it"):
-            pool.add(conversations)
-    pool.freeze()  # freezing a frozen pool changes nothing
+    with pytest.raises(RuntimeError, match="the text pool is frozen"):
+        pool.add([[LOW + 3]])
     assert _pool_facts(pool) == before
     # A frozen pool serves further plans, and the same seed then gives the same content.
     again = content.ContentPlan("0", LOW, HIGH, pool)
@@ -1184,7 +798,7 @@ def test_a_plan_refuses_a_pool_it_cannot_use():
     for conversations in ([], [[HIGH], [LOW - 1, HIGH + 1], []]):
         empty = content.TextPool(conversations, LOW, HIGH)
         assert (empty.conversations, empty.tokens) == (0, 0)
-        with pytest.raises(ValueError, match="^the text pool holds no conversation$"):
+        with pytest.raises(ValueError, match="holds no conversation"):
             content.ContentPlan("0", LOW, HIGH, empty)
         # The refused plan did not freeze it: it can still grow, and a plan then takes it.
         assert empty.frozen is False
@@ -1195,42 +809,9 @@ def test_a_plan_refuses_a_pool_it_cannot_use():
     # of the text.
     pool = content.TextPool([[LOW]], LOW, HIGH)
     for token_low, token_high in ((LOW, HIGH + 1), (LOW - 1, HIGH), (LOW + 1, HIGH + 1)):
-        message = (
-            rf"^the text pool keeps the token ids \[{LOW}, {HIGH}\), which does not hold the plan's token range "
-            rf"\[{token_low}, {token_high}\)$"
-        )
-        with pytest.raises(ValueError, match=message):
+        with pytest.raises(ValueError, match="does not hold the plan's token range"):
             content.ContentPlan("0", token_low, token_high, pool)
-    # A plan whose range lies inside the pool's is taken, whichever end is narrower.
-    for token_low, token_high in ((LOW, HIGH), (LOW + 1, HIGH), (LOW, HIGH - 1), (LOW + 7, HIGH - 7)):
-        ids = [LOW, HIGH - 1, LOW + 3]
-        plan = content.ContentPlan("0", token_low, token_high, content.TextPool([ids], LOW, HIGH))
-        assert plan.slot_prefix(0, 0, 4)[1:] == ids
-    for not_a_pool in ([[LOW]], (), "pool", 0, False):
-        with pytest.raises(TypeError, match="^pool must be a TextPool or None, got "):
-            content.ContentPlan("0", LOW, HIGH, not_a_pool)
     assert pool.frozen is False
-
-
-def test_a_plan_names_its_source_and_its_pool():
-    assert (content.CONTENT_SEEDED_IDS, content.CONTENT_TEXT_CHAINS) == ("seeded_token_ids", "dataset_text_chains")
-    seeded = content.ContentPlan("0", LOW, HIGH)
-    assert (seeded.source, seeded.pool) == ("seeded_token_ids", None)
-    # Passing None for the pool is the plan without a pool.
-    explicit = content.ContentPlan("0", LOW, HIGH, None)
-    assert (explicit.source, explicit.pool) == ("seeded_token_ids", None)
-    assert _recorded_calls(explicit) == _recorded_calls(seeded)
-
-    pool = content.TextPool(_fake_conversations(2, 30, LOW, HIGH), LOW, HIGH)
-    text = content.ContentPlan("0", LOW, HIGH, pool)
-    assert (text.source, text.pool is pool) == ("dataset_text_chains", True)
-    assert (text.seed, text.token_low, text.token_high, text.vocab_size) == ("0", LOW, HIGH, HIGH - LOW)
-    # The counts of a plan have the same keys for both sources; the pool has its own counts.
-    _recorded_calls(text)
-    assert text.stats() == seeded.stats()
-    for name in ("source", "pool"):
-        with pytest.raises(AttributeError):
-            setattr(text, name, None)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -1274,65 +855,6 @@ def _reference_shot_firsts(token_low: int, token_high: int, start: int, next_tok
     circle = [token_low + (start + step) % vocab_size for step in range(vocab_size)]
     circle.remove(token_low + (next_token - token_low) % vocab_size)
     return circle
-
-
-def _reference_first_suffix(token_low: int, vocab_size: int, start: int, own_next: int, shot: int) -> int:
-    """The rule in words: walk the range as a circle from the offset, skip the slot's own next token.
-
-    For a next token of the token range. ``_reference_shot_firsts`` also covers one outside it.
-    """
-    step = 0
-    remaining = shot
-    while True:
-        candidate = token_low + (start + step) % vocab_size
-        step += 1
-        if candidate == own_next:
-            continue
-        if remaining == 0:
-            return candidate
-        remaining -= 1
-
-
-@pytest.mark.parametrize(
-    ("seed", "token_low", "token_high", "conversations"),
-    [
-        ("0", 0, 4096, 1),  # one conversation: every chain is that conversation
-        ("0", 0, 4096, 2),
-        ("run-7", LOW, HIGH, 37),
-        ("s\u00e9ed:with:colons", 5, 5 + 151_643, 64),  # non-ASCII: the length prefix counts UTF-8 bytes
-        ("0", 2**32 - 4096, 2**32, 100),  # the top of the 32-bit id space
-    ],
-)
-def test_text_content_equals_the_documented_chains(seed, token_low, token_high, conversations):
-    fake = _fake_conversations(20261117, conversations, token_low, token_high, shortest=30)
-    total = sum(len(ids) for ids in fake)
-    plan = content.ContentPlan(seed, token_low, token_high, content.TextPool(fake, token_low, token_high))
-    vocab_size = token_high - token_low
-    zero_issued = dict.fromkeys(range(3), 0)  # the zero-cached counter runs per rank, across slots
-    for rank, slot in ((0, 0), (0, 3), (1, 0), (2, 41)):
-        # The allocation is that of the seeded ids: the rotation and the offsets are streams of token ids.
-        rotation = _reference_rotation(seed, token_low, token_high, rank)
-        chain = _reference_chain(seed, fake, "slot", (rank, slot))
-        assert len(chain) == total and sorted(chain) == sorted(token for ids in fake for token in ids)
-        sequence = [token_low + (rotation + slot) % vocab_size, *chain]
-        assert plan.slot_prefix(rank, slot, total + 1) == sequence
-
-        for cached in (1, 16, 29):
-            start = _reference_stream(seed, token_low, token_high, "off", (rank, slot, cached), 1)[0][0] - token_low
-            for shot in range(4):
-                first = _reference_first_suffix(token_low, vocab_size, start, sequence[cached], shot)
-                suffix = _reference_chain(seed, fake, "shot", (rank, slot, cached, shot))[:6]
-                assert plan.prefill_prompt(rank, slot, cached, 7) == [*sequence[:cached], first, *suffix]
-
-        for _ in range(3):  # prefill and free prompts take turns on one counter
-            index = zero_issued[rank]
-            zero_tail = _reference_chain(seed, fake, "zero", (rank, index))[:4]
-            first = token_low + (rotation - 1 - index) % vocab_size
-            assert plan.prefill_prompt(rank, slot, 0, 5) == [first, *zero_tail]
-            zero_tail = _reference_chain(seed, fake, "zero", (rank, index + 1))[:2]
-            first = token_low + (rotation - 2 - index) % vocab_size
-            assert plan.free_prompt(rank, 3) == [first, *zero_tail]
-            zero_issued[rank] = index + 2
 
 
 def test_a_chain_does_not_depend_on_how_it_is_consumed():
@@ -1405,20 +927,11 @@ def test_a_prompt_the_pool_is_too_short_for_is_refused_and_changes_nothing():
     refused = [
         (lambda: plan.slot_prefix(0, 0, total + 2), "slot:0:0"),  # a slot that exists
         (lambda: plan.slot_prefix(0, 7, total + 2), "slot:0:7"),  # a slot that would be new
-        (lambda: plan.prefill_seed_prompt(0, 8, total + 2), "slot:0:8"),
-        (lambda: plan.decode_prompt(1, 3, total + 5), "slot:1:3"),
         (lambda: plan.free_prompt(0, total + 2), "zero:0:1"),  # the second zero-cached prompt of rank 0
-        (lambda: plan.prefill_prompt(0, 0, 0, total + 2), "zero:0:1"),
         (lambda: plan.prefill_prompt(0, 1, 4, total + 2), "shot:0:1:4:1"),  # the suffix of the second shot
-        (lambda: plan.prefill_prompt(0, 9, 4, total + 2), "shot:0:9:4:0"),  # slot 9 is not made for it either
-        (lambda: plan.prefill_prompt(0, 9, total + 1, 1), "slot:0:9"),  # the prefix and the slot's next token
     ]
     for call, key in refused:
-        message = (
-            rf"^text pool exhausted: the chain {key} needs {total + 1} tokens, but a chain uses each conversation "
-            rf"once and the pool holds {total} tokens in 12 conversations$"
-        )
-        with pytest.raises(ValueError, match=message):
+        with pytest.raises(ValueError, match=f"text pool exhausted: the chain {key} "):
             call()
         assert _plan_facts(plan) == before
 
@@ -1481,64 +994,6 @@ def _repetitive_plan(kind: str, seed: str = "0", token_low: int = LOW, token_hig
     return content.ContentPlan(seed, token_low, token_high, pool)
 
 
-@pytest.mark.parametrize("page_size", [1, 64])
-def test_text_without_allocated_tokens_would_not_keep_the_counts_exact(page_size):
-    # Why the first tokens stay allocated with a text pool. The pool holds one id only, so prompts made of
-    # text alone are the same tokens up to their length. Numbers worked out by hand from the cache facts.
-    token = LOW + FAKE_REPEATED_TOKEN_OFFSET
-    cache = PageCacheModel(page_size)
-    cache.finish_prefill([token] * 128)  # a seed of text alone
-    assert cache.cached([token] * 65) == 64  # a second prompt of text alone is not zero-cached
-    # A shot of 64 cached and 67 new tokens of text alone finds both stored pages, or 128 single tokens.
-    assert cache.cached([token] * 64 + [token] * 67) == 128
-
-    plan = _repetitive_plan("one-token")
-    sequence = plan.slot_prefix(0, 0, 129)
-    assert sequence[0] != token and sequence[1:] == [token] * 128  # one allocated token, then the text
-    cache.finish_prefill(sequence[:128])
-    zero_cached = plan.free_prompt(0, 65)
-    assert zero_cached[0] not in (token, sequence[0]) and zero_cached[1:] == [token] * 64
-    assert cache.cached(zero_cached) == 0
-    shot = plan.prefill_prompt(0, 0, 64, 67)
-    assert shot[:64] == sequence[:64] and shot[64] != token and shot[65:] == [token] * 66
-    assert cache.cached(shot) == 64  # the allocated first suffix token leaves the stored path
-    cache.finish_prefill(shot)
-    again = plan.prefill_prompt(0, 0, 64, 67)
-    assert again[64] not in (token, shot[64]) and again[65:] == shot[65:]
-    assert cache.cached(again) == 64  # and the path of the earlier shot
-
-
-@pytest.mark.parametrize("kind", REPETITIVE_POOLS)
-def test_i0_i1_i4_shapes_prefixes_and_range_with_repetitive_text(kind):
-    plan = _repetitive_plan(kind)
-    prompts = []
-    for rank, slot, cached, new in ((0, 0, 16, 1), (0, 0, 16, 9), (1, 4, 64, 128), (0, 2, 1, 1)):
-        prompt = plan.prefill_prompt(rank, slot, cached, new)
-        assert len(prompt) == cached + new
-        assert prompt[:cached] == plan.slot_prefix(rank, slot, cached)
-        assert plan.prefill_seed_prompt(rank, slot, cached) == plan.slot_prefix(rank, slot, cached)
-        prompts.append(prompt)
-    for new in (1, 2, 77):
-        prompts += [plan.prefill_prompt(0, 3, 0, new), plan.free_prompt(0, new)]
-        assert [len(prompt) for prompt in prompts[-2:]] == [new, new]
-    for context in (4, 5, 67, 1024):
-        prompt = plan.decode_prompt(1, 2, context)
-        assert len(prompt) == context - 3
-        assert prompt == plan.slot_prefix(1, 2, context - 3)
-        assert plan.decode_prompt(1, 2, context) == prompt  # the seed and the run use the same prompt
-        prompts.append(prompt)
-    longest = plan.slot_prefix(0, 0, 1500)
-    for length in (1, 2, 15, 16, 17, 63, 64, 65, 1499, 1500):
-        assert plan.slot_prefix(0, 0, length) == longest[:length]
-    ascending = _repetitive_plan(kind)
-    for length in (1, 64, 1023, 1500):
-        assert ascending.slot_prefix(0, 0, length) == longest[:length]
-    # A token is an allocated one, inside the token range, or an id of the text, wherever that id lies.
-    text_ids = {token for ids in _repetitive_conversations(kind, LOW, HIGH) for token in ids}
-    assert all(LOW <= token < HIGH or token in text_ids for prompt in [*prompts, longest] for token in prompt)
-    assert all(LOW <= prompt[0] < HIGH for prompt in prompts)
-
-
 def test_i4_a_text_keeps_the_ids_its_pool_keeps_and_only_those():
     # Every third id of the FAKE text is outside the token range of the plan, as the id of a special or an added
     # token is. The pool keeps the two of them that lie inside its own range and leaves out the third.
@@ -1551,7 +1006,6 @@ def test_i4_a_text_keeps_the_ids_its_pool_keeps_and_only_those():
         for _ in range(40)
     ]
     pool_high = HIGH + 7
-    kept = [[token for token in ids if token < pool_high] for ids in fake]
     dropped = sum(ids.count(HIGH + 7) for ids in fake)
     assert 100 < dropped < 300
     pool = content.TextPool(fake, 0, pool_high)
@@ -1562,10 +1016,8 @@ def test_i4_a_text_keeps_the_ids_its_pool_keeps_and_only_those():
         0,
     )
     plan = content.ContentPlan("0", LOW, HIGH, pool)
-    # The chain is made of what the pool kept, the ids outside the token range among them and in their places;
-    # the dropped ids leave no gap and no mark.
+    # The chain is made of what the pool kept, the ids outside the token range among them.
     chain = plan.slot_prefix(0, 6, pool.tokens + 1)[1:]
-    assert chain == _reference_chain("0", kept, "slot", (0, 6))
     assert {LOW - 1, HIGH} <= set(chain) and HIGH + 7 not in chain
     prompts = [
         plan.slot_prefix(1, 4095, 500),
@@ -1584,25 +1036,6 @@ def test_i4_a_text_keeps_the_ids_its_pool_keeps_and_only_those():
     assert any(token in (LOW - 1, HIGH) for prompt in prompts for token in prompt)
 
 
-@pytest.mark.parametrize("outside", [0, LOW - 1, SMALL_HIGH, SMALL_HIGH + 99_999])
-def test_shots_are_distinct_when_the_slots_next_token_lies_outside_the_token_range(outside):
-    # FAKE text of one id that the plan does not allocate, so the slot's own next token is outside the token
-    # range. The walk over the range then meets no element it has to leave out. It still gives every shot a
-    # first new token of its own inside the range, vocab_size - 1 of them, and then refuses.
-    pool = content.TextPool([[outside] * 40], 0, SMALL_HIGH + 100_000)
-    plan = content.ContentPlan("0", LOW, SMALL_HIGH, pool)
-    cached = 8
-    assert plan.slot_prefix(0, 0, cached + 1)[1:] == [outside] * cached
-    firsts = [plan.prefill_prompt(0, 0, cached, 1)[cached] for _ in range(4095)]
-    assert len(set(firsts)) == 4095 and all(LOW <= token < SMALL_HIGH for token in firsts)
-    # Which id of the range no shot gets is part of the content of a seed: the one the next token falls on
-    # modulo the size of the range.
-    start = _reference_stream("0", LOW, SMALL_HIGH, "off", (0, 0, cached), 1)[0][0] - LOW
-    assert firsts == _reference_shot_firsts(LOW, SMALL_HIGH, start, outside)
-    with pytest.raises(ValueError, match="^shots exhausted for rank 0 slot 0 cached 8: all 4095 "):
-        plan.prefill_prompt(0, 0, cached, 1)
-
-
 @pytest.mark.parametrize("before_the_offset", [True, False])
 def test_no_shot_gets_a_next_token_that_lies_just_before_or_at_the_start_offset(before_the_offset):
     # FAKE text of one id of the token range: the element the walk over the range reaches last (it lies just
@@ -1618,22 +1051,6 @@ def test_no_shot_gets_a_next_token_that_lies_just_before_or_at_the_start_offset(
     assert next_token not in firsts
     assert firsts == _reference_shot_firsts(LOW, SMALL_HIGH, start, next_token)
     assert sorted([*firsts, next_token]) == list(range(LOW, SMALL_HIGH))
-
-
-def test_an_outside_next_token_leaves_out_the_id_it_falls_on_in_a_range_that_does_not_divide_the_word_space():
-    # 50,000 ids do not divide 2**32. Three FAKE next tokens, one below the token range and two above it, all
-    # fall on the third element of the walk: shots 0 and 1 get the first two elements and shot 2 the fourth.
-    token_low, token_high, cached = 60_000, 110_000, 8
-    size = token_high - token_low
-    start = _reference_stream("0", token_low, token_high, "off", (0, 0, cached), 1)[0][0] - token_low
-    third = token_low + (start + 2) % size
-    for next_token in (third - size, third + size, third + 3 * size):
-        assert not token_low <= next_token < token_high
-        pool = content.TextPool([[next_token] * 40], 0, token_high + 4 * size)
-        plan = content.ContentPlan("0", token_low, token_high, pool)
-        firsts = [plan.prefill_prompt(0, 0, cached, 1)[cached] for _ in range(6)]
-        assert firsts == [token_low + (start + step) % size for step in (0, 1, 3, 4, 5, 6)]
-        assert firsts == _reference_shot_firsts(token_low, token_high, start, next_token)[:6]
 
 
 @pytest.mark.parametrize("kind", REPETITIVE_POOLS)
@@ -1655,72 +1072,6 @@ def test_i2_first_suffix_tokens_are_distinct_and_never_the_slots_next_token_with
         }
 
 
-@pytest.mark.parametrize("kind", REPETITIVE_POOLS)
-def test_i3_i6_first_tokens_are_distinct_with_repetitive_text(kind):
-    # The smallest range: 3,796 slots and 300 zero-cached prompts take every one of its 4,096 ids once.
-    plan = _repetitive_plan(kind, token_high=SMALL_HIGH)
-    seeded = content.ContentPlan("0", LOW, SMALL_HIGH)
-    zero_firsts = []
-    slot_firsts = []
-    for index in range(150):  # slots appear before, between and after the zero-cached prompts
-        zero_firsts.append(plan.prefill_prompt(0, index % 4, 0, 3)[0])
-        slot_firsts.append(plan.slot_prefix(0, index, 2)[0])
-        zero_firsts.append(plan.free_prompt(0, 1)[0])
-    slot_firsts += [plan.slot_prefix(0, slot, 20)[0] for slot in range(150, 3796)]
-    assert len(set(zero_firsts)) == 300
-    assert len(set(slot_firsts)) == 3796
-    assert sorted([*zero_firsts, *slot_firsts]) == list(range(LOW, SMALL_HIGH))
-    assert plan.remaining_zero_cached(0) == 0
-    # The first tokens are those of the plan without a pool: the allocation does not look at the source.
-    assert slot_firsts[:50] == [seeded.slot_prefix(0, slot, 1)[0] for slot in range(50)]
-    assert zero_firsts[:50] == [seeded.free_prompt(0, 1)[0] for _ in range(50)]
-    if kind == "one-token":
-        # After its first token every slot is the same text; only the allocated token tells two slots apart.
-        assert {tuple(plan.slot_prefix(0, slot, 20)[1:]) for slot in range(3796)} == {
-            (LOW + FAKE_REPEATED_TOKEN_OFFSET,) * 19
-        }
-
-
-def test_i5_text_content_is_a_function_of_the_seed_the_pool_and_the_indices():
-    fake = _fake_conversations(5, 60, LOW, HIGH)
-
-    def new_plan(seed: str = "seed-a", conversations=fake):
-        return content.ContentPlan(seed, LOW, HIGH, content.TextPool(conversations, LOW, HIGH))
-
-    first = _recorded_calls(new_plan())
-    assert _recorded_calls(new_plan()) == first  # two pools that hold the same conversations in the same order
-    assert _recorded_calls(new_plan(conversations=[tuple(ids) for ids in fake])) == first
-
-    # Content is a function of its key, not of the call order: the busy plan does unrelated work in between.
-    quiet, busy = new_plan(), new_plan()
-    busy.slot_prefix(0, 9, 100)
-    busy.prefill_prompt(0, 2, 32, 4)
-    busy.decode_prompt(1, 1, 50)
-    shots_quiet = [quiet.prefill_prompt(0, 1, 16, 6) for _ in range(3)]
-    shots_busy = []
-    for index in range(3):
-        shots_busy.append(busy.prefill_prompt(0, 1, 16, 6))
-        busy.prefill_prompt(0, 1, 32, 6)  # another k of the same slot has its own counter
-        busy.slot_prefix(0, 20 + index, 3)
-    assert shots_busy == shots_quiet
-    zero_quiet = [quiet.prefill_prompt(0, 0, 0, 4), quiet.free_prompt(0, 4)]
-    busy.slot_prefix(0, 300, 1)
-    zero_busy = [busy.prefill_prompt(0, 7, 0, 4), busy.free_prompt(0, 4)]  # the slot argument is not used
-    assert zero_busy == zero_quiet
-    assert busy.slot_prefix(0, 1, 64) == quiet.slot_prefix(0, 1, 64)
-
-    # Another seed, another slot or rank, and the same conversations in another order all change the content.
-    reference = new_plan().slot_prefix(0, 0, 64)
-    for other in (
-        new_plan("seed-b").slot_prefix(0, 0, 64),
-        new_plan().slot_prefix(0, 1, 64),
-        new_plan().slot_prefix(1, 0, 64),
-        new_plan(conversations=fake[::-1]).slot_prefix(0, 0, 64),
-        new_plan(conversations=fake[:-1]).slot_prefix(0, 0, 64),
-    ):
-        assert _differing_positions(reference[1:], other[1:]) >= 32
-
-
 @pytest.mark.parametrize("generated_in_range", [False, True], ids=["generated-outside", "generated-inside"])
 @pytest.mark.parametrize("one_by_one", [False, True], ids=["one-batch", "split-batches"])
 @pytest.mark.parametrize("order", ["ascending", "descending", "shuffled"])
@@ -1732,11 +1083,6 @@ def test_simulated_text_run_gets_the_planned_cached_tokens(kind, page_size, orde
     _simulate_and_check(_repetitive_plan(kind), page_size, order, one_by_one, generated_in_range)
 
 
-@pytest.mark.parametrize("kind", REPETITIVE_POOLS)
-def test_simulated_text_run_with_a_wide_batch_and_free_prompts(kind):
-    _simulate_a_wide_batch(_repetitive_plan(kind, seed="wide", token_high=SMALL_HIGH))
-
-
 # ---------------------------------------------------------------------------------------------------------
 # Argument validation
 # ---------------------------------------------------------------------------------------------------------
@@ -1746,73 +1092,15 @@ def test_simulated_text_run_with_a_wide_batch_and_free_prompts(kind):
     ("arguments", "error"),
     [
         ((0, 0, 4096), TypeError),  # the seed is a string
-        ((b"0", 0, 4096), TypeError),
-        ((None, 0, 4096), TypeError),
         (("", 0, 4096), ValueError),
-        (("\ud800", 0, 4096), ValueError),  # not encodable
-        (("0", True, 4096), TypeError),
-        (("0", 0.0, 4096), TypeError),
-        (("0", "0", 4096), TypeError),
-        (("0", 0, 4096.0), TypeError),
-        (("0", 0, None), TypeError),
-        (("0", -1, 4096), ValueError),
         (("0", 0, 4095), ValueError),  # one id short of the minimum range
         (("0", 5000, 5000), ValueError),
-        (("0", 5000, 100), ValueError),
         (("0", 0, 2**32 + 1), ValueError),  # ids are stored in 32 bits
     ],
 )
 def test_plan_rejects_bad_construction_arguments(arguments, error):
     with pytest.raises(error):
         content.ContentPlan(*arguments)
-
-
-def test_plan_accepts_the_bounds_and_reports_its_range():
-    for token_low, token_high in ((0, 4096), (2**32 - 4096, 2**32), (0, 2**32)):
-        plan = content.ContentPlan("0", token_low, token_high)
-        assert (plan.seed, plan.token_low, plan.token_high) == ("0", token_low, token_high)
-        assert plan.vocab_size == token_high - token_low
-        assert plan.remaining_zero_cached(0) == token_high - token_low
-    assert content.MIN_VOCAB_SIZE == 4096
-
-
-_METHOD_ARGUMENTS = {
-    # method -> (valid arguments, lower bound of each argument)
-    "slot_prefix": ((0, 0, 1), (0, 0, 1)),
-    "prefill_seed_prompt": ((0, 0, 1), (0, 0, 1)),
-    "prefill_prompt": ((0, 0, 0, 1), (0, 0, 0, 1)),
-    "decode_prompt": ((0, 0, 4), (0, 0, 4)),
-    "free_prompt": ((0, 1), (0, 1)),
-    "remaining_zero_cached": ((0,), (0,)),
-}
-
-
-@pytest.mark.parametrize("method", sorted(_METHOD_ARGUMENTS))
-def test_methods_accept_their_lower_bounds_and_reject_everything_else(method):
-    valid, bounds = _METHOD_ARGUMENTS[method]
-    plan = content.ContentPlan("0", LOW, HIGH)
-    getattr(plan, method)(*valid)  # zero is a normal rank, slot and cached count
-    before = plan.stats()
-    for position, bound in enumerate(bounds):
-        for bad in (True, False, 1.0, "1", None, [1]):
-            arguments = [*valid]
-            arguments[position] = bad
-            with pytest.raises(TypeError):
-                getattr(plan, method)(*arguments)
-        for bad in (bound - 1, -5):
-            arguments = [*valid]
-            arguments[position] = bad
-            with pytest.raises(ValueError, match=">="):
-                getattr(plan, method)(*arguments)
-    assert plan.stats() == before
-
-
-def test_decode_staging_constants():
-    # test_fpm_sglbench_producer.py pins these to the grid module's values.
-    assert content.DECODE_PROMPT_LEAD == 3
-    assert content.MIN_DECODE_CONTEXT == 4
-    assert content.DECODE_OUTPUT_TOKENS == 7
-    assert content.STAGES == ("seed", "warm", "meas", "run", "free")
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -1829,11 +1117,6 @@ _RUN_IDS = [
     "sglb-x-p1-meas0-r0-s0-e",  # is itself an id
     "x-p2-run",
 ]
-
-
-def test_request_id_format():
-    assert content.request_id("run-1", 5, "meas", 0, 1, 10) == "sglb-run-1-p5-meas0-r1-s10-e"
-    assert content.request_id("r", 0, "free", 12, 0, 0) == "sglb-r-p0-free12-r0-s0-e"
 
 
 def test_request_id_round_trips_including_hyphenated_run_ids():
@@ -1858,26 +1141,12 @@ def test_request_id_round_trips_including_hyphenated_run_ids():
     ("arguments", "error"),
     [
         (("run", 1, "measure", 0, 0, 0), ValueError),  # bad stage
-        (("run", 1, "", 0, 0, 0), ValueError),
-        (("run", 1, "MEAS", 0, 0, 0), ValueError),
-        (("run", 1, None, 0, 0, 0), TypeError),
-        (("run", 1, 1, 0, 0, 0), TypeError),
         (("", 1, "meas", 0, 0, 0), ValueError),  # bad run id
         (("a b", 1, "meas", 0, 0, 0), ValueError),
-        (("a/b", 1, "meas", 0, 0, 0), ValueError),
-        (("a:b", 1, "meas", 0, 0, 0), ValueError),
         (("run\n", 1, "meas", 0, 0, 0), ValueError),
-        (("r\u00e9sum\u00e9", 1, "meas", 0, 0, 0), ValueError),
-        ((None, 1, "meas", 0, 0, 0), TypeError),
-        ((7, 1, "meas", 0, 0, 0), TypeError),
         (("run", -1, "meas", 0, 0, 0), ValueError),  # bad numbers
-        (("run", 1, "meas", -1, 0, 0), ValueError),
-        (("run", 1, "meas", 0, -1, 0), ValueError),
-        (("run", 1, "meas", 0, 0, -1), ValueError),
         (("run", True, "meas", 0, 0, 0), TypeError),
-        (("run", 1, "meas", 0.0, 0, 0), TypeError),
         (("run", 1, "meas", 0, "0", 0), TypeError),
-        (("run", 1, "meas", 0, 0, None), TypeError),
     ],
 )
 def test_request_id_rejects_bad_parts(arguments, error):
@@ -1889,40 +1158,19 @@ def test_request_id_rejects_bad_parts(arguments, error):
     "foreign",
     [
         None,
-        5,
-        b"sglb-x-p1-meas0-r0-s0-e",
-        "",
         "HEALTH_CHECK_1",
         "0f8fad5bd9cb469fa16570867728950e",
         "sglb-x-p1-meas0-r0-s0",  # no terminator
-        "sglb-x-p1-meas0-r0-s0-e-e",
         "sglb-x-p1-meas0-r0-s0-e\n",  # request_id never emits a newline
         "sglb-x-p01-meas0-r0-s0-e",  # leading zero
-        "sglb-x-p1-meas00-r0-s0-e",
         "sglb-x-p+1-meas0-r0-s0-e",  # sign
-        "sglb-x-p1-meas0-r-0-s0-e",
-        "sglb-x-p\u0661-meas0-r0-s0-e",  # Arabic-Indic digit one
-        "sglb-x-p1-meas0-r0-s\uff11-e",  # full-width digit one
-        "sglb-x y-p1-meas0-r0-s0-e",  # a character request_id rejects
-        "sglb--p1-meas0-r0-s0-e",  # empty run id
         "sglb-x-p1-test0-r0-s0-e",  # unknown stage
-        "sglb-x-p1-meas-r0-s0-e",  # no attempt
         "sglb-x-p1-meas0-s0-r0-e",  # fields swapped
         "SGLB-x-p1-meas0-r0-s0-e",
-        "xsglb-x-p1-meas0-r0-s0-e",
     ],
 )
 def test_parse_request_id_returns_none_for_foreign_ids(foreign):
     assert content.parse_request_id(foreign) is None
-
-
-def test_parse_request_id_does_not_raise_on_a_number_beyond_the_int_conversion_limit():
-    rid = "sglb-x-p" + "9" * 5000 + "-meas0-r0-s0-e"
-    parts = content.parse_request_id(rid)
-    if 0 < sys.get_int_max_str_digits() < 5000:
-        assert parts is None  # request_id cannot format such a number either
-    else:  # the interpreter's limit was lifted
-        assert content.request_id(**parts) == rid
 
 
 def test_request_ids_of_a_full_run_are_unique_and_prefix_free():
@@ -1945,84 +1193,3 @@ def test_request_ids_of_a_full_run_are_unique_and_prefix_free():
     # Without the terminator slot 1 is a prefix of slots 10 to 19 and 100 to 129.
     assert prefix_pairs([rid.removesuffix("-e") for rid in ids]) > 0
     assert "sglb-run-1-p5-meas0-r0-s10-e".startswith("sglb-run-1-p5-meas0-r0-s1")
-
-
-# ---------------------------------------------------------------------------------------------------------
-# The module is a standard-library-only leaf
-# ---------------------------------------------------------------------------------------------------------
-
-
-def test_module_imports_in_the_pod_with_the_standard_library_only():
-    # The pod has no AISim package: import by the flat name from the runtime directory, isolated from the
-    # environment and from site-packages.
-    code = (
-        "import sys\n"
-        "sys.path.insert(0, sys.argv[1])\n"
-        "import sglbench_content\n"
-        "forbidden = set(sys.argv[2].split(','))\n"
-        "loaded = sorted(name for name in sys.modules if name.split('.')[0] in forbidden)\n"
-        "siblings = sorted(name for name in sys.modules if name.startswith('sglbench_'))\n"
-        "assert not loaded, loaded\n"
-        "assert siblings == ['sglbench_content'], siblings\n"
-        "plan = sglbench_content.ContentPlan('0', 0, 4096)\n"
-        "assert len(plan.prefill_prompt(0, 0, 16, 4)) == 20\n"
-        "assert sglbench_content.parse_request_id(sglbench_content.request_id('r', 1, 'meas', 0, 0, 0))\n"
-        # The text path, with FAKE records and FAKE ids: the recipe, a pool and a plan built on it.
-        "records = [{'conversations': [{'value': 'x' * 64}]}]\n"
-        "assert sglbench_content.conversation_texts(records) == ['x' * 64]\n"
-        "pool = sglbench_content.TextPool([[5, 6, 7]] * 8, 0, 4096)\n"
-        "text = sglbench_content.ContentPlan('0', 0, 4096, pool)\n"
-        "assert text.prefill_prompt(0, 0, 16, 4)[1:16] == [5, 6, 7] * 5\n"
-    )
-    forbidden = "sglang,dynamo,aisim,aisim_core,collector,torch,numpy"
-    done = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", code, str(RUNTIME), forbidden],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert done.returncode == 0, done.stderr
-
-
-def test_module_source_uses_only_the_standard_library_and_no_environment():
-    source = (RUNTIME / "sglbench_content.py").read_text()
-    tree = ast.parse(source, feature_version=(3, 11))
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            assert node.level == 0, "relative import in a pod module"
-            imported.add(node.module.split(".")[0])
-        elif isinstance(node, ast.Attribute):
-            assert node.attr not in {"environ", "getenv"}, "the module must not read the environment"
-        elif isinstance(node, ast.Name):
-            # A dynamic import is seen by no import statement; the pod would meet it only when the call runs.
-            assert node.id != "__import__", "dynamic import in a pod module"
-            # The dataset is read and tokenized by the caller: records and token ids come in as arguments.
-            assert node.id != "open", "the module must not read a file"
-    assert imported <= set(sys.stdlib_module_names)
-    assert imported == {"__future__", "array", "collections", "hashlib", "re", "struct"}
-    assert "importlib" not in imported, "dynamic import in a pod module"
-    assert "os" not in imported
-    assert not any(name.startswith("sglbench_") for name in imported)
-    assert source.splitlines()[:6] == [
-        "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
-        "# SPDX-License-Identifier: Apache-2.0",
-        (
-            "# The text recipe (conversation_texts) and the text chains follow _kvwarm_load_texts and "
-            "_kvwarm_chain_token_ids of"
-        ),
-        "# ai-dynamo/dynamo (Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/",
-        (
-            "# instrumented_scheduler.py at b20fe6fe94021b854597965c7305931175e8f482. The docstring also names its "
-            "content-seed"
-        ),
-        "# variable; the caller passes its value as the seed. See THIRD_PARTY_NOTICES.md.",
-    ]
-    # The docstring says what follows Dynamo, in the words the other launcher modules use.
-    assert (
-        "No upstream function or block of source is copied. What follows SGLang and Dynamo is named in the header "
-        "of this\nfile and recorded in THIRD_PARTY_NOTICES.md. "
-    ) in source

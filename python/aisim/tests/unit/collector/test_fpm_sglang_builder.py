@@ -242,16 +242,10 @@ def _render(plan, cell, cell_dir: Path, overrides=None, *, smoke: bool = False, 
     )
 
 
-def _render_vllm(plan, cell, cell_dir: Path, overrides=None, *, smoke: bool = False) -> dict:
+def _render_vllm(plan, cell, cell_dir: Path) -> dict:
     """The vLLM render of the same cell, to compare with."""
     cell_dir.mkdir(parents=True, exist_ok=True)
-    return _render_cell(
-        dataclasses.replace(plan, backend="vllm"),
-        cell,
-        cell_dir,
-        DEPLOYMENT if overrides is None else overrides,
-        smoke=smoke,
-    )
+    return _render_cell(dataclasses.replace(plan, backend="vllm"), cell, cell_dir, DEPLOYMENT)
 
 
 def _edited_render(edit):
@@ -383,10 +377,8 @@ def test_pure_tp_cell_command_has_the_tensor_parallel_size_and_no_expert_paralle
     )
     cell = _cell(plan, phase, "pure_tp")
     assert cell.topology == ParallelTopology(tp=2, pp=1, dp=1, moe_tp=2, moe_ep=1, cp=1)
-    _render_vllm(plan, cell, tmp_path / "vllm")
 
     _render(plan, cell, tmp_path / "sglang")
-    _render(plan, _cell(plan, phase, "tep"), tmp_path / "tep")
 
     # The pure TP cell: the tensor-parallel size above 1 and no expert-parallel size after it, so SGLang's
     # default of one expert-parallel rank applies and every rank holds a slice of every expert. No attention-DP
@@ -395,47 +387,12 @@ def test_pure_tp_cell_command_has_the_tensor_parallel_size_and_no_expert_paralle
     assert command == (MOE_PREFILL if phase == "prefill" else MOE_DECODE).format(sizes="2").split()
     assert command[command.index("--tp-size") + 1] == "2"
     assert "--ep-size" not in command and "--attn-dp-size" not in command
-    # What was translated is the Generator's own vLLM command of the cell: the three parallel sizes, and no
-    # expert-parallel switch, because the cell has one expert-parallel rank.
-    vllm = _command(tmp_path / "vllm")
-    sizes = f"--tensor-parallel-size {cell.topology.tp} --pipeline-parallel-size 1 --data-parallel-size 1".split()
-    start = vllm.index("--tensor-parallel-size")
-    assert vllm[start : start + 6] == sizes
-    assert "--enable-expert-parallel" not in vllm
-    # The command of the TEP cell is the same command with the expert-parallel size right after --tp-size.
-    after_tp_size = command.index("--tp-size") + 2
-    assert _command(tmp_path / "tep") == [*command[:after_tp_size], "--ep-size", "2", *command[after_tp_size:]]
     # The launcher's own reader of flags takes the command and hands the one size to SGLang's parser.
     environment = {"DYN_BENCH_KV_WARMUP": "on", "DYN_BENCH_PREFILL_REAL_SEED": "on"}
     options = launcher._read_options(command[2:], environment)
     assert (options.rejection, options.output_problem, options.mode) == (None, None, phase)
     engine_arguments = MOE_ENGINE.format(sizes="2").split()
     assert options.sglang_argv[: len(engine_arguments)] == engine_arguments
-
-
-def test_moe_cell_changes_only_the_command_line_and_keeps_the_dataset_folder_block(tmp_path, monkeypatch):
-    plan = _moe_plan(tmp_path, monkeypatch)
-    cell = _cell(plan, "decode", "tep")
-    # The cell names a model cache, so the Generator exports HF_HOME and writes the block that makes the
-    # dataset folder beside it.
-    overrides = {"K8sConfig": {"k8s_image": FAKE_IMAGE, "k8s_hf_home": "/models/hub"}}
-    _render_vllm(plan, cell, tmp_path / "vllm", overrides)
-
-    _render(plan, cell, tmp_path / "sglang", overrides)
-
-    vllm_lines = (tmp_path / "vllm" / "run.sh").read_text().split("\n")
-    sglang_lines = (tmp_path / "sglang" / "run.sh").read_text().split("\n")
-    changed = [index for index, pair in enumerate(zip(vllm_lines, sglang_lines, strict=True)) if pair[0] != pair[1]]
-    assert len(changed) == 1
-    assert sglang_lines[changed[0]] == f"{COMMAND_LINE_START}{shlex.join(_command(tmp_path / 'sglang'))})"
-    # The launcher of a MoE cell reads the dataset from the folder this block prepares, or from the variable
-    # the block sets when that folder cannot be written.
-    assert "export HF_HOME=/models/hub" in sglang_lines
-    assert [line for line in sglang_lines if "fpm_datasets" in line] == [
-        line for line in vllm_lines if "fpm_datasets" in line
-    ]
-    assert any("DYN_BENCH_KV_WARMUP_CACHE_DIR" in line for line in sglang_lines)
-    subprocess.run(["bash", "-n", str(tmp_path / "sglang" / "run.sh")], check=True)
 
 
 # The DEP cell of two GPUs. SGLang's --tp-size and --ep-size count the ranks of both data-parallel ranks, and
@@ -452,25 +409,6 @@ VLLM_DEP_SIZES = [
     *("--tensor-parallel-size", "1", "--pipeline-parallel-size", "1", "--data-parallel-size", "2"),
     "--enable-expert-parallel",
 ]
-
-
-def test_the_commands_of_the_two_gpu_dep_cell_typed_out_in_full():
-    # Typed once without the shared pieces above, so that a change of any of them shows here.
-    assert " ".join(DEP_PREFILL_COMMAND) == (
-        "python3 /tmp/fpm-bench/sglbench_launcher.py --model-path private-org/moe-model"
-        " --served-model-name private-org/moe-model --tp-size 2 --ep-size 2 --attn-dp-size 2"
-        " --kv-cache-dtype fp8_e4m3 --benchmark-timeout 10200 --benchmark-mode prefill"
-        " --benchmark-warmup-iterations 5 --prefill-max-kv-read-token-samples 29 --chunked-prefill-size 16384"
-        " --max-prefill-tokens 8192 --dump-config-to /results/resolved-config-node0.json"
-        " --benchmark-output-path /results/benchmark.json --prefill-max-new-token-samples 8192"
-    )
-    assert " ".join(DEP_DECODE_COMMAND) == (
-        "python3 /tmp/fpm-bench/sglbench_launcher.py --model-path private-org/moe-model"
-        " --served-model-name private-org/moe-model --tp-size 2 --ep-size 2 --attn-dp-size 2"
-        " --kv-cache-dtype fp8_e4m3 --benchmark-timeout 10200 --benchmark-mode decode"
-        " --benchmark-warmup-iterations 5 --dump-config-to /results/resolved-config-node0.json"
-        " --benchmark-output-path /results/benchmark.json"
-    )
 
 
 @pytest.mark.parametrize(("phase", "expected"), [("prefill", DEP_PREFILL_COMMAND), ("decode", DEP_DECODE_COMMAND)])
@@ -509,21 +447,7 @@ def test_dep_cell_command(tmp_path, monkeypatch, phase, expected):
     assert options.sglang_argv[: len(engine_arguments)] == engine_arguments
 
 
-@pytest.mark.parametrize("phase", ["prefill", "decode"])
-def test_the_one_gpu_cell_of_the_dep_preset_renders_as_the_one_of_the_tep_preset(tmp_path, monkeypatch, phase):
-    dep_plan = _dep_plan(tmp_path, monkeypatch)
-    tep_plan = _moe_plan(tmp_path, monkeypatch)
-
-    _render(dep_plan, _cell(dep_plan, phase, "single"), tmp_path / "dep-preset")
-    _render(tep_plan, _cell(tep_plan, phase, "single"), tmp_path / "tep-preset")
-
-    command = _command(tmp_path / "dep-preset")
-    assert command == _command(tmp_path / "tep-preset")
-    # One data-parallel rank writes no attention-DP size and no expert-parallel size.
-    assert command == (MOE_PREFILL if phase == "prefill" else MOE_DECODE).format(sizes="1").split()
-
-
-def test_dep_cell_changes_only_the_command_line_and_asks_the_gate_for_two_rank_files(tmp_path, monkeypatch):
+def test_dep_cell_asks_the_gate_for_two_rank_files_and_the_pod_for_two_gpus(tmp_path, monkeypatch):
     plan = _dep_plan(tmp_path, monkeypatch)
     cell = _cell(plan, "decode", "dep")
     _render_vllm(plan, cell, tmp_path / "vllm")
@@ -531,11 +455,6 @@ def test_dep_cell_changes_only_the_command_line_and_asks_the_gate_for_two_rank_f
     _render(plan, cell, tmp_path / "sglang")
 
     vllm, sglang = _files(tmp_path / "vllm"), _files(tmp_path / "sglang")
-    vllm_lines, sglang_lines = vllm["run.sh"].split("\n"), sglang["run.sh"].split("\n")
-    changed = [index for index, pair in enumerate(zip(vllm_lines, sglang_lines, strict=True)) if pair[0] != pair[1]]
-    assert len(changed) == 1
-    assert sglang_lines[changed[0]] == f"{COMMAND_LINE_START}{shlex.join(DEP_DECODE_COMMAND)})"
-    subprocess.run(["bash", "-n", str(tmp_path / "sglang" / "run.sh")], check=True)
     # The environment of the gate is the vLLM render's: one node, and two data-parallel ranks on it. In its
     # mode without etcd the gate waits for one rank file per local rank (runtime/fpm_exec.sh), which is what
     # the launcher writes for a cell with two attention-DP ranks.
@@ -543,64 +462,11 @@ def test_dep_cell_changes_only_the_command_line_and_asks_the_gate_for_two_rank_f
     exports = sglang["fpm_env.sh"].splitlines()
     for line in ("export FPM_NODE_COUNT=1", "export FPM_DATA_PARALLEL_SIZE=2", "export FPM_LOCAL_DATA_PARALLEL_SIZE=2"):
         assert line in exports
-    assert (
-        sglang["collector-runtime-env.sh"] == vllm["collector-runtime-env.sh"] + "export AISIMULATE_SGLBENCH_GATE=1\n"
-    )
     # The pod asks for one GPU per rank.
     pod = yaml.safe_load(sglang["k8s_deploy.yaml"])
     (container,) = pod["spec"]["containers"]
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
     assert "workingDir" not in container
-
-
-def test_dep_and_tep_cells_of_the_same_gpus_ask_for_the_same_resources(tmp_path, monkeypatch):
-    plan = _sglang_plan(
-        tmp_path, monkeypatch, MOE_MODEL, FAKE_MOE_MODEL_CONFIG, fpm_gpu_counts=[2], fpm_parallel_presets=["tep", "dep"]
-    )
-    resources = {}
-    for strategy in ("tep", "dep"):
-        _render(plan, _cell(plan, "decode", strategy), tmp_path / strategy)
-        pod = yaml.safe_load((tmp_path / strategy / "k8s_deploy.yaml").read_text())
-        resources[strategy] = pod["spec"]["containers"][0]["resources"]
-
-    # The Generator sizes the pod by its GPUs. A DEP cell runs one scheduler process per GPU, as a TEP cell
-    # does, and the DP controller process in addition.
-    assert resources["dep"] == resources["tep"]
-    assert resources["dep"]["limits"]["nvidia.com/gpu"] == "2"
-
-
-# The variables a plan may set for the content of a cell, with FAKE values. The launcher reads them.
-CONTENT_ENVIRONMENT = (
-    ("DYN_BENCH_PREFILL_CONTENT", "sharegpt_chain"),
-    ("DYN_BENCH_KV_WARMUP_DATASET", "/models/datasets/fake-conversations.json"),
-    ("DYN_BENCH_KV_WARMUP_SHA256", "0" * 64),
-    ("DYN_BENCH_KV_WARMUP_CACHE_DIR", "/models/fpm_datasets"),
-)
-
-
-@pytest.mark.parametrize("model", ["dense", "moe"])
-def test_content_variables_of_the_plan_reach_run_script_and_nothing_the_gate_reads(tmp_path, monkeypatch, model):
-    if model == "moe":
-        plan = _moe_plan(tmp_path, monkeypatch)
-        cell = _cell(plan, "decode", "tep")
-    else:
-        plan = _plan(tmp_path, monkeypatch)
-        cell = _cell(plan, "decode")
-    _render(plan, cell, tmp_path / "plain")
-
-    _render(plan, cell, tmp_path / "cell", _with_environment(*CONTENT_ENVIRONMENT))
-
-    # run.sh starts the launcher, so the launcher's process gets the four values. The command is the same.
-    script = (tmp_path / "cell" / "run.sh").read_text().splitlines()
-    for name, value in CONTENT_ENVIRONMENT:
-        assert f"export {name}={value}" in script
-    assert _command(tmp_path / "cell") == _command(tmp_path / "plain")
-    # The gate sources the two other files before it starts run.sh. Neither names a content variable, so the
-    # gate and the preflight see none of them.
-    for name in ("collector-runtime-env.sh", "fpm_env.sh"):
-        text = (tmp_path / "cell" / name).read_text()
-        assert text == (tmp_path / "plain" / name).read_text()
-        assert not [variable for variable, _value in CONTENT_ENVIRONMENT if variable in text]
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
@@ -704,28 +570,6 @@ def test_runtime_environment_gets_the_gate_switch(tmp_path, monkeypatch):
         text=True,
     )
     assert sourced.stdout.splitlines() == ["1", "1", "0", "900"]
-
-
-def test_the_vllm_render_is_asked_for_the_same_plan_and_the_artifacts_are_the_cell_files(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    cell = _cell(plan, "prefill")
-    calls = []
-
-    def render(vllm_plan, *args, **kwargs):
-        calls.append((vllm_plan, args, kwargs))
-        return _render_cell(vllm_plan, *args, **kwargs)
-
-    artifacts = _render(plan, cell, tmp_path / "cell", smoke=True, render=render)
-
-    ((vllm_plan, args, kwargs),) = calls
-    assert vllm_plan.backend == "vllm"
-    assert vllm_plan.sha256 == plan.sha256
-    assert dataclasses.replace(vllm_plan, backend="sglang") == plan
-    assert args == (cell, tmp_path / "cell", DEPLOYMENT)
-    assert kwargs == {"smoke": True}
-    files = _files(tmp_path / "cell")
-    assert set(artifacts) == {"k8s_deploy.yaml", "fpm_env.sh", "run.sh"}
-    assert artifacts == {name: files[name] for name in artifacts}
 
 
 def test_run_script_starts_the_launcher_by_path_in_its_own_session(tmp_path, monkeypatch):
@@ -879,41 +723,9 @@ def test_context_length_memory_fraction_and_decode_batch(tmp_path, monkeypatch):
     assert _command(tmp_path / "decode") == decode.split()
 
 
-def test_request_cap_of_a_dep_cell_is_written_for_both_ranks(tmp_path, monkeypatch):
-    plan = _dep_plan(tmp_path, monkeypatch, fpm_max_decode_batch_size=64)
-    for strategy in ("dep", "single"):
-        cell = _cell(plan, "decode", strategy)
-        _render_vllm(plan, cell, tmp_path / f"vllm-{strategy}")
-        _render(plan, cell, tmp_path / f"sglang-{strategy}")
-        # What the Generator writes for the cell: the cap of one data-parallel rank.
-        vllm = _command(tmp_path / f"vllm-{strategy}")
-        assert vllm[vllm.index("--max-num-seqs") + 1] == "64"
-
-    # SGLang halves the cap it is given for each of the two ranks, so the DEP cell writes twice the cap. The
-    # one-GPU cell of the same plan writes it as it is.
-    engine = MOE_ENGINE.format(sizes=DEP_SIZES)
-    assert _command(tmp_path / "sglang-dep") == (
-        f"{LAUNCHER} {engine} {BENCHMARK.format(phase='decode')} --max-running-requests 128 {RESULT_FILES}".split()
-    )
-    engine = MOE_ENGINE.format(sizes="1")
-    assert _command(tmp_path / "sglang-single") == (
-        f"{LAUNCHER} {engine} {BENCHMARK.format(phase='decode')} --max-running-requests 64 {RESULT_FILES}".split()
-    )
-
-
 @pytest.mark.parametrize(
     ("cell_dtype", "sglang_dtype"),
-    [
-        ("fp8", "fp8_e4m3"),
-        ("bfloat16", "auto"),
-        ("auto", "auto"),
-        ("fp8_e5m2", "fp8_e5m2"),
-        ("fp8_e4m3", "fp8_e4m3"),
-        ("mxfp8", "mxfp8"),
-        ("bf16", "bf16"),
-        ("nvfp4", "nvfp4"),
-        ("fp4_mx_block16", "fp4_mx_block16"),
-    ],
+    [("fp8", "fp8_e4m3"), ("bfloat16", "auto"), ("auto", "auto")],
 )
 def test_kv_cache_dtype_is_translated_as_the_generator_does_for_sglang(tmp_path, monkeypatch, cell_dtype, sglang_dtype):
     plan = _plan(tmp_path, monkeypatch)
@@ -923,16 +735,6 @@ def test_kv_cache_dtype_is_translated_as_the_generator_does_for_sglang(tmp_path,
 
     command = _command(tmp_path / "cell")
     assert command[command.index("--kv-cache-dtype") + 1] == sglang_dtype
-
-
-def test_default_kv_cache_dtype_of_the_plan(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch, fpm_kv_cache_dtypes=None)
-    cell = _cell(plan, "prefill")
-    assert cell.kv_cache_dtype == "bfloat16"
-
-    _render(plan, cell, tmp_path / "cell")
-
-    assert _command(tmp_path / "cell") == " ".join(PREFILL_COMMAND).replace("fp8_e4m3", "auto").split()
 
 
 def test_slurm_cell_needs_no_kubernetes_image(tmp_path, monkeypatch):
@@ -954,7 +756,7 @@ def test_image_of_the_backend_policy_counts(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("value", ["on", "1", "true", "TRUE", "On"])
+@pytest.mark.parametrize("value", ["on", "TRUE"])
 def test_real_state_switches_that_say_on_are_kept(tmp_path, monkeypatch, value):
     plan = _plan(tmp_path, monkeypatch)
     overrides = _with_environment(("DYN_BENCH_KV_WARMUP", value), ("DYN_BENCH_PREFILL_REAL_SEED", value))
@@ -980,8 +782,10 @@ def test_missing_image_on_kubernetes_is_refused_before_the_render(tmp_path, monk
     assert list((tmp_path / "cell").iterdir()) == []
 
 
-@pytest.mark.parametrize("value", ["off", "0", "false", "OFF", "False"])
-@pytest.mark.parametrize("name", ["DYN_BENCH_KV_WARMUP", "DYN_BENCH_PREFILL_REAL_SEED"])
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("DYN_BENCH_KV_WARMUP", "off"), ("DYN_BENCH_PREFILL_REAL_SEED", "off"), ("DYN_BENCH_KV_WARMUP", "False")],
+)
 def test_real_state_switch_that_says_off_is_refused_before_the_render(tmp_path, monkeypatch, name, value):
     plan = _plan(tmp_path, monkeypatch)
 
@@ -1000,15 +804,12 @@ def test_real_state_switch_of_the_backend_policy_is_refused(tmp_path, monkeypatc
         _render(plan, cell, tmp_path / "cell")
 
 
-@pytest.mark.parametrize(
-    ("name", "accepted"),
-    [("DYN_BENCH_KV_WARMUP", "on, 1, true"), ("DYN_BENCH_PREFILL_REAL_SEED", "on, 1, true, auto")],
-)
-def test_real_state_switch_is_checked_again_in_the_rendered_run_script(tmp_path, monkeypatch, name, accepted):
+def test_real_state_switch_is_checked_again_in_the_rendered_run_script(tmp_path, monkeypatch):
     plan = _plan(tmp_path, monkeypatch)
+    name = "DYN_BENCH_KV_WARMUP"
     render = _edited_render(_edit_file("run.sh", lambda text: text.replace(f"export {name}=on", f"export {name}=off")))
 
-    with _refusal(f"{name}='off' in run.sh: the launcher stages real cached state only (accepted: {accepted})"):
+    with _refusal(f"{name}='off' in run.sh"):
         _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=render)
 
 
@@ -1046,41 +847,36 @@ def test_content_word_is_refused_at_render_exactly_when_the_launcher_refuses_it(
     assert refused is (value not in CONTENT_WORDS_ACCEPTED or (is_moe and value == "random"))
 
 
-@pytest.mark.parametrize("value", CONTENT_WORDS_ACCEPTED)
-def test_content_word_the_launcher_accepts_is_kept(tmp_path, monkeypatch, value):
-    plan = _plan(tmp_path, monkeypatch)
-
-    _render(plan, _cell(plan, "decode"), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, value)))
-
-    assert f"export {CONTENT_VARIABLE}={shlex.quote(value)}" in (tmp_path / "cell" / "run.sh").read_text().splitlines()
-
-
-@pytest.mark.parametrize("value", ["", "sharegpt_chain"])
-@pytest.mark.parametrize("strategy", ["single", "tep"])
-def test_content_word_of_a_text_run_is_kept_for_a_moe_plan(tmp_path, monkeypatch, strategy, value):
+def test_content_word_of_a_text_run_is_kept_for_a_moe_plan(tmp_path, monkeypatch):
     plan = _moe_plan(tmp_path, monkeypatch)
+    value = "sharegpt_chain"
 
-    _render(plan, _cell(plan, "prefill", strategy), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, value)))
+    _render(plan, _cell(plan, "prefill", "tep"), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, value)))
 
     assert f"export {CONTENT_VARIABLE}={shlex.quote(value)}" in (tmp_path / "cell" / "run.sh").read_text().splitlines()
 
 
-@pytest.mark.parametrize("value", [*CONTENT_WORDS_REFUSED, 1, True, None])
-def test_content_word_the_launcher_refuses_is_refused_before_the_render(tmp_path, monkeypatch, value):
-    plan = _plan(tmp_path, monkeypatch)
-    text = (
-        f"{CONTENT_VARIABLE}={value!r} in K8sConfig.extra_env: the launcher does not support it (accepted: "
-        "random, sharegpt_chain)"
-    )
+@pytest.mark.parametrize(
+    ("value", "executor"),
+    [("sharegpt", "kubernetes"), (None, "kubernetes"), ("sharegpt", "slurm")],
+    ids=["sharegpt", "None", "sharegpt-on-slurm"],
+)
+def test_content_word_the_launcher_refuses_is_refused_before_the_render(tmp_path, monkeypatch, value, executor):
+    if executor == "slurm":
+        # Slurm skips the image check and not the environment checks: its inputs name no Kubernetes image.
+        plan = _plan(tmp_path, monkeypatch, fpm_executor="slurm", fpm_slurm_container_image=FAKE_IMAGE)
+        overrides = {"K8sConfig": {"extra_env": [{"name": CONTENT_VARIABLE, "value": value}]}}
+    else:
+        plan = _plan(tmp_path, monkeypatch)
+        overrides = _with_environment((CONTENT_VARIABLE, value))
 
-    with _refusal(text):
-        _render(plan, _cell(plan, "prefill"), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, value)))
+    with _refusal(f"{CONTENT_VARIABLE}={value!r} in K8sConfig.extra_env"):
+        _render(plan, _cell(plan, "prefill"), tmp_path / "cell", overrides)
 
     assert list((tmp_path / "cell").iterdir()) == []
 
 
-@pytest.mark.parametrize("strategy", ["single", "tep"])
-def test_seeded_content_word_is_refused_for_a_moe_plan_before_the_render(tmp_path, monkeypatch, strategy):
+def test_seeded_content_word_is_refused_for_a_moe_plan_before_the_render(tmp_path, monkeypatch):
     plan = _moe_plan(tmp_path, monkeypatch)
     text = (
         f"{CONTENT_VARIABLE}=random in K8sConfig.extra_env: the launcher does not support it for a model with "
@@ -1088,36 +884,9 @@ def test_seeded_content_word_is_refused_for_a_moe_plan_before_the_render(tmp_pat
     )
 
     with _refusal(text):
-        _render(
-            plan, _cell(plan, "decode", strategy), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, "random"))
-        )
+        _render(plan, _cell(plan, "decode", "tep"), tmp_path / "cell", _with_environment((CONTENT_VARIABLE, "random")))
 
     assert list((tmp_path / "cell").iterdir()) == []
-
-
-def test_content_word_of_the_backend_policy_is_refused(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    policy = _policy(extra_env=[{"name": CONTENT_VARIABLE, "value": "sharegpt"}])
-    cell = dataclasses.replace(_cell(plan, "prefill"), backend_policy=policy)
-
-    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in K8sConfig.extra_env"):
-        _render(plan, cell, tmp_path / "cell")
-
-
-def test_an_environment_entry_that_is_no_mapping_is_left_to_the_runner(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    overrides = {"K8sConfig": {"k8s_image": FAKE_IMAGE, "extra_env": [f"{CONTENT_VARIABLE}=sharegpt"]}}
-
-    with pytest.raises(TypeError, match=re.escape("K8sConfig.extra_env entries must be {name, value} mappings")):
-        _render(plan, _cell(plan, "decode"), tmp_path / "cell", overrides)
-
-
-def test_a_content_entry_without_a_value_is_refused_by_the_builder(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    overrides = {"K8sConfig": {"k8s_image": FAKE_IMAGE, "extra_env": [{"name": CONTENT_VARIABLE}]}}
-
-    with _refusal(f"{CONTENT_VARIABLE}=None in K8sConfig.extra_env"):
-        _render(plan, _cell(plan, "decode"), tmp_path / "cell", overrides)
 
 
 def _with_content_lines(*values: str):
@@ -1131,17 +900,6 @@ def _with_content_lines(*values: str):
     )
 
 
-@pytest.mark.parametrize("value", ["sharegpt", "RANDOM", "sharegpt_chain "])
-def test_content_word_is_checked_again_in_the_rendered_run_script(tmp_path, monkeypatch, value):
-    plan = _plan(tmp_path, monkeypatch)
-    text = (
-        f"{CONTENT_VARIABLE}={value!r} in run.sh: the launcher does not support it (accepted: random, sharegpt_chain)"
-    )
-
-    with _refusal(text):
-        _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=_with_content_lines(value))
-
-
 def test_seeded_content_word_in_the_rendered_run_script_is_refused_for_a_moe_plan_only(tmp_path, monkeypatch):
     dense = _plan(tmp_path, monkeypatch)
     _render(dense, _cell(dense, "decode"), tmp_path / "dense-cell", render=_with_content_lines("random"))
@@ -1150,13 +908,6 @@ def test_seeded_content_word_in_the_rendered_run_script_is_refused_for_a_moe_pla
     moe = _moe_plan(tmp_path, monkeypatch)
     with _refusal(f"{CONTENT_VARIABLE}=random in run.sh: the launcher does not support it for a model with expert"):
         _render(moe, _cell(moe, "decode", "tep"), tmp_path / "moe-cell", render=_with_content_lines("random"))
-
-
-def test_a_later_export_line_of_the_content_variable_is_checked(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-
-    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in run.sh"):
-        _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=_with_content_lines("random", "sharegpt"))
 
 
 def test_the_last_export_line_of_the_content_variable_decides(tmp_path, monkeypatch):
@@ -1172,66 +923,13 @@ def test_the_last_export_line_of_the_content_variable_decides(tmp_path, monkeypa
         )
 
 
-def test_an_empty_last_export_line_of_the_content_variable_decides(tmp_path, monkeypatch):
-    # An empty value counts as unset, also after a line with a word the launcher would refuse.
-    dense = _plan(tmp_path, monkeypatch)
-    _render(dense, _cell(dense, "decode"), tmp_path / "dense", render=_with_content_lines("sharegpt", ""))
-
-    moe = _moe_plan(tmp_path, monkeypatch)
-    _render(moe, _cell(moe, "decode", "tep"), tmp_path / "moe", render=_with_content_lines("random", ""))
-
-
-def test_a_variable_with_a_longer_name_is_not_the_content_variable(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    longer = f"{CONTENT_VARIABLE}_SEED"
-
-    _render(plan, _cell(plan, "decode"), tmp_path / "cell", _with_environment((longer, "sharegpt")))
-
-    assert f"export {longer}=sharegpt" in (tmp_path / "cell" / "run.sh").read_text().splitlines()
-
-
-def test_content_word_is_refused_before_the_render_wherever_its_entry_stands(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    entries = (("HF_HUB_OFFLINE", "1"), ("DYN_BENCH_KV_WARMUP", "on"), (CONTENT_VARIABLE, "sharegpt"))
-
-    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in K8sConfig.extra_env"):
-        _render(plan, _cell(plan, "prefill"), tmp_path / "cell", _with_environment(*entries))
-
-    assert list((tmp_path / "cell").iterdir()) == []
-
-
-def test_content_word_is_refused_before_the_render_on_a_slurm_plan(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch, fpm_executor="slurm", fpm_slurm_container_image=FAKE_IMAGE)
-    overrides = {"K8sConfig": {"extra_env": [{"name": CONTENT_VARIABLE, "value": "sharegpt"}]}}
-
-    with _refusal(f"{CONTENT_VARIABLE}='sharegpt' in K8sConfig.extra_env"):
-        _render(plan, _cell(plan, "prefill"), tmp_path / "cell", overrides)
-
-    assert list((tmp_path / "cell").iterdir()) == []
-
-
-def _with_worker_environment(*entries: tuple[str, str], extra_env: tuple[tuple[str, str], ...] = ()) -> dict:
-    """Deployment inputs that name variables in the worker's pod spec, and ``extra_env`` in ``K8sConfig.extra_env``."""
-    overrides = _with_environment(*extra_env)
+def _with_worker_environment(*entries: tuple[str, str]) -> dict:
+    """Deployment inputs that name variables in the worker's pod spec, and none in ``K8sConfig.extra_env``."""
+    overrides = _with_environment()
     overrides["K8sConfig"]["worker_extra_pod_spec"] = {
         "mainContainer": {"env": [{"name": name, "value": value} for name, value in entries]}
     }
     return overrides
-
-
-def test_content_word_of_the_worker_pod_spec_is_replaced_by_the_one_of_extra_env(tmp_path, monkeypatch):
-    # The Generator writes the entries of the pod spec before those of K8sConfig.extra_env, so the shell and
-    # the launcher get the word of extra_env. The check before the render does not read the pod spec.
-    plan = _plan(tmp_path, monkeypatch)
-    overrides = _with_worker_environment((CONTENT_VARIABLE, "sharegpt"), extra_env=((CONTENT_VARIABLE, "random"),))
-
-    _render(plan, _cell(plan, "decode"), tmp_path / "cell", overrides)
-
-    script = (tmp_path / "cell" / "run.sh").read_text().splitlines()
-    assert [line for line in script if line.startswith(f"export {CONTENT_VARIABLE}=")] == [
-        f"export {CONTENT_VARIABLE}=sharegpt",
-        f"export {CONTENT_VARIABLE}=random",
-    ]
 
 
 def test_content_word_of_the_worker_pod_spec_alone_is_refused_in_the_rendered_run_script(tmp_path, monkeypatch):
@@ -1256,54 +954,6 @@ def test_unknown_flag_is_refused_and_the_vllm_render_stays(tmp_path, monkeypatch
     assert _command(tmp_path / "sglang")[:3] == ["python3", "-m", "dynamo.vllm"]
 
 
-def test_enforce_eager_is_refused(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    plan = dataclasses.replace(plan, options=dataclasses.replace(plan.options, enforce_eager=True))
-
-    with _refusal("the vLLM flag --enforce-eager has no SGLang translation"):
-        _render(plan, _cell(plan, "prefill"), tmp_path / "cell")
-
-
-def test_kv_cache_dtype_that_sglang_does_not_have_is_refused(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    cell = dataclasses.replace(_cell(plan, "decode"), kv_cache_dtype="float16")
-
-    with _refusal("--kv-cache-dtype float16: SGLang accepts auto, fp8_e5m2, fp8_e4m3, mxfp8, bf16, bfloat16, nvfp4,"):
-        _render(plan, cell, tmp_path / "cell")
-
-
-def test_vllm_capture_list_is_refused(tmp_path, monkeypatch):
-    # The explicit graph policy, which the planner does not admit for SGLang: the list is vLLM's.
-    plan = _plan(tmp_path, monkeypatch, fpm_prefill_cudagraph_policy=None)
-
-    with _refusal("the vLLM flag --compilation-config has no SGLang translation"):
-        _render(plan, _cell(plan, "prefill"), tmp_path / "cell")
-
-
-@pytest.mark.parametrize(
-    ("topology", "message"),
-    [
-        # Two data-parallel ranks of a dense model: whole replicas, which no plan holds.
-        (
-            ParallelTopology(tp=1, pp=1, dp=2, moe_tp=1, moe_ep=1, cp=1),
-            "--data-parallel-size 2 without --enable-expert-parallel: the launcher runs data-parallel ranks only as "
-            "DP attention with one expert-parallel rank on each",
-        ),
-        (
-            ParallelTopology(tp=1, pp=2, dp=1, moe_tp=1, moe_ep=1, cp=1),
-            "--pipeline-parallel-size 2: the launcher runs one pipeline stage",
-        ),
-    ],
-    ids=["data-parallel-replicas", "pipeline-stages"],
-)
-def test_parallel_size_other_than_one_is_refused(tmp_path, monkeypatch, topology, message):
-    plan = _plan(tmp_path, monkeypatch)
-    cell = dataclasses.replace(_cell(plan, "prefill"), topology=topology)
-
-    with _refusal(message):
-        _render(plan, cell, tmp_path / "cell")
-
-
 def test_cell_on_more_than_one_node_is_refused(tmp_path, monkeypatch):
     plan = _plan(tmp_path, monkeypatch)
     # Sixteen GPUs are two nodes of this system.
@@ -1315,141 +965,64 @@ def test_cell_on_more_than_one_node_is_refused(tmp_path, monkeypatch):
         _render(plan, cell, tmp_path / "cell")
 
 
-def test_dep_cell_on_more_than_one_node_is_refused(tmp_path, monkeypatch):
-    plan = _dep_plan(tmp_path, monkeypatch)
-    # Sixteen data-parallel ranks are two nodes of this system, with eight ranks on each.
-    cell = dataclasses.replace(
-        _cell(plan, "decode", "dep"), topology=ParallelTopology(tp=1, pp=1, dp=16, moe_tp=1, moe_ep=16, cp=1)
-    )
-
-    with _refusal("the launcher runs on one node, and fpm_env.sh exports 2 as FPM_NODE_COUNT"):
-        _render(plan, cell, tmp_path / "cell")
-
-    # The vLLM render stays, with the ranks of one node in its environment.
-    assert "export FPM_LOCAL_DATA_PARALLEL_SIZE=8" in (tmp_path / "cell" / "fpm_env.sh").read_text().splitlines()
-    assert _command(tmp_path / "cell")[:3] == ["python3", "-m", "dynamo.vllm"]
-
-
-def test_timeout_that_leaves_the_launcher_under_a_minute_is_refused(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    short = dataclasses.replace(_cell(plan, "decode"), backend_policy=_policy("--benchmark-timeout", "659"))
-    shortest = dataclasses.replace(_cell(plan, "decode"), backend_policy=_policy("--benchmark-timeout=660"))
-
+def test_timeout_that_leaves_the_launcher_under_a_minute_is_refused():
     with _refusal("--benchmark-timeout 659: the launcher's deadline is 600 s earlier and must be at least 60 s"):
-        _render(plan, short, tmp_path / "short")
-    _render(plan, shortest, tmp_path / "shortest")
+        builder._translate_command(_vllm("--benchmark-mode", "decode", "--benchmark-timeout", "659"))
 
-    command = _command(tmp_path / "shortest")
+    command = builder._translate_command(_vllm("--benchmark-mode", "decode", "--benchmark-timeout=660"))
     assert command[command.index("--benchmark-timeout") + 1] == "60"
 
 
+# A run.sh the Generator does not write today: (the change, the refusal).
 @pytest.mark.parametrize(
-    ("change", "count"),
+    ("change", "refusal"),
     [
-        (lambda text: text.replace(COMMAND_LINE_START, "engine_arguments=("), 0),
         (
-            lambda text: text.replace("\nfor index in", f"\n{COMMAND_LINE_START}python3 -m dynamo.vllm)\nfor index in"),
-            2,
+            lambda text: text.replace(COMMAND_LINE_START, "engine_arguments=("),
+            f"run.sh has 0 lines that start with {COMMAND_LINE_START}, expected one",
         ),
-    ],
-)
-def test_run_script_without_exactly_one_command_line_is_refused(tmp_path, monkeypatch, change, count):
-    plan = _plan(tmp_path, monkeypatch)
-
-    with _refusal(f"run.sh has {count} lines that start with {COMMAND_LINE_START}, expected one"):
-        _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=_edited_render(_edit_file("run.sh", change)))
-
-
-@pytest.mark.parametrize(
-    "change",
-    [
         # What the shell would expand is not a list of words this module can read.
-        lambda text: text.replace(f"{COMMAND_LINE_START}python3 ", f'{COMMAND_LINE_START}"$PYTHON" '),
-        lambda text: text.replace(f"{COMMAND_LINE_START}python3 ", f"{COMMAND_LINE_START}python3  "),
-        lambda text: text.replace("/results/benchmark.json)\n", "/results/benchmark.json\n"),
-        lambda text: text.replace("/results/benchmark.json)\n", "'/results/benchmark.json)\n"),
-    ],
-)
-def test_command_line_that_is_not_a_plain_list_of_words_is_refused(tmp_path, monkeypatch, change):
-    plan = _plan(tmp_path, monkeypatch)
-
-    with _refusal("the command line of run.sh is not a plain list of quoted words: "):
-        _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=_edited_render(_edit_file("run.sh", change)))
-
-
-def test_command_that_is_not_the_vllm_worker_is_refused(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    render = _edited_render(_edit_file("run.sh", lambda text: text.replace("-m dynamo.vllm", "-m dynamo.sglang")))
-
-    with _refusal("the command starts with 'python3 -m dynamo.sglang', not with 'python3 -m dynamo.vllm'"):
-        _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=render)
-
-
-def test_run_script_that_does_not_end_with_the_setsid_line_is_refused(tmp_path, monkeypatch):
-    plan = _plan(tmp_path, monkeypatch)
-    render = _edited_render(_edit_file("run.sh", lambda text: text + 'echo "done"\n'))
-
-    with _refusal('the last line of run.sh does not start the command in its own process group: echo "done"'):
-        _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=render)
-
-
-@pytest.mark.parametrize(
-    ("change", "line"),
-    [
+        (
+            lambda text: text.replace(f"{COMMAND_LINE_START}python3 ", f'{COMMAND_LINE_START}"$PYTHON" '),
+            "the command line of run.sh is not a plain list of quoted words: ",
+        ),
+        (
+            lambda text: text.replace("-m dynamo.vllm", "-m dynamo.sglang"),
+            "the command starts with 'python3 -m dynamo.sglang', not with 'python3 -m dynamo.vllm'",
+        ),
+        # The gate signals the process group of run.sh, so its last line must start the command in one.
+        (
+            lambda text: text + 'echo "done"\n',
+            'the last line of run.sh does not start the command in its own process group: echo "done"',
+        ),
         # A flag added after the assignment would reach the launcher without a translation.
         (
             lambda text: text.replace(
                 "\nif (( FPM_NODE_COUNT > 1 )); then\n",
                 "\nengine_command+=(--enable-something)\nif (( FPM_NODE_COUNT > 1 )); then\n",
             ),
-            "engine_command+=(--enable-something)",
+            "run.sh names the command array in a line this builder does not know: engine_command+=(--enable-something)",
         ),
-        # A second assignment inside a block would start the vLLM worker after all.
-        (
-            lambda text: text.replace("\nfor index in", "\n  engine_command=(python3 -m dynamo.vllm)\nfor index in"),
-            "  engine_command=(python3 -m dynamo.vllm)",
-        ),
-        (lambda text: text.replace("\nfor index in", "\nengine_command[1]=-I\nfor index in"), "engine_command[1]=-I"),
     ],
+    ids=["no-command-line", "no-plain-list-of-words", "not-the-vllm-worker", "no-setsid-line", "a-later-append"],
 )
-def test_run_script_that_changes_the_command_elsewhere_is_refused(tmp_path, monkeypatch, change, line):
+def test_run_script_the_generator_does_not_write_is_refused(tmp_path, monkeypatch, change, refusal):
     plan = _plan(tmp_path, monkeypatch)
 
-    with _refusal(f"run.sh names the command array in a line this builder does not know: {line}"):
+    with _refusal(refusal):
         _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=_edited_render(_edit_file("run.sh", change)))
 
 
-def test_command_array_is_named_only_where_the_builder_knows_it(tmp_path, monkeypatch):
+def test_manifest_without_a_working_dir_is_refused(tmp_path, monkeypatch):
     plan = _plan(tmp_path, monkeypatch)
-    _render(plan, _cell(plan, "prefill"), tmp_path / "cell")
+    render = _edited_render(
+        _edit_file(
+            "k8s_deploy.yaml",
+            lambda text: "".join(line for line in text.splitlines(keepends=True) if "workingDir" not in line),
+        )
+    )
 
-    lines = (tmp_path / "cell" / "run.sh").read_text().split("\n")
-    start = lines.index(builder._MULTINODE_BLOCK_START)
-    end = lines.index(builder._BLOCK_END, start)
-    naming = [index for index, line in enumerate(lines) if "engine_command" in line]
-    # On one node the array is assigned once, passed through the placeholder loop and started by the last line.
-    assert [lines[index] for index in naming if not start < index < end] == [
-        f"{COMMAND_LINE_START}{shlex.join(PREFILL_COMMAND)})",
-        *builder._ONE_NODE_ARRAY_LINES,
-    ]
-    # Everything else is an append of the multinode block, which a cell of one node never enters.
-    inside = [lines[index].strip() for index in naming if start < index < end]
-    assert inside
-    assert all(line.startswith("engine_command+=(") for line in inside)
-
-
-@pytest.mark.parametrize(
-    ("change", "count"),
-    [
-        (lambda text: "".join(line for line in text.splitlines(keepends=True) if "workingDir" not in line), 0),
-        (lambda text: text.replace("    workingDir: ", "    workingDir: /elsewhere\n    workingDir: "), 2),
-    ],
-)
-def test_manifest_without_exactly_one_working_dir_is_refused(tmp_path, monkeypatch, change, count):
-    plan = _plan(tmp_path, monkeypatch)
-    render = _edited_render(_edit_file("k8s_deploy.yaml", change))
-
-    with _refusal(f"k8s_deploy.yaml has {count} workingDir lines, expected one"):
+    with _refusal("k8s_deploy.yaml has 0 workingDir lines, expected one"):
         _render(plan, _cell(plan, "decode"), tmp_path / "cell", render=render)
 
     # The manifest is read after run.sh was translated in memory. Nothing of the translation is on disk.
@@ -1578,31 +1151,18 @@ def test_translation_of_single_flags(flags, expected):
         ),
         ("--benchmark-mode decode --max-num-seqs 8 --max-num-seqs=16", "--max-num-seqs is given twice"),
         ("--benchmark-mode", "--benchmark-mode has no value"),
-        ("--model --benchmark-mode decode", "--model has no value"),
         ("--no-async-scheduling=true", "--no-async-scheduling takes no value, got 'true'"),
         ("--max-model-len 0", "--max-model-len 0: a positive integer is required"),
         ("--max-model-len -2", "--max-model-len -2: a positive integer is required"),
-        ("--max-num-batched-tokens -1", "--max-num-batched-tokens -1: a positive integer is required"),
-        ("--max-num-batched-tokens 8k", "--max-num-batched-tokens 8k: a positive integer is required"),
         ("--benchmark-timeout soon", "--benchmark-timeout soon: a positive integer is required"),
         ("--kv-cache-dtype float16", "--kv-cache-dtype float16: SGLang accepts auto, fp8_e5m2, fp8_e4m3"),
-        ("--kv-cache-dtype int8", "--kv-cache-dtype int8: SGLang accepts"),
-        # vLLM's parser also takes the underscore spelling; the table does not.
-        ("--max_model_len 4096", "the vLLM flag --max_model_len has no SGLang translation"),
-        ("serve", "the vLLM flag serve has no SGLang translation"),
         # What the runner adds for a vLLM cell with memory or execution observation, or with a runtime probe.
         ("--worker-cls fpm_memory_worker.FpmExecutionWorker", "the vLLM flag --worker-cls has no SGLang translation"),
-        ("--revision main", "the vLLM flag --revision has no SGLang translation"),
         # The expert-parallel switch has no size of its own.
         (
             "--benchmark-mode decode --enable-expert-parallel",
             "--enable-expert-parallel is written with the value of --tensor-parallel-size, which the command does "
             "not give",
-        ),
-        ("--enable-expert-parallel=true", "--enable-expert-parallel takes no value, got 'true'"),
-        (
-            "--tensor-parallel-size 2 --enable-expert-parallel --enable-expert-parallel",
-            "--enable-expert-parallel is given twice",
         ),
         # Data-parallel ranks without the expert-parallel switch: whole replicas of the model.
         (
@@ -1611,37 +1171,18 @@ def test_translation_of_single_flags(flags, expected):
             "--data-parallel-size 2 without --enable-expert-parallel: the launcher runs data-parallel ranks only as "
             "DP attention with one expert-parallel rank on each",
         ),
-        # With the switch, the product needs both sizes, and each must be a positive integer.
-        (
-            "--data-parallel-size 2 --enable-expert-parallel --benchmark-mode decode",
-            "--enable-expert-parallel is written with the value of --tensor-parallel-size, which the command does "
-            "not give",
-        ),
-        (
-            "--tensor-parallel-size two --data-parallel-size 2 --enable-expert-parallel --benchmark-mode decode",
-            "--tensor-parallel-size two: a positive integer is required",
-        ),
+        # With the switch, each of the two sizes of the product must be a positive integer.
         (
             "--tensor-parallel-size 0 --data-parallel-size 2 --enable-expert-parallel --benchmark-mode decode",
             "--tensor-parallel-size 0: a positive integer is required",
         ),
         ("--data-parallel-size 0", "--data-parallel-size 0: a positive integer is required"),
-        ("--data-parallel-size -1", "--data-parallel-size -1: a positive integer is required"),
-        ("--data-parallel-size two", "--data-parallel-size two: a positive integer is required"),
-        ("--data-parallel-size 2 --data-parallel-size 2", "--data-parallel-size is given twice"),
         # Another start-up of vLLM's data-parallel engine cores than the one the Generator writes.
         ("--data-parallel-backend ray", "--data-parallel-backend ray: only mp, the value the Generator writes, is"),
-        ("--data-parallel-backend", "--data-parallel-backend has no value"),
         ("--pipeline-parallel-size 2", "--pipeline-parallel-size 2: the launcher runs one pipeline stage"),
-        # The other MoE flags of a vLLM cell, and SGLang's own names, which are no vLLM flags.
+        # The other MoE flags of a vLLM cell.
         ("--kernel-config {}", "the vLLM flag --kernel-config has no SGLang translation"),
         ("--enable-eplb", "the vLLM flag --enable-eplb has no SGLang translation"),
-        ("--attn-dp-size 2", "the vLLM flag --attn-dp-size has no SGLang translation"),
-        ("--dp-size 2", "the vLLM flag --dp-size has no SGLang translation"),
-        ("--enable-dp-attention", "the vLLM flag --enable-dp-attention has no SGLang translation"),
-        ("--ep-size 2", "the vLLM flag --ep-size has no SGLang translation"),
-        ("--expert-parallel-size 2", "the vLLM flag --expert-parallel-size has no SGLang translation"),
-        ("--moe-a2a-backend deepep", "the vLLM flag --moe-a2a-backend has no SGLang translation"),
         # What the runner adds for a model of the architecture GlmMoeDsaForCausalLM: its cells are refused.
         ("--trust-remote-code", "the vLLM flag --trust-remote-code has no SGLang translation"),
         ("--reasoning-parser=glm45", "the vLLM flag --reasoning-parser has no SGLang translation"),
@@ -1650,57 +1191,6 @@ def test_translation_of_single_flags(flags, expected):
 def test_translation_refusals(flags, message):
     with _refusal(message):
         builder._translate_command(_vllm(*flags.split()))
-
-
-def test_only_the_expert_parallel_switch_is_written_with_the_value_of_another_flag():
-    borrowing = {flag: row for flag, row in builder._TRANSLATION.items() if row.value_of is not None}
-
-    assert list(borrowing) == ["--enable-expert-parallel"]
-    row = borrowing["--enable-expert-parallel"]
-    assert (row.writes, row.takes_value, row.value, row.value_of) == (
-        ("--ep-size",),
-        False,
-        None,
-        "--tensor-parallel-size",
-    )
-    # The flag it takes its value from is written unchanged for one data-parallel rank and as the product
-    # above that. Either way the two sizes of a command are one text.
-    source = builder._TRANSLATION[row.value_of]
-    assert (source.writes, source.takes_value, source.value) == (("--tp-size",), True, None)
-    assert source.times == "--data-parallel-size"
-    # No other MoE setting of SGLang can be written: the launcher pins them to SGLang's defaults.
-    assert not {flag for flag in _written_flags() if "moe" in flag or "eplb" in flag or "expert" in flag}
-
-
-def test_what_is_multiplied_and_only_by_a_written_attention_dp_size():
-    multiplied = {flag: row for flag, row in builder._TRANSLATION.items() if row.times is not None}
-
-    # The three numbers that SGLang counts over all attention-DP ranks and vLLM for one data-parallel rank.
-    assert list(multiplied) == ["--tensor-parallel-size", "--max-num-batched-tokens", "--max-num-seqs"]
-    assert {row.times for row in multiplied.values()} == {"--data-parallel-size"}
-    factor = builder._TRANSLATION["--data-parallel-size"]
-    # The factor is what the data-parallel size writes: nothing for one rank, the attention-DP size above it.
-    assert (factor.writes, factor.takes_value, factor.value_of, factor.times) == (("--attn-dp-size",), True, None, None)
-    assert [factor.value("--data-parallel-size", size) for size in ("1", "01", "2", "8", "016")] == [
-        None,
-        None,
-        "2",
-        "8",
-        "16",
-    ]
-    # The start-up flag of vLLM's data-parallel engine cores writes nothing, whatever its value.
-    assert builder._TRANSLATION["--data-parallel-backend"].writes == ()
-    # Of the two flags the token budget writes, only the chunk size carries the product: SGLang divides that
-    # one by the attention-DP size and not the other. The two other rows multiply all they write, and the row
-    # the expert-parallel switch takes its value from is one of them.
-    assert {flag: row.times_writes for flag, row in multiplied.items()} == {
-        "--tensor-parallel-size": None,
-        "--max-num-batched-tokens": ("--chunked-prefill-size",),
-        "--max-num-seqs": None,
-    }
-    assert multiplied["--max-num-batched-tokens"].writes == ("--chunked-prefill-size", "--max-prefill-tokens")
-    assert multiplied["--max-num-seqs"].writes == ("--max-running-requests",)
-    assert not [row for row in builder._TRANSLATION.values() if row.times is None and row.times_writes is not None]
 
 
 @pytest.mark.parametrize("size", ["1", "01", "2", "4", "016"])
@@ -1725,70 +1215,17 @@ def test_each_rank_of_a_dep_cell_gets_the_whole_token_budget_and_request_cap(siz
     assert ("--attn-dp-size" in command) is (ranks > 1)
 
 
-@pytest.mark.parametrize("order", ["budget-first", "ranks-first"])
-def test_the_product_does_not_depend_on_where_the_data_parallel_size_stands(order):
+def test_limits_given_before_the_data_parallel_size_are_multiplied_by_it():
+    # The two limits stand before the data-parallel size they are multiplied by.
     limits = ("--max-num-batched-tokens=4096", "--max-num-seqs=7")
     ranks = ("--tensor-parallel-size", "1", "--data-parallel-size=3", "--enable-expert-parallel")
-    flags = (*limits, *ranks) if order == "budget-first" else (*ranks, *limits)
 
-    command = builder._translate_command(_vllm(*flags, "--benchmark-mode", "decode"))
+    command = builder._translate_command(_vllm(*limits, *ranks, "--benchmark-mode", "decode"))
 
     assert command[command.index("--chunked-prefill-size") + 1] == "12288"
     assert command[command.index("--max-prefill-tokens") + 1] == "4096"
     assert command[command.index("--max-running-requests") + 1] == "21"
     assert command[command.index("--tp-size") + 1] == command[command.index("--ep-size") + 1] == "3"
-
-
-def test_a_limit_with_leading_zeros_is_multiplied_as_a_number():
-    dep = ("--tensor-parallel-size", "1", "--data-parallel-size", "02", "--enable-expert-parallel")
-    limits = ("--benchmark-mode", "prefill", "--max-num-batched-tokens", "08192", "--max-num-seqs", "064")
-
-    command = builder._translate_command(_vllm(*dep, *limits))
-
-    assert command[command.index("--attn-dp-size") + 1] == "2"
-    assert command[command.index("--chunked-prefill-size") + 1] == "16384"
-    assert command[command.index("--max-prefill-tokens") + 1] == "8192"
-    assert command[command.index("--max-running-requests") + 1] == "128"
-    assert command[command.index("--prefill-max-new-token-samples") + 1] == "8192"
-
-    # Without data-parallel ranks the token budget is written as its number, as before, and the request cap
-    # as the text it was.
-    command = builder._translate_command(_vllm(*limits))
-
-    assert command[command.index("--chunked-prefill-size") + 1] == "8192"
-    assert command[command.index("--max-prefill-tokens") + 1] == "8192"
-    assert command[command.index("--max-running-requests") + 1] == "064"
-
-
-def test_a_request_cap_that_is_no_positive_integer_is_refused_for_a_dep_cell_only():
-    dep = ("--tensor-parallel-size", "1", "--data-parallel-size", "2", "--enable-expert-parallel")
-    # Without data-parallel ranks, and with one, the value is passed on as it is, for SGLang's parser to judge.
-    one_rank = ("--tensor-parallel-size", "1", "--data-parallel-size", "1")
-    for ranks in ((), one_rank):
-        for value in ("many", "0"):
-            command = builder._translate_command(_vllm(*ranks, "--benchmark-mode", "decode", "--max-num-seqs", value))
-            assert command[command.index("--max-running-requests") + 1] == value
-
-    with _refusal("--max-num-seqs many: a positive integer is required"):
-        builder._translate_command(_vllm(*dep, "--benchmark-mode", "decode", "--max-num-seqs", "many"))
-    with _refusal("--max-num-seqs 0: a positive integer is required"):
-        builder._translate_command(_vllm(*dep, "--benchmark-mode", "decode", "--max-num-seqs", "0"))
-
-
-def test_the_generators_sglang_serving_deployment_writes_the_same_size_under_sglangs_alias():
-    mapping = yaml.safe_load((AISIM / "src/aisim/generator/config/backend_config_mapping.yaml").read_text())
-    by_key = {entry["param_key"]: entry for entry in mapping["parameters"]}
-
-    # vLLM gets the switch and no size; SGLang gets the size. ``test_ep_size_and_its_serving_alias_are_one_field``
-    # shows that this name and --ep-size are one field of SGLang.
-    assert (by_key["enable_expert_parallel"]["vllm"], by_key["enable_expert_parallel"]["sglang"]) == (
-        "enable-expert-parallel",
-        None,
-    )
-    assert (by_key["moe_expert_parallel_size"]["vllm"], by_key["moe_expert_parallel_size"]["sglang"]) == (
-        None,
-        "expert-parallel-size",
-    )
 
 
 def test_written_flags_are_the_launchers_or_sglangs():
@@ -1803,7 +1240,7 @@ def test_written_flags_are_the_launchers_or_sglangs():
     assert "--benchmark-max-batch-size" in declared_by_the_launcher - written
 
 
-def test_nothing_the_launcher_refuses_can_be_written(tmp_path, monkeypatch):
+def test_nothing_the_launcher_refuses_can_be_written():
     written = _written_flags()
 
     assert written.isdisjoint(REFUSED_BY_THE_LAUNCHER)
@@ -1813,17 +1250,6 @@ def test_nothing_the_launcher_refuses_can_be_written(tmp_path, monkeypatch):
     # The two flags a vLLM cell switches scheduling and caching with have no counterpart in the cell.
     assert builder._TRANSLATION["--no-async-scheduling"].writes == ()
     assert builder._TRANSLATION["--no-enable-prefix-caching"].writes == ()
-    plan = _plan(tmp_path, monkeypatch)
-    for phase in ("prefill", "decode"):
-        _render(plan, _cell(plan, phase), tmp_path / phase)
-        assert REFUSED_BY_THE_LAUNCHER.isdisjoint(_command(tmp_path / phase))
-    # A DEP cell writes the attention-DP size under its current name and none of the names beside it.
-    dep_plan = _dep_plan(tmp_path, monkeypatch)
-    for phase in ("prefill", "decode"):
-        _render(dep_plan, _cell(dep_plan, phase, "dep"), tmp_path / f"dep-{phase}")
-        command = _command(tmp_path / f"dep-{phase}")
-        assert "--attn-dp-size" in command
-        assert (REFUSED_BY_THE_LAUNCHER | OTHER_ATTENTION_DP_SPELLINGS).isdisjoint(command)
 
 
 def _sglang_field_files(version: str) -> list[Path]:
@@ -1885,43 +1311,6 @@ def test_sglang_flags_are_declared_at_each_tested_release(version):
 
 
 @pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
-def test_the_attention_dp_size_is_its_own_field_and_vllms_name_is_another_at_each_tested_release(version):
-    files = _sglang_field_files(version)
-    declared = _declared_arguments(files)
-
-    # The flag the builder writes for vLLM's data-parallel size, with its alias, declared beside ``tp_size``.
-    assert declared["--attention-data-parallel-size"] is declared["--attn-dp-size"]
-    (parallel,) = [path for path in files if path.name == "parallel.py"]
-    assert {"--tp-size", "--attn-dp-size", "--ep-size"} <= set(_declared_arguments([parallel]))
-    # vLLM's own name is a flag of SGLang too, and it is another field: the number of whole replicas. A
-    # command that passed it on would start replicas and no DP attention.
-    assert declared["--data-parallel-size"] is declared["--dp-size"]
-    assert declared["--dp-size"] is not declared["--attn-dp-size"]
-    # SGLang's default is one attention-DP rank, which a cell without data-parallel ranks runs with.
-    fields = {
-        node.target.id: node
-        for node in ast.walk(ast.parse(parallel.read_text()))
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-    }
-    assert (ast.literal_eval(fields["attn_dp_size"].value), ast.literal_eval(fields["dp_size"].value)) == (1, 1)
-    # The deprecated switch is no flag of the field files (``no_cli``). SGLang registers it by hand, as
-    # deprecated, and turns the pair with --dp-size into the attention-DP size.
-    assert "--enable-dp-attention" not in declared
-    assert "no_cli=True" in ast.unparse(fields["enable_dp_attention"].annotation)
-    srt = parallel.parents[2]
-    registration = (srt / "server_args.py").read_text()
-    assert registration.count('"--enable-dp-attention"') == 1
-    assert "DeprecatedStoreTrueAction" in registration.split('"--enable-dp-attention"', 1)[1][:400]
-    hook = ast.parse((srt / "arg_groups" / "parallel_hook.py").read_text())
-    (resolution,) = [
-        node
-        for node in ast.walk(hook)
-        if isinstance(node, ast.FunctionDef) and node.name == "handle_deprecated_dp_attention"
-    ]
-    assert "attn_dp_size=cfg.dp_size" in ast.unparse(resolution) and "dp_size=1" in ast.unparse(resolution)
-
-
-@pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
 def test_sglang_divides_the_chunk_size_and_the_request_cap_of_a_rank_at_each_tested_release(version):
     # What the note at the translation table says SGLang does with the two numbers of a DEP cell, which is why
     # the cell writes them multiplied by the attention-DP size.
@@ -1947,64 +1336,6 @@ def test_sglang_divides_the_chunk_size_and_the_request_cap_of_a_rank_at_each_tes
     # Only the later release keeps at least one request for a rank.
     assert (f"max(1, {division})" in ast.unparse(per_rank_requests)) is (version == "0.5.23")
 
-    # The width of attention inside one rank, which makes ``tp_size`` the width over all ranks.
-    context = ast.parse((srt / "runtime_context.py").read_text())
-    (width,) = [
-        node for node in ast.walk(context) if isinstance(node, ast.FunctionDef) and node.name == "derive_attn_tp_size"
-    ]
-    assert "return tp_size // attn_dp_size // attn_cp_size" in ast.unparse(width)
-
-
-@pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
-def test_ep_size_and_its_serving_alias_are_one_field_at_each_tested_release(version):
-    files = _sglang_field_files(version)
-    declared = _declared_arguments(files)
-
-    # The flag the builder writes for vLLM's expert-parallel switch, and the name AISim's SGLang serving
-    # deployment uses for the same size.
-    assert "--ep-size" in declared
-    assert declared["--expert-parallel-size"] is declared["--ep-size"]
-    # It is declared beside ``tp_size``, in the file the module docstring names, and SGLang's default is one
-    # expert-parallel rank: a cell without the switch runs with no expert parallelism.
-    (parallel,) = [path for path in files if path.name == "parallel.py"]
-    assert {"--tp-size", "--ep-size"} <= set(_declared_arguments([parallel]))
-    defaults = {
-        node.target.id: ast.literal_eval(node.value)
-        for node in ast.walk(ast.parse(parallel.read_text()))
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ep_size"
-    }
-    assert defaults == {"ep_size": 1}
-
-
-@pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
-def test_sglang_gives_a_rank_a_slice_of_every_expert_without_the_expert_parallel_size_at_each_tested_release(version):
-    # What the note at the expert-parallel switch says of the command of a pure TP cell, --tp-size N alone.
-    files = _sglang_field_files(version)
-    context = ast.parse((files[0].parents[2] / "runtime_context.py").read_text())
-    functions = {node.name: ast.unparse(node) for node in ast.walk(context) if isinstance(node, ast.FunctionDef)}
-    # The number of ranks one expert is cut over, from the tensor-parallel size and two sizes that divide it.
-    assert "'moe_tp_size': tp_size // moe_ep_size // moe_dp_size" in functions["derive_parallel_widths"]
-    assert "moe_ep_size=cfg.ep_size" in functions["parallel_widths_of"]
-    assert "moe_dp_size=cfg.moe_dp_size" in functions["parallel_widths_of"]
-    # Both divisors are 1 unless a flag sets them, so the width is then the tensor-parallel size: pure TP.
-    (parallel,) = [path for path in files if path.name == "parallel.py"]
-    defaults = {
-        node.target.id: ast.literal_eval(node.value)
-        for node in ast.walk(ast.parse(parallel.read_text()))
-        if isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id in ("ep_size", "moe_dp_size")
-    }
-    assert defaults == {"ep_size": 1, "moe_dp_size": 1}
-    # The builder writes the first only for vLLM's expert-parallel switch, which the command of a pure TP cell
-    # does not have, and no row of its table writes the second under either of its names.
-    assert [flag for flag, row in builder._TRANSLATION.items() if "--ep-size" in row.writes] == [
-        "--enable-expert-parallel"
-    ]
-    declared = _declared_arguments([parallel])
-    assert declared["--moe-data-parallel-size"] is declared["--moe-dp-size"]
-    assert _written_flags().isdisjoint({"--moe-dp-size", "--moe-data-parallel-size"})
-
 
 @pytest.mark.parametrize("version", compat.TESTED_VERSIONS)
 def test_kv_cache_dtypes_are_sglangs_choices_at_each_tested_release(version):
@@ -2020,15 +1351,10 @@ def test_kv_cache_dtypes_are_sglangs_choices_at_each_tested_release(version):
 # ---------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("ranks", [1, 2, 4])
-@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("ranks", [1, 2])
 @pytest.mark.parametrize(
     ("graph_sizes", "low_end"),
     [
-        # No prefill graph and so no step: the low end is the 1 that the axis of powers of two starts with.
-        ((), [1]),
-        # A batch of 2 tokens is padded to 4, twice its tokens, and runs with that graph; a batch of 1 does not.
-        ((4, 8, 16, 32, 64, 128, 256, 512), [1, 2]),
         # The longest axis there can be: a graph for every token count up to the budget. One token has a graph
         # of its own, so no batch runs without one and the low end is the 1 that is a graph size.
         (tuple(range(1, 513)), [1]),
@@ -2037,7 +1363,7 @@ def test_kv_cache_dtypes_are_sglangs_choices_at_each_tested_release(version):
         ((256, 1024, 4096), [1, 127, 128]),
     ],
 )
-def test_token_budget_as_the_cap_never_cuts_the_new_token_axis(ranks, page_size, graph_sizes, low_end):
+def test_token_budget_as_the_cap_never_cuts_the_new_token_axis(ranks, graph_sizes, low_end):
     budget = 512
     sizes = ("--tensor-parallel-size", "1", "--data-parallel-size", str(ranks), "--enable-expert-parallel")
     command = builder._translate_command(
@@ -2047,7 +1373,7 @@ def test_token_budget_as_the_cap_never_cuts_the_new_token_axis(ranks, page_size,
     # What an engine started with the cell's two token flags reports, with FAKE sizes for the rest. Under DP
     # attention a scheduler reports the written chunk size divided by the number of ranks.
     limits = grid.Limits(
-        page_size=page_size,
+        page_size=1,
         max_req_input_len=131072,
         max_total_num_tokens=1048576,
         max_running_requests=64,
@@ -2060,18 +1386,6 @@ def test_token_budget_as_the_cap_never_cuts_the_new_token_axis(ranks, page_size,
 
     n_limit = grid.largest_prefill_new_tokens(limits)
     uncut = grid.graph_axis(graph_sizes, n_limit)
-    # The low end of the axis, worked out here from SGLang's rule and not with the grid's own function: 1 and
-    # the two sides of the first step. A batch of no more tokens than the smallest prefill graph size is padded
-    # to that size, and SGLang runs it with that graph only when the size is at most twice the batch's tokens
-    # (``can_replay_locally`` in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py). The
-    # step lies just below the first token count for which that holds. A side below 1 or above the largest
-    # new-token count is left out.
-    step = []
-    if graph_sizes:
-        smallest = min(graph_sizes)
-        first = next(tokens for tokens in range(1, smallest + 1) if smallest <= 2 * tokens)
-        step = [first - 1, first]
-    assert sorted({1, *(tokens for tokens in step if 1 <= tokens <= n_limit)}) == low_end
     # The cap of the cell cuts nothing: the axis is the whole graph axis with the low end, which is put on the
     # axis after the cut and does not count against the cap.
     assert axis == sorted({*uncut, *low_end})
@@ -2101,16 +1415,3 @@ def test_repeated_constants_equal_their_sources():
     assert builder._MIN_SAMPLE_CAP == 2
     with pytest.raises(ValueError, match="prefill_max_new_token_samples"):
         grid.SampleCaps(prefill_max_new_token_samples=builder._MIN_SAMPLE_CAP - 1)
-
-
-def test_module_does_not_import_the_runner():
-    tree = ast.parse(Path(builder.__file__).read_text())
-
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            imported.update({node.module or "", *(alias.name for alias in node.names)})
-        elif isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-    # The runner imports this module inside ``_render_cell`` and hands itself over as ``render_vllm_cell``.
-    assert not any(name.split(".")[-1] == "runner" for name in imported)

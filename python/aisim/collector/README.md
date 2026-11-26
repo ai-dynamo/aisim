@@ -1002,11 +1002,12 @@ comparison accepted the files of five smoke cells of `Qwen/Qwen3-0.6B` on
 H200 GPUs: with SGLang 0.5.23 two prefill cells on one GPU and one at a
 tensor-parallel size of 2, and with SGLang 0.5.22 two decode cells on one
 GPU. Called by hand on those files, it refused the files of the one-GPU
-cell for the cell of two GPUs and the reverse. A tensor-parallel size above
-2, a `producer.moe` block under this comparison and a refusal inside a
-collection have run in the unit tests only: on result files that were typed
-in, and on the files the launcher writes when the tests put a stand-in in
-the place of SGLang.
+cell for the cell of two GPUs and the reverse. A `producer.moe` block under
+this comparison and a refusal inside a collection have run in the unit tests
+only: on result files that were typed in, and on the files the launcher
+writes when the tests put a stand-in in the place of SGLang. A
+tensor-parallel size above 2 has run neither on an engine nor in the unit
+tests.
 
 A cell of a dense model has the same cell id and the same row labels whether
 it sent dataset text or seeded token ids: apart from the measured times, only

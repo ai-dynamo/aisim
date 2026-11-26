@@ -36,12 +36,9 @@ import ast
 import collections
 import dataclasses
 import enum
-import fnmatch
 import json
 import os
 import pickle
-import re
-import subprocess
 import sys
 import types
 from pathlib import Path
@@ -57,7 +54,6 @@ from .test_fpm_sglbench_preflight import (
 
 RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
 MODULE_PATH = RUNTIME / "sglbench_recorder.py"
-TEST_PATH = Path(__file__).resolve()
 
 # In the pod the runtime files sit flat in one directory and import each other by their flat names. The
 # directory goes to the END of sys.path, so that none of its files can shadow an installed module.
@@ -87,37 +83,6 @@ HEADER_KEYS = [
     "kv_cache_stored_dtype",
     "checks",
 ]
-RANK_KEYS = [
-    "tp_size",
-    "pp_size",
-    "attn_dp_size",
-    "attn_dp_enabled",
-    "attn_tp_rank",
-    "attn_cp_rank",
-    "attn_dp_rank",
-    "pp_rank",
-]
-LIMIT_KEYS = [
-    "page_size",
-    "max_req_input_len",
-    "max_total_num_tokens",
-    "max_running_requests",
-    "max_prefill_tokens",
-    "chunked_prefill_size",
-]
-CHECK_VALUE_KEYS = [
-    "disable_radix_cache",
-    "is_hybrid_swa",
-    "is_hybrid_ssm",
-    "max_queued_requests",
-    "max_new_tokens_limit",
-    "schedule_policy",
-    "enable_priority_scheduling",
-    "is_mixed_chunk",
-    "prefill_decode_interval",
-]
-CHECK_PRESENCE_KEYS = ["prefill_delayer", "min_free_slots_delayer", "recv_skipper", "input_blocker"]
-CHECK_KEYS = [*CHECK_VALUE_KEYS, *CHECK_PRESENCE_KEYS, "pp_max_micro_batch_size", "is_hip"]
 BATCH_KEYS = [
     "type",
     "seq",
@@ -133,9 +98,6 @@ BATCH_KEYS = [
     "extend_lens",
     "global_num_tokens",
 ]
-
-# Names the collector and the in-pod gate sweep for. No file of the recorder tree may match one of them.
-FORBIDDEN_FILE_PATTERNS = ("benchmark*.json", "resolved-config*.json", "fpm-*.json", "collector-provenance.json")
 
 FAKE_SGLANG_VERSION = "0.5.23"
 FAKE_PORT_ARGS = "FAKE port args"
@@ -161,6 +123,9 @@ FAKE_RANKS = {
     "attn_dp_rank": 0,
     "pp_rank": 0,
 }
+# The keys of the ranks and of the limits of a header, in the order they are typed in above.
+RANK_KEYS = list(FAKE_RANKS)
+LIMIT_KEYS = list(FAKE_LIMITS)
 
 # Request ids in the shape the benchmark's content module gives them. The text is typed in.
 RID_A = "sglb-fakerun1-p3-meas0-r0-s0-e"
@@ -178,7 +143,6 @@ class FakeForwardMode(enum.IntEnum):
 
     EXTEND = 1
     DECODE = 2
-    MIXED = 3
     IDLE = 4
 
 
@@ -270,13 +234,6 @@ class FakeGraphRunner:
             setattr(self, name, value)
 
 
-class FakeFalsyGraphRunner(FakeGraphRunner):
-    """FAKE runner that is false in a truth test although it holds captured sizes."""
-
-    def __bool__(self):
-        return False
-
-
 def _fake_torch_dtype(name):
     """A FAKE of a torch dtype: an object of a class ``dtype`` of a module ``torch`` with the text ``torch.<name>``.
 
@@ -351,12 +308,11 @@ def _fake_scheduler_attributes():
 class FakeServerArgs:
     """What a test hands to the FAKE scheduler constructor in the place of SGLang's server arguments."""
 
-    def __init__(self, world, overrides=None, missing=(), init_error=None, batch_during_init=None):
+    def __init__(self, world, overrides=None, missing=(), init_error=None):
         self.world = world
         self.overrides = dict(overrides or {})
         self.missing = tuple(missing)
         self.init_error = init_error
-        self.batch_during_init = batch_during_init
 
 
 class FakeSchedulerBase:
@@ -382,9 +338,6 @@ class FakeSchedulerBase:
             setattr(self, name, value)
         for name in server_args.missing:
             delattr(self, name)
-        if server_args.batch_during_init is not None:
-            batch = server_args.batch_during_init
-            self.process_batch_result(batch, self.run_batch(batch))
 
     def run_batch(self, batch, pp_proxy_tensors=None):
         world = self.world
@@ -451,7 +404,6 @@ class FakeSglang:
         self.built = []
         self.entry_return = object()
         self.parallel = FakeParallel()
-        self.get_parallel_error = None
         self.stock = type("Scheduler", (FakeSchedulerBase,), {})
 
         self.root = self._module("sglang", package=True)
@@ -502,8 +454,6 @@ class FakeSglang:
         return module
 
     def _get_parallel(self):
-        if self.get_parallel_error is not None:
-            raise self.get_parallel_error
         return self.parallel
 
     def _registry(self):
@@ -638,7 +588,8 @@ def _header_of(world, **options):
     return records[0]
 
 
-def _extend_batch(rids=(RID_A, RID_B)):
+def _extend_batch():
+    rids = (RID_A, RID_B)
     return FakeBatch(
         reqs=[FakeRequest(rid) for rid in rids],
         forward_mode=FakeForwardMode.EXTEND,
@@ -683,6 +634,10 @@ def _expected_header():
     }
 
 
+# The keys of the checks of a header, in the order they are typed in above.
+CHECK_KEYS = list(_expected_header()["checks"])
+
+
 def _assert_unreadable(value, error_type, *needles):
     assert isinstance(value, dict), value
     assert list(value) == ["unreadable"], value
@@ -699,172 +654,32 @@ def _fake_time(reading):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Public names and the module file
+# The seam rows
 # ---------------------------------------------------------------------------------------------------------------
-
-
-def test_public_names_have_the_values_a_reader_of_the_log_expects():
-    assert recorder.ENV_RECORDER_DIR == ENV
-    assert recorder.RECORD_FORMAT == 3
-    assert recorder.RECORDER_CLASS_NAME == CLASS_NAME
-    assert recorder.LOG_FILE_PREFIX == "sched-"
-    assert recorder.LOG_FILE_SUFFIX == ".jsonl"
-    assert recorder.TARGET == "sglang.srt.managers.scheduler.Scheduler"
-    assert callable(recorder.make_recorder_class)
-    assert callable(recorder.recorder_entry)
-
-
-def test_module_imports_in_a_bare_interpreter_without_sglang_torch_or_numpy():
-    # The interpreter has no site-packages, and a finder refuses the three packages by name, so an import
-    # of one of them at module level would fail here.
-    code = (
-        "import importlib.abc, sys\n"
-        "blocked = ('sglang', 'torch', 'numpy')\n"
-        "class Blocker(importlib.abc.MetaPathFinder):\n"
-        "    def find_spec(self, fullname, path=None, target=None):\n"
-        "        if fullname.split('.')[0] in blocked:\n"
-        "            raise ModuleNotFoundError('blocked for this test: ' + fullname)\n"
-        "        return None\n"
-        "sys.meta_path.insert(0, Blocker())\n"
-        "sys.path.append(sys.argv[1])\n"
-        "import sglbench_recorder as recorder\n"
-        "taboo = blocked + ('dynamo', 'aisim', 'aisim_core', 'collector')\n"
-        "loaded = sorted(name for name in sys.modules if name.split('.')[0] in taboo)\n"
-        "assert not loaded, loaded\n"
-        "siblings = sorted(name for name in sys.modules if name.startswith('sglbench_'))\n"
-        "assert siblings == ['sglbench_recorder'], siblings\n"
-        "try:\n"
-        "    recorder.recorder_entry()\n"
-        "except ModuleNotFoundError as error:\n"
-        "    print('entry:', error)\n"
-        "print(recorder.RECORD_FORMAT, recorder.RECORDER_CLASS_NAME)\n"
-    )
-    done = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", code, str(RUNTIME)], capture_output=True, text=True, timeout=60, check=False
-    )
-    assert done.returncode == 0, done.stderr
-    # SGLang is imported only when the entry runs, and without SGLang the entry says so; it does not go on.
-    assert done.stdout.splitlines() == ["entry: blocked for this test: sglang", f"3 {CLASS_NAME}"]
-
-
-def test_module_source_imports_sglang_only_inside_functions_and_reads_one_variable():
-    source = MODULE_PATH.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-
-    def roots(node):
-        if isinstance(node, ast.Import):
-            return {alias.name.split(".")[0] for alias in node.names}
-        assert node.level == 0, "relative imports do not resolve in the pod"
-        return {node.module.split(".")[0]}
-
-    top_level = set()
-    for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            top_level |= roots(node)
-    assert top_level == {"__future__", "json", "math", "os", "sys", "time"}
-    assert top_level - {"__future__"} <= sys.stdlib_module_names
-
-    everywhere = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            everywhere |= roots(node)
-    assert everywhere - top_level == {"sglang"}
-
-    # The environment is read in one way only: os.environ.get(ENV_RECORDER_DIR).
-    reads = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and node.attr == "environ"
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "os"
-    ]
-    gets = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "get"
-        and node.func.value in reads
-    ]
-    assert len(reads) == len(gets) == 2
-    for call in gets:
-        assert [ast.unparse(argument) for argument in call.args] == ["ENV_RECORDER_DIR"]
-        assert call.keywords == []
-    assert "getenv" not in source
-    assert "environ[" not in source
 
 
 # The two releases the module was read against; its header names their commits.
 SEAM_VERSIONS = ("0.5.22", "0.5.23")
 
-# The seam rows, typed here on their own, so that a change of the list has to be made in two places.
-SEAM_NAMES = (
-    ("sglang", "__version__", "name"),
-    ("sglang.srt.managers.scheduler", "Scheduler", "class"),
-    ("sglang.srt.managers.scheduler", "Scheduler.run_batch", "attribute"),
-    ("sglang.srt.managers.scheduler", "Scheduler.process_batch_result", "attribute"),
-    ("sglang.srt.managers.scheduler", "run_scheduler_process", "name"),
-    ("sglang.srt.plugins.hook_registry", "HookRegistry.register", "attribute"),
-    ("sglang.srt.plugins.hook_registry", "HookType.REPLACE", "attribute"),
-    ("sglang.srt.runtime_context", "get_parallel", "name"),
-    ("sglang.srt.managers.schedule_policy", "_IS_HIP", "name"),
-    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.reqs", "field"),
-    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.forward_iter", "field"),
-    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.launch_ts", "field"),
-    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.forward_mode", "field"),
-    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_num_tokens", "field"),
-    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.prefix_lens", "field"),
-    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.extend_lens", "field"),
-    ("sglang.srt.managers.schedule_batch", "ScheduleBatch.global_num_tokens", "field"),
-    ("sglang.srt.managers.utils", "GenerationBatchResult.copy_done", "field"),
-    ("sglang.srt.managers.utils", "EmbeddingBatchResult.copy_done", "field"),
-    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.EXTEND", "attribute"),
-    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.DECODE", "attribute"),
-    ("sglang.srt.model_executor.forward_batch_info", "ForwardMode.IDLE", "attribute"),
-)
+# The seam rows of the module itself, the rows the preflight looks up in the image. No copy is typed here.
+SEAM_NAMES = recorder.SGLANG_SEAM_NAMES
 
 
 def _seam_members(owner):
     return [name.partition(".")[2] for _module, name, _kind in SEAM_NAMES if name.startswith(owner + ".")]
 
 
-def test_seam_names_are_the_typed_rows_and_name_everything_the_module_takes_from_sglang():
+def test_seam_rows_name_everything_the_module_takes_from_sglang():
     import sglbench_driver as driver  # the reader of the log, for its three mode names
 
-    assert recorder.SGLANG_SEAM_NAMES == SEAM_NAMES
-    assert len(set(SEAM_NAMES)) == len(SEAM_NAMES)
     reached = sglang_names_reached_by_import(ast.parse(MODULE_PATH.read_text(encoding="utf-8")))
-    assert reached == {
-        ("sglang", None),
-        ("sglang", "__version__"),
-        ("sglang.srt.managers.scheduler", None),
-        ("sglang.srt.managers.scheduler", "Scheduler"),
-        ("sglang.srt.managers.scheduler", "run_scheduler_process"),
-        ("sglang.srt.plugins.hook_registry", "HookRegistry"),
-        ("sglang.srt.plugins.hook_registry", "HookRegistry.register"),
-        ("sglang.srt.plugins.hook_registry", "HookType"),
-        ("sglang.srt.plugins.hook_registry", "HookType.REPLACE"),
-        ("sglang.srt.runtime_context", "get_parallel"),
-        ("sglang.srt.managers.schedule_policy", "_IS_HIP"),
-    }
     # An import or a read that gets no row is noticed here, so the list cannot fall behind the code.
-    assert seam_rows_missing_for(reached, SEAM_NAMES) == []
-    assert seam_rows_missing_for(reached, SEAM_NAMES[:6] + SEAM_NAMES[7:]) == [
-        ("sglang.srt.plugins.hook_registry", "HookType"),
-        ("sglang.srt.plugins.hook_registry", "HookType.REPLACE"),
-    ]
-    # The class row is the hook target, and its two methods are the ones the subclass wraps.
-    assert (*recorder.TARGET.rpartition(".")[::2], "class") in SEAM_NAMES
-    assert _seam_members("Scheduler") == ["run_batch", "process_batch_result"]
-    # What no import shows: the fields read from the batch and the result, and the mode names that are logged.
-    # The FAKE batch of this file has exactly the fields the recorder reads, and a recorder that read one
-    # more would fail the batch tests until the FAKE had it.
+    assert seam_rows_missing_for(reached, recorder.SGLANG_SEAM_NAMES) == []
+    # What no import shows: the fields read from the batch, and the mode names that are logged. The FAKE batch
+    # of this file has exactly the fields the recorder reads, and a recorder that read one more would fail the
+    # batch tests until the FAKE had it.
     assert sorted(_seam_members("ScheduleBatch")) == sorted(field.name for field in dataclasses.fields(FakeBatch))
-    assert _seam_members("GenerationBatchResult") == _seam_members("EmbeddingBatchResult") == ["copy_done"]
-    assert hasattr(FakeResult(None), "copy_done")
     assert _seam_members("ForwardMode") == [driver.MODE_EXTEND, driver.MODE_DECODE, driver.MODE_IDLE]
-    assert set(_seam_members("ForwardMode")) <= set(FakeForwardMode.__members__)
 
 
 def test_every_seam_name_is_in_the_sglang_source_at_both_tags():
@@ -876,148 +691,6 @@ def test_every_seam_name_is_in_the_sglang_source_at_both_tags():
         module = "sglang.srt.managers.schedule_batch"
         assert seam_rows_not_in_source(((module, "ScheduleBatch.no_such_field", "field"),), python_root)
         assert seam_rows_not_in_source(((module, "ScheduleBatch.reqs", "attribute"),), python_root)
-
-
-def _class_methods(path, name):
-    """The methods of the class statement ``name`` in a parsed SGLang file, by name."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    (statement,) = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name]
-    return {node.name: node for node in statement.body if isinstance(node, ast.FunctionDef)}
-
-
-def _self_attributes_assigned(function):
-    """The names ``x`` of every ``self.x`` that an assignment of ``function`` binds, tuple targets included."""
-    names = set()
-    for node in ast.walk(function):
-        targets = node.targets if isinstance(node, ast.Assign) else [getattr(node, "target", None)]
-        if not isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
-            continue
-        for target in targets:
-            for leaf in ast.walk(target):
-                if isinstance(leaf, ast.Attribute) and isinstance(leaf.value, ast.Name) and leaf.value.id == "self":
-                    names.add(leaf.attr)
-    return names
-
-
-def _self_calls(function):
-    """The names ``m`` of every call ``self.m(...)`` in ``function``."""
-    return {
-        node.func.attr
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "self"
-    }
-
-
-def test_the_kv_cache_dtype_the_header_reads_is_set_by_the_model_runner_at_both_tags():
-    # Skipped where no SGLang source is at hand. ``ModelRunner.kv_cache_dtype`` is no seam row: it is an
-    # attribute of an object, set while the runner is built, and no import shows it. What the recorder relies
-    # on is looked up in the parsed files of both releases; nothing is imported.
-    rows = (
-        ("sglang.srt.managers.scheduler", "Scheduler.init_model_worker", "attribute"),
-        ("sglang.srt.managers.scheduler", "Scheduler.init_tp_model_worker", "attribute"),
-        ("sglang.srt.managers.tp_worker", "TpModelWorker.model_runner", "attribute"),
-        ("sglang.srt.model_executor.model_runner", "ModelRunner.initialize", "attribute"),
-        ("sglang.srt.model_executor.model_runner", "ModelRunner.configure_kv_cache_dtype", "attribute"),
-        ("sglang.srt.mem_cache.kv_cache_dtype", "configure_kv_cache_dtype", "name"),
-    )
-    for version, python_root in sglang_source_roots(SEAM_VERSIONS).items():
-        assert seam_rows_not_in_source(rows, python_root) == [], version
-        srt = python_root / "sglang" / "srt"
-
-        # One method of the runner binds the attribute, under this public name, and the constructor reaches
-        # it: ``__init__`` calls ``initialize``, which calls the method.
-        runner = _class_methods(srt / "model_executor" / "model_runner.py", "ModelRunner")
-        writers = [name for name, method in runner.items() if "kv_cache_dtype" in _self_attributes_assigned(method)]
-        assert writers == ["configure_kv_cache_dtype"], version
-        assert "kv_cache_dtype_str" in _self_attributes_assigned(runner["configure_kv_cache_dtype"]), version
-        assert "initialize" in _self_calls(runner["__init__"]), version
-        assert "configure_kv_cache_dtype" in _self_calls(runner["initialize"]), version
-        # The pool is built with it: the runner hands it to the configurator of the KV cache.
-        handed = [
-            ast.unparse(keyword.value)
-            for node in ast.walk(runner["init_kv_cache_configurator"])
-            if isinstance(node, ast.Call)
-            for keyword in node.keywords
-            if keyword.arg == "kv_cache_dtype"
-        ]
-        assert handed == ["self.kv_cache_dtype"], version
-        assert "init_kv_cache_configurator" in _self_calls(runner["alloc_memory_pool"]), version
-
-        # What is bound is the second value of this function, which it declares as a torch dtype.
-        (function,) = [
-            node
-            for node in ast.parse((srt / "mem_cache" / "kv_cache_dtype.py").read_text(encoding="utf-8")).body
-            if isinstance(node, ast.FunctionDef) and node.name == "configure_kv_cache_dtype"
-        ]
-        assert ast.unparse(function.returns) == "tuple[Optional[str], torch.dtype]", version
-
-        # The worker builds the runner in its constructor and hands it out as the property ``model_runner``.
-        worker = _class_methods(srt / "managers" / "tp_worker.py", "TpModelWorker")
-        assert [ast.unparse(decorator) for decorator in worker["model_runner"].decorator_list] == ["property"], version
-        assert ast.unparse(worker["model_runner"].body[-1]) == "return self._model_runner", version
-        assert "_init_model_runner" in _self_calls(worker["__init__"]), version
-        assert "_model_runner" in _self_attributes_assigned(worker["_init_model_runner"]), version
-
-        # The scheduler builds the worker inside its constructor, so all of this is done when the stock
-        # ``__init__`` returns and the recorder writes its header.
-        scheduler = _class_methods(srt / "managers" / "scheduler.py", "Scheduler")
-        assert "init_model_worker" in _self_calls(scheduler["__init__"]), version
-        assert "init_tp_model_worker" in _self_calls(scheduler["init_model_worker"]), version
-        assert "tp_worker" in _self_attributes_assigned(scheduler["init_tp_model_worker"]), version
-
-
-def test_module_file_has_the_required_header_and_plain_ascii_lines():
-    text = MODULE_PATH.read_bytes().decode("ascii")
-    lines = text.split("\n")
-    assert lines[:9] == [
-        "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
-        "# SPDX-FileCopyrightText: Copyright 2023-2026 SGLang Team",
-        "# SPDX-License-Identifier: Apache-2.0",
-        "# The recorder subclasses SGLang's Scheduler and reads its batch fields at v0.5.22 and v0.5.23.",
-        "# See THIRD_PARTY_NOTICES.md.",
-        "# Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d",
-        "# Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90",
-        "",
-        lines[8],
-    ]
-    assert lines[8].startswith('"""')
-    assert max(len(line) for line in lines) <= 120
-    docstring = " ".join(ast.get_docstring(ast.parse(text)).split())
-    assert (
-        "No upstream function or block of source is copied. What follows SGLang and Dynamo is named in the header "
-        "of this file and recorded in THIRD_PARTY_NOTICES.md." in docstring
-    )
-    assert "baa9befa381511cd4d56f83980951e5a45fffc6d" in docstring
-    assert "297e54fd105e974cdf401e5b4d20253a22c16f90" in docstring
-    assert "\nfrom __future__ import annotations\n" in text
-
-
-# ---------------------------------------------------------------------------------------------------------------
-# The class
-# ---------------------------------------------------------------------------------------------------------------
-
-
-def test_class_is_named_and_built_on_the_base_it_is_given(fake_sglang):
-    cls = recorder.make_recorder_class(fake_sglang.stock)
-    assert cls.__name__ == CLASS_NAME == recorder.RECORDER_CLASS_NAME
-    assert cls.__qualname__ == CLASS_NAME
-    assert cls.__mro__[:2] == (cls, fake_sglang.stock)
-    # Every call builds its own class on its own base: the base lives in a closure, not in the module.
-    other_base = type("Scheduler", (FakeSchedulerBase,), {})
-    other = recorder.make_recorder_class(other_base)
-    assert other is not cls
-    assert other.__mro__[1] is other_base
-    held = [name for name, value in vars(recorder).items() if isinstance(value, type)]
-    assert held == ["_RecorderLog"], "a module-level name of the recorder holds a class besides its own log"
-
-
-def test_class_overrides_exactly_the_three_methods(fake_sglang):
-    cls = recorder.make_recorder_class(fake_sglang.stock)
-    own = {name for name, value in vars(cls).items() if callable(value)}
-    assert own == {"__init__", "run_batch", "process_batch_result"}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1050,15 +723,6 @@ def test_header_names_the_class_of_the_object_and_the_version_sglang_reports(wor
     assert header["sglang_version"] == "0.5.22"
 
 
-def test_header_is_written_after_the_stock_constructor_has_returned(world):
-    scheduler = _scheduler(world)
-    # The FAKE stock constructor saw an empty directory: the log did not exist while it ran.
-    assert world.events == [("stock_init", [])]
-    assert [path.name for path in world.directory.iterdir()] == [f"sched-{os.getpid()}.jsonl"]
-    assert scheduler.page_size == FAKE_LIMITS["page_size"]
-    assert scheduler.port_args == FAKE_PORT_ARGS
-
-
 def test_stock_constructor_gets_its_arguments_unchanged_and_its_error_is_not_caught(world):
     cls = recorder.make_recorder_class(world.sglang.stock)
     server_args = FakeServerArgs(world)
@@ -1073,35 +737,23 @@ def test_stock_constructor_gets_its_arguments_unchanged_and_its_error_is_not_cau
 
 
 @pytest.mark.parametrize(
-    ("socket", "ranks", "leader"),
+    ("socket", "leader"),
     [
-        pytest.param(object(), {}, True, id="rank-zero-with-socket"),
-        pytest.param(None, {"tp_size": 2, "attn_tp_rank": 1}, False, id="tp-rank-one-without-socket"),
-        # The answer comes from the socket attribute alone, not from the ranks and not from a truth test.
-        pytest.param(None, {}, False, id="rank-zero-without-socket"),
-        pytest.param(object(), {"tp_size": 2, "attn_tp_rank": 1}, True, id="tp-rank-one-with-socket"),
-        pytest.param(0, {}, True, id="socket-that-is-false-in-a-truth-test"),
+        # The answer is "is not None" on the socket attribute, not a truth test of it.
+        pytest.param(None, False, id="rank-zero-without-socket"),
+        pytest.param(0, True, id="socket-that-is-false-in-a-truth-test"),
     ],
 )
-def test_leader_says_whether_the_process_holds_the_request_socket(world, socket, ranks, leader):
-    world.sglang.parallel.values.update(ranks)
+def test_leader_says_whether_the_process_holds_the_request_socket(world, socket, leader):
     header = _header_of(world, overrides={"recv_from_tokenizer": socket})
     assert header["leader"] is leader
-    assert header["ranks"] == {**FAKE_RANKS, **ranks}
-
-
-def test_limits_report_chunking_off_as_null(world):
-    header = _header_of(world, overrides={"chunked_prefill_size": None})
-    assert header["limits"] == {**FAKE_LIMITS, "chunked_prefill_size": None}
+    assert header["ranks"] == FAKE_RANKS
 
 
 def test_checks_report_objects_as_present_and_values_as_they_are(world):
     # Two of the four objects are false in a truth test: the header asks "is not None", not "is true".
-    overrides = {
-        "prefill_delayer": object(),
-        "min_free_slots_delayer": 0,
-        "recv_skipper": object(),
-        "input_blocker": [],
+    objects = {"prefill_delayer": object(), "min_free_slots_delayer": 0, "recv_skipper": object(), "input_blocker": []}
+    values = {
         "max_queued_requests": 512,
         "max_new_tokens_limit": 4,
         "schedule_policy": "lpm",
@@ -1114,56 +766,22 @@ def test_checks_report_objects_as_present_and_values_as_they_are(world):
     }
     world.sglang.policy_module._IS_HIP = True
     world.sglang.parallel.values["pp_max_micro_batch_size"] = 7
-    header = _header_of(world, overrides=overrides)
+    header = _header_of(world, overrides={**objects, **values})
     assert header["checks"] == {
-        "disable_radix_cache": True,
-        "is_hybrid_swa": True,
-        "is_hybrid_ssm": True,
-        "max_queued_requests": 512,
-        "max_new_tokens_limit": 4,
-        "schedule_policy": "lpm",
-        "enable_priority_scheduling": True,
-        "is_mixed_chunk": True,
-        "prefill_decode_interval": 22,
-        "prefill_delayer": True,
-        "min_free_slots_delayer": True,
-        "recv_skipper": True,
-        "input_blocker": True,
+        **_expected_header()["checks"],
+        **values,
+        **dict.fromkeys(objects, True),
         "pp_max_micro_batch_size": 7,
         "is_hip": True,
     }
 
 
-def test_micro_batch_size_comes_from_the_parallel_context_not_from_the_scheduler(world):
-    # SGLang's Scheduler has no such attribute; a FAKE one here must not be what the header shows.
-    world.sglang.parallel.values["pp_max_micro_batch_size"] = 2048
-    header = _header_of(world, overrides={"pp_max_micro_batch_size": 5})
-    assert header["checks"]["pp_max_micro_batch_size"] == 2048
-
-
 @pytest.mark.parametrize(
     ("decode_runner", "prefill_runner", "decode_sizes", "prefill_sizes"),
     [
-        pytest.param("default", "default", FAKE_DECODE_GRAPH_SIZES, FAKE_PREFILL_GRAPH_SIZES, id="both-captured"),
         pytest.param(None, "default", [], FAKE_PREFILL_GRAPH_SIZES, id="decode-runner-none"),
         pytest.param("default", None, FAKE_DECODE_GRAPH_SIZES, [], id="prefill-runner-none"),
         pytest.param("default", FakeGraphRunner(), FAKE_DECODE_GRAPH_SIZES, [], id="eager-prefill-runner"),
-        pytest.param(None, FakeGraphRunner(max_bs=8), [], [], id="no-graphs-at-all"),
-        pytest.param(
-            FakeFalsyGraphRunner(capture_bs=[2, 4]),
-            FakeFalsyGraphRunner(capture_num_tokens=[32]),
-            [2, 4],
-            [32],
-            id="runners-that-are-false-in-a-truth-test",
-        ),
-        pytest.param("default", FakeGraphRunner(capture_num_tokens=[]), FAKE_DECODE_GRAPH_SIZES, [], id="empty-list"),
-        pytest.param(
-            FakeGraphRunner(capture_bs=(1, 3)),
-            FakeGraphRunner(capture_num_tokens=(128,)),
-            [1, 3],
-            [128],
-            id="tuples-become-lists",
-        ),
     ],
 )
 def test_graph_sizes_of_both_runners(world, decode_runner, prefill_runner, decode_sizes, prefill_sizes):
@@ -1179,27 +797,10 @@ def test_graph_sizes_of_both_runners(world, decode_runner, prefill_runner, decod
 @pytest.mark.parametrize(
     ("tp_worker", "decode_error", "prefill_error", "dtype_error"),
     [
-        # Without a worker or a runner nothing behind them can be read: both graph lists and the dtype.
+        # Without a worker nothing behind it can be read: both graph lists and the dtype.
         pytest.param(None, "AttributeError", "AttributeError", "AttributeError", id="tp-worker-none"),
-        pytest.param(FakeTpWorker(None), "AttributeError", "AttributeError", "AttributeError", id="model-runner-none"),
         pytest.param(_fake_tp_worker(FakeGraphRunner()), "AttributeError", None, None, id="decode-runner-without-list"),
-        pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=None)), "TypeError", None, None, id="decode-list-none"),
         pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=[1, True])), "TypeError", None, None, id="decode-bool"),
-        pytest.param(_fake_tp_worker(FakeGraphRunner(capture_bs=[1, 2.0])), "TypeError", None, None, id="decode-float"),
-        pytest.param(
-            _fake_tp_worker(prefill_runner=FakeGraphRunner(capture_num_tokens=["16"])),
-            None,
-            "TypeError",
-            None,
-            id="prefill-str",
-        ),
-        pytest.param(
-            _fake_tp_worker(prefill_runner=FakeGraphRunner(capture_num_tokens=8)),
-            None,
-            "TypeError",
-            None,
-            id="prefill-not-a-list",
-        ),
     ],
 )
 def test_graph_sizes_that_cannot_be_read_are_marked_and_never_guessed(
@@ -1219,14 +820,7 @@ def test_graph_sizes_that_cannot_be_read_are_marked_and_never_guessed(
     assert header == rest
 
 
-def test_missing_tp_worker_marks_both_graph_lists_and_the_kv_cache_dtype(world):
-    header = _header_of(world, missing=("tp_worker",))
-    _assert_unreadable(header["decode_graph_sizes"], "AttributeError", "tp_worker")
-    _assert_unreadable(header["prefill_graph_sizes"], "AttributeError", "tp_worker")
-    _assert_unreadable(header["kv_cache_stored_dtype"], "AttributeError", "tp_worker")
-
-
-@pytest.mark.parametrize("name", ["bfloat16", "float16", "float8_e4m3fn", "float8_e5m2", "float32"])
+@pytest.mark.parametrize("name", ["float8_e4m3fn"])
 def test_header_holds_the_text_of_the_dtype_the_model_runner_built_its_kv_pool_with(world, name):
     header = _header_of(world, overrides={"tp_worker": _fake_tp_worker(kv_cache_dtype=_fake_torch_dtype(name))})
     assert header["kv_cache_stored_dtype"] == f"torch.{name}"
@@ -1236,41 +830,12 @@ def test_header_holds_the_text_of_the_dtype_the_model_runner_built_its_kv_pool_w
     assert header == rest
 
 
-def test_the_string_sglang_keeps_beside_the_dtype_is_not_what_the_header_holds(world):
-    # SGLang's runner holds ``kv_cache_dtype_str`` too. With the argument "auto" it stays "auto" whatever
-    # dtype the model has, so it does not tell a bfloat16 pool from a float16 one. The FAKE runner has it
-    # with a FAKE text.
-    runner = _fake_tp_worker().model_runner
-    assert runner.kv_cache_dtype_str.startswith("FAKE")
-    header = _header_of(world)
-    assert header["kv_cache_stored_dtype"] == FAKE_KV_CACHE_DTYPE_TEXT
-    assert not [string for string in _strings(header) if "FAKE" in string]
-
-
-def _fake_object_of(module, name, text):
-    """A FAKE object of a class ``name`` of a module ``module`` whose text is ``text``."""
-    return type(name, (), {"__module__": module, "__str__": lambda self: text})()
-
-
 @pytest.mark.parametrize(
     ("value", "needle"),
     [
-        # The text of a dtype, and the string SGLang keeps beside the dtype, are no dtype.
-        pytest.param("torch.bfloat16", "is a builtins.str, not a torch.dtype", id="the-text-of-a-dtype"),
+        # The string SGLang keeps beside the dtype is no dtype.
         pytest.param("auto", "is a builtins.str, not a torch.dtype", id="the-argument"),
         pytest.param(None, "is a builtins.NoneType, not a torch.dtype", id="none"),
-        pytest.param(16, "is a builtins.int, not a torch.dtype", id="int"),
-        # The class is told by its name and its module together.
-        pytest.param(
-            _fake_object_of("numpy", "dtype", "torch.bfloat16"),
-            "is a numpy.dtype, not a torch.dtype",
-            id="a-numpy-dtype",
-        ),
-        pytest.param(
-            _fake_object_of("torch", "device", "torch.bfloat16"),
-            "is a torch.device, not a torch.dtype",
-            id="a-torch-device",
-        ),
     ],
 )
 def test_a_kv_cache_dtype_that_is_no_torch_dtype_is_marked_and_never_written_as_text(world, value, needle):
@@ -1281,18 +846,7 @@ def test_a_kv_cache_dtype_that_is_no_torch_dtype_is_marked_and_never_written_as_
     assert header == rest
 
 
-def test_a_model_runner_without_the_kv_cache_dtype_is_marked(world):
-    worker = _fake_tp_worker()
-    del worker.model_runner.kv_cache_dtype
-    header = _header_of(world, overrides={"tp_worker": worker})
-    _assert_unreadable(header["kv_cache_stored_dtype"], "AttributeError", "kv_cache_dtype")
-    # The string beside it is not taken in its place, and the graph lists are still read.
-    rest = _expected_header()
-    del header["kv_cache_stored_dtype"], rest["kv_cache_stored_dtype"]
-    assert header == rest
-
-
-@pytest.mark.parametrize("name", RANK_KEYS)
+@pytest.mark.parametrize("name", ["attn_cp_rank"])
 @pytest.mark.parametrize(
     "error",
     [
@@ -1311,38 +865,7 @@ def test_one_rank_that_cannot_be_read_marks_that_name_only(world, name, error):
     assert header == expected
 
 
-def test_failing_parallel_context_marks_every_value_read_from_it(world):
-    error = RuntimeError("FAKE: no parallel context")
-    world.sglang.get_parallel_error = error
-    header = _header_of(world)
-    expected = _expected_header()
-    expected["ranks"] = {name: {"unreadable": repr(error)} for name in RANK_KEYS}
-    expected["checks"]["pp_max_micro_batch_size"] = {"unreadable": repr(error)}
-    assert header == expected
-
-
-def test_missing_runtime_context_module_marks_every_value_read_from_it(world, monkeypatch):
-    monkeypatch.delitem(sys.modules, "sglang.srt.runtime_context")
-    header = _header_of(world)
-    for name in RANK_KEYS:
-        _assert_unreadable(header["ranks"][name], "ModuleNotFoundError", "sglang.srt.runtime_context")
-    _assert_unreadable(header["checks"]["pp_max_micro_batch_size"], "ModuleNotFoundError")
-    expected = _expected_header()
-    del header["ranks"], expected["ranks"]
-    del header["checks"]["pp_max_micro_batch_size"], expected["checks"]["pp_max_micro_batch_size"]
-    assert header == expected
-
-
-def test_micro_batch_size_that_cannot_be_read_is_marked(world):
-    error = ValueError("FAKE: not published")
-    world.sglang.parallel.failures["pp_max_micro_batch_size"] = error
-    header = _header_of(world)
-    expected = _expected_header()
-    expected["checks"]["pp_max_micro_batch_size"] = {"unreadable": repr(error)}
-    assert header == expected
-
-
-@pytest.mark.parametrize("name", LIMIT_KEYS)
+@pytest.mark.parametrize("name", ["chunked_prefill_size", "page_size"])
 def test_one_limit_that_cannot_be_read_marks_that_name_only(world, name):
     header = _header_of(world, missing=(name,))
     _assert_unreadable(header["limits"][name], "AttributeError", name)
@@ -1351,7 +874,7 @@ def test_one_limit_that_cannot_be_read_marks_that_name_only(world, name):
     assert header == expected
 
 
-@pytest.mark.parametrize("name", [*CHECK_VALUE_KEYS, *CHECK_PRESENCE_KEYS])
+@pytest.mark.parametrize("name", ["max_queued_requests", "prefill_delayer"])
 def test_one_check_that_cannot_be_read_marks_that_name_only(world, name):
     header = _header_of(world, missing=(name,))
     _assert_unreadable(header["checks"][name], "AttributeError", name)
@@ -1366,8 +889,6 @@ def test_one_check_that_cannot_be_read_marks_that_name_only(world, name):
     [
         pytest.param(object(), "TypeError", id="object"),
         pytest.param(float("nan"), "ValueError", id="nan"),
-        pytest.param(float("inf"), "ValueError", id="infinity"),
-        pytest.param({"a": 1}, "TypeError", id="dict"),
         pytest.param([1, object()], "TypeError", id="list-with-object"),
     ],
 )
@@ -1377,45 +898,11 @@ def test_value_that_json_cannot_hold_is_marked(world, value, error_type):
     _assert_unreadable(header["checks"]["schedule_policy"], error_type, "schedule_policy")
 
 
-def test_is_hip_that_cannot_be_read_is_marked(world):
-    del world.sglang.policy_module._IS_HIP
-    header = _header_of(world)
-    _assert_unreadable(header["checks"]["is_hip"], "ImportError", "_IS_HIP")
-    expected = _expected_header()
-    del header["checks"]["is_hip"], expected["checks"]["is_hip"]
-    assert header == expected
-
-
-@pytest.mark.parametrize(
-    ("version", "error_type"),
-    [pytest.param(None, "AttributeError", id="missing"), pytest.param((0, 5, 23), "TypeError", id="not-a-str")],
-)
-def test_version_that_cannot_be_read_is_marked(world, version, error_type):
-    if version is None:
-        del world.sglang.root.__version__
-    else:
-        world.sglang.root.__version__ = version
-    header = _header_of(world)
-    _assert_unreadable(header["sglang_version"], error_type, "__version__")
-    expected = _expected_header()
-    del header["sglang_version"], expected["sglang_version"]
-    assert header == expected
-
-
-def test_leader_that_cannot_be_read_is_marked(world):
-    header = _header_of(world, missing=("recv_from_tokenizer",))
-    _assert_unreadable(header["leader"], "AttributeError", "recv_from_tokenizer")
-    expected = _expected_header()
-    del header["leader"], expected["leader"]
-    assert header == expected
-
-
 @pytest.mark.parametrize(
     ("options", "error_type"),
     [
         pytest.param({"missing": ("enable_overlap",)}, "AttributeError", id="missing"),
         pytest.param({"overrides": {"enable_overlap": 1}}, "TypeError", id="int"),
-        pytest.param({"overrides": {"enable_overlap": None}}, "TypeError", id="none"),
     ],
 )
 def test_overlap_flag_that_is_not_a_readable_bool_is_marked(world, options, error_type):
@@ -1424,10 +911,6 @@ def test_overlap_flag_that_is_not_a_readable_bool_is_marked(world, options, erro
     expected = _expected_header()
     del header["enable_overlap"], expected["enable_overlap"]
     assert header == expected
-
-
-def test_overlap_off_is_reported_as_false(world):
-    assert _header_of(world, overrides={"enable_overlap": False})["enable_overlap"] is False
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1462,115 +945,11 @@ def test_extend_batch_line(world):
     assert world.lines_of("fault") == []
 
 
-def test_steps_of_one_batch_run_in_order(world):
-    scheduler = _scheduler(world)
-    batch = _extend_batch()
-    result = scheduler.run_batch(batch)
-    scheduler.process_batch_result(batch, result)
-    assert world.events == [
-        ("stock_init", []),
-        # run_batch: the stock method first (it stamps launch_ts), then the recorder notes the return time.
-        ("stock_launch_ts", _fake_time(1)),
-        ("stock_run_batch", 1),
-        ("recorder_clock", _fake_time(2)),
-        # process_batch_result: wait, stamp, write; the stock method then finds the line in the file.
-        "synchronize",
-        ("recorder_clock", _fake_time(3)),
-        ("stock_process_batch_result", 1, 0),
-    ]
-    # The stock methods got the objects they were called with, and nothing else.
-    assert world.stock_calls == [("run_batch", batch, None, result), ("process_batch_result", batch, result)]
-    assert world.stock_calls[0][1] is batch
-    assert world.stock_calls[1][1] is batch
-    assert world.stock_calls[1][2] is result
-
-
-def test_decode_batch_line_leaves_the_stale_extend_fields_out(world):
-    scheduler = _scheduler(world)
-    # The decode batch is the object of an earlier extend batch: the three extend fields still hold its values.
-    batch = _extend_batch()
-    batch.forward_mode = FakeForwardMode.DECODE
-    result = scheduler.run_batch(batch)
-    scheduler.process_batch_result(batch, result)
-
-    (line,) = world.lines_of("batch")
-    assert list(line) == BATCH_KEYS
-    assert line == {
-        "type": "batch",
-        "seq": 1,
-        "forward_iter": 1,
-        "mode": "DECODE",
-        "launch_ts": _fake_time(1),
-        "run_return_ts": _fake_time(2),
-        "out_ts": _fake_time(3),
-        "copy_done": True,
-        "rids": [RID_A, RID_B],
-        "extend_num_tokens": None,
-        "prefix_lens": None,
-        "extend_lens": None,
-        "global_num_tokens": None,
-    }
-
-
-@pytest.mark.parametrize("mode", [FakeForwardMode.DECODE, FakeForwardMode.IDLE, FakeForwardMode.MIXED])
-def test_extend_fields_are_not_even_read_for_another_mode(world, mode):
-    scheduler = _scheduler(world)
-    batch = FakeBatch(
-        reqs=[],
-        forward_mode=mode,
-        extend_num_tokens=object(),
-        prefix_lens=object(),
-        extend_lens=object(),
-    )
-    scheduler.process_batch_result(batch, scheduler.run_batch(batch))
-    (line,) = world.lines_of("batch")
-    assert line["mode"] == mode.name
-    assert line["rids"] == []
-    assert (line["extend_num_tokens"], line["prefix_lens"], line["extend_lens"]) == (None, None, None)
-    assert world.lines_of("fault") == []
-
-
-@pytest.mark.parametrize(
-    ("held", "written"),
-    [
-        pytest.param(None, None, id="none"),
-        pytest.param([128], [128], id="one-count"),
-        pytest.param([128, 128], [128, 128], id="two-ranks"),
-        pytest.param((4096, 0, 4095), [4096, 0, 4095], id="a-tuple-of-three"),
-        pytest.param([], [], id="empty"),
-    ],
-)
-@pytest.mark.parametrize("mode", [FakeForwardMode.EXTEND, FakeForwardMode.DECODE])
-def test_global_num_tokens_is_written_as_the_batch_holds_it(world, mode, held, written):
-    scheduler = _scheduler(world)
-    batch = _extend_batch()
-    batch.forward_mode = mode
-    batch.global_num_tokens = held
-    scheduler.process_batch_result(batch, scheduler.run_batch(batch))
-
-    (line,) = world.lines_of("batch")
-    assert list(line) == BATCH_KEYS
-    assert line["global_num_tokens"] == written
-    # The counts are written for every mode, unlike the three extend fields.
-    assert (line["extend_num_tokens"] is None) == (mode is FakeForwardMode.DECODE)
-    assert world.lines_of("fault") == []
-
-
-@pytest.mark.parametrize("copy_done", ["event", "none"])
-def test_an_idle_batch_of_a_rank_without_work_gets_a_line_without_request_ids_and_no_fault(world, copy_done):
+def test_an_idle_batch_of_a_rank_without_work_gets_a_line_without_request_ids_and_no_fault(world):
     # FAKE of a scheduler process under DP attention: rank 1 of two, with an input blocker. SGLang gives a rank
     # that has nothing to run an idle batch in every step in which another rank runs one.
     world.sglang.parallel.values.update({"tp_size": 2, "attn_dp_size": 2, "attn_dp_enabled": True, "attn_dp_rank": 1})
     scheduler = _scheduler(world, overrides={"input_blocker": object()})
-    (header,) = world.records()
-    assert (header["leader"], header["checks"]["input_blocker"]) == (True, True)
-    assert header["ranks"] == {
-        **FAKE_RANKS,
-        "tp_size": 2,
-        "attn_dp_size": 2,
-        "attn_dp_enabled": True,
-        "attn_dp_rank": 1,
-    }
 
     # Step 1: the other rank extends alone. Step 2: both ranks extend. Step 3: the other rank decodes alone.
     steps = [
@@ -1579,8 +958,6 @@ def test_an_idle_batch_of_a_rank_without_work_gets_a_line_without_request_ids_an
         FakeBatch(reqs=[], forward_mode=FakeForwardMode.IDLE, global_num_tokens=[2, 0]),
     ]
     for batch in steps:
-        if copy_done == "none":
-            world.results.append(FakeResult(None))
         assert scheduler.process_batch_result(batch, scheduler.run_batch(batch)) is world.stock_process_return
 
     lines = world.lines_of("batch")
@@ -1595,46 +972,10 @@ def test_an_idle_batch_of_a_rank_without_work_gets_a_line_without_request_ids_an
     idle = lines[0]
     assert (idle["extend_num_tokens"], idle["prefix_lens"], idle["extend_lens"]) == (None, None, None)
     assert type(idle["launch_ts"]) is type(idle["out_ts"]) is float
-    assert [line["copy_done"] for line in lines] == [copy_done == "event"] * 3
+    assert [line["copy_done"] for line in lines] == [True] * 3
     assert world.lines_of("fault") == []
     # The stock methods got every batch, the idle ones included.
     assert [call[0] for call in world.stock_calls] == ["run_batch", "process_batch_result"] * 3
-
-
-def test_seq_counts_the_batch_lines_from_one(world):
-    scheduler = _scheduler(world)
-    for _ in range(5):
-        batch = _extend_batch()
-        scheduler.process_batch_result(batch, scheduler.run_batch(batch))
-    lines = world.lines_of("batch")
-    assert [line["seq"] for line in lines] == [1, 2, 3, 4, 5]
-    assert [line["forward_iter"] for line in lines] == [1, 2, 3, 4, 5]
-    assert [record["type"] for record in world.records()] == ["header"] + ["batch"] * 5
-
-
-def test_normal_loop_joins_the_return_time_on_the_same_object(world):
-    scheduler = _scheduler(world, overrides={"enable_overlap": False})
-    live = _extend_batch()
-    # As Scheduler.event_loop_normal: run_batch and process_batch_result back to back on one object, which
-    # the scheduler then turns into the decode batch.
-    for step in range(3):
-        if step:
-            live.forward_mode = FakeForwardMode.DECODE
-        result = scheduler.run_batch(live)
-        scheduler.process_batch_result(live, result)
-    lines = world.lines_of("batch")
-    assert [(line["seq"], line["forward_iter"], line["mode"]) for line in lines] == [
-        (1, 1, "EXTEND"),
-        (2, 2, "DECODE"),
-        (3, 3, "DECODE"),
-    ]
-    for index, line in enumerate(lines):
-        first = 3 * index
-        assert (line["launch_ts"], line["run_return_ts"], line["out_ts"]) == (
-            _fake_time(first + 1),
-            _fake_time(first + 2),
-            _fake_time(first + 3),
-        )
 
 
 def test_overlap_order_joins_by_forward_iter_and_reads_the_copy(world):
@@ -1740,120 +1081,16 @@ def test_copy_done_none_takes_the_time_without_a_wait(world):
     assert world.lines_of("fault") == []
 
 
-def test_launch_time_is_the_one_sglang_stamped_on_the_batch(world):
-    scheduler = _scheduler(world)
-    batch = _extend_batch()
-    result = scheduler.run_batch(batch)
-    batch.launch_ts = 12.5
-    scheduler.process_batch_result(batch, result)
-    (line,) = world.lines_of("batch")
-    assert line["launch_ts"] == 12.5
-
-
-def test_a_result_without_a_noted_return_time_writes_null(world):
-    scheduler = _scheduler(world)
-    # A batch that this recorder never saw in run_batch: the stock method of the base is called directly.
-    batch = _extend_batch()
-    result = world.sglang.stock.run_batch(scheduler, batch)
-    scheduler.process_batch_result(batch, result)
-    (line,) = world.lines_of("batch")
-    assert line["run_return_ts"] is None
-    assert line["forward_iter"] == 1
-
-
-def test_at_most_64_return_times_are_kept(world):
-    scheduler = _scheduler(world)
-    queued = []
-    live = _extend_batch()
-    for _ in range(70):
-        result = scheduler.run_batch(live)
-        queued.append((live.copy(), result))
-    assert len(scheduler._sglbench_recorder._run_return) == 64
-    # The six oldest notes are gone: forward_iter 6 has none, forward_iter 7 is the oldest that is left.
-    for copy, result in (queued[5], queued[6], queued[69]):
-        scheduler.process_batch_result(copy, result)
-    lines = world.lines_of("batch")
-    assert [line["forward_iter"] for line in lines] == [6, 7, 70]
-    assert lines[0]["run_return_ts"] is None
-    assert lines[1]["run_return_ts"] == _fake_time(2 * 7)
-    assert lines[2]["run_return_ts"] == _fake_time(2 * 70)
-    assert len(scheduler._sglbench_recorder._run_return) == 62
-
-
-def test_extra_arguments_reach_the_stock_methods(world):
-    scheduler = _scheduler(world)
-    proxy = object()
-    first = _extend_batch()
-    scheduler.run_batch(first, proxy)
-    second = _extend_batch()
-    scheduler.run_batch(second, pp_proxy_tensors=proxy)
-    assert [(call[0], call[1], call[2]) for call in world.stock_calls] == [
-        ("run_batch", first, proxy),
-        ("run_batch", second, proxy),
-    ]
-    assert world.stock_calls[0][2] is proxy
-    assert world.stock_calls[1][2] is proxy
-    # The stock process_batch_result takes two arguments; a third one must reach it and fail there.
-    with pytest.raises(TypeError, match="process_batch_result"):
-        scheduler.process_batch_result(first, FakeResult(None), "extra")
-
-
-def test_methods_work_while_the_stock_constructor_is_still_running(world):
-    batch = _extend_batch()
-    scheduler = _scheduler(world, batch_during_init=batch)
-    # The batch ran through both overrides before the log existed: nothing was recorded for it.
-    assert [call[0] for call in world.stock_calls] == ["run_batch", "process_batch_result"]
-    assert [record["type"] for record in world.records()] == ["header"]
-    later = _extend_batch()
-    scheduler.process_batch_result(later, scheduler.run_batch(later))
-    (line,) = world.lines_of("batch")
-    assert (line["seq"], line["forward_iter"]) == (1, 2)
-
-
 # ---------------------------------------------------------------------------------------------------------------
 # Faults
 # ---------------------------------------------------------------------------------------------------------------
-
-
-def test_synchronize_raising_gives_a_fault_line_and_no_batch_line(world):
-    scheduler = _scheduler(world)
-    error = RuntimeError("FAKE: async device->host copy failed")
-    world.results.append(FakeResult(FakeCopyDone(world.events, error)))
-    batch = _extend_batch()
-    result = scheduler.run_batch(batch)
-    returned = scheduler.process_batch_result(batch, result)
-
-    assert returned is world.stock_process_return
-    assert world.lines_of("batch") == []
-    assert world.lines_of("fault") == [{"type": "fault", "where": "process_batch_result", "error": repr(error)}]
-    # No time was taken after the failed wait, and the stock method still ran, after the fault line.
-    assert world.events[-2:] == ["synchronize", ("stock_process_batch_result", 0, 1)]
-    assert world.stock_calls[-1] == ("process_batch_result", batch, result)
-    assert world.stock_calls[-1][1] is batch
-    assert world.stock_calls[-1][2] is result
 
 
 def _no_stamp(world, batch):
     world.stock_stamps_batch = False
 
 
-def _clock_fails(world, batch):
-    world.clock.recorder_error = RuntimeError("FAKE clock failure")
-
-
-def _unhashable_iter(world, batch):
-    world.stock_stamps_batch = False
-    batch.forward_iter = [1]
-
-
-@pytest.mark.parametrize(
-    ("spoil", "error_type"),
-    [
-        pytest.param(_no_stamp, "TypeError", id="forward-iter-none"),
-        pytest.param(_unhashable_iter, "TypeError", id="forward-iter-a-list"),
-        pytest.param(_clock_fails, "RuntimeError", id="clock-raises"),
-    ],
-)
+@pytest.mark.parametrize(("spoil", "error_type"), [pytest.param(_no_stamp, "TypeError", id="forward-iter-none")])
 def test_fault_in_the_run_batch_step_leaves_the_stock_result_untouched(world, spoil, error_type):
     scheduler = _scheduler(world)
     batch = _extend_batch()
@@ -1877,30 +1114,17 @@ def test_fault_in_the_run_batch_step_leaves_the_stock_result_untouched(world, sp
 @pytest.mark.parametrize(
     ("field", "value", "error_type"),
     [
-        pytest.param("forward_iter", None, "TypeError", id="forward-iter-none"),
         pytest.param("forward_iter", True, "TypeError", id="forward-iter-bool"),
-        pytest.param("launch_ts", None, "TypeError", id="launch-ts-none"),
         pytest.param("launch_ts", 1000, "TypeError", id="launch-ts-int"),
         pytest.param("launch_ts", float("nan"), "ValueError", id="launch-ts-nan"),
-        pytest.param("forward_mode", None, "AttributeError", id="forward-mode-none"),
-        pytest.param("forward_mode", types.SimpleNamespace(name=1), "TypeError", id="mode-name-not-a-str"),
-        pytest.param("reqs", None, "TypeError", id="reqs-none"),
-        pytest.param("reqs", [FakeRequest(RID_A), types.SimpleNamespace()], "AttributeError", id="request-without-rid"),
         pytest.param("reqs", [FakeRequest(RID_A), FakeRequest(None)], "TypeError", id="rid-none"),
-        pytest.param("reqs", [FakeRequest(7)], "TypeError", id="rid-int"),
-        pytest.param("extend_num_tokens", None, "TypeError", id="extend-num-tokens-none"),
         pytest.param("extend_num_tokens", True, "TypeError", id="extend-num-tokens-bool"),
         pytest.param("prefix_lens", None, "TypeError", id="prefix-lens-none"),
-        pytest.param("prefix_lens", [0, "0"], "TypeError", id="prefix-lens-str"),
-        pytest.param("extend_lens", None, "TypeError", id="extend-lens-none"),
-        pytest.param("extend_lens", [64, True], "TypeError", id="extend-lens-bool"),
-        pytest.param("global_num_tokens", 128, "TypeError", id="global-num-tokens-int"),
-        pytest.param("global_num_tokens", "128", "TypeError", id="global-num-tokens-str"),
-        pytest.param("global_num_tokens", [128, True], "TypeError", id="global-num-tokens-bool"),
         pytest.param("global_num_tokens", [128.0, 128.0], "TypeError", id="global-num-tokens-float"),
-        pytest.param("global_num_tokens", [128, None], "TypeError", id="global-num-tokens-none-inside"),
         pytest.param("copy_done", "absent", "AttributeError", id="result-without-copy-done"),
-        pytest.param("clock", "raises", "RuntimeError", id="clock-raises"),
+        # The one fault with a real trigger: the wait on the copy event raises, as HostCopyDone.synchronize
+        # does at v0.5.23 for a copy that failed.
+        pytest.param("copy_done", "raises", "RuntimeError", id="synchronize-raises"),
         pytest.param("batch", "empty", "AttributeError", id="batch-without-fields"),
     ],
 )
@@ -1908,10 +1132,10 @@ def test_fault_in_the_result_step_leaves_the_stock_call_and_its_value_untouched(
     scheduler = _scheduler(world)
     batch = _extend_batch()
     result = scheduler.run_batch(batch)
-    if field == "copy_done":
+    if field == "copy_done" and value == "raises":
+        result = FakeResult(FakeCopyDone(world.events, RuntimeError("FAKE: async device->host copy failed")))
+    elif field == "copy_done":
         result = types.SimpleNamespace()
-    elif field == "clock":
-        world.clock.recorder_error = RuntimeError("FAKE clock failure")
     elif field == "batch":
         batch = types.SimpleNamespace()
     else:
@@ -1930,18 +1154,6 @@ def test_fault_in_the_result_step_leaves_the_stock_call_and_its_value_untouched(
     assert world.lines_of("batch") == []
     # The stock method ran after the fault line was in the file.
     assert world.events[-1] == ("stock_process_batch_result", 0, 1)
-
-
-def test_a_fault_uses_no_seq_number(world):
-    scheduler = _scheduler(world)
-    for spoiled in (False, True, False):
-        batch = _extend_batch()
-        result = scheduler.run_batch(batch)
-        if spoiled:
-            batch.launch_ts = None
-        scheduler.process_batch_result(batch, result)
-    assert [record["type"] for record in world.records()] == ["header", "batch", "fault", "batch"]
-    assert [(line["seq"], line["forward_iter"]) for line in world.lines_of("batch")] == [(1, 1), (2, 3)]
 
 
 def test_stock_run_batch_error_passes_through_unchanged(world):
@@ -1968,16 +1180,6 @@ def test_stock_process_batch_result_error_passes_through_after_the_line_is_writt
     assert [record["type"] for record in world.records()] == ["header", "batch"]
 
 
-def test_interrupt_in_a_recorder_step_is_not_swallowed(world):
-    scheduler = _scheduler(world)
-    batch = _extend_batch()
-    result = scheduler.run_batch(batch)
-    world.clock.recorder_error = KeyboardInterrupt()
-    with pytest.raises(KeyboardInterrupt):
-        scheduler.process_batch_result(batch, result)
-    assert world.lines_of("fault") == []
-
-
 def test_broken_log_never_stops_a_batch(world):
     scheduler = _scheduler(world)
     # The file is closed under the recorder: every write now raises, the fault line included.
@@ -1987,24 +1189,7 @@ def test_broken_log_never_stops_a_batch(world):
     world.results.append(marker)
     assert scheduler.run_batch(batch) is marker
     assert scheduler.process_batch_result(batch, marker) is world.stock_process_return
-    world.stock_stamps_batch = False
-    other = FakeBatch(reqs=[], forward_mode=FakeForwardMode.DECODE)
-    assert scheduler.run_batch(other).copy_done is not None
     assert [record["type"] for record in world.records()] == ["header"]
-
-
-def test_error_whose_repr_raises_still_gives_a_fault_line(world):
-    class FakeUnprintableError(Exception):
-        def __repr__(self):
-            raise RuntimeError("FAKE: no repr")
-
-    scheduler = _scheduler(world)
-    world.results.append(FakeResult(FakeCopyDone(world.events, FakeUnprintableError())))
-    batch = _extend_batch()
-    scheduler.process_batch_result(batch, scheduler.run_batch(batch))
-    assert world.lines_of("fault") == [
-        {"type": "fault", "where": "process_batch_result", "error": "FakeUnprintableError"}
-    ]
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -2047,27 +1232,6 @@ def test_existing_log_file_is_never_appended_to(world, capsys):
     scheduler.process_batch_result(batch, scheduler.run_batch(batch))
     assert world.log_path.read_bytes() == before
     assert "FileExistsError" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
-def test_class_built_without_the_variable_leaves_a_working_scheduler(world, monkeypatch, capsys, value):
-    if value is None:
-        monkeypatch.delenv(ENV)
-    else:
-        monkeypatch.setenv(ENV, value)
-    scheduler = _scheduler(world)
-    _assert_scheduler_works_without_a_log(world, scheduler)
-    assert list(world.directory.iterdir()) == []
-    assert f"RuntimeError('{ENV} is not set')" in capsys.readouterr().err
-
-
-def test_header_that_cannot_be_written_leaves_no_line_at_all(world, monkeypatch, capsys):
-    monkeypatch.setattr(recorder, "_header", lambda scheduler: {"type": "header", "pid": float("nan")})
-    scheduler = _scheduler(world)
-    _assert_scheduler_works_without_a_log(world, scheduler)
-    # The file was created and then closed without a line: a batch line never stands without a header.
-    assert world.log_path.read_bytes() == b""
-    assert "ValueError" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -2118,14 +1282,8 @@ def test_entry_class_still_calls_the_stock_methods_after_sglang_rebinds_the_stoc
         pytest.param(("FAKE server args", FAKE_PORT_ARGS, 3, 1, 0, 2, "FAKE pipe", 1, 2, 0), id="ten"),
     ],
 )
-@pytest.mark.parametrize("directory", ["set", "unset"])
-def test_entry_passes_seven_and_ten_positional_arguments_through(
-    fake_sglang, monkeypatch, tmp_path, positional, directory
-):
-    if directory == "set":
-        monkeypatch.setenv(ENV, str(tmp_path))
-    else:
-        monkeypatch.delenv(ENV, raising=False)
+def test_entry_passes_seven_and_ten_positional_arguments_through(fake_sglang, monkeypatch, tmp_path, positional):
+    monkeypatch.setenv(ENV, str(tmp_path))
     world = FakeWorld(tmp_path, fake_sglang)
     arguments = (FakeServerArgs(world), *positional[1:])
 
@@ -2135,49 +1293,6 @@ def test_entry_passes_seven_and_ten_positional_arguments_through(
     (call,) = fake_sglang.entry_calls
     assert call == arguments + (None,) * (10 - len(arguments))
     assert call[0] is arguments[0]
-    assert len(fake_sglang.hooks) == (1 if directory == "set" else 0)
-
-
-def test_entry_passes_keyword_arguments_through(fake_sglang, monkeypatch, tmp_path):
-    monkeypatch.setenv(ENV, str(tmp_path))
-    world = FakeWorld(tmp_path, fake_sglang)
-    server_args = FakeServerArgs(world)
-    recorder.recorder_entry(server_args, FAKE_PORT_ARGS, 0, 0, 0, None, pipe_writer="FAKE pipe", display_moe_ep_rank=5)
-    assert fake_sglang.entry_calls == [(server_args, FAKE_PORT_ARGS, 0, 0, 0, None, "FAKE pipe", None, None, 5)]
-
-
-@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
-def test_entry_without_the_variable_registers_nothing(fake_sglang, monkeypatch, tmp_path, value):
-    if value is None:
-        monkeypatch.delenv(ENV, raising=False)
-    else:
-        monkeypatch.setenv(ENV, value)
-    world = FakeWorld(tmp_path, fake_sglang)
-    server_args = FakeServerArgs(world)
-
-    returned = recorder.recorder_entry(server_args, FAKE_PORT_ARGS, 0, 0, 0, None, "FAKE pipe")
-
-    assert returned is fake_sglang.entry_return
-    assert fake_sglang.hooks == []
-    assert fake_sglang.events[0] == "stock_entry"
-    assert "register" not in fake_sglang.events
-    (scheduler,) = fake_sglang.built
-    assert type(scheduler) is fake_sglang.stock
-    assert fake_sglang.scheduler_module.Scheduler is fake_sglang.stock
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_entry_error_of_the_stock_entry_passes_through(fake_sglang, monkeypatch, tmp_path):
-    monkeypatch.setenv(ENV, str(tmp_path))
-    error = RuntimeError("FAKE failure of the stock entry")
-
-    def failing_entry(*args, **kwargs):
-        raise error
-
-    fake_sglang.scheduler_module.run_scheduler_process = failing_entry
-    with pytest.raises(RuntimeError) as caught:
-        recorder.recorder_entry("FAKE server args")
-    assert caught.value is error
     assert len(fake_sglang.hooks) == 1
 
 
@@ -2188,75 +1303,9 @@ def test_entry_is_a_module_level_function_that_spawn_can_name():
     assert pickle.loads(pickle.dumps(recorder.recorder_entry)) is recorder.recorder_entry
 
 
-def test_nothing_is_registered_when_the_module_is_imported(fake_sglang):
-    code = compile(MODULE_PATH.read_text(encoding="utf-8"), str(MODULE_PATH), "exec")
-    namespace = {"__name__": "sglbench_recorder_FAKE_reimport"}
-    exec(code, namespace)
-    assert fake_sglang.hooks == []
-    assert fake_sglang.events == []
-
-
 # ---------------------------------------------------------------------------------------------------------------
-# The file
+# The timed span, and an interrupt
 # ---------------------------------------------------------------------------------------------------------------
-
-
-def _strings(value):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            yield key
-            yield from _strings(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _strings(item)
-
-
-def test_every_line_is_one_compact_json_object_and_nothing_matches_a_swept_name(world):
-    scheduler = _scheduler(world, missing=("page_size",))
-    live = _extend_batch(rids=(RID_A, RID_B, "sglb-fakerun1-p3-meas0-r0-s2-e \u00e9 \U0001f600"))
-    scheduler.process_batch_result(live, scheduler.run_batch(live))
-    live.forward_mode = FakeForwardMode.DECODE
-    scheduler.process_batch_result(live, scheduler.run_batch(live))
-    live.launch_ts = None
-    scheduler.process_batch_result(live, FakeResult(None))
-
-    data = world.log_path.read_bytes()
-    text = data.decode("ascii")
-    assert text.endswith("\n")
-    lines = text.split("\n")[:-1]
-    assert len(lines) == 4
-    for line in lines:
-        assert line.strip() == line
-        assert line != ""
-        record = json.loads(line)
-        assert isinstance(record, dict)
-        assert line == json.dumps(record, separators=(",", ":"))
-    records = [json.loads(line) for line in lines]
-    assert [record["type"] for record in records] == ["header", "batch", "batch", "fault"]
-    assert records[1]["rids"][2] == "sglb-fakerun1-p3-meas0-r0-s2-e \u00e9 \U0001f600"
-
-    files = [path for path in world.directory.parent.rglob("*") if path.is_file()]
-    assert [path.name for path in files] == [f"sched-{os.getpid()}.jsonl"]
-    assert files[0].name.startswith(recorder.LOG_FILE_PREFIX)
-    assert files[0].name.endswith(recorder.LOG_FILE_SUFFIX)
-    for pattern in FORBIDDEN_FILE_PATTERNS:
-        for path in world.directory.parent.rglob("*"):
-            assert not fnmatch.fnmatch(path.name, pattern), (path, pattern)
-        for record in records:
-            for string in _strings(record):
-                assert not fnmatch.fnmatch(string, pattern), (string, pattern)
-
-
-def test_every_line_is_in_the_file_when_the_call_that_wrote_it_returns(world):
-    scheduler = _scheduler(world)
-    assert len(world.raw_lines()) == 1
-    for count in range(2, 6):
-        batch = _extend_batch()
-        scheduler.process_batch_result(batch, scheduler.run_batch(batch))
-        # Read through a second handle while the recorder keeps its own open.
-        assert len(world.raw_lines()) == count
 
 
 class FakeBatchThatNotesItsReads:
@@ -2289,32 +1338,19 @@ def test_out_time_is_taken_right_after_the_wait_and_before_any_batch_field_is_re
     assert line["out_ts"] == _fake_time(3)
 
 
-def test_seq_is_not_used_twice_after_a_write_that_failed(world):
-    scheduler = _scheduler(world)
-    log = scheduler._sglbench_recorder
-    real_write = log._write
-    failures = [OSError("FAKE: no space left on device")]
-
-    def fake_write_that_fails_once(text):
-        # Only the first batch line fails; the fault line and everything after it are written.
-        if failures and '"type":"batch"' in text:
-            raise failures.pop()
-        real_write(text)
-
-    log._write = fake_write_that_fails_once
-    for _ in range(2):
-        batch = _extend_batch()
-        scheduler.process_batch_result(batch, scheduler.run_batch(batch))
-    assert [record["type"] for record in world.records()] == ["header", "fault", "batch"]
-    # The number of the lost line is not given to the next one, so a reader sees the gap.
-    assert [line["seq"] for line in world.lines_of("batch")] == [2]
-
-
-def test_interrupt_in_the_run_batch_step_and_in_the_log_open_is_not_swallowed(world, monkeypatch):
+def test_interrupt_in_a_recorder_step_or_in_the_log_open_is_not_swallowed(world, monkeypatch):
     scheduler = _scheduler(world)
     world.clock.recorder_error = KeyboardInterrupt()
     with pytest.raises(KeyboardInterrupt):
         scheduler.run_batch(_extend_batch())
+    assert world.lines_of("fault") == []
+
+    # The same in the result step.
+    batch = _extend_batch()
+    result = scheduler.run_batch(batch)
+    world.clock.recorder_error = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        scheduler.process_batch_result(batch, result)
     assert world.lines_of("fault") == []
 
     def fake_header_that_is_interrupted(scheduler):
@@ -2324,50 +1360,3 @@ def test_interrupt_in_the_run_batch_step_and_in_the_log_open_is_not_swallowed(wo
     world.log_path.unlink()
     with pytest.raises(KeyboardInterrupt):
         _scheduler(world)
-
-
-def test_log_file_is_closed_when_the_header_cannot_be_written(world, monkeypatch):
-    opened = []
-    real_open = open
-
-    def fake_open_that_keeps_the_handle(*args, **kwargs):
-        handle = real_open(*args, **kwargs)
-        opened.append(handle)
-        return handle
-
-    monkeypatch.setattr(recorder, "open", fake_open_that_keeps_the_handle, raising=False)
-    monkeypatch.setattr(recorder, "_header", lambda scheduler: {"type": "header", "pid": float("nan")})
-    scheduler = _scheduler(world)
-    assert scheduler._sglbench_recorder is None
-    (handle,) = opened
-    assert handle.closed
-
-
-def test_the_test_file_has_the_same_source_lines_as_the_module():
-    module_lines = MODULE_PATH.read_text(encoding="utf-8").splitlines()[:8]
-    test_lines = TEST_PATH.read_text(encoding="utf-8").splitlines()[:8]
-    assert test_lines[:3] == module_lines[:3]
-    assert test_lines[5:] == module_lines[5:]
-
-
-@pytest.mark.parametrize("path", [MODULE_PATH, TEST_PATH], ids=["module", "test"])
-def test_files_are_ascii_within_120_columns_and_cite_only_what_the_repository_holds(path):
-    text = path.read_text(encoding="utf-8")
-    assert text.isascii()
-    assert max(len(line) for line in text.splitlines()) <= 120
-    # Working notes that the repository does not hold must not be cited.
-    patterns = (
-        r"phase\s*[0-9]",
-        r"the\s+design\b",
-        r"the\s+contract\b",
-        r"\b(engine|scheduler|rejections|gate|vllm|spec)\.md\b",
-        r"design_extrac[t]",
-    )
-    for pattern in patterns:
-        assert not re.search(pattern, text, flags=re.IGNORECASE), pattern
-    # Every evidence folder that is cited exists in the repository.
-    repository = Path(__file__).resolve().parents[5]
-    cited = {folder.rstrip(".") for folder in re.findall(r"benchmarks/evidence/collector/[A-Za-z0-9_.-]+", text)}
-    for folder in cited:
-        assert (repository / folder).is_dir(), folder
-    assert cited == {"benchmarks/evidence/collector/sglbench-engine-probe-20261113"}

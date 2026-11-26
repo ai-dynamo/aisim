@@ -260,14 +260,14 @@ File names are relative to `python/aisim/collector/fpm_forward/runtime/` for the
   `check_9.decode.batches` in `v0522-q06-p64-over` and `v0523-q06-p64-over`; `check_9.decode.runs[].batches`
   and `decode_batches_hold_all` in `v0522-q06-p64-over2` and `v0523-q06-p64-over2`. The 384-request runs were
   at context 256 (driver); the test row is at context 1024.
-- `sglbench_content.py`, the module docstring on the cache rules, and the two cache-model tests of
-  `test_fpm_sglbench_content.py` that name the engine probe: `check_3.cases[].cached_tokens`,
+- `sglbench_content.py`, the module docstring on the cache rules, and the cache-model test of
+  `test_fpm_sglbench_content.py` that names the engine probe,
+  `test_cache_model_reproduces_the_engine_probe_counts`: `check_3.cases[].cached_tokens`,
   `check_3.decode_prompt_tokens` and `check_3.decode_extend_tokens` in the ten runs with check_3;
   `check_5.rows[].seed_computed_tokens` in the eight runs with check_5, rows with batch 2 or 1.
 - `test_fpm_sglbench_grid.py`, `test_expected_cached_and_extend_tokens_match_the_engine_probe` (960 and 61 at
   page size 64, 1020 and 1 at page size 1, 128 of 128, 512 of 512): the same fields of check_3.
-- `sglbench_content.py` and `test_fpm_sglbench_content.py`, the input limit of 40954 tokens:
-  `headers[].max_req_input_len`, the same in every run.
+- `sglbench_content.py`, the input limit of 40954 tokens: `headers[].max_req_input_len`, the same in every run.
 - `sglbench_artifact.py`, the comment on `DECODE_RAW_STEPS` (seven output tokens give one extend batch and six
   decode batches): `check_4.cases[].modes_seen` in the ten runs with check_4.
 - `sglbench_artifact.py`, the decode deviation note: `check_4.cases[].median_inter_output_ms_by_step` and

@@ -1150,10 +1150,10 @@ def _validate_sglang_dense_producer(cell: FPMCell, producer: object, path: Path)
     and a null ``moe``. Called by hand on those files, the rule refused the files of the one-GPU cell for
     the cell of two GPUs and the reverse. The files of the runs are not kept in this repository.
 
-    Not run on an engine: a tensor-parallel size above 2; a model in which the launcher finds expert layers
-    and the plan none, so a ``moe`` block under this rule; a refusal inside a collection. These have run in
-    the tests only, on typed-in files and on the files the launcher writes there with a FAKE in the place
-    of SGLang.
+    Not run on an engine: a tensor-parallel size above 2, which no test runs either; a model in which the
+    launcher finds expert layers and the plan none, so a ``moe`` block under this rule; a refusal inside a
+    collection. The last two have run in the tests only, on typed-in files and on the files the launcher
+    writes there with a FAKE in the place of SGLang.
     """
     block = producer if isinstance(producer, dict) else {}
     found = (block.get("tp_size"), block.get("attn_dp_size"))

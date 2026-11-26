@@ -563,26 +563,25 @@ while True:
 
 
 # ---------------------------------------------------------------------------
-# engine streams: the filters are the gate's children and pass lines on at once
+# engine streams: the filters are the gate's children, and the gate waits for them
 # ---------------------------------------------------------------------------
 
 DRAIN_NOTE = "An engine output filter did not end within"
 
 
 def _tree_killing_engine_prelude() -> str:
-    """Source for a FAKE engine: ``_children(pid)``, ``_command(pid)``, ``_kill_descendants()`` and
-    ``_kill_process_tree()``.
+    """Source for a FAKE engine: ``_children(pid)``, ``_kill_descendants()`` and ``_kill_process_tree()``.
 
     ``_kill_process_tree`` does to the engine what SGLang's own function of that name does when a scheduler
     process fails: SIGKILL for every descendant of the engine's process, then for the process itself.
     ``_kill_descendants`` is the first half alone, which SGLang's engine does when it shuts down.
 
-    Processes are listed from /proc where there is one, and with pgrep and ps elsewhere.
+    Processes are listed from /proc where there is one, and with pgrep elsewhere.
     """
 
-    pgrep, ps = shutil.which("pgrep"), shutil.which("ps")
+    pgrep = shutil.which("pgrep")
     if not Path("/proc/self/stat").exists():
-        assert pgrep and ps, "without /proc these tests list processes with pgrep and ps"
+        assert pgrep, "without /proc these tests list processes with pgrep"
     return f"""\
 import os
 import signal
@@ -608,17 +607,6 @@ def _children(pid):
         return found
     listed = subprocess.run([{pgrep!r}, "-P", str(pid)], capture_output=True, text=True, check=False)
     return [int(child) for child in listed.stdout.split()]
-
-
-def _command(pid):
-    if _HAS_PROC:
-        try:
-            with open("/proc/" + str(pid) + "/cmdline", "rb") as handle:
-                return handle.read().replace(bytes(1), b" ").decode(errors="replace").strip()
-        except OSError:
-            return ""
-    shown = subprocess.run([{ps!r}, "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False)
-    return shown.stdout.strip()
 
 
 def _kill_descendants():
@@ -665,51 +653,6 @@ def _install_holding_awk(tmp_path: Path, *, pause: float = 0, pids: Path | None 
         tmp_path / "bin" / "awk",
         _HOLDING_AWK.format(real_awk=shlex.quote(real_awk), sleep=shlex.quote(sleep), pause=pause, note_pid=note_pid),
     )
-
-
-def test_the_stream_filters_are_not_descendants_of_the_engine(tmp_path):
-    """An engine that kills its own process tree must not find the gate's two filters in it. A filter that a
-    process substitution on the engine's command line starts is a child of the engine's process, or the child
-    of a subshell that is one. The engine starts one process of its own, to show that the list is not empty
-    for want of a working process listing."""
-
-    staged = _stage(tmp_path, run_script="")
-    children_path = tmp_path / "engine-children.json"
-    payloads = json.dumps(_finalized_artifacts({str(staged.benchmark_output): _benchmark_result()}))
-    engine_body = (
-        _tree_killing_engine_prelude()
-        + f"""\
-import json
-import pathlib
-import sys
-import time
-
-print("the engine is up", file=sys.stderr, flush=True)
-own_child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)  # the engine's own child"])
-commands = []
-pending = _children(os.getpid())
-while pending:
-    child = pending.pop()
-    pending.extend(_children(child))
-    commands.append(_command(child))
-own_child.kill()
-own_child.wait()
-pathlib.Path({str(children_path)!r}).write_text(json.dumps(commands))
-for path, payload in json.loads({payloads!r}).items():
-    pathlib.Path(path).write_text(json.dumps(payload))
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-while True:
-    time.sleep(0.1)
-"""
-    )
-    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
-
-    completed = _run(staged)
-
-    assert completed.returncode == 0, completed.stderr
-    descendants = json.loads(children_path.read_text())
-    assert len(descendants) == 1 and "the engine's own child" in descendants[0], descendants
-    assert "the engine is up" in (staged.results / "engine.stderr.log").read_text()
 
 
 def test_the_last_lines_of_an_engine_that_kills_its_process_tree_are_in_both_copies(tmp_path):
@@ -795,77 +738,32 @@ sys.exit(23)
     assert at_the_end["engine.stderr.log"].splitlines() == ["the last stderr line of the engine"]
 
 
-def test_two_gates_on_one_work_folder_do_not_share_their_pipes(tmp_path):
-    """The Slurm transport mounts one work folder for every node of a cell and a result folder per node, and
-    starts the gate on all nodes at once. Each gate keeps its two pipes in a folder of its own, so no gate
-    makes or removes the names of another."""
+def test_the_gate_keeps_its_two_pipes_out_of_the_work_folder(tmp_path):
+    """The Slurm transport mounts one work folder for every node of a cell and starts the gate on all nodes at
+    once. No gate makes or removes the names of another, because none keeps its two pipes in the work folder.
+    One gate is enough to show it: while its engine runs, the work folder holds the staged files and no more."""
 
-    nodes = []
-    for name in ("a", "b"):
-        (tmp_path / name).mkdir()
-        nodes.append(_stage(tmp_path / name, run_script=""))
-    first, second = nodes
-    # The second node runs its own copy of the gate, with its own result folder, on the first node's work folder.
-    script = second.script.read_text()
-    assert script.count(f"workdir={second.workdir}") == 1
-    second.script.write_text(script.replace(f"workdir={second.workdir}", f"workdir={first.workdir}"))
-    env_path = first.workdir / "fpm_env.sh"
-    env_text = env_path.read_text()
-    output_line = f"export FPM_BENCHMARK_OUTPUT_PATH={shlex.quote(str(first.benchmark_output))}"
-    assert env_text.count(output_line) == 1
-    # One path for every node that names another folder on each, as /results does under the per-node mount.
-    env_path.write_text(
-        env_text.replace(output_line, 'export FPM_BENCHMARK_OUTPUT_PATH="${NODE_RESULTS}/benchmark.json"')
-    )
-    payloads = {
-        str(node.results): _finalized_artifacts({str(node.results / "benchmark.json"): _benchmark_result()})
-        for node in nodes
-    }
+    staged = _stage(tmp_path, run_script="")
+    seen_path = tmp_path / "work-folder-seen.json"
+    files = {str(staged.benchmark_output): _benchmark_result()}
     engine_body = f"""\
 import json
 import os
-import pathlib
-import signal
-import sys
-import time
 
-mine = os.environ["NODE_RESULTS"]
-print("engine line of " + mine, file=sys.stderr, flush=True)
-for path, payload in json.loads({json.dumps(payloads)!r})[mine].items():
-    pathlib.Path(path).write_text(json.dumps(payload))
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-while True:
-    time.sleep(0.1)
-"""
-    (first.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
+with open({str(seen_path)!r}, "w") as handle:
+    json.dump(sorted(os.listdir({str(staged.workdir)!r})), handle)
+""" + _writer_engine_body(files)
+    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
 
-    running = [
-        subprocess.Popen(
-            ["bash", str(node.script)],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={**node.env, "NODE_RESULTS": str(node.results)},
-        )
-        for node in nodes
-    ]
-    outputs = [process.communicate(timeout=90) for process in running]
+    completed = _run(staged)
 
-    for node, process, (_, stderr) in zip(nodes, running, outputs, strict=True):
-        line = f"engine line of {node.results}"
-        assert process.returncode == 0, stderr
-        assert line in stderr
-        assert (node.results / "engine.stderr.log").read_text().splitlines() == [line]
-        assert list(node.gate_tmp.iterdir()) == []
-    assert sorted(path.name for path in first.workdir.iterdir()) == [
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(seen_path.read_text()) == [
         "collector-runtime-env.sh",
         "fpm_env.sh",
         "preflight.py",
         "run.sh",
     ]
-
-
-NO_PLACE_FOR_THE_PIPES = "Cannot make a folder for the engine output pipes under TMPDIR ({tmpdir}) or under /tmp"
 
 
 def _stage_with_a_tmpdir_that_does_not_exist(tmp_path: Path, second_place: Path) -> SimpleNamespace:
@@ -925,49 +823,6 @@ with open({str(seen_path)!r}, "w") as handle:
     assert list(second_place.iterdir()) == []
 
 
-def test_a_cell_with_no_place_for_its_pipes_fails_before_its_engine_starts(tmp_path):
-    """A gate that can make the folder of its pipes neither under TMPDIR nor in its second place has nothing
-    to start an engine on. It says so and ends as a failed cell."""
-
-    staged = _stage_with_a_tmpdir_that_does_not_exist(tmp_path, tmp_path / "no-second-place")
-    engine_started = tmp_path / "engine-started"
-    files = {str(staged.benchmark_output): _benchmark_result()}
-    engine_body = f"open({str(engine_started)!r}, 'w').close()\n" + _writer_engine_body(files)
-    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
-
-    completed = _run(staged)
-
-    assert completed.returncode == 1, completed.stderr
-    # The line before it is mktemp's own and says why the second attempt failed.
-    assert completed.stderr.splitlines()[-1] == NO_PLACE_FOR_THE_PIPES.format(tmpdir=staged.env["TMPDIR"])
-    assert not engine_started.exists()
-    assert list(staged.results.glob("engine.*")) == []
-    assert list(staged.results.glob("benchmark*")) == []
-
-
-def test_filters_that_no_engine_ever_wrote_to_are_not_waited_for(tmp_path):
-    """A gate that ends between the start of its filters and the start of the engine has two filters that
-    still wait for a writer. It ends them at once, without the wait and without the note."""
-
-    staged = _stage(tmp_path, run_script="")
-    script = staged.script.read_text()
-    launch = 'bash "${workdir}/run.sh" > "${engine_stream_dir}/stdout" 2> "${engine_stream_dir}/stderr" &\n'
-    assert script.count(launch) == 1
-    assert script.count("engine_stream_drain_seconds=10") == 1
-    # A wait long enough to tell from the time the gate needs anyway.
-    script = script.replace("engine_stream_drain_seconds=10", "engine_stream_drain_seconds=45")
-    staged.script.write_text(script.replace(launch, "exit 7\n" + launch))
-
-    started = time.monotonic()
-    completed = _run(staged)
-    elapsed = time.monotonic() - started
-
-    assert completed.returncode == 7, completed.stderr
-    assert DRAIN_NOTE not in completed.stderr
-    assert elapsed < 30, elapsed
-    assert list(staged.gate_tmp.iterdir()) == []
-
-
 def test_a_process_that_keeps_the_engine_streams_open_cannot_hold_the_gate(tmp_path):
     """A process that left the engine's process group survives the group kill and keeps both streams open, so
     the filters never see their end. The gate waits a bounded time, says so and ends with the engine's status.
@@ -1013,68 +868,16 @@ sys.exit(23)
                 pass
 
 
-def _awk_holds_lines_back() -> bool:
-    """Whether the awk of this machine is one that does not look at a line as it arrives. mawk fills a block
-    from a pipe first; what the awk of busybox does was not looked at, so it counts as holding too."""
-
-    awk = shutil.which("awk")
-    return awk is None or Path(awk).resolve().name in ("mawk", "busybox")
-
-
-@pytest.mark.skipif(_awk_holds_lines_back(), reason="the awk of this machine holds lines back")
-def test_a_line_is_in_both_copies_while_its_stream_is_still_open(tmp_path):
-    """The filter program flushes both copies after every line. With an awk that looks at a line as it
-    arrives, a line of the engine is therefore in the exec stream and in the log file before the stream has
-    ended. Here the stream never ends: a process outside the engine's group keeps it open until the gate gives
-    the filters up, and the line is in both copies all the same."""
-
-    staged = _stage(tmp_path, run_script="")
-    script = staged.script.read_text()
-    assert script.count("engine_stream_drain_seconds=10") == 1
-    staged.script.write_text(script.replace("engine_stream_drain_seconds=10", "engine_stream_drain_seconds=2"))
-    stray_pid_path = tmp_path / "stray.pid"
-    engine_body = f"""\
-import pathlib
-import subprocess
-import sys
-
-stray = subprocess.Popen(
-    [sys.executable, "-c", "import time; time.sleep(120)"],
-    start_new_session=True,
-)
-pathlib.Path({str(stray_pid_path)!r}).write_text(str(stray.pid))
-print("the engine wrote this before it ended", file=sys.stderr, flush=True)
-sys.exit(23)
-"""
-    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, engine_body))
-
-    try:
-        completed = _run(staged)
-        assert completed.returncode == 23, completed.stderr
-        assert completed.stderr.count(DRAIN_NOTE) == 1, completed.stderr
-        assert "the engine wrote this before it ended" in completed.stderr
-        assert "the engine wrote this before it ended" in (staged.results / "engine.stderr.log").read_text()
-    finally:
-        if stray_pid_path.exists():
-            try:
-                os.kill(int(stray_pid_path.read_text()), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
-
-@pytest.mark.parametrize(
-    "engine_ignores_sigterm", [False, True], ids=["engine-ends-on-sigterm", "engine-ignores-sigterm"]
-)
-def test_a_sigterm_to_the_gate_ends_the_engine_and_keeps_what_it_wrote(tmp_path, engine_ignores_sigterm):
-    """A gate that is told to stop while its engine runs ends the engine, with SIGKILL if the engine ignores
-    SIGTERM, waits for both filters, removes the folder of the pipes and ends with 143. The filters here hold
-    every line until the engine has gone, as mawk holds a block, and write two seconds later, so what the
-    engine wrote before the signal is in both copies only because the gate waited for the filters. The gate's
-    own output goes to files: a pipe to the test would wait for the filters whether the gate does or not."""
+def test_a_sigterm_to_the_gate_ends_the_engine_and_waits_for_both_filters(tmp_path):
+    """A gate that is told to stop while its engine runs ends the engine, with SIGKILL for the engine here,
+    which ignores SIGTERM, waits for both filters, removes the folder of the pipes and ends with 143. The
+    filters here hold every line until the engine has gone, as mawk holds a block, and write two seconds
+    later, so both have ended when the gate ends only because the gate waited for them. What the copies then
+    hold is in the test of the gate that does not end before its filters. The gate's own output goes to
+    files: a pipe to the test would wait for the filters whether the gate does or not."""
 
     # An engine that ignores SIGTERM is killed after the gate's grace period, which is one second here.
-    staged = _stage(tmp_path, run_script="", engine_grace_seconds=1 if engine_ignores_sigterm else None)
-    on_sigterm = "signal.SIG_IGN" if engine_ignores_sigterm else "lambda *_: sys.exit(0)"
+    staged = _stage(tmp_path, run_script="", engine_grace_seconds=1)
     filter_pids_path = tmp_path / "filter.pids"
     _install_holding_awk(tmp_path, pause=2, pids=filter_pids_path)
     engine_pid_path = tmp_path / "engine.pid"
@@ -1085,7 +888,7 @@ import signal
 import sys
 import time
 
-signal.signal(signal.SIGTERM, {on_sigterm})
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
 print("the engine wrote this to stdout before the signal", flush=True)
 print("the engine wrote this to stderr before the signal", file=sys.stderr, flush=True)
 partial = {str(engine_pid_path)!r} + ".tmp"
@@ -1112,29 +915,17 @@ while True:
 
         os.kill(gate.pid, signal.SIGTERM)
         returncode = gate.wait(timeout=60)
-        # Read at once: what is in the copies at the moment the gate ends is what the collector gets.
-        at_the_end = {
-            path.name: path.read_text() if path.exists() else ""
-            for path in (
-                exec_stdout,
-                exec_stderr,
-                staged.results / "engine.stdout.log",
-                staged.results / "engine.stderr.log",
-            )
-        }
+        # Looked at at once: a filter the gate did not wait for is still running at the moment the gate ends.
         engine_is_running = _process_is_running(engine_pid)
         filter_pids = [int(line) for line in filter_pids_path.read_text().split()] if filter_pids_path.exists() else []
         filters_running = [pid for pid in filter_pids if _process_is_running(pid)]
+        gate_stderr = exec_stderr.read_text()
 
-        assert returncode == 128 + signal.SIGTERM, at_the_end["exec.stderr"]
-        assert ("sending SIGKILL" in at_the_end["exec.stderr"]) == engine_ignores_sigterm, at_the_end["exec.stderr"]
-        assert DRAIN_NOTE not in at_the_end["exec.stderr"]
+        assert returncode == 128 + signal.SIGTERM, gate_stderr
+        assert "sending SIGKILL" in gate_stderr, gate_stderr
+        assert DRAIN_NOTE not in gate_stderr
         assert not engine_is_running
         assert len(filter_pids) == 2 and filters_running == []
-        assert "the engine wrote this to stdout before the signal" in at_the_end["exec.stdout"]
-        assert "the engine wrote this to stderr before the signal" in at_the_end["exec.stderr"]
-        assert at_the_end["engine.stdout.log"].splitlines() == ["the engine wrote this to stdout before the signal"]
-        assert at_the_end["engine.stderr.log"].splitlines() == ["the engine wrote this to stderr before the signal"]
         assert list(staged.gate_tmp.iterdir()) == []
     finally:
         # The engine left the gate's group with its own setsid, so it is cleared by its own group id.

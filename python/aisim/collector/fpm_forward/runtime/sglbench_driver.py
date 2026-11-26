@@ -161,8 +161,8 @@ writes it into the ``producer`` block. It ran on engines on 2026-11-25, through 
 AISim's collector, on H200 GPUs with one dense model (``Qwen/Qwen3-0.6B``): three prefill cells of a smoke
 grid with SGLang 0.5.23 (one GPU with a bfloat16 and with an FP8 KV cache, and two GPUs at ``--tp-size 2``,
 where both headers held the same dtype) and two decode cells of a smoke grid with SGLang 0.5.22 (one GPU,
-one for each KV cache). All five passed. Headers that disagree, a header without the key and a value the
-recorder marked unreadable have run in the tests only, as has format 3 under DP attention.
+one for each KV cache). All five passed. Headers that disagree and a value the recorder marked unreadable have
+run in the tests only, as has format 3 under DP attention; a header without the key has run in no test.
 
 A spike of the same day ran stock SGLang at both releases with the same model and layout, without this module:
 a script of its own sent SGLang's public batch call with SGLANG_ENABLE_COLOCATED_BATCH_GEN set and read the logs
@@ -203,8 +203,8 @@ import sglbench_grid as grid
 # ---------------------------------------------------------------------------------------------------------------
 
 # What the recorder writes, repeated here because this module may import only the three sibling modules named
-# in its docstring. tests/unit/collector/test_fpm_sglbench_driver.py compares each value with the recorder's
-# and the version list with the one of sglbench_compat.py.
+# in its docstring. The end-to-end tests of tests/unit/collector/test_fpm_sglbench_launcher.py run this driver on
+# the logs of the real recorder; no test compares the version list with the one of sglbench_compat.py.
 RECORD_FORMAT = 3
 RECORDER_CLASS_NAME = "SglbenchRecorderScheduler"
 LOG_FILE_PREFIX = "sched-"
@@ -279,7 +279,7 @@ _ONE_OUTPUT_TOKEN = grid.PREFILL_OUTPUT_TOKENS
 _KVWARM_DATASET_KEYS = ("path", "sha256", "collection_pool", "conversations")
 
 # How the message of the content plan begins when a text chain has used every conversation of the pool
-# (sglbench_content.py). tests/unit/collector/test_fpm_sglbench_driver.py compares it with what the plan raises.
+# (sglbench_content.py). test_fpm_sglbench_content.py expects these words of the plan; no test compares this copy.
 _POOL_EXHAUSTED = "text pool exhausted"
 
 # The response keys of one request, as the engine object returns them.

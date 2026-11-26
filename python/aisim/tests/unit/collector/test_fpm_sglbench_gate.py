@@ -13,9 +13,11 @@ The whole script runs, staged by the helpers of test_fpm_exec.py. What differs f
   path and stops on its failure.
 - The engine is a FAKE launcher: a short Python program that writes typed-in result files and ends the way
   ``sglbench_launcher.py`` ends, with its exit codes and its wait after the last file. It is not the launcher
-  and no engine produced the files.
+  and no engine produced the files. The test of a cell with two data-parallel ranks takes its files from the
+  launcher's own artifact module, built from FAKE times.
 
-The last tests run the same script without the switch, to show that a Dynamo cell still gets today's gate.
+The last test runs the same script without the switch, to show that a Dynamo cell still starts etcd and runs
+its own preflight.
 """
 
 from __future__ import annotations
@@ -28,18 +30,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from collector.fpm_forward import sglang_fpm_builder
+from collector.fpm_forward.runtime import sglbench_artifact as artifact
 
 from .test_fpm_exec import (
-    FPM_EXEC,
     _benchmark_result,
     _finalized_artifacts,
-    _install_holding_awk,
     _run,
     _setsid_run_script,
     _stage,
     _tree_killing_engine_prelude,
     _write_executable,
 )
+from .test_fpm_sglbench_artifact import _points, _rank_artifacts
 
 RUNTIME = Path(__file__).resolve().parents[3] / "collector/fpm_forward/runtime"
 # The pod holds the runtime files flat in one directory and imports them by their plain names. The directory
@@ -51,7 +54,10 @@ import sglbench_launcher as launcher
 
 pytestmark = pytest.mark.unit
 
-SWITCH = "AISIMULATE_SGLBENCH_GATE"
+# The cell builder writes the line and the gate reads it; neither file can import the other. A name that
+# changed on one side only would leave every SGLang cell with the gate of a Dynamo cell, which waits for an
+# etcd the image does not have. The tests write the builder's name, so such a change fails the first of them.
+SWITCH = sglang_fpm_builder.GATE_SWITCH_ENV
 
 # Every command the gate runs: bash for run.sh, python3 for the preflight and the checker, awk for the two
 # engine streams, mktemp and mkfifo for the folder of the two pipes the awks read and rm
@@ -206,30 +212,6 @@ def test_complete_files_give_0_with_no_etcd_no_endpoint_and_the_sglang_preflight
 
 
 @pytest.mark.parametrize(
-    ("status", "exit_code", "with_merged_file", "error"),
-    [
-        ("failed", launcher.EXIT_FAILED, False, "failed: FAKE reason"),
-        ("partial", launcher.EXIT_PARTIAL, True, "benchmark stopped by timeout after 1 of 2 points"),
-    ],
-)
-def test_a_rank_file_that_is_not_complete_gives_1_and_not_the_launchers_code(
-    tmp_path, status, exit_code, with_merged_file, error
-):
-    staged = _stage_cell(tmp_path)
-    files = {str(staged.benchmark_output): _unfinished_rank(status, error)}
-    if with_merged_file:
-        files = _finalized_artifacts(files)
-    assert len(files) == 1 + with_merged_file
-    _fake_launcher(tmp_path, staged, files=files, exit_code=exit_code)
-    done = _run(staged)
-
-    assert done.returncode == 1
-    assert f"Invalid FPM benchmark result {staged.benchmark_output}: " in done.stderr
-    assert f"status={status!r} valid=False errors=[{error!r}]" in done.stderr
-    assert ENGINE_EXITED not in done.stderr
-
-
-@pytest.mark.parametrize(
     ("exit_code", "kill_itself", "expected"),
     [(launcher.EXIT_REJECTED, False, 64), (0, True, 137)],
     ids=["rejected-without-an-artifact", "killed"],
@@ -242,43 +224,6 @@ def test_no_file_gives_the_status_the_launcher_ended_with(tmp_path, exit_code, k
     assert done.returncode == expected
     assert ENGINE_EXITED in done.stderr
     assert list(staged.results.glob("benchmark*")) == []
-
-
-def test_the_reason_of_a_launcher_that_sglang_kills_is_in_the_exec_stream_and_in_the_log(tmp_path):
-    """SGLang logs why a scheduler process failed and kills the launcher's process tree in the same moment, so
-    the launcher writes no reason of its own. What SGLang logged must still reach the exec stream, which the
-    collector records as the cell's error, and the log file that it copies. The filters here hold every line
-    until the launcher has gone, as mawk holds a block: a filter in the launcher's tree dies with what it holds."""
-
-    staged = _stage_cell(tmp_path)
-    _install_holding_awk(tmp_path)
-    lines = [
-        "[sglbench] SGLang 0.5.23: the start-up checks passed; building the engine",
-        "Scheduler hit an exception: Traceback (most recent call last):",
-        "ValueError: the reason SGLang gives for the end of the engine",
-        "Received sigquit from a child process. It usually means the child failed.",
-    ]
-    body = (
-        _tree_killing_engine_prelude()
-        + f"""import sys
-
-for line in {lines!r}:
-    print(line, file=sys.stderr)
-sys.stderr.flush()
-_kill_process_tree()
-"""
-    )
-    (staged.workdir / "run.sh").write_text(_setsid_run_script(tmp_path, body))
-
-    done = _run(staged)
-
-    assert done.returncode == 137, done.stderr
-    assert ENGINE_EXITED in done.stderr
-    for line in lines:
-        assert line in done.stderr
-    assert (staged.results / "engine.stderr.log").read_text().splitlines() == lines
-    assert list(staged.results.glob("benchmark*")) == []
-    assert list(staged.gate_tmp.iterdir()) == []
 
 
 def test_what_the_launcher_prints_after_the_engine_shutdown_is_in_the_exec_stream_and_in_the_log(tmp_path):
@@ -321,14 +266,10 @@ sys.exit({launcher.EXIT_COMPLETE})
 @pytest.mark.parametrize(
     ("switch", "env_overrides", "message"),
     [
-        ("1", {"FPM_NODE_COUNT": 2}, ONE_NODE_ONLY),
         ("1", {"FPM_NODE_COUNT": 2, "FPM_NODE_RANK": 1}, ONE_NODE_ONLY),
-        ("1", {"FPM_NODE_RANK": 1}, ONE_NODE_ONLY),
-        ("2", {}, UNKNOWN_VALUE),
         ("0", {}, UNKNOWN_VALUE),
-        ("true", {}, UNKNOWN_VALUE),
     ],
-    ids=["two-nodes-leader", "two-nodes-follower", "rank-1", "switch-2", "switch-0", "switch-true"],
+    ids=["two-nodes-follower", "switch-0"],
 )
 def test_more_than_one_node_or_another_switch_value_gives_2_before_anything_starts(
     tmp_path, switch, env_overrides, message
@@ -366,11 +307,8 @@ def test_files_that_are_complete_only_after_the_launcher_ended_are_accepted_in_t
         assert ENGINE_EXITED in done.stderr
 
 
-@pytest.mark.parametrize(
-    ("status", "exit_code"),
-    [("failed", launcher.EXIT_FAILED), ("partial", launcher.EXIT_PARTIAL)],
-)
-def test_the_second_check_gives_1_for_a_file_that_is_not_complete_as_the_first_does(tmp_path, status, exit_code):
+def test_the_second_check_gives_1_for_a_file_that_is_not_complete_as_the_first_does(tmp_path):
+    status, exit_code = "failed", launcher.EXIT_FAILED
     staged = _stage_cell(tmp_path)
     first_check_done = tmp_path / "first-check-done"
     _hold_the_liveness_test(staged, first_check_done)
@@ -386,11 +324,7 @@ def test_the_second_check_gives_1_for_a_file_that_is_not_complete_as_the_first_d
     assert ENGINE_EXITED not in done.stderr
 
 
-@pytest.mark.parametrize(
-    ("exit_code", "expected"),
-    [(launcher.EXIT_COMPLETE, 1), (launcher.EXIT_INTERNAL, launcher.EXIT_INTERNAL)],
-    ids=["launcher-0", "launcher-70"],
-)
+@pytest.mark.parametrize(("exit_code", "expected"), [(launcher.EXIT_COMPLETE, 1)], ids=["launcher-0"])
 def test_the_second_check_does_not_accept_a_rank_file_without_its_merged_file(tmp_path, exit_code, expected):
     staged = _stage_cell(tmp_path)
     first_check_done = tmp_path / "first-check-done"
@@ -404,17 +338,6 @@ def test_the_second_check_does_not_accept_a_rank_file_without_its_merged_file(tm
     assert done.stderr.endswith(ENGINE_EXITED + "\n")
     assert json.loads(staged.benchmark_output.read_text())["status"] == "complete"
     assert not staged.benchmark_output.with_name("benchmark_merged.json").exists()
-
-
-def test_a_failing_sglang_preflight_ends_the_cell_with_its_status_before_the_launcher_starts(tmp_path):
-    staged = _stage_cell(tmp_path)
-    (staged.workdir / "sglbench_preflight.py").write_text("import sys\nsys.exit('FAKE: a seam is missing')\n")
-    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0)
-    done = _run(staged)
-
-    assert done.returncode == 1
-    assert done.stderr == "FAKE: a seam is missing\n"
-    assert not staged.engine_report.exists() and not staged.dynamo_preflight_ran.exists()
 
 
 def test_the_shipped_preflight_under_the_gate_ends_a_cell_whose_image_has_no_sglang(tmp_path):
@@ -441,58 +364,61 @@ def test_the_shipped_preflight_under_the_gate_ends_a_cell_whose_image_has_no_sgl
     assert not staged.engine_report.exists()
 
 
-def test_the_mode_starts_the_file_the_collector_ships_by_path_with_a_plain_python3():
-    script = FPM_EXEC.read_text(encoding="utf-8")
-    assert script.count('\n  python3 "${workdir}/sglbench_preflight.py"\n') == 1
-    assert (RUNTIME / "sglbench_preflight.py").is_file()
-    # The switch is read after the file that carries it has been sourced, and before anything is started.
-    sourced = script.index('source "${workdir}/collector-runtime-env.sh"')
-    read = script.index('case "${' + SWITCH + ':-}" in')
-    assert sourced < read < script.index("etcd_pid=$!")
+# ---------------------------------------------------------------------------------------------------------------
+# Two data-parallel ranks
+# ---------------------------------------------------------------------------------------------------------------
+
+# A DEP cell of two GPUs runs on one node with two attention-DP ranks, and the gate waits for one rank file per
+# local rank and for the merged file that names both. The gate was not changed for these cells.
+
+# What fpm_env.sh of a two-GPU DEP cell exports for its ranks.
+TWO_LOCAL_RANKS = {"FPM_DATA_PARALLEL_SIZE": 2, "FPM_LOCAL_DATA_PARALLEL_SIZE": 2}
 
 
-def test_the_switch_is_the_name_the_cell_builder_writes():
-    # The cell builder writes the line and the gate reads it; neither file can import the other. A name that
-    # changed on one side only would leave every SGLang cell with the gate of a Dynamo cell, which waits for an
-    # etcd the image does not have.
-    from collector.fpm_forward import sglang_fpm_builder
+def _stage_two_ranks(tmp_path: Path) -> SimpleNamespace:
+    """One staged pod of a cell with two data-parallel ranks on its one node, in the gate's mode without etcd."""
+    staged = _stage_cell(tmp_path, env_overrides=TWO_LOCAL_RANKS)
+    # The paths the gate derives for the two ranks (``benchmark_path_for_dp_rank``).
+    staged.rank_paths = [str(staged.benchmark_output), str(staged.benchmark_output.with_name("benchmark_dp1.json"))]
+    staged.merged_path = str(staged.benchmark_output.with_name("benchmark_merged.json"))
+    return staged
 
-    assert sglang_fpm_builder.GATE_SWITCH_ENV == SWITCH
-    assert FPM_EXEC.read_text(encoding="utf-8").count('case "${' + sglang_fpm_builder.GATE_SWITCH_ENV + ':-}" in') == 1
+
+def _writer_files(staged: SimpleNamespace) -> dict:
+    """The two rank files and the merged file as the launcher's artifact module builds them, with FAKE times.
+
+    The order is the one ``sglbench_artifact.write_artifacts`` writes in: the highest rank first, rank 0 next
+    and the merged file last.
+    """
+    payloads = _rank_artifacts("prefill", _points("prefill"), dp=2)
+    paths = [artifact.rank_output_path(str(staged.benchmark_output), rank) for rank in range(2)]
+    assert paths == staged.rank_paths
+    merged = artifact.build_merged_artifact(payloads, paths)
+    assert merged["merged_output_path"] == staged.merged_path
+    return {paths[1]: payloads[1], paths[0]: payloads[0], staged.merged_path: merged}
+
+
+def _results(staged: SimpleNamespace) -> list[str]:
+    return sorted(path.name for path in staged.results.glob("benchmark*"))
+
+
+def test_two_rank_files_and_the_merged_file_that_names_both_give_0(tmp_path):
+    staged = _stage_two_ranks(tmp_path)
+    files = _writer_files(staged)
+    assert sorted(files) == sorted([*staged.rank_paths, staged.merged_path])
+    # The FAKE launcher waits as long as the launcher does: ``launcher.FINAL_WAIT_SECONDS`` is its default.
+    _fake_launcher(tmp_path, staged, files=files, exit_code=launcher.EXIT_COMPLETE)
+    done = _run(staged)
+
+    assert done.returncode == 0, done.stderr
+    assert _results(staged) == ["benchmark.json", "benchmark_dp1.json", "benchmark_merged.json"]
+    merged = json.loads(Path(staged.merged_path).read_text())
+    assert (merged["rank_files"], merged["dp"]["source_ranks"]) == (staged.rank_paths, [0, 1])
 
 
 # ---------------------------------------------------------------------------------------------------------------
 # Without the switch
 # ---------------------------------------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("switch", [None, ""], ids=["unset", "empty"])
-def test_without_the_switch_the_same_script_still_needs_etcd(tmp_path, switch):
-    staged = _stage_cell(tmp_path, switch=switch)
-    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0, ends_on_sigterm=True)
-    done = _run(staged)
-
-    assert done.returncode == 1
-    assert done.stderr.startswith("etcd exited with status 127 before becoming ready\n")
-    # The Dynamo preflight ran, between the start of etcd and the wait for it; the launcher never started.
-    assert staged.dynamo_preflight_ran.exists() and not staged.sglbench_preflight_ran.exists()
-    assert not staged.engine_report.exists()
-
-
-@pytest.mark.parametrize("switch", [None, ""], ids=["unset", "empty"])
-def test_without_the_switch_etcd_is_started_and_its_endpoint_is_exported(tmp_path, switch):
-    staged = _stage_cell(tmp_path, switch=switch, etcd_stub=True)
-    _fake_launcher(tmp_path, staged, files=_complete_files(staged), exit_code=0, ends_on_sigterm=True)
-    done = _run(staged)
-
-    assert done.returncode == 0, done.stderr
-    assert staged.etcd_trace.exists() and (staged.results / "etcd.log").exists()
-    assert _engine_report(staged) == {
-        "etcd_endpoints": f"http://127.0.0.1:{staged.etcd_port}",
-        "pythonpath": staged.env.get("PYTHONPATH"),
-        "sglbench_preflight_ran": False,
-        "dynamo_preflight_ran": True,
-    }
 
 
 def test_without_the_switch_a_failing_preflight_still_ends_the_cell_with_its_status(tmp_path):

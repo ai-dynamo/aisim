@@ -93,7 +93,7 @@ from typing import Any
 # Constants
 # ---------------------------------------------------------------------------------------------------------------
 
-# The only envelope version both checkers accept. The test pins it to
+# The only envelope version both checkers accept. The tests start the gate with
 # aisim.fpm_contract.FPM_NATIVE_BENCHMARK_RESULT_SCHEMA_VERSION, which the pod cannot import.
 SCHEMA_VERSION = 2
 

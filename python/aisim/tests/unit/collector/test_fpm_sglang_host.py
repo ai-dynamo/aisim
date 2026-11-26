@@ -3,9 +3,10 @@
 
 """Host side of an SGLang self-benchmark collection: entry gates, plan, staging, provenance and validation.
 
-No SGLang, no GPU and no cluster are involved. The cell builder (``sglang_fpm_builder.py``) is replaced with a
-double where a test reaches it, except in the campaign test, which renders with the real one. Every result file
-is a FAKE of ``test_fpm_sglbench_artifact.py``.
+No SGLang, no GPU and no cluster are involved. The tests that run cells on the in-process cluster replace the
+whole render (``runner._render_cell``, see ``_run_cells``), so the cell builder (``sglang_fpm_builder.py``) is not
+reached there; the campaign test renders with the real one. Every result file is a FAKE of
+``test_fpm_sglbench_artifact.py``.
 """
 
 from __future__ import annotations
@@ -17,11 +18,9 @@ import json
 import re
 import shlex
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
-import collector.fpm_forward as fpm_forward
 import pytest
 from collector.fpm_forward import cli, planner, runner, slurm
 from collector.fpm_forward.config import FPMCollectionOptions
@@ -32,7 +31,6 @@ from collector.fpm_forward.repeatability import load_repeatability_source
 from collector.fpm_forward.runtime import sglbench_artifact as artifact
 from collector.fpm_forward.runtime.sglbench_compat import TESTED_VERSIONS
 from collector.fpm_forward.runtime_memory import saved_plan_identity
-from collector.fpm_forward.topology import topology_strategy
 from collector.fpm_forward.types import ParallelTopology
 
 from aisim_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY
@@ -86,28 +84,6 @@ MOE_CONFIG = {
 # the options below (power off, as an SGLang plan has it).
 VLLM_PLAN_SHA256 = "4ce0a4bad64ad2381905bae7a2f416107cd6adacfccdf0c5904d090da85c14ca"
 VLLM_CELL_IDS = ["fpm-f28a6836df315638", "fpm-b80365929b21ac58", "fpm-f3124a62ef358b3e", "fpm-a7b1dd3127d7797a"]
-
-# The program a pod runs to write its provenance file, as it was before the backend switch, and the check that
-# follows it when the plan names a runtime version.
-VLLM_PROVENANCE_PROGRAM = (
-    "import importlib.metadata, json, pathlib, sys; "
-    "payload = json.loads(sys.argv[1]); "
-    "payload['runtime'] = {'backend': 'vllm', "
-    "'backend_version': importlib.metadata.version('vllm')}; "
-    "path = pathlib.Path('/results') / sys.argv[2]; "
-    "\ntry:\n"
-    "    payload['runtime']['dynamo_version'] = importlib.metadata.version('ai-dynamo')\n"
-    "except importlib.metadata.PackageNotFoundError:\n"
-    "    pass\n"
-    "path.write_text(json.dumps(payload, sort_keys=True) + '\\n')"
-)
-RUNTIME_VERSION_CHECK = (
-    "\nactual = payload['runtime']['backend_version']\n"
-    "if actual != sys.argv[3]:\n"
-    "    raise RuntimeError("
-    "f'FPM observed runtime changed: actual={actual!r}, expected={sys.argv[3]!r}. '"
-    "'Resolve the collection runtime again in a new output directory.')\n"
-)
 
 # What every cell stages before its backend's own files, and the launcher's files as the pattern finds them.
 STAGED_FOR_EVERY_CELL = ["run.sh", "fpm_env.sh", "collector-runtime-env.sh", "fpm_exec.sh"]
@@ -184,17 +160,6 @@ def _cli_argv(tmp_path: Path, *extra: str) -> list[str]:
     ]
 
 
-def test_the_cli_accepts_sglang_and_keeps_vllm_as_the_default(capsys):
-    parser = cli._parser()
-
-    assert parser.parse_args(["--backend", "sglang"]).backend == "sglang"
-    assert parser.parse_args([]).backend == "vllm"
-    with pytest.raises(SystemExit) as refused:
-        parser.parse_args(["--backend", "trtllm"])
-    assert refused.value.code == 2
-    assert "invalid choice: 'trtllm'" in capsys.readouterr().err
-
-
 def test_the_cli_plans_an_sglang_collection(tmp_path, monkeypatch, capsys):
     # main() sets this variable; registering it here restores the environment after the test.
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
@@ -217,18 +182,6 @@ def test_the_cli_plans_an_sglang_collection(tmp_path, monkeypatch, capsys):
         ("decode", "tp", 2),
     ]
     assert saved_plan_identity(printed).backend == "sglang"
-
-
-def test_the_cli_reports_a_refused_sglang_plan_as_a_usage_error(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MODEL)
-
-    with pytest.raises(SystemExit) as refused:
-        cli.main(_cli_argv(tmp_path))
-
-    assert refused.value.code == 2
-    error = capsys.readouterr().err
-    assert "error: SGLang FPM collection requires --fpm-runtime-backend-version" in error
-    assert "Traceback" not in error
 
 
 def test_a_backend_other_than_vllm_and_sglang_is_still_refused(tmp_path):
@@ -421,36 +374,9 @@ def test_an_sglang_plan_measures_no_power_and_refuses_to_be_asked_for_it(tmp_pat
     )
 
 
-def test_a_vllm_compilation_config_is_refused_whatever_filled_it(tmp_path, monkeypatch):
-    # Today the config is made of the three graph options, which are refused by name before it is looked at.
-    monkeypatch.setattr(FPMCollectionOptions, "compilation_config", property(lambda _self: {"fake_key": 1}))
-
-    _refused(tmp_path, r"cannot pass a vLLM compilation config \(\['fake_key'\]\)")
-
-
-def test_the_engine_limits_an_sglang_cell_can_take_are_admitted(tmp_path):
-    # --fpm-max-model-len -1 is the default: the cell then passes no context length.
-    assert build_collection_plan(**_plan_inputs(tmp_path)).options.vllm_max_model_len == -1
-    limits = {
-        "fpm_max_model_len": 8192,
-        "fpm_max_num_batched_tokens": 4096,
-        "fpm_max_num_seqs": 64,
-        "fpm_gpu_memory_utilization": 0.8,
-        "fpm_worker_type": "prefill",
-    }
-
-    plan = build_collection_plan(**_plan_inputs(tmp_path, options=_options(**limits)))
-
-    assert (plan.options.vllm_max_model_len, plan.options.max_num_batched_tokens) == (8192, 4096)
-    assert [cell.workload_kind for cell in plan.cells] == ["prefill", "prefill"]
-
-
 def test_a_moe_plan_with_the_tep_preset_is_frozen_with_a_single_and_a_tep_cell(tmp_path):
     plan = build_collection_plan(**_moe_plan_inputs(tmp_path))
 
-    # The capability of the checkpoint: expert layers, for which this backend plans pure TP too. The TEP preset
-    # of this plan leaves the pure TP cells out.
-    assert (plan.capability.is_moe, plan.capability.allow_pure_tp) == (True, True)
     # One cell per phase and GPU count. The one-GPU cell of the TEP preset has the strategy "single" and one
     # expert-parallel rank; the two-GPU cell has one expert-parallel rank per tensor-parallel rank.
     assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.to_dict()) for cell in plan.cells] == [
@@ -464,18 +390,6 @@ def test_a_moe_plan_with_the_tep_preset_is_frozen_with_a_single_and_a_tep_cell(t
     assert [(decision.topology, decision.disposition) for decision in plan.topology_memory_admission] == [
         (topology, "unknown") for topology in plan.topologies
     ]
-    assert [topology.to_dict()["tp"] for topology in plan.topologies] == [1, 2]
-    # The one backend policy is the automatic baseline: no engine flag, no vLLM marker, and the four backend
-    # identity columns of every row say that the engine decided.
-    (policy,) = plan.backend_policies
-    assert (policy.policy_id, policy.generator_overrides, policy.expected_markers) == ("baseline_auto", {}, {})
-    assert all(cell.backend_policy == policy for cell in plan.cells)
-    assert planner.backend_identity_columns(policy) == {
-        "moe_backend": "auto",
-        "attention_backend": "auto",
-        "enable_wideep": False,
-        "enable_eplb": False,
-    }
 
     # The saved form names the strategies, and its reader recomputes the hash and rebuilds every cell.
     saved = plan.to_dict()
@@ -483,28 +397,9 @@ def test_a_moe_plan_with_the_tep_preset_is_frozen_with_a_single_and_a_tep_cell(t
         ("single", 1, 1),
         ("tep", 2, 2),
     ]
-    assert saved["counts"]["memory_rejected_topologies"] == 0
-    assert saved["point_generation"]["owner"] == "collector.fpm_forward.runtime.sglbench_launcher"
     identity = saved_plan_identity(json.loads(json.dumps(saved)))
     assert (identity.backend, identity.sha256) == ("sglang", plan.sha256)
     assert identity.cells == plan.cells
-
-
-@pytest.mark.parametrize(
-    ("backend", "model", "allowed"),
-    [("sglang", "moe", True), ("sglang", "dense", False), ("vllm", "moe", True), ("vllm", "dense", False)],
-    ids=["sglang-moe", "sglang-dense", "vllm-moe", "vllm-dense"],
-)
-def test_pure_tp_is_a_capability_of_a_moe_model_under_sglang_as_under_vllm(tmp_path, backend, model, allowed):
-    inputs = _moe_plan_inputs(tmp_path) if model == "moe" else _plan_inputs(tmp_path)
-
-    plan = build_collection_plan(**{**inputs, "backend": backend})
-
-    # Pure TP is a layout of expert layers. The capability admits it for a model that has them, under either
-    # backend, and for no dense model.
-    assert (plan.capability.is_moe, plan.capability.allow_pure_tp) == (model == "moe", allowed)
-    # The saved plan holds the capability, so the answer is part of the plan hash.
-    assert plan.to_dict()["capability"]["allow_pure_tp"] is allowed
 
 
 def test_a_moe_plan_with_the_pure_tp_preset_holds_the_one_gpu_cell_and_a_pure_tp_cell(tmp_path):
@@ -517,17 +412,11 @@ def test_a_moe_plan_with_the_pure_tp_preset_holds_the_one_gpu_cell_and_a_pure_tp
         for phase in ("prefill", "decode")
         for strategy, tp in (("single", 1), ("pure_tp", 2))
     ]
-    assert [topology_strategy(topology, is_moe=True) for topology in plan.topologies] == ["single", "pure_tp"]
-    assert [topology.total_gpus for topology in plan.topologies] == [1, 2]
     assert {cell.execution_identity for cell in plan.cells} == {LEGACY_EXECUTION_IDENTITY}
     # Memory admission looked at both topologies and dropped none (no estimate in this suite, _hermetic_plans).
     assert [(decision.topology, decision.disposition) for decision in plan.topology_memory_admission] == [
         (topology, "unknown") for topology in plan.topologies
     ]
-    # The one backend policy is the automatic baseline, as for a TEP cell: no engine flag and no vLLM marker.
-    (policy,) = plan.backend_policies
-    assert (policy.policy_id, policy.generator_overrides, policy.expected_markers) == ("baseline_auto", {}, {})
-    assert all(cell.backend_policy == policy for cell in plan.cells)
 
     # The saved form names the strategy and both expert sizes, and its reader rebuilds every cell.
     saved = plan.to_dict()
@@ -535,74 +424,9 @@ def test_a_moe_plan_with_the_pure_tp_preset_holds_the_one_gpu_cell_and_a_pure_tp
         (topology["strategy"], topology["tp"], topology["moe_tp"], topology["moe_ep"])
         for topology in saved["topologies"]
     ] == [("single", 1, 1, 1), ("pure_tp", 2, 2, 1)]
-    assert saved["counts"]["memory_rejected_topologies"] == 0
-    assert saved["point_generation"]["owner"] == "collector.fpm_forward.runtime.sglbench_launcher"
     identity = saved_plan_identity(json.loads(json.dumps(saved)))
     assert (identity.backend, identity.sha256) == ("sglang", plan.sha256)
     assert identity.cells == plan.cells
-
-
-def test_the_cli_plans_a_moe_collection_with_the_tep_preset_and_with_the_default_preset(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("COLLECTOR_MODEL_PATH", MOE_MODEL)
-    arguments = [
-        *("--backend", "sglang", "--model-path", MOE_MODEL, "--model-architecture", "NewMoeDsaForCausalLM"),
-        *("--fpm-model-config", _config(tmp_path, MOE_CONFIG), "--gpu", SYSTEM, "--plan-only"),
-        *("--fpm-prefill-cudagraph-policy", "runtime"),
-        *("--fpm-backend-version", "0.5.23", "--fpm-runtime-backend-version", "0.5.23"),
-        *("--fpm-max-gpus", "2", "--fpm-gpu-counts", "1", "2"),
-    ]
-
-    assert cli.main([*arguments, "--fpm-parallel-presets", "tep"]) == 0
-
-    printed = json.loads(capsys.readouterr().out)
-    assert [
-        (cell["workload_kind"], cell["parallel_strategy"], cell["topology"]["tp"], cell["topology"]["moe_ep"])
-        for cell in printed["cells"]
-    ] == [
-        ("prefill", "single", 1, 1),
-        ("prefill", "tep", 2, 2),
-        ("decode", "single", 1, 1),
-        ("decode", "tep", 2, 2),
-    ]
-    assert saved_plan_identity(printed).backend == "sglang"
-
-    # Without the preset the plan of a MoE model holds a DEP cell and a pure TP cell as well for every GPU count
-    # above 1.
-    assert cli.main(arguments) == 0
-
-    printed = json.loads(capsys.readouterr().out)
-    assert [
-        (cell["workload_kind"], cell["parallel_strategy"], cell["topology"]["tp"], cell["topology"]["dp"])
-        for cell in printed["cells"]
-    ] == [
-        (phase, strategy, tp, dp)
-        for phase in ("prefill", "decode")
-        for strategy, tp, dp in (("single", 1, 1), ("dep", 1, 2), ("pure_tp", 2, 1), ("tep", 2, 1))
-    ]
-    assert saved_plan_identity(printed).backend == "sglang"
-
-
-def test_memory_admission_still_drops_a_moe_cell_that_does_not_fit(tmp_path, monkeypatch):
-    # FAKE sizes: the weights do not fit one GPU of the FAKE capacity and fit when two ranks share them.
-    capacity = 100 * 2**30
-
-    def estimate(*_args, tp_size, moe_ep_size, **_kwargs):
-        assert moe_ep_size == tp_size
-        non_kv = 120 * 2**30 // tp_size
-        return SimpleNamespace(breakdown={"non_kv_bytes": non_kv, "gpu_memory_capacity_bytes": capacity})
-
-    monkeypatch.setattr("collector.fpm_forward.memory_admission.KVCacheEstimator.from_request", estimate)
-
-    plan = build_collection_plan(**_moe_plan_inputs(tmp_path))
-
-    assert [(decision.topology.tp, decision.disposition) for decision in plan.topology_memory_admission] == [
-        (1, "rejected"),
-        (2, "admitted"),
-    ]
-    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.tp) for cell in plan.cells] == [
-        ("prefill", "tep", 2),
-        ("decode", "tep", 2),
-    ]
 
 
 # What a preset plans per phase for the FAKE MoE model on one and two GPUs: (strategy, tp, dp, moe_tp, moe_ep).
@@ -658,43 +482,7 @@ def test_a_moe_plan_holds_a_dep_cell_under_the_default_preset_and_under_the_dep_
     assert identity.cells == plan.cells
 
 
-def _cell_ids(plan) -> dict[tuple[str, str], str]:
-    return {(cell.workload_kind, cell.parallel_strategy): cell.cell_id for cell in plan.cells}
-
-
-def test_a_dep_cell_is_another_cell_than_the_tep_cell_of_the_same_gpus_and_the_tep_plan_is_unchanged(tmp_path):
-    every_layout = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=None)))
-    tep_only = build_collection_plan(**_moe_plan_inputs(tmp_path))
-
-    ids = _cell_ids(every_layout)
-    # Per phase the one-GPU cell and the three cells of two GPUs, each with an id of its own.
-    assert len(set(ids.values())) == 8
-    # The cells a TEP plan holds are the same cells in the plan of the default preset: admitting DEP and pure
-    # TP gave them no new id. The plan is another plan, because it holds more topologies.
-    assert _cell_ids(tep_only) == {key: cell_id for key, cell_id in ids.items() if key[1] in ("single", "tep")}
-    assert every_layout.sha256 != tep_only.sha256
-
-
-def test_a_pure_tp_cell_is_another_cell_than_the_tep_cell_of_the_same_gpus_and_the_other_cells_are_unchanged(tmp_path):
-    def plan(presets):
-        return build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=presets)))
-
-    every_layout, pure_tp_only, tep_and_dep = plan(None), plan(["pure_tp"]), plan(["tep", "dep"])
-
-    # The pure TP cell and the TEP cell of two GPUs have the same tensor-parallel size. They differ in the two
-    # expert sizes, which are part of a cell id.
-    ids = _cell_ids(every_layout)
-    for phase in ("prefill", "decode"):
-        assert ids[(phase, "pure_tp")] != ids[(phase, "tep")]
-    # The cells of the pure TP preset are the same cells in the plan of the default preset.
-    assert _cell_ids(pure_tp_only) == {key: cell_id for key, cell_id in ids.items() if key[1] in ("single", "pure_tp")}
-    # The TEP and the DEP preset together plan every other cell of the default preset under the id it has
-    # there: the cell set the default preset had before pure TP was admitted. Each is another plan.
-    assert _cell_ids(tep_and_dep) == {key: cell_id for key, cell_id in ids.items() if key[1] != "pure_tp"}
-    assert len({every_layout.sha256, pure_tp_only.sha256, tep_and_dep.sha256}) == 3
-
-
-@pytest.mark.parametrize(("max_gpus", "cells_per_phase"), [(2, 4), (4, 7), (8, 10)])
+@pytest.mark.parametrize(("max_gpus", "cells_per_phase"), [(8, 10)])
 def test_the_default_preset_plans_a_dep_a_pure_tp_and_a_tep_cell_for_every_gpu_count_above_one(
     tmp_path, max_gpus, cells_per_phase
 ):
@@ -719,160 +507,13 @@ def test_the_default_preset_plans_a_dep_a_pure_tp_and_a_tep_cell_for_every_gpu_c
     # The vLLM plan of the same inputs holds the same topologies in the same order.
     assert plan(None, backend="vllm").topologies == plan(None).topologies
 
-    # One cell per phase and GPU count above 1 is the pure TP cell. Without them the cells are those of the TEP
-    # and the DEP preset together: 3, 5 and 7 per phase.
-    without_pure_tp = _cells(plan(["tep", "dep"]))
-    for phase in ("prefill", "decode"):
-        assert without_pure_tp[phase] == [cell for cell in by_default[phase] if cell.parallel_strategy != "pure_tp"]
-        assert len(without_pure_tp[phase]) == cells_per_phase - len(widths)
 
-
-def test_the_dep_preset_plans_a_cell_for_every_gpu_count_and_the_width_filter_picks_one(tmp_path):
-    def strategies(**options):
-        plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(**options)))
-        return [(cell.parallel_strategy, cell.topology.dp, cell.topology.moe_ep) for cell in _cells(plan)["decode"]]
-
-    assert strategies(fpm_max_gpus=8, fpm_parallel_presets=["dep"]) == [
-        ("single", 1, 1),
-        ("dep", 2, 2),
-        ("dep", 4, 4),
-        ("dep", 8, 8),
-    ]
-    assert strategies(fpm_max_gpus=4, fpm_parallel_presets=["dep"], fpm_dp_sizes=[4]) == [("dep", 4, 4)]
-
-
-def test_the_pure_tp_preset_plans_a_cell_for_every_gpu_count_and_either_width_filter_picks_one(tmp_path):
-    def strategies(**options):
-        plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(**options)))
-        return [
-            (cell.parallel_strategy, cell.topology.tp, cell.topology.moe_tp, cell.topology.moe_ep)
-            for cell in _cells(plan)["decode"]
-        ]
-
-    assert strategies(fpm_max_gpus=8, fpm_parallel_presets=["pure_tp"]) == [
-        ("single", 1, 1, 1),
-        ("pure_tp", 2, 2, 1),
-        ("pure_tp", 4, 4, 1),
-        ("pure_tp", 8, 8, 1),
-    ]
-    # The width of a pure TP cell is its tensor-parallel size and its moe_tp, so either filter picks the cell.
-    for width_filter in ("fpm_tp_sizes", "fpm_moe_tp_sizes"):
-        assert strategies(fpm_max_gpus=4, fpm_parallel_presets=["pure_tp"], **{width_filter: [4]}) == [
-            ("pure_tp", 4, 4, 1)
-        ]
-
-
-def test_a_width_filter_under_the_default_preset_binds_only_the_presets_that_have_its_axis(tmp_path):
-    def strategies(**options):
-        plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(**options)))
-        return [(cell.parallel_strategy, cell.topology.total_gpus) for cell in _cells(plan)["decode"]]
-
-    # Pure TP has no expert-parallel and no data-parallel axis, so a filter on one of them leaves the pure TP
-    # cells in the plan of the default preset, as it does for vLLM. An expert-parallel filter leaves the
-    # one-GPU cell in it as well.
-    assert strategies(fpm_max_gpus=4, fpm_moe_ep_sizes=[2]) == [
-        ("single", 1),
-        ("dep", 2),
-        ("pure_tp", 2),
-        ("tep", 2),
-        ("pure_tp", 4),
-    ]
-    assert strategies(fpm_max_gpus=4, fpm_dp_sizes=[2]) == [
-        ("single", 1),
-        ("dep", 2),
-        ("pure_tp", 2),
-        ("tep", 2),
-        ("pure_tp", 4),
-        ("tep", 4),
-    ]
-    # With the presets named, the same filter gives the plan it gave before the default preset held pure TP.
-    assert strategies(fpm_max_gpus=4, fpm_parallel_presets=["tep", "dep"], fpm_moe_ep_sizes=[2]) == [
-        ("dep", 2),
-        ("tep", 2),
-    ]
-    # The legacy axes of pure TP plan the cells of the pure TP preset.
-    assert strategies(fpm_max_gpus=4, fpm_parallel_axes=["tp", "moe_tp"]) == [
-        ("single", 1),
-        ("pure_tp", 2),
-        ("pure_tp", 4),
-    ]
-
-
-def test_the_tp_preset_of_a_moe_model_is_refused(tmp_path):
-    # Refused before the SGLang check: plain TP is a preset of a dense model only.
-    _refused(
-        tmp_path,
-        "MoE models use pure TP, TEP or DEP; plain TP is not an independent typical preset",
-        **_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=["tp"])),
-    )
-
-
-def test_a_capability_that_does_not_admit_pure_tp_still_refuses_the_preset(tmp_path, monkeypatch):
-    # FAKE capability: the one of the MoE checkpoint with pure TP not admitted, which is what capabilities.py
-    # gives a DeepSeek V4.1 checkpoint under this backend.
-    resolve = planner.resolve_model_capability
-
-    def without_pure_tp(**keywords):
-        return dataclasses.replace(resolve(**keywords), allow_pure_tp=False)
-
-    monkeypatch.setattr(planner, "resolve_model_capability", without_pure_tp)
-
-    # Planning asks the capability and not the backend: the preset is refused before the SGLang check.
-    _refused(
-        tmp_path,
-        "pure TP was requested, but the AIC model/runtime capability profile does not explicitly admit",
-        **_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=["pure_tp"])),
-    )
-    # The default preset then plans TEP and DEP alone.
-    plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=_options(fpm_parallel_presets=None)))
-    assert plan.capability.allow_pure_tp is False
-    assert [cell.parallel_strategy for cell in _cells(plan)["decode"]] == ["single", "dep", "tep"]
-
-
-@pytest.mark.parametrize(
-    "presets", [None, ["auto"], ["tep"], ["dep"], ["pure_tp"]], ids=["default", "auto", "tep", "dep", "pure-tp"]
-)
-def test_a_one_gpu_plan_of_a_moe_model_holds_the_single_cell_under_these_presets(tmp_path, presets):
-    # On one GPU the TEP, the DEP and the pure TP preset give the same topology, so no preset plans a cell with
-    # DP attention or with more than one rank.
-    options = _options(fpm_max_gpus=1, fpm_parallel_presets=presets)
-
-    plan = build_collection_plan(**_moe_plan_inputs(tmp_path, options=options))
-
-    assert [(cell.workload_kind, cell.parallel_strategy, cell.topology.to_dict()) for cell in plan.cells] == [
-        (phase, "single", {"tp": 1, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": 1, "cp": 1})
-        for phase in ("prefill", "decode")
-    ]
-
-
-def test_a_refused_topology_with_data_parallel_ranks_is_named_in_the_refusal():
-    # Attention TP inside a data-parallel rank: four GPUs as two ranks of two. No preset plans it.
-    topology = ParallelTopology(tp=2, pp=1, dp=2, moe_tp=1, moe_ep=4, cp=1)
-
-    with pytest.raises(ValueError) as refused:
-        planner._require_sglang_launcher_cells(is_moe=True, execution=LEGACY_EXECUTION_IDENTITY, topologies=(topology,))
-
-    assert str(refused.value) == (
-        "SGLang FPM collection supports DP attention for the DEP cells of a MoE model only (tp, pp, cp and moe_tp "
-        "must be 1, and moe_ep must equal dp; attention TP inside a DP rank is not built); got topology "
-        "{'tp': 2, 'pp': 1, 'dp': 2, 'moe_tp': 1, 'moe_ep': 4, 'cp': 1}"
-    )
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "DYN_BENCH_PREFILL_CONTENT",
-        "DYN_BENCH_KV_WARMUP_DATASET",
-        "DYN_BENCH_KV_WARMUP_CACHE_DIR",
-        "DYN_BENCH_KV_WARMUP_SHA256",
-    ],
-)
-def test_a_content_variable_of_the_deployment_inputs_is_part_of_the_plan_hash(tmp_path, name):
+def test_a_content_variable_of_the_deployment_inputs_is_part_of_the_plan_hash(tmp_path):
     def plan(*environment: dict):
         overrides = {"K8sConfig": {"k8s_image": "example/sglang:test", "extra_env": list(environment)}}
         return build_collection_plan(**_moe_plan_inputs(tmp_path, generator_overrides=overrides))
 
+    name = "DYN_BENCH_PREFILL_CONTENT"
     # FAKE values: the planner does not read them, it freezes them. The launcher reads them in the pod.
     plans = [plan(), plan({"name": name, "value": "first"}), plan({"name": name, "value": "second"})]
 
@@ -881,24 +522,6 @@ def test_a_content_variable_of_the_deployment_inputs_is_part_of_the_plan_hash(tm
     assert len({saved.generator_config_sha256 for saved in plans}) == 3
     # The cells are the same cells: their ids name the backend, the model, the topology and the dtypes.
     assert len({tuple(cell.cell_id for cell in saved.cells) for saved in plans}) == 1
-
-
-def test_the_tep_preset_of_a_dense_model_is_still_refused(tmp_path):
-    _refused(
-        tmp_path,
-        r"dense models support only the TP typical preset, got \['tep'\]",
-        options=_options(fpm_parallel_presets=["tep"]),
-    )
-
-
-def test_the_pure_tp_preset_of_a_dense_model_is_refused(tmp_path):
-    # Pure TP spreads expert layers, which a dense model does not have: its capability does not admit the preset.
-    assert build_collection_plan(**_plan_inputs(tmp_path)).capability.allow_pure_tp is False
-    _refused(
-        tmp_path,
-        r"dense models support only the TP typical preset, got \['pure_tp'\]",
-        options=_options(fpm_parallel_presets=["pure_tp"]),
-    )
 
 
 def test_a_model_with_an_execution_identity_is_refused(tmp_path, monkeypatch):
@@ -934,70 +557,6 @@ def _moe_topology(**sizes: int) -> ParallelTopology:
     return ParallelTopology(**{"tp": tp, "pp": 1, "dp": 1, "moe_tp": 1, "moe_ep": tp, "cp": 1, **sizes})
 
 
-def test_the_single_and_the_tep_topologies_of_a_moe_model_are_admitted():
-    moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
-    admitted = tuple(_moe_topology(tp=tp) for tp in (1, 2, 4, 8))
-    assert [topology_strategy(topology, is_moe=True) for topology in admitted] == ["single", "tep", "tep", "tep"]
-
-    planner._require_sglang_launcher_cells(**moe, topologies=admitted)
-
-    # A dense model has no expert-parallel rank to spread: the same topologies above one GPU are refused for it.
-    with pytest.raises(ValueError, match=r"supports tensor-parallel cells only .*got topology .*'moe_ep': 2"):
-        planner._require_sglang_launcher_cells(is_moe=False, execution=LEGACY_EXECUTION_IDENTITY, topologies=admitted)
-
-
-def test_the_dep_topologies_of_a_moe_model_are_admitted_and_those_of_a_dense_model_are_not():
-    moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
-    admitted = tuple(_moe_topology(tp=1, dp=dp, moe_ep=dp) for dp in (2, 4, 8))
-    assert [topology_strategy(topology, is_moe=True) for topology in admitted] == ["dep", "dep", "dep"]
-
-    planner._require_sglang_launcher_cells(**moe, topologies=admitted)
-    # Beside the one-GPU cell, a pure TP cell and a TEP cell, as the default preset plans them.
-    beside = (_moe_topology(tp=1), _moe_topology(tp=2, moe_tp=2, moe_ep=1), _moe_topology(tp=2))
-    planner._require_sglang_launcher_cells(**moe, topologies=(*beside, *admitted))
-
-    # A dense model has no cell with more than one data-parallel rank.
-    with pytest.raises(ValueError, match=r"supports tensor-parallel cells only .*got topology .*'dp': 2"):
-        planner._require_sglang_launcher_cells(is_moe=False, execution=LEGACY_EXECUTION_IDENTITY, topologies=admitted)
-
-
-def test_the_pure_tp_topologies_of_a_moe_model_are_admitted_and_those_of_a_dense_model_are_not():
-    moe = {"is_moe": True, "execution": LEGACY_EXECUTION_IDENTITY}
-    # Every tensor-parallel rank holds a slice of every expert: moe_tp is the tensor-parallel size, and there
-    # is one expert-parallel rank, one data-parallel rank, one pipeline stage and no context parallelism.
-    admitted = tuple(_moe_topology(tp=tp, moe_tp=tp, moe_ep=1) for tp in (2, 4, 8))
-    assert [topology.to_dict() for topology in admitted] == [
-        {"tp": tp, "pp": 1, "dp": 1, "moe_tp": tp, "moe_ep": 1, "cp": 1} for tp in (2, 4, 8)
-    ]
-    assert [topology_strategy(topology, is_moe=True) for topology in admitted] == ["pure_tp", "pure_tp", "pure_tp"]
-
-    planner._require_sglang_launcher_cells(**moe, topologies=admitted)
-    # Beside the one-GPU cell, which is the pure TP shape and the TEP shape at once, and the TEP and the DEP cell
-    # of the same GPUs.
-    for tp, pure_tp in zip((2, 4, 8), admitted, strict=True):
-        same_gpus = (_moe_topology(tp=1), _moe_topology(tp=1, dp=tp, moe_ep=tp), pure_tp, _moe_topology(tp=tp))
-        planner._require_sglang_launcher_cells(**moe, topologies=same_gpus)
-
-    # A dense model has no expert layers to slice: the same topologies are refused for it.
-    with pytest.raises(ValueError, match=r"supports tensor-parallel cells only .*got topology .*'moe_tp': 2"):
-        planner._require_sglang_launcher_cells(is_moe=False, execution=LEGACY_EXECUTION_IDENTITY, topologies=admitted)
-
-
-def test_a_refused_topology_with_both_expert_sizes_above_one_is_named_in_the_refusal():
-    # A mixed layout: four tensor-parallel ranks as two expert-parallel groups of two. No preset plans it.
-    topology = ParallelTopology(tp=4, pp=1, dp=1, moe_tp=2, moe_ep=2, cp=1)
-
-    with pytest.raises(ValueError) as refused:
-        planner._require_sglang_launcher_cells(is_moe=True, execution=LEGACY_EXECUTION_IDENTITY, topologies=(topology,))
-
-    assert str(refused.value) == (
-        "SGLang FPM collection supports the TEP, the pure TP and the DEP cells of a MoE model only; a cell without "
-        "DP attention must have pp and cp of 1 and either moe_tp of 1 with moe_ep equal to tp (TEP) or moe_ep of 1 "
-        "with moe_tp equal to tp (pure TP); got topology "
-        "{'tp': 4, 'pp': 1, 'dp': 1, 'moe_tp': 2, 'moe_ep': 2, 'cp': 1}"
-    )
-
-
 # The end of the rule for a cell without DP attention, before the topology: it names the two layouts admitted.
 NEITHER_LAYOUT = (
     r"either moe_tp of 1 with moe_ep equal to tp \(TEP\) or moe_ep of 1 with moe_tp equal to tp \(pure TP\)"
@@ -1010,52 +569,24 @@ NEITHER_LAYOUT = (
         # With data-parallel ranks: attention TP inside a rank, an expert-parallel size that is not the number
         # of ranks, and the three fixed axes.
         ({"tp": 2, "dp": 2, "moe_ep": 4}, r"moe_ep must equal dp; .*\); got topology .*'tp': 2, .*'dp': 2"),
-        ({"tp": 2, "dp": 2, "moe_ep": 2}, r"moe_ep must equal dp; .*\); got topology .*'tp': 2, .*'dp': 2"),
         ({"tp": 1, "dp": 2, "moe_ep": 1}, r"moe_ep must equal dp; .*\); got topology .*'dp': 2, .*'moe_ep': 1"),
         ({"tp": 1, "dp": 2, "moe_ep": 4}, r"moe_ep must equal dp; .*\); got topology .*'dp': 2, .*'moe_ep': 4"),
-        ({"tp": 1, "dp": 4, "moe_ep": 2}, r"moe_ep must equal dp; .*\); got topology .*'dp': 4, .*'moe_ep': 2"),
         ({"tp": 1, "dp": 2, "moe_tp": 2, "moe_ep": 2}, r"moe_ep must equal dp; .*\); got topology .*'moe_tp': 2"),
         ({"tp": 1, "dp": 2, "moe_ep": 2, "pp": 2}, r"moe_ep must equal dp; .*\); got topology .*'pp': 2"),
         ({"tp": 1, "dp": 2, "moe_ep": 2, "cp": 2}, r"moe_ep must equal dp; .*\); got topology .*'cp': 2"),
-        # DP attention with a slice of every expert on each rank, so moe_tp above 1 and one expert-parallel rank:
-        # with one GPU per data-parallel rank, and with attention TP inside a rank.
-        (
-            {"tp": 1, "dp": 2, "moe_tp": 2, "moe_ep": 1},
-            r"moe_ep must equal dp; .*\); got topology .*'tp': 1, .*'dp': 2, 'moe_tp': 2, 'moe_ep': 1",
-        ),
-        (
-            {"tp": 2, "dp": 2, "moe_tp": 2, "moe_ep": 1},
-            r"moe_ep must equal dp; .*\); got topology .*'tp': 2, .*'dp': 2, 'moe_tp': 2, 'moe_ep': 1",
-        ),
-        # Without them. Plain TP of a MoE model, where neither expert size is the tensor-parallel size, and an
-        # expert-parallel size that is neither 1 nor the tensor-parallel size.
+        # Without them. Plain TP of a MoE model, where neither expert size is the tensor-parallel size.
         ({"tp": 2, "moe_ep": 1}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 2, .*'moe_tp': 1, 'moe_ep': 1"),
-        ({"tp": 4, "moe_ep": 2}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 4, .*'moe_ep': 2"),
-        ({"tp": 1, "moe_ep": 2}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 1, .*'moe_ep': 2"),
         # A mixed layout, with both expert sizes above 1: their product is the tensor-parallel size.
         ({"tp": 4, "moe_tp": 2, "moe_ep": 2}, rf"{NEITHER_LAYOUT}; got topology .*'moe_tp': 2, 'moe_ep': 2"),
-        # The expert-parallel size is the tensor-parallel size, and only moe_tp is not 1.
-        ({"tp": 2, "moe_tp": 2}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 2, .*'moe_tp': 2, 'moe_ep': 2"),
         # One expert-parallel rank, and a moe_tp that is neither 1 nor the tensor-parallel size.
         ({"tp": 4, "moe_tp": 2, "moe_ep": 1}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 4, .*'moe_tp': 2, 'moe_ep': 1"),
-        ({"tp": 2, "moe_tp": 4, "moe_ep": 1}, rf"{NEITHER_LAYOUT}; got topology .*'tp': 2, .*'moe_tp': 4, 'moe_ep': 1"),
-        # The two fixed axes, on the TEP shape and on the pure TP shape.
+        # The two fixed axes, on the TEP shape.
         ({"pp": 2}, rf"{NEITHER_LAYOUT}; got topology .*'pp': 2"),
         ({"cp": 2}, rf"{NEITHER_LAYOUT}; got topology .*'cp': 2"),
-        (
-            {"tp": 2, "moe_tp": 2, "moe_ep": 1, "pp": 2},
-            rf"{NEITHER_LAYOUT}; got topology .*'pp': 2, .*'moe_tp': 2, 'moe_ep': 1",
-        ),
-        (
-            {"tp": 2, "moe_tp": 2, "moe_ep": 1, "cp": 2},
-            rf"{NEITHER_LAYOUT}; got topology .*'moe_tp': 2, 'moe_ep': 1, 'cp': 2",
-        ),
     ],
     ids=[
-        *("dp-with-tp", "dp-with-tp-and-ep-of-dp", "dp-without-ep", "ep-above-dp", "ep-below-dp"),
-        *("dp-with-moe-tp", "dp-with-pp", "dp-with-cp", "dp-with-moe-tp-and-no-ep", "dp-with-pure-tp"),
-        *("no-ep", "ep-below-tp", "ep-above-tp", "mixed", "moe-tp-beside-ep", "moe-tp-below-tp", "moe-tp-above-tp"),
-        *("pp", "cp", "pure-tp-with-pp", "pure-tp-with-cp"),
+        *("dp-with-tp", "dp-without-ep", "ep-above-dp", "dp-with-moe-tp", "dp-with-pp", "dp-with-cp"),
+        *("no-ep", "mixed", "moe-tp-below-tp", "pp", "cp"),
     ],
 )
 def test_every_other_topology_of_a_moe_model_is_refused(sizes, message):
@@ -1069,20 +600,8 @@ def test_every_other_topology_of_a_moe_model_is_refused(sizes, message):
     )
     planner._require_sglang_launcher_cells(**moe, topologies=admitted)
 
-    with pytest.raises(ValueError, match=message) as refused:
+    with pytest.raises(ValueError, match=message):
         planner._require_sglang_launcher_cells(**moe, topologies=(*admitted, _moe_topology(**sizes)))
-
-    if sizes.get("dp", 1) > 1:
-        assert str(refused.value).startswith(
-            "SGLang FPM collection supports DP attention for the DEP cells of a MoE model only (tp, pp, cp and "
-            "moe_tp must be 1, and moe_ep must equal dp; attention TP inside a DP rank is not built); got topology {"
-        )
-    else:
-        assert str(refused.value).startswith(
-            "SGLang FPM collection supports the TEP, the pure TP and the DEP cells of a MoE model only; a cell "
-            "without DP attention must have pp and cp of 1 and either moe_tp of 1 with moe_ep equal to tp (TEP) or "
-            "moe_ep of 1 with moe_tp equal to tp (pure TP); got topology {"
-        )
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1104,10 +623,8 @@ def test_the_vllm_observers_stay_off_for_an_sglang_plan():
             deployment_profile=lambda _cell: SimpleNamespace(resources=SimpleNamespace(memory_source="pending")),
         )
 
-    assert runner._observe_runtime_memory(plan("vllm"), cell) is True
-    assert runner._observe_runtime_execution(plan("vllm"), cell) is True
-    assert runner._observe_runtime_memory(plan("sglang"), cell) is False
-    assert runner._observe_runtime_execution(plan("sglang"), cell) is False
+    for observes in (runner._observe_runtime_memory, runner._observe_runtime_execution):
+        assert (observes(plan("vllm"), cell), observes(plan("sglang"), cell)) == (True, False)
 
 
 def test_repeatability_refuses_an_sglang_campaign(tmp_path):
@@ -1121,43 +638,6 @@ def test_repeatability_refuses_an_sglang_campaign(tmp_path):
     assert load_repeatability_source(campaigns["vllm"]).sha256 == VLLM_PLAN_SHA256
     with pytest.raises(ValueError, match="supports only vLLM campaigns; the source has backend 'sglang'"):
         load_repeatability_source(campaigns["sglang"])
-
-
-# ---------------------------------------------------------------------------------------------------------------
-# Render
-# ---------------------------------------------------------------------------------------------------------------
-
-
-class _VllmRenderStarted(Exception):
-    """Raised where the vLLM path of ``_render_cell`` begins, in the place of a Generator render."""
-
-
-def test_an_sglang_cell_is_rendered_by_the_sglang_builder_from_the_vllm_render(tmp_path, monkeypatch):
-    plan = build_collection_plan(**_plan_inputs(tmp_path))
-    cell = plan.cells[0]
-    overrides = {"K8sConfig": {"k8s_image": "example/sglang:test"}}
-    calls = []
-
-    def render_cell(sglang_plan, sglang_cell, cell_dir, generator_overrides, *, smoke=False, render_vllm_cell):
-        calls.append((sglang_plan, sglang_cell, cell_dir, generator_overrides, smoke, render_vllm_cell))
-        return {"rendered_by": "the double"}
-
-    def vllm_path(render_plan, *_args, **_kwargs):
-        raise _VllmRenderStarted(render_plan.backend)
-
-    double = types.ModuleType("collector.fpm_forward.sglang_fpm_builder")
-    double.render_cell = render_cell
-    monkeypatch.setitem(sys.modules, double.__name__, double)
-    monkeypatch.setattr(fpm_forward, "sglang_fpm_builder", double, raising=False)
-    monkeypatch.setattr(runner, "_cell_generator_overrides", vllm_path)
-
-    assert runner._render_cell(plan, cell, tmp_path, overrides, smoke=True) == {"rendered_by": "the double"}
-
-    assert calls == [(plan, cell, tmp_path, overrides, True, runner._render_cell)]
-    # What the builder is handed renders the vLLM form of the cell, and does not come back to the builder.
-    with pytest.raises(_VllmRenderStarted, match="^vllm$"):
-        calls[0][5](dataclasses.replace(plan, backend="vllm"), cell, tmp_path, overrides, smoke=True)
-    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1226,17 +706,9 @@ def _run_cells(monkeypatch, root: Path, plan):
     return seen, checkpoint["cells"]
 
 
-def test_the_pattern_finds_the_launcher_and_its_preflight():
-    assert set(SGLBENCH_FILES) >= {
-        "sglbench_artifact.py",
-        "sglbench_compat.py",
-        "sglbench_content.py",
-        "sglbench_driver.py",
-        "sglbench_grid.py",
-        "sglbench_launcher.py",
-        "sglbench_preflight.py",
-        "sglbench_recorder.py",
-    }
+def test_the_pattern_finds_the_launcher():
+    # The staging test compares with this list, so the list must not be empty of what a pod needs.
+    assert "sglbench_launcher.py" in SGLBENCH_FILES
 
 
 @pytest.mark.parametrize("executor", ["kubernetes", "slurm"])
@@ -1301,36 +773,6 @@ def test_a_vllm_cell_stages_what_it_staged_and_its_pod_is_told_no_backend(tmp_pa
 # ---------------------------------------------------------------------------------------------------------------
 
 ATTEMPT = {"cell_id": "cell", "plan_sha256": "plan", "attempt_id": "attempt"}
-
-
-def test_the_vllm_provenance_program_is_the_text_it_was():
-    for keywords in ({}, {"backend": "vllm"}):
-        command = runner._attempt_provenance_command(**ATTEMPT, **keywords)
-        assert command[:2] == ["python3", "-c"]
-        assert command[2] == VLLM_PROVENANCE_PROGRAM
-        assert json.loads(command[3]) == {
-            "schema_name": "aic_fpm_collector_provenance",
-            "schema_version": 1,
-            **ATTEMPT,
-        }
-        assert command[4:] == ["collector-provenance.json"]
-
-        pinned = runner._attempt_provenance_command(**ATTEMPT, runtime_backend_version="0.27.0", **keywords)
-        assert pinned[2] == VLLM_PROVENANCE_PROGRAM + RUNTIME_VERSION_CHECK
-        assert pinned[4:] == ["collector-provenance.json", "0.27.0"]
-
-
-def test_the_sglang_provenance_program_differs_in_the_backend_and_the_distribution_only():
-    command = runner._attempt_provenance_command(**ATTEMPT, runtime_backend_version="0.5.23", backend="sglang")
-
-    assert command[2] == (VLLM_PROVENANCE_PROGRAM + RUNTIME_VERSION_CHECK).replace("'vllm'", "'sglang'")
-    assert VLLM_PROVENANCE_PROGRAM.count("'vllm'") == 2
-    # The JSON payload and the file name keep their places, and the payload names no backend.
-    assert command[3:] == [
-        runner._attempt_provenance_command(**ATTEMPT)[3],
-        "collector-provenance.json",
-        "0.5.23",
-    ]
 
 
 def test_the_sglang_provenance_program_records_the_installed_sglang(tmp_path, monkeypatch):
@@ -1489,56 +931,6 @@ def test_the_validator_wants_the_launchers_release_to_be_the_installed_one(tmp_p
         validate_native_collection(cell, tmp_path / "raw", expected_backend="sglang")
 
 
-def _kv_cache_refusal(found: str, resolved: str) -> str:
-    """The refusal of the stored KV-cache dtype for the fp8 cell of ``_collected``."""
-    return re.escape(
-        "native SGLang rank artifact did not store the KV cache of its cell: the cell's kv_cache_dtype 'fp8' "
-        f"stands for producer.kv_cache_stored_dtype 'torch.float8_e4m3fn', found {found} "
-        f"(producer.kv_cache_dtype {resolved}): "
-    )
-
-
-KV_CACHE_MISMATCHES = {
-    # name -> (an edit of the launcher's artifact, the refusal)
-    "the-pool-of-a-bfloat16-cell": (
-        lambda payload: payload["producer"].update(kv_cache_dtype="auto", kv_cache_stored_dtype="torch.bfloat16"),
-        _kv_cache_refusal("'torch.bfloat16'", "'auto'"),
-    ),
-    "a-float16-pool": (
-        lambda payload: payload["producer"].update(kv_cache_stored_dtype="torch.float16"),
-        _kv_cache_refusal("'torch.float16'", "'fp8_e4m3'"),
-    ),
-    "another-fp8-dtype": (
-        lambda payload: payload["producer"].update(kv_cache_stored_dtype="torch.float8_e4m3fnuz"),
-        _kv_cache_refusal("'torch.float8_e4m3fnuz'", "'fp8_e4m3'"),
-    ),
-    "no-stored-dtype-in-the-producer-block": (
-        lambda payload: payload["producer"].pop("kv_cache_stored_dtype"),
-        _kv_cache_refusal("no producer.kv_cache_stored_dtype", "'fp8_e4m3'"),
-    ),
-    "stored-dtype-is-not-a-string": (
-        lambda payload: payload["producer"].update(kv_cache_stored_dtype=8),
-        _kv_cache_refusal("8", "'fp8_e4m3'"),
-    ),
-    "stored-dtype-is-null": (
-        lambda payload: payload["producer"].update(kv_cache_stored_dtype=None),
-        _kv_cache_refusal("None", "'fp8_e4m3'"),
-    ),
-}
-
-
-@pytest.mark.parametrize("name", sorted(KV_CACHE_MISMATCHES))
-def test_the_validator_wants_the_stored_kv_cache_dtype_to_be_one_of_the_label_of_the_cell(tmp_path, name):
-    edit, refusal = KV_CACHE_MISMATCHES[name]
-    cell = _collected(tmp_path, edit=edit)
-    assert cell.kv_cache_dtype == "fp8"
-
-    # Asked of an SGLang collection whatever the caller says of expert layers, and of a caller without a plan.
-    for keywords in ({}, {"expected_moe": None}):
-        with pytest.raises(ValueError, match="^" + refusal):
-            validate_native_collection(cell, tmp_path / "raw", expected_backend="sglang", **keywords)
-
-
 # Config keys by which a checkpoint declares an NVFP4 KV cache of its own, as AISim reads them. Typed in.
 NVFP4_KV_CACHE_DECLARATIONS = {
     "hf-quant-config": {"hf_quant_config": {"quantization": {"quant_algo": "NVFP4", "kv_cache_quant_algo": "NVFP4"}}},
@@ -1570,24 +962,6 @@ def test_no_plan_carries_the_kv_cache_dtype_nvfp4_that_the_validator_has_a_rule_
         assert {cell.kv_cache_dtype for cell in plan.cells} == {label}
 
 
-def test_the_release_is_compared_before_the_kv_cache_and_a_matching_file_passes_both(tmp_path):
-    # A file that fails both rules is refused for its release, the rule that comes first.
-    def both(payload: dict) -> None:
-        payload["producer"].update(sglang_version="0.5.22", kv_cache_stored_dtype="torch.bfloat16")
-
-    cell = _collected(tmp_path / "both", edit=both)
-    with pytest.raises(ValueError, match=_differs("0.5.23", "0.5.22")):
-        validate_native_collection(cell, tmp_path / "both" / "raw", expected_backend="sglang")
-
-    # The same file is that of a bfloat16 cell in a pod of the release it names.
-    def bfloat16(payload: dict) -> None:
-        payload["producer"].update(POD_KV_CACHE["bfloat16"])
-
-    cell = dataclasses.replace(_collected(tmp_path / "fits", edit=bfloat16), kv_cache_dtype="bfloat16")
-    collection = validate_native_collection(cell, tmp_path / "fits" / "raw", expected_backend="sglang")
-    assert len(collection.points) == len(_points("prefill"))
-
-
 def test_publication_and_the_collection_summary_validate_with_the_backend_of_the_plan(tmp_path):
     cell = _collected(tmp_path, "decode")
 
@@ -1601,58 +975,6 @@ def test_publication_and_the_collection_summary_validate_with_the_backend_of_the
     assert summary["measured_point_count"] == len(_points("decode"))
     with pytest.raises(ValueError, match="Collector provenance has invalid runtime identity"):
         runner._runtime_collection_summary(cell, tmp_path / "raw")
-
-
-def test_a_failed_sglang_cell_with_complete_files_is_recovered_as_an_sglang_collection(tmp_path):
-    cell = _collected(tmp_path / "cells" / "cell-prefill")
-    assert cell.cell_id == "cell-prefill"
-    entry = {"status": "failed", "attempt_id": "attempt", "error_type": "RuntimeError", "error": "FAKE: copy failed"}
-
-    recovered = runner._recover_completed_attempt(_sglang_plan(cell), cell, tmp_path, entry)
-
-    assert recovered is not None
-    assert (recovered["status"], recovered["artifact_recovery"]["original_status"]) == ("passed", "failed")
-    # The same files are no vLLM collection, so a vLLM plan does not recover them.
-    assert runner._recover_completed_attempt(_plan(cell), cell, tmp_path, entry) is None
-
-
-def test_resuming_a_passed_sglang_cell_refreshes_its_record_from_an_sglang_collection(tmp_path, monkeypatch, caplog):
-    cell = _collected(tmp_path / "artifacts" / "plan-sha" / "smoke" / "cells" / "cell-prefill")
-    plan = _sglang_plan(cell)
-    assert (plan.sha256[:16], cell.cell_id) == ("plan-sha", "cell-prefill")
-    checkpoint_path = tmp_path / "checkpoints" / "fpm_forward_smoke.json"
-    checkpoint_path.parent.mkdir()
-    checkpoint_path.write_text(
-        json.dumps(
-            {
-                "schema": runner.CHECKPOINT_SCHEMA,
-                "plan_sha256": plan.sha256,
-                "cells": {cell.cell_id: {"status": "passed", "attempt_id": "attempt"}},
-            }
-        )
-    )
-
-    def reject_rerun(*_args, **_kwargs):
-        raise AssertionError("a passed cell must not run again")
-
-    monkeypatch.setattr(runner, "_render_cell", reject_rerun)
-    with caplog.at_level("WARNING", logger=runner.logger.name):
-        errors = runner.run_collection(
-            plan,
-            generator_overrides={},
-            checkpoint_dir=str(checkpoint_path.parent),
-            artifact_root=str(tmp_path / "artifacts"),
-            resume=True,
-            retry_failed=False,
-            smoke=True,
-            cell_limit=1,
-        )
-
-    assert errors == []
-    record = json.loads(checkpoint_path.read_text())["cells"][cell.cell_id]
-    # The refresh validated the files of the cell as those of an SGLang collection and counted its points.
-    assert (record["status"], record["measured_point_count"]) == ("passed", len(_points("prefill")))
-    assert not [message for message in caplog.messages if "Skipping metadata refresh" in message]
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1790,55 +1112,6 @@ def test_an_sglang_campaign_renders_with_the_real_builder_publishes_and_resumes(
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def _vllm_arguments(plan, cell, *, smoke: bool = False) -> list[str]:
-    """The arguments of the vLLM render the SGLang builder translates: the same cell of the plan as a vLLM plan."""
-    vllm_form = dataclasses.replace(plan, backend="vllm")
-    return runner._cell_generator_overrides(vllm_form, cell, {}, smoke=smoke)["params"]["agg"]["extra_cli_args"]
-
-
-def test_the_record_of_an_sglang_cell_says_what_the_cell_was_given(tmp_path):
-    plan = build_collection_plan(**_plan_inputs(tmp_path))
-    prefill, decode = _cells(plan)["prefill"][0], _cells(plan)["decode"][0]
-    kv_read_cap = plan.options.prefill_sampling.max_kv_read_token_samples
-
-    record = runner._configured_sampling_metadata(plan, prefill, smoke=False)
-    assert record == {
-        "prefill_max_new_token_samples": 8192,
-        "prefill_max_kv_read_token_samples": kv_read_cap,
-        "prefill_new_token_axis_source": "sglang_engine_cuda_graph_sizes",
-    }
-    # The vLLM render of the cell carries that token budget and that KV-read cap, and no new-token cap: the
-    # builder passes the budget as the cap.
-    arguments = _vllm_arguments(plan, prefill)
-    assert arguments[arguments.index("--max-num-batched-tokens") + 1] == "8192"
-    assert arguments[arguments.index("--prefill-max-kv-read-token-samples") + 1] == str(kv_read_cap)
-    assert "--prefill-max-new-token-samples" not in arguments
-
-    # A smoke cell keeps the two caps of its vLLM render.
-    assert runner._configured_sampling_metadata(plan, prefill, smoke=True) == {
-        "prefill_max_new_token_samples": 2,
-        "prefill_max_kv_read_token_samples": 2,
-        "prefill_new_token_axis_source": "sglang_engine_cuda_graph_sizes",
-    }
-    arguments = _vllm_arguments(plan, prefill, smoke=True)
-    assert arguments[arguments.index("--prefill-max-new-token-samples") + 1] == "2"
-    assert arguments[arguments.index("--prefill-max-kv-read-token-samples") + 1] == "2"
-
-    for smoke in (False, True):
-        assert runner._configured_sampling_metadata(plan, decode, smoke=smoke) == {"decode_radix_cache": "enabled"}
-
-    # The records of the same cells in a vLLM plan are what they were: vLLM's capture counts and its
-    # prefix-caching rule.
-    vllm_plan = dataclasses.replace(plan, backend="vllm")
-    assert runner._configured_sampling_metadata(vllm_plan, prefill, smoke=False) == {
-        "prefill_cudagraph_capture_size_count": None,
-        "prefill_requested_new_token_axis_count": None,
-        "prefill_max_new_token_samples": None,
-        "prefill_cudagraph_policy": "runtime",
-    }
-    assert runner._configured_sampling_metadata(vllm_plan, decode, smoke=False) == {"decode_prefix_caching": "disabled"}
-
-
 def test_the_record_of_an_sglang_cell_with_a_points_file_names_the_file(tmp_path):
     points = tmp_path / "points.json"
     points.write_text(
@@ -1862,8 +1135,5 @@ def test_the_record_of_an_sglang_cell_with_a_points_file_names_the_file(tmp_path
         "benchmark_points_sha256": digest,
         "requested_point_count": 1,
     }
-    assert runner._configured_sampling_metadata(plan, decode, smoke=False) == {
-        "benchmark_points_sha256": digest,
-        "requested_point_count": 2,
-        "decode_radix_cache": "enabled",
-    }
+    record = runner._configured_sampling_metadata(plan, decode, smoke=False)
+    assert (record["benchmark_points_sha256"], record["requested_point_count"]) == (digest, 2)

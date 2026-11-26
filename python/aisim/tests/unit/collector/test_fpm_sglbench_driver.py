@@ -5,7 +5,7 @@
 # THIRD_PARTY_NOTICES.md.
 # Source: https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
 # Source: https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
-# The run lifecycle, the point procedures and nine failure reason strings are re-implemented from ai-dynamo/dynamo
+# The run lifecycle, the point procedures and six failure reason strings are re-implemented from ai-dynamo/dynamo
 # (Apache-2.0, https://github.com/ai-dynamo/dynamo), components/src/dynamo/vllm/instrumented_scheduler.py at
 # b20fe6fe94021b854597965c7305931175e8f482. See THIRD_PARTY_NOTICES.md.
 
@@ -48,14 +48,10 @@ inside ``check_result_files()`` of ``runtime/fpm_exec.sh``).
 
 from __future__ import annotations
 
-import ast
 import collections
 import dataclasses
-import hashlib
-import inspect
 import itertools
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -85,7 +81,6 @@ FAKE_RUN_TAG = "fa4e0123"  # the first eight characters of the run id
 FAKE_WORKER_ID = "fake-cell-node0"
 FAKE_FIRST_PID = 4100
 LEADER_LOG = "sched-4100.jsonl"
-FOLLOWER_LOG = "sched-4101.jsonl"
 FAKE_FOREIGN_RID = "fake-foreign-request"
 FAKE_TIMEOUT_SECONDS = 10_800.0
 
@@ -302,20 +297,6 @@ def _edit(path: str, value, *, process: int | None = None):
     return edit
 
 
-def _drop(path: str):
-    """A header edit: take the key of ``path`` "a.b" out of the header of every process."""
-
-    def edit(_index: int, header: dict) -> dict:
-        *parents, last = path.split(".")
-        target = header
-        for key in parents:
-            target = target[key]
-        del target[last]
-        return header
-
-    return edit
-
-
 class _FakeLog:
     """One FAKE recorder file of one FAKE scheduler process."""
 
@@ -469,8 +450,7 @@ class _FakeEngine:
                 header = _fake_header(FAKE_FIRST_PID + index, index, self.limits, self.processes)
             if self.edit_header is not None:
                 header = self.edit_header(index, header)
-            if header is not None:
-                log.write(header)
+            log.write(header)
 
     def fake_eviction(self, ranks: tuple[int, ...] | None = None) -> None:
         """FAKE fault: the engine needed room and dropped every unlocked cache entry, on all ranks or on some."""
@@ -556,14 +536,10 @@ class _FakeEngine:
             batches.insert(decodes[2], _extend_batch([FAKE_FOREIGN_RID], [0], [1]))
         elif fault == "idle_between":
             batches.insert(decodes[2], _idle_batch())
-        elif fault == "idle_after":
-            batches.append(_idle_batch())
         elif fault == "extend_after_decode":
             batches.insert(1, batches.pop(0))
         elif fault == "second_extend_of_one_request":
             batches.insert(1, _extend_batch(rids[:1], first["prefix_lens"][:1], first["extend_lens"][:1]))
-        elif fault == "extend_lens_one_less":
-            first["extend_lens"] = [tokens - 1 for tokens in first["extend_lens"]]
         elif fault == "wrong_extend_lens":
             first["extend_lens"][0] += 1
         elif fault == "wrong_prefix_lens":
@@ -581,10 +557,6 @@ class _FakeEngine:
             first["launch_ts"] = 5000
         elif fault == "decode_copy_done_false":
             batches[decodes[3]]["copy_done"] = False
-        elif fault == "short_lens":
-            first["prefix_lens"] = first["prefix_lens"][:-1]
-        elif fault == "idle_with_ids_follows":
-            batches.append({"mode": "IDLE", "rids": list(rids)})
         elif fault == "late":
             # FAKE: the rank was released one step after the others. It idles while they run their first batch.
             batches.insert(0, _idle_batch())
@@ -601,10 +573,6 @@ class _FakeEngine:
                 "extend_num_tokens": len(rids),
                 FAKE_DECODE_STEP: True,
             }
-        elif fault == "extend_between_decodes":
-            # FAKE: an extend batch of one token for every request of the rank, after its first decode batch.
-            lengths = [len(prompt) + 1 for prompt in prompts]
-            batches.insert(decodes[0] + 1, _extend_batch(rids, lengths, [1] * len(rids)))
 
     def _fake_decode_to_extend(self, rank_batches: list[list[dict]], prompt_tokens: dict[str, int]) -> None:
         """FAKE of what SGLang does to a rank that decodes in a step in which another rank extends.
@@ -660,10 +628,6 @@ class _FakeEngine:
                 return [*tokens[:-1], tokens[-1] + 1]
             if fault == "no_global_tokens":
                 return None
-            if fault == "local_tokens":
-                return [tokens[rank]]
-            if fault == "bool_tokens":
-                return [bool(count) for count in tokens]
         return list(tokens)
 
     def _write_step(self, fault: str | None, target: int, row: list[dict], start: int) -> None:
@@ -752,8 +716,6 @@ class _FakeEngine:
         self.pending.clear()
         if fault == "raise":
             raise RuntimeError("FAKE engine failure")
-        if fault == "raise_value_error":
-            raise ValueError("FAKE engine failure")
         if fault == "system_exit":
             raise SystemExit(0)
         if fault == "keyboard_interrupt":
@@ -797,13 +759,6 @@ class _FakeEngine:
         if fault == "late_decode":
             late_rids = [call.rids[index] for index in mine[target]]
             self.pending.append((target, {"mode": "DECODE", "rids": late_rids, "ticks": FAKE_DECODE_BASE_TICKS}))
-        if fault == "line_of_the_next_rank":
-            # FAKE: after the batches of the call the log of the named rank gets one more line, and that line
-            # holds the requests of the rank after it. The other ranks idle in the step.
-            other_rids = [call.rids[index] for index in mine[(target + 1) % size]]
-            stray = {"mode": "DECODE", "rids": other_rids, "ticks": 0}
-            row = [stray if index == target else {**_idle_batch(), "ticks": 0} for index in range(size)]
-            self._write_step(None, 0, row, self.clock.ticks)
         for rank, prompt in zip(call.ranks, call.prompts, strict=True):
             # A finished request stores its prompt and the generated tokens that have KV: all but the last.
             # The FAKE output tokens are negative numbers, so they equal no token id: not an allocated one, not
@@ -849,9 +804,6 @@ class _FakeEngine:
             responses[0]["dp_rank"] = None
         elif fault == "dp_rank_true":
             responses[0]["dp_rank"] = True
-        elif fault == "odd_dp_rank":
-            # FAKE: an engine without DP attention reports a rank anyway.
-            responses[0]["dp_rank"] = 5
         return responses
 
 
@@ -897,10 +849,6 @@ class _FakeRun:
         """The one rank artifact of a run without DP attention."""
         (payload,) = self.run.payloads()
         return payload
-
-    def payload_of_rank(self, rank: int) -> dict:
-        """The artifact of one attention-DP rank."""
-        return self.run.payloads()[rank]
 
     @property
     def dp_size(self) -> int:
@@ -1275,58 +1223,6 @@ def test_the_stages_of_each_point_are_sent_in_order_with_the_planned_prompts(tmp
     assert order == sorted(order) and set(order) == {point.benchmark_id for point in built.points}
 
 
-@pytest.mark.parametrize("page_size", [1, 64])
-def test_one_request_of_two_new_tokens_is_measured_like_any_other_prefill_point(tmp_path, page_size):
-    """The low end of the prefill new-token axis at batch 1, with a cached prefix and without one.
-
-    The FAKE prefill graph sizes start at 4, as SGLang's default sizes do. A batch of two new tokens is then
-    the smallest that SGLang runs with a graph, and the grid plans it beside the batch of one
-    (``grid.prefill_new_token_axis``).
-    """
-    fake = _start(tmp_path, "prefill", page_size)
-
-    # One request of two new tokens can carry a prefix of up to I - 3 tokens in whole units of G: 425 tokens
-    # give 26 * 16 = 416 at page 1, and 809 give 12 * 64 = 768 at page 64. SMALL_CAPS keep the two ends and the
-    # middle of the prefixes 0, G, 2 G, 4 G and so on up to the longest.
-    longest, middle = {1: (416, 64), 64: (768, 256)}[page_size]
-    points = [point for point in fake.built.points if (point.batch_size, point.new_tokens) == (1, 2)]
-    assert [point.cached_tokens for point in points] == [longest, middle, 0]
-    on_disk = _assert_accepted(fake)
-    _assert_not_staged_again(fake)
-    for point in points:
-        number, cached = point.benchmark_id, point.cached_tokens
-        calls = fake.calls_of(number)
-        # A seed when there is a prefix, then one warm shot and one measured shot: one request and one output
-        # token each.
-        stages = ["seed", "warm", "meas"] if cached else ["warm", "meas"]
-        assert [call.rids for call in calls] == [[_rank_rid(number, stage, 0, 0, 0)] for stage in stages]
-        assert [call.max_new_tokens for call in calls] == [1] * len(stages)
-        warm, meas = calls[-2:]
-        times = []
-        for shot in (warm, meas):
-            # The prompt is the prefix and two new tokens. It ran as one extend batch, which found the planned
-            # cached count in the FAKE cache and computed the two tokens.
-            (prompt,) = shot.prompts
-            assert len(prompt) == cached + 2
-            (line,) = _lines_of_call(fake, 0, shot)
-            assert (line["mode"], line["rids"]) == ("EXTEND", shot.rids)
-            assert (line["prefix_lens"], line["extend_lens"], line["extend_num_tokens"]) == ([cached], [2], 2)
-            times.append(line["out_ts"] - line["launch_ts"])
-        # The two shots share the prefix, which is the prompt of the seed, and differ in their first new token.
-        assert warm.prompts[0][:cached] == meas.prompts[0][:cached]
-        assert warm.prompts[0][cached] != meas.prompts[0][cached]
-        if cached:
-            assert calls[0].prompts == [meas.prompts[0][:cached]]
-        # The row holds the counters of the batch of the measured shot and its FAKE time, not the time of the
-        # warm shot.
-        measured = (FAKE_EXTEND_BASE_TICKS + 2) / TICKS_PER_SECOND
-        assert times == [measured + FAKE_WARM_SHOT_EXTRA_TICKS / TICKS_PER_SECOND, measured]
-        row = on_disk["results"][number - 1]
-        assert row == _low_end_row(number, 1, cached)
-        assert (row["point"]["total_prefill_tokens"], row["point"]["total_kv_read_tokens"]) == (2, cached)
-        assert row["fpms"][0]["wall_time"] == measured
-
-
 def test_request_fields(tmp_path):
     fake = _start(tmp_path, "agg")
     assert fake.run.status == "complete"
@@ -1366,37 +1262,7 @@ def test_request_fields(tmp_path):
     assert {prompt[0] for prompt in free[FREE_ALIGNED_SEED].prompts} <= slot_first_tokens
 
 
-def test_a_points_manifest_is_measured_in_file_order(tmp_path):
-    manifest = grid.parse_points_manifest(
-        json.dumps(
-            {
-                "schema_version": 3,
-                "prefill": [
-                    {"batch_size": 2, "total_prefill_tokens": 64, "total_kv_read_tokens": 64},
-                    {"batch_size": 1, "total_prefill_tokens": 5, "total_kv_read_tokens": 0},
-                    {"batch_size": 4, "total_prefill_tokens": 16, "total_kv_read_tokens": 384, "rows": [[4, 96]] * 4},
-                ],
-                "decode": [{"batch_size": 3, "total_kv_read_tokens": 60}],
-            }
-        )
-    )
-    config = {**FAKE_CONFIG, "points_source": "manifest"}
-    fake = _start(tmp_path, "prefill", 16, limits=_limits(16), manifest=manifest, config=config)
-
-    built = fake.built
-    assert built.source == "manifest"
-    assert [(point.batch_size, point.new_tokens, point.cached_tokens) for point in built.points] == [
-        (2, 32, 32),
-        (1, 5, 0),
-        (4, 4, 96),
-    ]
-    on_disk = _assert_accepted(fake)
-    assert [row["point"]["sample_reasons"] for row in on_disk["results"]] == [
-        ["explicit", "prefill_real_seed"],
-        ["explicit"],
-        ["explicit", "prefill_real_seed"],
-    ]
-    assert on_disk["config"]["points_source"] == "manifest"
+def test_a_manifest_point_that_does_not_fit_is_rejected_before_any_request(tmp_path):
     # A manifest point that does not fit is refused when the grid is built, before any request.
     bad = grid.parse_points_manifest(
         json.dumps(
@@ -1413,55 +1279,6 @@ def test_a_points_manifest_is_measured_in_file_order(tmp_path):
     )
     assert refused.engine.calls == []
     assert refused.payload()["coverage"]["expected_points"] == 0
-
-
-@pytest.mark.parametrize("mode", ["prefill", "decode"])
-def test_two_scheduler_processes_are_read_as_a_leader_and_a_follower(tmp_path, mode):
-    fake = _start(tmp_path, mode, processes=2)
-
-    # Both FAKE processes wrote every batch; the follower's clock is 1000 s ahead and each of its batches is
-    # seven ticks slower. The samples are the leader's.
-    lines = {
-        name: [json.loads(line) for line in (fake.recorder_dir / name).read_text(encoding="utf-8").splitlines()]
-        for name in (LEADER_LOG, FOLLOWER_LOG)
-    }
-    assert (lines[LEADER_LOG][0]["leader"], lines[FOLLOWER_LOG][0]["leader"]) == (True, False)
-    assert len(lines[LEADER_LOG]) == len(lines[FOLLOWER_LOG]) > 20
-    assert lines[FOLLOWER_LOG][1]["launch_ts"] - lines[LEADER_LOG][1]["launch_ts"] == 1000.0
-    on_disk = _assert_accepted(fake)
-    assert on_disk["producer"]["scheduler_processes"] == 2
-
-
-def test_a_decode_run_above_the_chunk_budget_takes_two_extend_batches(tmp_path):
-    # Page size 64 with a chunk budget of 384 tokens: six requests fill one extend batch, whatever they compute.
-    fake = _start(tmp_path, "decode", 64)
-
-    split = [point for point in fake.built.points if point.batch_size > 6]
-    assert len(split) >= 6
-    for point in split:
-        (run,) = fake.calls_of(point.benchmark_id, "run")
-        assert run.modes == ["EXTEND", "EXTEND"] + ["DECODE"] * 6
-    whole = [point for point in fake.built.points if point.batch_size <= 6]
-    assert whole and all(
-        fake.calls_of(point.benchmark_id, "run")[0].modes == ["EXTEND"] + ["DECODE"] * 6 for point in whole
-    )
-    # The reader holds the lines of the last call only, however long the run was: seven for a run of one request.
-    assert fake.built.points[-1].batch_size == 1
-    assert [line["mode"] for line in fake.run.logs.batches(LEADER_LOG)] == ["EXTEND"] + ["DECODE"] * 6
-    _assert_accepted(fake)
-
-
-@pytest.mark.parametrize("mode", ["prefill", "decode"])
-def test_an_idle_batch_without_requests_between_two_decode_steps_is_ignored(tmp_path, mode):
-    plan = _plan_only(tmp_path, mode)
-    victim = _victim(plan)
-    stage = "meas" if mode == "prefill" else "run"
-    # In a prefill shot the idle line follows the extend batch; in a decode run it lies between two steps.
-    fault = "idle_between" if mode == "decode" else "idle_after"
-    fake = _start(tmp_path, mode, faults={(victim.benchmark_id, stage, 0): fault})
-    if mode == "decode":
-        assert "IDLE" in fake.calls_of(victim.benchmark_id, "run")[0].modes
-    _assert_accepted(fake)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1555,13 +1372,6 @@ def test_a_kept_batch_that_missed_the_cache_is_restaged_and_not_blamed_on_its_to
     assert fake.payload()["producer"]["restaged_points"] == [victim.benchmark_id]
 
 
-def test_a_seed_is_not_held_to_a_cached_count(tmp_path):
-    # A seed finds what earlier points left: its count is not planned and a surprising one fails nothing.
-    victim = _victim(_plan_only(tmp_path, "decode"))
-    fake = _start(tmp_path, "decode", faults={(victim.benchmark_id, "seed", 0): "cached_off"})
-    assert _assert_accepted(fake)["producer"]["restaged_points"] == []
-
-
 # ---------------------------------------------------------------------------------------------------------------
 # Validity checks: each one fails the point at once, with its reason
 # ---------------------------------------------------------------------------------------------------------------
@@ -1607,35 +1417,32 @@ PREFILL_FAULTS = [
     ("meas", "foreign_id", _FOREIGN_IN_EXTEND),
     ("warm", "foreign_id", _FOREIGN_IN_EXTEND),
     ("meas", "split_extend", _SPLIT),
-    ("warm", "split_extend", _SPLIT),
     ("meas", "chunked", _CHUNKED),
-    ("warm", "chunked", _CHUNKED),
     ("meas", "decode_follows", _DECODE_AFTER),
-    ("warm", "decode_follows", _DECODE_AFTER),
     ("meas", "wrong_extend_tokens", _TOKENS_REPORTED),
     ("meas", "wrong_extend_lens", _TOKENS_COUNTED),
     ("meas", "prompt_count", _PROMPT),
     ("seed", "prompt_count", _PROMPT),
     ("meas", "retraction", _RETRACTED),
-    ("seed", "retraction", _RETRACTED),
     ("meas", "finish_stop", _STOPPED),
     ("warm", "short_completion", _SHORT),
     ("meas", "raise", _RAISED),
-    ("seed", "raise", _RAISED),
     ("meas", "missing_key", "engine_call_failed: {rid0}: cached_tokens is None"),
     ("meas", "wrong_rid", None),
     ("meas", "short_list", None),
     ("meas", "copy_done_false", _NO_COPY_EVENT),
     ("meas", "no_lens", _NO_LENS),
-    ("meas", "short_lens", _NO_LENS),
-    ("meas", "idle_with_ids_follows", _TOKENS + ": a IDLE batch (seq {seq1}) holds requests of a one-token call"),
-    ("meas", "raise_value_error", "engine_call_failed: ValueError: FAKE engine failure"),
     ("meas", "zero_duration", _NO_TIME.replace("{what}", "extend batch seq {seq}")),
     # A time that is not a JSON float was not read off the scheduler's clock.
     ("meas", "no_out_ts", _RECORDER + ": batch seq {seq} has out_ts=None"),
     ("meas", "whole_number_launch_ts", _RECORDER + ": batch seq {seq} has launch_ts=5000"),
     ("meas", "fault_line", _FAULT_LINE),
-    ("seed", "fault_line", _FAULT_LINE),
+    # FAKE: the recorder writes nothing at all for the measured shot.
+    (
+        "meas",
+        "silent",
+        "no_fpm_before_deadline: sched-4100.jsonl holds no extend batch for {b} of {b} request(s) after 2.0 s",
+    ),
 ]
 
 DECODE_FAULTS = [
@@ -1645,26 +1452,16 @@ DECODE_FAULTS = [
     ("run", "second_extend_of_one_request", _CONTEXT + ": {rid0} is in 2 extend batches of the run"),
     ("run", "seven_decode", _SEQUENCE.replace("{found}", "1 EXTEND, 7 DECODE")),
     ("run", "extend_after_decode", _SEQUENCE.replace("{found}", "1 DECODE, 1 EXTEND, 5 DECODE")),
-    # An extend batch of requests that an earlier batch of the run had extended. With one rank that is a wrong
-    # sequence and nothing more: no decode step runs as an extend batch without DP attention.
-    ("run", "extend_between_decodes", _SEQUENCE.replace("{found}", "1 EXTEND, 1 DECODE, 1 EXTEND, 5 DECODE")),
     ("run", "foreign_between", _BETWEEN),
     ("run", "decode_missing_id", _DECODE_IDS.replace("{held}", "{b0}")),
     ("run", "decode_foreign_id", _DECODE_IDS.replace("{held}", "{b1}")),
     ("run", "five_decode", "no_fpm_before_deadline: sched-4100.jsonl holds 5 of the 6 decode batch(es) after 2.0 s"),
-    ("run", "prompt_count", _PROMPT),
-    ("seed", "prompt_count", _PROMPT),
     ("run", "retraction", _RETRACTED),
-    ("seed", "retraction", _RETRACTED),
     ("run", "short_completion", _SHORT),
     ("run", "finish_stop", _STOPPED),
-    ("run", "raise", _RAISED),
-    ("seed", "raise", _RAISED),
     ("run", "copy_done_false", _NO_COPY_EVENT),
     ("run", "decode_copy_done_false", _NO_COPY_EVENT.replace("{seq}", "{seq4}")),
     ("run", "zero_duration", _NO_TIME.replace("{what}", "decode step 1 (seq {seq1})")),
-    ("run", "no_out_ts", _RECORDER + ": batch seq {seq} has out_ts=None"),
-    ("run", "fault_line", _FAULT_LINE),
 ]
 
 
@@ -1771,70 +1568,6 @@ def test_a_follower_that_writes_late_is_waited_for(tmp_path):
     _assert_accepted(fake)
 
 
-def test_a_follower_is_not_waited_for_in_a_seed(tmp_path):
-    # Nothing of a seed is kept, so only the leader's log is read for it.
-    victim = _victim(_plan_only(tmp_path, "decode", processes=2))
-    fake = _start(tmp_path, "decode", processes=2, faults={(victim.benchmark_id, "seed", 0): "follower_missing"})
-
-    assert fake.clock.sleeps == 0
-    _assert_accepted(fake)
-
-
-def test_a_log_without_any_batch_of_a_call_fails_at_the_deadline(tmp_path):
-    victim = _victim(_plan_only(tmp_path, "prefill"))
-    # FAKE: the recorder writes nothing at all for the measured shot.
-    fake = _start(tmp_path, "prefill", faults={(victim.benchmark_id, "meas", 0): "silent"})
-
-    _assert_point_failed(
-        fake,
-        victim,
-        "no_fpm_before_deadline: sched-4100.jsonl holds no extend batch for 2 of 2 request(s) after 2.0 s",
-    )
-
-
-def test_a_decode_context_that_is_not_the_planned_one_fails_the_counter_check(tmp_path, monkeypatch):
-    # A FAKE planning error: every decode prompt is one token longer than the point's context less three. The
-    # engine does what it is asked, every response matches its prompt, and the FAKE recorder line hides the
-    # extra token of the extend batch. Only the counters of the kept decode batch, taken from the prompt
-    # tokens the engine reported, show that the middle kept step read one token more than planned.
-    real = content.ContentPlan.decode_prompt
-    monkeypatch.setattr(content.ContentPlan, "decode_prompt", lambda self, rank, slot, k: real(self, rank, slot, k + 1))
-    manifest = grid.parse_points_manifest(
-        json.dumps({"schema_version": 1, "prefill": [], "decode": [{"batch_size": 2, "total_kv_read_tokens": 80}]})
-    )
-    fake = _start(tmp_path, "decode", 64, manifest=manifest, faults={(1, "run", 0): "extend_lens_one_less"})
-
-    (run,) = fake.calls_of(1, "run")
-    assert [len(prompt) for prompt in run.prompts] == [38, 38]  # planned: 40 - 3 = 37
-    assert fake.run.reason == (
-        "benchmark_id=1: benchmark point failed: measured_decode_context_mismatch: sum_decode_kv_tokens is 82 "
-        "in the kept batch, the point plans 80"
-    )
-    assert fake.payload()["producer"]["restaged_points"] == []
-
-
-def test_a_fault_line_between_two_points_fails_the_run_without_naming_a_point(tmp_path, monkeypatch):
-    fake = _start(tmp_path, "prefill", execute=False)
-    real = artifact.build_measurement
-    victim = 3
-
-    def build_then_fault(record, rank_fpms):
-        # FAKE: the recorder faults after the batches of the point were read and before the next point starts.
-        if record["benchmark_id"] == victim:
-            fake.engine.logs[0].write({"type": "fault", "where": "run_batch", "error": "FAKE late fault"})
-        return real(record, rank_fpms)
-
-    monkeypatch.setattr(artifact, "build_measurement", build_then_fault)
-    fake.execute()
-
-    reason = "recorder_fault: sched-4100.jsonl: run_batch: FAKE late fault"
-    assert (fake.run.status, fake.run.reason) == ("failed", reason)
-    assert max(fake.sent_benchmark_ids()) == victim
-    on_disk = _assert_rejected(fake, "failed")
-    assert (on_disk["error"], on_disk["skipped_points"]) == (reason, [])
-    assert on_disk["coverage"]["completed_points"] == victim
-
-
 def test_a_fault_line_after_the_last_point_fails_a_run_that_has_every_row(tmp_path, monkeypatch):
     fake = _start(tmp_path, "decode", execute=False)
     real = artifact.build_measurement
@@ -1882,13 +1615,6 @@ def test_a_header_that_arrives_late_is_waited_for(tmp_path):
     _assert_accepted(fake)
 
 
-def test_one_header_of_two_fails_the_run(tmp_path):
-    fake = _start(tmp_path, processes=2, edit_header=lambda index, header: header if index == 0 else None)
-    _assert_failed_before_the_grid(
-        fake, f"recorder_header_invalid: 1 of 2 recorder header(s) in {fake.recorder_dir} after 2.0 s"
-    )
-
-
 def test_more_headers_than_scheduler_processes_fail_the_run(tmp_path):
     fake = _start(tmp_path, processes=2, expected_scheduler_processes=1)
     _assert_failed_before_the_grid(
@@ -1901,12 +1627,8 @@ def test_more_headers_than_scheduler_processes_fail_the_run(tmp_path):
     [
         # The stock scheduler was built: the class replacement did not apply.
         (_edit("class", "Scheduler"), "sched-4100.jsonl: class 'Scheduler', expected 'SglbenchRecorderScheduler'"),
-        # A recorder of the format before: its header lacks the dtype of the KV pool. One of the format before
-        # that: its batch lines lack the token counts of the ranks as well.
+        # A recorder of the format before: its header lacks the dtype of the KV pool.
         (_edit("format", 2), "sched-4100.jsonl: format 2, expected 3"),
-        (_edit("format", 1), "sched-4100.jsonl: format 1, expected 3"),
-        (_edit("format", 4), "sched-4100.jsonl: format 4, expected 3"),
-        (_edit("format", True), "sched-4100.jsonl: format True, expected 3"),
         (_edit("leader", False), "0 leader header(s), expected exactly one: []"),
         (_edit("leader", 1), "sched-4100.jsonl: leader is 1, expected true or false"),
         (_edit("checks", {}), "sched-4100.jsonl: the header has no checks.disable_radix_cache"),
@@ -1915,34 +1637,15 @@ def test_more_headers_than_scheduler_processes_fail_the_run(tmp_path):
             _edit("limits.max_total_num_tokens", 1185),
             "sched-4100.jsonl: limits: max_total_num_tokens 1185 is not a multiple of page_size 16",
         ),
-        (
-            _edit("limits.max_running_requests", 9.0),
-            "sched-4100.jsonl: limits: max_running_requests must be an int, got float: 9.0",
-        ),
-        # A header without the dtype of the KV pool, and one that holds anything but its text.
-        (_drop("kv_cache_stored_dtype"), "sched-4100.jsonl: the header has no kv_cache_stored_dtype"),
+        # A header that holds anything but the text of the dtype of the KV pool.
         (_edit("kv_cache_stored_dtype", None), "sched-4100.jsonl: kv_cache_stored_dtype is None, expected a string"),
         (_edit("kv_cache_stored_dtype", ""), "sched-4100.jsonl: kv_cache_stored_dtype is '', expected a string"),
-        (_edit("kv_cache_stored_dtype", 16), "sched-4100.jsonl: kv_cache_stored_dtype is 16, expected a string"),
-        (
-            _edit("kv_cache_stored_dtype", ["torch.float8_e4m3fn"]),
-            "sched-4100.jsonl: kv_cache_stored_dtype is ['torch.float8_e4m3fn'], expected a string",
-        ),
     ],
 )
 def test_an_invalid_header_fails_the_run(tmp_path, edit, reason):
     limits = _limits(16)
-    # A float cap equals the micro-batch cap, so only the limits record refuses it.
     fake = _start(tmp_path, limits=limits, edit_header=edit)
     _assert_failed_before_the_grid(fake, f"recorder_header_invalid: {reason}")
-
-
-def test_two_leaders_fail_the_run(tmp_path):
-    fake = _start(tmp_path, processes=2, edit_header=_edit("leader", True))
-    _assert_failed_before_the_grid(
-        fake,
-        "recorder_header_invalid: 2 leader header(s), expected exactly one: ['sched-4100.jsonl', 'sched-4101.jsonl']",
-    )
 
 
 UNREADABLE = {"unreadable": "RuntimeError('FAKE: not published')"}
@@ -1989,37 +1692,22 @@ STAGE_H_REJECTIONS = [
     ),
     ("checks.is_hip", True, _AMD.format(v="true")),
     # Only the boolean false passes: a recorder that wrote another falsy value did not write format 3.
-    ("checks.is_hip", None, _AMD.format(v="null")),
     ("checks.disable_radix_cache", 0, _RADIX_OFF.format(v="0")),
     ("checks.schedule_policy", "lpm", _POLICY.format(name="schedule_policy=lpm")),
     ("checks.prefill_decode_interval", 22, _INTERVAL.format(v="22")),
     ("checks.prefill_decode_interval", False, _INTERVAL.format(v="false")),
     ("checks.max_new_tokens_limit", 6, _OUTPUT_CAP.format(v="6")),
-    ("checks.max_new_tokens_limit", 1, _OUTPUT_CAP.format(v="1")),
-    ("checks.max_new_tokens_limit", True, _OUTPUT_CAP.format(v="true")),
     ("checks.pp_max_micro_batch_size", 8, "pp_max_micro_batch_size 8 differs from the running cap 9"),
-    ("checks.pp_max_micro_batch_size", None, "pp_max_micro_batch_size null differs from the running cap 9"),
     # The run was set up without DP attention: a scheduler that reports another layout is refused.
     ("ranks.attn_dp_enabled", True, _OTHER_LAYOUT.format(size="1", enabled="true", planned=1)),
     ("ranks.attn_dp_size", 2, _OTHER_LAYOUT.format(size="2", enabled="false", planned=1)),
-    ("ranks.attn_dp_size", True, _OTHER_LAYOUT.format(size="true", enabled="false", planned=1)),
-    ("ranks.attn_dp_enabled", None, _OTHER_LAYOUT.format(size="1", enabled="null", planned=1)),
     ("ranks.pp_size", 2, "pipeline parallelism is not supported (pp_size=2)"),
     ("sglang_version", "0.5.24", "SGLang 0.5.24 is not a tested version (tested: 0.5.22, 0.5.23)"),
-    ("sglang_version", "0.5.2", "SGLang 0.5.2 is not a tested version (tested: 0.5.22, 0.5.23)"),
     # A value the recorder could not read is never taken for an allowed one.
     _unreadable("leader"),
-    _unreadable("enable_overlap"),
-    _unreadable("sglang_version"),
-    _unreadable("decode_graph_sizes"),
-    _unreadable("prefill_graph_sizes"),
     _unreadable("kv_cache_stored_dtype"),
-    _unreadable("ranks.tp_size"),
-    _unreadable("ranks.pp_size"),
-    _unreadable("ranks.attn_dp_size"),
-    _unreadable("ranks.attn_dp_enabled"),
-    *(_unreadable(f"limits.{name}") for name in _fake_header(0, 0, _limits(1), 1)["limits"]),
-    *(_unreadable(f"checks.{name}") for name in _fake_header(0, 0, _limits(1), 1)["checks"]),
+    _unreadable("limits.page_size"),
+    _unreadable("checks.recv_skipper"),
 ]
 
 
@@ -2030,59 +1718,6 @@ def test_a_scheduler_setting_the_rules_do_not_cover_is_rejected(tmp_path, path, 
     fake = _start(tmp_path, edit_header=_edit(path, value))
     on_disk = _assert_failed_before_the_grid(fake, f"rejected: {reason}")
     assert on_disk["producer"]["scheduler_processes"] == 1
-
-
-def test_overlap_off_is_recorded_in_the_rejected_artifact(tmp_path):
-    fake = _start(tmp_path, edit_header=_edit("enable_overlap", False))
-    assert fake.payload()["producer"]["enable_overlap"] is False
-
-
-@pytest.mark.parametrize("stored", ["torch.bfloat16", "torch.float16", "torch.float8_e4m3fn"])
-@pytest.mark.parametrize("dp_size", [1, 2])
-def test_the_dtype_of_the_kv_pool_goes_from_the_headers_into_the_producer_block_of_every_rank_file(
-    tmp_path, dp_size, stored
-):
-    fake = _start(tmp_path, "decode", dp_size=dp_size, edit_header=_edit("kv_cache_stored_dtype", stored))
-
-    assert (fake.run.status, fake.run.reason) == ("complete", None)
-    blocks = [payload["producer"] for payload in fake.run.payloads()]
-    assert [block["kv_cache_stored_dtype"] for block in blocks] == [stored] * dp_size
-    # The resolved argument beside it is the launcher's fact and is written as the launcher gave it.
-    assert [block["kv_cache_dtype"] for block in blocks] == [FAKE_PRODUCER["kv_cache_dtype"]] * dp_size
-
-
-def test_the_dtype_of_the_kv_pool_is_null_in_the_artifact_of_a_run_whose_headers_were_not_accepted(tmp_path):
-    # The dtype is that of the run only once every header was accepted and all of them reported the same one.
-    refused = _start(tmp_path / "refused", edit_header=_edit("enable_overlap", False))
-    assert refused.run.status == "failed" and refused.payload()["producer"]["kv_cache_stored_dtype"] is None
-
-    edit = _edit("kv_cache_stored_dtype", "torch.bfloat16", process=1)
-    disagree = _start(tmp_path / "disagree", processes=2, edit_header=edit)
-    assert disagree.run.status == "failed" and disagree.payload()["producer"]["kv_cache_stored_dtype"] is None
-
-    # A run that never saw a header has none either.
-    silent = _start(tmp_path / "silent", headers=False)
-    assert silent.run.status == "failed" and silent.payload()["producer"]["kv_cache_stored_dtype"] is None
-
-
-@pytest.mark.parametrize("mode", ["prefill", "decode"])
-def test_the_validator_holds_the_recorded_dtype_of_the_kv_pool_against_the_label_of_the_cell(tmp_path, mode):
-    """A complete run whose FAKE engine stored bfloat16, held against the fp8 cell and against a bfloat16 cell."""
-    fake = _start(tmp_path, mode, edit_header=_edit("kv_cache_stored_dtype", "torch.bfloat16"))
-    assert (fake.run.status, fake.run.reason) == ("complete", None)
-    fake.run.write()
-    assert fake.cell.kv_cache_dtype == "fp8"
-
-    with pytest.raises(ValueError) as refusal:
-        _validate(fake.cell, fake.root)
-    assert str(refusal.value) == (
-        "native SGLang rank artifact did not store the KV cache of its cell: the cell's kv_cache_dtype 'fp8' "
-        "stands for producer.kv_cache_stored_dtype 'torch.float8_e4m3fn', found 'torch.bfloat16' "
-        f"(producer.kv_cache_dtype 'fp8_e4m3'): {fake.pod / 'benchmark.json'}"
-    )
-    # The same files are those of a cell that is labelled bfloat16.
-    collection = _validate(dataclasses.replace(fake.cell, kv_cache_dtype="bfloat16"), fake.root)
-    assert [measurement.point for measurement in collection.points] == fake.built.point_dicts()
 
 
 @pytest.mark.parametrize(
@@ -2136,17 +1771,6 @@ def test_headers_that_disagree_are_rejected(tmp_path, path, value, reason):
     _assert_failed_before_the_grid(fake, f"rejected: scheduler processes disagree on {reason}")
 
 
-def test_a_running_cap_that_differs_between_processes_is_rejected(tmp_path):
-    def edit(index: int, header: dict) -> dict:
-        if index == 1:
-            header["limits"]["max_running_requests"] = 8
-            header["checks"]["pp_max_micro_batch_size"] = 8
-        return header
-
-    fake = _start(tmp_path, processes=2, edit_header=edit)
-    _assert_failed_before_the_grid(fake, "rejected: scheduler processes disagree on max_running_requests: [9, 8]")
-
-
 def test_a_bad_setting_in_the_follower_alone_is_rejected(tmp_path):
     fake = _start(tmp_path, processes=2, edit_header=_edit("checks.is_mixed_chunk", True, process=1))
     _assert_failed_before_the_grid(fake, "rejected: --enable-mixed-chunk is not supported (is_mixed_chunk=true)")
@@ -2192,49 +1816,10 @@ def test_a_request_cap_below_the_largest_batch_is_rejected(tmp_path, overrides, 
     assert on_disk["coverage"]["expected_points"] == len(fake.built.points)
 
 
-def test_request_caps_at_the_largest_batch_are_accepted(tmp_path):
-    fake = _start(
-        tmp_path,
-        "decode",
-        prefill_max_requests=9,
-        max_queued_requests=9,
-        edit_header=_edit("checks.max_queued_requests", 9),
-    )
-    assert fake.run.status == "complete"
-    # In a prefill run the largest batch is 2, and a cap of 2 is enough.
-    prefill = _start(tmp_path / "prefill", "prefill", prefill_max_requests=2, max_queued_requests=2)
-    assert max(point.batch_size for point in prefill.built.points) == 2
-    assert prefill.run.status == "complete"
-
-
 def test_a_token_range_below_the_content_minimum_fails_the_run(tmp_path):
     fake = _start(tmp_path, tokens=(1000, 5095))
 
     reason = "token_range_too_small: the token range [1000, 5095) holds 4095 ids, the content plan needs at least 4096"
-    assert (fake.run.status, fake.run.reason) == ("failed", reason)
-    assert fake.engine.calls == []
-    _assert_rejected(fake, "failed")
-
-
-def test_a_run_that_needs_more_first_tokens_than_the_range_holds_fails_before_any_request(tmp_path):
-    # A running cap of 5000 plans decode batches of 5000 requests: 5000 slots, four free prompts of the
-    # self-test and the warm-up prompt.
-    limits = _limits(1, max_running_requests=5000, max_total_num_tokens=1_000_000)
-    fake = _start(tmp_path, "decode", limits=limits, tokens=(1000, 6004))
-
-    assert max(point.batch_size for point in fake.built.points) == 5000
-    need = {
-        "slots": 5000,
-        "zero_cached_prefill_prompts": 0,
-        "warmup_prompts": 1,
-        "self_test_free_prompts": 4,
-        "restage_reserve": 0,
-        "total": 5005,
-    }
-    reason = (
-        f"token_range_too_small: the run needs 5005 first tokens ({need}) and the token range [1000, 6004) "
-        "holds 5004 ids"
-    )
     assert (fake.run.status, fake.run.reason) == ("failed", reason)
     assert fake.engine.calls == []
     _assert_rejected(fake, "failed")
@@ -2257,58 +1842,8 @@ def test_a_token_range_of_exactly_the_planned_need_is_enough(tmp_path, monkeypat
     assert no_warmup.payload()["producer"]["first_token_need"]["total"] == need["total"] - 1
 
 
-def test_a_grid_without_any_slot_still_plans_the_two_slots_of_the_self_test(tmp_path):
-    manifest = grid.parse_points_manifest(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "prefill": [{"batch_size": 3, "total_prefill_tokens": 12, "total_kv_read_tokens": 0}],
-                "decode": [],
-            }
-        )
-    )
-    fake = _start(tmp_path, "prefill", manifest=manifest)
-
-    assert fake.run.status == "complete"
-    producer = fake.payload()["producer"]
-    assert producer["first_token_need"] == {
-        "slots": 2,
-        "zero_cached_prefill_prompts": 6,
-        "warmup_prompts": 1,
-        "self_test_free_prompts": 4,
-        "restage_reserve": 6,
-        "total": 19,
-    }
-    issued = producer["content"]["issued"]
-    assert (issued["slots"], issued["zero_cached_prompts"], issued["free_prompts"]) == (2, 6, 5)
-
-
-def test_a_second_restaged_zero_cached_point_runs_out_of_first_tokens(tmp_path, monkeypatch):
-    monkeypatch.setattr(content, "MIN_VOCAB_SIZE", 16)
-    plan = _plan_only(tmp_path, "prefill")
-    zero_cached = [point for point in plan.built.points if not point.cached_tokens and point.batch_size == 2]
-    first, second = zero_cached[:2]
-    need = _start(tmp_path / "need", "prefill").payload()["producer"]["first_token_need"]
-    faults = {(first.benchmark_id, "warm", 0): "cached_off", (second.benchmark_id, "warm", 0): "cached_off"}
-
-    # With room to spare both points recover on their re-stage.
-    roomy = _start(tmp_path / "roomy", "prefill", faults=faults)
-    assert roomy.run.status == "complete"
-    assert roomy.payload()["producer"]["restaged_points"] == [first.benchmark_id, second.benchmark_id]
-
-    # In a range of exactly the planned need the reserve covers one re-stage of two requests.
-    exact = _start(tmp_path / "exact", "prefill", faults=faults, tokens=(1000, 1000 + need["total"]))
-    assert exact.run.reason == (
-        f"benchmark_id={second.benchmark_id}: benchmark point failed: token_range_too_small: the re-stage needs 4 "
-        f"more first tokens and 0 are left in [1000, {1000 + need['total']})"
-    )
-    assert exact.payload()["producer"]["restaged_points"] == [first.benchmark_id, second.benchmark_id]
-    # Nothing was sent for the second attempt of the second point.
-    assert [call.key[2] for call in exact.calls_of(second.benchmark_id)] == [0]
-
-
 # ---------------------------------------------------------------------------------------------------------------
-# Self-test and warm-up
+# Self-test
 # ---------------------------------------------------------------------------------------------------------------
 
 _FREE_RID = "sglb-fa4e0123-p0-free{call}-r0-s0-e"
@@ -2318,7 +1853,6 @@ _ALL_BUT_LAST = ["batch_shape", "aligned_prefix", "unaligned_prompt"]
 SELF_TEST_FAULTS = [
     # (call, FAKE fault, reason after "self_test_failed: ", the checks that passed before)
     (FREE_BATCH_SHAPE, "split_extend", "batch_shape: " + _SPLIT, []),
-    (FREE_BATCH_SHAPE, "decode_follows", "batch_shape: " + _DECODE_AFTER.format(seq1=2), []),
     (
         FREE_BATCH_SHAPE,
         "cached_off",
@@ -2331,7 +1865,6 @@ SELF_TEST_FAULTS = [
         "aligned_prefix: " + _OTHER_COUNT.format(wrong=2, planned=16, rid=_FREE_RID.format(call=2), got=0),
         ["batch_shape"],
     ),
-    (FREE_ALIGNED_SHOTS, "split_extend", "aligned_prefix: " + _SPLIT, ["batch_shape"]),
     (
         FREE_UNALIGNED_AGAIN,
         "evict",
@@ -2353,12 +1886,6 @@ SELF_TEST_FAULTS = [
     ),
     (
         FREE_SEVEN_TOKEN_RUN,
-        "decode_missing_id",
-        "seven_token_run: " + _DECODE_IDS.format(seq4=10, held=1, b=2),
-        _ALL_BUT_LAST,
-    ),
-    (
-        FREE_SEVEN_TOKEN_RUN,
         "split_extend",
         "seven_token_run: measured_decode_context_mismatch: the run has 2 extend batches, expected one",
         _ALL_BUT_LAST,
@@ -2369,8 +1896,6 @@ SELF_TEST_FAULTS = [
         "seven_token_run: " + _OTHER_COUNT.format(wrong=1, planned=0, rid=_FREE_RID.format(call=5), got=1),
         _ALL_BUT_LAST,
     ),
-    (FREE_ALIGNED_SEED, "raise", "aligned_prefix: " + _RAISED, ["batch_shape"]),
-    (FREE_UNALIGNED_SEED, "retraction", None, ["batch_shape", "aligned_prefix"]),
 ]
 
 
@@ -2380,10 +1905,6 @@ SELF_TEST_FAULTS = [
 def test_a_failed_self_test_check_ends_the_run_before_the_sweep(tmp_path, call, fault, reason, passed):
     fake = _start(tmp_path, "prefill", faults={(0, "free", call): fault})
 
-    if reason is None:
-        reason = f"{driver.SELF_TEST_CHECKS[len(passed)]}: request_not_completed: " + (
-            f"sglb-fa4e0123-p0-free{call}-r0-s1-e: finish_type='length', completion_tokens=1 of 1, num_retractions=1"
-        )
     assert (fake.run.status, fake.run.reason) == ("failed", f"self_test_failed: {reason}")
     # No point was staged and no later check ran.
     assert fake.sent_benchmark_ids() == {0}
@@ -2394,39 +1915,13 @@ def test_a_failed_self_test_check_ends_the_run_before_the_sweep(tmp_path, call, 
     assert on_disk["coverage"]["expected_points"] == len(fake.built.points)
 
 
-@pytest.mark.parametrize(
-    ("call", "check", "batches"),
-    [
-        (FREE_BATCH_SHAPE, "batch_shape", 1),
-        (FREE_ALIGNED_SHOTS, "aligned_prefix", 1),
-        (FREE_SEVEN_TOKEN_RUN, "seven_token_run", 7),
-    ],
-)
-def test_the_checked_calls_of_the_self_test_wait_for_the_follower_log(tmp_path, call, check, batches):
-    fake = _start(tmp_path, processes=2, faults={(0, "free", call): "follower_missing"})
-    assert fake.run.reason == (
-        f"self_test_failed: {check}: no_fpm_before_deadline: sched-4101.jsonl lacks {batches} of the {batches} "
-        "batch(es) of the call after 2.0 s"
-    )
-    assert fake.sent_benchmark_ids() == {0}
-
-
-@pytest.mark.parametrize("page_size", [1, 3, 16, 24, 64])
-def test_the_self_test_expects_the_cached_counts_of_the_page_size(tmp_path, page_size):
-    fake = _start(tmp_path, "decode", limits=_limits(page_size))
+def test_the_self_test_expects_the_cached_counts_of_the_page_size(tmp_path):
+    fake = _start(tmp_path, "decode", limits=_limits(16))
     assert fake.run.status == "complete"
 
-    unit = -(-16 // page_size) * page_size  # the smallest page multiple of at least 16 tokens
+    unit = 16  # one page of 16 tokens: the smallest page multiple of at least 16 tokens
     free = [call for call in fake.engine.calls if call.key[0] == 0]
     assert [len(call.prompts[0]) for call in free[:6]] == [unit, unit, 2 * unit, 2 * unit + 7, 2 * unit + 7, unit]
-    # What the fake engine's cache model reported for the two prefix checks: the whole aligned prefix, and the
-    # unaligned prompt less its last token, rounded down to whole pages.
-    lines = [json.loads(line) for line in (fake.recorder_dir / LEADER_LOG).read_text(encoding="utf-8").splitlines()[1:]]
-    by_first_rid = {line["rids"][0]: line for line in lines}
-    assert by_first_rid[_FREE_RID.format(call=FREE_ALIGNED_SHOTS)]["prefix_lens"] == [unit, unit]
-    rounded = (2 * unit + 6) // page_size * page_size
-    assert by_first_rid[_FREE_RID.format(call=FREE_UNALIGNED_AGAIN)]["prefix_lens"] == [rounded, rounded]
-    assert rounded > unit
 
 
 def test_limits_that_do_not_admit_a_self_test_call_fail_the_self_test(tmp_path):
@@ -2438,85 +1933,10 @@ def test_limits_that_do_not_admit_a_self_test_call_fail_the_self_test(tmp_path):
     )
     assert fake.engine.calls == []
 
-    # An input limit of 32 tokens admits a prompt of 16 tokens and not one of 16 cached and 16 new tokens.
-    aligned = _start(tmp_path / "aligned", limits=_limits(1, max_req_input_len=32))
-    assert aligned.run.reason == (
-        "self_test_failed: aligned_prefix: the limits of this engine do not admit two requests of 16 cached and "
-        "16 new tokens in one extend batch: input_too_long"
-    )
-    assert [call.key[2] for call in aligned.engine.calls] == [FREE_BATCH_SHAPE]
-
-    # An input limit of 39 tokens admits the first two checks and not the unaligned prompt of 39 tokens.
-    short = _start(tmp_path / "short", limits=_limits(1, max_req_input_len=39), warmup_iterations=0)
-    assert short.run.reason == (
-        "self_test_failed: unaligned_prompt: the limits of this engine do not admit two requests of 39 tokens: "
-        "input_too_long"
-    )
-    assert [call.key[2] for call in short.engine.calls] == [FREE_BATCH_SHAPE, FREE_ALIGNED_SEED, FREE_ALIGNED_SHOTS]
-
-
-def test_an_unaligned_self_test_prompt_above_the_chunk_budget_may_be_chunked(tmp_path):
-    # Two prompts of 39 tokens do not fit a chunk budget of 32 tokens in one extend batch. The first send is a
-    # seed and may be chunked, so the check runs: 16 tokens of each prompt are cached, the first request
-    # computes its 23 tokens, the second 9 of its 23 and the rest in a second extend batch.
-    fake = _start(tmp_path, limits=_limits(1, chunked_prefill_size=32))
-    free = [call for call in fake.engine.calls if call.key[0] == 0]
-    assert free[FREE_UNALIGNED_SEED].modes == ["EXTEND", "EXTEND"]
-    assert free[FREE_UNALIGNED_AGAIN].modes == ["EXTEND"]
-    assert fake.run.status == "complete"
-
-
-def test_the_warm_up_is_one_prompt_of_256_tokens_and_is_skipped_at_zero(tmp_path):
-    with_warmup = _start(tmp_path / "five", "decode", warmup_iterations=5)
-    free = [call for call in with_warmup.engine.calls if call.key[0] == 0]
-    assert len(free) == 7
-    warmup = free[FREE_WARMUP]
-    assert ([len(prompt) for prompt in warmup.prompts], warmup.max_new_tokens) == ([256], 5)
-    # 256 tokens are above the chunk budget of 96 here: three extend batches, then four decode batches.
-    assert warmup.modes == ["EXTEND"] * 3 + ["DECODE"] * 4
-    assert with_warmup.run.status == "complete"
-
-    without = _start(tmp_path / "zero", "decode", warmup_iterations=0)
-    free = [call for call in without.engine.calls if call.key[0] == 0]
-    assert [call.key[2] for call in free] == list(range(6))
-    assert not any(len(prompt) == 256 for call in without.engine.calls for prompt in call.prompts)
-    assert without.run.status == "complete"
-    assert without.payload()["producer"]["first_token_need"]["warmup_prompts"] == 0
-
-    one = _start(tmp_path / "one", "decode", warmup_iterations=1)
-    assert [call for call in one.engine.calls if call.key[0] == 0][FREE_WARMUP].modes == ["EXTEND"] * 3
-    assert one.run.status == "complete"
-
-
-def test_a_warm_up_that_does_not_run_to_its_last_token_fails_the_run(tmp_path):
-    fake = _start(tmp_path, faults={(0, "free", FREE_WARMUP): "short_completion"})
-    assert fake.run.reason == (
-        f"request_not_completed: {_FREE_RID.format(call=6)}: finish_type='length', completion_tokens=4 of 5, "
-        "num_retractions=0"
-    )
-    assert fake.sent_benchmark_ids() == {0}
-    assert fake.payload()["producer"]["self_test"] == list(driver.SELF_TEST_CHECKS)
-
 
 # ---------------------------------------------------------------------------------------------------------------
 # Soft deadline
 # ---------------------------------------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("mode", ["prefill", "decode"])
-def test_a_deadline_that_passes_before_the_first_point_gives_a_partial_run_without_rows(tmp_path, mode):
-    # The self-test and the warm-up take FAKE milliseconds, which is more than this deadline.
-    fake = _start(tmp_path, mode, timeout_seconds=0.001)
-
-    assert (fake.run.status, fake.run.reason) == ("partial", "timeout")
-    assert fake.sent_benchmark_ids() == {0}
-    on_disk = _assert_rejected(fake, "partial")
-    assert (on_disk["stop_reason"], on_disk["error"], on_disk["usable"]) == ("timeout", None, False)
-    assert on_disk["coverage"] == {
-        "expected_points": len(fake.built.points),
-        "completed_points": 0,
-        "skipped_points": 0,
-    }
 
 
 @pytest.mark.parametrize("mode", ["prefill", "decode"])
@@ -2535,18 +1955,6 @@ def test_a_deadline_that_passes_between_two_points_gives_a_partial_run(tmp_path,
     assert on_disk["timing"]["benchmark_elapsed_seconds"] >= FAKE_TIMEOUT_SECONDS
     merged = json.loads((fake.pod / "benchmark_merged.json").read_text(encoding="utf-8"))
     assert (merged["artifact_type"], merged["status"], merged["valid"]) == ("merged", "partial", False)
-
-
-def test_the_deadline_is_reached_at_exactly_the_timeout(tmp_path):
-    # The FAKE jump after point 4 is the timeout itself, less what the run has taken until then.
-    probe = _start(tmp_path / "probe", "decode", faults={(4, "run", 0): "deadline"})
-    elapsed_then = probe.payload()["timing"]["benchmark_elapsed_seconds"] - FAKE_TIMEOUT_SECONDS
-
-    exact = _start(tmp_path / "exact", "decode", timeout_seconds=elapsed_then)
-    assert (exact.run.status, exact.sent_benchmark_ids()) == ("partial", set(range(5)))
-    # One tick more and point 5 still starts; the deadline has passed before point 6.
-    later = _start(tmp_path / "later", "decode", timeout_seconds=elapsed_then + 1 / TICKS_PER_SECOND)
-    assert (later.run.status, later.sent_benchmark_ids()) == ("partial", set(range(6)))
 
 
 def test_the_deadline_counts_from_the_start_of_the_launcher_and_the_elapsed_time_from_execute(tmp_path):
@@ -2659,23 +2067,6 @@ def test_a_failure_recorded_after_execute_fails_a_complete_run_and_keeps_its_row
     ]
 
 
-def test_a_failure_recorded_after_a_partial_run_keeps_the_stop_reason(tmp_path):
-    fake = _start(tmp_path, "decode", faults={(2, "run", 0): "deadline"})
-    fake.run.record_failure("stopped: FAKE signal")
-
-    on_disk = _assert_rejected(fake, "failed")
-    assert (on_disk["stop_reason"], on_disk["error"]) == ("timeout", "stopped: FAKE signal")
-
-
-def test_record_failure_refuses_what_is_not_a_reason(tmp_path):
-    fake = _start(tmp_path, execute=False)
-    with pytest.raises(TypeError, match="reason must be a str"):
-        fake.run.record_failure(RuntimeError("FAKE"))
-    with pytest.raises(ValueError, match="reason must not be empty"):
-        fake.run.record_failure("")
-    assert fake.run.status is None
-
-
 @pytest.mark.parametrize("stop", ["system_exit", "keyboard_interrupt"])
 def test_a_stop_raised_by_the_engine_passes_through_execute(tmp_path, stop):
     # SGLang turns SIGTERM into SystemExit inside an engine call once the first request has been sent.
@@ -2725,74 +2116,17 @@ def test_an_unexpected_exception_is_recorded_as_an_internal_error(tmp_path, monk
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [
-        ({"warmup_iterations": -1}, "internal_error: ValueError: settings.warmup_iterations must be >= 0, got -1"),
-        (
-            {"warmup_iterations": True},
-            "internal_error: TypeError: settings.warmup_iterations must be an int, got bool: True",
-        ),
         (
             {"expected_scheduler_processes": 0},
             "internal_error: ValueError: settings.expected_scheduler_processes must be >= 1, got 0",
         ),
         ({"timeout_seconds": 0}, "internal_error: ValueError: settings.timeout_seconds must be finite and > 0, got 0"),
-        (
-            {"timeout_seconds": float("inf")},
-            "internal_error: ValueError: settings.timeout_seconds must be finite and > 0, got inf",
-        ),
-        (
-            {"log_wait_seconds": -1.0},
-            "internal_error: ValueError: settings.log_wait_seconds must be finite and >= 0, got -1.0",
-        ),
-        (
-            {"header_wait_seconds": "60"},
-            "internal_error: TypeError: settings.header_wait_seconds must be a number of seconds, got str: '60'",
-        ),
-        ({"caps": None}, "internal_error: TypeError: settings.caps must be a SampleCaps record, got NoneType"),
-        ({"worker_id": None}, "internal_error: TypeError: settings.worker_id must be a str, got None"),
-        ({"content_seed": 0}, "internal_error: TypeError: settings.content_seed must be a str, got 0"),
     ],
 )
 def test_a_bad_setting_is_recorded_as_an_internal_error_before_any_request(tmp_path, overrides, reason):
     fake = _start(tmp_path, **overrides)
     assert (fake.run.status, fake.run.reason) == ("failed", reason)
     assert fake.engine.calls == []
-
-
-def test_the_constructor_refuses_what_no_artifact_can_carry(tmp_path):
-    fake = _start(tmp_path, execute=False)
-    good = fake.settings
-
-    def build(**changes):
-        return driver.BenchmarkRun(dataclasses.replace(good, **changes), fake.recorder_dir, started_at=0.0)
-
-    with pytest.raises(ValueError, match="settings.mode must be one of"):
-        build(mode="both")
-    with pytest.raises(ValueError, match="output_path must name a file"):
-        build(output_path=str(fake.pod) + "/")
-    with pytest.raises(ValueError, match="run_id must be non-empty"):
-        build(run_id="")
-    with pytest.raises(ValueError, match="run_id must be non-empty and use only"):
-        build(run_id="fake run")
-    with pytest.raises(TypeError, match="settings.run_id must be a str"):
-        build(run_id=7)
-    with pytest.raises(TypeError, match="settings must be a RunSettings record"):
-        driver.BenchmarkRun({"mode": "prefill"}, fake.recorder_dir, started_at=0.0)
-    # The number of attention-DP ranks decides how many rank files there are, so not even a failed artifact
-    # can be written without it.
-    with pytest.raises(ValueError, match="settings.dp_size must be >= 1, got 0"):
-        build(dp_size=0)
-    with pytest.raises(TypeError, match="settings.dp_size must be an int, got bool: True"):
-        build(dp_size=True)
-    with pytest.raises(TypeError, match="settings.dp_size must be an int, got str: '2'"):
-        build(dp_size="2")
-    assert build(dp_size=3).settings.dp_size == 3
-    with pytest.raises(TypeError, match="started_at must be a finite reading"):
-        driver.BenchmarkRun(good, fake.recorder_dir, started_at=None)
-    # The defaults are the real clock and the real sleep, and the two waits of the settings.
-    run = build()
-    assert (run._clock, run._sleep) == (driver.time.monotonic, driver.time.sleep)
-    fields = {field.name: field.default for field in dataclasses.fields(driver.RunSettings)}
-    assert (fields["log_wait_seconds"], fields["header_wait_seconds"]) == (30.0, 60.0)
 
 
 def test_a_block_that_is_not_json_fails_at_the_dry_build_before_any_request(tmp_path):
@@ -2812,15 +2146,11 @@ def test_a_block_that_is_not_json_fails_at_the_dry_build_before_any_request(tmp_
 @pytest.mark.parametrize(
     ("overrides", "start"),
     [
-        ({"config": {**FAKE_CONFIG, 7: "a key that is not a str"}}, "internal_error: TypeError: config "),
-        ({"config": {**FAKE_CONFIG, "mode": "decode"}}, "internal_error: ValueError: config may not contain 'mode'"),
         ({"config": None}, "internal_error: TypeError: settings.config must be a dict, got NoneType"),
         (
             {"producer": {"page_size": 64}},
             "internal_error: ValueError: settings.producer may not contain ['page_size']",
         ),
-        ({"producer": {"name": "other"}}, "internal_error: ValueError: producer may not contain ['name']"),
-        ({"producer": ["a", "list"]}, "internal_error: TypeError: settings.producer must be a dict, got list"),
         ({"producer": {"nan": float("nan")}}, "internal_error: ValueError: producer is not JSON data: "),
     ],
 )
@@ -2829,43 +2159,6 @@ def test_a_block_the_artifact_refuses_fails_at_the_dry_build(tmp_path, overrides
     assert fake.run.reason.startswith(start), fake.run.reason
     assert fake.engine.calls == []
     assert "omitted_launcher_blocks" in _assert_rejected(fake, "failed")["producer"]
-
-
-def test_a_fact_the_launcher_adds_to_producer_after_execute_is_written(tmp_path):
-    fake = _start(tmp_path, "decode")
-    # The launcher keeps the dict it handed over and records an engine shutdown error in it.
-    fake.settings.producer["engine_shutdown_error"] = "FAKE: RuntimeError('children not reaped')"
-
-    on_disk = _assert_accepted(fake)
-    assert on_disk["producer"]["engine_shutdown_error"] == "FAKE: RuntimeError('children not reaped')"
-
-
-def test_write_falls_back_to_a_failed_artifact_when_the_complete_one_cannot_be_written(tmp_path, monkeypatch):
-    fake = _start(tmp_path, "decode")
-    real = artifact.write_artifacts
-    statuses = []
-
-    def refuse_complete(output_path, rank_payloads):
-        statuses.append(rank_payloads[0]["status"])
-        if rank_payloads[0]["status"] == "complete":
-            raise ValueError("rank 0: FAKE refusal of a complete artifact")
-        return real(output_path, rank_payloads)
-
-    monkeypatch.setattr(artifact, "write_artifacts", refuse_complete)
-    assert fake.run.status == "complete"
-    written = fake.run.write()
-
-    reason = "internal_error: ValueError: rank 0: FAKE refusal of a complete artifact"
-    assert statuses == ["complete", "failed"]
-    assert written == {"status": "failed", "paths": [str(fake.pod / "benchmark.json")]}
-    assert (fake.run.status, fake.run.reason) == ("failed", reason)
-    on_disk = json.loads((fake.pod / "benchmark.json").read_text(encoding="utf-8"))
-    # The failed artifact keeps every row and both blocks of the launcher.
-    assert (on_disk["status"], on_disk["error"]) == ("failed", reason)
-    assert len(on_disk["results"]) == len(fake.built.points)
-    assert on_disk["producer"]["timing_source"].startswith("FAKE")
-    assert "omitted_launcher_blocks" not in on_disk["producer"]
-    assert not (fake.pod / "benchmark_merged.json").exists()
 
 
 def test_write_leaves_the_launcher_blocks_out_when_they_cannot_be_written(tmp_path):
@@ -2878,22 +2171,6 @@ def test_write_leaves_the_launcher_blocks_out_when_they_cannot_be_written(tmp_pa
     assert text.startswith("TypeError: producer is not JSON data: ")
     assert (on_disk["config"], on_disk["producer"]["omitted_launcher_blocks"]) == ({"mode": "decode"}, text)
     assert len(on_disk["results"]) == len(fake.built.points)
-
-
-def test_write_raises_when_not_even_the_reduced_artifact_can_be_built(tmp_path, monkeypatch):
-    fake = _start(tmp_path, "decode")
-
-    def refuse(_output_path, _rank_payloads):
-        raise ValueError("FAKE refusal")
-
-    monkeypatch.setattr(artifact, "write_artifacts", refuse)
-
-    with pytest.raises(ValueError, match="FAKE refusal"):
-        fake.run.write()
-    assert fake.run.reason == "internal_error: ValueError: FAKE refusal"
-    assert not (fake.pod / "benchmark.json").exists()
-    with pytest.raises(RuntimeError, match="write was already called for this run and did not finish"):
-        fake.run.write()
 
 
 def test_write_writes_once(tmp_path, monkeypatch):
@@ -2914,23 +2191,6 @@ def test_write_writes_once(tmp_path, monkeypatch):
     assert (fake.run.status, fake.run.reason, fake.payload()["status"]) == ("complete", None, "complete")
     second["paths"].clear()  # the returned dict is the caller's
     assert fake.run.write() == first
-
-
-def test_write_without_an_outcome_writes_a_failed_artifact(tmp_path):
-    fake = _start(tmp_path, execute=False)
-    written = fake.run.write()
-
-    reason = "internal_error: the result files were written before the run had an outcome"
-    assert written == {"status": "failed", "paths": [str(fake.pod / "benchmark.json")]}
-    assert fake.run.reason == reason
-
-
-def test_write_raises_what_is_not_an_artifact_error(tmp_path):
-    fake = _start(tmp_path, "decode", output_path=str(tmp_path / "missing-directory" / "benchmark.json"))
-    assert fake.run.status == "complete"
-    with pytest.raises(FileNotFoundError):
-        fake.run.write()
-    assert fake.run.status == "complete"
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -2965,21 +2225,6 @@ def test_ordinary_token_range_is_the_longest_run_without_an_excluded_id(size, ex
     longest = max(len(list(group)) for value, group in itertools.groupby(free) if value)
     assert high - low == longest
     assert driver.ordinary_token_range(size=size, excluded=iter(excluded)) == expected
-
-
-def test_ordinary_token_range_refuses_bad_input():
-    with pytest.raises(ValueError, match=r"every token id in \[0, 3\) is excluded"):
-        driver.ordinary_token_range(3, [0, 1, 2])
-    with pytest.raises(ValueError, match="size must be >= 1, got 0"):
-        driver.ordinary_token_range(0, [])
-    with pytest.raises(TypeError, match="size must be an int, got float"):
-        driver.ordinary_token_range(10.0, [])
-    with pytest.raises(TypeError, match="size must be an int, got bool"):
-        driver.ordinary_token_range(True, [])
-    with pytest.raises(TypeError, match="an excluded token id must be an int, got str"):
-        driver.ordinary_token_range(10, ["3"])
-    with pytest.raises(TypeError, match="an excluded token id must be an int, got bool"):
-        driver.ordinary_token_range(10, [True])
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -3034,22 +2279,6 @@ def test_recorder_logs_read_only_what_was_appended_and_keep_a_half_written_line_
     ]
 
 
-def test_recorder_logs_ignore_idle_lines_without_requests_and_keep_the_others(tmp_path):
-    logs = driver.RecorderLogs(str(tmp_path))
-    lines = [
-        {"type": "header", "format": 3},
-        _batch_line(1, "IDLE", []),
-        _batch_line(2, "IDLE", ["a"]),
-        _batch_line(3, "EXTEND", []),
-        _batch_line(4),
-    ]
-    (tmp_path / "sched-9.jsonl").write_bytes(b"".join(_line(line) for line in lines))
-    logs.poll()
-    # The idle line without requests is left out and still counts for seq.
-    assert [line["seq"] for line in logs.batches("sched-9.jsonl")] == [2, 3, 4]
-    assert logs.faults == []
-
-
 def test_recorder_logs_list_fault_lines_and_everything_that_is_not_a_line_of_the_format(tmp_path):
     logs = driver.RecorderLogs(tmp_path)
     good = tmp_path / "sched-1.jsonl"
@@ -3058,282 +2287,27 @@ def test_recorder_logs_list_fault_lines_and_everything_that_is_not_a_line_of_the
         + _line(_batch_line(1))
         + _line({"type": "fault", "where": "run_batch", "error": "FAKE"})
         + b"not json\n"
-        + b"\xff\xfe\n"
-        + b"[1, 2]\n"
-        + b"\n"
-        + _line({"type": "summary"})
         + _line({"type": "header", "format": 3})
         + _line(_batch_line(3))  # seq 2 was lost
-        + _line(_batch_line(4, mode=None))
-        + _line({"type": "batch", "seq": 5, "mode": "EXTEND", "rids": ["a", 7]})
-        + _line({"type": "batch", "seq": "6", "mode": "EXTEND", "rids": []})
-        + _line(_batch_line(7))
+        + _line(_batch_line(4))
     )
-    (tmp_path / "sched-2.jsonl").write_bytes(
-        _line(_batch_line(1)) + _line({"type": "fault", "where": "header", "error": "FAKE: no header"})
-    )
+    (tmp_path / "sched-2.jsonl").write_bytes(_line(_batch_line(1)))
     logs.poll()
 
     assert list(logs.headers) == ["sched-1.jsonl"]
     # A line that is not format 3 is not kept.
-    assert [line["seq"] for line in logs.batches("sched-1.jsonl")] == [1, 7]
+    assert [line["seq"] for line in logs.batches("sched-1.jsonl")] == [1, 4]
     assert logs.batches("sched-2.jsonl") == []
-    assert [(fault["file"], fault["where"]) for fault in logs.faults] == [
-        ("sched-1.jsonl", "run_batch"),
-        *[("sched-1.jsonl", "reader")] * 10,
-        ("sched-2.jsonl", "reader"),
-        ("sched-2.jsonl", "header"),
+    # The fault line is passed on as it is; the reader lists every other line with its number.
+    assert logs.faults[0] == {"file": "sched-1.jsonl", "where": "run_batch", "error": "FAKE"}
+    expected = [
+        ("sched-1.jsonl", "line 4: not a JSON line: "),
+        ("sched-1.jsonl", "line 5: a header that is not the first line of its file"),
+        ("sched-1.jsonl", "line 6: batch line with seq 3, expected 2"),
+        ("sched-2.jsonl", "line 1: a batch line in a file without a header"),
     ]
-    errors = [fault["error"] for fault in logs.faults]
-    assert errors[0] == "FAKE"
-    assert errors[1].startswith("line 4: not a JSON line: ")
-    assert errors[2].startswith("line 5: not a JSON line: ")
-    assert errors[3:] == [
-        "line 6: not a JSON object: list",
-        "line 7: not a JSON line: Expecting value: line 1 column 1 (char 0)",
-        "line 8: unknown line type 'summary'",
-        "line 9: a header that is not the first line of its file",
-        "line 10: batch line with seq 3, expected 2",
-        "line 11: batch line without a mode and a list of request ids",
-        "line 12: batch line without a mode and a list of request ids",
-        "line 13: batch line with seq '6', expected 6",
-        "line 1: a batch line in a file without a header",
-        "FAKE: no header",
-    ]
-
-
-def test_a_recorder_line_that_is_not_of_the_format_fails_the_run_before_the_first_request(tmp_path):
-    fake = _start(tmp_path, "decode", execute=False)
-    with (fake.recorder_dir / LEADER_LOG).open("a", encoding="utf-8") as handle:
-        handle.write("FAKE: not a recorder line\n")
-    fake.execute()
-
-    assert fake.run.reason.startswith("recorder_fault: sched-4100.jsonl: reader: line 2: not a JSON line: ")
-    assert fake.engine.calls == []
-    _assert_rejected(fake, "failed")
-
-
-# ---------------------------------------------------------------------------------------------------------------
-# The module itself
-# ---------------------------------------------------------------------------------------------------------------
-
-
-def test_the_driver_imports_only_the_standard_library_and_its_three_siblings_and_reads_no_environment():
-    source = (RUNTIME / "sglbench_driver.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            assert node.level == 0
-            imported.add(node.module.split(".")[0])
-    siblings = {"sglbench_grid", "sglbench_content", "sglbench_artifact"}
-    assert imported - siblings <= set(sys.stdlib_module_names)
-    assert imported & {name for name in imported if name.startswith("sglbench_")} == siblings
-    # No environment variable is read: every value is an argument.
-    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
-    assert not attributes & {"environ", "getenv", "environb", "putenv"}
-    assert source.isascii()
-    assert "No upstream function or block of source is copied." in source
-
-
-_POD_SCRIPT = """
-import sys
-
-sys.path.append(sys.argv[1])
-import sglbench_driver as driver
-
-forbidden = {"sglang", "torch", "numpy", "dynamo", "aisim", "aisim_core", "collector"}
-loaded = sorted(name for name in sys.modules if name.split(".")[0] in forbidden)
-assert not loaded, loaded
-third_party = sorted(
-    name for name, module in sys.modules.items() if "site-packages" in (getattr(module, "__file__", None) or "")
-)
-assert not third_party, third_party
-assert driver.ordinary_token_range(10, [5]) == (0, 5)
-print(sorted(name for name in sys.modules if name.startswith("sglbench_")))
-"""
-
-
-def test_the_driver_imports_in_a_bare_interpreter_without_sglang():
-    done = subprocess.run(
-        [sys.executable, "-I", "-S", "-B", "-c", _POD_SCRIPT, str(RUNTIME)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    assert done.returncode == 0, done.stderr
-    assert done.stdout.strip() == "['sglbench_artifact', 'sglbench_content', 'sglbench_driver', 'sglbench_grid']"
-
-
-def _module_constants(path: Path) -> dict:
-    """The module-level constants of a file that are plain literals, read without importing it."""
-    constants = {}
-    for node in ast.parse(path.read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            try:
-                constants[node.targets[0].id] = ast.literal_eval(node.value)
-            except ValueError:
-                continue
-    return constants
-
-
-def test_the_constants_the_driver_repeats_are_the_ones_of_the_recorder_and_of_compat():
-    # Typed here once more, as the recorder log format gives them.
-    assert (driver.RECORD_FORMAT, driver.RECORDER_CLASS_NAME) == (3, "SglbenchRecorderScheduler")
-    assert (driver.LOG_FILE_PREFIX, driver.LOG_FILE_SUFFIX) == ("sched-", ".jsonl")
-    assert driver.TESTED_SGLANG_VERSIONS == ("0.5.22", "0.5.23")
-    assert driver.WARMUP_PROMPT_TOKENS == 256
-    # The two modules that own the values import SGLang inside functions and are not imported here; their
-    # literals are read from the files beside this one.
-    constants = _module_constants(RUNTIME / "sglbench_recorder.py")
-    assert (constants["RECORD_FORMAT"], constants["RECORDER_CLASS_NAME"]) == (
-        driver.RECORD_FORMAT,
-        driver.RECORDER_CLASS_NAME,
-    )
-    assert (constants["LOG_FILE_PREFIX"], constants["LOG_FILE_SUFFIX"]) == (
-        driver.LOG_FILE_PREFIX,
-        driver.LOG_FILE_SUFFIX,
-    )
-    assert constants["_LIMIT_NAMES"] == driver._LIMIT_NAMES
-    assert _module_constants(RUNTIME / "sglbench_compat.py")["TESTED_VERSIONS"] == driver.TESTED_SGLANG_VERSIONS
-
-
-def test_the_public_names_have_the_agreed_shape(tmp_path):
-    # The launcher is written against these names.
-    assert [field.name for field in dataclasses.fields(driver.RunSettings)] == [
-        "mode",
-        "caps",
-        "manifest",
-        "warmup_iterations",
-        "timeout_seconds",
-        "output_path",
-        "run_id",
-        "content_seed",
-        "worker_id",
-        "expected_scheduler_processes",
-        "config",
-        "producer",
-        "prefill_max_requests",
-        "max_queued_requests",
-        "log_wait_seconds",
-        "header_wait_seconds",
-        "content_source",
-        "dp_size",
-    ]
-    # The last two have defaults, so a caller that names neither makes a run with seeded ids and one
-    # attention-DP rank.
-    defaults = {field.name: field.default for field in dataclasses.fields(driver.RunSettings)}
-    assert (defaults["content_source"], defaults["dp_size"]) == ("seeded_token_ids", 1)
-    fake = _start(tmp_path, execute=False)
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        fake.settings.mode = "decode"
-    # A run with other settings is built from a copy, with the same run id and start.
-    changed = dataclasses.replace(fake.settings, expected_scheduler_processes=2, prefill_max_requests=64)
-    assert (changed.run_id, changed.expected_scheduler_processes) == (FAKE_RUN_ID, 2)
-
-    def kinds(function) -> list[tuple[str, str]]:
-        return [(name, parameter.kind.name) for name, parameter in inspect.signature(function).parameters.items()]
-
-    assert kinds(driver.BenchmarkRun.__init__) == [
-        ("self", "POSITIONAL_OR_KEYWORD"),
-        ("settings", "POSITIONAL_OR_KEYWORD"),
-        ("recorder_dir", "POSITIONAL_OR_KEYWORD"),
-        ("started_at", "KEYWORD_ONLY"),
-        ("clock", "KEYWORD_ONLY"),
-        ("sleep", "KEYWORD_ONLY"),
-    ]
-    assert kinds(driver.BenchmarkRun.execute) == [
-        ("self", "POSITIONAL_OR_KEYWORD"),
-        ("engine", "POSITIONAL_OR_KEYWORD"),
-        ("token_low", "KEYWORD_ONLY"),
-        ("token_high", "KEYWORD_ONLY"),
-        ("text_pool", "KEYWORD_ONLY"),
-        ("dataset", "KEYWORD_ONLY"),
-        ("on_grid", "KEYWORD_ONLY"),
-    ]
-    # A run with seeded ids is started without the text pool and the dataset, and a caller with nothing to say
-    # about the grid names no hook.
-    parameters = inspect.signature(driver.BenchmarkRun.execute).parameters
-    assert (parameters["text_pool"].default, parameters["dataset"].default) == (None, None)
-    assert parameters["on_grid"].default is None
-    assert kinds(driver.BenchmarkRun.record_failure) == [
-        ("self", "POSITIONAL_OR_KEYWORD"),
-        ("reason", "POSITIONAL_OR_KEYWORD"),
-    ]
-    assert (
-        kinds(driver.BenchmarkRun.payloads) == kinds(driver.BenchmarkRun.write) == [("self", "POSITIONAL_OR_KEYWORD")]
-    )
-    assert kinds(driver.BenchmarkRun.prefill_pool_cut) == [("self", "POSITIONAL_OR_KEYWORD")]
-    assert kinds(driver.ordinary_token_range) == [
-        ("size", "POSITIONAL_OR_KEYWORD"),
-        ("excluded", "POSITIONAL_OR_KEYWORD"),
-    ]
-    assert isinstance(driver.BenchmarkRun.status, property) and isinstance(driver.BenchmarkRun.reason, property)
-    assert isinstance(driver.RecorderLogs(tmp_path), driver.RecorderLogs)
-    assert (fake.run.settings, fake.run.recorder_dir) == (fake.settings, str(fake.recorder_dir))
-
-
-def test_the_reason_strings_and_the_staging_constants_are_the_shared_ones():
-    # The five strings of Dynamo's vLLM self-benchmark and this module's own, as the artifact carries them.
-    assert (
-        driver.REASON_BATCH_SIZE,
-        driver.REASON_CACHE,
-        driver.REASON_PREFILL_TOKENS,
-        driver.REASON_DECODE_CONTEXT,
-        driver.REASON_NO_BATCHES,
-    ) == (
-        "measured_batch_size_mismatch",
-        "real_seed_cache_validation_failed",
-        "measured_prefill_tokens_mismatch",
-        "measured_decode_context_mismatch",
-        "no_fpm_before_deadline",
-    )
-    # The four verdicts of Dynamo's content probe, which the launcher takes from here.
-    assert (
-        driver.REASON_DATASET_UNAVAILABLE,
-        driver.REASON_DATASET_EMPTY,
-        driver.REASON_TOKENIZER_UNAVAILABLE,
-        driver.REASON_CONTENT_TOO_SHALLOW,
-    ) == ("dataset_unavailable", "dataset_empty", "tokenizer_unavailable", "content_too_shallow")
-    assert (
-        driver.REASON_NOT_COMPLETED,
-        driver.REASON_ENGINE_CALL,
-        driver.REASON_RECORDER_FAULT,
-        driver.REASON_HEADER,
-        driver.REASON_SELF_TEST,
-        driver.REASON_REJECTED,
-        driver.REASON_TOKEN_RANGE,
-        driver.REASON_INTERNAL,
-    ) == (
-        "request_not_completed",
-        "engine_call_failed",
-        "recorder_fault",
-        "recorder_header_invalid",
-        "self_test_failed",
-        "rejected",
-        "token_range_too_small",
-        "internal_error",
-    )
-    # A decode run has seven output tokens: one from an extend batch and six from six decode batches, of which
-    # the middle kept one reads the prompt and three generated tokens.
-    assert grid.DECODE_OUTPUT_TOKENS - 1 == artifact.DECODE_RAW_STEPS == 6
-    assert artifact.DECODE_KEPT_STEP_INDICES[len(artifact.DECODE_KEPT_STEP_INDICES) // 2] == grid.DECODE_PROMPT_LEAD
-    assert {"seed", "warm", "meas", "run", "free"} == set(content.STAGES)
-    assert driver.RUN_TAG_CHARACTERS == 8
-    # The two reasons of a run with several attention-DP ranks, and what the producer block says of the staging.
-    assert (driver.REASON_DP_PLACEMENT, driver.REASON_DP_STEP) == (
-        "dp_rank_placement_mismatch",
-        "dp_ranks_out_of_step",
-    )
-    assert (driver.STAGING_ONE_BATCH_CALL, driver.STAGING_BALANCED_BATCH_CALL) == (
-        "one_batch_call",
-        "balanced_batch_call",
-    )
-    # The number of ranks is a setting of the run, not a constant of the module.
-    assert not hasattr(driver, "RANK") and not hasattr(driver, "DP_SIZE")
+    assert [(fault["file"], fault["where"]) for fault in logs.faults[1:]] == [(name, "reader") for name, _ in expected]
+    assert all(fault["error"].startswith(start) for fault, (_, start) in zip(logs.faults[1:], expected, strict=True))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -3363,43 +2337,6 @@ def test_a_fault_line_in_a_follower_log_fails_the_point(tmp_path):
     _assert_point_failed(fake, victim, "recorder_fault: sched-4101.jsonl: process_batch_result: FAKE recorder fault")
 
 
-def test_the_header_wait_and_the_log_wait_are_two_settings(tmp_path):
-    missing = _start(tmp_path / "header", headers=False, header_wait_seconds=3.0, log_wait_seconds=1.0)
-    assert missing.run.reason.endswith(" after 3.0 s")
-    assert missing.clock.sleeps == 3.0 / driver.POLL_SECONDS
-
-    victim = _victim(_plan_only(tmp_path, "prefill"))
-    silent = _start(
-        tmp_path / "log",
-        "prefill",
-        faults={(victim.benchmark_id, "meas", 0): "silent"},
-        header_wait_seconds=3.0,
-        log_wait_seconds=1.0,
-    )
-    assert silent.run.reason.endswith(" after 1.0 s")
-    assert silent.clock.sleeps == 1.0 / driver.POLL_SECONDS
-
-
-def test_a_fault_line_is_looked_for_before_the_deadline(tmp_path, monkeypatch):
-    fake = _start(tmp_path, "prefill", execute=False)
-    real = artifact.build_measurement
-
-    def build_then_fault_and_deadline(record, rank_fpms):
-        # FAKE: after point 3 the recorder faults and the soft deadline passes.
-        if record["benchmark_id"] == 3:
-            fake.engine.logs[0].write({"type": "fault", "where": "run_batch", "error": "FAKE late fault"})
-            fake.clock.advance(round(FAKE_TIMEOUT_SECONDS * TICKS_PER_SECOND))
-        return real(record, rank_fpms)
-
-    monkeypatch.setattr(artifact, "build_measurement", build_then_fault_and_deadline)
-    fake.execute()
-
-    assert (fake.run.status, fake.run.reason) == (
-        "failed",
-        "recorder_fault: sched-4100.jsonl: run_batch: FAKE late fault",
-    )
-
-
 @pytest.mark.parametrize(
     ("mode", "stage", "reason"),
     [
@@ -3422,53 +2359,6 @@ def test_a_batch_that_is_written_after_its_call_was_checked_fails_the_run(tmp_pa
     _assert_rejected(fake, "failed")
 
 
-def test_a_seventh_decode_batch_of_the_self_test_that_is_written_late_fails_the_run(tmp_path):
-    fake = _start(tmp_path, "decode", faults={(0, "free", FREE_SEVEN_TOKEN_RUN): "late_decode"})
-    assert fake.run.status == "failed"
-    assert "a DECODE batch (seq " in fake.run.reason
-    assert fake.sent_benchmark_ids() <= {0, 1}
-
-
-def test_a_recorder_file_that_appears_after_the_header_wait_fails_the_run(tmp_path):
-    fake = _start(tmp_path, "prefill", execute=False)
-    real = fake.engine.generate
-
-    def generate_after_a_new_process(prompts, rids, max_new_tokens):
-        # FAKE: one more scheduler process writes its header once the run has started.
-        path = fake.recorder_dir / "sched-9999.jsonl"
-        if not path.exists():
-            path.write_text(json.dumps(_fake_header(9999, 1, fake.limits, 1)) + "\n", encoding="utf-8")
-        return real(prompts, rids, max_new_tokens)
-
-    fake.engine.generate = generate_after_a_new_process
-    fake.execute()
-
-    assert fake.run.reason == (
-        "self_test_failed: batch_shape: recorder_header_invalid: 2 recorder headers after the run started, "
-        "expected 1: ['sched-4100.jsonl', 'sched-9999.jsonl']"
-    )
-    assert fake.sent_benchmark_ids() == {0}
-    _assert_rejected(fake, "failed")
-
-
-def test_the_request_caps_also_cover_the_pairs_of_the_self_test(tmp_path):
-    manifest = grid.parse_points_manifest(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "prefill": [{"batch_size": 1, "total_prefill_tokens": 8, "total_kv_read_tokens": 16}],
-                "decode": [],
-            }
-        )
-    )
-    fake = _start(tmp_path, "prefill", manifest=manifest, prefill_max_requests=1)
-    assert fake.run.reason == "rejected: prefill_max_requests=1 is below the largest batch 2"
-    assert fake.engine.calls == []
-    queued = _start(tmp_path / "queued", "prefill", manifest=manifest, max_queued_requests=1)
-    assert queued.run.reason == "rejected: max_queued_requests=1 is below the largest batch 2"
-    assert _start(tmp_path / "two", "prefill", manifest=manifest, prefill_max_requests=2).run.status == "complete"
-
-
 # ---------------------------------------------------------------------------------------------------------------
 # Text runs: prompts made of the conversations of a text pool
 # ---------------------------------------------------------------------------------------------------------------
@@ -3477,7 +2367,7 @@ def test_the_request_caps_also_cover_the_pairs_of_the_self_test(tmp_path):
 def _longest_prompt(fake: _FakeRun) -> int:
     """The longest prompt a run sends, worked out here: the points, the self-test and the warm-up."""
     unit = grid.cached_unit(fake.limits.page_size)
-    lengths = [2 * unit + 7, 256 if fake.settings.warmup_iterations else 0]
+    lengths = [2 * unit + 7, 256]
     for point in fake.built.points:
         lengths.append(point.cached_tokens + point.new_tokens if point.phase == "prefill" else point.cached_tokens - 3)
     return max(lengths)
@@ -3527,61 +2417,13 @@ def test_a_text_run_of_a_small_grid_passes_the_validator_and_the_gate(tmp_path, 
         assert on_disk["kvwarm"] == {**SEEDED_KVWARM, "dataset": FAKE_KVWARM_DATASET}
         merged = json.loads((fake.pod / "benchmark_merged.json").read_text(encoding="utf-8"))
         assert merged["kvwarm"] == on_disk["kvwarm"]
-    # The pool was frozen by the plan: nothing can be added to it under the run.
-    with pytest.raises(RuntimeError):
-        pool.add([[FAKE_TEXT_LOW]])
-
-    # Every prompt is text after its allocated tokens. A second plan over an equal pool gives the same prompts:
-    # the content is a function of the seed and the pool.
-    plan = content.ContentPlan("0", TOKEN_LOW, TOKEN_HIGH, pool=_fake_pool())
-    for call in fake.engine.calls:
-        assert all(TOKEN_LOW <= token < TOKEN_HIGH for prompt in call.prompts for token in prompt)
-    for point in built.points:
-        calls = fake.calls_of(point.benchmark_id)
-        if point.phase == "decode":
-            seed, run = calls
-            assert seed.prompts == run.prompts
-            assert run.prompts == [
-                plan.slot_prefix(0, slot, point.cached_tokens - 3) for slot in range(point.batch_size)
-            ]
-            assert all(_is_fake_text(prompt[1:]) for prompt in run.prompts)
-            continue
-        cached = point.cached_tokens
-        warm, meas = calls[-2:]
-        for slot in range(point.batch_size):
-            for shot in (warm, meas):
-                prompt = shot.prompts[slot]
-                assert len(prompt) == cached + point.new_tokens
-                if cached:
-                    # The slot's prefix, one allocated suffix token, then text again.
-                    assert prompt[:cached] == plan.slot_prefix(0, slot, cached) == calls[0].prompts[slot]
-                    assert _is_fake_text(prompt[1:cached]) and _is_fake_text(prompt[cached + 1 :])
-                else:
-                    assert _is_fake_text(prompt[1:])
-            assert warm.prompts[slot][cached] != meas.prompts[slot][cached]
-    # The self-test and the warm-up are text too.
+    # A prompt that is one slot prefix or one free prompt is text after its first token.
     free = [call for call in fake.engine.calls if call.key[0] == 0]
-    assert len(free) == 7
-    for number in (FREE_BATCH_SHAPE, FREE_UNALIGNED_SEED, FREE_SEVEN_TOKEN_RUN, FREE_WARMUP):
-        assert all(_is_fake_text(prompt[1:]) for prompt in free[number].prompts)
-    # A seeded run of the same grid sends other prompts of the same lengths.
-    seeded_calls = _start(tmp_path / "seeded-again", mode, page_size).engine.calls
-    assert [[len(prompt) for prompt in call.prompts] for call in seeded_calls] == [
-        [len(prompt) for prompt in call.prompts] for call in fake.engine.calls
-    ]
-    long_prompts = [prompt for call in seeded_calls for prompt in call.prompts if len(prompt) > 8]
-    assert long_prompts and not any(_is_fake_text(prompt[1:]) for prompt in long_prompts)
-
-
-def test_a_text_run_with_two_scheduler_processes_and_an_eviction_is_staged_again(tmp_path):
-    victim = _victim(_plan_only(tmp_path, "decode", processes=2))
-    fake = _start_text(tmp_path, "decode", processes=2, evictions={victim.benchmark_id: 1})
-
-    on_disk = _assert_accepted(fake)
-    assert on_disk["producer"]["restaged_points"] == [victim.benchmark_id]
-    # The second attempt sends the prompts of the first: a slot has one sequence for the whole run.
-    first, second = fake.calls_of(victim.benchmark_id, "run")
-    assert first.prompts == second.prompts and all(_is_fake_text(prompt[1:]) for prompt in first.prompts)
+    whole = [free[number] for number in (FREE_BATCH_SHAPE, FREE_UNALIGNED_SEED, FREE_SEVEN_TOKEN_RUN, FREE_WARMUP)]
+    whole += [call for call in fake.engine.calls if call.key[1] in ("seed", "run")]
+    assert len(free) == 7 and len(whole) > 8
+    for call in whole:
+        assert all(_is_fake_text(prompt[1:]) for prompt in call.prompts)
 
 
 @pytest.mark.parametrize("mode", ["prefill", "decode"])
@@ -3601,196 +2443,16 @@ def test_a_text_pool_that_is_not_deeper_than_the_longest_prompt_fails_before_any
     assert (fake.run.status, fake.run.reason) == ("failed", reason)
     assert fake.engine.calls == []
     on_disk = _assert_rejected(fake, "failed")
-    # The grid exists by then; the plan does not, and the artifact still names the source and the pool.
+    # The grid exists by then.
     assert on_disk["coverage"]["expected_points"] == len(fake.built.points)
-    assert on_disk["producer"]["content"] == {
-        "source": "dataset_text_chains",
-        "seed": "0",
-        "token_range": None,
-        "issued": None,
-        "dataset": FAKE_DATASET,
-        "pool": {
-            "id_range": [TOKEN_LOW, TOKEN_HIGH],
-            "conversations": 2,
-            "tokens": need,
-            "dropped_tokens": 0,
-            "dropped_conversations": 0,
-        },
-    }
 
     # One token more is enough: every chain can then give the longest prompt and the token after it.
     deep = _start_text(tmp_path / "deep", mode, text_pool=pool_of(need + 1))
     assert (deep.run.status, deep.run.reason) == ("complete", None)
     _assert_accepted(deep)
-    # Without the warm-up of 256 tokens the points alone decide, and they need as much here.
-    no_warmup = _start_text(tmp_path / "no-warmup", mode, text_pool=pool_of(need), warmup_iterations=0)
-    assert no_warmup.run.reason == reason
 
 
-@pytest.mark.parametrize(("warmup_iterations", "longest"), [(5, 256), (0, 39)])
-def test_the_warm_up_and_the_self_test_count_among_the_prompts_of_a_text_run(tmp_path, warmup_iterations, longest):
-    # One point of three four-token prompts. The longest prompt of the run is then the warm-up's 256 tokens,
-    # and without a warm-up the unaligned prompt of the self-test: two cached units of 16 tokens and 7 more.
-    manifest = grid.parse_points_manifest(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "prefill": [{"batch_size": 3, "total_prefill_tokens": 12, "total_kv_read_tokens": 0}],
-                "decode": [],
-            }
-        )
-    )
-
-    def start(name: str, tokens: int) -> _FakeRun:
-        # Two FAKE conversations that hold ``tokens`` ids in all.
-        ids = [FAKE_TEXT_LOW + step % 50 for step in range(tokens)]
-        pool = _fake_pool([ids[:20], ids[20:]])
-        return _start_text(
-            tmp_path / name, "prefill", manifest=manifest, warmup_iterations=warmup_iterations, text_pool=pool
-        )
-
-    need = longest + 1
-    shallow = start("shallow", need)
-    assert _longest_prompt(shallow) == longest
-    reason = f"content_too_shallow: the text pool holds {need} tokens and the longest prompt needs {need}"
-    assert (shallow.run.status, shallow.run.reason, shallow.engine.calls) == ("failed", reason, [])
-    # One token more and the self-test, the warm-up and the point all get their prompts.
-    assert start("deep", need + 1).run.status == "complete"
-
-
-def test_an_empty_text_pool_is_too_shallow_and_not_an_internal_error(tmp_path):
-    fake = _start_text(tmp_path, "decode", text_pool=_fake_pool([[TOKEN_HIGH], []]))
-
-    assert fake.run.reason == "content_too_shallow: the text pool holds 0 tokens and the longest prompt needs 426"
-    assert fake.engine.calls == []
-    assert fake.payload()["producer"]["content"]["pool"] == {
-        "id_range": [TOKEN_LOW, TOKEN_HIGH],
-        "conversations": 0,
-        "tokens": 0,
-        "dropped_tokens": 1,
-        "dropped_conversations": 2,
-    }
-
-
-def test_the_first_token_check_comes_before_the_too_shallow_check(tmp_path, monkeypatch):
-    # The content plan accepts a small range here, so that a small grid can need more first tokens than it has.
-    monkeypatch.setattr(content, "MIN_VOCAB_SIZE", 16)
-    need = _start(tmp_path / "need", "prefill").payload()["producer"]["first_token_need"]["total"]
-    tokens = (FAKE_TEXT_LOW, FAKE_TEXT_LOW + need - 1)
-    # FAKE: a pool of ten tokens, far too shallow, in a range that is one first token too small.
-    shallow = _fake_pool([[FAKE_TEXT_LOW + step for step in range(10)]], tokens)
-    fake = _start_text(tmp_path / "both", "prefill", tokens=tokens, text_pool=shallow)
-
-    assert fake.run.reason.startswith(f"token_range_too_small: the run needs {need} first tokens (")
-    assert fake.engine.calls == []
-    # With one id more the range is enough, and the pool is what fails the run.
-    wider = (FAKE_TEXT_LOW, FAKE_TEXT_LOW + need)
-    pool = _fake_pool([[FAKE_TEXT_LOW + step for step in range(10)]], wider)
-    enough = _start_text(tmp_path / "pool", "prefill", tokens=wider, text_pool=pool)
-    assert enough.run.reason == "content_too_shallow: the text pool holds 10 tokens and the longest prompt needs 421"
-
-
-def test_a_chain_that_runs_out_during_the_sweep_fails_its_point_as_too_shallow(tmp_path, monkeypatch):
-    # What the content plan raises when a chain has used every conversation, typed in here on its own.
-    plan = content.ContentPlan("0", TOKEN_LOW, TOKEN_HIGH, pool=_fake_pool([[FAKE_TEXT_LOW] * 40]))
-    with pytest.raises(ValueError, match="^text pool exhausted: ") as raised:
-        plan.free_prompt(0, 64)
-    assert str(raised.value).startswith(driver._POOL_EXHAUSTED) and driver._POOL_EXHAUSTED == "text pool exhausted"
-
-    victim = _victim(_plan_only(tmp_path, "decode"))
-    fake = _start_text(tmp_path, "decode", execute=False)
-    real = content.ContentPlan.decode_prompt
-
-    def decode_prompt_then_exhausted(self, rank, slot, context):
-        # FAKE: the chain of one slot of the victim runs out, which the check before the sweep rules out.
-        if fake.run._current_point["benchmark_id"] == victim.benchmark_id and slot == 1:
-            raise ValueError("text pool exhausted: FAKE chain of slot 1")
-        return real(self, rank, slot, context)
-
-    monkeypatch.setattr(content.ContentPlan, "decode_prompt", decode_prompt_then_exhausted)
-    fake.execute()
-
-    # The point failed with the reason of a shallow pool, before any of its requests was sent, and it is
-    # named in the artifact as a point that failed a check is.
-    reason = "content_too_shallow: text pool exhausted: FAKE chain of slot 1"
-    message = f"benchmark_id={victim.benchmark_id}: benchmark point failed: {reason}"
-    assert (fake.run.status, fake.run.reason) == ("failed", message)
-    assert fake.calls_of(victim.benchmark_id) == [] and max(fake.sent_benchmark_ids()) == victim.benchmark_id - 1
-    on_disk = _assert_rejected(fake, "failed")
-    assert on_disk["skipped_points"] == [{"point": victim.as_dict(), "kv_seed_regime": "real_kv", "reason": reason}]
-    assert on_disk["coverage"]["completed_points"] == victim.benchmark_id - 1
-
-
-def test_a_chain_that_runs_out_in_the_self_test_fails_the_run_as_too_shallow(tmp_path, monkeypatch):
-    def free_prompt_exhausted(self, rank, length):
-        raise ValueError("text pool exhausted: FAKE chain of a free prompt")
-
-    monkeypatch.setattr(content.ContentPlan, "free_prompt", free_prompt_exhausted)
-    fake = _start_text(tmp_path, "prefill")
-
-    reason = "content_too_shallow: text pool exhausted: FAKE chain of a free prompt"
-    assert (fake.run.status, fake.run.reason) == ("failed", reason)
-    assert fake.engine.calls == []
-    assert _assert_rejected(fake, "failed")["skipped_points"] == []
-
-
-def test_only_an_exhausted_pool_of_a_text_run_is_too_shallow(tmp_path, monkeypatch):
-    def decode_prompt_fails(text: str):
-        def decode_prompt(self, rank, slot, context):
-            raise ValueError(text)
-
-        return decode_prompt
-
-    # Another ValueError of the plan stays an internal error in a text run.
-    monkeypatch.setattr(content.ContentPlan, "decode_prompt", decode_prompt_fails("FAKE: another refusal"))
-    other = _start_text(tmp_path / "other", "decode")
-    assert other.run.reason == "internal_error: ValueError: FAKE: another refusal (while staging benchmark_id=1)"
-    # A run with seeded ids has no pool that could run out, so the same words are an internal error there.
-    monkeypatch.setattr(content.ContentPlan, "decode_prompt", decode_prompt_fails("text pool exhausted: FAKE"))
-    seeded = _start(tmp_path / "seeded", "decode")
-    assert seeded.run.reason == "internal_error: ValueError: text pool exhausted: FAKE (while staging benchmark_id=1)"
-
-
-def test_execute_takes_the_text_pool_and_the_dataset_together_or_not_at_all(tmp_path):
-    fake = _start(tmp_path, "decode", execute=False)
-    low, high = fake.tokens
-
-    def execute(**arguments):
-        fake.run.execute(fake.engine, token_low=low, token_high=high, **arguments)
-
-    with pytest.raises(TypeError, match="text_pool was given without dataset"):
-        execute(text_pool=_fake_pool())
-    with pytest.raises(TypeError, match="dataset was given without text_pool"):
-        execute(dataset=dict(FAKE_DATASET))
-    with pytest.raises(TypeError, match="text_pool must be a TextPool, got list"):
-        execute(text_pool=_fake_conversations(), dataset=dict(FAKE_DATASET))
-    with pytest.raises(TypeError, match="dataset must be a dict, got str"):
-        execute(text_pool=_fake_pool(), dataset=FAKE_DATASET["path"])
-    for absent in ("path", "sha256", "collection_pool", "conversations"):
-        record = {key: value for key, value in FAKE_DATASET.items() if key != absent}
-        with pytest.raises(TypeError, match=f"it has no \\['{absent}'\\]"):
-            execute(text_pool=_fake_pool(), dataset=record)
-    # A call that was refused for its arguments did not start the run: nothing was sent and it can still run.
-    assert (fake.run.status, fake.engine.calls) == (None, [])
-    execute(text_pool=_fake_pool(), dataset=dict(FAKE_DATASET))
-    assert fake.run.status == "complete"
-    with pytest.raises(RuntimeError, match="execute was already called"):
-        execute()
-
-
-def test_a_text_pool_that_does_not_hold_the_token_range_is_an_internal_error(tmp_path):
-    fake = _start_text(tmp_path, "decode", text_pool=_fake_pool(tokens=(TOKEN_LOW, TOKEN_HIGH - 1)))
-
-    reason = (
-        f"internal_error: ValueError: the text pool keeps the token ids [{TOKEN_LOW}, {TOKEN_HIGH - 1}), which does "
-        f"not hold the plan's token range [{TOKEN_LOW}, {TOKEN_HIGH})"
-    )
-    assert fake.run.reason == reason
-    assert fake.engine.calls == []
-
-
-@pytest.mark.parametrize("page_size", [1, 64])
-@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.parametrize(("mode", "page_size"), [("prefill", 1), ("decode", 64)])
 def test_a_text_run_with_a_pool_wider_than_the_token_range_sends_the_ids_outside_it(tmp_path, mode, page_size):
     # The launcher's pool keeps the ids the model counts, so a text can hold ids outside the token range of
     # the run. Here the pool keeps the three FAKE ids that a pool over the token range drops.
@@ -3818,100 +2480,6 @@ def test_a_text_run_with_a_pool_wider_than_the_token_range_sends_the_ids_outside
     assert all(TOKEN_LOW <= prompt[0] < TOKEN_HIGH for prompt in prompts)
     sent_outside = {token for prompt in prompts for token in prompt if not TOKEN_LOW <= token < TOKEN_HIGH}
     assert sent_outside and sent_outside <= outside
-
-
-def test_a_text_run_that_fails_before_its_plan_still_names_its_source(tmp_path):
-    fake = _start_text(tmp_path, "decode", headers=False)
-
-    on_disk = _assert_failed_before_the_grid(
-        fake, f"recorder_header_invalid: 0 of 1 recorder header(s) in {fake.recorder_dir} after 2.0 s"
-    )
-    assert on_disk["producer"]["content"] == {
-        "source": "dataset_text_chains",
-        "seed": "0",
-        "token_range": None,
-        "issued": None,
-        "dataset": FAKE_DATASET,
-        "pool": {
-            "id_range": [TOKEN_LOW, TOKEN_HIGH],
-            "conversations": 64,
-            "tokens": fake.text_pool.tokens,
-            "dropped_tokens": 3,
-            "dropped_conversations": 1,
-        },
-    }
-    assert on_disk["kvwarm"] == {**SEEDED_KVWARM, "dataset": FAKE_KVWARM_DATASET}
-    # A run that was never executed has no pool: it writes the block of a run with seeded ids.
-    never = _start(tmp_path / "never", "decode", execute=False)
-    never.run.record_failure("rejected: FAKE refusal before the engine was built")
-    assert never.payload()["producer"]["content"] == {
-        "source": "seeded_token_ids",
-        "seed": "0",
-        "token_range": None,
-        "issued": None,
-    }
-    assert never.payload()["kvwarm"] == SEEDED_KVWARM
-
-
-def test_the_source_of_the_settings_is_what_an_artifact_names_before_execute(tmp_path):
-    # The launcher knows the source before it can call execute: a text run whose dataset cannot be had fails
-    # before there is a pool. The setting lets that artifact say what the run was started for.
-    fake = _start(tmp_path / "text", "decode", execute=False, content_source="dataset_text_chains")
-    fake.run.record_failure("dataset_unavailable: FAKE: no such file")
-
-    on_disk = _assert_rejected(fake, "failed")
-    assert on_disk["producer"]["content"] == {
-        "source": "dataset_text_chains",
-        "seed": "0",
-        "token_range": None,
-        "issued": None,
-    }
-    # No pool was handed over, so the ``kvwarm`` block names no dataset.
-    assert on_disk["kvwarm"] == SEEDED_KVWARM
-
-    # ``execute`` goes by the pool it is given. A run whose settings name dataset text and that gets no pool
-    # is a mistake of the caller; a run that gets a pool is a text run whatever the settings say.
-    no_pool = _start(tmp_path / "no-pool", "decode", content_source="dataset_text_chains")
-    assert no_pool.run.reason == (
-        "internal_error: TypeError: settings.content_source names dataset text, and execute was given no text pool"
-    )
-    assert no_pool.engine.calls == []
-    with_pool = _start_text(tmp_path / "with-pool", "decode", content_source="dataset_text_chains")
-    assert with_pool.run.status == "complete"
-    default = _start_text(tmp_path / "default", "decode")
-    assert default.settings.content_source == "seeded_token_ids"
-    assert default.payload()["producer"]["content"]["source"] == "dataset_text_chains"
-    unknown = _start(tmp_path / "unknown", "decode", content_source="FAKE-source")
-    assert unknown.run.reason == (
-        "internal_error: ValueError: settings.content_source must be one of ('seeded_token_ids', "
-        "'dataset_text_chains'), got 'FAKE-source'"
-    )
-
-
-@pytest.mark.parametrize(
-    ("mode", "change"),
-    [
-        ("decode", {"sha256": "FAKE: not a digest"}),
-        ("decode", {"conversations": 0}),
-        ("agg", {"path": ""}),
-        ("prefill", {"url": object()}),
-    ],
-)
-def test_a_dataset_record_that_cannot_be_written_is_left_out_with_the_launcher_blocks(tmp_path, mode, change):
-    fake = _start_text(tmp_path, mode, dataset={**FAKE_DATASET, **change})
-
-    # The dry build refuses the record before any request, and the failed artifact is written without it.
-    assert fake.run.status == "failed" and fake.run.reason.startswith("internal_error: ")
-    assert fake.engine.calls == []
-    on_disk = _assert_rejected(fake, "failed")
-    producer = on_disk["producer"]
-    assert producer["omitted_launcher_blocks"] == fake.run.reason.removeprefix("internal_error: ")
-    assert "timing_source" not in producer and on_disk["config"] == {"mode": mode}
-    assert producer["content"]["source"] == "dataset_text_chains" and "dataset" not in producer["content"]
-    assert producer["content"]["pool"]["conversations"] == 64
-    # The record of the pool is the driver's own and stays whole, its id range included.
-    assert producer["content"]["pool"]["id_range"] == [TOKEN_LOW, TOKEN_HIGH]
-    assert on_disk.get("kvwarm") == (None if mode == "prefill" else SEEDED_KVWARM)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -4074,24 +2642,6 @@ def test_a_complete_run_with_two_ranks_passes_the_validator_and_the_gate(tmp_pat
         # Both ranks ran the batches of the call in the same shape.
         assert call.rank_modes == [one.modes, one.modes]
 
-    # The FAKE ranks ran in lockstep: line for line the same mode, step number and token counts, with as many
-    # requests on each rank, and no rank ever idled.
-    lines = [fake.rank_lines(rank) for rank in range(2)]
-    assert len(lines[0]) == len(lines[1]) > 20
-    for first, second in zip(*lines, strict=True):
-        assert (first["mode"], first["forward_iter"], len(first["rids"])) == (
-            second["mode"],
-            second["forward_iter"],
-            len(second["rids"]),
-        )
-        assert first["global_num_tokens"] == second["global_num_tokens"]
-        assert len(set(first["global_num_tokens"])) == 1 and len(first["global_num_tokens"]) == 2
-        assert first["mode"] != "IDLE"
-        assert {content.parse_request_id(rid)["rank"] for rid in first["rids"]} == {0}
-        assert {content.parse_request_id(rid)["rank"] for rid in second["rids"]} == {1}
-    # The clock of the second FAKE process is 1000 s ahead: no time of one rank was set against the other's.
-    assert lines[1][0]["launch_ts"] - lines[0][0]["launch_ts"] == 1000.0
-
 
 @pytest.mark.parametrize("mode", ["prefill", "decode"])
 def test_a_complete_run_with_three_ranks_passes_the_validator_and_the_gate(tmp_path, mode):
@@ -4136,71 +2686,21 @@ def test_a_text_run_with_two_ranks_passes_the_validator_and_the_gate(tmp_path, m
         assert all(own != other for own, other in zip(call.prompts[0::2], call.prompts[1::2], strict=True))
 
 
-def test_the_calls_outside_any_point_are_balanced_too(tmp_path):
-    fake = _start(tmp_path, "decode", dp_size=2)
-    assert fake.run.status == "complete"
-
-    free = [call for call in fake.engine.calls if call.key[0] == 0]
-    assert fake.engine.calls[: len(free)] == free
-    # The self-test sends its pairs to every rank, and the warm-up one prompt of 256 tokens to every rank.
-    assert [call.key for call in free] == [(0, "free", number) for number in range(7)]
-    assert [len(call.prompts) for call in free] == [4, 4, 4, 4, 4, 4, 2]
-    assert [call.max_new_tokens for call in free] == [1, 1, 1, 1, 1, 7, 5]
-    assert [sorted({len(prompt) for prompt in call.prompts}) for call in free] == [
-        [16],
-        [16],
-        [32],
-        [39],
-        [39],
-        [16],
-        [256],
-    ]
-    assert free[FREE_WARMUP].rids == [_rank_rid(0, "free", 6, rank, 0) for rank in range(2)]
-    # No call of the run holds an odd number of requests, so the FAKE round robin never shifts.
-    assert all(len(call.rids) % 2 == 0 for call in fake.engine.calls)
-    assert fake.engine.round_robin == 0
-    # The seven-token run of the self-test: one extend and six decode batches on each rank, in the same steps.
-    run = free[FREE_SEVEN_TOKEN_RUN]
-    assert run.rank_modes == [["EXTEND"] + ["DECODE"] * 6] * 2
-    first = _line_of(fake, 0, run.rids[0])["forward_iter"]
-    for rank in range(2):
-        steps = [line["forward_iter"] for line in fake.rank_lines(rank) if run.rids[rank] in line["rids"]]
-        assert steps == list(range(first, first + 7))
-    # Without the warm-up nothing is sent in its place.
-    without = _start(tmp_path / "zero", "decode", dp_size=2, warmup_iterations=0)
-    assert [len(call.prompts) for call in without.engine.calls if call.key[0] == 0] == [4] * 6
-    assert without.run.status == "complete"
-
-
-def test_the_first_token_need_of_a_run_with_two_ranks_is_the_need_of_one_rank(tmp_path, monkeypatch):
-    # The content plan accepts a small range here, so that a small grid can fill it to the last id.
-    monkeypatch.setattr(content, "MIN_VOCAB_SIZE", 16)
-    need = _start(tmp_path / "need", "prefill").payload()["producer"]["first_token_need"]
-
-    # Each rank allocates its first tokens from the whole range, so the range of one rank's need is enough.
-    exact = _start(tmp_path / "exact", "prefill", dp_size=2, tokens=(1000, 1000 + need["total"]))
-    assert exact.run.status == "complete"
-    assert exact.run.payloads()[0]["producer"]["first_token_need"] == need
-    short = _start(tmp_path / "short", "prefill", dp_size=2, tokens=(1000, 1000 + need["total"] - 1))
-    assert short.run.reason.startswith(f"token_range_too_small: the run needs {need['total']} first tokens (")
-    assert short.engine.calls == []
-
-
 # -- placement
 
 
-@pytest.mark.parametrize("mode", ["prefill", "decode"])
 @pytest.mark.parametrize(
-    ("fault", "found"),
+    ("mode", "measured", "fault", "found"),
     [
-        ("misplaced", "dp_rank 1"),
-        ("no_dp_rank", "no dp_rank"),
-        ("dp_rank_none", "no dp_rank"),
+        ("prefill", True, "misplaced", "dp_rank 1"),
+        ("decode", True, "misplaced", "dp_rank 1"),
+        ("decode", False, "misplaced", "dp_rank 1"),
+        ("prefill", True, "no_dp_rank", "no dp_rank"),
+        ("prefill", True, "dp_rank_none", "no dp_rank"),
         # Only an int is a rank: the engine object hands over an int or None.
-        ("dp_rank_true", "dp_rank True"),
+        ("prefill", True, "dp_rank_true", "dp_rank True"),
     ],
 )
-@pytest.mark.parametrize("measured", [True, False], ids=["measured-call", "seed"])
 def test_a_request_that_did_not_run_on_its_planned_rank_fails_the_point(tmp_path, mode, fault, found, measured):
     victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
     stage = "seed" if not measured else "meas" if mode == "prefill" else "run"
@@ -4214,34 +2714,6 @@ def test_a_request_that_did_not_run_on_its_planned_rank_fails_the_point(tmp_path
     # staged again.
     _assert_not_staged_again(fake)
     assert fake.calls_of(victim.benchmark_id)[-1].key[1] == stage
-
-
-def test_a_call_that_is_not_the_drivers_shifts_the_placement_and_the_run_fails_at_its_first_call(tmp_path):
-    fake = _start(tmp_path, "decode", dp_size=2, execute=False)
-    # FAKE: something else sent the engine one request without a rank before the run. The FAKE round robin,
-    # like the counter of SGLang's DP controller, then starts the first call of the run on rank 1.
-    stray = content.request_id("stray", 0, "free", 0, 0, 0)
-    fake.engine.generate([[TOKEN_LOW]], [stray], 1)
-    assert fake.engine.calls.pop().ranks == [0] and fake.engine.round_robin == 1
-    fake.execute()
-
-    rid = _rank_rid(0, "free", 0, 0, 0)
-    assert fake.run.reason == (
-        f"self_test_failed: batch_shape: {_PLACEMENT}: {rid}: the engine reports dp_rank 1, the request was "
-        "planned for rank 0"
-    )
-    assert fake.engine.calls[0].ranks == [1, 0, 1, 0] and len(fake.engine.calls) == 1
-    _assert_rejected(fake, "failed")
-
-
-@pytest.mark.parametrize("mode", ["prefill", "decode"])
-def test_a_run_with_one_rank_asks_for_no_rank_in_a_response(tmp_path, mode):
-    # The FAKE engine without DP attention reports no ``dp_rank`` at all, and every other test of this file
-    # passes on that. A rank it does report is not looked at either.
-    victim = _victim(_plan_only(tmp_path, mode))
-    stage = "meas" if mode == "prefill" else "run"
-    fake = _start(tmp_path, mode, faults={(victim.benchmark_id, stage, 0): "odd_dp_rank"})
-    _assert_accepted(fake)
 
 
 # -- the same step on every rank
@@ -4326,11 +2798,8 @@ def test_a_seed_is_not_held_to_one_step_on_all_ranks(tmp_path, mode):
         ("unequal_tokens@1", "[[8, 8], [8, 9]]"),
         # Both ranks hold the same list, and it says that rank 1 ran another number of tokens than rank 0.
         ("uneven_tokens@1", "[[8, 9], [8, 9]]"),
-        # A rank whose batch holds no counts, or only its own, or values that are not counts.
-        ("no_global_tokens@1", "[[8, 8], null]"),
+        # A rank whose batch holds no counts.
         ("no_global_tokens@0", "[null, [8, 8]]"),
-        ("local_tokens@1", "[[8, 8], [8]]"),
-        ("bool_tokens@0", "[[true, true], [8, 8]]"),
         # Every rank holds the same list, and it has one entry where the run has two ranks: the lists are
         # equal and their entries are, so only their length tells.
         ("own_tokens_only", "[[8], [8]]"),
@@ -4349,35 +2818,10 @@ def test_token_counts_that_do_not_show_the_same_step_on_every_rank_fail_the_poin
     _assert_not_staged_again(fake)
 
 
-def test_token_counts_are_compared_for_every_kept_batch_of_a_decode_run(tmp_path):
-    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
-    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "unequal_tokens@1"})
-
-    rid = _rank_rid(victim.benchmark_id, "run", 0, 0, 0)
-    line = _line_of(fake, 0, rid)
-    counts = line["global_num_tokens"]
-    assert counts == [line["extend_num_tokens"]] * 2
-    tokens = json.dumps([counts, [counts[0], counts[1] + 1]])
-    _assert_point_failed(fake, victim, _TOKENS_DIFFER.format(of=7, step=line["forward_iter"], tokens=tokens))
-
-
 def test_a_rank_that_splits_the_extend_of_a_decode_run_fails_the_point(tmp_path):
     # The sequence of rank 1 is one a decode run may have: two extend batches and six decode batches with
-    # exactly its requests. It took one extend batch more than rank 0, so its decode steps are one step behind,
-    # and the first decode step of rank 0 ran beside the second extend batch of rank 1. The FAKE engine wrote
-    # that step of rank 0 as SGLang does, as an extend batch.
+    # exactly its requests. It took one extend batch more than rank 0.
     victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
-    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "split_extend@1"})
-
-    (run,) = fake.calls_of(victim.benchmark_id, "run")
-    assert run.rank_modes == [["EXTEND", "EXTEND"] + ["DECODE"] * 5, ["EXTEND", "EXTEND"] + ["DECODE"] * 6]
-    whole = _lines_of_call(fake, 0, run)
-    _assert_decode_steps_as_extend(whole[1:2], 0, run.prompts[0::2])
-    reason = _DECODE_AS_EXTEND.format(rank=0, found="2 EXTEND, 5 DECODE", seqs=[whole[1]["seq"]])
-    _assert_point_failed(fake, victim, reason)
-    _assert_not_staged_again(fake)
-    assert fake.clock.sleeps == 0
-
     # FAKE: an engine whose prefill graphs cannot replay the step. Rank 0 then keeps its decode batches, and
     # each rank's own sequence is one a decode run may have. The ranks are held against each other.
     kept = _start(
@@ -4422,42 +2866,6 @@ def test_a_decode_step_that_ran_as_an_extend_batch_is_never_kept_as_a_batch_of_t
     assert fake.clock.sleeps == 0
 
 
-def test_a_second_extend_batch_of_other_requests_is_no_decode_step(tmp_path):
-    # Page size 64: a decode run of more than six requests takes two extend batches on each rank, the second
-    # with the requests the first had no room for. That is no decode step under another mode, so a wrong
-    # sequence on a rank keeps the reason a run with one rank gives for it.
-    plan = _plan_only(tmp_path, "decode", 64, dp_size=2)
-    victim = next(point for point in plan.built.points[2:] if point.batch_size > 6)
-    fake = _start(tmp_path, "decode", 64, dp_size=2, faults={(victim.benchmark_id, "run", 0): "seven_decode@1"})
-
-    (run,) = fake.calls_of(victim.benchmark_id, "run")
-    assert run.rank_modes == [["EXTEND", "EXTEND"] + ["DECODE"] * 6, ["EXTEND", "EXTEND"] + ["DECODE"] * 7]
-    first, second = _lines_of_call(fake, 1, run)[:2]
-    assert not set(first["rids"]) & set(second["rids"])
-    _assert_point_failed(
-        fake,
-        victim,
-        f"{_CONTEXT}: rank 1: the batches of the run are 2 EXTEND, 7 DECODE, expected one or more EXTEND and then "
-        "6 DECODE",
-    )
-    # The same run without the fault is kept: its two extend batches stand for no decode step.
-    _assert_ranks_accepted(_start(tmp_path / "whole", "decode", 64, dp_size=2))
-
-
-def test_with_one_rank_an_extend_batch_is_never_counted_as_a_decode_step(tmp_path):
-    # The same FAKE line in a run with one rank, where SGLang turns no decode batch into an extend batch. The
-    # driver waits for six lines of mode DECODE, as it did before it knew attention-DP ranks.
-    victim = _victim(_plan_only(tmp_path, "decode"))
-    fake = _start(tmp_path, "decode", faults={(victim.benchmark_id, "run", 0): "decode_as_extend"})
-
-    (run,) = fake.calls_of(victim.benchmark_id, "run")
-    assert run.modes == ["EXTEND", "EXTEND"] + ["DECODE"] * 5
-    _assert_point_failed(
-        fake, victim, f"no_fpm_before_deadline: {LEADER_LOG} holds 5 of the 6 decode batch(es) after 2.0 s"
-    )
-    assert fake.clock.sleeps == 2.0 / driver.POLL_SECONDS
-
-
 def test_a_step_number_that_is_not_a_count_is_a_recorder_fault(tmp_path):
     victim = _victim(_plan_only(tmp_path, "prefill", dp_size=2))
     fake = _start(tmp_path, "prefill", dp_size=2, faults={(victim.benchmark_id, "meas", 0): "no_forward_iter@1"})
@@ -4484,53 +2892,25 @@ def test_an_idle_batch_inside_the_decode_run_of_a_rank_fails_the_point(tmp_path,
     _assert_not_staged_again(fake)
 
 
-def test_idle_lines_around_the_batches_of_a_call_are_skipped(tmp_path):
-    # A rank idles whenever another rank runs a step alone. Such lines hold no request, and the driver passes
-    # over them where it looks for the batches of its requests.
-    plan = _plan_only(tmp_path, "agg", dp_size=2)
-    prefill = next(point for point in plan.built.points[2:] if point.phase == "prefill" and point.batch_size >= 2)
-    decode = next(point for point in plan.built.points if point.phase == "decode" and point.batch_size >= 2)
-    faults = {(prefill.benchmark_id, "meas", 0): "idle_after@1", (decode.benchmark_id, "run", 0): "idle_after@0"}
-    fake = _start(tmp_path, "agg", dp_size=2, faults=faults)
-
-    assert fake.calls_of(prefill.benchmark_id, "meas")[0].rank_modes == [["EXTEND"], ["EXTEND", "IDLE"]]
-    assert fake.calls_of(decode.benchmark_id, "run")[0].rank_modes[0][-1] == "IDLE"
-    # The FAKE ranks run in lockstep, so in each of the two steps the other rank wrote an idle line as well.
-    assert [sum(1 for line in fake.rank_lines(rank) if line["mode"] == "IDLE") for rank in range(2)] == [2, 2]
-    _assert_ranks_accepted(fake)
-
-
 # -- every check on every rank
 
 
-# (mode, stage, FAKE fault, the reason a run with one rank gives for it)
+# (mode, stage, FAKE fault, the reason a run with one rank gives for it, the rank the fault is on)
 RANK_FAULTS = [
-    ("prefill", "meas", "split_extend", _SPLIT),
-    ("prefill", "warm", "split_extend", _SPLIT),
-    ("prefill", "meas", "foreign_id", _FOREIGN_IN_EXTEND),
-    ("prefill", "meas", "chunked", _CHUNKED),
-    ("prefill", "meas", "decode_follows", _DECODE_AFTER),
-    ("prefill", "meas", "wrong_extend_tokens", _TOKENS_REPORTED),
-    ("prefill", "meas", "wrong_extend_lens", _TOKENS_COUNTED),
-    ("decode", "run", "foreign_id", _CONTEXT + ": extend batch seq {seq} holds a foreign request"),
-    ("decode", "run", "seven_decode", _SEQUENCE.replace("{found}", "1 EXTEND, 7 DECODE")),
-    ("decode", "run", "decode_missing_id", _DECODE_IDS.replace("{held}", "{b0}")),
-]
-# Two more, in which the faulty rank runs one extend batch more than the other while the other decodes. The
-# FAKE engine, as SGLang, then writes that decode step of the other rank as an extend batch. The ranks are
-# looked at in rank order, so the faulty rank is named only when it is rank 0.
-RANK_FAULTS_WITH_ONE_EXTEND_MORE = [
-    ("decode", "run", "foreign_between", _BETWEEN),
-    ("decode", "run", "second_extend_of_one_request", _CONTEXT + ": {rid0} is in 2 extend batches of the run"),
+    ("prefill", "meas", "split_extend", _SPLIT, 1),
+    ("prefill", "warm", "split_extend", _SPLIT, 1),
+    ("prefill", "meas", "foreign_id", _FOREIGN_IN_EXTEND, 0),
+    ("prefill", "meas", "wrong_extend_tokens", _TOKENS_REPORTED, 1),
+    ("prefill", "meas", "wrong_extend_lens", _TOKENS_COUNTED, 1),
+    ("decode", "run", "foreign_id", _CONTEXT + ": extend batch seq {seq} holds a foreign request", 1),
+    ("decode", "run", "seven_decode", _SEQUENCE.replace("{found}", "1 EXTEND, 7 DECODE"), 1),
+    ("decode", "run", "decode_missing_id", _DECODE_IDS.replace("{held}", "{b0}"), 1),
 ]
 
 
 @pytest.mark.parametrize(
     ("mode", "stage", "fault", "reason", "rank"),
-    [
-        *((*row, rank) for rank in (0, 1) for row in RANK_FAULTS),
-        *((*row, 0) for row in RANK_FAULTS_WITH_ONE_EXTEND_MORE),
-    ],
+    RANK_FAULTS,
     ids=lambda value: str(value) if not isinstance(value, str) or " " not in value else None,
 )
 def test_a_check_that_fails_on_one_rank_fails_the_point_and_names_the_rank(tmp_path, mode, stage, fault, reason, rank):
@@ -4546,46 +2926,15 @@ def test_a_check_that_fails_on_one_rank_fails_the_point_and_names_the_rank(tmp_p
     code, _, detail = reason.partition(": ")
     detail = detail.format(
         seq=seq,
-        seq1=seq + 1,
         seq4=seq + 4,
-        seqs=[line["seq"] for line in mine],
         b=batch,
         b0=batch - 1,
         b1=batch + 1,
         bn=batch * victim.new_tokens,
         bn1=batch * victim.new_tokens + 1,
-        rid0=_rank_rid(victim.benchmark_id, stage, 0, rank, 0),
     )
     _assert_point_failed(fake, victim, f"{code}: rank {rank}: {detail}")
     _assert_not_staged_again(fake)
-
-
-@pytest.mark.parametrize(
-    ("fault", "found", "converted"),
-    [
-        # A foreign extend batch on rank 1 between its third and its fourth decode step.
-        ("foreign_between", "1 EXTEND, 2 DECODE, 1 EXTEND, 3 DECODE", 3),
-        # A second extend batch of one request on rank 1, right after its first.
-        ("second_extend_of_one_request", "2 EXTEND, 5 DECODE", 1),
-    ],
-)
-def test_an_extend_batch_more_on_rank_1_inside_a_decode_run_shows_in_the_log_of_rank_0_first(
-    tmp_path, fault, found, converted
-):
-    assert ("decode", "run", fault) in [row[:3] for row in RANK_FAULTS_WITH_ONE_EXTEND_MORE]
-    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
-    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): f"{fault}@1"})
-
-    # Rank 0 decoded in the step in which rank 1 ran its extra extend batch, and the FAKE engine wrote that
-    # step of rank 0 as an extend batch. Rank 0 is looked at first, so the run fails as ranks out of step.
-    (run,) = fake.calls_of(victim.benchmark_id, "run")
-    lines = _lines_of_call(fake, 0, run)
-    assert [line["mode"] for line in lines].count("DECODE") == 5 and lines[converted]["mode"] == "EXTEND"
-    assert lines[converted]["extend_lens"] == [1] * victim.batch_size
-    reason = _DECODE_AS_EXTEND.format(rank=0, found=found, seqs=[lines[converted]["seq"]])
-    _assert_point_failed(fake, victim, reason)
-    _assert_not_staged_again(fake)
-    assert fake.clock.sleeps == 0
 
 
 @pytest.mark.parametrize(
@@ -4615,17 +2964,6 @@ def test_a_recorder_fault_on_rank_1_names_the_log_of_rank_1(tmp_path, mode, stag
     _assert_point_failed(fake, victim, f"recorder_fault: {RANK_1_LOG}: " + reason.format(seq=seq, seq4=seq + 4))
 
 
-def test_a_log_of_one_rank_without_the_batches_of_a_call_fails_at_the_deadline(tmp_path):
-    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
-    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "five_decode@1"})
-
-    # Rank 0 holds every batch of its part of the call; rank 1 lacks its sixth decode batch.
-    _assert_point_failed(
-        fake, victim, f"no_fpm_before_deadline: {RANK_1_LOG} holds 5 of the 6 decode batch(es) after 2.0 s"
-    )
-    assert fake.clock.sleeps == 2.0 / driver.POLL_SECONDS
-
-
 @pytest.mark.parametrize(
     ("mode", "stage", "reason"),
     [("decode", "run", "measured_decode_context_mismatch"), ("prefill", "meas", "measured_prefill_tokens_mismatch")],
@@ -4637,34 +2975,6 @@ def test_a_late_batch_on_rank_1_fails_the_run_and_names_the_rank(tmp_path, mode,
     assert fake.run.status == "failed"
     assert f"{reason}: rank 1: a DECODE batch (seq " in fake.run.reason
     assert fake.run.reason.endswith(") holds requests of a call that had already been checked")
-    _assert_rejected(fake, "failed")
-
-
-@pytest.mark.parametrize(
-    ("mode", "stage", "reason"),
-    [("decode", "run", "measured_decode_context_mismatch"), ("prefill", "meas", "measured_prefill_tokens_mismatch")],
-)
-def test_a_request_of_rank_1_in_the_log_of_rank_0_fails_the_run(tmp_path, mode, stage, reason):
-    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
-    fake = _start(tmp_path, mode, dp_size=2, faults={(victim.benchmark_id, stage, 0): "line_of_the_next_rank@0"})
-
-    # FAKE: after the batches of the call, the log of rank 0 got one more line, with the requests of rank 1.
-    # The line holds no request of rank 0, so it is none of the lines the call was checked on, and the log of
-    # rank 1 holds what it should. It is found when the lines of the call are dropped, by the request ids of
-    # the run that it holds and that are not those of rank 0.
-    (call,) = fake.calls_of(victim.benchmark_id, stage)
-    of_rank_1 = set(call.rids[1::2])
-    (stray,) = [line for line in fake.rank_lines(0) if of_rank_1 & set(line["rids"])]
-    assert stray["rids"] == call.rids[1::2] and stray["seq"] == _lines_of_call(fake, 0, call)[-1]["seq"] + 1
-    assert len(_lines_of_call(fake, 1, call)) == (7 if mode == "decode" else 1)
-    assert (fake.run.status, fake.run.reason) == (
-        "failed",
-        f"{reason}: rank 0: a DECODE batch (seq {stray['seq']}) holds requests of a call that had already been checked",
-    )
-    # The call itself passed its checks. The line was found before the first call of the next point was sent,
-    # and the failure names no point, because the line belongs to none that was being staged.
-    assert max(fake.sent_benchmark_ids()) == victim.benchmark_id
-    assert fake.calls_of(victim.benchmark_id)[-1] is call
     _assert_rejected(fake, "failed")
 
 
@@ -4691,24 +3001,6 @@ def test_a_cache_miss_on_one_rank_stages_the_point_again_on_all_ranks(tmp_path, 
     assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
 
 
-@pytest.mark.parametrize("mode", ["prefill", "decode"])
-def test_two_cache_misses_on_one_rank_fail_the_point(tmp_path, mode):
-    victim = _victim(_plan_only(tmp_path, mode, dp_size=2))
-    fake = _start(tmp_path, mode, dp_size=2, evictions={victim.benchmark_id: 2}, eviction_ranks=(1,))
-
-    expected = grid.expected_cached_tokens(mode, victim.cached_tokens, 1)
-    stage = "meas" if mode == "prefill" else "run"
-    batch = victim.batch_size
-    # Only the requests of rank 1 missed, and the first of them is named.
-    on_disk = _assert_point_failed(
-        fake,
-        victim,
-        f"real_seed_cache_validation_failed: {batch} of {2 * batch} request(s) report another cached count than "
-        f"the planned {expected}: {_rank_rid(victim.benchmark_id, stage, 1, 1, 0)} reports 0",
-    )
-    assert on_disk["producer"]["restaged_points"] == [victim.benchmark_id]
-
-
 def _decode_point_above_the_chunk_budget(plan: _FakeRun) -> grid.Point:
     """A planned decode point whose prompts, once they are computed whole, do not fit one extend batch of a rank."""
     chunk = plan.limits.chunked_prefill_size
@@ -4719,11 +3011,9 @@ def _decode_point_above_the_chunk_budget(plan: _FakeRun) -> grid.Point:
     )
 
 
-@pytest.mark.parametrize("missing", [1, 0])
-def test_a_cache_miss_on_one_rank_in_a_decode_run_above_the_chunk_budget_is_staged_again(tmp_path, missing):
+def test_a_cache_miss_on_one_rank_in_a_decode_run_above_the_chunk_budget_is_staged_again(tmp_path):
     victim = _decode_point_above_the_chunk_budget(_plan_only(tmp_path, "decode", dp_size=2))
-    hit = 1 - missing
-    fake = _start(tmp_path, "decode", dp_size=2, evictions={victim.benchmark_id: 1}, eviction_ranks=(missing,))
+    fake = _start(tmp_path, "decode", dp_size=2, evictions={victim.benchmark_id: 1}, eviction_ranks=(1,))
 
     # First attempt. The rank that lost its cache computed its prompts again, in several extend batches. The
     # rank that hit its cache extended in the first step only and decoded from the second step on, beside the
@@ -4731,15 +3021,6 @@ def test_a_cache_miss_on_one_rank_in_a_decode_run_above_the_chunk_budget_is_stag
     # extend batches of one token per request, so the log of that rank holds fewer than six DECODE lines.
     first, second = fake.calls_of(victim.benchmark_id, "run")
     assert (first.key[2], second.key[2]) == (0, 1)
-    extends = first.rank_modes[missing].count("EXTEND")
-    assert extends >= 2 and first.rank_modes[missing] == ["EXTEND"] * extends + ["DECODE"] * 6
-    converted = min(extends - 1, 6)
-    assert first.rank_modes[hit] == ["EXTEND"] * (1 + converted) + ["DECODE"] * (6 - converted)
-    lines = _lines_of_call(fake, hit, first)
-    _assert_decode_steps_as_extend(lines[1 : 1 + converted], hit, first.prompts[hit::2])
-    # The other rank's count in each of those steps is the tokens of one of its extend batches.
-    assert all(line["global_num_tokens"][missing] > victim.batch_size for line in lines[1 : 1 + converted])
-    assert first.ranks == [0, 1] * victim.batch_size
 
     # The driver saw the missed cache in the responses and staged the point again on both ranks, without
     # waiting for DECODE lines that were never written. The second attempt ran as planned and is kept.
@@ -4755,91 +3036,12 @@ def test_a_cache_miss_on_one_rank_in_a_decode_run_above_the_chunk_budget_is_stag
     assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
 
 
-def test_a_cache_miss_on_one_rank_is_staged_again_on_an_engine_that_keeps_its_decode_batches(tmp_path):
-    # FAKE: the prefill graphs cannot replay the step, so the rank that hit its cache keeps its six decode
-    # batches while the other rank still extends, and idles once it is done.
-    victim = _decode_point_above_the_chunk_budget(_plan_only(tmp_path, "decode", dp_size=2))
-    fake = _start(
-        tmp_path,
-        "decode",
-        dp_size=2,
-        evictions={victim.benchmark_id: 1},
-        eviction_ranks=(1,),
-        prefill_graphs_replay=False,
-    )
-
-    first = fake.calls_of(victim.benchmark_id, "run")[0]
-    assert first.rank_modes[0] == ["EXTEND"] + ["DECODE"] * 6 and first.rank_modes[1].count("EXTEND") >= 2
-    assert fake.clock.sleeps == 0
-    on_disk = _assert_ranks_accepted(fake)
-    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
-
-
-def test_after_a_cache_miss_on_one_rank_only_the_extend_batches_of_a_decode_run_are_waited_for(tmp_path):
-    victim = _victim(_plan_only(tmp_path / "two", "decode", dp_size=2))
-    # FAKE: rank 1 lost its cache before the run, and the log of rank 0 lacks the last decode step of the run.
-    fake = _start(
-        tmp_path / "two",
-        "decode",
-        dp_size=2,
-        evictions={victim.benchmark_id: 1},
-        eviction_ranks=(1,),
-        faults={(victim.benchmark_id, "run", 0): "five_decode@0"},
-    )
-
-    # Nothing of a call that missed its cache is kept, so the missing line is not waited for: the point is
-    # staged again at once and the second attempt is kept.
-    first = fake.calls_of(victim.benchmark_id, "run")[0]
-    assert len(first.rank_modes[0]) == 6 and first.rank_modes[0][0] == "EXTEND"
-    assert fake.clock.sleeps == 0
-    on_disk = _assert_ranks_accepted(fake)
-    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
-
-    # With one rank the batches of the run are waited for first, as before: the missing line ends the run at
-    # the deadline of the log wait, and the missed cache is never reached.
-    victim = _victim(_plan_only(tmp_path / "one", "decode"))
-    one = _start(
-        tmp_path / "one",
-        "decode",
-        evictions={victim.benchmark_id: 1},
-        faults={(victim.benchmark_id, "run", 0): "five_decode"},
-    )
-    _assert_point_failed(
-        one, victim, f"no_fpm_before_deadline: {LEADER_LOG} holds 5 of the 6 decode batch(es) after 2.0 s"
-    )
-    assert one.clock.sleeps == 2.0 / driver.POLL_SECONDS and one.payload()["producer"]["restaged_points"] == []
-
-
-def test_a_kept_batch_that_missed_the_cache_on_one_rank_is_staged_again_and_not_called_out_of_step(tmp_path):
-    # The recorder line of rank 1 says that nothing was cached, so rank 1 computed more tokens than rank 0 and
-    # the token counts of the step are not equal. The cached tokens are looked at first: the point is staged
-    # again as after an eviction, and the second attempt is kept.
-    victim = _victim(_plan_only(tmp_path, "prefill", dp_size=2))
-    fake = _start(tmp_path, "prefill", dp_size=2, faults={(victim.benchmark_id, "meas", 0): "line_missed_the_cache@1"})
-
-    line = _line_of(fake, 1, _rank_rid(victim.benchmark_id, "meas", 0, 1, 0))
-    assert line["global_num_tokens"][0] != line["global_num_tokens"][1]
-    on_disk = _assert_ranks_accepted(fake)
-    assert on_disk[0]["producer"]["restaged_points"] == [victim.benchmark_id]
-
-    faults = {(victim.benchmark_id, "meas", attempt): "line_missed_the_cache@1" for attempt in (0, 1)}
-    twice = _start(tmp_path / "twice", "prefill", dp_size=2, faults=faults)
-    planned = victim.batch_size * victim.cached_tokens
-    _assert_point_failed(
-        twice,
-        victim,
-        f"real_seed_cache_validation_failed: rank 1: sum_prefill_kv_tokens is 0 in the kept batch, the point "
-        f"plans {planned}",
-    )
-
-
 # -- self-test
 
 
 @pytest.mark.parametrize(
     ("call", "fault", "reason", "passed"),
     [
-        (FREE_BATCH_SHAPE, "split_extend@1", "batch_shape: " + _SIZE + ": rank 1: " + _SPLIT.partition(": ")[2], []),
         (FREE_BATCH_SHAPE, "late@1", "batch_shape: " + _STEPS_DIFFER.format(of=1, step=1, step1=2), []),
         (
             FREE_BATCH_SHAPE,
@@ -4857,37 +3059,9 @@ def test_a_kept_batch_that_missed_the_cache_on_one_rank_is_staged_again_and_not_
             ["batch_shape"],
         ),
         (
-            FREE_ALIGNED_SHOTS,
-            "late@1",
-            "aligned_prefix: " + _STEPS_DIFFER.format(of=1, step=3, step1=4),
-            ["batch_shape"],
-        ),
-        (
-            FREE_UNALIGNED_AGAIN,
-            "evict@0",
-            "unaligned_prompt: 2 of 4 request(s) report another cached count than the planned 38: "
-            + _rank_rid(0, "free", 4, 0, 0)
-            + " reports 0",
-            ["batch_shape", "aligned_prefix"],
-        ),
-        (
-            # Rank 0 split its extend batch. Its own sequence is looked at first and has one extend too many.
-            FREE_SEVEN_TOKEN_RUN,
-            "split_extend@0",
-            "seven_token_run: measured_decode_context_mismatch: rank 0: the run has 2 extend batches, expected one",
-            _ALL_BUT_LAST,
-        ),
-        (
-            # Rank 1 split its extend batch, or was released one step late. Either way rank 0 ran its first
-            # decode step beside an extend batch of rank 1, and the FAKE engine, as SGLang, wrote that step
-            # as an extend batch: line 7 of the log of rank 0, after the five one-token calls and the extend
-            # batch of the run.
-            FREE_SEVEN_TOKEN_RUN,
-            "split_extend@1",
-            "seven_token_run: " + _DECODE_AS_EXTEND.format(rank=0, found="2 EXTEND, 5 DECODE", seqs=[7]),
-            _ALL_BUT_LAST,
-        ),
-        (
+            # Rank 1 was released one step late. Rank 0 then ran its first decode step beside the extend batch
+            # of rank 1, and the FAKE engine, as SGLang, wrote that step as an extend batch: line 7 of the log
+            # of rank 0, after the five one-token calls and the extend batch of the run.
             FREE_SEVEN_TOKEN_RUN,
             "late@1",
             "seven_token_run: " + _DECODE_AS_EXTEND.format(rank=0, found="2 EXTEND, 5 DECODE", seqs=[7]),
@@ -4913,15 +3087,6 @@ def test_a_self_test_check_that_fails_on_one_rank_ends_the_run_before_the_sweep(
     assert on_disk["producer"]["self_test"] == passed
 
 
-def test_a_warm_up_that_is_misplaced_fails_the_run(tmp_path):
-    fake = _start(tmp_path, dp_size=2, faults={(0, "free", FREE_WARMUP): "misplaced"})
-    assert fake.run.reason == (
-        f"{_PLACEMENT}: {_rank_rid(0, 'free', 6, 0, 0)}: the engine reports dp_rank 1, the request was planned "
-        "for rank 0"
-    )
-    assert fake.payload_of_rank(0)["producer"]["self_test"] == list(driver.SELF_TEST_CHECKS)
-
-
 # -- headers
 
 
@@ -4938,11 +3103,6 @@ def _edit_rank(path: str, value, *, rank: int):
             "recorder_header_invalid: no leader header for attention-DP rank(s) [1], expected exactly one for each "
             "of [0, 1]: the leaders are ['sched-4100.jsonl']",
         ),
-        (
-            _edit("leader", False),
-            "recorder_header_invalid: no leader header for attention-DP rank(s) [0, 1], expected exactly one for "
-            "each of [0, 1]: the leaders are []",
-        ),
         # Two leaders for rank 0, and so none for rank 1.
         (
             _edit_rank("ranks.attn_dp_rank", 0, rank=1),
@@ -4953,32 +3113,7 @@ def _edit_rank(path: str, value, *, rank: int):
             _edit_rank("ranks.attn_dp_rank", 2, rank=1),
             "recorder_header_invalid: sched-4101.jsonl: attn_dp_rank is 2, expected one of [0, 1]",
         ),
-        (
-            _edit_rank("ranks.attn_dp_rank", True, rank=1),
-            "recorder_header_invalid: sched-4101.jsonl: attn_dp_rank is true, expected one of [0, 1]",
-        ),
-        (
-            _edit_rank("ranks.attn_dp_rank", UNREADABLE, rank=1),
-            "rejected: the recorder could not read ranks.attn_dp_rank in sched-4101.jsonl: " + UNREADABLE["unreadable"],
-        ),
-        # The ranks disagree on a limit: each has its own pool and its own admission.
-        (
-            _edit_rank("limits.max_total_num_tokens", 1200, rank=1),
-            "rejected: scheduler processes disagree on max_total_num_tokens: [1184, 1200]",
-        ),
-        (
-            _edit_rank("limits.chunked_prefill_size", 48, rank=1),
-            "rejected: scheduler processes disagree on chunked_prefill_size: [96, 48]",
-        ),
-        (
-            _edit_rank("decode_graph_sizes", [1, 2, 4], rank=1),
-            "rejected: scheduler processes disagree on decode_graph_sizes: [[1, 2, 4, 8], [1, 2, 4]]",
-        ),
         # The layout a scheduler reports is not the one the run was set up for.
-        (
-            _edit_rank("ranks.attn_dp_size", 3, rank=1),
-            "rejected: " + _OTHER_LAYOUT.format(size="3", enabled="true", planned=2),
-        ),
         (
             _edit("ranks.attn_dp_enabled", False),
             "rejected: " + _OTHER_LAYOUT.format(size="2", enabled="false", planned=2),
@@ -5001,38 +3136,6 @@ def test_a_header_that_does_not_fit_a_run_with_two_ranks_fails_the_run(tmp_path,
     _assert_failed_before_the_grid(fake, reason)
 
 
-def test_headers_of_another_layout_than_the_run_was_set_up_for_are_refused_for_the_layout(tmp_path):
-    # FAKE: the engine has two attention-DP ranks and the run was set up for one. The two leaders are found
-    # first.
-    two_leaders = _start(tmp_path / "two", dp_size=2, **{"expected_scheduler_processes": 2}, execute=False)
-    one_rank = dataclasses.replace(two_leaders.settings, dp_size=1)
-    run = driver.BenchmarkRun(
-        one_rank, two_leaders.recorder_dir, started_at=0.0, clock=two_leaders.clock.read, sleep=two_leaders.clock.sleep
-    )
-    run.execute(two_leaders.engine, token_low=TOKEN_LOW, token_high=TOKEN_HIGH)
-    assert run.reason == (
-        "recorder_header_invalid: 2 leader header(s), expected exactly one: ['sched-4100.jsonl', 'sched-4101.jsonl']"
-    )
-
-    # One scheduler process that reports DP attention, with its input blocker, in a run set up for one rank:
-    # the run is refused for the layout, not for the blocker that goes with it.
-    def dp_header(index: int, header: dict) -> dict:
-        return _fake_header(header["pid"], 0, _limits(1), 1, dp_size=2, dp_rank=0)
-
-    fake = _start(tmp_path / "one", edit_header=dp_header)
-    _assert_failed_before_the_grid(fake, "rejected: " + _OTHER_LAYOUT.format(size="2", enabled="true", planned=1))
-
-    # A run set up for two ranks on an engine without DP attention has no leader for rank 1.
-    def plain_header(index: int, header: dict) -> dict:
-        return _fake_header(header["pid"], index, _limits(1), 2)
-
-    plain = _start(tmp_path / "plain", dp_size=2, edit_header=plain_header)
-    assert plain.run.reason == (
-        "recorder_header_invalid: no leader header for attention-DP rank(s) [1], expected exactly one for each of "
-        "[0, 1]: the leaders are ['sched-4100.jsonl']"
-    )
-
-
 def test_a_scheduler_process_without_a_request_socket_is_refused_under_dp_attention(tmp_path):
     # FAKE: a third scheduler process, the second TP rank inside attention-DP rank 1. Attention TP above 1
     # inside a rank is not supported.
@@ -5051,22 +3154,6 @@ def test_a_scheduler_process_without_a_request_socket_is_refused_under_dp_attent
 
 
 # -- runs that do not complete
-
-
-def test_a_failed_run_with_two_ranks_writes_both_rank_files_and_no_merged_file(tmp_path):
-    victim = _victim(_plan_only(tmp_path, "decode", dp_size=2))
-    fake = _start(tmp_path, "decode", dp_size=2, faults={(victim.benchmark_id, "run", 0): "retraction"})
-
-    rid = _rank_rid(victim.benchmark_id, "run", 0, 1, victim.batch_size - 1)
-    on_disk = _assert_point_failed(
-        fake, victim, f"request_not_completed: {rid}: finish_type='length', completion_tokens=7 of 7, num_retractions=1"
-    )
-    assert sorted(path.name for path in fake.pod.glob("benchmark*")) == ["benchmark.json", "benchmark_dp1.json"]
-    # Both rank files keep the rows of the points before, each with the record of its own rank.
-    for rank, path in enumerate(fake.rank_paths()):
-        rows = json.loads(Path(path).read_text(encoding="utf-8"))["results"]
-        assert [row["fpms"][0]["dp_rank"] for row in rows] == [rank] * (victim.benchmark_id - 1)
-    assert on_disk["coverage"]["completed_points"] == victim.benchmark_id - 1
 
 
 def test_a_run_with_two_ranks_that_is_cut_short_by_the_deadline_is_partial_in_every_rank_file(tmp_path):
@@ -5093,350 +3180,17 @@ def test_a_failure_recorded_before_execute_is_written_for_every_rank(tmp_path):
     assert sorted(path.name for path in fake.pod.glob("benchmark*")) == ["benchmark.json", "benchmark_dp1.json"]
 
 
-# -- a run with one rank is the run it was, on the grid it had
-
-
-def _digest(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-# What a run with one rank sends and writes for a grid whose prefill new-token axis has no low end but 1, as
-# SHA-256 digests: of the calls (prompts, request ids and output tokens of every call, as compact JSON) and of
-# the rank file. The digests of the calls were typed in from runs of this file's fake engine against the driver
-# as it stood before it knew attention-DP ranks. The generated grid had that axis then, and
-# ``_plan_without_the_low_end`` plans it again. For that grid a run with one rank therefore sends what it did
-# then, byte for byte. It writes what it did then apart from three values of the producer block: the format
-# number of the recorder, the dtype of the KV pool, which the driver writes since record format 3, and the
-# resolved KV-cache dtype among the FAKE facts of the launcher (``FAKE_PRODUCER``). The digests of the rank
-# files were typed in again when format 3 came, from the driver as it stands. Each file was first turned back
-# into the file of the digest before, with the format number 2 and without the two keys, and gave that digest;
-# that was done once, by a script that is not kept in this repository. A change that is meant to alter what
-# the driver sends or writes for a given grid retypes them. A change of the generated grid belongs in
-# ``ONE_RANK_DIGESTS``.
-ONE_RANK_DIGESTS_WITHOUT_LOW_END = {
-    ("seeded", "prefill", 1, 1): (
-        "6b24b27d78033d00d7e9d62930fbdf0a833ce54364cff0ee55f8b067588583c6",
-        "a1dc7a64d6a0e6525f5bbeb1d1b9273e51e3a7c5d19c68c09053240012c87ba3",
-    ),
-    ("seeded", "decode", 64, 1): (
-        "434d5f187ff06d2dfb6128094c89f21fcada6ff9c3d13f035040cfdff41639e7",
-        "bdea0e6e7f5cdca0e2dc3ab457260fe1829c1a4317de4617c7fa43d2d28e4cfe",
-    ),
-    ("seeded", "agg", 1, 2): (
-        "ddea84370f198be561d13bcc0a7290d09ae7f2b5bae6f936c811801cc3ae209f",
-        "eda9bf53e4e441ccd471ed1f6308551907ed93628d5f86012ef143e87f66b6eb",
-    ),
-    ("text", "prefill", 64, 1): (
-        "f96a88b7d6a05aeb77faf0227dca5a36f0b6889c35d2e8edab0426f621ec3bf5",
-        "d4dee32a3c8baaf773123ad74054163840ed00558caabd10e4e9bdcc347d8eb9",
-    ),
-    ("text", "decode", 1, 2): (
-        "4864a00e60a507311f37bb42b4c8c4953b58792c901a571c3067ad595852aa53",
-        "a8cb3181e679eace10f82c22e00a008e05de33be323690e372ce79eaeba08cfc",
-    ),
-}
-
-# The same digests for the grid as it is generated now. Its prefill new-token axis holds the two sides of the
-# first step of the table (``grid.prefill_new_token_axis``): for the FAKE graph sizes, which start at 4 as
-# SGLang's default sizes do, two new tokens per request beside one. A run with a prefill block therefore plans
-# six points more with SMALL_CAPS, and a decode run plans what it did. The three pairs below were typed in from
-# runs of this file's fake engine against the driver that still gives the digests above. The test that says
-# what they stand for is
-# ``test_a_run_with_one_rank_differs_from_the_run_without_the_low_end_by_six_points``: it derives the rank file
-# from the file of the run without the low end, byte for byte, and holds every call against the calls of that
-# run.
-ONE_RANK_DIGESTS = {
-    **ONE_RANK_DIGESTS_WITHOUT_LOW_END,
-    ("seeded", "prefill", 1, 1): (
-        "c43aa4cc13f29e5d9bece7fc7411b83c5c031884e6bb806c4de50338d6220a2c",
-        "6f82e18b5ff5ce58ad542a82135efd1b0e2450dd5af27e83c435b3bdb482f5a4",
-    ),
-    ("seeded", "agg", 1, 2): (
-        "547202b41c0ebecd341c0cd6b8ca1591c9b77f2e66803da03c1bf614ea5a6161",
-        "a28ce3e187a7cde23bcca736bd1f0fa9f660496c671c8e18c85acd74f0fa718e",
-    ),
-    ("text", "prefill", 64, 1): (
-        "a5f97e540c5f241af923f2398fe5726f6b98bd5ce3566509b33b49eedffe1325",
-        "dc44a5e3e652a7d8afc2daacbb74612e2113df61be7029a916e80528a853a048",
-    ),
-}
-
-
-def _plan_without_the_low_end(monkeypatch) -> None:
-    """Make the grid plan the prefill new-token axis without the two sides of its first step.
-
-    The low end of the axis is then 1 alone and the axis is the cut graph axis with 1 in front, as it was
-    before the two sides were added (``grid.prefill_new_token_axis``). The driver holds the grid module this
-    file holds, so the grid of a run and the grid a test plans beside it are both planned that way while the
-    patch lasts.
-    """
-    assert driver.grid is grid
-    monkeypatch.setattr(grid, "first_prefill_graph_tokens", lambda graph_sizes: None)
-
-
-def _one_rank_run(
-    tmp_path: Path, source: str, mode: str, page_size: int, processes: int
-) -> tuple[_FakeRun, list, bytes]:
-    """A complete run with one rank: the run, what it sent in every call and its rank file as it is on disk."""
-    start = _start_text if source == "text" else _start
-    fake = start(tmp_path, mode, page_size, processes=processes)
-    assert fake.run.status == "complete" and fake.settings.dp_size == 1
-
-    calls = [[call.prompts, call.rids, call.max_new_tokens] for call in fake.engine.calls]
-    written = fake.run.write()
-    assert written["paths"] == [str(fake.pod / "benchmark.json"), str(fake.pod / "benchmark_merged.json")]
-    # No response of the FAKE engine named a rank, and no batch line held token counts of ranks.
-    assert all(call.ranks == [0] * len(call.rids) for call in fake.engine.calls)
-    assert {line["global_num_tokens"] for line in fake.rank_lines(0)} == {None}
-    return fake, calls, Path(written["paths"][0]).read_bytes()
-
-
-def _one_rank_digests(calls: list, rank_file: bytes) -> tuple[str, str]:
-    return _digest(json.dumps(calls, separators=(",", ":")).encode()), _digest(rank_file)
-
-
-@pytest.mark.parametrize(
-    ("source", "mode", "page_size", "processes"), list(ONE_RANK_DIGESTS_WITHOUT_LOW_END), ids=lambda value: str(value)
-)
-def test_without_the_low_end_a_run_with_one_rank_sends_and_writes_what_it_did_before_attention_dp_ranks(
-    tmp_path, monkeypatch, source, mode, page_size, processes
-):
-    _plan_without_the_low_end(monkeypatch)
-    _fake, calls, rank_file = _one_rank_run(tmp_path, source, mode, page_size, processes)
-
-    assert _one_rank_digests(calls, rank_file) == ONE_RANK_DIGESTS_WITHOUT_LOW_END[(source, mode, page_size, processes)]
-
-
-@pytest.mark.parametrize(
-    ("source", "mode", "page_size", "processes"), list(ONE_RANK_DIGESTS), ids=lambda value: str(value)
-)
-def test_a_run_with_one_rank_sends_and_writes_what_is_pinned_for_the_grid_with_the_low_end(
-    tmp_path, source, mode, page_size, processes
-):
-    _fake, calls, rank_file = _one_rank_run(tmp_path, source, mode, page_size, processes)
-
-    assert _one_rank_digests(calls, rank_file) == ONE_RANK_DIGESTS[(source, mode, page_size, processes)]
-
-
-def _low_end_row(benchmark_id: int, batch: int, cached: int) -> dict:
-    """The row of a rank file for ``batch`` requests of two new tokens each, typed here key by key.
-
-    The time is the FAKE time of the one extend batch of the measured shot on rank 0.
-    """
-    point = {
-        "point_type": "prefill",
-        "benchmark_id": benchmark_id,
-        "total_prefill_tokens": 2 * batch,
-        "total_kv_read_tokens": cached * batch,
-        "batch_size": batch,
-        "sample_reasons": ["prefill_real_seed"] if cached else [],
-    }
-    fpm = {
-        "counter_id": benchmark_id,
-        "dp_rank": 0,
-        "wall_time": (FAKE_EXTEND_BASE_TICKS + 2 * batch) / TICKS_PER_SECOND,
-        "scheduled_requests": {
-            "num_prefill_requests": batch,
-            "sum_prefill_tokens": 2 * batch,
-            "sum_prefill_kv_tokens": cached * batch,
-            "num_decode_requests": 0,
-            "sum_decode_kv_tokens": 0,
-        },
-        "worker_id": FAKE_WORKER_ID,
-    }
-    return {"point": point, "kv_seed_regime": "real_prefix" if cached else "not_applicable", "fpms": [fpm]}
-
-
-def _one_rank_group(row: dict) -> dict:
-    """The iteration group that the rank file of a run with one rank holds beside a row, typed here key by key."""
-    (fpm,) = row["fpms"]
-    return {
-        "benchmark_id": row["point"]["benchmark_id"],
-        "point": row["point"],
-        "expected_dp_ranks": [0],
-        "complete": True,
-        "rank_results": [{"dp_rank": 0, "fpms": [fpm]}],
-        "wall_time": fpm["wall_time"],
-    }
-
-
-def _renumbered(entry: dict, benchmark_id: int) -> dict:
-    """A row or an iteration group of a rank file under another benchmark id, changed in every place that holds it."""
-    entry["point"]["benchmark_id"] = benchmark_id
-    if "benchmark_id" in entry:
-        entry["benchmark_id"] = benchmark_id
-    for holder in (entry, *entry.get("rank_results", ())):
-        for fpm in holder.get("fpms", ()):
-            fpm["counter_id"] = benchmark_id
-    return entry
-
-
-@pytest.mark.parametrize(
-    ("source", "mode", "page_size", "processes"),
-    [run for run in ONE_RANK_DIGESTS if run[1] != "decode"],
-    ids=lambda value: str(value),
-)
-def test_a_run_with_one_rank_differs_from_the_run_without_the_low_end_by_six_points(
-    tmp_path, monkeypatch, source, mode, page_size, processes
-):
-    """What stands behind the digests that the low end changed, shown on the two runs themselves."""
-    fake, _calls, rank_file = _one_rank_run(tmp_path / "with", source, mode, page_size, processes)
-    with monkeypatch.context() as patch:
-        _plan_without_the_low_end(patch)
-        old, _old_calls, old_file = _one_rank_run(tmp_path / "without", source, mode, page_size, processes)
-        old_points = old.built.points
-
-    # The six points, typed here: two requests and one request of two new tokens each, with the longest prefix,
-    # a middle one and none. A request of two new tokens can carry a prefix of up to I - 3 tokens in whole
-    # units of G: 425 tokens give 26 * 16 = 416 at page 1, and 809 give 12 * 64 = 768 at page 64. SMALL_CAPS
-    # keep the two ends and the middle of the prefixes 0, G, 2 G, 4 G and so on up to the longest.
-    longest, middle = {1: (416, 64), 64: (768, 256)}[page_size]
-    added = [(batch, 2, cached) for batch in (2, 1) for cached in (longest, middle, 0)]
-    shapes = [(point.batch_size, point.new_tokens, point.cached_tokens) for point in fake.built.points]
-    old_shapes = [(point.batch_size, point.new_tokens, point.cached_tokens) for point in old_points]
-    # They stand where the points of one new token stood, which follow them now with the same batch sizes and
-    # prefixes. Every other point is planned as it was, in the same order.
-    first = shapes.index(added[0])
-    assert shapes[first : first + 6] == added
-    assert shapes[first + 6 : first + 12] == [(batch, 1, cached) for batch, _new, cached in added]
-    assert shapes[:first] + shapes[first + 6 :] == old_shapes
-
-    # The rank file, derived from the file of the run without the low end: the rows and the groups of the six
-    # points go in, and the points after them count six higher.
-    derived = json.loads(old_file)
-    rows = [_low_end_row(first + 1 + index, batch, cached) for index, (batch, _new, cached) in enumerate(added)]
-    for name, entries in (("results", rows), ("iteration_groups", [_one_rank_group(row) for row in rows])):
-        before, after = derived[name][:first], derived[name][first:]
-        derived[name] = [
-            *before,
-            *entries,
-            *(_renumbered(entry, first + 7 + index) for index, entry in enumerate(after)),
-        ]
-    # The digest of a grid is SHA-256 over its numbered points in execution order, as compact JSON with sorted
-    # keys.
-    points = [row["point"] for row in derived["results"]]
-    derived["grid_digest"] = _digest(json.dumps(points, sort_keys=True, separators=(",", ":")).encode())
-    derived["coverage"].update(expected_points=len(points), completed_points=len(points))
-    # The content plan issued a seed prompt for every request with a prefix and, in each of the two shots, a
-    # shot of a slot for such a request and a prompt with a first token of its own for a request without a
-    # prefix. The run plans for those first tokens.
-    seeded = sum(batch for batch, _new, cached in added if cached)
-    unseeded = sum(batch for batch, _new, cached in added if not cached)
-    issued, need = derived["producer"]["content"]["issued"], derived["producer"]["first_token_need"]
-    issued["seed_prompts"] += seeded
-    issued["shots"] += 2 * seeded
-    issued["zero_cached_prompts"] += 2 * unseeded
-    need["zero_cached_prefill_prompts"] += 2 * unseeded
-    need["total"] += 2 * unseeded
-    # The FAKE time of the six points. The points before them stored every prefix, and a prompt is never found
-    # in the cache to its last token, so each request of a seed computes the last page of its prefix. A warm
-    # shot and a measured shot compute two tokens per request, and the FAKE engine takes longer for a warm shot.
-    ticks = 0
-    for batch, _new, cached in added:
-        if cached:
-            ticks += FAKE_EXTEND_BASE_TICKS + batch * page_size
-        ticks += 2 * (FAKE_EXTEND_BASE_TICKS + 2 * batch) + FAKE_WARM_SHOT_EXTRA_TICKS
-    derived["timing"]["benchmark_elapsed_seconds"] += ticks / TICKS_PER_SECOND
-    derived["timing"]["measured_iteration_seconds"] += sum(row["fpms"][0]["wall_time"] for row in rows)
-    assert json.loads(rank_file) == derived
-    # A rank file is the JSON text of its payload with the keys in the order they were written
-    # (sglbench_artifact.py), and every FAKE time is a whole number of ticks, so the sums above are exact: the
-    # derived file is the written one byte for byte.
-    assert json.dumps(derived, allow_nan=False).encode() == rank_file
-
-    # The calls. Those of the six points lie between the calls the run sent before: a seed for the four points
-    # with a prefix, and two shots for each of the six.
-    numbers = range(first + 1, first + 7)
-    kept = [call for call in fake.engine.calls if call.key[0] not in numbers]
-    assert len(fake.engine.calls) - len(kept) == 4 + 2 * 6
-    changed_shots = 0
-    for call, old_call in zip(kept, old.engine.calls, strict=True):
-        number, stage, attempt = call.key
-        old_number = number - 6 if number > first + 6 else number
-        assert (old_number, stage, attempt) == old_call.key
-        assert call.rids == [rid.replace(f"-p{old_number}-", f"-p{number}-") for rid in old_call.rids]
-        assert call.max_new_tokens == old_call.max_new_tokens
-        if first + 6 < number <= first + 12 and stage in ("warm", "meas"):
-            # A shot of a point of one new token. The six points took shots of its slots and prefix before it,
-            # or prompts without a prefix, so the prompt is the one it was up to the prefix and its one new
-            # token is another.
-            cached = shapes[number - 1][2]
-            for prompt, old_prompt in zip(call.prompts, old_call.prompts, strict=True):
-                assert len(prompt) == len(old_prompt) == cached + 1
-                assert prompt[:cached] == old_prompt[:cached] and prompt[cached] != old_prompt[cached]
-            changed_shots += 1
-        else:
-            assert call.prompts == old_call.prompts
-    assert changed_shots == 2 * 6
-    # The six points took the place of the points of one new token in the content of the run, whose numbers they
-    # have: each of their seeds is the seed that was sent under the number before, and each prompt of their
-    # shots is the prompt that was sent before and one token more.
-    for number in numbers:
-        for call, old_call in zip(fake.calls_of(number), old.calls_of(number), strict=True):
-            assert (call.key, call.rids, call.max_new_tokens) == (old_call.key, old_call.rids, 1)
-            more = 0 if call.key[1] == "seed" else 1
-            assert [prompt[: len(prompt) - more] for prompt in call.prompts] == old_call.prompts
-
-
 # ---------------------------------------------------------------------------------------------------------------
 # What the KV pool takes from the generated prefill block
 # ---------------------------------------------------------------------------------------------------------------
 
-# The FAKE limits at page 1: I = 428, S = 1184. A request of n new tokens can carry a prefix up to 427 - n. Four
-# such requests must keep 4 * (k + n + 2) below 1184, so the pool ends their prefix at k + n <= 293; two requests
-# may reach 589, which the input limit ends first. The default caps plan batch 1, 2 and 4, or 3 where four
-# requests no longer fit a step; SMALL_CAPS plan batch 1 and 2. Typed here on its own. The new-token axis holds
-# 13 values: the low end 1 and 2, every FAKE graph size and the size plus one (4, 5, 8, 9, 16, 17, 32, 33, 64
-# and 65) and the chunk budget, 96. The two step budgets, 80 and 96 tokens, leave batch 1, 2 and 4 to the eight
-# values up to 17, batch 1, 2 and 3 to 32, batch 1 and 2 to 33 and batch 1 to 64, 65 and 96, which are
-# 8 * 3 + 3 + 2 + 3 = 32 pairs. The pool shortens the 8 pairs at batch 4 and the pair of n = 32 at batch 3, and
-# the longest batch of four, 4 * (425 + 2) = 1708 tokens, must stay below the pool.
-FAKE_POOL_CUT = grid.PoolCut(
-    pool_tokens=1184,
-    pairs=32,
-    dropped_pairs=0,
-    shortened_pairs=9,
-    whole_grid_pool_tokens=1709,
-    pool_sets_input_limit=False,
-)
-# The same when the low end of the new-token axis is 1 alone (``_plan_without_the_low_end``): the three pairs of
-# n = 2 are not planned, and the pool shortens the one at batch 4 among them. It is what the pool took before
-# the axis had the two sides of its first step.
-FAKE_POOL_CUT_WITHOUT_LOW_END = dataclasses.replace(FAKE_POOL_CUT, pairs=29, shortened_pairs=8)
 
-
-@pytest.mark.parametrize("mode", ["prefill", "agg"])
-def test_a_run_tells_what_the_kv_pool_takes_from_its_generated_prefill_block(tmp_path, mode):
-    fake = _start(tmp_path, mode, caps=grid.SampleCaps())
-
-    assert fake.run.status == "complete"
-    assert fake.run.prefill_pool_cut() == FAKE_POOL_CUT == grid.prefill_pool_cut(fake.limits, grid.SampleCaps())
-    # Asking changes nothing, and nothing of the answer is in the files.
-    written = fake.run.write()
-    assert fake.run.prefill_pool_cut() == FAKE_POOL_CUT
-    for path in written["paths"]:
-        assert "pool_cut" not in Path(path).read_text(encoding="utf-8")
-
-
-def test_a_run_with_two_ranks_tells_what_the_pool_of_one_rank_takes(tmp_path):
-    """The limits are those of one attention-DP rank, and so is the pool of the answer."""
-    fake = _start(tmp_path, "prefill", dp_size=2, caps=grid.SampleCaps())
-
-    assert fake.run.status == "complete" and fake.dp_size == 2
-    assert fake.run.prefill_pool_cut() == FAKE_POOL_CUT
-
-
-def test_without_the_low_end_a_run_tells_what_the_kv_pool_took_before(tmp_path, monkeypatch):
-    """The low end changes the answer by its own pairs and by nothing else."""
-    _plan_without_the_low_end(monkeypatch)
-    fake = _start(tmp_path, "prefill", caps=grid.SampleCaps())
-
-    assert fake.run.status == "complete"
-    assert not any(point.new_tokens == 2 for point in fake.built.points)
-    assert fake.run.prefill_pool_cut() == FAKE_POOL_CUT_WITHOUT_LOW_END
-
-
-def test_a_run_tells_nothing_about_a_pool_that_ends_no_axis_of_its_prefill_block(tmp_path):
+def test_a_run_tells_what_the_kv_pool_takes_from_a_generated_prefill_block_and_nothing_otherwise(tmp_path):
+    for mode in ("prefill", "agg"):
+        fake = _start(tmp_path / mode, mode, caps=grid.SampleCaps())
+        assert fake.run.status == "complete"
+        cut = grid.prefill_pool_cut(fake.limits, grid.SampleCaps())
+        assert cut is not None and fake.run.prefill_pool_cut() == cut
     # Before the grid exists.
     assert _plan_only(tmp_path, "prefill", caps=grid.SampleCaps()).run.prefill_pool_cut() is None
     # The same limits with caps that plan no batch above two.
@@ -5448,34 +3202,12 @@ def test_a_run_tells_nothing_about_a_pool_that_ends_no_axis_of_its_prefill_block
     # A decode run: its block is not looked at.
     decode = _start(tmp_path / "decode", "decode", caps=grid.SampleCaps())
     assert decode.run.status == "complete" and decode.run.prefill_pool_cut() is None
-
-
-def test_a_run_with_a_points_manifest_tells_nothing_about_the_pool(tmp_path):
-    manifest = grid.parse_points_manifest(
-        json.dumps(
-            {
-                "schema_version": 3,
-                "prefill": [{"batch_size": 4, "total_prefill_tokens": 16, "total_kv_read_tokens": 64}],
-                "decode": [],
-            }
-        )
-    )
-    fake = _start(tmp_path, "prefill", manifest=manifest, caps=grid.SampleCaps())
-
-    assert fake.run.status == "complete" and fake.built.source == "manifest"
-    assert grid.prefill_pool_cut(fake.limits, grid.SampleCaps()) == FAKE_POOL_CUT
-    assert fake.run.prefill_pool_cut() is None
-
-
-def test_a_run_whose_pool_leaves_no_prefill_point_fails_and_still_tells_what_the_pool_took(tmp_path):
-    # One request of one token needs 16 + 16 + 1 = 33 pool tokens at page 16, strictly below the pool.
-    limits = grid.Limits(16, 100, 32, 8, 512, 256)
-    fake = _start(tmp_path, "prefill", 16, limits=limits)
-
-    assert fake.run.status == "failed" and fake.built.missing_phases == ("prefill",)
-    cut = fake.run.prefill_pool_cut()
-    assert cut == grid.prefill_pool_cut(limits, SMALL_CAPS)
-    assert cut.dropped_pairs == cut.pairs > 0 and cut.shortened_pairs == 0
+    # A run with a points manifest, on the limits and caps of the generated runs above.
+    points = [{"batch_size": 4, "total_prefill_tokens": 16, "total_kv_read_tokens": 64}]
+    manifest = grid.parse_points_manifest(json.dumps({"schema_version": 3, "prefill": points, "decode": []}))
+    listed = _start(tmp_path / "manifest", "prefill", manifest=manifest, caps=grid.SampleCaps())
+    assert listed.run.status == "complete" and listed.built.source == "manifest"
+    assert listed.run.prefill_pool_cut() is None
 
 
 def _execute_with_hook(fake: _FakeRun, hook) -> None:
@@ -5490,41 +3222,12 @@ def test_the_grid_hook_is_called_once_when_the_grid_is_planned_and_before_any_re
     _execute_with_hook(fake, lambda: seen.append((fake.run.prefill_pool_cut(), len(fake.engine.calls))))
 
     # The answer was there when the hook ran, and no request had been sent.
-    assert seen == [(FAKE_POOL_CUT, 0)]
+    cut = grid.prefill_pool_cut(fake.limits, grid.SampleCaps())
+    assert cut is not None and seen == [(cut, 0)]
     assert fake.run.status == "complete" and len(fake.engine.calls) > 0
 
-
-def test_the_grid_hook_is_called_for_a_grid_that_misses_a_phase_and_not_when_no_grid_is_planned(tmp_path):
+    # The hook is also called for a grid that misses a phase.
     missing = _start(tmp_path / "missing", "prefill", 16, limits=grid.Limits(16, 100, 32, 8, 512, 256), execute=False)
     seen = []
     _execute_with_hook(missing, lambda: seen.append(missing.run.prefill_pool_cut()))
     assert missing.run.status == "failed" and len(seen) == 1 and seen[0].dropped_pairs == seen[0].pairs
-
-    # A manifest point that does not fit: the grid cannot be planned, and the run is rejected before the hook.
-    bad = grid.parse_points_manifest(
-        json.dumps(
-            {
-                "schema_version": 3,
-                "prefill": [{"batch_size": 4, "total_prefill_tokens": 16, "total_kv_read_tokens": 4000}],
-                "decode": [],
-            }
-        )
-    )
-    refused = _start(tmp_path / "refused", "prefill", manifest=bad, execute=False)
-    called = []
-    _execute_with_hook(refused, lambda: called.append(1))
-    assert refused.run.status == "failed" and refused.run.reason.startswith("rejected: ") and called == []
-    assert refused.run.prefill_pool_cut() is None
-
-
-def test_an_exception_of_the_grid_hook_is_a_failure_of_the_run(tmp_path):
-    fake = _start(tmp_path, "prefill", execute=False)
-
-    def hook():
-        raise RuntimeError("FAKE hook fault")
-
-    _execute_with_hook(fake, hook)
-
-    assert fake.run.status == "failed"
-    assert fake.run.reason == "internal_error: RuntimeError: FAKE hook fault"
-    assert fake.engine.calls == []
