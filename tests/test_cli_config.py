@@ -2457,7 +2457,9 @@ def test_imported_agentic_snapshot_requires_one_selection_per_lane(selection_cou
 
 
 @pytest.mark.parametrize("warmup", [False, True])
-@pytest.mark.parametrize("profile", [{}, {"duration_seconds": 2.0, "response_grace_seconds": 0.0}])
+@pytest.mark.parametrize(
+    "profile", [{}, {"duration_seconds": 2.0, "response_grace_seconds": 0.0, "burst_phase_starts": True}]
+)
 def test_agentic_profile_roundtrip_and_compiler_preserve_controls(warmup: bool, profile: dict) -> None:
     from aisim.compiler import prediction_to_replay_spec
     from aisim.config import AgenticProfileOptions, TrafficPredictionConfig, TrafficRecommendationConfig

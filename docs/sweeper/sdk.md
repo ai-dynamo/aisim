@@ -432,6 +432,7 @@ Every `Workload` field:
 | `agentic_profile.cancel_drain_seconds` | `float` | `10.0` when enabled | Nonnegative finite upper bound for cancellation acknowledgements. Supported offline runtimes acknowledge synchronously; server/GPU cleanup is not guaranteed by this budget. |
 | `agentic_profile.tree_idle_cap_seconds` | `float` | `300.0` when enabled | Positive finite idle cap for advancing a play's pending workload timers when that play has no outstanding requests. |
 | `agentic_profile.global_idle_cap_seconds` | `float` | `10.0` when enabled | Positive finite idle cap for advancing pending workload timers when the entire client workload has no outstanding requests. Engine completions and server cleanup keep their actual timestamps. |
+| `agentic_profile.burst_phase_starts` | `bool` | `false` | Start warmup primers together and align the first eligible profiling request of each lane to the phase start. |
 | `replay_concurrency` | `int \| None` | `None` | Closed-loop in-flight cap **for a trace**; when set, trace timestamps are ignored. For synthetic closed-loop use `concurrency` instead. |
 
 Seed-only snapshots retain the existing sampling behavior and serialize as

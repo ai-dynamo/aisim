@@ -226,8 +226,10 @@ caps). For example, a lane that advances far into a long play can wait while
 a freshly recycled lane starts at zero; this is not a scheduler stall. This
 matches the pinned reference's `_handoff_replay_offset_ms` and
 `_profiling_phase_t0_offset_ms` with its default spread phase starts. The
-reference's optional `--burst-phase-starts` mode instead re-anchors each lane;
-that alternative is not the policy modeled here.
+reference's optional `--burst-phase-starts` mode is available through
+`traffic.load.agentic_profile.burst_phase_starts: true`. In this mode, all
+primers start together. At the profiling boundary, each lane subtracts its
+own earliest eligible offset. Later turns retain their dependencies and delays.
 
 The formal request and trajectory cohorts exclude all preparation-only plays.
 Partially warmed active trees retain their cache/request identity but start

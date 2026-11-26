@@ -84,6 +84,7 @@ the current SA convention.
 | `traffic.load.agentic_profile.cancel_drain_seconds` | `10` when enabled | `x` | `-` | Nonnegative finite upper bound for cancellation acknowledgements. The supported offline runtimes acknowledge synchronously; this does not guarantee server/GPU cleanup. |
 | `traffic.load.agentic_profile.tree_idle_cap_seconds` | `300` when enabled | `x` | `-` | Positive finite idle cap for advancing a play's pending workload timers when that play has no outstanding requests. |
 | `traffic.load.agentic_profile.global_idle_cap_seconds` | `10` when enabled | `x` | `-` | Positive finite idle cap for advancing pending workload timers when the entire client workload has no outstanding requests. Engine completions and server cleanup keep their actual timestamps. |
+| `traffic.load.agentic_profile.burst_phase_starts` | `false` | `x` | `-` | Start warmup primers together and bring each lane's first eligible profiling request to the phase start. |
 | `traffic.stop.requests` | `100` for default traffic | `x` | `-` | Positive integer; 10× default concurrency; synthetic request source only. |
 | `traffic.stop.requests_per_load_unit` | `null` | `x` | `-` | Positive; synthetic request source only. |
 | `traffic.stop.sessions` | `null` | `x` | `-` | Positive integer; synthetic session source only. |
@@ -649,11 +650,17 @@ also applies without a continuous profile.
 | `cancel_drain_seconds` | `10` | Upper bound for cancellation acknowledgements. Offline runtimes acknowledge immediately. |
 | `tree_idle_cap_seconds` | `300` | Longest idle wait inside a play with no outstanding requests; longer authored waits are shortened. |
 | `global_idle_cap_seconds` | `10` | Longest idle wait when no client request is outstanding. |
+| `burst_phase_starts` | `false` | Start warmup primers together and align the first eligible profiling request of each lane to the phase start. |
 
 `agentic_profile: {}` uses all defaults. Durations and idle caps must be
 positive; grace periods may be zero. The profile cannot be combined with
 `traffic.stop.max_virtual_time_seconds`. Idle caps shorten client wait timers
 only; engine work keeps its real timing.
+
+With `burst_phase_starts: true`, the `live_trajectory_v1` and `primers_only`
+policies release their snapshot primers together. At the profiling boundary,
+each lane retains the relative offsets of its initial work. Later turns
+still wait for their dependencies and recorded delays, subject to the idle caps.
 
 Throughput uses the successful requests, including those that finish during
 the grace period. The observed interval runs from their earliest arrival to
