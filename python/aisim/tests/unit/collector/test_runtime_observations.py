@@ -1510,6 +1510,32 @@ def test_vllm_032_layer_strided_plan_imports_every_layout(tmp_path, layout, grou
     assert {group.page_size_bytes for group in resources.cache_groups} == {512}
 
 
+@pytest.mark.parametrize("field", ["cache", "raw_cache_config"])
+@pytest.mark.parametrize("heads,named,valid", [(2, "LBHNC", False), (2, "LBNHC", True), (1, "LBHNC", True)])
+def test_nixl_compaction_checks_named_and_physical_layouts(tmp_path, field, heads, named, valid):
+    from aisim import _runtime
+    from aisim.support.finalization import _merge_resources
+
+    path, launch = _strided_fixture(tmp_path, layout="LBNHC", heads=heads)
+
+    def name_worker_layout(row):
+        if row["kind"] == "worker":
+            row.setdefault(field, {})["kv_cache_layout"] = named
+
+    _mutate(path, name_worker_layout)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    memory = result["resources"]["runtime_memory"]
+    if valid:
+        _runtime.observed_model_dtype(memory["provenance"])
+        _merge_resources([result["resources"]], {}, source_references=True)
+    else:
+        with pytest.raises(ValueError, match="kv_cache_layout"):
+            _runtime.observed_model_dtype(memory["provenance"])
+        with pytest.raises(ValueError, match="kv_cache_layout"):
+            _merge_resources([result["resources"]], {}, source_references=True)
+
+
 @pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
 def test_vllm_032_kernel_block_subdivision_keeps_manager_block_stride(tmp_path, layout):
     path, launch = _strided_fixture(tmp_path, layout=layout, kernel=8)

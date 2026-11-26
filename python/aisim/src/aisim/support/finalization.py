@@ -94,6 +94,7 @@ def finalization_manifest(request: SupportRequest) -> dict[str, Any] | None:
         "source_references_v2",
         "source_references_v3",
         "source_references_v4",
+        "source_references_v5",
     ):
         raise ValueError("unsupported finalized observation provenance format")
     try:
@@ -191,7 +192,7 @@ def _merge_resources(
     manifest: dict[str, Any],
     *,
     source_references: bool = False,
-    observation_format: str = "source_references_v4",
+    observation_format: str = "source_references_v5",
 ) -> dict[str, Any]:
     if not observations:
         raise ValueError("collection has no runtime memory observations")
@@ -244,12 +245,13 @@ def _merge_resources(
         if source_references:
             # Raw records remain immutable collection artifacts. Reference their
             # exact bytes instead of copying every rank/layer into each candidate.
-            if observation_format in ("source_references_v3", "source_references_v4"):
+            if observation_format in ("source_references_v3", "source_references_v4", "source_references_v5"):
                 from .runtime import _worker_observation_digest, _worker_observations
 
-                bound = observation_format == "source_references_v4"
-                workers = _worker_observations(evidence, current_format=bound)
-                if any(worker.get("backends") or worker.get("kv_cache_layout") for worker in workers):
+                current = observation_format == "source_references_v5"
+                bound = current or observation_format == "source_references_v4"
+                workers = _worker_observations(evidence, ranked=bound, layout_choices=current)
+                if current or any(worker.get("backends") or worker.get("kv_cache_layout") for worker in workers):
                     evidence["worker_observations"] = workers
                     with_worker_observations = True
                 if bound:
@@ -273,9 +275,11 @@ def _merge_resources(
             )
     assert canonical is not None and minimum is not None
     if source_references:
-        if with_worker_observations and worker_digests:
+        if worker_digests:
             manifest["worker_observation_digests"] = sorted(worker_digests)
-        manifest["observation_provenance"] = observation_format if with_worker_observations else "source_references"
+        manifest["observation_provenance"] = (
+            observation_format if with_worker_observations or worker_digests else "source_references"
+        )
     manifest["cell_observations"] = summaries if source_references else observations
     manifest["capacity_policy"] = "minimum observed request-usable rank-local capacity across compatible cells"
     provenance = _canonical(manifest)
@@ -297,7 +301,7 @@ def _finalized_resources(
     manifest: dict[str, Any],
     *,
     source_references: bool = False,
-    observation_format: str = "source_references_v4",
+    observation_format: str = "source_references_v5",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The finalized resources in the source profile's cache layout, and the merged grouped measurements.
 

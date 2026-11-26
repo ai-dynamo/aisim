@@ -1029,6 +1029,41 @@ def test_new_versions_observe_and_finalize_layer_strided_memory(tmp_path, monkey
     assert resolved["runtime_memory"]["kv_cache_bytes"] == 88 * 128
 
 
+def test_sparse_formal_finalization_still_binds_its_installed_version_and_rank_roster(tmp_path, monkeypatch):
+    from aisim import _runtime
+    from aisim.support.finalization import _merge_resources
+
+    cell = _evidence(tmp_path, monkeypatch, version="0.32.0", initialized=_initialized_layer_strided)
+    resources = _resolve(cell, tmp_path, expected_backend_version="0.32.0")
+    for version in ("source_references_v4", "source_references_v5"):
+        saved = {}
+        _merge_resources([resources], saved, source_references=True, observation_format=version)
+        assert saved["observation_provenance"] == version
+        assert len(saved["worker_observation_digests"]) == 1
+        memory = saved["cell_observations"][0]["runtime_memory"]
+        portable = json.loads(memory["provenance"])
+        assert all(
+            not row["backends"] and row["kv_cache_layout"] is None for row in portable.get("worker_observations", [])
+        )
+        assert bool(portable.get("worker_observations")) == (version == "source_references_v5")
+        captured = (json.dumps(saved), None, "auto")
+        recorded = ("bfloat16", "0.32.0", None, 4)
+        assert _runtime.grouped_observation_requirement(captured, captured, recorded, recorded, 2) is None
+        wrong_width = ("bfloat16", "0.32.0", None, 2)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.grouped_observation_requirement(captured, captured, wrong_width, wrong_width, 2)
+
+        for key in ("backend_version", "rank_capacities", "artifacts"):
+            edited = json.loads(json.dumps(portable))
+            if key == "backend_version":
+                edited[key] = "0.33.0"
+            else:
+                edited[key].pop()
+            memory["provenance"] = json.dumps(edited)
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(saved))
+
+
 @pytest.mark.parametrize("backend", ["uva", "prefetch"])
 def test_active_weight_offload_is_observed_and_cannot_resolve(tmp_path, monkeypatch, backend):
     original = _initialized

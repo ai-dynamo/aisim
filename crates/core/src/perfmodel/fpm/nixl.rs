@@ -14,11 +14,14 @@ mod roster;
 
 use std::collections::BTreeMap;
 
+use layout::Layouts;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::FpmRuntimeMemoryConfig;
 use crate::AicError;
+
+const PROBE_FAMILY: &str = "aisimulate-onboarding-runtime-probe/";
 
 fn conflict(field: &str) -> AicError {
     AicError::InvalidEngineConfig(format!(
@@ -49,7 +52,7 @@ pub(crate) struct Worker {
     dp_rank: Option<u64>,
     phase: Option<String>,
     backends: Vec<String>,
-    kv_cache_layout: Option<String>,
+    kv_cache_layout: Option<Layouts>,
     use_mla: Option<bool>,
     permit_permute: Option<bool>,
     requires_hma: bool,
@@ -75,7 +78,11 @@ impl Worker {
         names
     }
 
-    fn observed(rank: &Value, physical_strides: bool) -> Self {
+    fn observed(
+        rank: &Value,
+        physical_strides: bool,
+        keep_choices: bool,
+    ) -> Result<Self, AicError> {
         let config = &rank["resolved_config"];
         let groups = rank.pointer("/cache/groups").and_then(Value::as_array);
         // Older probes record the concrete per-layer classes. Only recognize an ordinary attention
@@ -110,40 +117,56 @@ impl Worker {
             .pointer("/kv_transfer_config/kv_buffer_device")
             .and_then(Value::as_str)
             == Some("cpu");
-        let mut layout = rank
-            .pointer("/cache/kv_cache_layout")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                rank.pointer("/raw_cache_config/kv_cache_layout")
-                    .and_then(Value::as_str)
-            })
-            .or_else(|| {
-                if physical_strides && ordinary == Some(true) && !mamba {
-                    layout::from_strides(rank)
-                } else {
-                    None
+        let use_mla = config
+            .pointer("/model_config/use_mla")
+            .and_then(Value::as_bool)
+            .or_else(|| (ordinary == Some(true)).then_some(false));
+        let gpu_attention = ordinary == Some(true) && !mamba && use_mla == Some(false);
+        let physical = if gpu_attention {
+            layout::from_strides(rank, true)?
+        } else {
+            None
+        };
+        let mut named = None;
+        for path in [
+            "/cache/kv_cache_layout",
+            "/raw_cache_config/kv_cache_layout",
+        ] {
+            if let Some(name) = rank
+                .pointer(path)
+                .and_then(Value::as_str)
+                .and_then(Layouts::named)
+            {
+                if named.as_ref().is_some_and(|seen| seen != &name)
+                    || physical
+                        .as_ref()
+                        .is_some_and(|possible| !possible.names().contains(&name.names()[0]))
+                {
+                    return Err(conflict("kv_cache_layout"));
                 }
-            });
-        if host && layout == Some("LBNHC") {
-            layout = permute.map(|enabled| if enabled { "LBHNC" } else { "LBNHC" });
+                named = Some(name);
+            }
         }
-        Self {
+        let layout = if named.is_some() || !physical_strides {
+            named
+        } else if keep_choices {
+            physical
+        } else if gpu_attention {
+            layout::from_strides(rank, false)?.filter(|v| matches!(v, Layouts::Named(_)))
+        } else {
+            None
+        };
+        Ok(Self {
             tp_rank: rank["tp_rank"].as_u64(),
             dp_rank: rank["dp_rank"].as_u64(),
             phase: rank["phase"].as_str().map(str::to_owned),
             backends: Self::names(&rank["attention_backend"]),
-            kv_cache_layout: layout
-                .filter(|s| {
-                    matches!(
-                        *s,
-                        "LBHNC" | "LBNHC" | "LHBNC" | "BLHNC" | "BLNHC" | "BHLNC"
-                    )
-                })
-                .map(str::to_owned),
-            use_mla: config
-                .pointer("/model_config/use_mla")
-                .and_then(Value::as_bool)
-                .or_else(|| (ordinary == Some(true)).then_some(false)),
+            kv_cache_layout: if host {
+                layout.and_then(|v| v.host(permute, keep_choices))
+            } else {
+                layout
+            },
+            use_mla,
             permit_permute: permute,
             // Standard full attention and Mamba cannot be promoted to one cache spec when
             // HMA is disabled. Their separate initialized groups also establish this for old probes.
@@ -153,7 +176,7 @@ impl Worker {
                         .pointer("/scheduler_config/disable_hybrid_kv_cache_manager")
                         .and_then(Value::as_bool)
                         == Some(false)),
-        }
+        })
     }
 
     fn coordinate(&self, single_dp: bool) -> Option<(bool, u64, u64)> {
@@ -178,11 +201,19 @@ impl Worker {
                 return Err(conflict("attention_backend"));
             }
         }
-        record(
-            &mut self.kv_cache_layout,
-            other.kv_cache_layout.as_deref(),
-            "kv_cache_layout",
-        )?;
+        if let Some(other) = &other.kv_cache_layout {
+            self.kv_cache_layout = Some(match &self.kv_cache_layout {
+                None => other.clone(),
+                Some(ours) => Layouts::from_names(
+                    ours.names()
+                        .iter()
+                        .filter(|n| other.names().contains(n))
+                        .cloned()
+                        .collect(),
+                )
+                .ok_or_else(|| conflict("kv_cache_layout"))?,
+            });
+        }
         for (field, old, new) in [
             ("use_mla", &mut self.use_mla, other.use_mla),
             (
@@ -213,20 +244,35 @@ impl Worker {
                 .any(|name| peer.backends.contains(name))
     }
 
+    fn accepts_layout(&self, remote: &str, local: &str, version: Option<&str>) -> bool {
+        // 0.31 only tests the remote layout in its permute branch. A probe with no connector
+        // does not determine a later serving deployment's permute setting.
+        remote == local
+            || (remote == "LBHNC"
+                && (local == "LBNHC" || version == Some("0.31.0") || version.is_none())
+                && self.permit_permute != Some(false)
+                && !self.requires_hma)
+    }
+
     fn excludes_layout(&self, decode: &Self, version: Option<&str>) -> bool {
         let (Some(remote), Some(local)) = (&self.kv_cache_layout, &decode.kv_cache_layout) else {
             return false;
         };
-        if decode.use_mla != Some(false) || remote == local {
-            return false;
-        }
-        // 0.31 only tests the remote layout in its permute branch. The later tags test both.
-        // A memory probe without a connector does not determine the serving permute setting.
-        !(remote == "LBHNC"
-            && (local == "LBNHC" || version == Some("0.31.0") || version.is_none())
-            && decode.permit_permute != Some(false)
-            && !decode.requires_hma)
+        decode.use_mla == Some(false)
+            && !remote.names().iter().any(|r| {
+                local
+                    .names()
+                    .iter()
+                    .any(|l| decode.accepts_layout(r, l, version))
+            })
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Capture {
+    Full,
+    References,
+    Ranked,
 }
 
 #[derive(Default)]
@@ -246,19 +292,20 @@ pub(crate) struct NixlIdentity {
 
 impl NixlIdentity {
     /// Reproducing an older snapshot preserves its omitted DP coordinate and named-only layout.
-    pub(crate) fn compact_workers(records: &[Value], current_format: bool) -> Value {
-        serde_json::json!(
-            records
-                .iter()
-                .map(|row| {
-                    let mut worker = Worker::observed(row, current_format);
-                    if !current_format {
-                        worker.dp_rank = None;
-                    }
-                    worker
-                })
-                .collect::<Vec<_>>()
-        )
+    pub(crate) fn compact_workers(
+        records: &[Value],
+        ranked: bool,
+        keep_choices: bool,
+    ) -> Result<Value, AicError> {
+        let mut workers = Vec::with_capacity(records.len());
+        for row in records {
+            let mut worker = Worker::observed(row, ranked, ranked && keep_choices)?;
+            if !ranked {
+                worker.dp_rank = None;
+            }
+            workers.push(worker);
+        }
+        Ok(serde_json::json!(workers))
     }
 
     pub(crate) fn observation_digest(entry: &Value, source: &str) -> Result<String, AicError> {
@@ -311,7 +358,7 @@ impl NixlIdentity {
         &mut self,
         entry: &Value,
         v1_phase_width: Option<u64>,
-        verified_roster: bool,
+        capture: Capture,
     ) -> Result<bool, AicError> {
         self.settings(&entry["runtime_settings"])?;
         record(
@@ -326,8 +373,9 @@ impl NixlIdentity {
                 "vllm_version",
             )?;
         }
+        let mut complete = roster::validate_source(entry, capture, self.phase_width, self.tp_size)?
+            || capture == Capture::Ranked;
         let start = self.workers.len();
-        let mut complete = verified_roster;
         if let Some(workers) = entry["worker_observations"].as_array() {
             for worker in workers {
                 // New snapshots spell unavailable optional fields as null or an empty name list.
@@ -368,16 +416,19 @@ impl NixlIdentity {
             });
             if let Some(rows) = capacities {
                 complete = true;
+                let prefill = rows.iter().filter(|row| row["phase"] == "prefill").count();
                 self.workers
-                    .extend(names.iter().zip(rows).map(|(name, row)| Worker {
-                        phase: row["phase"].as_str().map(str::to_owned),
+                    .extend(names.iter().enumerate().map(|(i, name)| Worker {
+                        phase: Some(if i < prefill { "prefill" } else { "decode" }.to_owned()),
                         backends: Worker::names(name),
                         ..Default::default()
                     }));
-            } else if let Some(width) = v1_phase_width
-                .and_then(|n| usize::try_from(n).ok())
-                .filter(|&n| n > 0 && (names.len() == n || names.len().checked_sub(n) == Some(n)))
-            {
+            } else if let Some(width) = v1_phase_width.and_then(|n| usize::try_from(n).ok()) {
+                if width == 0
+                    || (names.len() != width && names.len().checked_sub(width) != Some(width))
+                {
+                    return Err(roster::invalid());
+                }
                 complete = true;
                 // A v1 import verifies every TP × DP worker before retaining its slot, including
                 // nulls. A combined import writes one complete prefill block, then one decode block.
@@ -428,7 +479,7 @@ impl NixlIdentity {
                         rank.pointer("/runtime/version").and_then(Value::as_str),
                         "vllm_version",
                     )?;
-                    self.workers.push(Worker::observed(rank, true));
+                    self.workers.push(Worker::observed(rank, true, true)?);
                 }
             }
         }
@@ -452,13 +503,13 @@ impl NixlIdentity {
         Ok(self.workers.len() != start)
     }
 
-    fn collection(&mut self, entry: &Value, verified_roster: bool) -> Result<bool, AicError> {
-        let mut found = self.observation(entry, None, verified_roster)?;
+    fn collection(&mut self, entry: &Value, capture: Capture) -> Result<bool, AicError> {
+        let mut found = self.observation(entry, None, capture)?;
         if let Some(phases) = entry["phases"].as_object() {
             for (phase, snapshot) in phases {
                 let before = self.workers.len();
                 let rosters_before = self.rosters.len();
-                if !self.observation(snapshot, None, false)? {
+                if !self.observation(snapshot, None, capture)? {
                     self.workers.push(Worker::default());
                 }
                 for rank in self.workers[before..]
@@ -474,9 +525,14 @@ impl NixlIdentity {
     }
 
     fn probe(&mut self, entry: &Value) -> Result<(), AicError> {
-        self.collection(entry, false)?;
+        self.collection(entry, Capture::Full)?;
         let version = entry["schema_version"].as_str();
-        let bound = version == Some("aisimulate-onboarding-runtime-probe/v3");
+        let bound = matches!(
+            version,
+            Some(
+                "aisimulate-onboarding-runtime-probe/v3" | "aisimulate-onboarding-runtime-probe/v4"
+            )
+        );
         if bound || version == Some("aisimulate-onboarding-runtime-probe/v2") {
             let snapshot = &entry["nixl_observation"];
             let recorded = [
@@ -498,7 +554,16 @@ impl NixlIdentity {
                     "onboarding runtime probe is missing its NIXL observation".into(),
                 ));
             }
-            roster::validate(snapshot, self.phase_width, self.tp_size, None, bound)?;
+            roster::validate(
+                snapshot,
+                snapshot["worker_observations"]
+                    .as_array()
+                    .ok_or_else(roster::invalid)?,
+                self.phase_width,
+                self.tp_size,
+                None,
+                bound,
+            )?;
             if bound {
                 let source = entry["source_artifacts"]
                     .as_array()
@@ -516,7 +581,8 @@ impl NixlIdentity {
             Some(
                 "aisimulate-onboarding-runtime-probe/v1"
                 | "aisimulate-onboarding-runtime-probe/v2"
-                | "aisimulate-onboarding-runtime-probe/v3",
+                | "aisimulate-onboarding-runtime-probe/v3"
+                | "aisimulate-onboarding-runtime-probe/v4",
             ) => {
                 let memory = &entry["observed_resources"]["runtime_memory"];
                 self.memory(memory)?;
@@ -524,13 +590,22 @@ impl NixlIdentity {
                 self.observation(
                     &entry["nixl_observation"],
                     self.phase_width.filter(|_| legacy),
-                    !legacy,
+                    if legacy {
+                        Capture::References
+                    } else {
+                        Capture::Ranked
+                    },
                 )?;
                 if let Some(nested) = memory["provenance"].as_str()
                     && let Ok(direct) = serde_json::from_str(nested)
                 {
-                    self.collection(&direct, false)?;
+                    self.probe(&direct)?;
                 }
+            }
+            Some(other) if other.starts_with(PROBE_FAMILY) => {
+                return Err(AicError::InvalidEngineConfig(format!(
+                    "unsupported onboarding runtime probe version: {other}"
+                )));
             }
             _ => {}
         }
@@ -554,20 +629,37 @@ impl NixlIdentity {
         };
         identity.probe(&evidence)?;
         if let Some(probe) = evidence.get("runtime_probe")
-            && matches!(
-                probe["schema_version"].as_str(),
-                Some(
-                    "aisimulate-onboarding-runtime-probe/v1"
-                        | "aisimulate-onboarding-runtime-probe/v2"
-                        | "aisimulate-onboarding-runtime-probe/v3"
-                )
-            )
+            && probe["schema_version"]
+                .as_str()
+                .is_some_and(|s| s.starts_with(PROBE_FAMILY))
         {
             identity.probe(probe)?;
         }
         let format = evidence["observation_provenance"].as_str();
-        let bound = format == Some("source_references_v4");
+        if format.is_some_and(|s| {
+            s.starts_with("source_references_v")
+                && !matches!(
+                    s,
+                    "source_references_v2"
+                        | "source_references_v3"
+                        | "source_references_v4"
+                        | "source_references_v5"
+                )
+        }) {
+            return Err(AicError::InvalidEngineConfig(
+                "unsupported finalized observation provenance format".into(),
+            ));
+        }
+        let current = format == Some("source_references_v5");
+        let bound = current || format == Some("source_references_v4");
         let compact = bound || format == Some("source_references_v3");
+        let capture = if compact {
+            Capture::Ranked
+        } else if matches!(format, Some("source_references" | "source_references_v2")) {
+            Capture::References
+        } else {
+            Capture::Full
+        };
         let mut any_workers = false;
         let mut digests = Vec::new();
         if let Some(cells) = evidence["cell_observations"].as_array() {
@@ -578,22 +670,36 @@ impl NixlIdentity {
                     .as_str()
                     .and_then(|s| serde_json::from_str(s).ok());
                 let nested: Value = nested.unwrap_or_default();
-                if compact && nested.get("worker_observations").is_some() {
+                if current || (compact && nested.get("worker_observations").is_some()) {
                     let capacities = nested["rank_capacities"]
                         .as_array()
                         .ok_or_else(roster::invalid)?;
-                    roster::validate(&nested, phase_width, tp_size, Some(capacities), bound)?;
+                    roster::validate(
+                        &nested,
+                        nested["worker_observations"]
+                            .as_array()
+                            .ok_or_else(roster::invalid)?,
+                        phase_width,
+                        tp_size,
+                        Some(capacities),
+                        bound,
+                    )?;
                     any_workers = true;
                 }
                 if bound {
                     digests.push(roster::digest(&nested, roster::cell_source(&nested))?);
                 }
-                if !identity.collection(&nested, compact)? {
+                if nested["schema_version"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with(PROBE_FAMILY))
+                {
+                    identity.probe(&nested)?;
+                } else if !identity.collection(&nested, capture)? {
                     identity.workers.push(Worker::default());
                 }
             }
         }
-        if compact && !any_workers {
+        if (compact && !bound && !any_workers) || (bound && digests.is_empty()) {
             return Err(roster::invalid());
         }
         if bound {
@@ -658,6 +764,23 @@ impl NixlIdentity {
         }
         self.rosters
             .retain(|r| !r.is_empty() && self.phase_width.is_some_and(|n| r.len() as u64 == n));
+        if self.rosters.len() > 1
+            && self
+                .rosters
+                .iter()
+                .flatten()
+                .any(|w| w.tp_rank.is_none() || w.dp_rank.is_none())
+        {
+            let slots = self.rosters[0].len();
+            let tp = self.tp_size.unwrap_or(slots as u64).max(1);
+            let rosters: Vec<_> = self.rosters.iter().map(Vec::as_slice).collect();
+            if !roster::backends_fit(&rosters, slots, |w, i| {
+                w.tp_rank.is_none_or(|t| t == i as u64 % tp)
+                    && w.dp_rank.is_none_or(|d| d == i as u64 / tp)
+            }) {
+                return Err(conflict("attention_backend"));
+            }
+        }
         self.workers.sort_unstable();
         self.workers.dedup();
         if let Some(name) = backend.filter(|s| known(s) && !s.eq_ignore_ascii_case("auto")) {
@@ -799,6 +922,42 @@ impl NixlIdentity {
                 "prefill workers".into(),
                 "decode workers".into(),
             ));
+        }
+        if let Some(tp) = self
+            .tp_size
+            .filter(|t| Some(*t) == decode.tp_size && *t > 0)
+            && !(self.rosters.is_empty() && decode.rosters.is_empty())
+        {
+            for slot in 0..tp {
+                let at_slot =
+                    |w: &&Worker| w.tp_rank == Some(slot) || (tp == 1 && w.tp_rank.is_none());
+                let p: Vec<_> = self.workers.iter().filter(at_slot).collect();
+                let d: Vec<_> = decode.workers.iter().filter(at_slot).collect();
+                // A missing prefill observation leaves one freely chosen, immutable layout.
+                // A missing decode observation also leaves the MLA exemption possible.
+                if (p.len() > 1 || d.len() > 1) && !layout::routable(&p, &d, version) {
+                    return Some((
+                        "kv_cache_layout",
+                        "prefill workers".into(),
+                        "decode workers".into(),
+                    ));
+                }
+            }
+            let rosters: Vec<_> = self
+                .rosters
+                .iter()
+                .chain(&decode.rosters)
+                .map(Vec::as_slice)
+                .collect();
+            if !roster::backends_fit(&rosters, tp as usize, |worker, slot| {
+                worker.tp_rank.is_none_or(|rank| rank == slot as u64)
+            }) {
+                return Some((
+                    "attention_backend",
+                    "prefill workers".into(),
+                    "decode workers".into(),
+                ));
+            }
         }
         for p in &self.rosters {
             for d in &decode.rosters {
@@ -1002,7 +1161,7 @@ mod tests {
                 .iter()
                 .map(|n| json!({"attention_backend":n}))
                 .collect::<Vec<_>>();
-            let saved = json!({"worker_observations": NixlIdentity::compact_workers(&raw, false)});
+            let saved = json!({"worker_observations": NixlIdentity::compact_workers(&raw, false, false).unwrap()});
             let mut id =
                 NixlIdentity::observed(None, &saved.to_string(), Some(4), Some(4)).unwrap();
             id.select(phase, None, None, None, None).unwrap();
@@ -1035,11 +1194,10 @@ mod tests {
                 .mismatch(&draft(two_phases.clone(), "decode", Some(2)))
                 .is_some()
         );
-        assert!(
-            uniform
-                .mismatch(&draft(two_phases, "decode", Some(3)))
-                .is_none()
-        );
+        let impossible = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v1",
+            "nixl_observation":{"worker_attention_backends":two_phases}});
+        assert!(NixlIdentity::observed(None, &impossible.to_string(), Some(3), None).is_err());
+        assert!(NixlIdentity::observed(None, &impossible.to_string(), None, None).is_ok());
         for names in [json!([b, null]), json!([null, b])] {
             let partial = draft(names.clone(), "decode", Some(2));
             assert!(uniform.mismatch(&partial).is_some());
@@ -1092,7 +1250,7 @@ mod tests {
     fn imported_snapshot_requires_recorded_fields_but_accepts_sparse_workers() {
         let mut probe = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v2", "nixl_observation":{
             "runtime":{"version":"0.33.0"},"runtime_settings":{"model_config":{"model":"/M","dtype":"torch.bfloat16"},
-            "cache_config":{"cache_dtype":"auto"}},"worker_observations":NixlIdentity::compact_workers(&[json!({"tp_rank":0,"phase":"prefill"})], false)}});
+            "cache_config":{"cache_dtype":"auto"}},"worker_observations":NixlIdentity::compact_workers(&[json!({"tp_rank":0,"phase":"prefill"})], false, false).unwrap()}});
         assert!(NixlIdentity::observed(None, &probe.to_string(), None, None).is_ok());
         for (parent, key) in [
             ("/nixl_observation/runtime_settings/model_config", "model"),
@@ -1129,7 +1287,7 @@ mod tests {
             json!({"phase":"prefill", "tp_rank":1}),
             json!({"phase":"prefill", "tp_rank":0}),
         ];
-        let old = NixlIdentity::compact_workers(&raw, false);
+        let old = NixlIdentity::compact_workers(&raw, false, false).unwrap();
         let snapshot = |rows: Value| {
             json!({"schema_version":"aisimulate-onboarding-runtime-probe/v2",
             "nixl_observation":{"runtime":{"version":"0.33.0"},"runtime_settings":{"model_config":{"model":"M","dtype":"half"},
@@ -1157,9 +1315,159 @@ mod tests {
     }
 
     #[test]
+    fn imported_anonymous_workers_must_match_every_dp_peer_at_their_tp_rank() {
+        fn imported(names: Value, tp: u64, phase: &str) -> NixlIdentity {
+            let width = names.as_array().unwrap().len() as u64;
+            let probe = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v1",
+                "nixl_observation":{"worker_attention_backends":names}});
+            let mut id =
+                NixlIdentity::observed(None, &probe.to_string(), Some(width), Some(tp)).unwrap();
+            id.select(phase, None, None, None, None).unwrap();
+            id
+        }
+        let mut missing = NixlIdentity::observed(None, "", Some(2), Some(1)).unwrap();
+        missing.select("prefill", None, None, None, None).unwrap();
+        let mixed = imported(json!(["a", "b"]), 1, "decode");
+        assert!(missing.mismatch(&mixed).is_some());
+        assert!(mixed.mismatch(&missing).is_some());
+        assert!(
+            missing
+                .mismatch(&imported(json!(["a", null]), 1, "decode"))
+                .is_none()
+        );
+        for (tp, p, d, legal) in [
+            (1, json!(["a", "b"]), json!(["a", "b"]), false),
+            (1, json!(["a", null]), json!([null, "a"]), true),
+            (2, json!(["a", "a", "b", "b"]), json!(["a", "b"]), true),
+            (2, json!(["a", "a", "a", "b"]), json!(["a", "b"]), false),
+            (
+                2,
+                json!(["a", "a", "b", null]),
+                json!([["b", "c"], "a"]),
+                true,
+            ),
+        ] {
+            let p = imported(p, tp, "prefill");
+            let d = imported(d, tp, "decode");
+            assert_eq!(p.mismatch(&d).is_none(), legal);
+            assert_eq!(d.mismatch(&p).is_none(), legal);
+        }
+    }
+
+    #[test]
+    fn complete_anonymous_cells_must_describe_the_same_physical_workers() {
+        let cell = |names: Value| {
+            let captures = json!({"source":"runtime_observations","worker_attention_backends":names,
+                "rank_capacities":[{"phase":"prefill","tp_rank":0,"dp_rank":0},{"phase":"prefill","tp_rank":1,"dp_rank":0}]});
+            json!({"runtime_memory":{"provenance":captures.to_string()}})
+        };
+        let select = |cells: Vec<Value>| {
+            let profile =
+                json!({"observation_provenance":"source_references_v2","cell_observations":cells});
+            let mut id =
+                NixlIdentity::observed(None, &profile.to_string(), Some(2), Some(2)).unwrap();
+            id.select("prefill", None, None, None, None)
+        };
+        assert!(select(vec![cell(json!(["a", "b"])), cell(json!(["b", "a"]))]).is_ok());
+        assert!(select(vec![cell(json!(["a", null])), cell(json!(["b", null]))]).is_ok());
+        assert!(select(vec![cell(json!(["a", "a"])), cell(json!(["b", "b"]))]).is_err());
+        // Every two cells share a possibility. All three together still have no consistent assignment.
+        assert!(
+            select(vec![
+                cell(json!([["a", "b"], "x"])),
+                cell(json!([["b", "c"], "x"])),
+                cell(json!([["a", "c"], "x"]))
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_runtime_probe_versions_are_errors_at_a_recognized_location() {
+        let future = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v99"});
+        let cell =
+            json!({"cell_observations":[{"runtime_memory":{"provenance":future.to_string()}}]});
+        for value in [future.clone(), json!({"runtime_probe":future}), cell] {
+            assert!(NixlIdentity::observed(None, &value.to_string(), None, None).is_err());
+        }
+        assert!(
+            NixlIdentity::observed(None, r#"{"schema_version":"unrelated/v99"}"#, None, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn ambiguous_physical_layouts_require_a_permitted_pair() {
+        let worker = |layouts: &[&str]| Worker {
+            kv_cache_layout: Layouts::from_names(
+                layouts.iter().map(|name| name.to_string()).collect(),
+            ),
+            use_mla: Some(false),
+            ..Default::default()
+        };
+        let layer_outer = worker(&["LBHNC", "LBNHC", "LHBNC"]);
+        let block_outer = worker(&["BLHNC", "BLNHC", "BHLNC"]);
+        for (p, d) in [(&layer_outer, &block_outer), (&block_outer, &layer_outer)] {
+            assert!(p.excludes_layout(d, Some("0.32.0")));
+            assert!(!p.excludes_layout(p, Some("0.32.0")));
+        }
+        let p = worker(&["LBHNC", "BLHNC"]);
+        let mut d = worker(&["LBNHC", "BLNHC"]);
+        assert!(!p.excludes_layout(&d, Some("0.32.0")));
+        assert!(d.excludes_layout(&p, Some("0.32.0")));
+        d.permit_permute = Some(false);
+        assert!(p.excludes_layout(&d, Some("0.32.0")));
+        d.use_mla = Some(true);
+        assert!(!p.excludes_layout(&d, Some("0.32.0")));
+        let mut captured = layer_outer.clone();
+        captured.combine(&worker(&["BLNHC", "LHBNC"])).unwrap();
+        assert_eq!(captured.kv_cache_layout, Layouts::named("LHBNC"));
+        assert!(captured.combine(&block_outer).is_err());
+    }
+
+    #[test]
+    fn one_physical_layout_has_to_serve_all_routable_dp_peers() {
+        let p = Worker {
+            kv_cache_layout: Layouts::from_names(
+                ["BHLNC", "BLHNC", "BLNHC"].map(str::to_owned).to_vec(),
+            ),
+            use_mla: Some(false),
+            ..Default::default()
+        };
+        let local = |name| Worker {
+            kv_cache_layout: Layouts::named(name),
+            ..p.clone()
+        };
+        let a = local("BLHNC");
+        let b = local("BLNHC");
+        let mla = Worker {
+            use_mla: Some(true),
+            ..b.clone()
+        };
+        assert!(!layout::routable(&[], &[&a, &b], Some("0.32.0")));
+        assert!(layout::routable(&[&a, &b], &[], Some("0.32.0")));
+        assert!(!layout::routable(&[&p, &p], &[&a, &b], Some("0.32.0")));
+        assert!(!layout::routable(&[&a, &b], &[&p, &p], Some("0.32.0")));
+        assert!(layout::routable(&[&p, &p], &[&a, &mla], Some("0.32.0")));
+        assert!(layout::routable(&[&p, &p], &[&a, &p], Some("0.32.0")));
+        let remote = local("LBHNC");
+        let permuted = local("LBNHC");
+        assert!(layout::routable(
+            &[&remote, &permuted],
+            &[&permuted, &permuted],
+            Some("0.32.0")
+        ));
+        assert!(!layout::routable(
+            &[&remote, &permuted],
+            &[&remote, &permuted],
+            Some("0.32.0")
+        ));
+    }
+
+    #[test]
     fn physical_layout_mismatch_follows_the_decoder_transfer_direction() {
         let w = |layout: &str| Worker {
-            kv_cache_layout: Some(layout.into()),
+            kv_cache_layout: Layouts::named(layout),
             use_mla: Some(false),
             ..Default::default()
         };

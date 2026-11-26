@@ -2811,7 +2811,11 @@ fn materialize_aic_capacity(
             && let Some(version) = &config.backend_version
         {
             ensure!(
-                crate::perfmodel::fpm::FpmRuntimeMemoryConfig::modeled_release(observed) == version,
+                if role.rank.enable_prefix_caching {
+                    observed
+                } else {
+                    crate::perfmodel::fpm::FpmRuntimeMemoryConfig::modeled_release(observed)
+                } == version,
                 "grouped FPM cache P/D requires runtime_memory.runtime_framework_version ({observed}) to equal the deployment's backend_version ({version})"
             );
         }
@@ -4835,11 +4839,21 @@ fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult
 
 /// Compact initialized worker fields for a hash-bound onboarding observation.
 #[pyfunction]
-#[pyo3(signature = (records, current_format=false))]
-fn nixl_worker_observations(records: &str, current_format: bool) -> PyResult<String> {
+#[pyo3(signature = (records, current_format=false, keep_layout_choices=true))]
+fn nixl_worker_observations(
+    records: &str,
+    current_format: bool,
+    keep_layout_choices: bool,
+) -> PyResult<String> {
     let parsed: Vec<serde_json::Value> = serde_json::from_str(records)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    Ok(crate::perfmodel::fpm::NixlIdentity::compact_workers(&parsed, current_format).to_string())
+    Ok(crate::perfmodel::fpm::NixlIdentity::compact_workers(
+        &parsed,
+        current_format,
+        keep_layout_choices,
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+    .to_string())
 }
 
 #[pyfunction]

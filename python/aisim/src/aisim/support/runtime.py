@@ -38,7 +38,8 @@ from .schema import (
 
 LEGACY_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v1"
 RANK_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v2"
-PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v3"
+BOUND_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v3"
+PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v4"
 _PRECISION = (
     "gemm_quant_mode",
     "moe_quant_mode",
@@ -341,11 +342,10 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
         value = json.loads(provenance)
     except (TypeError, ValueError):
         return None
-    if not isinstance(value, dict) or value.get("schema_version") not in (
-        LEGACY_PROVENANCE_SCHEMA,
-        RANK_PROVENANCE_SCHEMA,
-        PROVENANCE_SCHEMA,
-    ):
+    schema = value.get("schema_version") if isinstance(value, dict) else None
+    if schema not in (LEGACY_PROVENANCE_SCHEMA, RANK_PROVENANCE_SCHEMA, BOUND_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA):
+        if isinstance(schema, str) and schema.startswith("aisimulate-onboarding-runtime-probe/"):
+            raise ValueError(f"unsupported onboarding runtime probe version: {schema}")
         return None
     snapshot = value.get("nixl_observation")
     if value["schema_version"] != LEGACY_PROVENANCE_SCHEMA and (
@@ -353,7 +353,7 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
         or not isinstance(snapshot.get("runtime_settings"), dict)
         or not isinstance(snapshot.get("worker_observations"), list)
         or (
-            value["schema_version"] == PROVENANCE_SCHEMA
+            value["schema_version"] in (BOUND_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA)
             and not isinstance(snapshot.get("worker_observations_sha256"), str)
         )
     ):
@@ -384,11 +384,11 @@ def _worker_attention_backends(evidence: dict[str, Any]) -> list:
     ]
 
 
-def _worker_observations(evidence: dict[str, Any], *, current_format: bool) -> list:
+def _worker_observations(evidence: dict[str, Any], *, ranked: bool, layout_choices: bool) -> list:
     from aisim import _runtime
 
     workers = [item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] == "worker"]
-    return json.loads(_runtime.nixl_worker_observations(json.dumps(workers), current_format))
+    return json.loads(_runtime.nixl_worker_observations(json.dumps(workers), ranked, layout_choices))
 
 
 def _worker_observation_digest(snapshot: dict[str, Any], evidence: dict[str, Any]) -> str:
@@ -427,10 +427,13 @@ def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str = PROVE
     if schema == LEGACY_PROVENANCE_SCHEMA:
         snapshot["worker_attention_backends"] = _worker_attention_backends(evidence)
     else:
-        snapshot["worker_observations"] = _worker_observations(evidence, current_format=schema == PROVENANCE_SCHEMA)
+        bound = schema in (BOUND_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA)
+        snapshot["worker_observations"] = _worker_observations(
+            evidence, ranked=bound, layout_choices=schema == PROVENANCE_SCHEMA
+        )
         if version := evidence.get("runtime", {}).get("version"):
             snapshot["runtime"] = {"version": version}
-        if schema == PROVENANCE_SCHEMA:
+        if bound:
             snapshot["worker_observations_sha256"] = _worker_observation_digest(snapshot, evidence)
     return snapshot
 

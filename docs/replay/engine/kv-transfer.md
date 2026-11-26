@@ -96,26 +96,36 @@ observed model dtype when those facts are available. The selected deployment's
 `runtime_memory.model_dtype` records vLLM's initialized `ModelConfig.dtype`.
 Older observation and finalization records can retain it in their runtime settings.
 For a measured deployment, the literal `ModelConfig.model` and
-`CacheConfig.cache_dtype` enter the handshake. The installed vLLM version must match the modeled release. The handshake compares
-the full installed version strings, including any local build suffix.
+`CacheConfig.cache_dtype` enter the handshake. The installed vLLM version must match the modeled release. The handshake
+compares the full installed version strings, including any local build suffix.
+Grouped prefix caching also requires the full recorded version to match its profile row.
 The probe records backend names per TP rank. It sorts mixed layers, so the
 first registered backend is unknown. Two disjoint sets cannot match through
 either the first backend or the packed transfer's joined names. A complete
-anonymous phase needs a distinct compatible peer for every worker. A missing
-backend can match any backend the other transfer settings permit.
+anonymous phase retains one slot per worker, including unknown backends.
+Observations from different cells must describe the same workers in the selected
+phase. Each TP rank can route to every DP peer at that TP rank. Their measured
+backend sets must admit one common choice for those routes, even when the other
+side has no measured backend identity.
 
 Current runtime drafts and compact finalizations record a SHA-256 digest of
 the worker observations, initialized settings and source references. The references
 identify the observation index or the formal collection plan and individual files.
-Replay checks the saved fields and rank coverage offline, including after workers
-are reordered. Older archives support the structural checks their recorded coordinates
-and counts permit. Onboarding verification also rehashes the original sources.
+Replay checks the saved fields and rank coverage offline, including cells whose
+workers have no recorded backend or layout. Reordering the workers preserves
+their receipt. Older archives support the structural checks their recorded
+coordinates and counts permit. Onboarding verification also rehashes the original sources.
 For known non-MLA GPU caches, the decode worker checks the physical KV layout.
-When a probe omits the layout name, recorded layer and tensor byte strides can
-identify it if exactly one physical axis order fits its non-unit dimensions.
-Permuting a remote LBHNC cache into a local LBNHC cache requires the decoder's
-permute option and a layout that permits postprocessing. A memory probe without
-a connector leaves that serving option open.
+When a probe omits the layout name, recorded layer and tensor byte strides narrow
+the possible layouts. The ordinary attention views that identify their axes must
+agree with one another and with any measured layout name. A raw byte view
+can leave the layout unknown for that layer. Each worker must have one feasible
+layout for all its routable peers, including when a unit dimension leaves several
+possible orders.
+With the decoder's permute option enabled and postprocessing available, vLLM
+0.32.0 and 0.33.0 can convert a remote LBHNC cache to a local LBNHC cache.
+The 0.31.0 conversion checks the remote LBHNC layout alone. A memory probe
+without a connector leaves the serving permute option open.
 Search skips pairs with incompatible workers. Contradictory observations within
 a selected worker's profile raise a configuration error.
 Grouped prefill and decode workers require a nonempty original prompt. A one-token

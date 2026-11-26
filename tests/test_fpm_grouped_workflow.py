@@ -1338,6 +1338,40 @@ def test_grouped_pd_accepts_vllm_0330_with_prefix_caching_on_and_off(grouped_cas
 
 
 @pytest.mark.parametrize("prefix_caching", [False, True])
+def test_native_grouped_pd_checks_the_entire_build_when_prefix_caching_is_enabled(grouped_case, prefix_caching):
+    from aisim import _runtime
+    from aisim.runner import EngineReplayRunnerFactory
+
+    profile, root = grouped_case
+    profile = _with_transfer_markers(
+        _with_prefix_evidence(_with_state_group(profile), version="0.33.0"), version="0.33.0"
+    )
+    _write_timings(root, profile, version="0.33.0")
+    raw = _pd_prediction(profile, root)
+    raw["engine"]["context_length"] = 1024
+    raw["traffic"]["source"]["input_tokens"] = 128
+    for worker in raw["engine"]["workers"].values():
+        worker["kv_cache"]["prefix_caching"] = prefix_caching
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+
+    class LocalBuild:
+        def run_replay_json(self, serialized):
+            wire = json.loads(serialized)
+            for role in ("prefill", "decode"):
+                timing = wire["spec"]["engine"][role]["rank"]["timing_model"]["config"]
+                for row in timing["fpm_profile"]["deployments"]:
+                    row["resources"]["runtime_memory"]["runtime_framework_version"] = "0.33.0+cu130"
+            return _runtime.run_replay_json(json.dumps(wire))
+
+    runner = EngineReplayRunnerFactory(runtime=LocalBuild()).create(0)
+    if prefix_caching:
+        with pytest.raises(RuntimeError, match="runtime_framework_version"):
+            runner.run(spec)
+    else:
+        assert runner.run(spec).metrics["completed_requests"] == 2
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
 def test_grouped_pd_rank_on_vllm_0330_refuses_a_prefill_schedule_interval_above_one(grouped_case, prefix_caching):
     # vLLM 0.33.0 applies the interval without data parallelism, with prefix caching on or off, and replay does not
     # model that. A prefill or decode rank gets the P/D text first, whose remedy holds with prefix caching off too.

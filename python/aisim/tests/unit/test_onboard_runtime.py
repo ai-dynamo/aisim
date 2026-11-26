@@ -2594,7 +2594,13 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
         rank["attention_backend"] = "FLASHINFER"
     workers[-1]["attention_backend"] = ["FLASH_ATTN", "FLASHINFER"]
     observation["runtime_memory"]["provenance"] = json.dumps(evidence)
-    for version in ("source_references", "source_references_v2", "source_references_v3", "source_references_v4"):
+    for version in (
+        "source_references",
+        "source_references_v2",
+        "source_references_v3",
+        "source_references_v4",
+        "source_references_v5",
+    ):
         saved = {}
         _merge_resources([observation], saved, source_references=True, observation_format=version)
         assert saved["observation_provenance"] == version
@@ -2603,12 +2609,12 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
         assert compact.get("worker_attention_backends") == (
             [w["attention_backend"] for w in workers] if version == "source_references_v2" else None
         )
-        if version in ("source_references_v3", "source_references_v4"):
+        if version in ("source_references_v3", "source_references_v4", "source_references_v5"):
             assert [(r["phase"], r["tp_rank"]) for r in compact["worker_observations"]] == [
                 (r["phase"], r["tp_rank"]) for r in workers
             ]
             assert compact["worker_observations"][-1]["backends"] == ["flash_attn", "flashinfer"]
-        if version == "source_references_v4":
+        if version in ("source_references_v4", "source_references_v5"):
             from aisim import _runtime
 
             digest = saved["worker_observation_digests"][0]
@@ -2655,7 +2661,8 @@ def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_so
     assert resolved.profile_deployment().tp == 8
     manifest = finalization_manifest(resolved)
     assert manifest == json.loads((target / "finalization.json").read_text())
-    assert manifest["observation_provenance"] == "source_references"
+    assert manifest["observation_provenance"] == "source_references_v5"
+    assert len(manifest["worker_observation_digests"]) == len(manifest["cell_observations"])
     observation = json.loads(manifest["cell_observations"][0]["runtime_memory"]["provenance"])
     assert len(observation["rank_capacities"]) == 16
     assert len(observation["artifacts"]) == 18
