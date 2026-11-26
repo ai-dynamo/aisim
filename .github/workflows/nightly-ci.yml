@@ -85,7 +85,7 @@ jobs:
       # including main's own tip — must lie on main or a release/* branch.
       - name: Resolve and validate the target commit
         id: target
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           REQUESTED_SHA: ${{ inputs.commit_sha }}
         with:
@@ -136,7 +136,7 @@ jobs:
       # run crosses a UTC midnight.
       - name: Compute unique nightly version
         id: version
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const {data: run} = await github.rest.actions.getWorkflowRun({
@@ -151,7 +151,7 @@ jobs:
 
       - name: Compare HEAD with the last successful nightly
         id: decide
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             // Only scheduled runs dedup; other events always build.
