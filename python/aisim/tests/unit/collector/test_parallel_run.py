@@ -82,6 +82,13 @@ def _task_fn(label, behavior, device):
         os.kill(os.getpid(), signal.SIGABRT)
     elif behavior == "error":
         raise ValueError(f"simulated: {label}")
+    elif behavior == "fatal_persist":
+        # A shared resource the whole op writes through is broken (perf-log
+        # header, parked twin, unowned inode): the executor must stop the
+        # collection instead of paying a case setup per remaining point.
+        from helper import FatalCollectError
+
+        raise FatalCollectError(f"simulated unusable staging file: {label}")
     elif behavior == "hang":
         # a wedged kernel: never returns (Event.wait is immune to the shortened
         # time.sleep the parent patched before forking, and survives SIGUSR1)
@@ -445,6 +452,24 @@ class TestTaskExceptions:
         assert task_errors[0]["classification"] == "unexpected"
         # Plain tuple tasks carry no model/dtype attributes: no group label.
         assert task_errors[0]["group"] is None
+
+    def test_a_fatal_shared_resource_failure_stops_the_collection(self, tmp_path):
+        """One unusable staging file must not cost a case setup per queued point.
+
+        ``PerfLogError``/``FatalCollectError`` describes the op's perf-log file,
+        not the point: the file has to be fixed between runs, so letting the
+        next case start only repeats the error (C3.3 heal 2026-11-01: 15 min of
+        H200 per case). The undispatched points must stay out of the failed
+        ledger or ``--resume-retry-failed`` would re-run them behind the same
+        broken file.
+        """
+        tasks = _tasks([("t0", "fatal_persist"), ("t1", "normal"), ("t2", "normal"), ("t3", "normal")])
+        errors = _run(tasks, 1, tmp_path, module_name="fatal_persist")
+
+        assert [e["task_id"] for e in errors if e.get("error_type") == "FatalCollectError"] == ["t0"]
+        assert _load_failed_ids(tmp_path, "fatal_persist") == {"t0"}
+        assert _load_done_ids(tmp_path, "fatal_persist") == set()
+        assert {e["task_id"] for e in errors if e.get("error_type") == "WorkerOrphanedTask"} == {"t1", "t2", "t3"}
 
     def test_oom_records_once_and_restarts_worker(self, tmp_path, monkeypatch):
         oom_error = type("OutOfMemoryError", (Exception,), {})

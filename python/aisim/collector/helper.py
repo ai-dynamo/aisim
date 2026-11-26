@@ -63,7 +63,21 @@ class WorkerRestartSignal:
 WORKER_RESTART = WorkerRestartSignal()
 
 
-class PerfLogError(RuntimeError):
+class FatalCollectError(RuntimeError):
+    """A failure that makes every remaining task of the same collection fail.
+
+    Distinct from a point-scoped failure (an OOM, a shape the device cannot
+    run): the broken resource is shared by the whole op — a perf-log file whose
+    header is incompatible, an unowned inode, a parked ``.retained`` twin — so
+    re-entering it from the next queued case only repeats the same error and
+    burns one case setup per remaining point (C3.3 heal 2026-11-01 lost 15 min
+    of H200 per case to exactly this). The executor stops the collection when
+    this reaches it and leaves the never-dispatched points out of the failed
+    ledger, so a plain ``--resume`` queues them again.
+    """
+
+
+class PerfLogError(FatalCollectError):
     """A measured performance row could not be durably persisted.
 
     Persistence is part of task completion, so this exception must propagate to
