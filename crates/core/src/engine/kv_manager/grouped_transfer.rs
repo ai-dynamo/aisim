@@ -165,8 +165,8 @@ impl GroupedTransferRules {
     /// 0 (V31 `vllm/config/vllm.py:668-670`, V32 `:655-657`) and its term
     /// does not count. Fails when a group fails `FpmCacheGroup::validate`,
     /// when a group lacks `prefix_cacheable` or `transfer_bytes_per_block`,
-    /// and when two full-attention groups differ in block, because the timing
-    /// has one unit.
+    /// when a ring has more than one block, or when two full-attention groups
+    /// differ in block, because the timing has one unit.
     pub(crate) fn new(groups: &[FpmCacheGroup]) -> anyhow::Result<Self> {
         // A zero block would divide by zero in `full_blocks` and `fixed_bytes`.
         for group in groups {
@@ -184,14 +184,20 @@ impl GroupedTransferRules {
         for (group, bytes_per_block) in groups.iter().zip(bytes) {
             let block = group.block_size_tokens;
             let kind = match (group.kind, group.sliding_window) {
-                (FpmCacheKind::State, _) => TransferKind::State,
+                (FpmCacheKind::State, _) => {
+                    ensure!(
+                        group.prefix_cacheable == Some(true) || group.blocks_per_request == Some(1),
+                        "grouped FPM cache P/D requires blocks_per_request=1 for a ring state group"
+                    );
+                    TransferKind::State
+                }
                 (FpmCacheKind::Attention | FpmCacheKind::Convolution, Some(window)) => {
                     TransferKind::Window { window }
                 }
                 (FpmCacheKind::Attention, None) => {
                     ensure!(
                         unit_block.is_none_or(|unit| unit == block),
-                        "full-attention groups must share one block_size_tokens"
+                        "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across full-attention groups"
                     );
                     unit_block = Some(block);
                     TransferKind::Full
@@ -608,13 +614,13 @@ mod tests {
                 group(FpmCacheKind::State, 16, 50, None, mamba),
                 group(FpmCacheKind::State, 16, 50, None, false),
             ];
-            for group in &mut groups {
-                group.blocks_per_request = Some(2);
+            if mamba {
+                groups[0].blocks_per_request = Some(2);
             }
             rules(&groups)
         };
         let mamba = states(true);
-        // Each group moves its running block, not its second block.
+        // A Mamba group moves its running block, and a ring moves its single block.
         assert_eq!(mamba.fixed_bytes(1_000), 100);
         assert_eq!(mamba.backoff_tokens(), 1);
         assert_eq!(mamba.transfer_tokens(2), 1);
@@ -664,7 +670,7 @@ mod tests {
         let full = |block| group(FpmCacheKind::Attention, block, 100, None, true);
         assert_eq!(
             refusal(&[full(64), full(16)]),
-            "full-attention groups must share one block_size_tokens"
+            "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across full-attention groups"
         );
         // A missing marker is reported before mixed full blocks.
         let mut unmarked = full(16);

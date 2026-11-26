@@ -256,13 +256,19 @@ mod vllm {
     #[test]
     fn rejects_prompt_at_max_model_len() {
         let sequence = native_sequence(Uuid::from_u128(740), 0..8, 1, false);
-        assert!(should_reject_for_model_len(&sequence, Some(8)));
+        assert!(should_reject_for_model_len(
+            sequence.num_input_tokens(),
+            Some(8)
+        ));
     }
 
     #[test]
     fn rejects_prompt_above_max_model_len() {
         let sequence = native_sequence(Uuid::from_u128(741), 0..9, 1, false);
-        assert!(should_reject_for_model_len(&sequence, Some(8)));
+        assert!(should_reject_for_model_len(
+            sequence.num_input_tokens(),
+            Some(8)
+        ));
     }
 
     #[test]
@@ -1008,7 +1014,10 @@ mod trtllm {
             false,
             None,
         );
-        assert!(should_reject_for_model_len(&sequence, Some(8)));
+        assert!(should_reject_for_model_len(
+            sequence.num_input_tokens(),
+            Some(8)
+        ));
     }
 
     /// block_size 4, 6 GPU blocks (24 tokens). Each request below reserves

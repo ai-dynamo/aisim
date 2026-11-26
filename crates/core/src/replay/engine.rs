@@ -1,5 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
+// Modified grouped handoff validation follows vLLM's NIXL handshake at v0.31.0, v0.32.0 and v0.33.0.
+// https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+// https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+// https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 
 //! Default generalized-engine construction for offline replay.
 //!
@@ -14,7 +19,7 @@ use crate::engine::belady::BeladyOracle;
 use crate::engine::generalized::EngineIdentity;
 use crate::engine::{
     Backend, Engine, EngineConfig, EngineFactory, G2Binding, G2Registry, G2Scope, KvEvictionPolicy,
-    TimingModel, WorkerType,
+    TimingModel, TimingModelConfig, WorkerType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -109,6 +114,49 @@ impl Default for ReplayRoleConfig {
             num_gpu_blocks_is_explicit: None,
             rank: EngineConfig::default(),
         }
+    }
+}
+
+impl ReplayRoleConfig {
+    /// NIXL hashes the model ID, cache dtype and attention backend. The
+    /// materialized AIC timing descriptor records these facts. Fixed timings
+    /// do not identify a model or a cache dtype.
+    fn grouped_transfer_identity(&self) -> ReplayResult<[Option<&str>; 3]> {
+        let TimingModelConfig::External { provider, config } = &self.rank.timing_model else {
+            return Ok([None; 3]);
+        };
+        if provider != "aic" {
+            return Ok([None; 3]);
+        }
+        let known = |value: &&str| {
+            !value.eq_ignore_ascii_case("auto") && !value.eq_ignore_ascii_case("unknown")
+        };
+        if let Some(version) = config
+            .get("backend_version")
+            .and_then(Value::as_str)
+            .filter(known)
+            && let Some(rank_version) = &self.rank.vllm_version
+            && version != rank_version
+        {
+            return Err(ReplayError::InvalidSpec(format!(
+                "grouped rank vllm_version ({rank_version}) must match timing backend_version ({version})"
+            )));
+        }
+        Ok([
+            config
+                .get("model")
+                .or_else(|| config.get("model_path"))
+                .and_then(Value::as_str),
+            config
+                .get("kvcache_quant_mode")
+                .or_else(|| config.get("kv_cache_dtype"))
+                .and_then(Value::as_str)
+                .filter(known),
+            config
+                .get("attention_backend")
+                .and_then(Value::as_str)
+                .filter(known),
+        ])
     }
 }
 
@@ -240,24 +288,39 @@ impl ReplayEngineConfig {
                             .to_string(),
                     ));
                 }
-                // Grouped transfer bytes describe one TP rank; the handoff
-                // does not reshard the cache between different TP sizes.
-                if !prefill.kv_cache_groups.is_empty()
-                    && prefill_role.tensor_parallel_size != decode_role.tensor_parallel_size
-                {
-                    return Err(ReplayError::InvalidSpec(
-                        "grouped prefill and decode roles require equal tensor_parallel_size"
-                            .to_string(),
-                    ));
-                }
-                // One handoff follows the transfer rules of one vLLM version.
-                if !prefill.kv_cache_groups.is_empty()
-                    && prefill.vllm_version != decode.vllm_version
-                {
-                    return Err(ReplayError::InvalidSpec(
-                        "vllm_version must be identical on the prefill and decode roles"
-                            .to_string(),
-                    ));
+                if !prefill.kv_cache_groups.is_empty() {
+                    // The handoff moves one TP rank's cache with one vLLM rule set.
+                    if prefill_role.tensor_parallel_size != decode_role.tensor_parallel_size {
+                        return Err(ReplayError::InvalidSpec(
+                            "grouped prefill and decode roles require equal tensor_parallel_size"
+                                .into(),
+                        ));
+                    }
+                    if prefill.vllm_version != decode.vllm_version {
+                        return Err(ReplayError::InvalidSpec(
+                            "vllm_version must be identical on the prefill and decode roles".into(),
+                        ));
+                    }
+                    let prefill_identity = prefill_role.grouped_transfer_identity()?;
+                    let decode_identity = decode_role.grouped_transfer_identity()?;
+                    for (i, field) in ["model", "kv_cache_dtype", "attention_backend"]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let (Some(p), Some(d)) = (prefill_identity[i], decode_identity[i]) else {
+                            continue;
+                        };
+                        let same = if field == "model" {
+                            p == d
+                        } else {
+                            p.eq_ignore_ascii_case(d)
+                        };
+                        if !same {
+                            return Err(ReplayError::InvalidSpec(format!(
+                                "grouped prefill and decode roles require matching {field} ({p} and {d})"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -848,6 +911,64 @@ mod disaggregated_tests {
             assert!(matches!(error, ReplayError::InvalidSpec(_)), "{error}");
             assert!(error.to_string().contains("sglang.mamba_cache"), "{error}");
         }
+    }
+
+    #[test]
+    fn grouped_handoff_compares_only_the_known_timing_identity_of_each_role() {
+        let topology: ReplayTopology = serde_json::from_value(serde_json::json!({
+            "kind": "disaggregated", "prefill": {"initial_workers": 1}, "decode": {"initial_workers": 1}
+        })).unwrap();
+        let rank: EngineConfig = serde_json::from_value(serde_json::json!({
+            "vllm_version": "0.32.0", "kv_cache_groups": [{
+                "name": "full", "kind": "attention", "num_layers": 1, "block_size_tokens": 16,
+                "page_size_bytes": 64, "prefix_cacheable": true, "transfer_bytes_per_block": 64
+            }]
+        }))
+        .unwrap();
+        let role = |timing_model| {
+            Some(ReplayRoleConfig {
+                rank: EngineConfig {
+                    timing_model,
+                    ..rank.clone()
+                },
+                ..Default::default()
+            })
+        };
+        let aic = |config| TimingModelConfig::External {
+            provider: "aic".into(),
+            config,
+        };
+        let mut config = ReplayEngineConfig {
+            prefill: role(aic(
+                serde_json::json!({"model_path":"org/Model", "kv_cache_dtype":"fp8", "attention_backend":"FLASHINFER"}),
+            )),
+            ..Default::default()
+        };
+        for timing in [
+            TimingModelConfig::Fixed {
+                prefill_ms: 1.0,
+                decode_ms: 1.0,
+            },
+            aic(
+                serde_json::json!({"model":"org/Model", "kvcache_quant_mode":"fp8", "attention_backend":"flashinfer"}),
+            ),
+            aic(serde_json::json!({"model":"org/Model", "attention_backend":"auto"})),
+        ] {
+            config.decode = role(timing);
+            config.validate_topology(&topology).unwrap();
+        }
+        config.decode = role(aic(serde_json::json!({"model":"org/model"})));
+        assert!(
+            config
+                .validate_topology(&topology)
+                .unwrap_err()
+                .to_string()
+                .contains("require matching model")
+        );
+        for role in [&mut config.prefill, &mut config.decode] {
+            role.as_mut().unwrap().rank.kv_cache_groups.clear();
+        }
+        config.validate_topology(&topology).unwrap();
     }
 
     #[test]

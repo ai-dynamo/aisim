@@ -102,7 +102,6 @@ pub(super) trait PolicySequence {
     fn len(&self) -> usize;
     fn max_output_tokens(&self) -> usize;
     fn generated_tokens(&self) -> usize;
-    fn num_input_tokens(&self) -> usize;
     fn num_allocated_tokens(&self) -> usize;
     fn current_known_blocks(&self) -> usize;
     fn to_completion_blocks(&self) -> usize;
@@ -126,10 +125,6 @@ impl PolicySequence for RequestKvState {
 
     fn generated_tokens(&self) -> usize {
         self.generated_tokens()
-    }
-
-    fn num_input_tokens(&self) -> usize {
-        self.num_input_tokens()
     }
 
     fn num_allocated_tokens(&self) -> usize {
@@ -332,11 +327,11 @@ pub(super) fn cap_output_for_model_len(
     }
 }
 
-pub(super) fn should_reject_for_model_len<S: PolicySequence>(
-    sequence: &S,
+pub(super) fn should_reject_for_model_len(
+    prompt_tokens: usize,
     max_model_len: Option<usize>,
 ) -> bool {
-    max_model_len.is_some_and(|limit| sequence.num_input_tokens() >= limit)
+    max_model_len.is_some_and(|limit| prompt_tokens >= limit)
 }
 
 /// Number of additional tokens the request may generate before reaching

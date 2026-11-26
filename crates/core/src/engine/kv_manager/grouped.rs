@@ -18,6 +18,7 @@ use crate::engine::cache::vllm_block_pool::{
 };
 use crate::engine::common::hashing::SequenceHash;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
@@ -83,16 +84,15 @@ pub(crate) struct GroupedBlockLease {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GroupLease {
-    /// `copies[i]` holds logical block `i`. It is `None` for an expired
-    /// window block or a null block below a sliding-window hit. Such blocks
-    /// lie below `first_live`. `finalized` counts the blocks that the request
+    /// `copies[i]` holds logical block `first_live + i`. Skipped window
+    /// blocks occupy no storage. `finalized` counts the blocks that the request
     /// had completed at its last finalization. The next finalization visits
     /// only the full-attention blocks above it, as vLLM's `num_cached_block`
     /// does, and only the sliding-window retention positions above
     /// `finalized * block_size`. The window run that it publishes before such
     /// a position can include blocks below `finalized`.
     Attention {
-        copies: Vec<Option<BlockCopyId>>,
+        copies: VecDeque<BlockCopyId>,
         first_live: usize,
         finalized: usize,
     },
@@ -106,14 +106,7 @@ pub(crate) enum GroupLease {
 impl GroupLease {
     pub(super) fn live_copies(&self) -> usize {
         match self {
-            // The `None` copies lie exactly below `first_live`, so a count per
-            // step does not scan the whole context.
-            Self::Attention {
-                copies, first_live, ..
-            } => {
-                debug_assert_eq!(copies.iter().flatten().count(), copies.len() - first_live);
-                copies.len() - first_live
-            }
+            Self::Attention { copies, .. } => copies.len(),
             Self::State(state) => state.live_copies(),
             Self::Ring { copy } => usize::from(copy.is_some()),
         }
@@ -130,6 +123,8 @@ pub(crate) struct GroupedBlockPool {
     id: u64,
     /// See `GroupedKvPool::retry_epoch`.
     retry_epoch: u64,
+    #[cfg(test)]
+    pub(super) key_probes: std::cell::Cell<usize>,
     /// The most active blocks seen since the last reset, for tests that
     /// observe a step's peak after the step.
     #[cfg(test)]
@@ -165,6 +160,8 @@ impl GroupedBlockPool {
     }
 
     pub(crate) fn key_hit(&self, group: u16, hash: SequenceHash) -> Option<PrefixHit> {
+        #[cfg(test)]
+        self.key_probes.set(self.key_probes.get() + 1);
         self.pool.key_hit(CacheKey::Grouped { group, hash })
     }
 
@@ -388,6 +385,8 @@ impl GroupedKvPool {
                 retry_epoch: 0,
                 #[cfg(test)]
                 peak_active_blocks: std::cell::Cell::new(0),
+                #[cfg(test)]
+                key_probes: std::cell::Cell::new(0),
             }),
             ..Self::new(groups, capacity_bytes)
         }
@@ -981,7 +980,7 @@ mod tests {
                 groups: vec![
                     // A window group whose block 0 has expired.
                     GroupLease::Attention {
-                        copies: vec![None, Some(ids[0]), Some(ids[1])],
+                        copies: [ids[0], ids[1]].into(),
                         first_live: 1,
                         finalized: 0,
                     },

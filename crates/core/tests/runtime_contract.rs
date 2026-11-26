@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use aisim_core::engine::generalized::{EngineIdentity, SchedulerCommand};
 use aisim_core::engine::{
-    Backend, Command, EncoderShape, EngineConfig, EngineFactory, HandoffId, ImageSpec,
-    LifecycleEvent, Request, SglangConfig, TimingModel, TimingModelConfig, WorkerType,
+    Backend, Command, CommandResult, EncoderShape, EngineConfig, EngineFactory, HandoffId,
+    ImageSpec, LifecycleEvent, Request, SglangConfig, TimingModel, TimingModelConfig, WorkerType,
 };
 use aisim_core::replay::loadgen::ReplayRequestPayload;
 use aisim_core::replay::{
@@ -1674,6 +1674,96 @@ fn small_grouped_pd_spec(
         rank["max_model_len"] = max_model_len.into();
     }
     spec
+}
+
+#[test]
+fn grouped_prefill_tests_the_original_length_before_mamba_backoff() {
+    let mut spec = small_grouped_pd_spec(
+        vec![request("fits", 0.0, 7, 2), request("at-limit", 5.0, 8, 2)],
+        16,
+        None,
+    );
+    spec.engine["rank"]["max_model_len"] = 16.into();
+    spec.engine["prefill"] = serde_json::json!({"rank": spec.engine["rank"].clone()});
+    spec.engine["prefill"]["rank"]["max_model_len"] = 8.into();
+    let report = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(
+        record(&report, "fits").terminal_status,
+        aisim_core::replay::ReplayTerminalStatus::Completed
+    );
+    let rejected = record(&report, "at-limit");
+    assert_eq!(
+        rejected.terminal_status,
+        aisim_core::replay::ReplayTerminalStatus::Rejected
+    );
+    assert!(rejected.source_held_ms.is_none() && rejected.destination_reserved_ms.is_none());
+}
+
+#[test]
+fn grouped_destination_rejects_an_empty_prompt_before_reserving() {
+    let handoff_id = HandoffId::new(Uuid::from_u128(20));
+    let request_id = Uuid::from_u128(21);
+    for max_model_len in [None, Some(64)] {
+        let spec = small_grouped_pd_spec(Vec::new(), 8, max_model_len);
+        let mut rank = serde_json::from_value::<ReplayEngineConfig>(spec.engine)
+            .unwrap()
+            .rank;
+        rank.worker_type = WorkerType::Decode;
+        // The state still needs a destination, even when no full-attention
+        // block travels remotely. A one-token original prompt is valid.
+        rank.kv_cache_groups.retain(|group| group.name == "state");
+        let mut engine = EngineFactory::new(rank)
+            .unwrap()
+            .build(EngineIdentity::new(0), NonZeroU32::MIN)
+            .unwrap();
+        let reserve = |prompt| {
+            SchedulerCommand::new(
+                0,
+                Command::ReserveDestination {
+                    handoff_id,
+                    request: handoff_request(21, prompt),
+                },
+            )
+        };
+        let cancel = || SchedulerCommand::new(0, Command::CancelDestination { handoff_id });
+        let error = engine.apply_command_effects(reserve(0), 0.0).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "applying command to attention-DP rank 0: grouped KV destinations require a nonempty prompt"
+        );
+        assert!(engine.is_drained());
+        let after_error = engine.apply_command_effects(cancel(), 0.0).unwrap();
+        assert_eq!(after_error.by_rank[0].effects.result, CommandResult::Noop);
+        assert_eq!(
+            after_error.by_rank[0].effects.metrics.kv_cache_used_bytes,
+            Some(0)
+        );
+        let accepted = engine.apply_command_effects(reserve(1), 0.0).unwrap();
+        let effects = &accepted.by_rank[0].effects;
+        assert_eq!(
+            effects.result,
+            CommandResult::DestinationAccepted { request_id }
+        );
+        assert_eq!(
+            effects.lifecycle_events,
+            [LifecycleEvent::DestinationReserved {
+                handoff_id,
+                request_id,
+                transferable_prompt_tokens: 0,
+            }]
+        );
+        assert_eq!(effects.metrics.kv_cache_used_bytes, Some(100));
+        let cancelled = engine.apply_command_effects(cancel(), 0.0).unwrap();
+        assert_eq!(cancelled.by_rank[0].effects.result, CommandResult::Applied);
+        assert_eq!(
+            cancelled.by_rank[0].effects.metrics.kv_cache_used_bytes,
+            Some(0)
+        );
+        assert!(engine.is_drained());
+    }
 }
 
 fn record<'a>(

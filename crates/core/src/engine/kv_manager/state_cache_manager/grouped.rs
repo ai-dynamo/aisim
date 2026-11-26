@@ -277,7 +277,7 @@ impl StateCacheManager {
                         group: g as u16,
                         hash,
                     };
-                    self.visible(key) && pool.pool.key_hit(key).is_some()
+                    self.visible(key) && pool.key_hit(g as u16, hash).is_some()
                 })
             })
         };

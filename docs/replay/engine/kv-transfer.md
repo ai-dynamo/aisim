@@ -89,8 +89,8 @@ a block of each full-attention group. No full-attention spec of vLLM 0.31.0,
 0.32.0 or 0.33.0 opts out of prefix caching. Only a profile that describes no
 deployment of these versions has such a group. The state moves with every
 transfer that moves at least one token.
-A grouped prefill worker refuses a request with an empty prompt, as vLLM
-refuses an empty prompt, see vLLM v0.31.0
+Grouped prefill and decode workers require a nonempty original prompt. A one-token
+prompt is valid even when the decode worker receives zero remote tokens. See vLLM v0.31.0
 [`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517),
 vLLM v0.32.0
 [`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566)

@@ -14,6 +14,7 @@ import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from enum import IntEnum, auto
 from importlib.resources import files
 from importlib.util import find_spec, module_from_spec
 from pathlib import Path
@@ -36,6 +37,17 @@ _GLM_ARCHITECTURE = "Glm5NextForConditionalGeneration"
 # and audited_release; onboard init must not import the observer. A test keeps the copies equal.
 MEMORY_OBSERVATION_VERSIONS = ("0.27.0", "0.32.0", "0.33.0")
 SOURCE_MANIFEST_RELEASES = ("0.32.0", "0.33.0")
+
+
+class _PlannerVersion(IntEnum):
+    """The successive planner changes that altered a grouped plan's files or cache bound."""
+
+    BEFORE_CLI_RENAME = auto()
+    BEFORE_GROUPED_PREFIX_CACHING = auto()
+    BEFORE_STATE_STARTUP_BOUND = auto()
+    BEFORE_WINDOW_STARTUP_BOUND = auto()
+    BEFORE_CONVOLUTION_PREFIX_CACHING = auto()
+    CURRENT = auto()
 
 
 class _PoolRefusal(ValueError):
@@ -353,9 +365,7 @@ def _plan_documents(
     request: SupportRequest,
     root: Path,
     *,
-    legacy_cli: bool = False,
-    grouped_cold: bool = False,
-    earlier_peak: bool = False,
+    planner: _PlannerVersion = _PlannerVersion.CURRENT,
 ) -> tuple[dict[str, Any], dict[Path, bytes]]:
     package_spec = find_spec("aisim_core")
     if package_spec is None:
@@ -367,8 +377,12 @@ def _plan_documents(
             f"GPU {request.identity.gpu!r} has no packaged system specification; "
             "new GPU architectures require integration"
         )
+    legacy_cli = planner == _PlannerVersion.BEFORE_CLI_RENAME
     if request.identity.framework_version is None:
         return _pending_version_documents(request, root, legacy_cli=legacy_cli)
+    grouped_cold = planner <= _PlannerVersion.BEFORE_GROUPED_PREFIX_CACHING
+    if not grouped_cold and planner < _PlannerVersion.CURRENT and request.fpm_profile is not None:
+        grouped_cold = any(group.kind == "convolution" for group in request.profile_deployment().resources.cache_groups)
     prediction, recommendations, presets = _configs(request, root, grouped_cold=grouped_cold)
     commands = _commands(request, root, list(recommendations), legacy_cli=legacy_cli)
     runtime_prerequisite = (
@@ -491,15 +505,22 @@ def _plan_documents(
                 else "Native timing collection policy; runtime memory observation is unavailable for this vLLM version."
             )
         elif deployment.resources.cache_layout == "grouped":
-            if earlier_peak:
-                # The peak bound of the planner before it counted vLLM's startup blocks: each state group counts its
-                # blocks_per_request pages, a window group its window and one chunk, any other group the context.
+            if planner <= _PlannerVersion.BEFORE_WINDOW_STARTUP_BOUND:
+                # Windows used one chunk before e08c69e70. Align state added its startup pages in 900472e40.
+                memory = deployment.resources.runtime_memory
+                state_startup = (
+                    planner == _PlannerVersion.BEFORE_WINDOW_STARTUP_BOUND
+                    and memory is not None
+                    and memory.mamba_cache_mode == "align"
+                )
                 context, chunk = request.search.context_length, scheduler["max_batched_tokens"]
                 peak = 0
                 for group in estimate["cache_groups"]:
                     block, window = group["block_size_tokens"], group.get("sliding_window")
                     if group["kind"] == "state":
                         pages = group["blocks_per_request"]
+                        if state_startup and group.get("prefix_cacheable"):
+                            pages += 1 + (group.get("prefill_checkpoint_blocks") or 0)
                     elif window is not None:
                         pages = min(-(-context // block), -(-(window - 1 + chunk + block - 1) // block))
                     else:
@@ -789,19 +810,10 @@ def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = Fal
         # pool is too small for the plan of this checkout, it keeps its value,
         # because the planner refuses to write it again. Only the pool refusal of
         # a rendering is caught; every other error of a rendering is raised.
-        for legacy_cli, grouped_cold, earlier_peak in (
-            (True, False, False),
-            (False, True, False),
-            (True, True, False),
-            (False, False, True),
-            (True, False, True),
-            (False, True, True),
-            (True, True, True),
-        ):
+        # Only combinations that one planner could have produced are valid.
+        for planner in reversed(tuple(_PlannerVersion)[:-1]):
             try:
-                expected, documents = _plan_documents(
-                    saved, root, legacy_cli=legacy_cli, grouped_cold=grouped_cold, earlier_peak=earlier_peak
-                )
+                expected, documents = _plan_documents(saved, root, planner=planner)
             except _PoolRefusal:
                 continue
             completed = True

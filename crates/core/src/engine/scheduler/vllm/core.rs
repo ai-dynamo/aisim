@@ -1520,7 +1520,13 @@ impl VllmCore {
                 request.uuid = Some(uuid);
                 self.validate_request_id(uuid)?;
                 self.source_holds.register(uuid, handoff_id)?;
-                if let Some(rules) = self.kv_manager.grouped_transfer() {
+                // Keep the original length for the scheduler's normal request rejection.
+                if let Some(rules) = self.kv_manager.grouped_transfer()
+                    && !policy::should_reject_for_model_len(
+                        request.tokens.len(),
+                        self.args.max_model_len,
+                    )
+                {
                     // vLLM's prefill rank drops the last backoff tokens of the
                     // prompt, which the decode rank recomputes (V31
                     // `nixl/base_scheduler.py:409-436`, V32 `:405-435`).
@@ -1581,6 +1587,10 @@ impl VllmCore {
                 handoff_id,
                 mut request,
             } => {
+                anyhow::ensure!(
+                    self.kv_manager.grouped_transfer().is_none() || !request.tokens.is_empty(),
+                    "grouped KV destinations require a nonempty prompt"
+                );
                 let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
                 request.uuid = Some(uuid);
                 self.validate_request_id(uuid)?;
@@ -1598,7 +1608,10 @@ impl VllmCore {
                     RequestStatus::WaitingForRemoteKv,
                     waiting_order,
                 );
-                if policy::should_reject_for_model_len(&request.sequence, self.args.max_model_len) {
+                if policy::should_reject_for_model_len(
+                    request.sequence.num_input_tokens(),
+                    self.args.max_model_len,
+                ) {
                     anyhow::bail!("destination prompt must be shorter than max_model_len");
                 }
                 if !self
@@ -3451,10 +3464,12 @@ impl VllmCore {
                     .get(&uuid)
                     .expect("waiting request missing from state");
                 (
-                    policy::should_reject_for_model_len(&request.sequence, self.args.max_model_len)
-                        || !self
-                            .kv_manager
-                            .accepts_sequence_length(request.sequence.len()),
+                    policy::should_reject_for_model_len(
+                        request.sequence.num_input_tokens(),
+                        self.args.max_model_len,
+                    ) || !self
+                        .kv_manager
+                        .accepts_sequence_length(request.sequence.len()),
                     admission.stage_for(request.prompt_is_prebuilt()),
                     request.admissible_from_pass,
                     request.arrival_ms,

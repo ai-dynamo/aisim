@@ -776,6 +776,96 @@ def test_native_grouped_rematerialization_checks_identity_and_budget(grouped_cas
         EngineReplayRunnerFactory(runtime=ChangedNativeInput()).create(0).run(spec)
 
 
+@pytest.mark.parametrize(
+    "field,timing_field,value",
+    [("kv_cache_dtype", "kvcache_quant_mode", "int8"), ("attention_backend", "attention_backend", "fa3")],
+)
+def test_native_grouped_pd_checks_resolved_nixl_identity(grouped_case, field, timing_field, value):
+    from aisim import _runtime
+    from aisim.runner import EngineReplayRunnerFactory
+
+    profile, root = grouped_case
+    shared = _with_transfer_markers(profile, version="0.32.0")["deployments"][0]
+    profile["deployments"] = [{**shared, "attention_backend": "flashinfer"}]
+    _write_timings(root, profile, version="0.32.0")
+    config = CorePredictionConfig.model_validate(_pd_prediction(profile, root))
+    spec = prediction_to_replay_spec(config)
+
+    class ChangedDecodeProfile:
+        def run_replay_json(self, serialized):
+            # The persisted native input identifies a different decode deployment with its own matching timing rows.
+            payload = json.loads(serialized)
+            engine = payload["spec"]["engine"]
+            decode_timing = engine["decode"]["rank"]["timing_model"]["config"]
+            decode_timing[timing_field] = value
+            measured = decode_timing["fpm_profile"]
+            deployment = measured["deployments"][0]
+            measured["deployments"] = [
+                {**deployment, "worker_type": "prefill"},
+                {**deployment, "worker_type": "decode", field: value},
+            ]
+            engine["prefill"]["rank"]["timing_model"]["config"]["fpm_profile"] = measured
+            _write_timings(root, measured, version="0.32.0")
+            return _runtime.run_replay_json(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match=f"require matching {field}"):
+        EngineReplayRunnerFactory(runtime=ChangedDecodeProfile()).create(0).run(spec)
+
+
+@pytest.mark.parametrize(
+    "field,error",
+    [
+        ("model", "require matching model"),
+        ("backend_version", "vllm_version .* must match timing backend_version"),
+        ("runtime_framework_version", "runtime_memory.runtime_framework_version .* to equal the deployment's"),
+    ],
+)
+def test_native_grouped_pd_binds_timing_model_and_version_to_the_handoff(grouped_case, field, error):
+    from aisim import _runtime
+    from aisim.runner import EngineReplayRunnerFactory
+
+    profile, root = grouped_case
+    if field == "runtime_framework_version":
+        profile = _with_prefix_evidence(_with_state_group(profile), version="0.32.0")
+    profile = _with_transfer_markers(profile, version="0.32.0")
+    profile["deployments"] = [profile["deployments"][0]]
+    _write_timings(root, profile, version="0.32.0")
+    raw = _pd_prediction(profile, root)
+    if field == "runtime_framework_version":
+        raw["engine"]["context_length"] = 1024
+        raw["traffic"]["source"]["input_tokens"] = 256
+    config = CorePredictionConfig.model_validate(raw)
+    spec = prediction_to_replay_spec(config)
+
+    class OtherDecodeTiming:
+        def run_replay_json(self, serialized):
+            payload = json.loads(serialized)
+            timing = payload["spec"]["engine"]["decode"]["rank"]["timing_model"]["config"]
+            measured = timing["fpm_profile"]
+            version = "0.32.0"
+            systems = root
+            if field == "model":
+                original = Path(measured["model"])
+                other = original.with_name("other-checkpoint")
+                other.mkdir()
+                (other / "config.json").write_bytes((original / "config.json").read_bytes())
+                timing["model"] = measured["model"] = str(other)
+                systems = root.with_name("decode-systems")
+                systems.mkdir()
+                (systems / "h200_sxm.yaml").write_bytes((root / "h200_sxm.yaml").read_bytes())
+                timing["systems_paths"] = [str(systems)]
+            elif field == "backend_version":
+                version = "0.33.0"
+                timing["backend_version"] = measured["deployments"][0]["backend_version"] = version
+            else:
+                measured["deployments"][0]["resources"]["runtime_memory"]["runtime_framework_version"] = "0.33.0"
+            _write_timings(systems, measured, version=version)
+            return _runtime.run_replay_json(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match=error):
+        EngineReplayRunnerFactory(runtime=OtherDecodeTiming()).create(0).run(spec)
+
+
 def test_grouped_capacity_preserves_graph_reservation_and_rejects_fixed_blocks(grouped_case):
     profile, root = grouped_case
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_prediction(profile, root)))
@@ -895,8 +985,9 @@ def test_grouped_kv_load_sizes_each_pd_role_by_its_bytes(grouped_case):
         result = resolve_kv_load(
             sample, workload=workload, parallel_config=candidate, ratio=1.0, backend_version="0.31.0"
         )
-        # Each role holds the 1,760 bytes per request of the aggregated rank, and the decode role sets the load.
-        assert result.role_request_cache_bytes == {"prefill": 1760, "decode": 1760}
+        # Prefill holds the 1,152 input tokens. Decode has two more tokens on average.
+        # They open one additional full-attention block; the window footprints have the same bound.
+        assert result.role_request_cache_bytes == {"prefill": 1696, "decode": 1760}
         assert result.role_capacity_bytes == {
             "prefill": 3486 * candidate.prefill.shape.dp,
             "decode": 3486 * candidate.decode.shape.dp,
@@ -930,7 +1021,7 @@ def test_grouped_kv_load_sizes_each_pd_role_with_its_own_context_length(grouped_
             "gpu_memory_utilization": 0.9,
             "provenance": "Synthetic initialized cache pool; no GPU qualification.",
         }
-    role_context = {"prefill": 1024, "decode": 512}
+    role_context = {"prefill": 257, "decode": 512}
     candidates = parallel_configs_for(
         profile["model"],
         "h200_sxm",
@@ -972,18 +1063,18 @@ def test_grouped_kv_load_sizes_each_pd_role_with_its_own_context_length(grouped_
     estimate = kv_load.estimate_grouped_cache_budget
 
     def record(*args, **kwargs):
-        sized[kwargs["worker_type"]] = kwargs["context_length"]
+        sized[kwargs["worker_type"]] = (kwargs["context_length"], kwargs["request_occupancy_tokens"])
         return estimate(*args, **kwargs)
 
     monkeypatch.setattr(kv_load, "estimate_grouped_cache_budget", record)
     result = resolve_kv_load(
         sample,
-        workload=Workload(isl=256, osl=4, kv_load_ratio=1.0, request_count=2),
+        workload=Workload(isl=256, osl=128, kv_load_ratio=1.0, request_count=2),
         parallel_config=candidates[0],
         ratio=1.0,
         backend_version="0.31.0",
     )
-    assert sized == {"prefill": 1024, "decode": 512}
+    assert sized == {"prefill": (257, 256), "decode": (512, 320)}
     assert set(result.role_request_cache_bytes) == {"prefill", "decode"}
 
 
@@ -1080,6 +1171,11 @@ def test_grouped_unsupported_execution_modes_fail_before_replay(grouped_case, ch
         ("transfer_bytes", _PD_TRANSFER),
         ("non_cacheable_window", _PD_REPLAY_WINDOW),
         ("ring_state", None),
+        ("multi_block_ring", "requires blocks_per_request=1 for a ring state group"),
+        ("kv_dtype", "matching kv_cache_dtype"),
+        ("known_backend", "matching attention_backend when both backends are known"),
+        ("auto_backend", None),
+        ("matching_backend", None),
     ],
 )
 def test_grouped_pd_requires_equal_tp_identical_groups_and_markers(grouped_case, case, error):
@@ -1100,13 +1196,26 @@ def test_grouped_pd_requires_equal_tp_identical_groups_and_markers(grouped_case,
         # window group that takes part in prefix caching passes in the other cases.
         for deployment in profile["deployments"]:
             deployment["resources"]["cache_groups"][1]["prefix_cacheable"] = False
-    elif case == "ring_state":
+    elif case in {"ring_state", "multi_block_ring"}:
         # A ring described as a state group of one block that does not take part in prefix caching.
         for deployment in profile["deployments"]:
-            ring = {**_STATE_GROUP, "name": "ring", "blocks_per_request": 1, "prefix_cacheable": False}
+            ring = {
+                **_STATE_GROUP,
+                "name": "ring",
+                "blocks_per_request": 2 if case == "multi_block_ring" else 1,
+                "prefix_cacheable": False,
+            }
             deployment["resources"]["cache_groups"].append(
                 {**ring, "transfer_bytes_per_block": ring["page_size_bytes"]}
             )
+    elif case in {"kv_dtype", "known_backend", "auto_backend", "matching_backend"}:
+        prefill = {**profile["deployments"][0], "worker_type": "prefill", "attention_backend": "flashinfer"}
+        decode = {**deepcopy(prefill), "worker_type": "decode"}
+        if case == "kv_dtype":
+            decode["kv_cache_dtype"] = "int8"
+        elif case != "matching_backend":
+            decode["attention_backend"] = "fa3" if case == "known_backend" else "auto"
+        profile["deployments"] = [prefill, decode]
     elif case == "other_groups":
         # Role-tagged deployments of one shape: the decode deployment lacks the convolution group.
         prefill = profile["deployments"][0]
@@ -1121,7 +1230,7 @@ def test_grouped_pd_requires_equal_tp_identical_groups_and_markers(grouped_case,
     if case == "unequal_tp":
         workers["decode"]["parallelism"] = dep
         search["parallel_configs_by_mode"] = {"disagg": [{"prefill": tensor_pin, "decode": dep_pin}]}
-    elif case == "other_groups":
+    elif case in {"other_groups", "kv_dtype", "known_backend", "auto_backend", "matching_backend"}:
         search["parallel_configs_by_mode"] = {"disagg": [{"prefill": tensor_pin, "decode": tensor_pin}]}
     elif case == "linear_decode":
         # The mixed profile groups the DEP deployment and keeps the tensor-parallel one linear.
@@ -1130,6 +1239,19 @@ def test_grouped_pd_requires_equal_tp_identical_groups_and_markers(grouped_case,
     elif case == "transfer_bytes":
         raw["engine"]["kv_transfer"] = {"bytes_per_token": 7}
         search["kv_transfer_bytes_per_token"] = 7
+    if case in {"kv_dtype", "known_backend", "auto_backend", "matching_backend"}:
+        from aisim.recommend import recommendation_to_sweeper
+
+        recommendation = deepcopy(raw)
+        for worker in recommendation["engine"]["workers"].values():
+            worker["parallelism"] = {"preset": [{**worker["parallelism"], "replicas": 1, "pipeline": 1}]}
+        recommendation["optimization"] = {"constraints": {"max_candidate_gpus": 4}}
+        config = CoreRecommendationConfig.model_validate(recommendation)
+        if error is None:
+            recommendation_to_sweeper(config)
+        else:
+            with pytest.raises(ValidationError, match=re.escape(error)):
+                recommendation_to_sweeper(config)
     if error is None:
         CorePredictionConfig.model_validate(raw)
         SearchSpace.model_validate(search)
@@ -1138,6 +1260,39 @@ def test_grouped_pd_requires_equal_tp_identical_groups_and_markers(grouped_case,
         CorePredictionConfig.model_validate(raw)
     with pytest.raises(ValidationError, match=re.escape(error)):
         SearchSpace.model_validate(search)
+
+
+@pytest.mark.parametrize("second_full_block", [64, 16])
+def test_grouped_pd_full_attention_transfer_unit(grouped_case, second_full_block):
+    from aisim.recommend import recommendation_to_sweeper
+    from aisim.sweeper.config import SearchSpace
+
+    profile, root = grouped_case
+    profile = _with_transfer_markers(profile)
+    for deployment in profile["deployments"]:
+        groups = deployment["resources"]["cache_groups"]
+        # Both ranks have identical groups. Only full-attention groups share the
+        # transfer unit. The window's 16-token blocks are valid beside a 64-token unit.
+        groups.append({**groups[0], "name": "full2", "block_size_tokens": second_full_block})
+    prediction = _pd_prediction(profile, root)
+    search = _pd_search(profile, root)
+    recommendation = deepcopy(prediction)
+    for worker in recommendation["engine"]["workers"].values():
+        worker["parallelism"] = {"preset": "default"}
+    recommendation["optimization"] = {"constraints": {"max_candidate_gpus": 4}}
+    config = CoreRecommendationConfig.model_validate(recommendation)
+    if second_full_block == 64:
+        CorePredictionConfig.model_validate(prediction)
+        SearchSpace.model_validate(search)
+        recommendation_to_sweeper(config)
+    else:
+        error = "require one block_size_tokens across full-attention groups"
+        with pytest.raises(ValidationError, match=error):
+            CorePredictionConfig.model_validate(prediction)
+        with pytest.raises(ValidationError, match=error):
+            SearchSpace.model_validate(search)
+        with pytest.raises(ValidationError, match=error):
+            recommendation_to_sweeper(config)
 
 
 def test_grouped_pd_of_a_probe_profile_gets_the_markers_text(grouped_case):
@@ -1831,6 +1986,33 @@ def test_grouped_pd_recommendation_enumerates_equal_tp_pairs(grouped_case):
     candidates = branches[0].parallel_configs
     assert candidates
     assert all(candidate.prefill.shape.tp == candidate.decode.shape.tp == 2 for candidate in candidates)
+
+
+def test_grouped_search_checks_incompatible_deployments_before_creating_replica_pairs(grouped_case, monkeypatch):
+    from aisim.fpm_profile import load_fpm_profile
+    from aisim.sweeper import model_hw
+
+    profile, _ = grouped_case
+    deployment = {**_with_transfer_markers(profile)["deployments"][0], "tp": 1, "moe_tp": 1}
+    profile["deployments"] = [
+        {**deployment, "worker_type": "prefill"},
+        {**deployment, "worker_type": "decode", "kv_cache_dtype": "int8"},
+    ]
+
+    def unexpected_pair(**kwargs):
+        pytest.fail("created a replica pair for incompatible cache dtypes")
+
+    monkeypatch.setattr(model_hw, "DisaggParallelConfig", unexpected_pair)
+    with pytest.raises(model_hw.NoViableParallelConfig, match="matching kv_cache_dtype"):
+        model_hw._profile_parallel_configs(
+            load_fpm_profile(profile),
+            hardware_sku="h200_sxm",
+            backend="vllm",
+            backend_version="0.31.0",
+            gpu_budget=512,
+            min_gpu_budget=None,
+            deployment_mode="disagg",
+        )
 
 
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):
@@ -2539,6 +2721,8 @@ def _plan_cold_like_an_earlier_planner(monkeypatch):
     def cold(*args, **kwargs):
         with monkeypatch.context() as patch:
             patch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
+            # Full and window groups at context 1024 and chunk 128 used 16 + 11 pages.
+            _peak_like_an_earlier_planner(patch, peak=27 * 64)
             return original(*args, **kwargs)
 
     monkeypatch.setattr(module, "create_plan", cold)
@@ -2651,6 +2835,7 @@ def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(grouped_case, tmp_pa
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
     monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
+    _peak_like_an_earlier_planner(monkeypatch)
     _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
     monkeypatch.undo()
     plan = tmp_path / "collection"
@@ -2738,15 +2923,17 @@ def test_grouped_plan_saved_with_the_earlier_peak_bound_still_verifies(
         # A plan saved cold before replay modeled grouped prefix caching, and with the earlier bound.
         monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
     if case.startswith("legacy"):
-        # A plan saved under the earlier command name, and with the earlier bound.
-        original = plan_module._plan_documents
-        monkeypatch.setattr(
-            plan_module, "_plan_documents", lambda *args, **kwargs: original(*args, **kwargs, legacy_cli=True)
-        )
+        # Recreate the command names and branding independently of the validator's historical renderings.
+        commands = plan_module._commands
+        monkeypatch.setattr(plan_module, "_commands", lambda *args, **kwargs: commands(*args, legacy_cli=True))
     _onboarding_plan(profile, tmp_path, capsys, version)
     monkeypatch.undo()
     plan = tmp_path / "collection"
-    saved = json.loads((plan / "support-plan.json").read_text())
+    manifest = plan / "support-plan.json"
+    if case.startswith("legacy"):
+        text = manifest.read_text().replace("AISim launches and manages", "AISimulate launches and manages")
+        manifest.write_text(text)
+    saved = json.loads(manifest.read_text())
     if case == "between":
         assert saved["resources"]["request_peak_cache_bytes"] == _EARLIER_PEAK
     else:
@@ -2756,12 +2943,59 @@ def test_grouped_plan_saved_with_the_earlier_peak_bound_still_verifies(
         assert _prefix_caching_of(plan) == ([False, False] if case.endswith("cold") else [True, True])
     assert ('"aisimulate"' in (plan / "commands.json").read_text()) is case.startswith("legacy")
     request = SupportRequest.from_yaml(plan / "request.yaml")
+    if case == "legacy":
+        # Before the rename the planner kept every grouped pilot cold.
+        with pytest.raises(ValueError, match="support-plan.json was modified"):
+            plan_module.check_plan(request, plan)
+        return
     plan_module.check_plan(request, plan)
+    # Between the two startup changes the warm pilot counted one extra align state page,
+    # while the window still used the earlier one-chunk bound.
+    _set_saved_peak(plan, _EARLIER_PEAK + 64)
+    if case.endswith("cold"):
+        with pytest.raises(ValueError, match="support-plan.json was modified"):
+            plan_module.check_plan(request, plan)
+    elif case != "between":
+        plan_module.check_plan(request, plan)
+    if case.endswith("cold"):
+        # Grouped prefix caching already existed when startup accounting changed.
+        _set_saved_peak(plan, _STARTUP_PEAK)
+        with pytest.raises(ValueError, match="support-plan.json was modified"):
+            plan_module.check_plan(request, plan)
     # A saved bound of any other value is neither the bound of the planner nor the earlier one. A plan whose pool is
     # too small for the planner of the checkout gets the same text, because the earlier renderings complete.
     _set_saved_peak(plan, _STARTUP_PEAK + 64)
     with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
         plan_module.check_plan(request, plan)
+
+
+@reads_saved_config
+def test_convolution_plan_rejects_earlier_peak_with_a_warm_pilot(grouped_case, tmp_path, capsys, monkeypatch):
+    from aisim.support import plan as plan_module
+
+    profile, _ = grouped_case
+    profile = _with_prefix_evidence(profile)
+    for deployment in profile["deployments"]:
+        groups = deployment["resources"]["cache_groups"]
+        groups[:] = [groups[0], dict(_CONVOLUTION_GROUP)]
+    _onboarding_plan(profile, tmp_path, capsys, "0.31.0")
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    assert _prefix_caching_of(plan) == [True, True]
+    assert json.loads((plan / "support-plan.json").read_text())["resources"]["request_peak_cache_bytes"] == 1408
+    _set_saved_peak(plan, 1280)
+    with pytest.raises(ValueError, match="support-plan.json was modified"):
+        plan_module.check_plan(request, plan)
+    # Recreate the historical cold pilot and its generated-file hashes.
+    with monkeypatch.context() as patch:
+        patch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
+        parent = tmp_path / "historical"
+        parent.mkdir()
+        _onboarding_plan(profile, parent, capsys, "0.31.0")
+    old = parent / "collection"
+    assert _prefix_caching_of(old) == [False, False]
+    _set_saved_peak(old, 1280)
+    plan_module.check_plan(SupportRequest.from_yaml(old / "request.yaml"), old)
 
 
 @reads_saved_config

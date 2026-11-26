@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
+# Modified grouped handoff validation follows vLLM's NIXL handshake at v0.31.0, v0.32.0 and v0.33.0.
+# https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+# https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+# https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 
 """Typed engine input for prediction and recommendation."""
 
@@ -1857,34 +1861,36 @@ GROUPED_PD_REPLAY_WINDOW_TEXT = (
 )
 
 
-def grouped_pd_pairable(prefill_deployment, decode_deployment) -> bool:
-    """Whether a prefill and a decode FPM deployment can run as a P/D pair.
-
-    Two linear deployments always can. Replay moves each cache group into the same group of the decode rank, so a
-    pair with a grouped deployment needs two grouped deployments with equal tensor parallelism and identical groups.
-    """
+def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | None:
+    """Return the first incompatible property of a grouped NIXL pair."""
     prefill, decode = prefill_deployment.resources, decode_deployment.resources
     if prefill.cache_layout != "grouped" and decode.cache_layout != "grouped":
-        return True
-    return (
-        prefill.cache_layout == decode.cache_layout
-        and prefill_deployment.tp == decode_deployment.tp
-        and prefill.cache_groups == decode.cache_groups
-    )
+        return None
+    if (
+        prefill.cache_layout != decode.cache_layout
+        or prefill_deployment.tp != decode_deployment.tp
+        or prefill.cache_groups != decode.cache_groups
+    ):
+        return "equal tensor parallelism and identical cache groups"
+    if prefill_deployment.kv_cache_dtype != decode_deployment.kv_cache_dtype:
+        return "matching kv_cache_dtype"
+    # The NIXL handshake checks the resolved backend. An automatic selection
+    # in a profile does not identify the backend the runtime actually chose.
+    backends = {deployment.attention_backend.lower() for deployment in (prefill_deployment, decode_deployment)}
+    if len(backends - {"auto", "unknown"}) > 1:
+        return "matching attention_backend when both backends are known"
+    return None
 
 
 def grouped_pd_requirements(prefill_deployment, decode_deployment, *, backend_version: str | None, kv_transfer) -> None:
     """Check a prefill and a decode FPM deployment with a grouped cache for P/D replay.
 
     The prediction and the sweeper share this rule. The sweeper enumerates only pairs that pass
-    ``grouped_pd_pairable``. ``kv_transfer`` is the prediction's transfer configuration, or None. The Rust gate checks
-    the markers, the version and the full-attention block of each rank again.
+    ``grouped_pd_pair_requirement``. ``kv_transfer`` is the prediction's transfer configuration, or None. The Rust
+    gate checks the transfer geometry and the version of each rank again.
     """
-    if not grouped_pd_pairable(prefill_deployment, decode_deployment):
-        raise ValueError(
-            "grouped FPM cache P/D requires prefill and decode deployments with equal tensor parallelism and "
-            "identical cache groups"
-        )
+    if requirement := grouped_pd_pair_requirement(prefill_deployment, decode_deployment):
+        raise ValueError(f"grouped FPM cache P/D requires prefill and decode deployments with {requirement}")
     # The versions come first, as in the Rust gate and the prefix-caching rule: no marker makes P/D of another
     # version run.
     if backend_version not in GROUPED_PD_VERSIONS:
@@ -1892,10 +1898,8 @@ def grouped_pd_requirements(prefill_deployment, decode_deployment, *, backend_ve
     for deployment in (prefill_deployment, decode_deployment):
         require_runtime_version(deployment.resources.runtime_memory, backend_version=backend_version, feature="P/D")
     # The transfer rules read both markers. The pair's groups are identical, so the prefill groups stand for both.
-    if any(
-        group.prefix_cacheable is None or group.transfer_bytes_per_block is None
-        for group in prefill_deployment.resources.cache_groups
-    ):
+    groups = prefill_deployment.resources.cache_groups
+    if any(group.prefix_cacheable is None or group.transfer_bytes_per_block is None for group in groups):
         raise ValueError(
             "grouped FPM cache P/D requires every cache group to declare prefix_cacheable and "
             "transfer_bytes_per_block; set both on each cache group of the profile, with the transfer_bytes_per_block "
@@ -1905,9 +1909,21 @@ def grouped_pd_requirements(prefill_deployment, decode_deployment, *, backend_ve
     # Rust rules do not model. The Rust gate refuses it with this text, with prefix caching on or off.
     if any(
         group.kind == "attention" and group.sliding_window is not None and group.prefix_cacheable is False
-        for group in prefill_deployment.resources.cache_groups
+        for group in groups
     ):
         raise ValueError(GROUPED_PD_REPLAY_WINDOW_TEXT)
+    if any(
+        group.kind == "state" and group.prefix_cacheable is False and group.blocks_per_request != 1 for group in groups
+    ):
+        raise ValueError("grouped FPM cache P/D requires blocks_per_request=1 for a ring state group")
+    full_blocks = {
+        group.block_size_tokens for group in groups if group.kind == "attention" and group.sliding_window is None
+    }
+    if len(full_blocks) > 1:
+        raise ValueError(
+            "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across "
+            "full-attention groups"
+        )
     if kv_transfer is not None and kv_transfer.bytes_per_token != "auto":
         raise ValueError("grouped FPM cache derives kv_transfer.bytes_per_token from its cache groups; set it to auto")
 

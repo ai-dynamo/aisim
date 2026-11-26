@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 from enum import Enum
+from itertools import chain
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1314,12 +1315,11 @@ class SearchSpace(BaseModel):
                     if self.kv_transfer_bytes_per_token is not None
                     else None
                 )
-                # The enumeration keeps only the pairs that grouped_pd_pairable accepts. The other checks hold for
+                # The enumeration keeps only compatible deployment pairs. The other checks hold for
                 # every pair of the search.
-                pairs = list(pinned_pairs())
-                for prefill_shape, decode_shape in dict.fromkeys((c.prefill.shape, c.decode.shape) for c in configs):
-                    pairs.append((select("prefill", prefill_shape), select("decode", decode_shape)))
-                for prefill, decode in pairs:
+                shapes = dict.fromkeys((c.prefill.shape, c.decode.shape) for c in configs)
+                enumerated_pairs = ((select("prefill", p), select("decode", d)) for p, d in shapes)
+                for prefill, decode in chain(pinned_pairs(), enumerated_pairs):
                     if "grouped" in (prefill.resources.cache_layout, decode.resources.cache_layout):
                         grouped_pd_requirements(prefill, decode, backend_version=backend_version, kv_transfer=transfer)
         return self

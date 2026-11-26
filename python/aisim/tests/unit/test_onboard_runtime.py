@@ -1689,19 +1689,17 @@ def test_a_session_planned_cold_before_vllm_0330_rules_still_finalizes(tmp_path,
         worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
         return worker["kv_cache"]["prefix_caching"]
 
-    def refuse(*_args, **_kwargs):
-        raise ValueError("no grouped rules for vLLM 0.33.0")
-
-    # `onboard plan` writes the plan as it did while replay had no grouped rules for vLLM 0.33.0: the grouped
-    # prefix-caching requirements refused the profile, so the plan is cold.
+    # The pre-prefix-caching planner also used the earlier cache peak.
+    original = support_plan._plan_documents
+    earlier = support_plan._PlannerVersion.BEFORE_GROUPED_PREFIX_CACHING
     with monkeypatch.context() as before:
-        before.setattr(support_plan, "grouped_prefix_caching_requirements", refuse)
+        before.setattr(support_plan, "_plan_documents", lambda *args, **kwargs: original(*args, planner=earlier))
         _, request, files, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
     saved = (root / "support-plan.json").read_bytes()
     assert not prefix_caching(root, "predict/pilot.yaml")
     # The cold plan and the plan with prefix caching on differ only in the two pilots and the plan manifest, so the
     # collection inputs of the saved session are those of the new plan too.
-    _, cold = support_plan._plan_documents(request, root, grouped_cold=True)
+    _, cold = support_plan._plan_documents(request, root, planner=earlier)
     _, warm = support_plan._plan_documents(request, root)
     assert sorted(str(path) for path in cold if cold[path] != warm.get(path)) == [
         "predict/pilot.yaml",

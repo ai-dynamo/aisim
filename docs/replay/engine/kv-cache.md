@@ -1535,9 +1535,14 @@ sub-block matching without an explicit full-state scratch count.
     Replay preempts the last of its running requests.
 
   In `mode: disaggregated`, the prefill and decode deployments need equal
-  tensor parallelism and identical cache groups. `engine.backend_version` must
-  be `0.31.0`, `0.32.0` or `0.33.0`. On `0.33.0`, a prefill or decode rank
-  refuses a `scheduler.prefill_schedule_interval` above 1, with prefix caching
+  tensor parallelism, identical cache groups and the same `kv_cache_dtype`.
+  When both deployments name an `attention_backend`, the backends must match.
+  vLLM hashes the model ID, cache dtype and resolved attention backend during
+  the NIXL handshake. See [v0.31.0](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L182-L199),
+  [v0.32.0](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L185-L202)
+  and [v0.33.0](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L186-L203).
+  `engine.backend_version` must be `0.31.0`, `0.32.0` or `0.33.0`. On
+  `0.33.0`, a prefill or decode rank refuses a `scheduler.prefill_schedule_interval` above 1, with prefix caching
   on or off, also with `attention_data` above 1. See
   [vLLM prefill schedule interval](workers.md#vllm-prefill-schedule-interval).
   Every group must declare `prefix_cacheable` and
@@ -1559,19 +1564,23 @@ sub-block matching without an explicit full-state scratch count.
   `blocks_per_request: 1` and `prefix_cacheable: false`. For a native pair,
   replay checks that the prefill and decode
   roles have identical `kv_cache_groups` and the same `vllm_version`, and
-  it runs the gate of each rank. It also checks equal `tensor_parallel_size`,
-  but not the version that the profile records. P/D moves whole blocks of
-  full-attention groups, the last blocks of window groups and one block of
-  each state group.
-  A grouped prefill worker refuses a request with an empty prompt, as vLLM
-  refuses an empty prompt, see vLLM v0.31.0
+  it runs the gate of each rank. Native replay checks equal `tensor_parallel_size`
+  and compares the model ID, KV cache dtype and attention backend when both
+  timing models identify them. Each rank's `vllm_version` must match its known
+  timing `backend_version`, including the observed runtime version when the
+  selected FPM deployment records it. P/D
+  moves whole blocks of full-attention groups, the last blocks of window groups
+  and one block of each state group.
+  Grouped prefill and decode workers require a nonempty original prompt,
+  as in vLLM v0.31.0
   [`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517),
   vLLM v0.32.0
   [`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/input_processor.py#L565-L566)
   and vLLM v0.33.0
   [`input_processor.py:565-566`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/input_processor.py#L565-L566).
-  The prefill of a model with recurrent state layers stops
-  one token short, and the decode worker recomputes that token. The prefill
+  The prefill worker checks the original prompt against its context limit.
+  For a model with recurrent state layers, prefill then stops one token
+  short, and the decode worker recomputes that token. The prefill
   of a one-token prompt computes that token, and the decode worker computes
   it again. A `state` group with `prefix_cacheable: true` marks such layers.
   [KV transfer](kv-transfer.md) gives the transferred bytes.

@@ -1847,12 +1847,7 @@ impl EngineConfig {
             }),
             "kv_cache_groups with worker_type=prefill or decode do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and replay a bounded replay window on an aggregated rank with prefix caching off"
         );
-        // The groups passed `validate` and declare both fields, so the rules
-        // can fail only on two different full-attention blocks.
-        ensure!(
-            GroupedTransferRules::new(&self.kv_cache_groups).is_ok(),
-            "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across full-attention groups"
-        );
+        GroupedTransferRules::new(&self.kv_cache_groups)?;
         Ok(())
     }
 
@@ -3840,7 +3835,7 @@ mod tests {
         let byte_geometry = "kv_cache_groups cannot use linear cache or KV transfer byte geometry";
         let replay_window = "kv_cache_groups with worker_type=prefill or decode do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and replay a bounded replay window on an aggregated rank with prefix caching off";
         type Refusal = (fn(&mut serde_json::Value), &'static str);
-        let refusals: [Refusal; 14] = [
+        let refusals: [Refusal; 16] = [
             (
                 |wire| {
                     wire.as_object_mut().unwrap().remove("vllm_version");
@@ -3882,6 +3877,20 @@ mod tests {
                         .remove("prefix_cacheable");
                 },
                 declare,
+            ),
+            // A ring owns and transfers one block per request, with caching off or on.
+            (
+                |wire| wire["kv_cache_groups"][1]["blocks_per_request"] = 2.into(),
+                "grouped FPM cache P/D requires blocks_per_request=1 for a ring state group",
+            ),
+            (
+                |wire| {
+                    wire["kv_cache_groups"][1]["blocks_per_request"] = 2.into();
+                    wire["enable_prefix_caching"] = true.into();
+                    wire["prefix_match_unit"] = 2176.into();
+                    wire["max_model_len"] = 131_072.into();
+                },
+                "grouped FPM cache P/D requires blocks_per_request=1 for a ring state group",
             ),
             // The handoff timing counts in one full-attention block.
             (

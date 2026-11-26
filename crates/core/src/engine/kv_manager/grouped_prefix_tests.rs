@@ -207,7 +207,7 @@ fn state_and_ring_blocks(lease: &GroupedBlockLease) -> usize {
 
 fn attention_copies(lease: &GroupedBlockLease, group: usize) -> usize {
     match &lease.groups[group] {
-        GroupLease::Attention { copies, .. } => copies.iter().flatten().count(),
+        GroupLease::Attention { copies, .. } => copies.len(),
         other => panic!("group {group} is not an attention lease: {other:?}"),
     }
 }
@@ -897,6 +897,83 @@ fn full_attention_hit_is_capped_below_the_prompt() {
         let hit = coordinator.find_longest_hit(pool, &lease(65, 16), 65);
         assert_eq!(hit.tokens, 64);
     }
+}
+
+#[test]
+fn grouped_destination_looks_up_each_spec_once_when_full_attention_hits_furthest() {
+    let groups = [attention("full", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 8194);
+    let pool = kv.block_pool_mut().unwrap();
+    let end = 131_072;
+    let request = lease(end + 1, 16);
+    for tokens in (16..=end).step_by(16) {
+        seed(
+            pool,
+            grouped_key(0, request.prefix_hash_at(tokens)).unwrap(),
+        );
+    }
+    seed(
+        pool,
+        grouped_key(1, request.prefix_hash_at(end - 16)).unwrap(),
+    );
+    pool.key_probes.set(0);
+    let hit = coordinator.find_destination_hit(pool, &request, end + 1, end + 1);
+    assert_eq!(hit.tokens, end);
+    assert!(
+        matches!(hit.per_group[1], GroupHitBlocks::DroppedState { tokens, .. } if tokens == end - 16)
+    );
+    // One full-attention probe per block, then the state's miss and hit.
+    assert_eq!(pool.key_probes.get(), end / 16 + 2);
+}
+
+#[test]
+fn grouped_destination_reuses_the_full_attention_lookup_when_state_hits_deeper() {
+    let groups = [attention("full", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 16));
+    let mut kv = kv_pool(&groups, 5);
+    let pool = kv.block_pool_mut().unwrap();
+    for (group, tokens) in [(0, 16), (0, 32), (1, 32), (1, 48)] {
+        seed(pool, key(group, 16, tokens));
+    }
+    pool.key_probes.set(0);
+    let hit = coordinator.find_destination_hit(pool, &lease(49, 16), 49, 49);
+    assert_eq!(hit.tokens, 32);
+    // Three full-attention probes. State hits 48 alone and 32 on both
+    // passes that establish the common hit.
+    assert_eq!(pool.key_probes.get(), 6);
+}
+
+#[test]
+fn grouped_destination_window_stores_only_its_live_suffix() {
+    let groups = [attention("window", 4, Some(4))];
+    let mut coordinator = with_limits(rules(&groups, 4));
+    let mut kv = kv_pool(&groups, 3);
+    let pool = kv.block_pool_mut().unwrap();
+    let mut lease = coordinator.new_lease();
+    let loaded = 1_048_576;
+    assert!(coordinator.allocate(pool, &mut lease, loaded + 1, loaded, loaded, loaded, None));
+    let GroupLease::Attention {
+        copies, first_live, ..
+    } = &lease.groups[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!((*first_live, copies.len()), (262_143, 1));
+    assert!(copies.capacity() < 10);
+    assert_eq!(pool.active_blocks(), 1);
+    assert!(coordinator.allocate(
+        pool,
+        &mut lease,
+        loaded + 1,
+        loaded,
+        loaded + 1,
+        loaded,
+        None
+    ));
+    assert_eq!(pool.active_blocks(), 2);
+    coordinator.release_request(pool, &mut lease);
+    assert_eq!(pool.active_blocks(), 0);
 }
 
 #[test]
@@ -4154,12 +4231,15 @@ fn rescan_finds_a_block(
     use crate::engine::cache::vllm_block_pool::BlockCopyId;
     let rules = coordinator.rules();
     let junction = (hit.junction_tokens > 0).then_some(hit.tokens + hit.junction_tokens);
-    let publishable = |g: usize, copy: Option<&Option<BlockCopyId>>, end: usize| {
-        copy.is_some_and(|copy| copy.is_some_and(|id| pool.is_private(id)))
+    let publishable = |g: usize, copy: Option<&BlockCopyId>, end: usize| {
+        copy.is_some_and(|&id| pool.is_private(id))
             && grouped_key(g, request.prefix_hash_at(end)).is_some()
     };
     rules.groups.iter().enumerate().any(|(g, rule)| {
-        let GroupLease::Attention { copies, .. } = &lease.groups[g] else {
+        let GroupLease::Attention {
+            copies, first_live, ..
+        } = &lease.groups[g]
+        else {
             return false;
         };
         let block = rule.block;
@@ -4168,9 +4248,16 @@ fn rescan_finds_a_block(
             // blocks up to the last multiple of the scheduler block get a key
             // (v0.31.0 coord:796-806, v0.32.0 coord:767-777, v0.33.0
             // coord:777-787).
-            GroupRuleKind::FullAttention => (0..computed_after / rules.alignment * rules.alignment
-                / block)
-                .any(|i| publishable(g, copies.get(i), (i + 1) * block)),
+            GroupRuleKind::FullAttention => {
+                (0..computed_after / rules.alignment * rules.alignment / block).any(|i| {
+                    publishable(
+                        g,
+                        i.checked_sub(*first_live)
+                            .and_then(|offset| copies.get(offset)),
+                        (i + 1) * block,
+                    )
+                })
+            }
             GroupRuleKind::SlidingWindow { window } => [
                 Some(rules.align_rules().replay_boundary(prompt, block)),
                 junction.map(|junction| rules.align_rules().block_floor(junction, block)),
@@ -4180,8 +4267,14 @@ fn rescan_finds_a_block(
             .filter(|&pos| pos > 0 && pos <= computed_after)
             .any(|pos| {
                 let top = pos / block;
-                (top.saturating_sub((window - 1).div_ceil(block))..top)
-                    .any(|i| publishable(g, copies.get(i), (i + 1) * block))
+                (top.saturating_sub((window - 1).div_ceil(block))..top).any(|i| {
+                    publishable(
+                        g,
+                        i.checked_sub(*first_live)
+                            .and_then(|offset| copies.get(offset)),
+                        (i + 1) * block,
+                    )
+                })
             }),
             _ => false,
         }
@@ -4276,11 +4369,7 @@ fn finalize_publishes_what_a_full_rescan_would() {
                 };
                 let cached = target / rules.alignment * rules.alignment / rules.groups[0].block;
                 assert!(
-                    copies
-                        .iter()
-                        .skip(cached)
-                        .flatten()
-                        .all(|id| pool.is_private(*id)),
+                    copies.iter().skip(cached).all(|id| pool.is_private(*id)),
                     "case {case} {groups:?} prompt {prompt}: a block past the cached count holds a key at {target}"
                 );
                 computed = target;

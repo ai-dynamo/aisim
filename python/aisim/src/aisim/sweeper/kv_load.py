@@ -249,7 +249,8 @@ def resolve_kv_load(
     """Map a normalized KV load to candidate-specific closed-loop concurrency.
 
     ``ratio=1`` is the estimated steady-state KV occupancy where each in-flight
-    request holds ``isl + floor(osl / 2)`` tokens on average. ``ratio=0`` is the
+    decode or aggregated request holds ``isl + floor(osl / 2)`` tokens on average.
+    A grouped prefill worker holds only the input tokens. ``ratio=0`` is the
     minimum useful replay load and therefore maps to one request.
     """
     if workload.isl is None or workload.osl is None:
@@ -300,7 +301,7 @@ def resolve_kv_load(
             role=role,
             config=config,
             backend_version=backend_version,
-            request_occupancy_tokens=expected_tokens_per_request,
+            request_occupancy_tokens=isl if role == "prefill" else expected_tokens_per_request,
         )
         if grouped is not None:
             capacity_bytes[role], request_bytes[role], request_capacities[role] = grouped

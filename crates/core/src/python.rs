@@ -2798,9 +2798,23 @@ fn materialize_aic_capacity(
         role.rank.validate()?;
         return Ok(());
     }
-    if resources.as_ref().is_some_and(|resources| {
+    if let Some(grouped) = resources.as_ref().filter(|resources| {
         resources.cache_layout == crate::perfmodel::fpm::FpmCacheLayout::Grouped
     }) {
+        if matches!(
+            config.worker_type,
+            Some(ForwardPassWorkerType::Prefill | ForwardPassWorkerType::Decode)
+        ) && let Some(observed) = grouped
+            .runtime_memory
+            .as_ref()
+            .and_then(|memory| memory.runtime_framework_version.as_deref())
+            && let Some(version) = &config.backend_version
+        {
+            ensure!(
+                observed == version,
+                "grouped FPM cache P/D requires runtime_memory.runtime_framework_version ({observed}) to equal the deployment's backend_version ({version})"
+            );
+        }
         ensure!(
             !capacity_is_explicit,
             "grouped FPM cache cannot use fixed num_gpu_blocks; use the profile byte budget"

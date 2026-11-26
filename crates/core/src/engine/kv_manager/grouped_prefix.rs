@@ -484,8 +484,8 @@ impl GroupedPrefixRules {
                         copies, first_live, ..
                     },
                 ) => {
-                    let mut end =
-                        ((computed_after / block + 1) * block).min(copies.len() * block + 1);
+                    let mut end = ((computed_after / block + 1) * block)
+                        .min((first_live + copies.len()) * block + 1);
                     if let GroupRuleKind::SlidingWindow { window } = rule.kind {
                         end = end.min((first_live + 1) * block + window - 1);
                     }
@@ -894,7 +894,7 @@ impl GroupedPrefixCoordinator {
                 .map(|rule| match rule.kind {
                     GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. } => {
                         GroupLease::Attention {
-                            copies: Vec::new(),
+                            copies: Default::default(),
                             first_live: 0,
                             finalized: 0,
                         }
@@ -927,6 +927,16 @@ impl GroupedPrefixCoordinator {
         lease: &BlockRequestLease,
         num_tokens: usize,
     ) -> GroupedHit {
+        self.common_hit(pool, lease, num_tokens, None)
+    }
+
+    fn common_hit(
+        &self,
+        pool: &GroupedBlockPool,
+        lease: &BlockRequestLease,
+        num_tokens: usize,
+        first_full: Option<(Vec<usize>, usize)>,
+    ) -> GroupedHit {
         let rules = &self.rules;
         let mut hit = GroupedHit {
             tokens: 0,
@@ -939,7 +949,10 @@ impl GroupedPrefixCoordinator {
         let alignment = rules.alignment;
         let mut candidate = (num_tokens - 1) / alignment * alignment;
         // Full attention is downward-closed: one lookup, then trims.
-        let mut full_hits: Vec<Option<(Vec<usize>, usize)>> = vec![None; rules.specs.len()];
+        let mut full_hits = vec![None; rules.specs.len()];
+        if let Some(hit) = first_full {
+            full_hits[0] = Some(hit);
+        }
         let mut longest = 0;
         loop {
             let before = candidate;
@@ -1080,57 +1093,49 @@ impl GroupedPrefixCoordinator {
             return self.empty_hit();
         }
         let max = (num_tokens - 1) / rules.alignment * rules.alignment;
-        let full = rules
-            .specs
-            .iter()
-            .find(|spec| spec.kind == GroupRuleKind::FullAttention);
-        let mamba = rules
-            .groups
-            .iter()
-            .any(|rule| rule.kind == GroupRuleKind::State);
-        // Rules 2 to 4: the per-group path of a model with Mamba layers.
-        let local = full.filter(|_| mamba).and_then(|spec| {
-            let (ends, tokens) = self.full_attention_hit(pool, lease, spec, max);
-            let deeper = rules
-                .specs
-                .iter()
-                .any(|other| self.own_hit(pool, lease, other, max) > tokens);
-            (!deeper).then_some((spec, ends, tokens))
-        });
-        let mut hit = match local {
-            // The keys of every group of `spec`, the own hit of each state
-            // group and no junction.
-            Some((spec, ends, tokens)) => {
-                let mut hit = self.empty_hit();
-                for &g in &spec.groups {
-                    hit.per_group[g] = GroupHitBlocks::Attention(
-                        ends.iter()
-                            .map(|&end| grouped_key(g, lease.prefix_hash_at(end)))
-                            .collect(),
-                    );
-                }
-                for state in rules
-                    .specs
+        // Full attention sorts first in the spec groups. If no other spec
+        // hits deeper, keep that first lookup and each state's own hit.
+        let full = rules.specs.split_first().filter(|(spec, _)| {
+            spec.kind == GroupRuleKind::FullAttention
+                && rules
+                    .groups
                     .iter()
-                    .filter(|spec| spec.kind == GroupRuleKind::State)
-                {
-                    let own = self.own_hit(pool, lease, state, max);
-                    for &g in &state.groups {
-                        if let Some(key) = (own > 0)
-                            .then(|| grouped_key(g, lease.prefix_hash_at(own)))
-                            .flatten()
-                        {
+                    .any(|rule| rule.kind == GroupRuleKind::State)
+        });
+        let mut first_full = None;
+        let local = full.and_then(|(spec, others)| {
+            let (ends, tokens) = self.full_attention_hit(pool, lease, spec, max);
+            let mut hit = self.empty_hit();
+            for other in others {
+                let own = self.own_hit(pool, lease, other, max);
+                if own > tokens {
+                    first_full = Some((ends, tokens));
+                    return None;
+                }
+                if other.kind == GroupRuleKind::State && own > 0 {
+                    for &g in &other.groups {
+                        if let Some(key) = grouped_key(g, lease.prefix_hash_at(own)) {
                             hit.per_group[g] = GroupHitBlocks::DroppedState { key, tokens: own };
                         }
                     }
                 }
-                hit.tokens = tokens;
-                hit
             }
+            for &g in &spec.groups {
+                hit.per_group[g] = GroupHitBlocks::Attention(
+                    ends.iter()
+                        .map(|&end| grouped_key(g, lease.prefix_hash_at(end)))
+                        .collect(),
+                );
+            }
+            hit.tokens = tokens;
+            Some(hit)
+        });
+        let mut hit = match local {
+            Some(hit) => hit,
             // Rules 1 and 3: the fixed point, with no hit block outside full
             // attention. A state group keeps the agreed hit as its own.
             None => {
-                let mut hit = self.find_longest_hit(pool, lease, num_tokens);
+                let mut hit = self.common_hit(pool, lease, num_tokens, first_full);
                 let tokens = hit.tokens;
                 for (blocks, rule) in hit.per_group.iter_mut().zip(&rules.groups) {
                     if rule.kind != GroupRuleKind::FullAttention {
@@ -1531,11 +1536,10 @@ impl GroupedPrefixCoordinator {
                     },
                     GroupHitBlocks::Attention(keys),
                 ) => {
-                    *held = keys
-                        .iter()
-                        .map(|key| key.map(|_| copies.next().expect("one copy per hit key")))
-                        .collect();
-                    *first_live = held.iter().position(Option::is_some).unwrap_or(held.len());
+                    *first_live = keys.iter().position(Option::is_some).unwrap_or(keys.len());
+                    for _ in *first_live..keys.len() {
+                        held.push_back(copies.next().expect("one copy per hit key"));
+                    }
                 }
                 (GroupLease::State(state), GroupHitBlocks::State(Some(_))) => {
                     self.state.group(g).pin(
@@ -1607,12 +1611,11 @@ impl GroupedPrefixCoordinator {
                     if copy {
                         // The shared tail block gives way to a private copy
                         // (`single:387-409`), and it is the copy source.
-                        let shared = copies.last_mut().expect("a partial hit has a tail block");
-                        let old = shared.replace(pool.take_private(&mut reservation));
-                        self.state
-                            .retain_copy(g, old.expect("a partial hit has a tail block"));
+                        let shared = copies.back_mut().expect("a partial hit has a tail block");
+                        let old = std::mem::replace(shared, pool.take_private(&mut reservation));
+                        self.state.retain_copy(g, old);
                     }
-                    copies.extend((0..new).map(|_| Some(pool.take_private(&mut reservation))));
+                    copies.extend((0..new).map(|_| pool.take_private(&mut reservation)));
                 }
                 (Plan::State(plan), GroupLease::State(state)) => {
                     self.state.apply_group(
@@ -1680,23 +1683,16 @@ impl GroupedPrefixCoordinator {
                         let skipped = processed.saturating_sub(window - 1) / block;
                         // Tail first, as `_remove_blocks_in_range` frees the
                         // range (v0.31 `single:660-685`, v0.32 `:645-670`).
-                        let held = skipped.min(copies.len());
-                        for copy in copies[*first_live..held.max(*first_live)].iter_mut().rev() {
-                            releases.extend(copy.take());
-                        }
-                        // A request that computed its tokens elsewhere, as a
-                        // P/D destination did, holds null blocks below the
-                        // window (v0.31 `single:314`, v0.32 `:311`).
-                        if copies.len() < skipped {
-                            copies.resize(skipped, None);
-                        }
+                        let expired = skipped.saturating_sub(*first_live).min(copies.len());
+                        releases.extend(copies.drain(..expired).rev());
                         *first_live = (*first_live).max(skipped);
                     }
-                    let new = target.div_ceil(block).saturating_sub(copies.len());
+                    let logical_len = *first_live + copies.len();
+                    let new = target.div_ceil(block).saturating_sub(logical_len);
                     let copy = first
                         && !computed_before.is_multiple_of(block)
-                        && copies.len() == computed_before.div_ceil(block)
-                        && copies.last().is_some_and(Option::is_some);
+                        && logical_len == computed_before.div_ceil(block)
+                        && !copies.is_empty();
                     fresh += new + usize::from(copy);
                     Plan::Attention { new, copy }
                 }
@@ -1775,7 +1771,9 @@ impl GroupedPrefixCoordinator {
                 match (rule.kind, group) {
                     (
                         GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. },
-                        GroupLease::Attention { copies, .. },
+                        GroupLease::Attention {
+                            copies, first_live, ..
+                        },
                     ) => {
                         let mut required = tokens.div_ceil(block);
                         if let GroupRuleKind::SlidingWindow { window } = rule.kind {
@@ -1786,7 +1784,7 @@ impl GroupedPrefixCoordinator {
                                 self.limits.max_model_len,
                             ));
                         }
-                        required.saturating_sub(copies.len())
+                        required.saturating_sub(first_live + copies.len())
                     }
                     (GroupRuleKind::State, GroupLease::State(state)) => self
                         .state
@@ -1863,10 +1861,8 @@ impl GroupedPrefixCoordinator {
                     // (`single:500-533`). Earlier ones are cached, or have
                     // no key.
                     let full = (cacheable / block).min(copies.len());
-                    for (i, copy) in copies.iter().enumerate().take(full).skip(*finalized) {
-                        if let Some(id) = copy
-                            && let Some(key) = key_at((i + 1) * block)
-                        {
+                    for (i, id) in copies.iter().enumerate().take(full).skip(*finalized) {
+                        if let Some(key) = key_at((i + 1) * block) {
                             if pool.is_private(*id) {
                                 pool.cache(*id, key);
                             } else {
@@ -1896,7 +1892,7 @@ impl GroupedPrefixCoordinator {
                         && tail > 0
                         && !tail.is_multiple_of(block)
                         && tail <= cacheable
-                        && let Some(Some(id)) = copies.get(tail / block)
+                        && let Some(id) = copies.get(tail / block)
                         && let Some(key) = key_at(tail)
                     {
                         if pool.is_private(*id) {
@@ -1909,7 +1905,9 @@ impl GroupedPrefixCoordinator {
                 (
                     GroupRuleKind::SlidingWindow { window },
                     GroupLease::Attention {
-                        copies, finalized, ..
+                        copies,
+                        first_live,
+                        finalized,
                     },
                 ) => {
                     // Retention 0 keeps the run before the replay boundary and
@@ -1928,8 +1926,8 @@ impl GroupedPrefixCoordinator {
                             continue;
                         }
                         let top = pos / block;
-                        for i in top.saturating_sub(need)..top {
-                            if let Some(Some(id)) = copies.get(i)
+                        for i in top.saturating_sub(need).max(*first_live)..top {
+                            if let Some(id) = copies.get(i - *first_live)
                                 && pool.is_private(*id)
                                 && let Some(key) = key_at((i + 1) * block)
                             {
@@ -1973,7 +1971,7 @@ impl GroupedPrefixCoordinator {
                     first_live,
                     finalized,
                 } => {
-                    released.extend(copies.drain(..).rev().flatten());
+                    released.extend(copies.drain(..).rev());
                     *first_live = 0;
                     *finalized = 0;
                 }
