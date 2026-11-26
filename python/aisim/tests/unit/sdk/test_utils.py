@@ -760,6 +760,17 @@ class TestParseHFConfig:
             with pytest.raises(ValueError, match="ple_layer_ids are 1-based"):
                 _parse_hf_config_json(self._qwen38_flash_next_config(ple_layer_ids=bad))
 
+    def test_parse_qwen38_flash_next_rejects_duplicate_ple_layer_id(self):
+        """A repeated id is one runtime branch, not two.
+
+        The runtime tests ``(layer_id + 1) in ple_layer_ids``, so ``[2, 2]``
+        selects layer 2 once and allocates one n-gram table. Accepting the
+        duplicate built two PLE branches and counted two 51.2e9-parameter
+        tables in resident weights.
+        """
+        with pytest.raises(ValueError, match="must not repeat a layer"):
+            _parse_hf_config_json(self._qwen38_flash_next_config(ple_layer_ids=[2, 2]))
+
     def test_parse_qwen38_flash_next_rejects_unsupported_block_topk(self):
         """A ratio yielding a block top-k other than 512/2048 is a hard error."""
         config = self._qwen38_flash_next_config(indexer_budget=1024, indexer_compress_ratio=4)

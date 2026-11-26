@@ -1602,6 +1602,11 @@ def _parse_hf_config_json(config: dict) -> dict:
                 "Qwen3.8-Flash-Next ple_layer_ids are 1-based decoder layer ids and "
                 f"must be within [1, {layers}]; got {sorted(ple_layer_ids)}"
             )
+        # The runtime tests membership, so a repeated id is still one branch on
+        # the device. Building one PLE branch (and one 51.2e9-parameter table)
+        # per list entry would price a table the process never allocates.
+        if len(set(ple_layer_ids)) != len(ple_layer_ids):
+            raise ValueError(f"Qwen3.8-Flash-Next ple_layer_ids must not repeat a layer; got {sorted(ple_layer_ids)}")
 
         # The six PLE geometry fields have no safe zero. A missing key would emit
         # a zero-width table plus zero-width ``key_proj``/``value_proj`` GEMMs —
