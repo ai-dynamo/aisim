@@ -2203,6 +2203,98 @@ def test_qualified_aggregate_keeps_a_prefill_slot_at_equal_phase_lengths(monkeyp
     assert norm_ms == pytest.approx((2 * 4096 + 128) * 2 / database.system_spec["gpu"]["mem_bw"] * 1000)
 
 
+@pytest.mark.parametrize("osl,decoders", [(1, 0), (2, 1)])
+def test_qualified_aggregate_only_mixes_requested_decode_work(monkeypatch, tmp_path, osl, decoders):
+    from pathlib import Path
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import aisim_core
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.operations import Mamba2Kernel
+    from aisim_core.sdk.perf_database import PerfDatabase
+
+    backend = get_backend("vllm")
+    model = _qualified_scan_model("vllm")
+    model.generation_ops.append(
+        Mamba2Kernel(
+            "generation_scan",
+            1,
+            "selective_state_update",
+            "generation",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            4,
+            128,
+            state_dtype="float16",
+        )
+    )
+    # Synthetic powered rows make accidental decode work visible in energy
+    # as well as latency: prefill is 3 ms * 100 W, decode is 7 ms * 200 W.
+    spec = Path(aisim_core.__file__).parent / "systems/b200_sxm.yaml"
+    (tmp_path / spec.name).write_text(spec.read_text())
+    data = tmp_path / "data/b200_sxm/linear_attention/vllm/0.24.0"
+    data.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "kernel_source": ["causal_conv1d_fn", "causal_conv1d_update"],
+                "phase": ["context", "generation"],
+                "batch_size": [1, 1],
+                "seq_len": [4096, 1],
+                "d_model": [4096, 4096],
+                "d_state": [128, 128],
+                "d_conv": [4, 4],
+                "nheads": [64, 64],
+                "head_dim": [64, 64],
+                "n_groups": [4, 4],
+                "chunk_size": [128, 128],
+                "latency": [3.0, 7.0],
+                "power": [100.0, 200.0],
+            }
+        ),
+        data / "mamba2_perf.parquet",
+    )
+    for phase, ops, kernel in (
+        ("context", model.context_ops, "causal_conv1d_fn"),
+        ("generation", model.generation_ops, "causal_conv1d_update"),
+    ):
+        ops.append(Mamba2Kernel(f"{phase}_conv", 1, kernel, phase, 4096, 64, 64, 128, 4, 4, 128, state_dtype="float16"))
+    database = PerfDatabase(
+        "b200_sxm", "vllm", "0.24.0", str(tmp_path), database_mode="HYBRID", strict_provenance=False
+    )
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(batch_size=2, isl=4096, osl=osl)
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=4096)
+    estimates = summary.get_step_estimates()
+    scheduling = estimates["scheduling"]
+    assert scheduling["mix_decode_requests"] == decoders
+    assert scheduling["num_mix_steps"] == 2
+    assert scheduling["num_genonly_steps"] == 0
+    assert estimates["mixed"].num_decode_requests == decoders
+    # Both requests prefill once. At osl=1 there is no generation scan and
+    # the shared norm processes exactly 8192 tokens, rather than 8194.
+    reference = backend.run_mixed(model, database, runtime, MixedStepInput(4096, decoders))
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    # HYBRID uses the packaged B200 memory calibration: two 3 us
+    # launches, with 2 B/token transferred at 80% of peak bandwidth.
+    bw = database.system_spec["gpu"]["mem_bw"]
+    assert group.per_op_latency_ms["norm"] == pytest.approx(0.006 + (8192 + 2 * decoders) * 2 / (0.8 * bw) * 1000)
+    assert group.per_op_latency_ms.get("generation_scan", 0.0) == pytest.approx(
+        2 * reference.per_op_latency_ms.get("generation_scan", 0.0)
+    )
+    assert (group.per_op_latency_ms.get("generation_scan", 0.0) > 0) == bool(decoders)
+    assert group.latency_ms == pytest.approx(2 * reference.latency_ms)
+    assert reference.energy_wms == pytest.approx(300 + decoders * 1400)
+    assert group.energy_wms == pytest.approx(2 * reference.energy_wms)
+    # vLLM adds 0.8 ms/layer and queues b=2 with 1 + log2(2)/8 = 1.125.
+    assert summary.get_result_dict()["ttft"] == pytest.approx((reference.latency_ms + model._num_layers * 0.8) * 1.125)
+
+
 def test_fixed_native_decode_pass_keeps_folded_energy_and_coverage(monkeypatch):
     from aisim_core.sdk import rust_engine_step
 

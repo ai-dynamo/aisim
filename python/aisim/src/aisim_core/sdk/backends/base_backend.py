@@ -2259,7 +2259,12 @@ class BaseBackend:
             num_mix_gen_tokens = self._mix_step_gen_tokens(b, scheduling_ctx_tokens, isl, decode_iterations)
             if (_is_fpm_model(model) or qualified_prefill) and isl > prefix:
                 num_mix_gen_tokens = min(b - 1, num_mix_gen_tokens)
-            assert num_mix_gen_tokens >= 1, (
+            # The first output token comes from prefill. Qualified osl=1
+            # requests therefore have no decode work to mix into those steps.
+            no_post_prefill_decode = qualified_prefill and osl == 1
+            if no_post_prefill_decode:
+                num_mix_gen_tokens = 0
+            assert num_mix_gen_tokens >= 1 or no_post_prefill_decode, (
                 f"num_mix_gen_tokens: {num_mix_gen_tokens}, b: {b}, ctx_tokens: {ctx_tokens}, isl: {isl}"
             )
             num_mix_ctx_tokens = ctx_tokens
