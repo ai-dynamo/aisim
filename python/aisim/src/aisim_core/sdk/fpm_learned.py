@@ -960,7 +960,8 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
                     continue
                 # Width without depth: a chain draft of depth d verifies d + 1 tokens.
                 steps = max(draft_tokens - 1, 0)
-            if steps > 0 and draft_tokens is not None and draft_tokens != steps + 1:
+            # Depth 0 (no speculation) may record a width of 0 or 1; any wider width contradicts it.
+            if draft_tokens is not None and draft_tokens != steps + 1 and not (steps == 0 and draft_tokens == 0):
                 raise ValueError(
                     f"iteration {index}: spec_num_draft_tokens={draft_tokens} != spec_num_steps + 1; "
                     "only chain MTP drafts (verify width nextn + 1) are supported"

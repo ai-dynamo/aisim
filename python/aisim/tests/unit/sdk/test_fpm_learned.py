@@ -706,6 +706,9 @@ def test_training_nextn_reads_the_capture_hook_depth():
     idle = _decode_fpm(0, 0, 0.0)
     assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=3), idle]]) == 3
     assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=3)]], nextn=3) == 3
+    # Depth 0 may record a verify width of 0 or 1.
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=0, draft_tokens=0)]]) == 0
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=0, draft_tokens=1)]]) == 0
     # JSON may carry integral counts as floats.
     assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=3.0, draft_tokens=4.0)]]) == 3
     assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]]) == 0
@@ -727,6 +730,7 @@ def test_training_nextn_reads_the_capture_hook_depth():
         ([[_mtp_fpm(1, 50, 0.01, steps=3)], [_decode_fpm(1, 50, 0.01)]], None, "mix speculative depths"),
         ([[_mtp_fpm(1, 50, 0.01, steps=3)]], 2, "does not match the steps' recorded spec_num_steps=3"),
         ([[_mtp_fpm(1, 50, 0.01, steps=3, draft_tokens=8)]], None, "only chain MTP drafts"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=0, draft_tokens=8)]], None, "only chain MTP drafts"),
         ([[_decode_fpm(1, 50, 0.01)]], -1, "non-negative integer"),
         ([[_mtp_fpm(1, 50, 0.01, steps=3.9, draft_tokens=4.9)]], None, "spec_num_steps must be a non-negative integer"),
         ([[_mtp_fpm(1, 50, 0.01, steps=True, draft_tokens=2)]], None, "spec_num_steps must be a non-negative integer"),
