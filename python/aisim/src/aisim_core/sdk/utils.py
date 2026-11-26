@@ -930,6 +930,44 @@ _GEMMA4_VLLM_GLOBAL_DEFAULTS = {
 # These Gemma4TextConfig fields also exist when omitted from the JSON. SGLang
 # rejects a surviving override of any of them before constructing its decoder.
 _GEMMA4_OTHER_DEFAULTS = {
+    "_auto_class": None,
+    "attribute_map": {},
+    "base_config_key": "",
+    "base_model_ep_plan": {
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+        "layers.*.router": "ep_router",
+        "layers.*.experts.gate_up_proj": "grouped_gemm",
+        "layers.*.experts.down_proj": "grouped_gemm",
+        "layers.*.experts": "moe_tp_experts",
+    },
+    "base_model_fsdp_plan": {
+        "embed_tokens": "free_full_weight",
+        "layers.*": "free_full_weight",
+        "norm": "keep_full_weight",
+    },
+    "base_model_tp_plan": {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
+        "layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+        "layers.*.experts.gate_up_proj": "packed_colwise",
+        "layers.*.experts.down_proj": "rowwise",
+        "layers.*.experts": "moe_tp_experts",
+    },
+    "default_rope_type": "default",
+    "default_theta": 10000.0,
+    "has_no_defaults_at_init": False,
+    "is_heterogeneous": False,
+    "sub_configs": {},
+    # The inherited pipeline plan contains tuples. JSON arrays never compare equal to them.
+    "base_model_pp_plan": object(),
     "model_type": "gemma4_text",
     "architectures": None,
     "transformers_version": None,
@@ -988,6 +1026,16 @@ def _check_gemma4_layer_attributes(
     labels = config.get("id2label")
     defaults.setdefault("num_labels", len(labels) if isinstance(labels, dict) else 2)
     defaults["name_or_path"] = defaults["_name_or_path"] = config.get("_name_or_path", config.get("name_or_path", ""))
+    defaults["use_return_dict"] = defaults["return_dict"]
+    defaults["output_attentions"] = defaults["_output_attentions"] = config.get(
+        "_output_attentions", defaults["output_attentions"]
+    )
+    defaults["rope_scaling"] = defaults["rope_parameters"]
+    for setting in ("attn_implementation", "experts_implementation"):
+        value = config.get("_" + setting, config.get(setting))
+        if isinstance(value, dict):
+            value = value.get("")
+        defaults["_" + setting] = defaults["_" + setting + "_internal"] = value
     # Serving converts a global dtype to a torch.dtype. A non-null layer value remains a JSON string.
     dtype = config.get("dtype") or config.get("torch_dtype")
     defaults["dtype"] = defaults["torch_dtype"] = None if dtype is None else object()

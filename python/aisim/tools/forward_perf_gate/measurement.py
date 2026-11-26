@@ -68,7 +68,7 @@ def build_session(
             moe_tp_size=case.moe_tp_size,
             moe_ep_size=case.moe_ep_size,
         )
-        model = get_model(case.model_path, model_config, case.backend_name, database.version)
+        model = get_model(case.model_path, model_config, case.backend_name, database=database)
     runtime_config = config.RuntimeConfig(
         batch_size=case.batch_size,
         beam_width=1,

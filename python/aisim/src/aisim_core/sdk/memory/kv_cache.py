@@ -91,6 +91,11 @@ from aisim_core.sdk.config import validate_parallel_size
 from aisim_core.sdk.config_builders import apply_nextn, build_model_config, validate_moe_controls, validate_nextn
 from aisim_core.sdk.fpm_model_metadata import attach_quantization_sidecar, inherit_decoder_precision
 from aisim_core.sdk.fpm_profile import FpmModelProfile, _load_fpm_timing_profile
+from aisim_core.sdk.memory.vllm_registry import (
+    is_known_transformers_config,
+    select_architecture,
+    select_wrapper_architecture,
+)
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.base import _MODEL_REGISTRY, BaseModel
 from aisim_core.sdk.models.deepseek_v32 import _dsa_full_layer_fraction
@@ -124,6 +129,7 @@ _SELECTED_DECODER_ARCHITECTURES = {
     "kimi_k2": "DeepseekV3ForCausalLM",
     "mimo": "MiMoForCausalLM",
     "mimo_v2_flash": "MiMoV2FlashForCausalLM",
+    "opt": "OPTForCausalLM",
     "qwen2_moe": "Qwen2MoeForCausalLM",
     "step3p5": "Step3p5ForCausalLM",
     "step3p7": "Step3p5ForCausalLM",
@@ -136,6 +142,9 @@ _TEXT_CONFIG_DEFAULTS = {
     "LlavaNextVideoForConditionalGeneration": "llama",
     "LlavaOnevisionForConditionalGeneration": "qwen2",
 }
+
+_FIXED_LLAMA_WRAPPERS = {"Idefics3ForConditionalGeneration", "SmolVLMForConditionalGeneration"}
+_TEXT_WRAPPERS = _TEXT_CONFIG_DEFAULTS.keys() | _FIXED_LLAMA_WRAPPERS
 
 _VLLM_FP8_WEIGHT_DTYPES = {
     "F8_E4M3": "float8_e4m3fn",
@@ -172,6 +181,14 @@ _DECODER_HEAD_DEFAULTS = {
 _DECODER_GEOMETRY_DEFAULTS = {
     "llama": {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32, "intermediate_size": 11008},
     "mistral": {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32, "intermediate_size": 14336},
+    "opt": {
+        "hidden_size": 768,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 12,
+        "ffn_dim": 3072,
+        "max_position_embeddings": 2048,
+        "vocab_size": 50272,
+    },
     "qwen2": {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32, "intermediate_size": 22016},
     "qwen3": {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32, "intermediate_size": 22016},
     "deepseek_v3": {
@@ -203,19 +220,22 @@ def _apply_decoder_geometry_defaults(decoder: dict, constructor: str | None) -> 
         decoder.setdefault("num_key_value_heads", kv_heads)
 
 
-def _select_text_decoder(decoder: dict, key: str, parent: str | None, backend: str) -> tuple[str | None, str | None]:
+def _select_text_decoder(
+    decoder: dict, key: str | None, parent: str | None, backend: str, backend_version: str | None
+) -> tuple[str | None, str | None]:
     """Resolve the Transformers config class and the model class selected by its serving wrapper."""
     registered_submodel = key == "text_config" and parent in _TEXT_CONFIG_DEFAULTS
-    if registered_submodel and decoder.setdefault("model_type", _TEXT_CONFIG_DEFAULTS[parent]) is None:
-        raise ValueError(f"{key}.model_type must be a string")
+    fixed_llama = key == "text_config" and parent in _FIXED_LLAMA_WRAPPERS
     kind = decoder.get("model_type")
-    if kind is not None and not isinstance(kind, str):
+    if registered_submodel or fixed_llama:
+        kind = decoder.setdefault("model_type", _TEXT_CONFIG_DEFAULTS.get(parent, "llama"))
+        if not isinstance(kind, str):
+            raise ValueError(f"{key}.model_type must be a string")
+        if not is_known_transformers_config(kind, backend_version):
+            raise ValueError(f"{key}.model_type={kind!r} does not identify an available Transformers config")
+    elif kind is not None and not isinstance(kind, str):
         raise ValueError(f"{key}.model_type must be a string")
-    if (
-        key == "text_config"
-        and parent in ("Idefics3ForConditionalGeneration", "SmolVLMForConditionalGeneration")
-        and (backend == "vllm" or kind in (None, "llama"))
-    ):
+    if fixed_llama and (backend == "vllm" or kind == "llama"):
         # Idefics3 builds LlamaModel with the selected config's attributes.
         decoder["architectures"] = ["LlamaForCausalLM"]
         return kind or "llama", "LlamaForCausalLM"
@@ -234,15 +254,40 @@ def _select_text_decoder(decoder: dict, key: str, parent: str | None, backend: s
     if dynamic and classes == []:
         raise ValueError("No model architectures are specified for the vLLM text decoder")
     named = classes[0] if classes else None
+    if dynamic and classes:
+        named = select_architecture(classes, backend_version, decoder.get("auto_map"))
+        if named is None:
+            raise ValueError(f"model_type={kind!r} conflicts with architectures={classes[0]!r}")
+        decoder["architectures"] = [named]
+        if named == "Qwen2ForCausalLM" and kind in ("llama", "mistral", "qwen2"):
+            # The Qwen2 QKV projection derives its head width from the config's
+            # hidden size and query head count, including on a LlamaConfig.
+            _apply_decoder_geometry_defaults(decoder, kind)
+            decoder["head_dim"] = decoder["hidden_size"] // decoder["num_attention_heads"]
+            if kind != "qwen2":
+                # LlamaConfig and MistralConfig do not derive layer_types from this Qwen2Config flag.
+                decoder.pop("use_sliding_window", None)
+            return kind, named
     if kind is None and named:
         kind = next((k for k, name in _SELECTED_DECODER_ARCHITECTURES.items() if name == named), None)
-    if not named or not selected or named == selected:
+    if kind == "opt":
+        _apply_decoder_geometry_defaults(decoder, kind)
+        decoder.setdefault("enable_bias", True)
+        decoder.setdefault("activation_function", "relu")
+        decoder.setdefault("layer_norm_elementwise_affine", True)
+        decoder.setdefault("do_layer_norm_before", True)
+        decoder.setdefault("_remove_final_layer_norm", False)
+        if decoder.get("word_embed_proj_dim") is None:
+            decoder["word_embed_proj_dim"] = decoder["hidden_size"]
+        named = named or "OPTForCausalLM"
+        decoder["architectures"] = [named]
+    if not named or not selected or (named == selected and named != "OPTForCausalLM"):
         return kind, selected
     if selected == "Step3p5ForCausalLM" and ARCHITECTURE_TO_MODEL_FAMILY.get(named) == "STEP3P7":
         return kind, selected
-    if dynamic and kind in ("llama", "mistral") and named in ("LlamaForCausalLM", "MistralForCausalLM"):
+    if dynamic and kind in ("llama", "mistral", "qwen2") and named in ("LlamaForCausalLM", "MistralForCausalLM"):
         return kind, named
-    if dynamic and named == "OPTForCausalLM":
+    if named == "OPTForCausalLM" and (dynamic or kind == "opt"):
         # OPT uses full multi-head attention and its own FFN fields even when a
         # different Transformers config provides the actual constructor arguments.
         needed = (
@@ -850,6 +895,11 @@ class KVCacheEstimator:
         resolve_sglang_mla_compute(model_config, model_path, backend, database.version, database.system_spec)
         resolve_trtllm_mla_compute(model_config, model_path, backend, database.system_spec)
         model = get_model(model_path, model_config, backend, database=database)
+        if backend == "vllm" and getattr(model, "architecture", None) == "Gemma4ForConditionalGeneration":
+            raw = _load_model_config_from_model_path(model_path)
+            text = raw.get("text_config", raw)
+            if "per_layer_config" in text:
+                gemma4_cache_shapes(text, backend, database.version, agreement_tp_size=tp_size)
         backend_obj = get_backend(backend)
 
         # num_tokens = max_num_tokens -> activations track BuildConfig.max_num_tokens
@@ -1233,6 +1283,7 @@ class NaiveKVCacheEstimator:
         moe_tp_size: int,
         backend: str,
         backend_version: str | None,
+        resolve_bare: bool = True,
     ) -> NaiveKVCacheEstimator:
         architectures = hf_config.get("architectures") or []
         if not isinstance(architectures, list) or not all(isinstance(name, str) for name in architectures):
@@ -1257,16 +1308,20 @@ class NaiveKVCacheEstimator:
                 ) from error
             parsed = None  # unsupported arch (the fallback's target) -> raw-key read, of its decoder when nested
             key = decoder_config_key(hf_config)
-            if key is None and isinstance(model_type, str) and model_type in _DECODER_GEOMETRY_DEFAULTS:
-                # A bare child with its model_type still identifies the same constructor.
-                hf_config = dict(hf_config)
-                _apply_decoder_geometry_defaults(hf_config, model_type)
-            if key is not None:
-                problem = decoder_config_problem(key, hf_config[key])
-                if problem is not None:
-                    raise ValueError(f"HF config: {problem}") from error
-                raw_decoder = inherit_decoder_precision(hf_config, hf_config[key])[0]
-                selected_type, selected = _select_text_decoder(raw_decoder, key, architecture, backend)
+            bare = resolve_bare and isinstance(model_type, str) and model_type in _DECODER_GEOMETRY_DEFAULTS
+            if key is not None or bare:
+                if key is None:
+                    raw_decoder = dict(hf_config)
+                else:
+                    problem = decoder_config_problem(key, hf_config[key])
+                    if problem is not None:
+                        raise ValueError(f"HF config: {problem}") from error
+                    raw_decoder = inherit_decoder_precision(hf_config, hf_config[key])[0]
+                if key == "text_config" and backend == "vllm":
+                    architecture = select_wrapper_architecture(
+                        architectures, backend_version, hf_config.get("auto_map"), _TEXT_WRAPPERS
+                    )
+                selected_type, selected = _select_text_decoder(raw_decoder, key, architecture, backend, backend_version)
                 constructor = "deepseek_v3" if selected_type == "kimi_k2" else selected_type
                 _apply_decoder_geometry_defaults(raw_decoder, constructor)
                 if selected_type in _DECODER_HEAD_DEFAULTS:
@@ -1326,6 +1381,7 @@ class NaiveKVCacheEstimator:
                     moe_tp_size=moe_tp_size,
                     backend=backend,
                     backend_version=backend_version,
+                    resolve_bare=False,
                 )
                 if selected_type == "gemma4_text" and raw_decoder.get("use_bidirectional_attention") == "all":
                     # The layer-map reader above consumes the original serialized window.
@@ -1787,15 +1843,14 @@ class NaiveKVCacheEstimator:
             return None, None, None
         if enabled is False and num_swa:
             raise ValueError("use_sliding_window=false conflicts with sliding attention layers")
-        qwen2 = (
-            hf_config.get("model_type") == "qwen2"
-            or (hf_config.get("architectures") or [None])[0] == "Qwen2ForCausalLM"
-        )
-        if qwen2 and num_swa:
+        names = hf_config.get("architectures")
+        implementation = names[0] if names else _SELECTED_DECODER_ARCHITECTURES.get(hf_config.get("model_type"))
+        if implementation in ("Qwen2ForCausalLM", "Qwen3ForCausalLM") and num_swa:
             if backend == "sglang" and not hf_config.get("is_hybrid_swa"):
                 return None, None, None
             if backend == "vllm" and num_global and hf_config.get("max_window_layers", 28) != num_layers:
-                raise ValueError("vLLM Qwen2 does not support sliding attention for only some layers")
+                name = implementation.removesuffix("ForCausalLM")
+                raise ValueError(f"vLLM {name} does not support sliding attention for only some layers")
         return window, num_swa, num_global
 
     @classmethod

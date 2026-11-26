@@ -2099,7 +2099,7 @@ def test_selected_qwen_and_gemma_physical_defaults(tmp_path):
     assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == 114_688
     dense["max_window_layers"] = 5
     _write_config(tmp_path, {"text_config": dense})
-    with pytest.raises(ValueError, match="resident attention layers"):
+    with pytest.raises(ValueError, match="vLLM Qwen3 does not support"):
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=2)
     dense["sliding_window"] = None
     _write_config(tmp_path, {"text_config": dense})
@@ -2348,6 +2348,8 @@ def test_gemma4_per_layer_fields_use_the_initialized_configuration(tmp_path, bac
     document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
     text = document["text_config"]
     text["use_bidirectional_attention"] = "all"
+    text["return_dict"] = False
+    text["_output_attentions"] = True
     text["per_layer_config"] = {
         str(i): {"head_dim": text["global_head_dim"], "num_key_value_heads": text["num_global_key_value_heads"]}
         for i, kind in enumerate(text["layer_types"])
@@ -2361,6 +2363,11 @@ def test_gemma4_per_layer_fields_use_the_initialized_configuration(tmp_path, bac
         "keys_to_ignore_at_inference": ["past_key_values"],
         "serialize_explicit_per_layer_config": False,
         "name_or_path": text.get("_name_or_path", ""),
+        "use_return_dict": False,
+        "output_attentions": True,
+        "attribute_map": {},
+        "has_no_defaults_at_init": False,
+        "_attn_implementation": None,
     }
     options = dict(tp_size=1, pp_size=1, backend=backend, backend_version=release)
     assert estimate_kv_bytes_per_token(_write_config(tmp_path, document), **options) == 225_280
@@ -2468,6 +2475,27 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
         else:
             with pytest.raises(ValueError, match="runtime profile"):
                 estimate_kv_bytes_per_token(path, tp_size=4, **args)
+    # A reduced schema-1 cell may omit rows. A custom retained measurement
+    # contradicts the official GEMM cell; an empty Parquet table contributes no evidence.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    attention = tmp_path / "data/test_xpu/attention/vllm/0.28.0"
+    attention.mkdir(parents=True)
+    metadata.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": table}))
+    (attention / "collection_meta.yaml").write_text(
+        json.dumps(
+            {"schema_version": 1, "runtime": custom, "tables": {"generation_attention_perf": {"status": "complete"}}}
+        )
+    )
+    retained = attention / "generation_attention_perf.parquet"
+    for latencies in ([0.5], []):
+        pq.write_table(pa.table({"latency": pa.array(latencies, type=pa.float32())}), retained)
+        if latencies:
+            with pytest.raises(ValueError, match="runtime profile"):
+                get_model(path, config, "vllm", database=database)
+        else:
+            assert get_model(path, config, "vllm", database=database).get_kvcache_bytes_per_sequence(1) == 225_280
     (directory / "gemm_perf.txt").unlink()
     with pytest.raises(ValueError, match="runtime profile"):
         estimate_kv_bytes_per_token(path, tp_size=1, **args)
@@ -2804,6 +2832,42 @@ def test_qwen2_enabled_sliding_window_uses_its_constructor_default(wrapped):
         NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.32.0")
 
 
+def test_mixed_attention_follows_the_serving_model_selected_by_the_wrapper():
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    text = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
+    text.update(use_sliding_window=True, max_window_layers=14)
+    text.pop("layer_types", None)
+    text.pop("sliding_window", None)
+    wrapped = {"architectures": ["LlavaForConditionalGeneration"], "text_config": text}
+    with pytest.raises(ValueError, match="vLLM Qwen3 does not support"):
+        NaiveKVCacheEstimator.from_hf_config(wrapped, tp_size=1, pp_size=1, backend_version="0.32.0")
+    sglang = NaiveKVCacheEstimator.from_hf_config(
+        wrapped, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20"
+    )
+    assert sglang.geometry["num_swa_layers"] is None
+    assert sglang.kv_bytes_per_token() == 114_688
+
+    # The converse uses Qwen2Model on a LlamaConfig. Its extra window flag does
+    # not generate Qwen2Config's mixed layer list.
+    llama = {**text, "model_type": "llama", "architectures": ["Qwen2LMHeadModel", "LlamaForCausalLM"]}
+    dispatched = {**wrapped, "text_config": llama}
+    assert (
+        NaiveKVCacheEstimator.from_hf_config(
+            dispatched, tp_size=1, pp_size=1, backend_version="0.32.0"
+        ).kv_bytes_per_token()
+        == 57_344
+    )
+
+    # Idefics3 uses LlamaModel with Qwen2Config, so Qwen2's mixed-layer rejection does not apply.
+    text.update(model_type="qwen2", architectures=["Qwen2ForCausalLM"])
+    fixed = {"architectures": ["Idefics3ForConditionalGeneration"], "text_config": text}
+    assert (
+        NaiveKVCacheEstimator.from_hf_config(fixed, tp_size=1, pp_size=1, backend_version="0.32.0").kv_bytes_per_token()
+        == 114_688
+    )
+
+
 def test_registered_qwen2_sliding_defaults_follow_the_sdk_parser(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
 
@@ -2862,6 +2926,19 @@ def test_fixed_llama_wrapper_uses_its_decoder_independently_of_the_training_clas
         model = _write_config(tmp_path, {"architectures": ["UnknownConditionalGeneration"], decoder_key: text})
         assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == bare == 23_040
     text["architectures"] = ["DeepseekV3ForCausalLM"]
+    normalized = wrapper.replace("ForConditionalGeneration", "LMHeadModel")
+    for names in (["OldCheckpoint", wrapper], ["OldCheckpoint", normalized], ["AlbertModel", wrapper]):
+        model = _write_config(tmp_path, {"architectures": names, "text_config": text})
+        assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend_version="0.32.0") == 23_040
+    for names, reason in (
+        (["LlavaNextForConditionalGeneration", wrapper], "conflicts with architectures"),
+        (["Phi3ForCausalLM", wrapper], "selected wrapper"),
+        (["AlbertModel", normalized], "selected wrapper"),
+        (["LlamaForCausalLM", wrapper], "config parser refuses.*LlamaForCausalLM"),
+    ):
+        model = _write_config(tmp_path, {"architectures": names, "text_config": text})
+        with pytest.raises(ValueError, match=reason):
+            estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend_version="0.32.0")
     model = _write_config(tmp_path, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": text})
     with pytest.raises(ValueError, match="conflicts with architectures"):
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1)
@@ -2922,6 +2999,140 @@ def test_config_class_defaults_and_explicit_vllm_decoder_dispatch():
     del text["ffn_dim"]
     with pytest.raises(ValueError, match="OPT decoder"):
         width(parent | {"text_config": text})
+
+
+@pytest.mark.parametrize(
+    "classes,expected",
+    [
+        (["VLlama3ForCausalLM", "LlamaForCausalLM"], 81_920),
+        (["VLlama3ForCausalLM", "LlamaLMHeadModel"], 81_920),
+        (["VLlama3ForCausalLM", "Qwen2LMHeadModel"], 163_840),
+        (["LlamaForCausalLM", "Qwen2LMHeadModel"], 81_920),
+        (["Qwen2LMHeadModel", "LlamaForCausalLM"], 163_840),
+        (["VLlama3ForCausalLM", "OPTForCausalLM", "LlamaForCausalLM"], 819_200),
+    ],
+)
+def test_vllm_dispatches_the_first_available_text_decoder(tmp_path, classes, expected):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config import CorePredictionConfig
+
+    # Each of 40 layers stores K and V in FP16. Llama uses 8 heads of width 64,
+    # Qwen2 uses 8 of width 5120 / 40, and OPT uses all 40 of width 5120 / 40.
+    text = dict(
+        model_type="llama",
+        architectures=classes,
+        hidden_size=5120,
+        num_attention_heads=40,
+        num_key_value_heads=8,
+        head_dim=64,
+        num_hidden_layers=40,
+        intermediate_size=13824,
+        max_position_embeddings=4096,
+        vocab_size=32064,
+        ffn_dim=13824,
+        word_embed_proj_dim=5120,
+        enable_bias=True,
+        activation_function="relu",
+        layer_norm_elementwise_affine=True,
+        do_layer_norm_before=False,
+    )
+    path = _write_config(tmp_path, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": text})
+    assert estimate_kv_bytes_per_token(path, tp_size=1, pp_size=1, backend_version="0.32.0") == expected
+    worker = dict(
+        parallelism={"tensor": 1},
+        timing={"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
+        kv_cache={"capacity": {"type": "fixed", "blocks": 256}},
+    )
+    engine = dict(
+        model=path,
+        mode="disaggregated",
+        hardware="gb300",
+        backend="vllm",
+        backend_version="0.32.0",
+        context_length=4096,
+        workers={"prefill": worker, "decode": worker},
+        kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50},
+    )
+    deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
+    assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == expected
+    assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == expected
+
+
+def test_vllm_stops_at_a_registered_decoder_even_when_its_geometry_is_unknown():
+    def width(first, version, last="LlamaForCausalLM", auto_map=None):
+        text = {"model_type": "llama", "architectures": [first, last], "auto_map": auto_map}
+        wrapped = {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": text}
+        return NaiveKVCacheEstimator.from_hf_config(
+            wrapped, tp_size=1, pp_size=1, backend_version=version
+        ).kv_bytes_per_token()
+
+    # Dory first appeared in v0.33.0. Older registries reach the default 32-layer Llama.
+    assert width("DoryForCausalLM", "0.32.0") == 524_288
+    with pytest.raises(ValueError, match="conflicts with architectures='DoryForCausalLM'"):
+        width("DoryForCausalLM", "0.33.0")
+    with pytest.raises(ValueError, match="depends on the backend release"):
+        width("DoryForCausalLM", None)
+    with pytest.raises(ValueError, match="conflicts with architectures='Phi3ForCausalLM'"):
+        width("Phi3ForCausalLM", "0.32.0")
+    assert width("VLlama3ForCausalLM", "0.32.0", "LlamaLMHeadModel", {"AutoConfig": "remote.Config"}) == 524_288
+    assert width("ReformerModel", "0.32.0", "LlamaLMHeadModel", {"AutoModel": "remote.Model"}) == 524_288
+    for first, auto_map in (
+        ("BertConfig", None),
+        ("AlbertModel", {"AutoModel": "remote.Model"}),
+        ("VLlama3ForCausalLM", {"AutoModel": "remote.Model"}),
+    ):
+        with pytest.raises(ValueError, match="conflicts with architectures"):
+            width(first, "0.32.0", "LlamaLMHeadModel", auto_map)
+
+
+def test_bare_normalized_decoders_use_their_local_layers_and_experts(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    path = _write_config(
+        tmp_path, {"model_type": "llama", "architectures": ["LLaMAForCausalLM"], "num_key_value_heads": 8}
+    )
+    assert estimate_kv_bytes_per_token(path, tp_size=1, pp_size=2, backend_version="0.32.0") == 65_536
+    with pytest.raises(ValueError, match="divisible by tp_size"):
+        estimate_kv_bytes_per_token(path, tp_size=3, pp_size=1, backend_version="0.32.0")
+
+    deepseek = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3")
+    deepseek.pop("quantization_config", None)
+    deepseek["architectures"] = ["DeepseekV2ForCausalLM"]
+    options = dict(tp_size=8, pp_size=1, moe_tp_size=8, moe_ep_size=1, backend_version="0.32.0")
+    explicit = NaiveKVCacheEstimator.from_hf_config(deepseek, **options).weight_bytes()
+    del deepseek["num_hidden_layers"], deepseek["n_routed_experts"]
+    inferred = NaiveKVCacheEstimator.from_hf_config(deepseek, **options).weight_bytes()
+    # The routed BF16 FFNs alone span 58 layers, each with 256 experts sharded over 8 GPUs.
+    assert explicit == inferred >= 58 * 256 * 3 * 7168 * 2048 * 2 // 8 > 80 * _GIB
+    deepseek["architectures"] = ["DeepseekV3BidirectionalModel", "DeepseekV3ForCausalLM"]
+    parent = {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": deepseek}
+    assert NaiveKVCacheEstimator.from_hf_config(parent, **options).kv_bytes_per_token() == 70_272
+
+
+def test_real_opt_child_reserves_positions_and_defaults_the_embedding_projection(tmp_path):
+    options = _missing_system_cache_options(tmp_path, tp_size=1, capacity=400 << 20)
+    parent = {"architectures": ["LlavaNextForConditionalGeneration"]}
+    for names in ({}, {"architectures": ["OPTForCausalLM"]}):
+        text = {"model_type": "opt", **names}
+        for embedding in ({}, {"word_embed_proj_dim": None}, {"word_embed_proj_dim": 768}):
+            config = parent | {"text_config": text | embedding}
+            estimate = NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1, backend_version="0.32.0")
+            assert estimate.kv_bytes_per_token() == 36_864
+            assert estimate.weight_bytes() < 400 << 20
+        path = _write_config(tmp_path, parent | {"text_config": text | {"max_position_embeddings": 131072}})
+        with pytest.raises(ValueError, match="no KV budget"):
+            memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **options)
+
+
+@pytest.mark.parametrize("model_type", ["", "fake_llama_config"])
+def test_registered_wrapper_resolves_the_child_config_before_the_architecture(model_type):
+    text = dict(_UNKNOWN_DECODER, model_type=model_type, architectures=["LlamaForCausalLM"])
+    for parent in ("LlavaNextForConditionalGeneration", "Idefics3ForConditionalGeneration"):
+        config = {"architectures": [parent], "text_config": text}
+        with pytest.raises(ValueError, match="text_config.model_type"):
+            NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1, backend_version="0.32.0")
 
 
 def test_gemma_readers_compare_only_the_rank_dimensions_used_by_the_adapter():

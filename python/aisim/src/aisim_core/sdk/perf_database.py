@@ -721,7 +721,26 @@ def _parse_reuse_yaml(path: str) -> dict:
     return {"entries": validated}
 
 
-def _load_collection_meta_yaml(path: str) -> dict:
+def _load_collection_meta_yaml(path: str, *, cache: bool = False) -> dict:
+    if not cache:
+        return _read_collection_meta_yaml(path)
+    # Admission and image qualification on a selected database share sidecars. Bind
+    # the parsed document to this file revision, including atomic replacements.
+    path = os.path.abspath(path)
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return _read_collection_meta_yaml(path)
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    return copy.deepcopy(_cached_collection_meta_yaml(path, signature))
+
+
+@functools.lru_cache(maxsize=256)
+def _cached_collection_meta_yaml(path: str, signature: tuple[int, ...]) -> dict:
+    return _read_collection_meta_yaml(path)
+
+
+def _read_collection_meta_yaml(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
@@ -875,7 +894,9 @@ def _collection_meta_has_partial_table(meta: dict) -> bool:
     return bool(_collection_meta_partial_tables(meta))
 
 
-def _version_dir_state(version_path: str, *, data_dir: str | None = None) -> dict[str, object]:
+def _version_dir_state(
+    version_path: str, *, data_dir: str | None = None, cache_collection_meta: bool = False
+) -> dict[str, object]:
     """Consolidated per-version-dir marker state, yaml-first with legacy .txt fallback.
 
     - ``declared_reuse``: parsed ``reuse.yaml`` contents (design §6.3) when it has
@@ -910,7 +931,9 @@ def _version_dir_state(version_path: str, *, data_dir: str | None = None) -> dic
     meta_yaml_path = os.path.join(version_path, COLLECTION_META_MARKER)
     legacy_incomplete_path = os.path.join(version_path, INCOMPLETE_MARKER)
     if os.path.isfile(meta_yaml_path):
-        partial_tables = _collection_meta_partial_tables(_load_collection_meta_yaml(meta_yaml_path))
+        partial_tables = _collection_meta_partial_tables(
+            _load_collection_meta_yaml(meta_yaml_path, cache=cache_collection_meta)
+        )
     elif os.path.isfile(legacy_incomplete_path):
         _warn_legacy_marker_once(warn_scope, INCOMPLETE_MARKER, COLLECTION_META_MARKER)
         # INCOMPLETE.txt predates per-table provenance, so there is no safe way
@@ -1343,7 +1366,9 @@ def _check_strict_provenance_for_request(paths: list[str], backend: str, data_di
             _check_strict_provenance_coverage(os.path.dirname(donor_path), strict=strict, only_table=entry["table"])
 
 
-def _version_dir_unusable_for_request(version_path: str, data_dir: str, *, strict: bool) -> bool:
+def _version_dir_unusable_for_request(
+    version_path: str, data_dir: str, *, strict: bool, cache_collection_meta: bool = False
+) -> bool:
     """Return whether a request must reject the whole version directory.
 
     Structured ``collection_meta.yaml`` partial status is intentionally *not*
@@ -1361,7 +1386,9 @@ def _version_dir_unusable_for_request(version_path: str, data_dir: str, *, stric
     ``get_database`` request gate's incomplete-check.
     """
     try:
-        return bool(_version_dir_state(version_path, data_dir=data_dir)["unusable"])
+        return bool(
+            _version_dir_state(version_path, data_dir=data_dir, cache_collection_meta=cache_collection_meta)["unusable"]
+        )
     except ValueError as e:
         if strict:
             raise

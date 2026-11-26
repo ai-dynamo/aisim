@@ -194,7 +194,7 @@ def post_sla(
                 model_path=model_path,
                 model_config=overwritten_model_config,
                 backend_name=backend,
-                backend_version=database.version,
+                database=database,
             )
             sess = InferenceSession(model, database, backend_instance)
 

@@ -60,13 +60,13 @@ _GEMMA4_ADAPTER_IMAGES = {
 }
 
 
-def _gemma4_collection_images(directory: Path, version: str, framework: str) -> Iterator[bool]:
+def _gemma4_collection_images(directory: Path, version: str, framework: str, *, cache: bool) -> Iterator[bool]:
     """Yield whether each retained measurement of this framework used the pinned official image."""
     path = directory / perf_database.COLLECTION_META_MARKER
     digests = _GEMMA4_ADAPTER_IMAGES.get((version, framework))
     if not digests or not path.is_file():
         return
-    collection = perf_database._load_collection_meta_yaml(str(path))
+    collection = perf_database._load_collection_meta_yaml(str(path), cache=cache)
     tables = collection.get("tables")
     if not isinstance(tables, dict):
         return
@@ -77,7 +77,7 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str) -> 
     }
     repository = "vllm/vllm-openai-xpu" if framework == "vllm_xpu" else "vllm/vllm-openai"
     image = f"{repository}:v{version}"
-    for table in files.intersection(tables):
+    for table in files & tables.keys():
         data = tables[table]
         if not isinstance(data, dict):
             continue
@@ -85,7 +85,23 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str) -> 
         # measurement can override the directory's runtime.
         for event in data.get("collections", [data]):
             runtime = event.get("runtime", collection.get("runtime"))
-            if not isinstance(runtime, dict) or type(event.get("rows")) is not int or event["rows"] <= 0:
+            if not isinstance(runtime, dict):
+                continue
+            rows = event.get("rows")
+            if "rows" not in event and collection.get("schema_version", 1) == 1:
+                # Reduced schema 1 may record only the status. The retained
+                # Parquet row count distinguishes measurements from empty tables.
+                parquet = directory / f"{table}.parquet"
+                if parquet.is_file():
+                    from pyarrow.parquet import read_metadata
+
+                    rows = read_metadata(parquet).num_rows
+                else:
+                    with (directory / f"{table}.txt").open(encoding="utf-8") as stream:
+                        lines = (line for line in stream if line.strip() and not line.lstrip().startswith("#"))
+                        next(lines, None)  # CSV header
+                        rows = int(next(lines, None) is not None)
+            if type(rows) is not int or rows <= 0:
                 continue
             if runtime.get("framework") != framework:
                 continue
@@ -131,7 +147,9 @@ def _has_stock_gemma4_collection(
         cells = [
             directory
             for directory, data_dir in paths
-            if not perf_database._version_dir_unusable_for_request(directory, data_dir, strict=strict)
+            if not perf_database._version_dir_unusable_for_request(
+                directory, data_dir, strict=strict, cache_collection_meta=database is not None
+            )
         ]
         if not cells:
             continue
@@ -139,7 +157,9 @@ def _has_stock_gemma4_collection(
         if spec.get("gpu"):
             framework = "vllm_xpu" if perf_database.is_xpu_system_spec(spec) else "vllm"
             images = {
-                stock for directory in cells for stock in _gemma4_collection_images(Path(directory), version, framework)
+                stock
+                for directory in cells
+                for stock in _gemma4_collection_images(Path(directory), version, framework, cache=database is not None)
             }
             return images == {True}
         break
@@ -194,8 +214,13 @@ def check_gemma4_adapter_runtime(
             validate_inherited_attention=validate_inherited_attention,
         )
 
-    if _has_stock_gemma4_collection(version, database, system, systems_paths):
-        return
+    try:
+        if _has_stock_gemma4_collection(version, database, system, systems_paths):
+            return
+    except (OSError, ValueError) as error:
+        if database is not None:
+            raise UnverifiedGemmaRuntimeError(str(error)) from error
+        raise
     message = f"vLLM {version} Gemma 4 per_layer_config needs a stock collection or a runtime profile"
     if database is not None:
         raise UnverifiedGemmaRuntimeError(message)
