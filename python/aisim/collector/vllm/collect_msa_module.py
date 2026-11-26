@@ -676,11 +676,36 @@ def _finalize_module_weights(attn_module, vllm_config, device: str, *, seed_inde
 
 # The QSA backend publishes ``MultipleOf(16)`` kernel block sizes
 # (Qwen4ExpQSAFlashAttentionBackend.get_supported_kernel_block_sizes,
-# qsa.py@v0.31.0) and the ring key-state cache asserts the attention block
+# qsa.py@v0.32.0) and the ring key-state cache asserts the attention block
 # size is divisible by its capacity (compress_ratio 4 + speculative lookahead
-# → 4). 16 is vLLM's default block size, so serving resolves the same value;
-# the collector re-checks the divisibility contract at construction instead of
-# assuming it.
+# → 4), so 16 is the smallest block the kernel accepts.
+#
+# RECORDED DEVIATION — serving does not keep 16 for this checkpoint. Qwen4-Exp
+# is hybrid (36 GDN + 12 QSA layers), so
+# ``Platform.update_block_size_for_backend`` runs ``_align_hybrid_block_size``
+# (platforms/interface.py@v0.32.0), which raises ``block_size`` until one
+# attention page covers the mamba page and overrides even an explicit
+# ``--block-size``:
+#
+#     block_size >= mamba_page_size / (2 * kv_heads_per_tp * head_dim * dtype_bytes)
+#
+# The GDN recurrent state the SDK prices in ``_gdn_state_bytes_per_request`` is
+# 110.11 MiB per request at BF16 TP1 and 13.76 MiB at TP8, so serving resolves
+# ~56,376 tokens (TP1) and ~14,094 (TP8), not 16. This harness builds one
+# attention layer and no mamba spec, so it cannot run that alignment; it times
+# the QSA kernel at the backend's minimum block instead.
+#
+# Timing effect: the attended token count is ``indexer.token_topk`` from the
+# checkpoint config (checked at construction), not ``block_size``, so the
+# kernel's arithmetic per token is the same. What differs is the block table
+# the kernel walks and the compressed pool's page granularity
+# (``block_size / compress_ratio`` tokens per compressed page): at 16 that page
+# is 4 tokens, at 14,094 it is 3,523, i.e. ~880x fewer, much larger pages. These
+# rows therefore price the QSA kernel's per-token work at its smallest block,
+# not serving's block-table geometry; a consumer that needs the latter has to
+# re-apply the hybrid alignment above. The accepted rows were measured at 16 and
+# are deliberately not re-measured: changing the harness page would invalidate
+# every collected QSA row for this checkpoint without new H200 evidence.
 _QSA_BLOCK_SIZE = 16
 
 
