@@ -1035,33 +1035,75 @@ def test_sparse_formal_finalization_still_binds_its_installed_version_and_rank_r
 
     cell = _evidence(tmp_path, monkeypatch, version="0.32.0", initialized=_initialized_layer_strided)
     resources = _resolve(cell, tmp_path, expected_backend_version="0.32.0")
-    for version in ("source_references_v4", "source_references_v5", "source_references_v6"):
-        saved = {}
-        _merge_resources([resources], saved, source_references=True, observation_format=version)
-        assert saved["observation_provenance"] == version
-        assert len(saved["worker_observation_digests"]) == 1
-        memory = saved["cell_observations"][0]["runtime_memory"]
-        portable = json.loads(memory["provenance"])
-        assert all(
-            not row["backends"] and row["kv_cache_layout"] is None for row in portable.get("worker_observations", [])
-        )
-        assert bool(portable.get("worker_observations")) == (version != "source_references_v4")
-        captured = (json.dumps(saved), None, "auto")
-        recorded = ("bfloat16", "0.32.0", None, 4)
-        assert _runtime.grouped_observation_requirement(captured, captured, recorded, recorded, 2) is None
-        wrong_width = ("bfloat16", "0.32.0", None, 2)
-        with pytest.raises(ValueError, match="worker roster"):
-            _runtime.grouped_observation_requirement(captured, captured, wrong_width, wrong_width, 2)
+    saved = {}
+    _merge_resources([resources], saved, source_references=True, observation_format="source_references_v2")
+    assert saved["observation_provenance"] == "source_references_v2"
+    assert len(saved["worker_observation_digests"]) == 1
+    memory = saved["cell_observations"][0]["runtime_memory"]
+    portable = json.loads(memory["provenance"])
+    assert all(
+        not row["backends"] and row["kv_cache_layout"] is None for row in portable.get("worker_observations", [])
+    )
+    assert portable["worker_observations"]
+    captured = (json.dumps(saved), None, "auto")
+    recorded = ("bfloat16", "0.32.0", None, 4)
+    assert _runtime.grouped_observation_requirement(captured, captured, recorded, recorded, 2) is None
+    wrong_width = ("bfloat16", "0.32.0", None, 2)
+    with pytest.raises(ValueError, match="worker roster"):
+        _runtime.grouped_observation_requirement(captured, captured, wrong_width, wrong_width, 2)
 
-        for key in ("backend_version", "rank_capacities", "artifacts"):
-            edited = json.loads(json.dumps(portable))
-            if key == "backend_version":
-                edited[key] = "0.33.0"
-            else:
-                edited[key].pop()
-            memory["provenance"] = json.dumps(edited)
-            with pytest.raises(ValueError, match="worker roster"):
-                _runtime.observed_model_dtype(json.dumps(saved))
+    portable["artifacts"].reverse()
+    memory["provenance"] = json.dumps(portable)
+    assert _runtime.observed_model_dtype(json.dumps(saved))
+    for key in ("kind", "path", "sha256"):
+        edited = json.loads(json.dumps(portable))
+        worker = next(ref for ref in edited["artifacts"] if ref["kind"] == "worker")
+        scheduler = next(ref for ref in edited["artifacts"] if ref["kind"] == "scheduler")
+        worker[key], scheduler[key] = scheduler[key], worker[key]
+        memory["provenance"] = json.dumps(edited)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(saved))
+    for key in ("backend_version", "rank_capacities", "artifacts"):
+        edited = json.loads(json.dumps(portable))
+        if key == "backend_version":
+            edited[key] = "0.33.0"
+        else:
+            edited[key].pop()
+        memory["provenance"] = json.dumps(edited)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(saved))
+
+
+def test_grouped_pair_checks_the_full_observed_version_only_for_the_prefix_enabled_role(tmp_path, monkeypatch):
+    from aisim.config.engine import GroupedObservationError, grouped_pd_pair_requirement
+    from aisim_core.fpm_profile import FpmDeploymentProfile
+
+    cell = _evidence(tmp_path, monkeypatch, version="0.33.0", initialized=_initialized_layer_strided)
+    resources = _resolve(cell, tmp_path, expected_backend_version="0.33.0")
+
+    def deployment(version):
+        worker = {"kind": "worker", "runtime": {"version": version}}
+        return FpmDeploymentProfile.model_validate(
+            {
+                **_profile()["deployments"][0],
+                "backend_version": "0.33.0",
+                "kv_cache_dtype": "bfloat16",
+                "resources": {
+                    **resources,
+                    "runtime_memory": {
+                        **resources["runtime_memory"],
+                        "runtime_framework_version": None,
+                        "provenance": json.dumps({"artifacts": [{"evidence": worker}]}),
+                    },
+                },
+            }
+        )
+
+    measured, unknown = deployment("0.33.0+cu130"), deployment(None)
+    for p, d, on in [(measured, unknown, (True, False)), (unknown, measured, (False, True))]:
+        with pytest.raises(GroupedObservationError, match=r"observed vllm_version .*0.33.0\+cu130"):
+            grouped_pd_pair_requirement(p, d, prefix_caching=on)
+        assert grouped_pd_pair_requirement(p, d, prefix_caching=on[::-1]) is None
 
 
 @pytest.mark.parametrize("backend", ["uva", "prefetch"])

@@ -1320,7 +1320,13 @@ class SearchSpace(BaseModel):
                     except ValueError:
                         continue
                     if "grouped" in (prefill.resources.cache_layout, decode.resources.cache_layout):
-                        grouped_pd_requirements(prefill, decode, backend_version=backend_version, kv_transfer=transfer)
+                        grouped_pd_requirements(
+                            prefill,
+                            decode,
+                            backend_version=backend_version,
+                            kv_transfer=transfer,
+                            prefix_caching=(self.prefill_enable_prefix_caching, self.decode_enable_prefix_caching),
+                        )
         return self
 
 

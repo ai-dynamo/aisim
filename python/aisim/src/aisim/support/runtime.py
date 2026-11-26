@@ -37,10 +37,7 @@ from .schema import (
 )
 
 LEGACY_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v1"
-RANK_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v2"
-BOUND_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v3"
-LAYOUT_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v4"
-PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v5"
+PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v2"
 _PRECISION = (
     "gemm_quant_mode",
     "moe_quant_mode",
@@ -344,23 +341,16 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     schema = value.get("schema_version") if isinstance(value, dict) else None
-    if schema not in (
-        LEGACY_PROVENANCE_SCHEMA,
-        RANK_PROVENANCE_SCHEMA,
-        BOUND_PROVENANCE_SCHEMA,
-        LAYOUT_PROVENANCE_SCHEMA,
-        PROVENANCE_SCHEMA,
-    ):
+    if schema not in (LEGACY_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA):
         if isinstance(schema, str) and schema.startswith("aisimulate-onboarding-runtime-probe/"):
             raise ValueError(f"unsupported onboarding runtime probe version: {schema}")
         return None
     snapshot = value.get("nixl_observation")
     if (
         schema == LEGACY_PROVENANCE_SCHEMA
-        and snapshot is not None
+        and "nixl_observation" in value
         and (
             not isinstance(snapshot, dict)
-            or "worker_observations" in snapshot
             or "worker_observations_sha256" in snapshot
             or ("worker_attention_backends" in snapshot and not isinstance(snapshot["worker_attention_backends"], list))
         )
@@ -370,10 +360,7 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
         not isinstance(snapshot, dict)
         or not isinstance(snapshot.get("runtime_settings"), dict)
         or not isinstance(snapshot.get("worker_observations"), list)
-        or (
-            value["schema_version"] in (BOUND_PROVENANCE_SCHEMA, LAYOUT_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA)
-            and not isinstance(snapshot.get("worker_observations_sha256"), str)
-        )
+        or not isinstance(snapshot.get("worker_observations_sha256"), str)
     ):
         raise ValueError("onboarding runtime probe is missing its NIXL observation")
     if (
@@ -402,19 +389,17 @@ def _worker_attention_backends(evidence: dict[str, Any]) -> list:
     ]
 
 
-def _worker_observations(
-    evidence: dict[str, Any], *, ranked: bool, layout_choices: bool, engine_layout: bool = False
-) -> list:
+def _worker_observations(evidence: dict[str, Any]) -> list:
     from aisim import _runtime
 
     records = [
         item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] in ("worker", "scheduler")
     ]
-    return json.loads(_runtime.nixl_worker_observations(json.dumps(records), ranked, layout_choices, engine_layout))
+    return json.loads(_runtime.nixl_worker_observations(json.dumps(records)))
 
 
 def _worker_observation_digest(
-    snapshot: dict[str, Any], evidence: dict[str, Any], *, bind_references: bool = False
+    snapshot: dict[str, Any], evidence: dict[str, Any], inventory: dict[str, Any], *, draft: bool = False
 ) -> str:
     from aisim import _runtime
 
@@ -425,22 +410,38 @@ def _worker_observation_digest(
     }
     if evidence.get("source") == "vllm_initialized_cache":
         fields.update(
-            source=evidence["source"],
-            backend_version=evidence["backend_version"],
-            artifacts=[{"sha256": item["sha256"]} for item in evidence["artifacts"]],
+            source=evidence["source"], backend_version=evidence["backend_version"], artifacts=evidence["artifacts"]
         )
         source = evidence["plan_sha256"]
     else:
         source = evidence["observations_index"]["sha256"]
-        if bind_references:
+        if not draft:
             fields["observations_index"] = evidence["observations_index"]
             for key in ("artifacts", "runtime_artifacts", "launch_artifacts"):
                 if key in evidence:
-                    fields[key] = [{"path": ref["path"], "sha256": ref["sha256"]} for ref in evidence[key]]
-    return _runtime.nixl_observation_digest(json.dumps(fields), source, bind_references)
+                    fields[key] = evidence[key]
+    references = {k: inventory[k] for k in ("observations_index", "source_artifacts", "formal_data") if k in inventory}
+    return _runtime.nixl_observation_digest(json.dumps(fields), source, json.dumps(references), draft)
 
 
-def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str = PROVENANCE_SCHEMA) -> dict[str, Any]:
+def _probe_sources(index: Path, evidence: dict[str, Any], digests: dict[Path, str]) -> list[dict[str, str]]:
+    root = index.parent
+    kinds = {index: "observations_index", root / "launch.json": "launch", root / "model-config.json": "model_config"}
+    for artifact in evidence["artifacts"]:
+        kinds[root / artifact["path"]] = artifact["evidence"]["kind"]
+    for launch in evidence["launch_artifacts"]:
+        kinds[root / launch["path"]] = "launch_manifest"
+    for artifact in evidence["runtime_artifacts"]:
+        kinds[root / artifact["path"]] = artifact.get("kind", "runtime_artifact")
+    if kinds.keys() - digests.keys():
+        raise ValueError("runtime probe provenance is missing immutable source artifacts")
+    return [
+        {"path": str(path), "sha256": digest, **({"kind": kinds[path]} if path in kinds else {})}
+        for path, digest in sorted(digests.items())
+    ]
+
+
+def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str, inventory: dict[str, Any]) -> dict[str, Any]:
     """Retain the initialized NIXL fields when an import replaces raw rank records with source hashes."""
     settings = evidence["runtime_settings"]
     sections = {"model_config": ("model", "dtype"), "cache_config": ("cache_dtype",)}
@@ -456,17 +457,10 @@ def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str = PROVE
     if schema == LEGACY_PROVENANCE_SCHEMA:
         snapshot["worker_attention_backends"] = _worker_attention_backends(evidence)
     else:
-        bound = schema in (BOUND_PROVENANCE_SCHEMA, LAYOUT_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA)
-        snapshot["worker_observations"] = _worker_observations(
-            evidence,
-            ranked=bound,
-            layout_choices=schema in (LAYOUT_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA),
-            engine_layout=schema == PROVENANCE_SCHEMA,
-        )
+        snapshot["worker_observations"] = _worker_observations(evidence)
         if version := evidence.get("runtime", {}).get("version"):
             snapshot["runtime"] = {"version": version}
-        if bound:
-            snapshot["worker_observations_sha256"] = _worker_observation_digest(snapshot, evidence)
+        snapshot["worker_observations_sha256"] = _worker_observation_digest(snapshot, evidence, inventory, draft=True)
     return snapshot
 
 
@@ -607,14 +601,14 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     from collector.fpm_forward.runtime_instrumentation import read_json
     from collector.fpm_forward.runtime_observations import validate_observations
 
-    covered = set()
+    covered = {}
     for ref in manifest["source_artifacts"]:
         path = Path(ref["path"])
         if path.is_symlink() or not path.is_file() or _hash(path) != ref["sha256"]:
             raise ValueError(f"runtime probe source artifact changed: {path}")
-        covered.add(str(path))
+        covered[path] = ref["sha256"]
     index = Path(manifest["observations_index"])
-    if {str(index), str(index.parent / "launch.json"), str(index.parent / "model-config.json")} - covered:
+    if {index, index.parent / "launch.json", index.parent / "model-config.json"} - covered.keys():
         raise ValueError("runtime probe provenance is missing immutable source artifacts")
     name = manifest["configuration"]
     launch = read_json(index)["configurations"][name]["launch"]
@@ -626,7 +620,11 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     expected = as_saved_resources(manifest["observed_resources"], _resource_values(result["resources"]))
     if "nixl_observation" in manifest:
         saved = deepcopy(manifest["nixl_observation"])
-        fresh = _observed_transfer_settings(result["provenance"], schema=manifest["schema_version"])
+        if manifest["schema_version"] == PROVENANCE_SCHEMA and sorted(
+            manifest["source_artifacts"], key=_json
+        ) != sorted(_probe_sources(index, result["provenance"], covered), key=_json):
+            raise ValueError("runtime probe provenance differs from its immutable source artifacts")
+        fresh = _observed_transfer_settings(result["provenance"], schema=manifest["schema_version"], inventory=manifest)
         if "worker_observations" in saved and "worker_observations" in fresh:
             for sample in (saved, fresh):
                 sample["worker_observations"].sort(key=_json)
@@ -1014,16 +1012,18 @@ def _draft(
         "checkpoint": str(checkpoint),
         "configuration": name,
         "observations_index": str(snapshot),
-        "source_artifacts": [
-            {"path": str(path), "sha256": _hash(path)} for path in sorted(snapshot.parent.rglob("*")) if path.is_file()
-        ],
+        "source_artifacts": _probe_sources(
+            snapshot, result["provenance"], {path: _hash(path) for path in snapshot.parent.rglob("*") if path.is_file()}
+        ),
         "observed_resources": _resource_values(result["resources"]),
-        "nixl_observation": _observed_transfer_settings(result["provenance"]),
         "model_metadata": {key: getattr(profile, key) for key in ("architecture", "context_length", "num_experts")},
         "user_overrides": {},
         "review_status": "requires_review",
         "timing_status": "not_established_by_runtime_probe",
     }
+    manifest["nixl_observation"] = _observed_transfer_settings(
+        result["provenance"], schema=PROVENANCE_SCHEMA, inventory=manifest
+    )
     profile.deployments[0].resources.runtime_memory.provenance = _json(manifest)
     payload = deepcopy(payload)
     payload["fpm_profile"] = profile.model_dump(mode="json", exclude_none=True)

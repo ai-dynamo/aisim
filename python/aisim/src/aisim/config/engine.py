@@ -1748,6 +1748,10 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
             selected["decode"],
             backend_version=backend_version,
             kv_transfer=engine.kv_transfer,
+            prefix_caching=(
+                engine.workers.prefill.kv_cache.prefix_caching,
+                engine.workers.decode.kv_cache.prefix_caching,
+            ),
         )
 
 
@@ -1879,7 +1883,7 @@ class GroupedObservationError(ValueError):
     """A selected deployment contains conflicting observations of its own runtime."""
 
 
-def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | None:
+def grouped_pd_pair_requirement(prefill_deployment, decode_deployment, *, prefix_caching=(False, False)) -> str | None:
     """Return the first incompatible property of a grouped NIXL pair."""
     prefill, decode = prefill_deployment.resources, decode_deployment.resources
     if prefill.cache_layout != "grouped" and decode.cache_layout != "grouped":
@@ -1916,6 +1920,7 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | 
                 row(prefill_deployment),
                 row(decode_deployment),
                 prefill_deployment.tp,
+                prefix_caching,
             )
         except ValueError as error:
             raise GroupedObservationError(str(error)) from error
@@ -1927,14 +1932,16 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | 
     return requirement
 
 
-def grouped_pd_requirements(prefill_deployment, decode_deployment, *, backend_version: str | None, kv_transfer) -> None:
+def grouped_pd_requirements(
+    prefill_deployment, decode_deployment, *, backend_version: str | None, kv_transfer, prefix_caching=(False, False)
+) -> None:
     """Check a prefill and a decode FPM deployment with a grouped cache for P/D replay.
 
     The prediction and the sweeper share this rule. The sweeper enumerates only pairs that pass
     ``grouped_pd_pair_requirement``. ``kv_transfer`` is the prediction's transfer configuration, or None. The Rust
     gate checks the transfer geometry and the version of each rank again.
     """
-    if requirement := grouped_pd_pair_requirement(prefill_deployment, decode_deployment):
+    if requirement := grouped_pd_pair_requirement(prefill_deployment, decode_deployment, prefix_caching=prefix_caching):
         raise ValueError(f"grouped FPM cache P/D requires prefill and decode deployments with {requirement}")
     grouped_pd_transfer_requirements(
         prefill_deployment, decode_deployment, backend_version=backend_version, kv_transfer=kv_transfer

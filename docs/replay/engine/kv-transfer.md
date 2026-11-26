@@ -111,9 +111,10 @@ side has no measured backend identity.
 Current runtime drafts and compact finalizations record a SHA-256 digest of
 the worker observations, initialized settings and source references. The references
 identify the observation index or the formal collection plan and individual files.
-Finalization v6 also binds the path and hash of each retained indexed worker,
-scheduler, runtime and launch artifact. Earlier indexed receipts bind the index
-hash. Source-backed onboarding verifies the files listed by that index.
+Runtime probe v2 and finalization `source_references_v2` bind each file path to
+its hash and retained artifact kind, independently of reference order. The
+original `source_references` format retains file references and rank capacities.
+Source-backed onboarding verifies the files listed by the capture.
 Replay checks the saved fields and rank coverage offline, including cells whose
 workers have no recorded backend or layout. Reordering the workers preserves
 their receipt. Older archives support the structural checks their recorded
@@ -127,11 +128,14 @@ within one DP engine share a resolved GPU layout. Attention views in hybrid
 caches constrain that layout too. A worker using a CPU transfer buffer can
 announce a different layout when it permutes ordinary attention into LBHNC.
 Each worker must use one feasible registration for all its routable DP peers.
-Runtime probe v5 and finalization v6 record the GPU and transfer-buffer evidence
-separately. Earlier projections retain their observed registration layouts.
-When a complete cell omits DP coordinates, the workers at each TP rank can be
-reordered across DP engines. The same engines must still explain every TP rank
-and every cell.
+Current runtime probes and finalizations record GPU and transfer-buffer evidence
+separately. Original captures constrain only the fields they retained.
+Both collectors record each measured worker’s TP and DP coordinates. An original
+compact receipt can retain the rank capacities without a worker layout.
+A decoder using layout permutation requires one receive mode across its peers.
+A native input and an input needing permutation cannot share that decoder. A
+Mamba worker requires the hybrid cache manager. CSA-linear caches require a GPU
+transfer buffer. Recorded `NHD` and `HND` names resolve to `LBNHC` and `LBHNC`.
 With the decoder's permute option enabled and postprocessing available, vLLM
 0.32.0 and 0.33.0 can convert a remote LBHNC cache to a local LBNHC cache.
 The 0.31.0 conversion checks the remote LBHNC layout alone. A memory probe

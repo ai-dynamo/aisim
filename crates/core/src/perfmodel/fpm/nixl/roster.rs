@@ -23,15 +23,45 @@ pub(super) fn cell_source(entry: &Value) -> Option<&str> {
     }
 }
 
+fn sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+fn file_references(files: &Value, path_key: &str) -> Result<Value, AicError> {
+    let mut paths = BTreeSet::new();
+    let mut references = Vec::new();
+    for file in files.as_array().ok_or_else(invalid)? {
+        let path = file[path_key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(invalid)?;
+        let hash = file["sha256"]
+            .as_str()
+            .filter(|s| sha256(s))
+            .ok_or_else(invalid)?;
+        let kind = file
+            .get("kind")
+            .filter(|v| !v.is_null())
+            .map(|v| v.as_str().filter(|s| !s.is_empty()).ok_or_else(invalid))
+            .transpose()?;
+        if !paths.insert(path) {
+            return Err(invalid());
+        }
+        references.push((kind, path, hash));
+    }
+    references.sort_unstable();
+    Ok(serde_json::json!(references))
+}
+
 /// Bind the portable projection to its recorded sources, independently of worker order.
 /// The onboarding verifier separately rehashes the original files.
 pub(crate) fn digest(
     entry: &Value,
     source: Option<&str>,
-    bind_references: bool,
+    inventory: &Value,
+    draft: bool,
 ) -> Result<String, AicError> {
     let formal = entry["source"] == "vllm_initialized_cache";
-    let sha256 = |s: &str| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit());
     let source = source
         .filter(|s| if formal { !s.is_empty() } else { sha256(s) })
         .ok_or_else(invalid)?;
@@ -42,27 +72,8 @@ pub(crate) fn digest(
             rows
         })
     };
-    // The formal memory collector saves a plan hash and individual file hashes in place of
-    // a runtime-observation index. Bind those exact source files and the installed version.
-    let mut artifacts = Vec::new();
-    if formal {
-        for artifact in entry["artifacts"]
-            .as_array()
-            .filter(|files| !files.is_empty())
-            .ok_or_else(invalid)?
-        {
-            artifacts.push(
-                artifact["sha256"]
-                    .as_str()
-                    .filter(|s| sha256(s))
-                    .ok_or_else(invalid)?,
-            );
-        }
-        artifacts.sort_unstable();
-    }
     let mut contents = vec![
         Value::from(source),
-        Value::from(artifacts),
         if formal {
             entry["backend_version"].clone()
         } else {
@@ -71,42 +82,52 @@ pub(crate) fn digest(
         entry["runtime"].clone(),
         entry["runtime_settings"].clone(),
         serde_json::json!(sorted_rows("worker_observations")),
+        serde_json::json!(sorted_rows("rank_capacities")),
     ];
-    // Compact finalizations retain the measured roster even for a cell with no observed names or layout.
-    if let Some(capacities) = sorted_rows("rank_capacities") {
-        contents.push(serde_json::json!(capacities));
-    }
-    if bind_references && !formal {
-        // The verified index is the source of truth. A portable cell also retains copies
-        // of its paths and hashes; bind those copies without having to reopen the index.
-        contents.push(entry["observations_index"].clone());
-        for key in ["artifacts", "runtime_artifacts", "launch_artifacts"] {
-            let Some(value) = entry.get(key) else {
-                if key == "artifacts" {
-                    return Err(invalid());
-                }
-                contents.push(Value::Null);
-                continue;
-            };
-            let mut files = Vec::new();
-            for file in value.as_array().ok_or_else(invalid)? {
-                let path = file["path"]
-                    .as_str()
-                    .filter(|p| !p.is_empty())
-                    .ok_or_else(invalid)?;
-                let hash = file["sha256"]
-                    .as_str()
-                    .filter(|s| sha256(s))
-                    .ok_or_else(invalid)?;
-                files.push((path, hash));
-            }
-            if key == "artifacts" && files.is_empty() {
+    let mut files = serde_json::Map::new();
+    if draft {
+        let index = inventory["observations_index"]
+            .as_str()
+            .ok_or_else(invalid)?;
+        // A draft retains its indexed capture and the frozen launch and model inputs.
+        let sources = inventory["source_artifacts"]
+            .as_array()
+            .ok_or_else(invalid)?;
+        if !sources.iter().any(|r| {
+            r["kind"] == "observations_index" && r["path"] == index && r["sha256"] == source
+        }) || !["launch", "model_config"]
+            .iter()
+            .all(|kind| sources.iter().any(|r| r["kind"] == *kind))
+        {
+            return Err(invalid());
+        }
+        files.insert("observations_index".into(), Value::from(index));
+    } else {
+        if !formal {
+            let index = &entry["observations_index"];
+            if index["path"].as_str().is_none_or(str::is_empty) || index["sha256"] != source {
                 return Err(invalid());
             }
-            files.sort_unstable();
-            contents.push(serde_json::json!(files));
+            files.insert("observations_index".into(), index.clone());
+        }
+        for key in ["artifacts", "runtime_artifacts", "launch_artifacts"] {
+            if key == "artifacts" && entry[key].as_array().is_none_or(Vec::is_empty) {
+                return Err(invalid());
+            }
+            if let Some(refs) = entry.get(key) {
+                files.insert(key.into(), file_references(refs, "path")?);
+            }
         }
     }
+    for (key, path_key) in [
+        ("source_artifacts", "path"),
+        ("formal_data", "relative_path"),
+    ] {
+        if let Some(refs) = inventory.get(key) {
+            files.insert(key.into(), file_references(refs, path_key)?);
+        }
+    }
+    contents.push(Value::Object(files));
     Ok(format!(
         "{:x}",
         Sha256::digest(Value::Array(contents).to_string())
@@ -247,7 +268,7 @@ pub(super) fn validate<'a>(
         }
         *slots.entry((phase, rank)).or_insert(0_u64) += 1;
         *sizes.entry(phase).or_insert(0_u64) += 1;
-        if require_dp {
+        if require_dp || !worker["dp_rank"].is_null() {
             let dp = worker["dp_rank"].as_u64().ok_or_else(invalid)?;
             if !full_slots.insert((phase, rank, dp))
                 || width.zip(tp).is_some_and(|(w, t)| t == 0 || dp >= w / t)
@@ -293,7 +314,7 @@ pub(super) fn validate<'a>(
                 return Err(invalid());
             }
         }
-        if expected != slots || (require_dp && coordinates != full_slots) {
+        if expected != slots || !full_slots.is_subset(&coordinates) {
             return Err(invalid());
         }
     }
@@ -339,7 +360,7 @@ pub(super) fn can_pair<L, R>(
 
 /// Assign one worker from each complete cell to each physical slot, retaining all their
 /// common settings. The optional physical-layout constraint can depend on the slot's DP rank.
-pub(super) fn assign_workers(
+fn assign_workers(
     slots: &mut [Worker],
     cells: &[Vec<Worker>],
     allowed: &impl Fn(&Worker) -> bool,
@@ -703,11 +724,18 @@ mod tests {
         let source = "a".repeat(64);
         let first = json!({"phase":"decode","tp_rank":0,"dp_rank":0,"kv_cache_bytes":256});
         let second = json!({"phase":"decode","tp_rank":1,"dp_rank":0,"kv_cache_bytes":128});
-        let mut cell = json!({"rank_capacities":[first,second]});
-        let original = digest(&cell, Some(&source), false).unwrap();
+        let mut cell = json!({"rank_capacities":[first,second],"observations_index":{"path":"index","sha256":source},
+            "artifacts":[{"path":"worker","kind":"worker","sha256":source}]});
+        let original = digest(&cell, Some(&source), &json!({}), false).unwrap();
         cell["rank_capacities"].as_array_mut().unwrap().reverse();
-        assert_eq!(digest(&cell, Some(&source), false).unwrap(), original);
+        assert_eq!(
+            digest(&cell, Some(&source), &json!({}), false).unwrap(),
+            original
+        );
         cell["rank_capacities"][0]["phase"] = json!("prefill");
-        assert_ne!(digest(&cell, Some(&source), false).unwrap(), original);
+        assert_ne!(
+            digest(&cell, Some(&source), &json!({}), false).unwrap(),
+            original
+        );
     }
 }

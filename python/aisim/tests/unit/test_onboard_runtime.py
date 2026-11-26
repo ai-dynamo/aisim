@@ -2574,6 +2574,35 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
     settings = manifest["nixl_observation"]["runtime_settings"]
     assert settings["model_config"]["model"] == expected["model_config"]["model"]
     assert settings["cache_config"]["cache_dtype"] == expected["cache_config"]["cache_dtype"]
+    from aisim import _runtime
+
+    (Path(manifest["observations_index"]).parent / "review-notes.txt").write_text("outside the captured inventory")
+    manifest["source_artifacts"].reverse()
+    memory = request.profile_deployment().resources.runtime_memory
+    memory.provenance = json.dumps(manifest)
+    assert verify_runtime_profile(request)["status"] == "complete"
+    assert _runtime.observed_model_dtype(memory.provenance)
+    for field in ("kind", "path", "sha256"):
+        edited = json.loads(json.dumps(manifest))
+        workers = [ref for ref in edited["source_artifacts"] if ref.get("kind") == "worker"]
+        a, b = workers[:2]
+        if field == "kind":
+            a[field] = "scheduler"
+        else:
+            a[field], b[field] = b[field], a[field]
+        memory.provenance = json.dumps(edited)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(memory.provenance)
+        with pytest.raises(ValueError, match="immutable source artifacts|source artifact changed"):
+            verify_runtime_profile(request)
+    for keep in (
+        [ref for ref in manifest["source_artifacts"] if ref.get("kind") != "launch"],
+        [ref for ref in manifest["source_artifacts"] if ref.get("kind") == "observations_index"],
+        [*manifest["source_artifacts"], manifest["source_artifacts"][0]],
+    ):
+        memory.provenance = json.dumps({**manifest, "source_artifacts": keep})
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(memory.provenance)
     manifest["nixl_observation"]["runtime_settings"]["model_config"]["model"] += "/edited"
     request.profile_deployment().resources.runtime_memory.provenance = json.dumps(manifest)
     with pytest.raises(ValueError, match="saved NIXL settings differ"):
@@ -2586,6 +2615,11 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
     manifest["schema_version"] = "aisimulate-onboarding-runtime-probe/v1"
     request.profile_deployment().resources.runtime_memory.provenance = json.dumps(manifest)
     assert verify_runtime_profile(request)["status"] == "complete"
+    request.profile_deployment().resources.runtime_memory.provenance = json.dumps(
+        {**manifest, "nixl_observation": None}
+    )
+    with pytest.raises(ValueError, match="invalid legacy NIXL observation"):
+        verify_runtime_profile(request)
 
     observation = direct["resources"]
     evidence = json.loads(observation["runtime_memory"]["provenance"])
@@ -2594,55 +2628,47 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
         rank["attention_backend"] = "FLASHINFER"
     workers[-1]["attention_backend"] = ["FLASH_ATTN", "FLASHINFER"]
     observation["runtime_memory"]["provenance"] = json.dumps(evidence)
-    for version in (
-        "source_references",
-        "source_references_v2",
-        "source_references_v3",
-        "source_references_v4",
-        "source_references_v5",
-        "source_references_v6",
-    ):
+    for version in ("source_references", "source_references_v2"):
         saved = {}
         _merge_resources([observation], saved, source_references=True, observation_format=version)
         assert saved["observation_provenance"] == version
-        compact = json.loads(saved["cell_observations"][0]["runtime_memory"]["provenance"])
-        assert all(set(artifact) == {"path", "sha256"} for artifact in compact["artifacts"])
-        assert compact.get("worker_attention_backends") == (
-            [w["attention_backend"] for w in workers] if version == "source_references_v2" else None
-        )
-        if version in ("source_references_v3", "source_references_v4", "source_references_v5", "source_references_v6"):
-            assert [(r["phase"], r["tp_rank"]) for r in compact["worker_observations"]] == [
-                (r["phase"], r["tp_rank"]) for r in workers
-            ]
-            assert compact["worker_observations"][-1]["backends"] == ["flash_attn", "flashinfer"]
-        if version in ("source_references_v4", "source_references_v5", "source_references_v6"):
-            from aisim import _runtime
-
-            digest = saved["worker_observation_digests"][0]
-            assert (
-                _runtime.nixl_observation_digest(
-                    json.dumps(compact), compact["observations_index"]["sha256"], version == "source_references_v6"
-                )
-                == digest
-            )
-            if version == "source_references_v6":
-                for key in ("artifacts", "runtime_artifacts", "launch_artifacts"):
-                    edited = json.loads(json.dumps(compact))
-                    if edited[key]:
-                        edited[key][0]["sha256"] = "0" * 64
-                    else:
-                        edited[key].append({"path": "runtime.json", "sha256": "0" * 64})
-                    saved["cell_observations"][0]["runtime_memory"]["provenance"] = json.dumps(edited)
-                    with pytest.raises(ValueError, match="worker roster"):
-                        _runtime.observed_model_dtype(json.dumps(saved))
-                compact["artifacts"].reverse()
-            compact["worker_observations"].reverse()
-            saved["cell_observations"][0]["runtime_memory"]["provenance"] = json.dumps(compact)
-            assert _runtime.observed_model_dtype(json.dumps(saved))
-            compact["worker_observations"][0]["backends"] = []
-            saved["cell_observations"][0]["runtime_memory"]["provenance"] = json.dumps(compact)
+        memory = saved["cell_observations"][0]["runtime_memory"]
+        compact = json.loads(memory["provenance"])
+        if version == "source_references":
+            assert all(set(artifact) == {"path", "sha256"} for artifact in compact["artifacts"])
+            assert "worker_observations" not in compact
+            assert "worker_observation_digests" not in saved
+            continue
+        assert all(set(artifact) == {"kind", "path", "sha256"} for artifact in compact["artifacts"])
+        assert [(r["phase"], r["tp_rank"], r["dp_rank"]) for r in compact["worker_observations"]] == [
+            (r["phase"], r["tp_rank"], r["dp_rank"]) for r in workers
+        ]
+        assert compact["worker_observations"][-1]["backends"] == ["flash_attn", "flashinfer"]
+        assert saved["worker_observation_digests"] == [
+            _runtime.nixl_observation_digest(json.dumps(compact), compact["observations_index"]["sha256"], "{}", False)
+        ]
+        injected = json.loads(json.dumps(compact))
+        injected["artifacts"][0]["evidence"] = {"kind": "worker", "phase": "prefill"}
+        memory["provenance"] = json.dumps(injected)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(saved))
+        for key in ("artifacts", "runtime_artifacts", "launch_artifacts"):
+            edited = json.loads(json.dumps(compact))
+            if edited[key]:
+                edited[key][0]["sha256"] = "0" * 64
+            else:
+                edited[key].append({"path": "runtime.json", "sha256": "0" * 64})
+            memory["provenance"] = json.dumps(edited)
             with pytest.raises(ValueError, match="worker roster"):
                 _runtime.observed_model_dtype(json.dumps(saved))
+        compact["artifacts"].reverse()
+        compact["worker_observations"].reverse()
+        memory["provenance"] = json.dumps(compact)
+        assert _runtime.observed_model_dtype(json.dumps(saved))
+        compact["worker_observations"][0]["backends"] = []
+        memory["provenance"] = json.dumps(compact)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(saved))
 
 
 def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_sources(tmp_path, capsys):
@@ -2676,14 +2702,25 @@ def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_so
     assert resolved.profile_deployment().tp == 8
     manifest = finalization_manifest(resolved)
     assert manifest == json.loads((target / "finalization.json").read_text())
-    assert manifest["observation_provenance"] == "source_references_v6"
+    assert manifest["observation_provenance"] == "source_references_v2"
     assert len(manifest["worker_observation_digests"]) == len(manifest["cell_observations"])
     observation = json.loads(manifest["cell_observations"][0]["runtime_memory"]["provenance"])
     assert len(observation["rank_capacities"]) == 16
     assert len(observation["artifacts"]) == 18
-    assert all(set(reference) == {"path", "sha256"} for reference in observation["artifacts"])
+    assert all(set(reference) == {"kind", "path", "sha256"} for reference in observation["artifacts"])
     for reference in manifest["source_artifacts"]:
         assert hashlib.sha256(Path(reference["path"]).read_bytes()).hexdigest() == reference["sha256"]
+    from aisim import _runtime
+
+    for key, path_key in (("source_artifacts", "path"), ("formal_data", "relative_path")):
+        edited = json.loads(json.dumps(manifest))
+        edited[key].reverse()
+        assert _runtime.observed_model_dtype(json.dumps(edited))
+        a = edited[key][0]
+        b = next(ref for ref in edited[key] if ref["sha256"] != a["sha256"])
+        a[path_key], b[path_key] = b[path_key], a[path_key]
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(edited))
     output = tmp_path / "recommendation"
     result = subprocess.run(
         [

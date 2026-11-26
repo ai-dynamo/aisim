@@ -55,7 +55,7 @@ impl Layouts {
         }
     }
 
-    pub(super) fn host(self, permute: Option<bool>, keep_choices: bool) -> Option<Self> {
+    pub(super) fn host(self, permute: Option<bool>) -> Option<Self> {
         if !self.names().iter().any(|n| n == "LBNHC") {
             return Some(self);
         }
@@ -66,7 +66,7 @@ impl Layouts {
         if permute == Some(true) {
             names.retain(|name| name != "LBNHC");
         }
-        Self::from_names(names).filter(|v| keep_choices || matches!(v, Self::Named(_)))
+        Self::from_names(names)
     }
 }
 
@@ -75,14 +75,15 @@ const LBHNC: usize = 0;
 const LBNHC: usize = 1;
 const ALL: u8 = (1 << LAYOUTS.len()) - 1;
 
-fn routes_fit(senders: &[u8], receivers: &[[u8; 6]], compatible: impl Fn(u8) -> bool) -> bool {
-    // Every sender announces one layout and each decoder accepts every announced layout.
+fn routes_fit(senders: &[u8], receivers: &[[u8; 6]]) -> bool {
+    // NIXL's repack flag belongs to the decoder worker. Native and repacked inputs
+    // cannot share that decoder. Only MLA accepts several remote layouts unchanged.
     (1..=ALL).any(|set| {
         senders.iter().all(|s| s & set != 0)
-            && receivers
-                .iter()
-                .all(|opts| opts.iter().any(|r| set & !r == 0))
-            && compatible(set)
+            && receivers.iter().all(|opts| {
+                opts.iter()
+                    .any(|&r| set & !r == 0 && (set.count_ones() == 1 || r == ALL))
+            })
     })
 }
 
@@ -93,7 +94,7 @@ fn announced(received: &[u8; 6]) -> u8 {
         .fold(0, |bits, (i, &v)| bits | (u8::from(v != 0) << i))
 }
 
-// An old anonymous cell can retain a TP rank without identifying a DP engine.
+// A partially observed worker may have a TP rank without a DP engine identifier.
 pub(super) fn routable(prefill: &[&Worker], decode: &[&Worker], version: Option<&str>) -> bool {
     let allowed = |w: &Worker| {
         let choices = std::array::from_fn(|gpu| transfer(w, gpu, version));
@@ -104,7 +105,7 @@ pub(super) fn routable(prefill: &[&Worker], decode: &[&Worker], version: Option<
         .map(|w| announced(&allowed(w)))
         .collect::<Vec<_>>();
     let receivers = decode.iter().map(|w| allowed(w)).collect::<Vec<_>>();
-    routes_fit(&senders, &receivers, |_| true)
+    routes_fit(&senders, &receivers)
 }
 
 fn mask(layout: Option<&Layouts>) -> u8 {
@@ -190,14 +191,11 @@ struct Engine {
 #[derive(Default)]
 pub(crate) struct Deployment {
     engines: Vec<Engine>,
-    // Historical compact cells saved TP ranks but omitted the DP coordinates within a TP rank.
-    anonymous: BTreeMap<u64, Vec<Vec<Worker>>>,
 }
 
 impl Deployment {
     pub(super) fn from_workers(
         workers: &[Worker],
-        rosters: &[Vec<Worker>],
         width: Option<u64>,
         tp: Option<u64>,
     ) -> Result<Self, AicError> {
@@ -219,89 +217,17 @@ impl Deployment {
                 .or_default();
             entry.combine(worker)?;
         }
-        let mut anonymous = BTreeMap::<u64, Vec<Vec<Worker>>>::new();
-        let mut common = ALL;
-        if let Some(dp) = width
-            .zip(tp)
-            .and_then(|(w, t)| w.checked_div(t))
-            .filter(|&d| d > 1)
-        {
-            for roster in rosters.iter().filter(|r| {
-                r.iter().any(|w| w.dp_rank.is_none()) && r.iter().all(|w| w.tp_rank.is_some())
-            }) {
-                let mut by_tp = BTreeMap::<u64, Vec<Worker>>::new();
-                for w in roster {
-                    by_tp.entry(w.tp_rank.unwrap()).or_default().push(w.clone());
-                }
-                for (rank, mut cell) in by_tp {
-                    // Each DP engine has one worker at this TP rank. Its GPU layout must
-                    // explain at least one of the captured workers, even after losing DP order.
-                    common &= cell.iter().fold(0, |bits, w| bits | possible_gpu(w));
-                    cell.sort_unstable();
-                    let cells = anonymous.entry(rank).or_default();
-                    if !cells.contains(&cell) {
-                        cells.push(cell);
-                    }
-                }
-            }
-            if !anonymous.is_empty() {
-                for d in 0..dp {
-                    engines.entry(d).or_default();
-                }
-            }
-        }
         for engine in engines.values_mut() {
             engine.layouts = engine
                 .workers
                 .values()
-                .fold(common, |layouts, w| layouts & possible_gpu(w));
+                .fold(ALL, |layouts, w| layouts & possible_gpu(w));
             if engine.layouts == 0 {
                 return Err(conflict("kv_cache_layout"));
             }
         }
-        let deployment = Self {
+        Ok(Self {
             engines: engines.into_values().collect(),
-            anonymous,
-        };
-        if !deployment.anonymous.is_empty()
-            && !engines_routable(&deployment, &Self::default(), None)
-        {
-            return Err(conflict("kv_cache_layout"));
-        }
-        Ok(deployment)
-    }
-
-    fn anonymous_fit(
-        &self,
-        rank: u64,
-        domains: &[u8],
-        version: Option<&str>,
-        remote: u8,
-        sending: bool,
-    ) -> bool {
-        let Some(cells) = self.anonymous.get(&rank) else {
-            return true;
-        };
-        let mut slots: Vec<_> = self
-            .engines
-            .iter()
-            .enumerate()
-            .map(|(dp, e)| {
-                let mut w = e.workers.get(&rank).cloned().unwrap_or_default();
-                w.dp_rank = Some(dp as u64);
-                w.tp_rank = Some(rank);
-                w
-            })
-            .collect();
-        super::roster::assign_workers(&mut slots, cells, &|w| {
-            let domain = domains[w.dp_rank.unwrap() as usize];
-            let options = std::array::from_fn(|gpu| transfer(w, gpu, version));
-            let local = receive_options(&options, domain);
-            if sending {
-                announced(&local) & remote != 0
-            } else {
-                local.iter().any(|accept| remote & !accept == 0)
-            }
         })
     }
 }
@@ -320,7 +246,6 @@ pub(super) fn engines_routable(
             .iter()
             .flat_map(|e| e.workers.values())
             .any(observed)
-            || r.anonymous.values().flatten().flatten().any(observed)
     }) {
         return true;
     }
@@ -341,30 +266,25 @@ pub(super) fn engines_routable(
     let ranks: BTreeSet<_> = engines
         .iter()
         .flat_map(|e| e.workers.keys())
-        .chain(prefill.anonymous.keys())
-        .chain(decode.anonymous.keys())
         .copied()
         .collect();
     let unknown_worker = Worker::default();
     let mut domains = engines.iter().map(|e| e.layouts).collect::<Vec<_>>();
     // Cache the six hardware choices once, including the unknown choice at an unmeasured rank.
-    let options: Vec<(u64, Vec<[[u8; 6]; 6]>)> = ranks
+    let options: Vec<Vec<[[u8; 6]; 6]>> = ranks
         .into_iter()
         .map(|rank| {
-            (
-                rank,
-                engines
-                    .iter()
-                    .map(|e| {
-                        let worker = e.workers.get(&rank).unwrap_or(&unknown_worker);
-                        std::array::from_fn(|gpu| transfer(worker, gpu, version))
-                    })
-                    .collect(),
-            )
+            engines
+                .iter()
+                .map(|e| {
+                    let worker = e.workers.get(&rank).unwrap_or(&unknown_worker);
+                    std::array::from_fn(|gpu| transfer(worker, gpu, version))
+                })
+                .collect()
         })
         .collect();
     let fits = |domains: &[u8]| {
-        options.iter().all(|(rank, choices)| {
+        options.iter().all(|choices| {
             let mut senders = Vec::new();
             let mut receivers = Vec::new();
             for (index, (gpus, domain)) in choices.iter().zip(domains).enumerate() {
@@ -375,12 +295,13 @@ pub(super) fn engines_routable(
                     receivers.push(received);
                 }
             }
-            routes_fit(&senders, &receivers, |set| {
-                prefill.anonymous_fit(*rank, &domains[..senders_count], version, set, true)
-                    && decode.anonymous_fit(*rank, &domains[senders_count..], version, set, false)
-            })
+            routes_fit(&senders, &receivers)
         })
     };
+    // A single TP row has no second worker to constrain the same engine's physical layout.
+    if options.len() == 1 {
+        return fits(&domains);
+    }
     fn choose(domains: &mut [u8], fits: &impl Fn(&[u8]) -> bool) -> bool {
         if !fits(domains) {
             return false;
@@ -445,20 +366,15 @@ fn view_dimensions(
         .then_some(dims)
 }
 
-pub(super) fn from_strides(
-    rank: &Value,
-    current_format: bool,
-    ordinary_only: bool,
-) -> Result<Option<Layouts>, AicError> {
+pub(super) fn from_strides(rank: &Value) -> Result<Option<Layouts>, AicError> {
     if rank["schema_version"] != "aisimulate-runtime-observation/v1" {
         return Ok(None);
     }
     // v0.33 records every block-first view of a layer. Its backing storage identifies the device.
-    let block_first = current_format
-        && rank
-            .pointer("/runtime/version")
-            .and_then(Value::as_str)
-            .is_some_and(|v| v.split('+').next() == Some("0.33.0"));
+    let block_first = rank
+        .pointer("/runtime/version")
+        .and_then(Value::as_str)
+        .is_some_and(|v| v.split('+').next() == Some("0.33.0"));
     let cache = &rank["cache"];
     let (Some(allocations), Some(tensors)) = (
         cache["tensor_allocations"].as_array(),
@@ -467,28 +383,24 @@ pub(super) fn from_strides(
         return Ok(None);
     };
     // A separate state allocation can have four axes with different meanings.
-    let attention_layers = cache["groups"]
-        .as_array()
-        .filter(|_| current_format)
-        .map(|groups| {
-            groups
-                .iter()
-                .filter(|g| g["kind"] == "attention")
-                .filter_map(|g| g["layer_classes"].as_object())
-                .flat_map(|classes| classes.iter())
-                .filter(|(_, class)| {
-                    !ordinary_only
-                        || matches!(
-                            class.as_str(),
-                            Some(
-                                "vllm.model_executor.layers.attention.Attention"
-                                    | "vllm.model_executor.layers.attention.attention.Attention"
-                            )
-                        )
-                })
-                .map(|(layer, _)| layer.as_str())
-                .collect::<BTreeSet<_>>()
-        });
+    let attention_layers = cache["groups"].as_array().map(|groups| {
+        groups
+            .iter()
+            .filter(|g| g["kind"] == "attention")
+            .filter_map(|g| g["layer_classes"].as_object())
+            .flat_map(|classes| classes.iter())
+            .filter(|(_, class)| {
+                matches!(
+                    class.as_str(),
+                    Some(
+                        "vllm.model_executor.layers.attention.Attention"
+                            | "vllm.model_executor.layers.attention.attention.Attention"
+                    )
+                )
+            })
+            .map(|(layer, _)| layer.as_str())
+            .collect::<BTreeSet<_>>()
+    });
     let mut candidates = LAYOUTS.to_vec();
     let mut measured = false;
     for allocation in allocations {
@@ -496,9 +408,6 @@ pub(super) fn from_strides(
             .as_array()
             .map(Vec::as_slice)
             .unwrap_or_default();
-        if layers.is_empty() && !current_format {
-            return Ok(None);
-        }
         for name in layers {
             let name = name.as_str().unwrap_or_default();
             if attention_layers
@@ -516,11 +425,8 @@ pub(super) fn from_strides(
                 let Some(dims) =
                     view_dimensions(cache, allocation, layers.len(), view, block_first)
                 else {
-                    if current_format {
-                        // Opaque views contribute no constraint on the worker's initialized layout.
-                        continue;
-                    }
-                    return Ok(None); // Preserve the historical all-views projection.
+                    // Opaque views contribute no constraint on the initialized layout.
+                    continue;
                 };
                 measured = true;
                 candidates.retain(|(_, order)| {
@@ -536,7 +442,7 @@ pub(super) fn from_strides(
                     }
                     true
                 });
-                if current_format && candidates.is_empty() {
+                if candidates.is_empty() {
                     return Err(conflict("kv_cache_layout"));
                 }
             }
@@ -567,21 +473,21 @@ mod tests {
                 "layer_tensors":{"a":view,"b":view}
             }})
         };
-        let inferred = |rank: &Value, current| from_strides(rank, current, false).unwrap();
+        let inferred = |rank: &Value| from_strides(rank).unwrap();
         let shape = [100, 2, 16, 4];
         let compact = capture(shape, [256, 128, 8, 2], 25600);
-        assert_eq!(inferred(&compact, true), Layouts::named("LBHNC"));
+        assert_eq!(inferred(&compact), Layouts::named("LBHNC"));
         assert_eq!(
-            inferred(&capture(shape, [256, 8, 16, 2], 25600), true),
+            inferred(&capture(shape, [256, 8, 16, 2], 25600)),
             Layouts::named("LBNHC")
         );
         assert_eq!(
-            inferred(&capture(shape, [512, 8, 16, 2], 256), true),
+            inferred(&capture(shape, [512, 8, 16, 2], 256)),
             Layouts::named("BLNHC")
         );
         let one_head = capture([100, 1, 16, 4], [128, 128, 8, 2], 12800);
         assert_eq!(
-            inferred(&one_head, true).unwrap().names(),
+            inferred(&one_head).unwrap().names(),
             ["LBHNC", "LBNHC", "LHBNC"]
         );
         let mut block_first = capture([10, 1, 64, 32], [10240, 4096, 64, 2], 4096);
@@ -597,25 +503,23 @@ mod tests {
             *view = json!([view]);
         }
         assert_eq!(
-            inferred(&block_first, true).unwrap().names(),
+            inferred(&block_first).unwrap().names(),
             ["BHLNC", "BLHNC", "BLNHC"]
         );
-        assert_eq!(inferred(&block_first, false), None);
         block_first["cache"]["storages"][0]["device"] = json!("cpu");
-        assert_eq!(inferred(&block_first, true), None);
+        assert_eq!(inferred(&block_first), None);
         let mut empty = compact.clone();
         empty["cache"]["tensor_allocations"] = json!([]);
-        assert_eq!(inferred(&empty, true), None);
+        assert_eq!(inferred(&empty), None);
         let mut incomplete = compact.clone();
         incomplete["cache"]["layer_tensors"]
             .as_object_mut()
             .unwrap()
             .remove("b");
-        assert_eq!(inferred(&incomplete, true), Layouts::named("LBHNC"));
-        assert_eq!(inferred(&incomplete, false), None);
+        assert_eq!(inferred(&incomplete), Layouts::named("LBHNC"));
         let mut unrelated = compact;
         unrelated["schema_version"] = json!("other");
-        assert_eq!(inferred(&unrelated, true), None);
+        assert_eq!(inferred(&unrelated), None);
     }
     #[test]
     fn opaque_or_separate_state_views_do_not_erase_attention_layouts() {
@@ -635,14 +539,14 @@ mod tests {
                     "schema_version":"aisimulate-runtime-observation/v1",
                     "runtime":{"version": if block_first { "0.33.0" } else { "0.32.0" }},
                     "cache":{
-                        "groups":[{"kind":"attention","layer_classes":{"a":"Attention","b":"Attention"}},
+                        "groups":[{"kind":"attention","layer_classes":{"a":"vllm.model_executor.layers.attention.Attention","b":"vllm.model_executor.layers.attention.Attention"}},
                                   {"kind":"state","layer_classes":{"s":"State"}}],
                         "tensor_allocations":[{"layers":["a","b"],"host_resident":false,"layer_stride":1024},
                                               {"layers":["s"],"host_resident":false,"layer_stride":1024}],
                         "layer_tensors":{"a":view(a),"b":view(b),"s":view(&token_first)}
                     }
                 });
-                let physical = from_strides(&rank, true, false);
+                let physical = from_strides(&rank);
                 if layout == Some("conflict") {
                     assert!(
                         physical

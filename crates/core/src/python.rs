@@ -4839,51 +4839,51 @@ fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult
 
 /// Compact initialized worker fields for a hash-bound onboarding observation.
 #[pyfunction]
-#[pyo3(signature = (records, current_format=false, keep_layout_choices=true, engine_layout=false))]
-fn nixl_worker_observations(
-    records: &str,
-    current_format: bool,
-    keep_layout_choices: bool,
-    engine_layout: bool,
-) -> PyResult<String> {
+fn nixl_worker_observations(records: &str) -> PyResult<String> {
     let parsed: Vec<serde_json::Value> = serde_json::from_str(records)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    Ok(crate::perfmodel::fpm::NixlIdentity::compact_workers(
-        &parsed,
-        current_format,
-        keep_layout_choices,
-        engine_layout,
+    Ok(
+        crate::perfmodel::fpm::NixlIdentity::compact_workers(&parsed)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+            .to_string(),
     )
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
-    .to_string())
 }
 
 #[pyfunction]
-#[pyo3(signature = (entry, source_sha256, bind_references=false))]
 fn nixl_observation_digest(
     entry: &str,
     source_sha256: &str,
-    bind_references: bool,
+    inventory: &str,
+    draft: bool,
 ) -> PyResult<String> {
-    let entry = serde_json::from_str(entry).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("invalid worker observation: {e}"))
-    })?;
-    crate::perfmodel::fpm::NixlIdentity::observation_digest(&entry, source_sha256, bind_references)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    let parse = |value: &str| {
+        serde_json::from_str(value).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid worker observation: {e}"))
+        })
+    };
+    crate::perfmodel::fpm::NixlIdentity::observation_digest(
+        &parse(entry)?,
+        source_sha256,
+        &parse(inventory)?,
+        draft,
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
 /// Compare runtime evidence for selected prefill and decode rows, including legacy imports.
 #[pyfunction]
-#[pyo3(signature = (prefill, decode, prefill_row=None, decode_row=None, tp_size=None))]
+#[pyo3(signature = (prefill, decode, prefill_row=None, decode_row=None, tp_size=None, prefix_caching=(false,false)))]
 fn grouped_observation_requirement(
     prefill: (&str, Option<&str>, &str),
     decode: (&str, Option<&str>, &str),
     prefill_row: Option<(&str, Option<&str>, Option<&str>, u64)>,
     decode_row: Option<(&str, Option<&str>, Option<&str>, u64)>,
     tp_size: Option<u64>,
+    prefix_caching: (bool, bool),
 ) -> PyResult<Option<String>> {
     let identity = |(provenance, dtype, backend),
                     role,
+                    prefix,
                     row: Option<(&str, Option<&str>, Option<&str>, u64)>| {
         let mut value = crate::perfmodel::fpm::NixlIdentity::observed(
             dtype,
@@ -4897,14 +4897,14 @@ fn grouped_observation_requirement(
             row.map(|r| r.0),
             row.and_then(|r| r.1),
             row.and_then(|r| r.2),
-            false,
+            prefix,
         )?;
         Ok::<_, crate::AicError>(value)
     };
     let check = || {
         Ok::<_, crate::AicError>(
-            identity(prefill, "prefill", prefill_row)?
-                .mismatch(&identity(decode, "decode", decode_row)?)
+            identity(prefill, "prefill", prefix_caching.0, prefill_row)?
+                .mismatch(&identity(decode, "decode", prefix_caching.1, decode_row)?)
                 .map(|(field, _, _)| format!("matching {field} when both runtimes recorded it")),
         )
     };

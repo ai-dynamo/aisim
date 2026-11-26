@@ -140,6 +140,8 @@ def parallel_configs_for(
     fpm_profile: dict[str, Any] | None = None,
     worker_type: str = "aggregated",
     model_controls: dict[str, str | int | bool] | None = None,
+    prefill_enable_prefix_caching: bool = True,
+    decode_enable_prefix_caching: bool = False,
     nextn: int = 0,
     candidate_configs: list[ReplicaParallelConfig] | list[DisaggParallelConfig] | None = None,
 ) -> list[ReplicaParallelConfig] | list[DisaggParallelConfig]:
@@ -173,6 +175,7 @@ def parallel_configs_for(
             raise ValueError("max_seq_len exceeds FPM profile context_length")
         configs = _profile_parallel_configs(
             profile,
+            prefix_caching=(prefill_enable_prefix_caching, decode_enable_prefix_caching),
             hardware_sku=hardware_sku,
             backend=backend,
             backend_version=backend_version,
@@ -351,6 +354,7 @@ def parallel_configs_for(
 def _profile_parallel_configs(
     profile,
     *,
+    prefix_caching: tuple[bool, bool] = (True, False),
     hardware_sku: str,
     backend: str,
     backend_version: str | None,
@@ -422,7 +426,7 @@ def _profile_parallel_configs(
 
         def compatible(prefill_shape, decode_shape):
             prefill, decode = prefill_shapes[prefill_shape], decode_shapes[decode_shape]
-            requirement = grouped_pd_pair_requirement(prefill, decode)
+            requirement = grouped_pd_pair_requirement(prefill, decode, prefix_caching=prefix_caching)
             if requirement:
                 requirements[requirement] = None
                 return False
