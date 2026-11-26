@@ -24,21 +24,19 @@ RECURRENT_STATE_FIELDS = (
 )
 RECURRENT_ARCHITECTURES = ("mamba", "jamba", "rwkv")
 LAYER_COUNT_FIELDS = ("num_hidden_layers", "n_layer", "num_layers")
-WINDOW_FIELDS = ("sliding_window", "sliding_window_size")
 
 
+# The supervisor imports this module while building its parser. Load the decoder only on config intake.
 def layout_integer(value: Any, field: str, *, minimum: int = 1, maximum: int | None = None) -> int:
-    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
-        bound = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
-        raise ValueError(f"{field} must be an integer {bound}, not a boolean, float or numeric string")
-    return value
+    from aisim_core import decoder_config
+
+    return decoder_config.layout_integer(value, field, minimum=minimum, maximum=maximum)
 
 
 def cache_window(raw: Mapping[str, Any]) -> int | None:
-    supplied = {key: layout_integer(raw[key], key, minimum=0) for key in WINDOW_FIELDS if raw.get(key) is not None}
-    if len(set(supplied.values())) > 1:
-        raise ValueError(f"conflicting sliding-window fields: {supplied}")
-    return next(iter(supplied.values()), None)
+    from aisim_core import decoder_config
+
+    return decoder_config.cache_window(raw)
 
 
 def layer_count(raw: Mapping[str, Any]) -> int | None:
@@ -49,12 +47,9 @@ def layer_count(raw: Mapping[str, Any]) -> int | None:
 
 
 def layer_types(raw: Mapping[str, Any], layers: int | None) -> list[str]:
-    types = raw["layer_types"]
-    if not isinstance(types, list) or (layers is not None and len(types) != layers):
-        raise ValueError("layer_types must have one entry per num_hidden_layers")
-    if any(not isinstance(value, str) or not value.strip() for value in types):
-        raise ValueError("layer_types entries must be nonempty strings")
-    return types
+    from aisim_core import decoder_config
+
+    return decoder_config.layer_types(raw, layers)
 
 
 def attn_type_list(raw: Mapping[str, Any], layers: int | None) -> list[int]:

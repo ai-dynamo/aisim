@@ -28,8 +28,8 @@ Resource sources:
   :func:`~aisim_core.sdk.utils._parse_hf_config_json`) and ``estimate``
   reserves a fraction (default 80%) of post-weight memory for KV. It handles
   standard and compressed attention. Shared scheduler sizing charges in-flight
-  tokens on every attention layer and preserves DeepSeek V4's fixed state and
-  physical block size. Incomplete weight or KV geometry raises an error.
+  tokens on every attention layer. DeepSeek V4 exposes marginal token bytes;
+  its packed groups require an allocator to determine capacity.
 
 The scalar budget math is factored into :func:`kv_cache_budget_bytes` so the deferred
 consolidation of ``InferenceSummary._check_and_set_kv_cache_oom`` onto a single
@@ -45,16 +45,26 @@ from collections.abc import Callable
 from functools import partial
 from typing import Any
 
-from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
+from aisim_core.decoder_config import (
+    cache_window,
+    decoder_config_key,
+    decoder_config_problem,
+    layer_types,
+    layout_integer,
+)
 from aisim_core.sdk import perf_database
 from aisim_core.sdk.backends.factory import get_backend
 from aisim_core.sdk.common import (
     ARCHITECTURE_TO_MODEL_FAMILY,
     MULTIMODAL_TEXT_CONFIG_KEY,
+    CommQuantMode,
     DeepSeekV4Config,
     DefaultHFModels,
+    FMHAQuantMode,
     Gemma4MixConfig,
+    GEMMQuantMode,
     KVCacheQuantMode,
+    MoEQuantMode,
 )
 from aisim_core.sdk.config import validate_parallel_size
 from aisim_core.sdk.config_builders import apply_nextn, build_model_config, validate_moe_controls, validate_nextn
@@ -62,7 +72,7 @@ from aisim_core.sdk.fpm_model_metadata import attach_quantization_sidecar, inher
 from aisim_core.sdk.fpm_profile import FpmModelProfile, _load_fpm_timing_profile
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.helpers import (
-    _apply_model_quant_defaults,
+    _infer_quant_modes_from_raw_config,
     resolve_sglang_mla_compute,
     resolve_trtllm_mla_compute,
 )
@@ -651,7 +661,8 @@ class NaiveKVCacheEstimator:
         self.pp_size = validate_parallel_size("pp_size", pp_size)
         self.moe_ep_size = validate_parallel_size("moe_ep_size", moe_ep_size)
         self.moe_tp_size = validate_parallel_size("moe_tp_size", moe_tp_size)
-        self._deepseek_v4_model_info: dict | None = None
+        self._v4_cache_mode: KVCacheQuantMode | None = None
+        self._nested_decoder = False
 
     @classmethod
     def from_model_path(
@@ -686,7 +697,7 @@ class NaiveKVCacheEstimator:
             moe_tp_size=moe_tp_size,
         )
 
-        if estimator._deepseek_v4_model_info is not None:
+        if "deepseek_v4" in estimator.geometry:
             # The native checkpoint loader also reads ModelOpt's optional hf_quant_config.json sidecar.
             raw = _load_model_config_from_model_path(model_path)
             key = decoder_config_key(raw)
@@ -695,7 +706,9 @@ class NaiveKVCacheEstimator:
                 if raw.get("hf_quant_config") is not None:
                     decoder = attach_quantization_sidecar(decoder, raw["hf_quant_config"])
                 raw = _attach_inferred_quant_fields(decoder)
-            estimator._deepseek_v4_model_info.update(model_path=model_path, raw_config=raw)
+            estimator._v4_cache_mode = _infer_quant_modes_from_raw_config(raw, estimator.architecture).get(
+                "kvcache_quant_mode"
+            )
         return estimator
 
     @classmethod
@@ -718,6 +731,7 @@ class NaiveKVCacheEstimator:
             raise ValueError(f"HF config architectures must be a list of strings, got {architectures!r}")
         architecture = next(iter(architectures), None)
         raw_config = hf_config
+        nested_decoder = False
         try:
             parsed = _parse_hf_config_json(hf_config)  # supported arch -> normalized parse, or its refusal
         except Exception as error:
@@ -732,11 +746,14 @@ class NaiveKVCacheEstimator:
                 problem = decoder_config_problem(key, hf_config[key])
                 if problem is not None:
                     raise ValueError(f"HF config: {problem}") from error
+                nested_decoder = True
                 raw_config = inherit_decoder_precision(hf_config, hf_config[key])[0]
                 if raw_config.get("architectures"):
-                    return cls.from_hf_config(
+                    decoder = cls.from_hf_config(
                         raw_config, tp_size=tp_size, pp_size=pp_size, moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size
                     )
+                    decoder._nested_decoder = True
+                    return decoder
         estimator = cls(
             cls._geometry(raw_config, parsed),
             dtype_bytes=cls._dtype_bytes(raw_config),
@@ -746,13 +763,10 @@ class NaiveKVCacheEstimator:
             moe_tp_size=moe_tp_size,
         )
         estimator.architecture = architecture
+        estimator._nested_decoder = nested_decoder
         if "deepseek_v4" in estimator.geometry:
-            estimator._deepseek_v4_model_info = {
-                **parsed,
-                "model_path": architecture,
-                "model_family": ARCHITECTURE_TO_MODEL_FAMILY[architecture],
-                "raw_config": _attach_inferred_quant_fields(dict(raw_config)),
-            }
+            inferred = _infer_quant_modes_from_raw_config(_attach_inferred_quant_fields(dict(raw_config)), architecture)
+            estimator._v4_cache_mode = inferred.get("kvcache_quant_mode")
         return estimator
 
     # ----------------------------- config -> geometry ----------------------------- #
@@ -832,8 +846,6 @@ class NaiveKVCacheEstimator:
         A bare ``sliding_window`` with no per-layer signal is left unresolved -- the
         split is too model-specific to guess, and linear is the safe default.
         """
-        from aisim.fpm_cache_layout import cache_window, layer_types, layout_integer
-
         family = ARCHITECTURE_TO_MODEL_FAMILY.get(parsed.get("architecture")) if parsed is not None else None
         extra = parsed.get("extra_params") if parsed is not None else None
         normalized = family == "STEP3P7" or isinstance(extra, Gemma4MixConfig)
@@ -857,7 +869,11 @@ class NaiveKVCacheEstimator:
             num_global = extra.attn_layer_pattern.count(1)
         elif "layer_types" in hf_config:
             types = layer_types(hf_config, None)
-            if num_layers and len(types) != num_layers and (window or isinstance(extra, Gemma4MixConfig)):
+            if (
+                num_layers
+                and len(types) != num_layers
+                and (window or isinstance(extra, Gemma4MixConfig) or hf_config.get("model_type") == "gemma4_text")
+            ):
                 raise ValueError(f"layer_types has {len(types)} entries for {num_layers} decoder layers")
             if (
                 (parsed is not None and parsed.get("architecture") == "GptOssForCausalLM")
@@ -904,7 +920,18 @@ class NaiveKVCacheEstimator:
                 heads, dim = extra.global_num_kv_heads, extra.global_head_dim
                 swa_heads, swa_dim = extra.swa_num_kv_heads, extra.swa_head_dim
             elif ARCHITECTURE_TO_MODEL_FAMILY.get(parsed.get("architecture")) == "STEP3P7":
-                swa_heads, swa_dim = extra.swa_num_kv_heads, extra.swa_head_dim
+                # Step shares decoder KV heads and the explicit head dimension across both layer types.
+                key = MULTIMODAL_TEXT_CONFIG_KEY.get(parsed["architecture"])
+                decoder = hf_config.get(key, hf_config)
+                if not decoder.get("head_dim"):
+                    if decoder.get("is_heterogeneous"):
+                        raise ValueError("Step heterogeneous query heads require an explicit head_dim for cache sizing")
+                    other = decoder.get("attention_other_setting") or {}
+                    queries = decoder.get("num_sliding_attention_heads")
+                    if not queries and other.get("attention_type") == "sliding_attention":
+                        queries = other.get("num_attention_heads")
+                    if queries:
+                        swa_dim = parsed["hidden_size"] // layout_integer(queries, "sliding attention query heads")
             return {
                 **({"deepseek_v4": extra} if isinstance(extra, DeepSeekV4Config) else {}),
                 "layers": parsed.get("layers"),
@@ -974,11 +1001,6 @@ class NaiveKVCacheEstimator:
 
     # --------------------------- geometry -> byte sizes --------------------------- #
 
-    def _deepseek_v4_pool(self) -> dict[str, Any]:
-        from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
-
-        return deepseek_v4_state_cache(self.geometry["deepseek_v4"], indexer_cache_dtype="auto")
-
     def kv_bytes_per_token(self) -> float | None:
         """Per-token KV byte size (the ``seq_len=1`` rate), MLA-aware, or ``None``.
 
@@ -994,7 +1016,11 @@ class NaiveKVCacheEstimator:
         """
         geom = self.geometry
         if "deepseek_v4" in geom:
-            return self._deepseek_v4_pool()["kv_bytes_per_token"]
+            from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
+
+            if self._v4_cache_mode not in (None, KVCacheQuantMode.fp8):
+                raise ValueError("DeepSeek V4 stores fp8_ds_mla KV; use kvcache_quant_mode fp8")
+            return deepseek_v4_state_cache(geom["deepseek_v4"], indexer_cache_dtype="auto")["kv_bytes_per_token"]
         layers = geom.get("layers")
         if not layers:
             return None
@@ -1017,63 +1043,29 @@ class NaiveKVCacheEstimator:
         heads_per_rank = -(-int(kv_heads) // max(self.tp_size, 1))
         return 2 * heads_per_rank * int(head_dim) * self.dtype_bytes
 
-    def _attention_group_rates(self) -> tuple[float, float]:
+    def _attention_layer_rates(self) -> tuple[float, float]:
         geom = self.geometry
         sliding = self._kv_layer_bytes(
             geom.get("swa_kv_heads") or geom["num_kv_heads"], geom.get("swa_head_dim") or geom["head_dim"]
         )
         full = self._kv_layer_bytes(geom["num_kv_heads"], geom["head_dim"])
-        return sliding * geom["num_swa_layers"], full * geom["num_global_layers"]
+        return sliding, full
+
+    def _attention_group_rates(self) -> tuple[float, float]:
+        sliding, full = self._attention_layer_rates()
+        return sliding * self.geometry["num_swa_layers"], full * self.geometry["num_global_layers"]
 
     def set_kvcache_quant_mode(self, mode: str) -> None:
         """Apply an explicit KV precision independently of the checkpoint's weight width."""
         if mode == "nvfp4" and (self.geometry.get("kv_lora_rank") or self.architecture == "DeepseekV41ForCausalLM"):
             raise ValueError("an nvfp4 KV cache is modeled only for standard K/V attention")
         try:
-            self.dtype_bytes = KVCacheQuantMode[mode].value.memory
+            quantization = KVCacheQuantMode[mode]
+            self.dtype_bytes = quantization.value.memory
+            if "deepseek_v4" in self.geometry:
+                self._v4_cache_mode = quantization
         except KeyError as error:
             raise ValueError(f"unsupported kvcache_quant_mode {mode!r}") from error
-
-    def _deepseek_v4_weights(
-        self,
-        *,
-        attention_dp_size: int = 1,
-        gemm_quant_mode: str | None = None,
-        moe_quant_mode: str | None = None,
-        fmha_quant_mode: str | None = None,
-        comm_quant_mode: str | None = None,
-    ) -> int:
-        """Resident weights from the native offline V4 operation inventory, including mixed GEMM/MoE formats."""
-        from aisim_core.sdk.models.deepseek_v4 import DeepSeekV4Model
-
-        info = self._deepseek_v4_model_info
-        assert info is not None
-        config = build_model_config(
-            tp_size=self.tp_size,
-            pp_size=self.pp_size,
-            attention_dp_size=attention_dp_size,
-            moe_tp_size=self.moe_tp_size,
-            moe_ep_size=self.moe_ep_size,
-            fmha_quant_mode=fmha_quant_mode,
-            comm_quant_mode=comm_quant_mode,
-        )
-        _, expert_ranks = config.resolve_moe_parallelism()
-        if expert_ranks > info["num_experts"]:
-            raise ValueError("DeepSeek V4 moe_ep_size exceeds the number of experts")
-        _apply_model_quant_defaults(config, info["raw_config"], info["architecture"], "vllm")
-        for requested, checkpoint in (
-            (gemm_quant_mode, config.gemm_quant_mode),
-            (moe_quant_mode, config.moe_quant_mode),
-        ):
-            if requested is not None and requested != checkpoint.name:
-                raise ValueError(
-                    f"DeepSeek V4 naive sizing requires checkpoint mode {checkpoint.name!r}, got {requested!r}"
-                )
-        try:
-            model = DeepSeekV4Model.create(info, config, "vllm")
-        except AssertionError as error:
-            raise ValueError(str(error)) from error
-        return int(model.get_resident_weights_bytes()) // self.pp_size
 
     def weight_bytes(self) -> int | None:
         """Rough per-rank weight estimate (bytes) from the geometry, or ``None``.
@@ -1086,8 +1078,6 @@ class NaiveKVCacheEstimator:
         ``4 * hidden_size`` expansion. Returns ``None`` (the caller raises) when a
         required dimension is still missing, rather than fabricating a placeholder.
         """
-        if self._deepseek_v4_model_info is not None:
-            return self._deepseek_v4_weights()
         geom = self.geometry
         hidden = geom.get("hidden")
         layers = geom.get("layers")
@@ -1139,17 +1129,12 @@ class NaiveKVCacheEstimator:
         layers at the window while global layers keep growing; LINEAR floor-divides
         the budget by the per-token size. An explicit HYBRID with no usable layout
         falls back to LINEAR. Each concurrent request may fill a whole sliding
-        window. DeepSeek V4 reserves its fixed state per request and assigns the
-        remaining budget in whole compressed-KV blocks.
+        window. DeepSeek V4 exposes marginal token bytes only. Its packed groups
+        require runtime allocations to determine token capacity.
         """
         validate_parallel_size("max_batch_size", max_batch_size)
         if "deepseek_v4" in self.geometry:
-            if self.pp_size != 1:
-                raise ValueError("DeepSeek V4 cache sizing requires PP=1")
-            pool = self._deepseek_v4_pool()
-            state_bytes = max_batch_size * pool["bytes_per_request"]
-            blocks = max(0, int(kv_budget_bytes - state_bytes) // pool["bytes_per_block"])
-            return blocks * pool["block_size"]
+            raise ValueError("DeepSeek V4 packed cache capacity requires runtime group allocations")
         hybrid = self._hybrid_tokens_from_bytes(max_batch_size)
         use_hybrid = mode is NaiveKVCacheMode.HYBRID or (mode is None and hybrid is not None)
         if use_hybrid and hybrid is not None:
@@ -1163,8 +1148,8 @@ class NaiveKVCacheEstimator:
         naive_kv_reservation: float,
         cuda_graph_reserved_bytes: int = 0,
         max_batch_size: int = 1,
-        mode: NaiveKVCacheMode | None = None,
-        weight_bytes: int | None = None,
+        scheduler_backend: str | None = None,
+        scheduler_block_size: int | None = None,
     ) -> dict[str, Any]:
         """Conservative naive estimate: reserve ``naive_kv_reservation`` of post-weight memory.
 
@@ -1173,12 +1158,14 @@ class NaiveKVCacheEstimator:
         must supply, since the native SystemSpec capacity is unavailable when this
         path runs). Does NOT honor the requested ``memory_fraction`` -- the
         post-weight reservation is the crude budget. By default this direct method
-        estimates retention after eviction. Shared scheduling passes LINEAR to cover
-        in-flight prefill and supplies V4's topology-specific resident weight inventory.
+        estimates retention after eviction. Shared scheduling also covers live
+        prefill and independent pages for each attention group.
         RAISES ``ValueError`` when ``capacity`` is missing or the config lacks the
         metadata to estimate the weights / per-token KV (rather than guessing with a
         placeholder constant).
         """
+        if "deepseek_v4" in self.geometry:
+            raise ValueError("DeepSeek V4 packed cache capacity requires runtime group allocations")
         if not (capacity and int(capacity) > 0):
             raise ValueError(
                 "naive fallback requires gpu_memory_capacity_bytes_override (the native "
@@ -1192,8 +1179,7 @@ class NaiveKVCacheEstimator:
                 "insufficient model metadata; missing: per-token KV geometry "
                 "(layer count + KV attention heads/head dimension, or the MLA latent dims)"
             )
-        if weight_bytes is None:
-            weight_bytes = self.weight_bytes()
+        weight_bytes = self.weight_bytes()
         if weight_bytes is None:
             raise ValueError(
                 "insufficient model metadata; missing: weight-estimate fields "
@@ -1212,7 +1198,9 @@ class NaiveKVCacheEstimator:
                 f"KV-cache memory limit (capacity={int(max(capacity_bytes, 0.0))} bytes)"
             )
 
-        tokens_from_kv_bytes = partial(self.get_kvcache_max_tokens, mode=mode, max_batch_size=max_batch_size)
+        tokens_from_kv_bytes = partial(self.get_kvcache_max_tokens, max_batch_size=max_batch_size)
+        if scheduler_backend is not None:
+            tokens_from_kv_bytes = self._shared_tokens_from_bytes(kv_per_token, scheduler_backend, scheduler_block_size)
         return {
             "total_gpu_capacity_bytes": int(max(capacity_bytes, 0.0)),
             "total_kv_size_bytes": math.floor(total_kv_size_bytes_f),
@@ -1225,6 +1213,39 @@ class NaiveKVCacheEstimator:
             "memory_breakdown": None,
             "tolerance_adjusted": None,
         }
+
+    def _shared_tokens_from_bytes(self, token_bytes: float, backend: str, block_size: int | None) -> TokensFromBytes:
+        """Bound independent scheduler blocks with live prefill pages in every attention group."""
+        geom = self.geometry
+        sliding_count, full_count = geom.get("num_swa_layers"), geom.get("num_global_layers")
+        row_rate = layer_rate = token_bytes
+        grouped_geometry = geom.get("swa_kv_heads") or geom.get("swa_head_dim")
+        if sliding_count and full_count and not geom.get("kv_lora_rank"):
+            widest = max(self._attention_layer_rates())
+            layer_rate = widest * (sliding_count + full_count)
+            if backend == "vllm":
+                # vLLM unifies page sizes and splits each layer type into equally wide groups, padding the last.
+                # Comparable layer counts use the wider group. Larger ratios use the narrower group.
+                smaller, larger = sorted((sliding_count, full_count))
+                row_layers = larger if 2 * larger < 3 * smaller else smaller
+                groups = -(-sliding_count // row_layers) + -(-full_count // row_layers)
+                row_rate = widest * row_layers
+                layer_rate = row_rate * groups
+        if block_size is None:
+            if backend == "vllm" and grouped_geometry:
+                # Group-specific geometry has no single known page size. Allow room for its null row
+                # even if the client chooses only one large independently allocated block.
+                return _linear_tokens_from_bytes(layer_rate + row_rate)
+            return _linear_tokens_from_bytes(token_bytes if backend == "vllm" else layer_rate)
+
+        def schedulable_tokens(budget: float) -> int:
+            # A layer-outermost vLLM pool permanently holds one physical row. Each logical scheduler
+            # block can open a whole page in every group, including when each request has only one block.
+            null_bytes = block_size * row_rate if backend == "vllm" else 0
+            blocks = max(0, int((budget - null_bytes) // (block_size * layer_rate)))
+            return blocks * block_size
+
+        return schedulable_tokens
 
     def _hybrid_tokens_from_bytes(self, max_batch_size: int = 1) -> TokensFromBytes | None:
         """Piecewise sliding-window inverse closure, or ``None`` when not hybrid.
@@ -1286,7 +1307,7 @@ def estimate_kv_cache(
     moe_tp_size: int | None = None,
     moe_ep_size: int | None = None,
     cp_size: int = 1,
-    dcp_size: int = 1,
+    dcp_size: int | None = None,
     gemm_quant_mode: str | None = None,
     moe_quant_mode: str | None = None,
     kvcache_quant_mode: str | None = None,
@@ -1309,6 +1330,7 @@ def estimate_kv_cache(
     worker_type: str = "aggregated",
     context_length: int | None = None,
     request_occupancy_tokens: int | None = None,
+    scheduler_block_size: int | None = None,
     colocated_encoder: bool = False,
     reserved_bytes: int = 0,
     encoder_parallel: str | None = None,
@@ -1342,6 +1364,10 @@ def estimate_kv_cache(
             ``mem_fraction_static``. Must be no greater than ``2**53`` so the
             floating-point budget math preserves the integer exactly. Defaults
             to zero for wire compatibility.
+        dcp_size: decode context parallel width. A config-only nested decoder at TP greater than one
+            needs the explicit width to distinguish an unsharded cache from DCP.
+        scheduler_block_size: optional tokens per scheduler block for config-only grouped attention.
+            With a known block size, the vLLM fallback reserves its pool-wide null row once.
         tolerance_fraction: optional safety margin in ``[0, 1)``; when set,
             ``tolerance_adjusted`` is populated with ``floor(raw * (1 - t))``
             bytes and the recomputed token count. ``None`` -> raw estimate only.
@@ -1393,7 +1419,10 @@ def estimate_kv_cache(
     _validate_reserved_bytes(reserved_bytes)
     # Before the model build and the naive fallback, which would swallow the error.
     validate_parallel_size("cp_size", cp_size)
-    validate_parallel_size("dcp_size", dcp_size)
+    explicit_dcp = dcp_size is not None
+    dcp_size = validate_parallel_size("dcp_size", 1 if dcp_size is None else dcp_size)
+    if scheduler_block_size is not None:
+        validate_parallel_size("scheduler_block_size", scheduler_block_size)
     fraction = float(memory_fraction_value)
     is_of_free = memory_fraction_kind == "of_free"
 
@@ -1526,6 +1555,16 @@ def estimate_kv_cache(
     for name, value in (("moe_tp_size", moe_tp_size), ("moe_ep_size", moe_ep_size)):
         if value is not None:
             validate_parallel_size(name, value)
+    validate_parallel_size("max_batch_size", max_batch_size)
+    for field, mode, options in (
+        ("gemm_quant_mode", gemm_quant_mode, GEMMQuantMode),
+        ("moe_quant_mode", moe_quant_mode, MoEQuantMode),
+        ("kvcache_quant_mode", kvcache_quant_mode, KVCacheQuantMode),
+        ("fmha_quant_mode", fmha_quant_mode, FMHAQuantMode),
+        ("comm_quant_mode", comm_quant_mode, CommQuantMode),
+    ):
+        if mode is not None and (not isinstance(mode, str) or mode not in options.__members__):
+            raise ValueError(f"unsupported {field} {mode!r}")
     validate_moe_controls(
         model_path=model_path,
         enable_eplb=enable_eplb,
@@ -1599,38 +1638,36 @@ def estimate_kv_cache(
             moe_ep_size=int(moe_ep_size or 1),
             moe_tp_size=int(moe_tp_size or 1),
         )
-        weight_bytes = None
-        if "deepseek_v4" in naive.geometry:
-            # The packed rows and fixed compressor state follow vLLM's unstriped allocator.
-            if backend != "vllm" or cp_size != 1 or dcp_size != 1:
-                raise ValueError("DeepSeek V4 naive cache sizing requires vLLM with CP=1 and DCP=1") from exc
-            if kvcache_quant_mode not in (None, "fp8"):
-                raise ValueError("DeepSeek V4 stores fp8_ds_mla KV; use kvcache_quant_mode fp8") from exc
-            if nextn:
-                raise ValueError("DeepSeek V4 naive sizing requires nextn=0") from exc
-            if pp_size != 1:
-                raise ValueError("DeepSeek V4 cache sizing requires PP=1") from exc
-            weight_bytes = naive._deepseek_v4_weights(
+        if naive._nested_decoder and tp_size > 1 and not explicit_dcp and "deepseek_v4" not in naive.geometry:
+            raise ValueError(
+                "config-only sizing of a nested decoder at TP>1 requires explicit dcp_size. "
+                "Set dcp_size=1 for an unsharded cache"
+            ) from exc
+        if cp_size != 1 or dcp_size != 1:
+            raise ValueError(
+                "config-only cache sizing requires CP=1 and DCP=1; context parallelism needs the native model"
+            ) from exc
+        if naive.geometry.get("num_experts") and (
+            naive._nested_decoder or moe_tp_size is not None or moe_ep_size is not None
+        ):
+            ranks = build_model_config(
+                tp_size=tp_size,
+                pp_size=pp_size,
                 attention_dp_size=attention_dp_size,
-                gemm_quant_mode=gemm_quant_mode,
-                moe_quant_mode=moe_quant_mode,
-                fmha_quant_mode=fmha_quant_mode,
-                comm_quant_mode=comm_quant_mode,
+                moe_tp_size=moe_tp_size if moe_tp_size is not None or moe_ep_size is not None else 1,
+                moe_ep_size=moe_ep_size,
             )
-        elif kvcache_quant_mode is not None:
+            naive.moe_tp_size, naive.moe_ep_size = ranks.resolve_moe_parallelism()
+        if kvcache_quant_mode is not None:
             naive.set_kvcache_quant_mode(kvcache_quant_mode)
         estimate = naive.estimate(
             capacity=gpu_memory_capacity_bytes_override,
             naive_kv_reservation=float(naive_kv_reservation),
             cuda_graph_reserved_bytes=cuda_graph_reserved_bytes,
-            max_batch_size=int(max_batch_size),
-            # The scheduler can write an in-flight prefill before it releases past sliding blocks.
-            # Config-only sizing lacks physical group pages and the runtime's maximum concurrent batches.
-            mode=NaiveKVCacheMode.LINEAR,
-            weight_bytes=weight_bytes,
+            max_batch_size=max_batch_size,
+            scheduler_backend=backend,
+            scheduler_block_size=scheduler_block_size,
         )
-        if "deepseek_v4" in naive.geometry:
-            estimate["cache_block_size_tokens"] = naive._deepseek_v4_pool()["block_size"]
     else:
         # Native model built: budget-math failures (no KV budget, zero per-token)
         # propagate; they do NOT trigger the naive fallback.
@@ -1719,17 +1756,16 @@ def estimate_num_gpu_blocks(
             model/backend, incompatible memory fraction, out-of-range tolerance,
             no KV budget, etc.).
     """
-    block_size = int(scheduler_block_size)
-    if block_size <= 0 or block_size != scheduler_block_size:
-        raise ValueError(f"scheduler_block_size must be a positive integer, got {scheduler_block_size!r}")
+    block_size = validate_parallel_size("scheduler_block_size", scheduler_block_size)
 
     estimate = estimate_kv_cache(
         model_path,
         system,
         backend,
         backend_version=backend_version,
+        scheduler_block_size=block_size,
         max_num_tokens=max_num_tokens if fpm_profile is not None else int(max_num_tokens),
-        max_batch_size=max_batch_size if fpm_profile is not None else int(max_batch_size),
+        max_batch_size=max_batch_size,
         memory_fraction_kind=memory_fraction_kind,
         memory_fraction_value=float(memory_fraction_value),
         tp_size=tp_size,
@@ -1751,7 +1787,7 @@ def estimate_num_gpu_blocks(
         attention_backend=attention_backend,
         enable_eplb=enable_eplb,
         wideep_num_slots=wideep_num_slots,
-        nextn=nextn if fpm_profile is not None else int(nextn),
+        nextn=nextn,
         systems_path=systems_path,
         gpu_memory_capacity_bytes_override=gpu_memory_capacity_bytes_override,
         cuda_graph_reserved_bytes=cuda_graph_reserved_bytes,
@@ -1774,9 +1810,6 @@ def estimate_num_gpu_blocks(
             "grouped FPM caches require cache_groups and the byte budget from estimate_kv_cache; "
             "a scalar num_gpu_blocks or token capacity cannot represent windowed cache groups"
         )
-    physical_block = estimate.get("cache_block_size_tokens")
-    if physical_block is not None and block_size != physical_block:
-        raise ValueError(f"vLLM's DeepSeek V4 kernels and compressor states use {physical_block}-token blocks")
     adjusted = estimate.get("tolerance_adjusted")
     if adjusted is not None:
         tokens = int(adjusted["total_kv_size_tokens"])

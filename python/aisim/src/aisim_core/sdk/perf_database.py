@@ -369,7 +369,9 @@ def resolve_query_version(
     if version in _SLOT_ALIASES:
         resolved = slots.get(version)
         if resolved is None:
-            raise ValueError(f"{backend} on {system} has no {version!r} version; available slots: {slots}")
+            raise UnlistedQueryVersionError(
+                f"{backend} on {system} has no {version!r} version; available slots: {slots}"
+            )
         return resolved
     if version in slots.values() or allow_unlisted:
         return version

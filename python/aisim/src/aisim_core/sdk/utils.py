@@ -1453,7 +1453,7 @@ def _parse_hf_config_json(config: dict) -> dict:
         # rejects real checkpoints and silently sizes every sliding layer with the
         # global head count.
         other = config.get("attention_other_setting") or {}
-        n_kv = n_kv or config.get("num_attention_groups") or 0
+        n_kv = config.get("num_attention_groups") or n_kv
         swa_n_heads = int(other.get("num_attention_heads", 0) or 0)
         swa_hd_other = int(other.get("head_dim", 0) or 0)
         layer_types_raw = config.get("layer_types", [])
@@ -1491,7 +1491,6 @@ def _parse_hf_config_json(config: dict) -> dict:
             moe_layer_freq=moe_freq,
             # 0 on any field = fall back to the model-level default.
             swa_num_heads=swa_n_heads,
-            swa_num_kv_heads=other.get("num_key_value_heads") or other.get("num_attention_groups") or 0,
             swa_head_dim=swa_hd_other,
             sliding_window_size=config.get("sliding_window", 0) or config.get("sliding_window_size", 0),
             dense_inter_size=0,  # dense layers use model-level inter_size

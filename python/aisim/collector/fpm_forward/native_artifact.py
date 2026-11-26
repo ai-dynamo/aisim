@@ -575,6 +575,11 @@ def _validate_glm_repetitions(
             raise ValueError(f"{error}: missing dispatch receipt for {role} {index}: {path}")
         # Earlier dispatches can build the prefix. Only the final ones are the forwards of this repetition.
         receipts = dispatches[-len(steps) :]
+        counts = repetition.get("scheduled_token_counts")
+        if "scheduled_token_counts" in repetition and (not isinstance(counts, list) or len(counts) != len(dispatches)):
+            raise ValueError(f"{error}: scheduled token count list must align with the dispatch receipts: {path}")
+        scheduled_counts = counts[-len(steps) :] if counts is not None else None
+        previous_output = None
         for step, (fpm, expected) in enumerate(zip(fpms, steps, strict=True)):
             if (
                 not isinstance(fpm, dict)
@@ -597,6 +602,10 @@ def _validate_glm_repetitions(
                 if json.dumps(raw[position], sort_keys=True) != json.dumps(expected_raw, sort_keys=True):
                     raise ValueError(f"{error}: measurement {position} differs from its saved raw sample: {path}")
             basis, graph, _ = _observed_forward(sample, fpm["wall_time"], glm=True, path=path)
+            timing = sample["timing"]
+            if step and timing["start_monotonic"] != previous_output:
+                raise ValueError(f"{error}: inter-output interval must start at the preceding output: {path}")
+            previous_output = timing["end_monotonic"]
             receipt = receipts[step]
             if (
                 basis != ("schedule_to_output" if step == 0 else "inter_output")
@@ -607,6 +616,15 @@ def _validate_glm_repetitions(
                 )
             ):
                 raise ValueError(f"{error}: invalid timing basis or dispatch receipt for {role} {index}: {path}")
+            # Only newly scheduled tokens reach the GPU. The first decode step and the steady step each
+            # schedule one token per request, independent of the amount of prefix KV they read.
+            tokens = expected["sum_prefill_tokens"] + expected["num_decode_requests"]
+            if graph["num_unpadded_tokens"] != tokens or (
+                scheduled_counts is not None and not _same(scheduled_counts[step], tokens)
+            ):
+                raise ValueError(
+                    f"{error}: dispatch differs from the scheduled token count {tokens} for {role} {index}: {path}"
+                )
             previous_forward = forward
     return previous_forward
 

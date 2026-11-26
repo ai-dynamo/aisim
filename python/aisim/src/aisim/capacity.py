@@ -614,6 +614,8 @@ def estimate_kv_bytes_per_token(
         # fixed per-request state, not token bytes. Replicated on every TP rank.
         if kvcache_quant_mode not in (None, "fp8"):
             raise ValueError("DeepSeek V4 stores fp8_ds_mla KV; use kvcache_quant_mode fp8")
+        if kvcache_quant_mode is not None:
+            estimator.set_kvcache_quant_mode(kvcache_quant_mode)
         return int(estimator.kv_bytes_per_token())
     if kvcache_quant_mode is not None:
         estimator.set_kvcache_quant_mode(kvcache_quant_mode)

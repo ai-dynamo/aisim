@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Choose the key of a checkpoint config that nests the text decoder.
+"""Read text decoder keys and cache-layout declarations from a checkpoint config.
 
 FPM config intake, the FPM collector, the FPM profile check, the context lookup of replay and the naive KV-cache
 estimator call decoder_config_key, so all five read one decoder.
@@ -18,6 +18,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+
+WINDOW_FIELDS = ("sliding_window", "sliding_window_size")
+
 
 # The wrappers whose text decoder is under llm_config, and those whose text decoder is under text_config.
 # aisim_core.sdk.common builds MULTIMODAL_TEXT_CONFIG_KEY from these two sets, so the op-level parser and the callers
@@ -134,3 +137,26 @@ def wrapper_key_problem(document: Mapping[str, Any]) -> str | None:
     if own in document or decoder_config_key(document) != other:
         return None
     return f"{wrapper} keeps its text decoder under {own}, but this config holds {other} and no {own}"
+
+
+def layout_integer(value: Any, field: str, *, minimum: int = 1, maximum: int | None = None) -> int:
+    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+        bound = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
+        raise ValueError(f"{field} must be an integer {bound}, not a boolean, float or numeric string")
+    return value
+
+
+def cache_window(raw: Mapping[str, Any]) -> int | None:
+    supplied = {key: layout_integer(raw[key], key, minimum=0) for key in WINDOW_FIELDS if raw.get(key) is not None}
+    if len(set(supplied.values())) > 1:
+        raise ValueError(f"conflicting sliding-window fields: {supplied}")
+    return next(iter(supplied.values()), None)
+
+
+def layer_types(raw: Mapping[str, Any], layers: int | None) -> list[str]:
+    types = raw["layer_types"]
+    if not isinstance(types, list) or (layers is not None and len(types) != layers):
+        raise ValueError("layer_types must have one entry per num_hidden_layers")
+    if any(not isinstance(value, str) or not value.strip() for value in types):
+        raise ValueError("layer_types entries must be nonempty strings")
+    return types

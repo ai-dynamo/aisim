@@ -304,6 +304,11 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
                     "sum_decode_kv_tokens": point["total_kv_read_tokens"] - point["batch_size"],
                 }
                 first["benchmark_sample"] = _glm_forward_sample(point, first["wall_time"], forward - 1, 0)
+                boundary = measured["benchmark_sample"].get("timing", {}).get("start_monotonic")
+                if type(boundary) in (int, float):
+                    first["benchmark_sample"]["timing"].update(
+                        start_monotonic=boundary - first["wall_time"], end_monotonic=boundary
+                    )
                 fpms.insert(0, first)
             repetitions.append(
                 {
@@ -311,6 +316,11 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
                     "repetition": index,
                     "role": "warmup" if index < 5 else "measurement",
                     "fpms": fpms,
+                    "scheduled_token_counts": [
+                        item["scheduled_requests"]["sum_prefill_tokens"]
+                        + item["scheduled_requests"]["num_decode_requests"]
+                        for item in fpms
+                    ],
                     "dispatches": [
                         {
                             key: value
@@ -733,6 +743,7 @@ def test_glm_publication_requires_both_decode_steps(tmp_path, change):
         ("prefill", 0, "dispatch", "dispatch receipt"),
         ("decode", 0, "interval", "contradicts its local timing interval"),
         ("decode", 0, "dispatch", "dispatch receipt"),
+        ("decode", 0, "shifted", "inter-output interval must start at the preceding output"),
         ("decode", 1, "basis", "timing basis or dispatch receipt"),
     ],
 )
@@ -750,12 +761,87 @@ def test_glm_publication_checks_unretained_forward_evidence(tmp_path, phase, ste
             fpm["wall_time"] = 3600.0
         elif change == "dispatch":
             repetition["dispatches"][-len(repetition["fpms"]) + step] = None
+        elif change == "shifted":
+            timing = fpm["benchmark_sample"]["timing"]
+            timing["start_monotonic"] += 3600
+            timing["end_monotonic"] += 3600
         elif change == "interval":
             fpm["benchmark_sample"]["timing"]["end_monotonic"] += 90
         else:
             fpm["benchmark_sample"]["timing"]["basis"] = "schedule_to_output"
 
     _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, expected)
+
+
+@pytest.mark.parametrize(
+    ("phase", "repetition_index", "step", "fault"),
+    [
+        ("prefill", 0, 0, "dispatch"),
+        ("prefill", 5, 0, "dispatch"),
+        ("decode", 5, 0, "dispatch"),
+        ("decode", 0, 1, "dispatch"),
+        ("prefill", 0, 0, "scheduled"),
+        ("decode", 5, 0, "scheduled"),
+        ("decode", 0, 1, "short-list"),
+        ("decode", 0, 1, "boolean"),
+    ],
+)
+def test_glm_publication_matches_each_dispatch_to_its_scheduled_tokens(tmp_path, phase, repetition_index, step, fault):
+    cell = glm_cell(phase)
+    payload = glm_native_payload(phase, points=[PREFILL_COLD if phase == "prefill" else DECODE_POINTS[0]])
+    _glm_producer_shape(tmp_path)(phase, payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    assert len(database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)) == 1
+
+    def corrupt(record):
+        repetition = record["repetitions"][repetition_index]
+        wrong = 1 if phase == "prefill" else 64
+        if fault == "short-list":
+            repetition["scheduled_token_counts"].pop()
+        elif fault == "scheduled":
+            repetition["scheduled_token_counts"][step] = wrong
+        elif fault == "boolean":
+            repetition["scheduled_token_counts"][step] = True
+        else:
+            fpm = repetition["fpms"][step]
+            graph = fpm["benchmark_sample"]["cudagraph"]
+            receipt = {
+                "runtime_mode": "FULL" if wrong == 1 else "PIECEWISE",
+                "num_unpadded_tokens": wrong,
+                "num_padded_tokens": wrong,
+                "num_paddings": 0,
+            }
+            graph.update(receipt)
+            repetition["dispatches"][step] = receipt
+            if phase == "prefill" and repetition_index == 5:
+                # All three copies of the retained observation can agree while naming the wrong workload.
+                payload["results"][0]["fpms"][0]["benchmark_measurement"]["raw_fpms"][0]["benchmark_sample"][
+                    "cudagraph"
+                ].update(receipt)
+
+    _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, "scheduled token count")
+
+
+@pytest.mark.parametrize("records_counts", [True, False])
+def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_path, records_counts):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[DECODE_POINTS[0]])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    sidecar = artifact.with_suffix(".repetitions.jsonl")
+    record = json.loads(sidecar.read_bytes())
+    for repetition in record["repetitions"]:
+        # The seeded prefix runs before the two counted decode forwards; its dispatch receipt may be missing.
+        repetition["dispatches"].insert(0, None)
+        if records_counts:
+            repetition["scheduled_token_counts"].insert(0, 2176)
+        else:
+            del repetition["scheduled_token_counts"]
+    line = json.dumps(record).encode()
+    _rewrite_sidecar(payload, sidecar, [line])
+    payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
+    artifact.write_text(json.dumps(payload))
+    assert len(database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)) == 1
 
 
 def test_glm_forward_indices_are_monotonic_across_all_executed_points_of_one_rank(tmp_path):

@@ -109,17 +109,26 @@ retained window and its in-flight tokens at the same time. The runtime's
 concurrent steps and physical cache pages are needed to tighten that bound.
 The direct estimator's single-request retention curve caps each sliding layer
 at its window. For GPT-OSS-20B at TP1 with 96 MiB available, bf16 KV retains
-3,968 tokens after eviction and allows 2,048 tokens for shared scheduling.
+3,968 tokens after eviction. The 96 MiB budget holds 256 physical rows.
+vLLM reserves one null row. The two groups then fit 127 independently
+schedulable 16-token blocks (2,032 tokens).
 
-For DeepSeek V4, the scheduler fallback models vLLM's packed cache with PP1,
-CP1, DCP1 and no draft tokens. Its offline weight inventory uses the same
-per-operation GEMM and MoE storage formats as the native memory estimator,
-including an adjacent `hf_quant_config.json` when supplied. Explicit modes
-must match the checkpoint. At TP8/EP8, Flash holds 20,364,048,808 bytes of
-resident weights per rank and the NVIDIA NVFP4 variant holds 22,528,309,672.
-The fraction of post-weight memory available for KV remains an estimate.
-Each Flash request reserves 26 fixed 1,002,240-byte rows. Each additional row
-fits 256 tokens and requires a 256-token scheduler block.
+Groups with different KV widths can share a physical page size. Each independent
+scheduler block may open a page in every layer. For Gemma-4-26B at TP1/BF16, 32
+independent 16-token prompts use 120 MiB across 25 sliding and five global layers.
+vLLM reserves one additional 640 KiB row for its null block. A 110 MiB config-only
+budget yields 29 independently schedulable 16-token blocks. The scalar API accepts
+`scheduler_block_size` to reserve that row once. Without a block size it allows
+room for a null row even if the caller chooses just one large scheduler block.
+When the fallback reads an unregistered wrapper’s nested decoder at TP greater
+than one, the scalar request must supply the actual `dcp_size`. At TP1 the
+only legal value is one. The block API passes its DCP setting explicitly.
+
+DeepSeek V4 Flash exposes 3,915 marginal compressed-cache bytes per token.
+Its runtime also reserves compressor state, live sliding and prefill pages, and
+a pool-wide null row. Config-only capacity estimation requires runtime group
+allocations for this layout. Native system estimates and measured FPM cache
+profiles use their respective memory models.
 
 ### FPM profile cache groups and byte budgets
 

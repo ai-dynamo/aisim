@@ -94,7 +94,9 @@ def test_estimate_num_gpu_blocks_rejects_non_positive_or_non_integer_block_size(
         memory_fraction_kind="of_free",
         memory_fraction_value=0.9,
     )
-    for bad in (0, -1, 0.5, 1.5):
+    for bad in (0, -1, 0.5, 1.5, True):
+        with pytest.raises(ValueError, match="scheduler_block_size"):
+            memory.estimate_kv_cache("Qwen/Qwen3-32B", "h200_sxm", "trtllm", scheduler_block_size=bad, **common)
         with pytest.raises(ValueError, match="scheduler_block_size"):
             memory.estimate_num_gpu_blocks(
                 "Qwen/Qwen3-32B",
@@ -1101,16 +1103,10 @@ def test_wrapped_deepseek_v4_uses_the_decoders_compressed_cache(tmp_path):
     for pp_size in (1, 4):
         assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=pp_size) == 3_915
         assert estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=pp_size) == 3_915
-    # The packed Flash pool uses 26 fixed rows of 1,002,240 bytes for one request and one row per 256 tokens.
-    state = 26 * 1_002_240
     for raw in (config, wrapper):
         estimator = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=1, pp_size=1)
-        assert [estimator.get_kvcache_max_tokens(budget) for budget in (3_915, state, state + 1_002_239)] == [0, 0, 0]
-        assert estimator.get_kvcache_max_tokens(state + 1_002_240) == 256
-        assert estimator.get_kvcache_max_tokens(state + 2 * 1_002_240) == 512
-        pipeline = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=1, pp_size=4)
-        with pytest.raises(ValueError, match="DeepSeek V4 cache sizing requires PP=1"):
-            pipeline.get_kvcache_max_tokens(state + 1_002_240)
+        with pytest.raises(ValueError, match="packed cache capacity requires runtime group allocations"):
+            estimator.get_kvcache_max_tokens(27 * 1_002_240)
     with pytest.raises(ValueError, match="DeepSeek V4 stores fp8_ds_mla KV"):
         estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=1, kvcache_quant_mode="bfloat16")
 
@@ -1382,11 +1378,9 @@ def test_gpt_oss_scheduler_pool_covers_in_flight_prefill(tmp_path, batch, chunk)
     capacity, adjusted = 2048, 1024
     assert result["total_kv_size_tokens"] == capacity
     assert result["tolerance_adjusted"]["total_kv_size_tokens"] == adjusted
-    assert memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16) == capacity // 16
-    assert (
-        memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16, tolerance_fraction=0.5)
-        == adjusted // 16
-    )
+    assert memory.estimate_kv_cache(*args, **options, scheduler_block_size=16)["total_kv_size_tokens"] == 2032
+    assert memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16) == 127
+    assert memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16, tolerance_fraction=0.5) == 63
 
 
 @pytest.mark.parametrize("wrapped", [True, False], ids=["registered-wrapper", "flat-text-export"])
@@ -1418,17 +1412,28 @@ def test_gemma4_cache_rates_follow_each_attention_group(tmp_path, wrapped, mode,
     )
     result = memory.estimate_kv_cache(*args, **options)
     assert result["kv_size_per_token_bytes"] == rate
-    assert result["total_kv_size_tokens"] == _GIB // rate
-    assert memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16) == _GIB // rate // 16
+    # Each independent scheduler block can open a page in all 30 layers at the larger per-layer size.
+    shared_rate = 30 * 1024 * width
+    row_rate = 5 * 1024 * width
+    assert result["total_kv_size_tokens"] == _GIB // (shared_rate + row_rate)
+    expected = (_GIB - 16 * row_rate) // shared_rate
+    assert (
+        memory.estimate_kv_cache(*args, **options, scheduler_block_size=16)["total_kv_size_tokens"]
+        == expected // 16 * 16
+    )
+    assert memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16) == expected // 16
 
 
-def test_unknown_wrapper_uses_step_decoder_attention_groups(tmp_path):
+@pytest.mark.parametrize("other_groups", [4, 8])
+def test_unknown_wrapper_uses_step_decoder_attention_groups(tmp_path, other_groups):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     decoder = _load_pre_downloaded_hf_config("stepfun-ai/Step-3.7-Flash")
     decoder["architectures"] = ["Step3p5ForCausalLM"]
     decoder["num_attention_groups"] = decoder.pop("num_key_value_heads")
+    decoder["attention_other_setting"].update(num_attention_groups=other_groups, head_dim=64)
+    # Step reads KV heads and explicit head_dim from the decoder for every attention layer.
     decoder["layer_types"].extend(["sliding_attention"] * decoder["num_nextn_predict_layers"])
     checkpoint = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": decoder})
     assert estimate_kv_bytes_per_token(checkpoint, tp_size=1, pp_size=1) == 45 * 8 * 128 * 2 * 2 == 184_320
@@ -1445,7 +1450,20 @@ def test_unknown_wrapper_uses_step_decoder_attention_groups(tmp_path):
     )
     args = (checkpoint, "missing-memory-spec", "vllm", "0.33.0")
     assert memory.estimate_kv_cache(*args, **options)["total_kv_size_tokens"] == 364
-    assert memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16) == 22
+    assert memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16) == 21
+
+
+def test_step_cache_uses_each_query_group_when_the_decoder_omits_its_head_dimension(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("stepfun-ai/Step-3.7-Flash")
+    raw["architectures"] = ["Step3p5ForCausalLM"]
+    del raw["head_dim"]
+    raw["num_sliding_attention_heads"] = 32
+    checkpoint = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": raw})
+    # The runtime derives head_dim from 4096 / query heads separately for 33 sliding and 12 full layers.
+    assert estimate_kv_bytes_per_token(checkpoint, tp_size=1, pp_size=1) == 2 * 2 * 8 * (33 * 128 + 12 * 64)
 
 
 def test_nested_fp8_kv_leaves_the_checkpoint_weight_budget_intact(tmp_path):
@@ -1478,7 +1496,7 @@ def test_nested_fp8_kv_leaves_the_checkpoint_weight_budget_intact(tmp_path):
         assert shared["total_kv_size_tokens"] == tokens
         assert (
             memory.estimate_num_gpu_blocks(*args, **options, kvcache_quant_mode=mode, scheduler_block_size=16)
-            == tokens // 16
+            == tokens // 16 - 1
         )
 
 
@@ -1512,254 +1530,270 @@ def test_absent_or_disabled_window_preserves_linear_capacity(window):
     assert estimator.get_kvcache_max_tokens(_GIB, max_batch_size=32) == _GIB // estimator.kv_bytes_per_token()
 
 
-def test_deepseek_v4_sdk_fallback_reserves_each_requests_packed_state(tmp_path):
-    # Native TP8/EP8 resident inventory includes FP8 projections, MXFP4 routed experts, and replicated tensors.
-    weight = 20_364_048_808
-    row = 1_002_240
-    args = ("deepseek-ai/DeepSeek-V4-Flash", "missing-memory-spec", "vllm", "0.33.0")
-    options = dict(
-        systems_path=str(tmp_path),
-        max_num_tokens=8192,
-        max_batch_size=2,
-        tp_size=8,
-        moe_ep_size=8,
-        moe_tp_size=1,
-        memory_fraction_kind="of_total",
-        memory_fraction_value=0.9,
-        allow_naive_fallback=True,
-        naive_kv_reservation=1.0,
-    )
-    result = memory.estimate_kv_cache(
-        *args, **options, gpu_memory_capacity_bytes_override=weight + 64 * row, tolerance_fraction=0.125
-    )
-    assert result["source"] == "naive_fallback"
-    assert result["kv_size_per_token_bytes"] == 3915
-    assert result["total_kv_size_bytes"] == 64 * row
-    # Each of the two requests needs 26 rows before compressed tokens can use whole 256-token rows.
-    assert result["total_kv_size_tokens"] == (64 - 52) * 256
-    assert result["tolerance_adjusted"]["total_kv_size_tokens"] == (56 - 52) * 256
-    assert (
-        memory.estimate_num_gpu_blocks(
-            *args,
-            **options,
-            scheduler_block_size=256,
-            gpu_memory_capacity_bytes_override=weight + 64 * row,
-            tolerance_fraction=0.125,
-        )
-        == 4
-    )
-    for extra, blocks in [(-1, 0), (0, 1)]:
-        assert (
-            memory.estimate_num_gpu_blocks(
-                *args, **options, scheduler_block_size=256, gpu_memory_capacity_bytes_override=weight + 53 * row + extra
-            )
-            == blocks
-        )
-    for incompatible in (16, 128, 512):
-        with pytest.raises(ValueError, match="256-token blocks"):
-            memory.estimate_num_gpu_blocks(
-                *args,
-                **options,
-                scheduler_block_size=incompatible,
-                gpu_memory_capacity_bytes_override=weight + 53 * row,
-            )
-    for override, reason in [
-        ({"kvcache_quant_mode": "bfloat16"}, "fp8_ds_mla"),
-        ({"nextn": 1}, "nextn=0"),
-        ({"gemm_quant_mode": "fp8"}, "checkpoint"),
-        ({"moe_quant_mode": "nvfp4"}, "checkpoint"),
-    ]:
-        with pytest.raises(ValueError, match=reason):
-            memory.estimate_kv_cache(*args, **options, **override, gpu_memory_capacity_bytes_override=weight + 64 * row)
-    assert (
-        memory.estimate_num_gpu_blocks(
-            *args,
-            **(options | {"moe_tp_size": None}),
-            gemm_quant_mode="fp8_block",
-            moe_quant_mode="w4a8_mxfp4_mxfp8",
-            scheduler_block_size=256,
-            gpu_memory_capacity_bytes_override=weight + 64 * row,
-        )
-        == 12
-    )
-
-
 @pytest.mark.parametrize(
-    ("model", "moe_mode", "weight", "tokens"),
+    ("model", "tp", "extra"),
     [
-        ("deepseek-ai/DeepSeek-V4-Flash", "w4a8_mxfp4_mxfp8", 20_364_048_808, 5_755_648),
-        ("nvidia/DeepSeek-V4-Flash-NVFP4", "nvfp4", 22_528_309_672, 5_202_688),
-        ("sgl-project/DeepSeek-V4-Flash-FP8", "fp8_block", 37_678_135_720, 1_332_992),
+        ("deepseek-ai/DeepSeek-V4-Flash", 8, {}),
+        ("deepseek-ai/DeepSeek-V4-Flash", 16, {}),
+        ("deepseek-ai/DeepSeek-V4-Flash", 3, {}),
+        ("deepseek-ai/DeepSeek-V4-Flash", 8, {"dcp_size": 2}),
+        ("deepseek-ai/DeepSeek-V4-Pro", 16, {}),
+        ("deepseek-ai/DeepSeek-V4-Pro", 32, {}),
+        ("nvidia/DeepSeek-V4-Flash-NVFP4", 8, {}),
     ],
 )
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_deepseek_v4_fallback_preserves_the_checkpoints_weight_modes(
-    tmp_path, model, moe_mode, weight, tokens, wrapped
-):
-    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config, _load_pre_downloaded_hf_quant_config
-
-    if wrapped:
-        decoder = _load_pre_downloaded_hf_config(model)
-        sidecar = _load_pre_downloaded_hf_quant_config(model)
-        model = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": decoder})
-        if sidecar:
-            (tmp_path / "hf_quant_config.json").write_text(json.dumps(sidecar))
+def test_a_missing_system_cannot_supply_deepseek_v4_packed_capacity(tmp_path, model, tp, extra):
     args = (model, "missing-memory-spec", "vllm", "0.33.0")
     options = dict(
         systems_path=str(tmp_path),
-        max_num_tokens=8192,
-        max_batch_size=2,
-        tp_size=8,
-        moe_ep_size=8,
+        tp_size=tp,
         moe_tp_size=1,
+        moe_ep_size=tp,
+        max_num_tokens=256,
+        max_batch_size=1,
         memory_fraction_kind="of_total",
         memory_fraction_value=0.9,
-        gpu_memory_capacity_bytes_override=40 * _GIB,
+        gpu_memory_capacity_bytes_override=20_364_048_808 + 27 * 1_002_240,
         allow_naive_fallback=True,
-        naive_kv_reservation=1.0,
+        naive_kv_reservation=1,
+        **extra,
     )
-    implicit = memory.estimate_kv_cache(*args, **options)
-    assert implicit["total_kv_size_bytes"] == 40 * _GIB - weight
-    assert implicit["total_kv_size_tokens"] == tokens
-    for modes in (
-        {"gemm_quant_mode": "fp8_block"},
-        {"moe_quant_mode": moe_mode},
-        {"gemm_quant_mode": "fp8_block", "moe_quant_mode": moe_mode},
+    # Raw capacity and both scheduler page sizes must refuse, including through a tolerance-adjusted estimate.
+    for function, args_extra in (
+        (memory.estimate_kv_cache, {"tolerance_fraction": 0.1}),
+        (memory.estimate_num_gpu_blocks, {"scheduler_block_size": 16}),
+        (memory.estimate_num_gpu_blocks, {"scheduler_block_size": 256}),
     ):
-        assert memory.estimate_kv_cache(*args, **options, **modes) == implicit
-        assert memory.estimate_num_gpu_blocks(*args, **options, **modes, scheduler_block_size=256) == tokens // 256
-    with pytest.raises(ValueError, match="checkpoint"):
-        memory.estimate_kv_cache(*args, **options, moe_quant_mode="bfloat16")
+        with pytest.raises(ValueError, match="packed cache capacity|context parallelism"):
+            function(*args, **options, **args_extra)
 
 
-@pytest.mark.parametrize(
-    ("backend", "tp", "dp", "cp", "dcp", "ep", "reason"),
-    [
-        ("vllm", 8, 1, 1, 2, 8, "CP=1 and DCP=1"),
-        ("vllm", 8, 1, 2, 1, 16, "CP=1 and DCP=1"),
-        ("sglang", 1, 1, 2, 1, 2, "vLLM"),
-        ("sglang", 8, 1, 1, 2, 8, "vLLM"),
-        ("trtllm", 8, 1, 1, 1, 8, "vLLM"),
-        ("vllm", 8, 1, 1, 1, 16, "Parallelism width mismatch"),
-        ("vllm", 8, 2, 1, 1, 8, "Parallelism width mismatch"),
-        ("vllm", 8, 64, 1, 1, 512, "number of experts"),
-    ],
-)
-def test_deepseek_v4_fallback_requires_a_modeled_rank_layout(tmp_path, backend, tp, dp, cp, dcp, ep, reason):
-    args = ("deepseek-ai/DeepSeek-V4-Flash", "missing-memory-spec", backend)
-    options = dict(
-        systems_path=str(tmp_path),
-        max_num_tokens=8192,
-        max_batch_size=2,
-        tp_size=tp,
-        attention_dp_size=dp,
-        cp_size=cp,
-        dcp_size=dcp,
-        moe_ep_size=ep,
-        moe_tp_size=1,
-        memory_fraction_kind="of_free" if backend == "trtllm" else "of_total",
-        memory_fraction_value=0.9,
-        allow_naive_fallback=True,
-        gpu_memory_capacity_bytes_override=100 * _GIB,
-    )
-    with pytest.raises(ValueError, match=reason):
-        memory.estimate_kv_cache(*args, **options)
-    with pytest.raises(ValueError, match=reason):
-        memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=256)
+@pytest.mark.parametrize("source", ["decoder", "sidecar"])
+def test_deepseek_v4_marginal_bytes_respect_the_effective_kv_precision(tmp_path, source):
+    from pathlib import Path
 
-
-def test_unquantized_v4_uses_bfloat16_weight_inventory(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     raw = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V4-Flash")
-    del raw["expert_dtype"], raw["quantization_config"]
+    if source == "decoder":
+        raw["quantization_config"]["kv_cache_quant_algo"] = "NVFP4"
+    model = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": raw})
+    if source == "sidecar":
+        (Path(model) / "hf_quant_config.json").write_text(
+            json.dumps({"quantization": {"kv_cache_quant_algo": "NVFP4"}})
+        )
+    with pytest.raises(ValueError, match="fp8_ds_mla"):
+        estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1)
+    assert estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1, kvcache_quant_mode="fp8") == 3915
+
+
+@pytest.mark.parametrize("tp", [1, 4, 8])
+@pytest.mark.parametrize("shape", ["registered", "flat-text", "unknown-wrapper"])
+def test_gemma_cache_pages_charge_every_short_request(tmp_path, tp, shape):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("nvidia/Gemma-4-26B-A4B-NVFP4")
+    if shape == "flat-text":
+        raw = raw["text_config"]
+    elif shape == "unknown-wrapper":
+        raw = {"architectures": [_UNKNOWN_WRAPPER], "text_config": raw["text_config"]}
     model = _write_config(tmp_path, raw)
+    estimator = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=tp, pp_size=1, moe_tp_size=1, moe_ep_size=tp)
+    sliding = 2 * (-(-8 // tp)) * 256 * 2
+    full = 2 * (-(-2 // tp)) * 512 * 2
+    # vLLM uses six groups of five layers. Equal per-layer widths at TP4 still require the null row.
+    page_bytes = 16 * max(sliding, full)
+    data_bytes = 32 * 30 * page_bytes
+    row_bytes = 5 * page_bytes
     options = dict(
         systems_path=str(tmp_path),
-        tp_size=8,
-        moe_tp_size=1,
-        moe_ep_size=8,
-        max_num_tokens=4096,
-        max_batch_size=2,
+        max_num_tokens=512,
+        max_batch_size=32,
         memory_fraction_kind="of_total",
         memory_fraction_value=0.9,
-        gpu_memory_capacity_bytes_override=80 * _GIB,
-        naive_kv_reservation=1.0,
         allow_naive_fallback=True,
+        naive_kv_reservation=1,
+        tp_size=tp,
+        moe_tp_size=1,
+        moe_ep_size=tp,
     )
-    result = memory.estimate_kv_cache(
-        model, "missing-memory-spec", "vllm", **options, gemm_quant_mode="bfloat16", moe_quant_mode="bfloat16"
-    )
-    assert result["total_kv_size_bytes"] == 80 * _GIB - 73_561_455_016
-    assert result["total_kv_size_tokens"] == ((80 * _GIB - 73_561_455_016) // 1_002_240 - 52) * 256
+    options["dcp_size"] = 1
+    args = (model, "missing-memory-spec", "vllm", "0.33.0")
+    threshold = data_bytes + row_bytes
+    cases = [(data_bytes, 31), (threshold - 1, 31), (threshold, 32)]
+    if tp == 1:
+        assert data_bytes == 120 * 1024**2
+        cases.append((110 * 1024**2, 29))
+    if tp == 4:
+        assert data_bytes == 30 * 1024**2 and threshold == 31_621_120
+    for budget, blocks in cases:
+        capacity = estimator.weight_bytes() + budget
+        result = memory.estimate_kv_cache(
+            *args, **options, scheduler_block_size=16, gpu_memory_capacity_bytes_override=capacity
+        )
+        assert result["kv_size_per_token_bytes"] == (25 * sliding + 5 * full)
+        assert result["total_kv_size_tokens"] == 16 * blocks
+        assert (
+            memory.estimate_num_gpu_blocks(
+                *args, **options, scheduler_block_size=16, gpu_memory_capacity_bytes_override=capacity
+            )
+            == blocks
+        )
+
+
+@pytest.mark.parametrize("window", [0, 1024])
+def test_flat_gemma_layout_covers_the_full_decoder_even_without_retention(tmp_path, window):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("nvidia/Gemma-4-26B-A4B-NVFP4")["text_config"]
+    checkpoint = _write_config(tmp_path, raw | {"sliding_window": window, "layer_types": ["full_attention"]})
+    with pytest.raises(ValueError, match="1 entries for 30 decoder layers"):
+        estimate_kv_bytes_per_token(checkpoint, tp_size=8, pp_size=1)
 
 
 @pytest.mark.parametrize(
-    ("invalid", "message"),
+    ("override", "reason"),
     [
-        ({"tp_size": 3, "moe_tp_size": 3, "moe_ep_size": 1}, "num_heads 64 should be divisible"),
-        ({"moe_tp_size": 0.5, "moe_ep_size": 16}, "moe_tp_size must be a positive integer"),
-        ({"moe_tp_size": 1, "moe_ep_size": 8.0}, "moe_ep_size must be a positive integer"),
-        ({"tp_size": 8.5}, "tp_size must be a positive integer"),
-        ({"pp_size": True}, "pp_size must be a positive integer"),
-        ({"attention_dp_size": 0}, "attention_dp_size must be a positive integer"),
+        ({"moe_ep_size": 32}, "Parallelism width mismatch"),
+        ({"dcp_size": 2}, "context parallelism"),
+        ({"cp_size": 2}, "context parallelism"),
+        ({"gemm_quant_mode": "not_a_mode"}, "unsupported gemm_quant_mode"),
+        ({"moe_quant_mode": ""}, "unsupported moe_quant_mode"),
+        ({"kvcache_quant_mode": "fp8_typo"}, "unsupported kvcache_quant_mode"),
+        ({"fmha_quant_mode": "fp8_typo"}, "unsupported fmha_quant_mode"),
+        ({"comm_quant_mode": "fp8_typo"}, "unsupported comm_quant_mode"),
+        ({"moe_tp_size": 0.5, "moe_ep_size": 2}, "moe_tp_size must be a positive integer"),
+        ({"nextn": 0.5}, "must be an integer draft length"),
+        ({"nextn": True}, "must be an integer draft length"),
+        ({"max_batch_size": 1.5}, "max_batch_size must be a positive integer"),
+        ({"max_batch_size": True}, "max_batch_size must be a positive integer"),
     ],
 )
-def test_v4_pool_rejects_invalid_physical_ranks_before_coercion(tmp_path, invalid, message):
-    args = ("deepseek-ai/DeepSeek-V4-Flash", "missing-memory-spec", "vllm", "0.33.0")
-    opts = (
-        dict(
-            systems_path=str(tmp_path),
-            tp_size=8,
-            moe_tp_size=1,
-            moe_ep_size=8,
-            max_batch_size=2,
-            max_num_tokens=4096,
-            memory_fraction_kind="of_total",
-            memory_fraction_value=0.9,
-            gpu_memory_capacity_bytes_override=280 * _GIB,
-            allow_naive_fallback=True,
-        )
-        | invalid
+def test_wrapped_moe_public_capacity_validates_the_deployment(tmp_path, override, reason):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("openai/gpt-oss-20b")
+    model = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": raw})
+    base = dict(
+        systems_path=str(tmp_path),
+        max_num_tokens=4096,
+        max_batch_size=1,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        moe_tp_size=1,
+        moe_ep_size=1,
+        allow_naive_fallback=True,
+        gpu_memory_capacity_bytes_override=60 * _GIB,
     )
+    args = (model, "missing-memory-spec", "sglang", "0.33.0")
     for function, extra in (
         (memory.estimate_kv_cache, {}),
-        (memory.estimate_num_gpu_blocks, {"scheduler_block_size": 256}),
+        (memory.estimate_num_gpu_blocks, {"scheduler_block_size": 16}),
     ):
-        with pytest.raises(ValueError, match=message):
-            function(*args, **opts, **extra)
+        assert function(*args, **base, **extra)
+        with pytest.raises(ValueError, match=reason):
+            function(*args, **(base | override), **extra)
 
 
-def test_v4_pool_respects_the_known_systems_version_slots(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "model, row_bytes, groups, logical_blocks",
+    [
+        ("openai/gpt-oss-20b", 393_216, 2, 128),
+        ("Qwen/Qwen3-0.6B", 1_835_008, 1, 32),
+    ],
+)
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_vllm_public_scheduler_capacity_counts_full_pages_and_a_null_row(
+    tmp_path, model, row_bytes, groups, logical_blocks, wrapped
+):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config(model)
+    if wrapped:
+        model = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": raw})
+    weights = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=1, pp_size=1).weight_bytes()
+    options = dict(
+        systems_path=str(tmp_path),
+        max_num_tokens=4096,
+        max_batch_size=1 if groups == 2 else 32,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        allow_naive_fallback=True,
+        naive_kv_reservation=1,
+        scheduler_block_size=16,
+    )
+    threshold = (logical_blocks * groups + 1) * row_bytes
+    args = (model, "missing-memory-spec", "vllm", "0.33.0")
+    for budget, expected in [
+        (threshold - row_bytes, logical_blocks - 1),
+        (threshold - 1, logical_blocks - 1),
+        (threshold, logical_blocks),
+    ]:
+        capacity = weights + budget
+        result = memory.estimate_kv_cache(*args, **options, gpu_memory_capacity_bytes_override=capacity)
+        assert result["total_kv_size_tokens"] == expected * 16
+        assert memory.estimate_num_gpu_blocks(*args, **options, gpu_memory_capacity_bytes_override=capacity) == expected
+
+
+def test_nested_scalar_requires_explicit_dcp_only_when_tp_can_partition_the_cache(tmp_path):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("openai/gpt-oss-20b")
+    model = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": raw})
+    args = (model, "missing-memory-spec", "sglang", "0.5.20")
+    options = dict(
+        systems_path=str(tmp_path),
+        max_num_tokens=4096,
+        max_batch_size=1,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        gpu_memory_capacity_bytes_override=60 * _GIB,
+        allow_naive_fallback=True,
+    )
+    assert memory.estimate_kv_cache(*args, **options) == memory.estimate_kv_cache(*args, **options, dcp_size=1)
+    with pytest.raises(ValueError, match="context parallelism"):
+        memory.estimate_kv_cache(*args, **options, dcp_size=2)
+    opts = options | {"tp_size": 2, "moe_tp_size": 1, "moe_ep_size": 2}
+    with pytest.raises(ValueError, match="requires explicit dcp_size"):
+        memory.estimate_kv_cache(*args, **opts)
+    assert memory.estimate_kv_cache(*args, **opts, dcp_size=1)["source"] == "naive_fallback"
+    with pytest.raises(ValueError, match="context parallelism"):
+        memory.estimate_kv_cache(*args, **opts, dcp_size=2)
+    assert memory.estimate_num_gpu_blocks(*args, **opts, scheduler_block_size=16) > 0
+
+
+def test_fallback_preserves_the_known_systems_version_slots(tmp_path, monkeypatch):
     from aisim_core.sdk import perf_database
 
     monkeypatch.delenv("AIC_ALLOW_UNLISTED_VERSIONS", raising=False)
-    (tmp_path / "gb300.yaml").write_text("data_dir: data/gb300\n")
-    (tmp_path / "data/gb300/vllm/0.33.0").mkdir(parents=True)
-    (tmp_path / "query_versions.yaml").write_text("schema_version: 1\ndefaults: {vllm: {current: '0.33.0'}}\n")
-    opts = dict(
+    (tmp_path / "a100_sxm.yaml").write_text("data_dir: data/a100_sxm\n")
+    (tmp_path / "data/a100_sxm/vllm/0.14.0").mkdir(parents=True)
+    (tmp_path / "query_versions.yaml").write_text(
+        "schema_version: 1\noverrides: {a100_sxm: {vllm: {current: '0.14.0'}}}\n"
+    )
+    options = dict(
         systems_path=str(tmp_path),
-        tp_size=8,
-        moe_tp_size=1,
-        moe_ep_size=8,
         max_batch_size=2,
         max_num_tokens=4096,
         memory_fraction_kind="of_total",
         memory_fraction_value=0.9,
-        gpu_memory_capacity_bytes_override=40 * _GIB,
-        naive_kv_reservation=1,
+        gpu_memory_capacity_bytes_override=60 * _GIB,
         allow_naive_fallback=True,
     )
-    model = "deepseek-ai/DeepSeek-V4-Flash"
+    model = "openai/gpt-oss-20b"
     for function, extra in (
         (memory.estimate_kv_cache, {}),
-        (memory.estimate_num_gpu_blocks, {"scheduler_block_size": 256}),
+        (memory.estimate_num_gpu_blocks, {"scheduler_block_size": 16}),
     ):
-        with pytest.raises(perf_database.UnlistedQueryVersionError, match="0.1.0.*not a queryable version"):
-            function(model, "gb300", "vllm", "0.1.0", **opts, **extra)
-    # The fixture has no complete hardware spec. An admitted slot can use the caller's memory override.
-    for version in ("current", "0.33.0"):
-        assert memory.estimate_kv_cache(model, "gb300", "vllm", version, **opts)["total_kv_size_tokens"] == 5_755_648
+        for version, message in [("0.1.0", "not a queryable version"), ("next", "has no 'next' version")]:
+            with pytest.raises(perf_database.UnlistedQueryVersionError, match=message):
+                function(model, "a100_sxm", "vllm", version, **options, **extra)
+        # The accepted alias and literal still permit an incomplete hardware specification to use the override.
+        assert function(model, "a100_sxm", "vllm", "current", **options, **extra) == function(
+            model, "a100_sxm", "vllm", "0.14.0", **options, **extra
+        )
 
 
 @pytest.mark.parametrize("wrapped", [True, False])

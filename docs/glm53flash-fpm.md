@@ -196,8 +196,12 @@ this producer. The cell selects these rules, not the artifact:
   Each repetition has its own index and an increasing attempt number. Prefill
   records one forward. Decode records two forwards for the full batch, with
   one fewer KV token per request in the first. The reader verifies each
-  forward's rank, scheduled work, positive wall time and order. The ten
-  measured forwards match their saved raw samples in every field except the
+  forward's rank, scheduled work, positive wall time and order. The unpadded
+  token count in each graph dispatch must equal the new prefill tokens or the
+  decode batch size. The producer's per-step scheduled counts, when recorded,
+  must agree with the same workload. The second decode interval starts at the
+  first forward’s recorded output timestamp. The ten measured forwards match their
+  saved raw samples in every field except the
   sample index, which the producer renumbers for publication.
 - `serving_config` must record prefix caching, synchronous scheduling, the
   Mamba cache mode `align`, the block-aligned split of prefill chunks, and
