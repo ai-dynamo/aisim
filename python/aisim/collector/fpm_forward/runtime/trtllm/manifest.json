@@ -1,0 +1,5 @@
+{
+  "schema_version": "aisim-trtllm-fpm-observer/v1",
+  "runtime": {"framework": "trtllm", "version": "1.3.0rc29", "source_revision": "v1.3.0rc29"},
+  "files": ["sitecustomize.py", "observer.py", "runtime-source-sha256.json"]
+}
