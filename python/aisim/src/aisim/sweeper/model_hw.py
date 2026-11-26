@@ -23,6 +23,8 @@ or infer another topology's resources from its GPU count.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cache
 from typing import Any
@@ -359,11 +361,10 @@ def _profile_parallel_configs(
     worker_type: str = "aggregated",
     candidate_configs: list[ReplicaParallelConfig] | list[DisaggParallelConfig] | None = None,
     validate_transfer: bool = True,
-    deferred_observation_errors: dict[tuple[ParallelShape, ParallelShape], ValueError] | None = None,
+    replica_counts: Callable[[str, ParallelShape, int], Sequence[int]] | None = None,
 ):
     """Enumerate only declared deployment shapes; replicas do not change a cell."""
     from aisim.config.engine import (
-        GroupedObservationError,
         grouped_pd_pair_requirement,
         grouped_pd_transfer_requirements,
     )
@@ -390,15 +391,30 @@ def _profile_parallel_configs(
             for count in range(1, budget // shape.gpus_per_worker + 1)
         )
 
+    @cache
+    def allowed_counts(role, shape):
+        maximum = gpu_budget // shape.gpus_per_worker
+        return replica_counts(role, shape, maximum) if replica_counts is not None else range(1, maximum + 1)
+
     if candidate_configs is not None:
         candidate_configs = [
             config for config in candidate_configs if (min_gpu_budget or 0) <= config.total_gpus <= gpu_budget
         ]
+        if replica_counts is not None:
+            if deployment_mode == "agg":
+                candidate_configs = [c for c in candidate_configs if c.replicas in allowed_counts("agg", c.shape)]
+            else:
+                candidate_configs = [
+                    c
+                    for c in candidate_configs
+                    if c.prefill.replicas in allowed_counts("prefill", c.prefill.shape)
+                    and c.decode.replicas in allowed_counts("decode", c.decode.shape)
+                ]
     if deployment_mode == "agg":
         shapes = shapes_for(hardware_sku, worker_type)
         if candidate_configs is not None:
             return [config for config in candidate_configs if config.shape in shapes]
-        configs = [replica for shape in shapes for replica in replicas(shape, gpu_budget)]
+        configs = [ReplicaParallelConfig(shape, count) for shape in shapes for count in allowed_counts("agg", shape)]
     elif deployment_mode == "disagg":
         prefill_shapes = shapes_for(hardware_sku, "prefill")
         decode_shapes = shapes_for(decode_hardware_sku or hardware_sku, "decode")
@@ -406,15 +422,7 @@ def _profile_parallel_configs(
 
         def compatible(prefill_shape, decode_shape):
             prefill, decode = prefill_shapes[prefill_shape], decode_shapes[decode_shape]
-            try:
-                requirement = grouped_pd_pair_requirement(prefill, decode)
-            except GroupedObservationError as error:
-                if deferred_observation_errors is None:
-                    raise
-                # Search applies role and replica domains after enumerating shapes. Surface the
-                # data error only if an affected pair survives those constraints.
-                deferred_observation_errors[prefill_shape, decode_shape] = error
-                return True
+            requirement = grouped_pd_pair_requirement(prefill, decode)
             if requirement:
                 requirements[requirement] = None
                 return False
@@ -431,6 +439,25 @@ def _profile_parallel_configs(
                 if prefill in prefill_shapes and decode in decode_shapes and compatible(prefill, decode)
             }
             configs = [config for config in candidate_configs if (config.prefill.shape, config.decode.shape) in allowed]
+        elif replica_counts is not None:
+            # The admissible replica counts are sorted. Check a shape pair once, only when a
+            # joint count survives the caller's domains and GPU budget.
+            configs = []
+            compatible = cache(compatible)
+            decode_replica = cache(ReplicaParallelConfig)
+            for shape in prefill_shapes:
+                for count in allowed_counts("prefill", shape):
+                    prefill = ReplicaParallelConfig(shape, count)
+                    for dest in decode_shapes:
+                        choices = allowed_counts("decode", dest)
+                        width = dest.gpus_per_worker
+                        minimum = ((min_gpu_budget or 0) - prefill.total_gpus + width - 1) // width
+                        start = bisect_left(choices, minimum)
+                        stop = bisect_right(choices, (gpu_budget - prefill.total_gpus) // width)
+                        if start < stop and compatible(shape, dest):
+                            configs.extend(
+                                DisaggParallelConfig(prefill, decode_replica(dest, n)) for n in choices[start:stop]
+                            )
         else:
             configs = []
 

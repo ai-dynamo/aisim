@@ -2184,10 +2184,16 @@ def test_grouped_pd_checks_dtype_when_only_one_role_has_runtime_memory(grouped_c
 
 
 @pytest.mark.parametrize(
-    "field,changed",
-    [("model", "/other/M"), ("kv_cache_dtype", "fp8_e4m3"), ("attention_backend", "FLASHINFER")],
+    "field,initial,changed",
+    [
+        ("model", "/source/M", "/other/M"),
+        ("kv_cache_dtype", "fp8", "fp8_e4m3"),
+        ("attention_backend", "FLASH_ATTN", "FLASHINFER"),
+        ("attention_backend", ["GDN_ATTN", "FLASHINFER_MLA_SPARSE"], "FLASH_ATTN"),
+    ],
 )
-def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, changed):
+@pytest.mark.parametrize("changed_role", ["prefill", "decode"])
+def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, initial, changed, changed_role):
     from aisim import _runtime
     from aisim.runner import EngineReplayRunnerFactory
     from aisim.sweeper.config import SearchSpace
@@ -2209,7 +2215,7 @@ def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, cha
         )
 
     for deployment in profile["deployments"]:
-        deployment["resources"]["runtime_memory"]["provenance"] = observed()
+        deployment["resources"]["runtime_memory"]["provenance"] = observed(**{field: initial})
     raw = _pd_prediction(profile, root)
     raw["engine"]["context_length"] = 1024
     raw["traffic"]["source"]["input_tokens"] = 128
@@ -2221,23 +2227,31 @@ def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, cha
     class ChangedWorker:
         def run_replay_json(self, serialized):
             payload = json.loads(serialized)
-            rank = payload["spec"]["engine"]["decode"]["rank"]
+            rank = payload["spec"]["engine"][changed_role]["rank"]
             for deployment in rank["timing_model"]["config"]["fpm_profile"]["deployments"]:
-                if deployment["worker_type"] == "decode":
+                if deployment["worker_type"] == changed_role:
                     deployment["resources"]["runtime_memory"]["provenance"] = changed_evidence
             return _runtime.run_replay_json(json.dumps(payload))
 
     with pytest.raises(RuntimeError, match=f"matching {field}"):
         EngineReplayRunnerFactory(runtime=ChangedWorker()).create(0).run(spec)
-    profile["deployments"][1]["resources"]["runtime_memory"]["provenance"] = changed_evidence
+    row = next(item for item in profile["deployments"] if item["worker_type"] == changed_role)
+    row["resources"]["runtime_memory"]["provenance"] = changed_evidence
     with pytest.raises(ValueError, match=f"matching {field}"):
         CorePredictionConfig.model_validate(raw)
     search = _pd_search(profile, root)
-    with pytest.raises(ValueError, match=f"matching {field}"):
-        _fpm_parallel_configs(SearchSpace.model_validate(search), "disagg")
+    rank = {"tp": 2, "moe_tp": 2}
+    pinned = {
+        **search,
+        "parallel_configs_by_mode": {"disagg": [{"prefill": rank, "decode": rank}]},
+    }
+    for request in (search, pinned):
+        with pytest.raises(ValueError, match=f"matching {field}"):
+            _fpm_parallel_configs(SearchSpace.model_validate(request), "disagg")
 
 
-def test_grouped_pd_surfaces_conflicting_evidence_only_for_reachable_shapes(grouped_case):
+def test_grouped_pd_surfaces_conflicting_evidence_only_for_reachable_shapes(grouped_case, monkeypatch):
+    from aisim.sweeper import model_hw
     from aisim.sweeper.config import SearchSpace
     from aisim.sweeper.search_space import _fpm_parallel_configs
 
@@ -2270,6 +2284,34 @@ def test_grouped_pd_surfaces_conflicting_evidence_only_for_reachable_shapes(grou
     ):
         (candidate,) = _fpm_parallel_configs(SearchSpace.model_validate(raw), "disagg")
         assert candidate.prefill.shape.tp == candidate.decode.shape.tp == 1
+
+    build = model_hw.DisaggParallelConfig
+    constructed = []
+
+    def count_pair(prefill, decode):
+        constructed.append((prefill, decode))
+        return build(prefill, decode)
+
+    monkeypatch.setattr(model_hw, "DisaggParallelConfig", count_pair)
+    constrained = {
+        **search,
+        "gpu_budget": 512,
+        "parallel_independent_by_mode": {
+            "disagg": {"prefill_tp": [1], "decode_tp": [1], "prefill_replicas": [1], "decode_replicas": [1]}
+        },
+    }
+    (candidate,) = _fpm_parallel_configs(SearchSpace.model_validate(constrained), "disagg")
+    assert constructed and all(pair == (candidate.prefill, candidate.decode) for pair in constructed)
+
+    ranged = {
+        **constrained,
+        "gpu_budget": 6 * candidate.prefill.shape.gpus_per_worker,
+        "parallel_independent_log_ranges_by_mode": {"disagg": {"prefill_replicas": (1, 4), "decode_replicas": (1, 4)}},
+    }
+    configs = _fpm_parallel_configs(SearchSpace.model_validate(ranged), "disagg")
+    assert {(c.prefill.replicas, c.decode.replicas) for c in configs} == {
+        (p, d) for p in range(1, 5) for d in range(1, 5) if p + d <= 6
+    }
 
 
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):

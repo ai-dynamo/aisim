@@ -96,11 +96,16 @@ observed model dtype when those facts are available. The selected deployment's
 `runtime_memory.model_dtype` records vLLM's initialized `ModelConfig.dtype`.
 Older observation and finalization records can retain it in their runtime settings.
 For a measured deployment, the literal `ModelConfig.model` and
-`CacheConfig.cache_dtype` enter the handshake. The probe can identify a backend
-selected by `auto` when every worker records the same single backend. A sorted
-list of several layer backends leaves the handshake backend unknown. New
-imports and compact finalizations retain the worker observations. Older compact
-profiles can contain only source references.
+`CacheConfig.cache_dtype` enter the handshake. The installed vLLM version must match the modeled release. The handshake compares
+the full installed version strings, including any local build suffix.
+The probe records backend names per TP rank. It sorts mixed layers, so the
+first registered backend is unknown. Two disjoint sets cannot match through
+either the first backend or the packed transfer's joined names. Older compact
+profiles can have only anonymous worker lists or source references.
+For known non-MLA GPU caches, the decode worker checks the physical KV layout.
+Permuting a remote LBHNC cache into a local LBNHC cache requires the decoder's
+permute option and a layout that permits postprocessing. A memory probe without
+a connector leaves that serving option open.
 Search skips pairs with incompatible workers. Contradictory observations within
 a selected worker's profile raise a configuration error.
 Grouped prefill and decode workers require a nonempty original prompt. A one-token

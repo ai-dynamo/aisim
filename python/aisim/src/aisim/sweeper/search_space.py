@@ -245,7 +245,27 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
     custom = search_space.parallel_custom_configs_by_mode.get(deployment_mode, {})
     domains = search_space.parallel_independent_by_mode.get(deployment_mode, {})
     bounds = search_space.parallel_independent_log_ranges_by_mode.get(deployment_mode, {})
-    errors = {}
+    role_choices = {role: {_replica_from_dict(entry) for entry in entries} for role, entries in custom.items()}
+
+    def replica_counts(role, shape, maximum):
+        prefix = "" if role == "agg" else f"{role}_"
+        role_domains = {k.removeprefix(prefix): v for k, v in domains.items() if k.startswith(prefix)}
+        role_bounds = {k.removeprefix(prefix): v for k, v in bounds.items() if k.startswith(prefix)}
+        counts = role_domains.pop("replicas", None)
+        if "replicas" in role_bounds:
+            # The search compiler stores a placeholder choice alongside a log range.
+            counts = None
+        lower, upper = role_bounds.pop("replicas", (1, maximum))
+        if not matches_parallel_domains(ReplicaParallelConfig(shape, 1), role_domains, role_bounds):
+            return ()
+        if role in role_choices:
+            choices = (r.replicas for r in role_choices[role] if r.shape == shape)
+        else:
+            choices = counts if counts is not None else range(max(1, lower), min(maximum, upper) + 1)
+        return tuple(
+            sorted({n for n in choices if lower <= n <= min(upper, maximum) and (counts is None or n in counts)})
+        )
+
     configs = _profile_parallel_configs(
         profile,
         hardware_sku=search_space.hardware_sku_for("agg" if deployment_mode == "agg" else "prefill"),
@@ -260,17 +280,8 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
         else None,
         # The search validates transfer evidence after applying its role and topology domains.
         validate_transfer=False,
-        deferred_observation_errors=errors if custom or domains or bounds else None,
+        replica_counts=replica_counts if custom or domains or bounds else None,
     )
-    for role, entries in custom.items():
-        choices = {_replica_from_dict(entry) for entry in entries}
-        configs = [config for config in configs if _parallel_role(config, role) in choices]
-    if domains or bounds:
-        configs = [config for config in configs if matches_parallel_domains(config, domains, bounds)]
-    if errors:
-        for config in configs:
-            if error := errors.get((config.prefill.shape, config.decode.shape)):
-                raise error
     return configs
 
 

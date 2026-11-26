@@ -1759,7 +1759,7 @@ def require_runtime_version(memory, *, backend_version: str | None, feature: str
     grouped feature in the message.
     """
     recorded = None if memory is None else memory.runtime_framework_version
-    if recorded is not None and recorded != backend_version:
+    if recorded is not None and (recorded.partition("+")[0] if feature == "P/D" else recorded) != backend_version:
         raise ValueError(
             f"grouped FPM cache {feature} requires runtime_memory.runtime_framework_version ({recorded}) to equal "
             f"the deployment's backend_version ({backend_version})"
@@ -1890,13 +1890,7 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | 
         or prefill.cache_groups != decode.cache_groups
     ):
         return "equal tensor parallelism and identical cache groups"
-    if prefill_deployment.kv_cache_dtype != decode_deployment.kv_cache_dtype:
-        return "matching kv_cache_dtype"
-    # The NIXL handshake checks the resolved backend. An automatic selection
-    # in a profile does not identify the backend the runtime actually chose.
-    backends = {deployment.attention_backend.lower() for deployment in (prefill_deployment, decode_deployment)}
-    if len(backends - {"auto", "unknown"}) > 1:
-        return "matching attention_backend when both backends are known"
+    requirement = None
     if prefill.runtime_memory is not None or decode.runtime_memory is not None:
         from aisim import _runtime
 
@@ -1906,11 +1900,30 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | 
                 return "", None, deployment.attention_backend
             return memory.provenance, memory.model_dtype, deployment.attention_backend
 
+        def row(deployment):
+            memory = deployment.resources.runtime_memory
+            return (
+                deployment.kv_cache_dtype,
+                deployment.backend_version,
+                memory.runtime_framework_version if memory else None,
+                deployment.tp * deployment.dp,
+            )
+
         try:
-            return _runtime.grouped_observation_requirement(evidence(prefill_deployment), evidence(decode_deployment))
+            requirement = _runtime.grouped_observation_requirement(
+                evidence(prefill_deployment),
+                evidence(decode_deployment),
+                row(prefill_deployment),
+                row(decode_deployment),
+            )
         except ValueError as error:
             raise GroupedObservationError(str(error)) from error
-    return None
+    if prefill_deployment.kv_cache_dtype != decode_deployment.kv_cache_dtype:
+        return "matching kv_cache_dtype"
+    backends = {deployment.attention_backend.lower() for deployment in (prefill_deployment, decode_deployment)}
+    if len(backends - {"auto", "unknown"}) > 1:
+        return "matching attention_backend when both backends are known"
+    return requirement
 
 
 def grouped_pd_requirements(prefill_deployment, decode_deployment, *, backend_version: str | None, kv_transfer) -> None:

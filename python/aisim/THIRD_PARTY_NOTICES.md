@@ -786,7 +786,7 @@ the profile, so one set of rules covers them.
 `crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
 tests of these rules. The native replay pair validation in
 `crates/core/src/replay/engine.rs`, the initialized identity comparison in
-`crates/core/src/perfmodel/fpm/resources.rs`, and profile pairing in
+`crates/core/src/perfmodel/fpm/nixl.rs`, and profile pairing in
 `python/aisim/src/aisim/config/engine.py` adapt the observable model identity,
 version, attention backend and cache dtype checks of the NIXL handshake.
 
@@ -795,6 +795,7 @@ version, attention backend and cache dtype checks of the NIXL handshake.
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/utils.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_interface.py

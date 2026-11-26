@@ -36,7 +36,8 @@ from .schema import (
     SupportRequest,
 )
 
-PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v1"
+LEGACY_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v1"
+PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v2"
 _PRECISION = (
     "gemm_quant_mode",
     "moe_quant_mode",
@@ -339,8 +340,15 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
         value = json.loads(provenance)
     except (TypeError, ValueError):
         return None
-    if not isinstance(value, dict) or value.get("schema_version") != PROVENANCE_SCHEMA:
+    if not isinstance(value, dict) or value.get("schema_version") not in (LEGACY_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA):
         return None
+    snapshot = value.get("nixl_observation")
+    if value["schema_version"] == PROVENANCE_SCHEMA and (
+        not isinstance(snapshot, dict)
+        or not isinstance(snapshot.get("runtime_settings"), dict)
+        or not isinstance(snapshot.get("worker_observations"), list)
+    ):
+        raise ValueError("onboarding runtime probe is missing its NIXL observation")
     if (
         any(
             not isinstance(value.get(key), str) or not value[key]
@@ -367,17 +375,33 @@ def _worker_attention_backends(evidence: dict[str, Any]) -> list:
     ]
 
 
-def _observed_transfer_settings(evidence: dict[str, Any]) -> dict[str, Any]:
+def _worker_observations(evidence: dict[str, Any]) -> list:
+    from aisim import _runtime
+
+    workers = [item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] == "worker"]
+    return json.loads(_runtime.nixl_worker_observations(json.dumps(workers)))
+
+
+def _observed_transfer_settings(evidence: dict[str, Any], *, legacy: bool = False) -> dict[str, Any]:
     """Retain the initialized NIXL fields when an import replaces raw rank records with source hashes."""
     settings = evidence["runtime_settings"]
-    return {
+    sections = {"model_config": ("model", "dtype"), "cache_config": ("cache_dtype",)}
+    if not legacy:
+        sections["scheduler_config"] = ("disable_hybrid_kv_cache_manager",)
+    snapshot = {
         "runtime_settings": {
             section: {key: settings[section][key] for key in fields if key in settings[section]}
-            for section, fields in (("model_config", ("model", "dtype")), ("cache_config", ("cache_dtype",)))
+            for section, fields in sections.items()
             if section in settings
-        },
-        "worker_attention_backends": _worker_attention_backends(evidence),
+        }
     }
+    if legacy:
+        snapshot["worker_attention_backends"] = _worker_attention_backends(evidence)
+    else:
+        snapshot["worker_observations"] = _worker_observations(evidence)
+        if version := evidence.get("runtime", {}).get("version"):
+            snapshot["runtime"] = {"version": version}
+    return snapshot
 
 
 def _resource_values(resources: dict[str, Any]) -> dict[str, Any]:
@@ -501,7 +525,7 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
                 observations,
                 evidence,
                 source_references="observation_provenance" in finalized,
-                keep_worker_backends=finalized.get("observation_provenance") == "source_references_v2",
+                observation_format=finalized.get("observation_provenance", "source_references"),
             )
             if request.profile_deployment().resources.model_dump(mode="json") != expected:
                 raise ValueError("finalized runtime resources differ from verified formal observations")
@@ -535,7 +559,7 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
         raise ValueError("runtime-affecting draft edits require a compatible fresh probe")
     expected = as_saved_resources(manifest["observed_resources"], _resource_values(result["resources"]))
     if "nixl_observation" in manifest and manifest["nixl_observation"] != _observed_transfer_settings(
-        result["provenance"]
+        result["provenance"], legacy=manifest["schema_version"] == LEGACY_PROVENANCE_SCHEMA
     ):
         raise ValueError("saved NIXL settings differ from immutable runtime evidence")
     if manifest["observed_resources"] != expected:

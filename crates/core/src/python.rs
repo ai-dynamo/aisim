@@ -4828,26 +4828,45 @@ fn validate_grouped_prefix_geometry(
 #[pyfunction]
 #[pyo3(signature = (provenance, model_dtype=None))]
 fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult<Option<String>> {
-    crate::perfmodel::fpm::NixlIdentity::observed(model_dtype, provenance)
+    crate::perfmodel::fpm::NixlIdentity::observed(model_dtype, provenance, None)
         .map(|identity| identity.model_dtype)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
+/// Compact initialized worker fields for a hash-bound onboarding observation.
+#[pyfunction]
+fn nixl_worker_observations(records: &str) -> PyResult<String> {
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(records)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(crate::perfmodel::fpm::NixlIdentity::compact_workers(&parsed).to_string())
+}
+
 /// Compare runtime evidence for selected prefill and decode rows, including legacy imports.
 #[pyfunction]
+#[pyo3(signature = (prefill, decode, prefill_row=None, decode_row=None))]
 fn grouped_observation_requirement(
     prefill: (&str, Option<&str>, &str),
     decode: (&str, Option<&str>, &str),
+    prefill_row: Option<(&str, &str, Option<&str>, u64)>,
+    decode_row: Option<(&str, &str, Option<&str>, u64)>,
 ) -> PyResult<Option<String>> {
-    let identity = |(provenance, dtype, backend)| {
-        let mut value = crate::perfmodel::fpm::NixlIdentity::observed(dtype, provenance)?;
-        value.resolve_backend(Some(backend))?;
-        Ok::<_, crate::AicError>(value)
-    };
+    let identity =
+        |(provenance, dtype, backend), role, row: Option<(&str, &str, Option<&str>, u64)>| {
+            let mut value =
+                crate::perfmodel::fpm::NixlIdentity::observed(dtype, provenance, row.map(|r| r.3))?;
+            value.select(
+                role,
+                Some(backend),
+                row.map(|r| r.0),
+                row.map(|r| r.1),
+                row.and_then(|r| r.2),
+            )?;
+            Ok::<_, crate::AicError>(value)
+        };
     let check = || {
         Ok::<_, crate::AicError>(
-            identity(prefill)?
-                .mismatch(&identity(decode)?)
+            identity(prefill, "prefill", prefill_row)?
+                .mismatch(&identity(decode, "decode", decode_row)?)
                 .map(|(field, _, _)| format!("matching {field} when both runtimes recorded it")),
         )
     };
@@ -4960,6 +4979,7 @@ fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(validate_grouped_prefix_geometry, module)?)?;
     module.add_function(wrap_pyfunction!(observed_model_dtype, module)?)?;
     module.add_function(wrap_pyfunction!(grouped_observation_requirement, module)?)?;
+    module.add_function(wrap_pyfunction!(nixl_worker_observations, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_with_artifacts_json, module)?)?;
     module.add_function(wrap_pyfunction!(scan_weka_requests, module)?)?;

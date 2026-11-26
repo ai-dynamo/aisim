@@ -35,6 +35,7 @@ mod learned;
 mod learned_online;
 mod metrics;
 mod model;
+mod nixl;
 mod options;
 mod quality_gate;
 mod regression;
@@ -77,9 +78,9 @@ pub use model::{
     ForwardPassStoreNotReadyReason, ForwardPassStoreReadiness, ForwardPassWorkerType,
     StateSnapshotOptions,
 };
+pub(crate) use nixl::NixlIdentity;
 pub use options::{CorrectionMode, ForwardPassPerfOptions};
 pub use regression::ForwardPassSplineDiagnostics;
-pub(crate) use resources::NixlIdentity;
 pub use resources::{
     FpmCacheBudget, FpmCacheBudgetAdjusted, FpmCacheBudgetRequest, FpmCacheGroup, FpmCacheKind,
     FpmCacheLayout, FpmMambaCache, FpmMambaCacheMode, FpmResourceConfig, FpmRuntimeMemoryConfig,

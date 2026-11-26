@@ -645,7 +645,7 @@ def _check_replay(path: Path, original: SupportRequest, collection: dict[str, An
             observations,
             verified_manifest,
             source_references="observation_provenance" in manifest,
-            keep_worker_backends=manifest.get("observation_provenance") == "source_references_v2",
+            observation_format=manifest.get("observation_provenance", "source_references"),
         )
         if request.profile_deployment().resources.model_dump(mode="json") != expected_resources:
             raise ValueError("finalized replay resources differ from verified collection memory")

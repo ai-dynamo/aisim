@@ -233,7 +233,11 @@ impl ReplayRoleConfig {
         ] {
             if let Some(version) = version.filter(known)
                 && let Some(rank_version) = &self.rank.vllm_version
-                && version != rank_version
+                && (if field == "runtime_memory.runtime_framework_version" {
+                    version.split('+').next().unwrap_or(version)
+                } else {
+                    version
+                }) != rank_version
             {
                 bail!("grouped rank vllm_version ({rank_version}) must match {field} ({version})");
             }
@@ -272,6 +276,12 @@ impl ReplayRoleConfig {
             memory
                 .and_then(|m| m["provenance"].as_str())
                 .unwrap_or_default(),
+            Some(u64::from(self.tensor_parallel_size) * u64::from(self.dp_size)),
+        )?;
+        let backend = source(
+            "attention_backend",
+            config["attention_backend"].as_str(),
+            deployment.and_then(|d| d["attention_backend"].as_str()),
         )?;
         let labels = NixlIdentity {
             model: model.map(str::to_owned),
@@ -282,20 +292,22 @@ impl ReplayRoleConfig {
                 deployment.and_then(|d| d["kv_cache_dtype"].as_str()),
             )?
             .map(|s| s.to_ascii_lowercase()),
-            attention_backend: source(
-                "attention_backend",
-                config["attention_backend"].as_str(),
-                deployment.and_then(|d| d["attention_backend"].as_str()),
-            )?
-            .map(|s| s.to_ascii_lowercase()),
+            attention_backend: backend.map(|s| s.to_ascii_lowercase()),
             model_dtype,
+            ..NixlIdentity::default()
         };
         observed.model_dtype = source(
             "model_dtype",
             labels.model_dtype.as_deref(),
             observed.model_dtype.as_deref(),
         )?;
-        observed.resolve_backend(labels.attention_backend.as_deref())?;
+        observed.select(
+            role.as_str().unwrap_or_default(),
+            labels.attention_backend.as_deref(),
+            labels.kv_cache_dtype.as_deref(),
+            self.rank.vllm_version.as_deref(),
+            memory.and_then(|m| m["runtime_framework_version"].as_str()),
+        )?;
         Ok([labels, observed])
     }
 }

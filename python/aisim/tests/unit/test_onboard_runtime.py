@@ -2579,6 +2579,14 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
     with pytest.raises(ValueError, match="saved NIXL settings differ"):
         verify_runtime_profile(request)
 
+    del manifest["nixl_observation"]
+    request.profile_deployment().resources.runtime_memory.provenance = json.dumps(manifest)
+    with pytest.raises(ValueError, match="missing its NIXL observation"):
+        verify_runtime_profile(request)
+    manifest["schema_version"] = "aisimulate-onboarding-runtime-probe/v1"
+    request.profile_deployment().resources.runtime_memory.provenance = json.dumps(manifest)
+    assert verify_runtime_profile(request)["status"] == "complete"
+
     observation = direct["resources"]
     evidence = json.loads(observation["runtime_memory"]["provenance"])
     workers = [item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] == "worker"]
@@ -2586,15 +2594,20 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
         rank["attention_backend"] = "FLASHINFER"
     workers[-1]["attention_backend"] = ["FLASH_ATTN", "FLASHINFER"]
     observation["runtime_memory"]["provenance"] = json.dumps(evidence)
-    for retain, version in [(False, "source_references"), (True, "source_references_v2")]:
+    for version in ("source_references", "source_references_v2", "source_references_v3"):
         saved = {}
-        _merge_resources([observation], saved, source_references=True, keep_worker_backends=retain)
+        _merge_resources([observation], saved, source_references=True, observation_format=version)
         assert saved["observation_provenance"] == version
         compact = json.loads(saved["cell_observations"][0]["runtime_memory"]["provenance"])
         assert all(set(artifact) == {"path", "sha256"} for artifact in compact["artifacts"])
         assert compact.get("worker_attention_backends") == (
-            [w["attention_backend"] for w in workers] if retain else None
+            [w["attention_backend"] for w in workers] if version == "source_references_v2" else None
         )
+        if version == "source_references_v3":
+            assert [(r["phase"], r["tp_rank"]) for r in compact["worker_observations"]] == [
+                (r["phase"], r["tp_rank"]) for r in workers
+            ]
+            assert compact["worker_observations"][-1]["backends"] == ["flash_attn", "flashinfer"]
 
 
 def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_sources(tmp_path, capsys):
