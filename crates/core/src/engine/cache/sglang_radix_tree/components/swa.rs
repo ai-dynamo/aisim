@@ -926,12 +926,21 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         transfers: &[PoolTransfer<V>],
     ) -> Result<(), TreeCoreRuntimeError> {
         let mut node = tree_core.arena.node(node_id);
-        if self.swa_req_ring && !node.has_device_value(SWA) && !node.has_host_value(SWA) {
-            return Ok(()); // Full-only ring restore; the request rebuilds SWA.
-        }
         let invalid = || TreeCoreRuntimeError::InvalidLoadBackSpec {
             node_id: tree_core.arena.node(node_id).id,
         };
+        // The driver consumes one tree transfer. A ring-only restore must not
+        // smuggle in another anchor's SWA rows through its window exemption.
+        if transfers.len() > 1 {
+            return Err(invalid());
+        }
+        if self.swa_req_ring && !node.has_device_value(SWA) && !node.has_host_value(SWA) {
+            return if transfers.is_empty() {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
         // The commit hook consumes the first transfer, ordered ancestors first.
         // Walk its borrowed handles backwards alongside the required window.
         let mut planned = transfers

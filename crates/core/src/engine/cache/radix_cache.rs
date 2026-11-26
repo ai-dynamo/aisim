@@ -1444,6 +1444,41 @@ mod tests {
     }
 
     #[test]
+    fn admission_snapshots_share_edges_but_isolate_splits_inserts_and_eviction() {
+        let mut cache = RadixCache::new(16, 1);
+        let pages = cache.page_pool.allocate(4).unwrap();
+        cache.insert(&[10, 20, 30, 40], &pages);
+        let mut before_split = cache.admission_checkpoint();
+        assert!(Arc::ptr_eq(
+            &cache.tree.arena.node(cache.tree.arena.root()).children,
+            &before_split
+                .tree
+                .arena
+                .node(before_split.tree.arena.root())
+                .children,
+        ));
+        assert_eq!(cache.match_prefix(&[10, 20]).0, 2);
+        let mut after_split = cache.admission_checkpoint();
+        assert_eq!(cache.num_nodes(), 3);
+        assert_eq!(before_split.num_nodes(), 2);
+        assert_eq!(cache.evict(16).0, 4);
+        assert_eq!(cache.available_tokens(), 16);
+        assert_eq!(before_split.prefix_match_len(&[10, 20, 30, 40]), 4);
+        assert_eq!(after_split.prefix_match_len(&[10, 20, 30, 40]), 4);
+        let other = before_split.page_pool.allocate(1).unwrap();
+        before_split.insert(&[90], &other);
+        assert_eq!(after_split.prefix_match_len(&[90]), 0);
+        assert_eq!(cache.prefix_match_len(&[90]), 0);
+        // The second snapshot keeps its native split and whole-leaf victim.
+        assert_eq!(after_split.evict(1).0, 2);
+        assert_eq!(after_split.prefix_match_len(&[10, 20, 30, 40]), 2);
+        assert_eq!(before_split.prefix_match_len(&[10, 20, 30, 40]), 4);
+        cache.assert_invariants();
+        before_split.assert_invariants();
+        after_split.assert_invariants();
+    }
+
+    #[test]
     fn lru_split_recency_victim_matches_native_policy() {
         for partial_match in [true, false] {
             let mut cache = RadixCache::new(4, 1);

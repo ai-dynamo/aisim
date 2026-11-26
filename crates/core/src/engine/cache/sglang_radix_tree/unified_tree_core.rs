@@ -2661,7 +2661,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             Some(child.creation_counter),
             child_namespace.as_ref(),
         );
-        self.arena.node_mut(new_node_id).children.insert(
+        Arc::make_mut(&mut self.arena.node_mut(new_node_id).children).insert(
             (child_namespace.clone(), key_tail.child_key(page_size)),
             child_id,
         );
@@ -5579,7 +5579,8 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         }
         // Parent ↔ child bidirectional consistency
         for &node_id in &all_nodes {
-            for ((edge_namespace, edge_key), &child_id) in &self.arena.node(node_id).children {
+            for ((edge_namespace, edge_key), &child_id) in self.arena.node(node_id).children.iter()
+            {
                 let child = self.arena.node(child_id);
                 let child_parent = child.try_parent();
                 if child_parent != Some(node_id) {

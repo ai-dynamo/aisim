@@ -157,6 +157,13 @@ following local corrections to this pinned revision:
   Full backup descriptors, multiple backup descriptors for a component, and
   disabled component keys before adopting any staged rows. Generic load-back
   commits are rejected; use `commit_load_back` for validation and source pins.
+- Reject extra SWA load-back descriptors and any SWA descriptor on a ring
+  Full-only restore. The ring exemption permits rebuilding request-owned SWA,
+  not adopting rows for an unrelated anchor.
+- Share immutable child-edge maps between admission snapshots, copying a map
+  only on a structural edit. Recency, component values, locks, and node handles
+  remain independently snapshotted. Preserve native node boundaries and eviction
+  victims; snapshot-isolation tests cover splits, insertion, and removal.
 - Reject both sharded-to-unsharded and unsharded-to-sharded extensions. Revalidate
   a suspended insert's remaining path before restoring a host graft; a rotation
   conflict preserves the walk and returns `InsertRotationMismatch` for cancellation.

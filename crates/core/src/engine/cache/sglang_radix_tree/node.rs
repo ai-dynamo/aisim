@@ -179,7 +179,8 @@ pub struct Node<K: ChildKeyType, V: RadixValue> {
     pub namespace: KeyNamespace,
     /// Child edges keyed by (namespace, the child's page key); the namespace
     /// component mirrors the child's namespace at every level.
-    pub(crate) children: ChildMap<K>,
+    // Share immutable topology across admission snapshots; detach on structural edits.
+    pub(crate) children: Arc<ChildMap<K>>,
     /// The page key labelling the edge from the parent (also this node's key in the
     /// parent's `children`); empty for the root.
     pub key: K,
@@ -418,7 +419,7 @@ impl<K: ChildKeyType, V: RadixValue> Node<K, V> {
         Node {
             parent: None,
             namespace: KeyNamespace::default(),
-            children: ChildMap::with_hasher(RandomState::new()),
+            children: Arc::new(ChildMap::with_hasher(RandomState::new())),
             key: K::default(),
             values: Default::default(),
             swa_uuid: None,
@@ -444,7 +445,7 @@ impl<K: ChildKeyType, V: RadixValue> Node<K, V> {
         Node {
             parent: None,
             namespace: KeyNamespace::default(),
-            children: ChildMap::with_hasher(RandomState::new()),
+            children: Arc::new(ChildMap::with_hasher(RandomState::new())),
             key,
             values: Default::default(),
             swa_uuid: None,
@@ -486,7 +487,7 @@ impl<K: ChildKeyType, V: RadixValue> Node<K, V> {
             child.parent
         );
         let parent_idx = self.idx;
-        match self.children.entry(child.edge_key(page_size)) {
+        match Arc::make_mut(&mut self.children).entry(child.edge_key(page_size)) {
             Entry::Occupied(_) => Err(TreeCoreRuntimeError::DuplicateChildKey {
                 parent: self.id,
                 key: format!("{:?}", child.key),
@@ -503,7 +504,7 @@ impl<K: ChildKeyType, V: RadixValue> Node<K, V> {
     /// parent link; panics on a broken parent<->child link (an internal invariant).
     pub(crate) fn detach_from_parent(&mut self, parent: &mut Node<K, V>, page_size: usize) {
         // A live child is always registered under its namespaced page key.
-        match parent.children.remove(&ChildEdgeRef::<K> {
+        match Arc::make_mut(&mut parent.children).remove(&ChildEdgeRef::<K> {
             namespace: self.namespace.as_ref(),
             page: &self.key.as_ref()[..page_size],
         }) {
@@ -1400,9 +1401,7 @@ impl<K: ChildKeyType, V: RadixValue> NodeArena<K, V> {
         child: NodeIdx_,
     ) -> Option<NodeIdx_> {
         let namespace = self.node(child).namespace.clone();
-        self.node_mut(parent)
-            .children
-            .insert((namespace, map_key), child)
+        Arc::make_mut(&mut self.node_mut(parent).children).insert((namespace, map_key), child)
     }
 
     /// Reserve a detached child and attach it under `parent`; `extra_key` names the

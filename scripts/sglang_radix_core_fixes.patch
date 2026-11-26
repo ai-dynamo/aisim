@@ -333,7 +333,7 @@
          };
          tree_core.component_state_mut(SWA).evict_device_cursor = cursor;
          next
-@@ -912,6 +919,45 @@
+@@ -912,6 +919,54 @@
          }
      }
 
@@ -344,12 +344,21 @@
 +        transfers: &[PoolTransfer<V>],
 +    ) -> Result<(), TreeCoreRuntimeError> {
 +        let mut node = tree_core.arena.node(node_id);
-+        if self.swa_req_ring && !node.has_device_value(SWA) && !node.has_host_value(SWA) {
-+            return Ok(()); // Full-only ring restore; the request rebuilds SWA.
-+        }
 +        let invalid = || TreeCoreRuntimeError::InvalidLoadBackSpec {
 +            node_id: tree_core.arena.node(node_id).id,
 +        };
++        // The driver consumes one tree transfer. A ring-only restore must not
++        // smuggle in another anchor's SWA rows through its window exemption.
++        if transfers.len() > 1 {
++            return Err(invalid());
++        }
++        if self.swa_req_ring && !node.has_device_value(SWA) && !node.has_host_value(SWA) {
++            return if transfers.is_empty() {
++                Ok(())
++            } else {
++                Err(invalid())
++            };
++        }
 +        // The commit hook consumes the first transfer, ordered ancestors first.
 +        // Walk its borrowed handles backwards alongside the required window.
 +        let mut planned = transfers
@@ -379,7 +388,7 @@
      fn build_hicache_transfers(
          &self,
          tree_core: &UnifiedTreeCore<K, V>,
-@@ -953,6 +999,12 @@
+@@ -953,6 +1008,12 @@
                  }])
              }
              CacheTransferPhase::LoadBack => {
@@ -392,7 +401,7 @@
                  // `node` is best_match_node; the SWA validator guarantees every
                  // ancestor within `sliding_window_size` has value or host_value.
                  let mut n_swa = 0;
-@@ -982,6 +1034,7 @@
+@@ -982,6 +1043,7 @@
                  nodes_to_load.reverse();
                  Some(vec![PoolTransfer {
                      name: PoolName::Swa,
@@ -450,19 +459,56 @@
      }
 
      pub fn to_owned(self) -> KeyNamespace {
-@@ -495,7 +503,10 @@
+@@ -171,7 +179,8 @@
+     pub namespace: KeyNamespace,
+     /// Child edges keyed by (namespace, the child's page key); the namespace
+     /// component mirrors the child's namespace at every level.
+-    pub(crate) children: ChildMap<K>,
++    // Share immutable topology across admission snapshots; detach on structural edits.
++    pub(crate) children: Arc<ChildMap<K>>,
+     /// The page key labelling the edge from the parent (also this node's key in the
+     /// parent's `children`); empty for the root.
+     pub key: K,
+@@ -410,7 +419,7 @@
+         Node {
+             parent: None,
+             namespace: KeyNamespace::default(),
+-            children: ChildMap::with_hasher(RandomState::new()),
++            children: Arc::new(ChildMap::with_hasher(RandomState::new())),
+             key: K::default(),
+             values: Default::default(),
+             swa_uuid: None,
+@@ -436,7 +445,7 @@
+         Node {
+             parent: None,
+             namespace: KeyNamespace::default(),
+-            children: ChildMap::with_hasher(RandomState::new()),
++            children: Arc::new(ChildMap::with_hasher(RandomState::new())),
+             key,
+             values: Default::default(),
+             swa_uuid: None,
+@@ -478,7 +487,7 @@
+             child.parent
+         );
+         let parent_idx = self.idx;
+-        match self.children.entry(child.edge_key(page_size)) {
++        match Arc::make_mut(&mut self.children).entry(child.edge_key(page_size)) {
+             Entry::Occupied(_) => Err(TreeCoreRuntimeError::DuplicateChildKey {
+                 parent: self.id,
+                 key: format!("{:?}", child.key),
+@@ -495,7 +504,10 @@
      /// parent link; panics on a broken parent<->child link (an internal invariant).
      pub(crate) fn detach_from_parent(&mut self, parent: &mut Node<K, V>, page_size: usize) {
          // A live child is always registered under its namespaced page key.
 -        match parent.children.remove(&self.edge_key(page_size)) {
-+        match parent.children.remove(&ChildEdgeRef::<K> {
++        match Arc::make_mut(&mut parent.children).remove(&ChildEdgeRef::<K> {
 +            namespace: self.namespace.as_ref(),
 +            page: &self.key.as_ref()[..page_size],
 +        }) {
              Some(idx) if idx == self.idx => self.parent = None,
              found => panic!(
                  "detach_from_parent: parent {} has no child {} under key {:?} (found {:?})",
-@@ -739,6 +750,18 @@
+@@ -739,6 +751,18 @@
  #[allow(clippy::enum_variant_names)]
  #[derive(Debug, thiserror::Error)]
  pub enum TreeCoreRuntimeError {
@@ -481,7 +527,7 @@
      /// A public NodeId no longer names a live arena node.
      #[error(transparent)]
      NodeAccess(#[from] NodeAccessError),
-@@ -748,6 +771,15 @@
+@@ -748,6 +772,15 @@
      /// `resume_insert` called without a suspended insert.
      #[error("no in-flight insert")]
      NoInFlightInsert,
@@ -497,7 +543,7 @@
      /// An arena slot beyond the arena's bounds — never allocated. `size` is the
      /// arena's current slot count, so valid ids are `0..size`.
      #[error("node access out of bounds: id {id} not in [0, {size})")]
-@@ -782,11 +814,33 @@
+@@ -782,11 +815,33 @@
      /// A host insert below a non-root anchor must remain in that anchor's namespace.
      #[error("insert_host namespace does not match non-root anchor {node_id}")]
      InsertHostNamespaceMismatch { node_id: NodeId },
@@ -531,7 +577,7 @@
      /// The retained prefix cannot extend beyond the aligned input key.
      #[error(
          "insert continuation prefix length {prefix_len} exceeds aligned key length {aligned_key_len}"
-@@ -804,6 +858,9 @@
+@@ -804,6 +859,9 @@
          node_prefix_len: usize,
          prefix_len: usize,
      },
@@ -541,7 +587,7 @@
      /// A non-root continuation stays inside the anchor's namespace.
      #[error("insert continuation namespace does not match non-root anchor {node_id}")]
      InsertContinuationNamespaceMismatch { node_id: NodeId },
-@@ -817,6 +874,9 @@
+@@ -817,6 +875,9 @@
          value_len: usize,
          required_len: usize,
      },
@@ -551,6 +597,17 @@
      /// An inspection-only invariant check failed without mutating the tree.
      #[cfg(test)]
      #[error("{0}")]
+@@ -1340,9 +1401,7 @@
+         child: NodeIdx_,
+     ) -> Option<NodeIdx_> {
+         let namespace = self.node(child).namespace.clone();
+-        self.node_mut(parent)
+-            .children
+-            .insert((namespace, map_key), child)
++        Arc::make_mut(&mut self.node_mut(parent).children).insert((namespace, map_key), child)
+     }
+
+     /// Reserve a detached child and attach it under `parent`; `extra_key` names the
 --- a/page_value_core.rs
 +++ b/page_value_core.rs
 @@ -49,12 +49,25 @@
@@ -1372,6 +1429,15 @@
          let node = self.arena.node(target_node_id);
          self.enable_hicache
              && node.backuped()
+@@ -2449,7 +2661,7 @@
+             Some(child.creation_counter),
+             child_namespace.as_ref(),
+         );
+-        self.arena.node_mut(new_node_id).children.insert(
++        Arc::make_mut(&mut self.arena.node_mut(new_node_id).children).insert(
+             (child_namespace.clone(), key_tail.child_key(page_size)),
+             child_id,
+         );
 @@ -2614,6 +2826,9 @@
 
          self.update_evictable_leaf_sets_(new_node_id);
@@ -1915,19 +1981,29 @@
          }
          Ok(())
      }
-@@ -4829,6 +5377,11 @@
-         for &(child_id, pos, prefix_len) in &spans {
+@@ -4830,6 +5378,11 @@
              if pos + prefix_len <= window_start {
                  continue;
-+            }
+             }
 +            if !self.arena.has_device_value(child_id, FULL) {
 +                return Err(
 +                    "attach_swa_window requires device Full KV throughout the window".into(),
 +                );
-             }
++            }
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
-@@ -5601,14 +6154,7 @@
+                     "attach_swa_window over live SWA at [{}, {})",
+@@ -5026,7 +5579,8 @@
+         }
+         // Parent ↔ child bidirectional consistency
+         for &node_id in &all_nodes {
+-            for ((edge_namespace, edge_key), &child_id) in &self.arena.node(node_id).children {
++            for ((edge_namespace, edge_key), &child_id) in self.arena.node(node_id).children.iter()
++            {
+                 let child = self.arena.node(child_id);
+                 let child_parent = child.try_parent();
+                 if child_parent != Some(node_id) {
+@@ -5601,14 +6155,7 @@
      /// Whether the node is currently eligible as a Full device leaf.
      pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
          let node_id = self.arena.resolve(node_id)?;
@@ -1943,7 +2019,7 @@
      }
 
      /// Materialize every live tree node handle.
-@@ -5833,6 +6379,12 @@
+@@ -5833,6 +6380,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -1956,7 +2032,7 @@
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +6395,7 @@
+@@ -5843,6 +6396,7 @@
                  params,
                  value_chunks,
                  best_value_len,

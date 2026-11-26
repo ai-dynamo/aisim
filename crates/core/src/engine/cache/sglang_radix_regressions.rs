@@ -3611,11 +3611,12 @@ fn repair_transfer_entrypoints_reject_invalid_dispatch_before_adoption() {
     }
 }
 
-#[test]
-fn repair_swa_load_back_rejects_an_unrelated_anchor() {
+#[rstest::rstest]
+fn repair_swa_load_back_rejects_an_unrelated_anchor(#[values(false, true)] ring: bool) {
     let mut tree = Core::new(
         CacheInitParams {
             enable_hicache: true,
+            swa_req_ring: ring,
             swa_sliding_window_size: Some(1),
             has_swa_host_pool: true,
             ..Default::default()
@@ -3668,6 +3669,50 @@ fn repair_swa_load_back_rejects_an_unrelated_anchor() {
                 .node(tree.arena.resolve(id).unwrap())
                 .has_device_value(SWA)
         );
+    }
+    // Every SWA tree destination must be validated, including extra descriptors.
+    let (mixed_full, mut mixed) = tree.build_load_back_spec(leaves[1], None).unwrap();
+    mixed.get_mut(&SWA).unwrap()[0].device_indices = Some(PageValue::from_vec(vec![302]));
+    let (_, mut extra) = tree.build_load_back_spec(leaves[0], None).unwrap();
+    extra.get_mut(&SWA).unwrap()[0].device_indices = Some(PageValue::from_vec(vec![301]));
+    mixed
+        .get_mut(&SWA)
+        .unwrap()
+        .append(extra.get_mut(&SWA).unwrap());
+    assert!(matches!(
+        tree.commit_load_back(leaves[1], PageValue::from_vec(vec![]), mixed_full, mixed),
+        Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+    ));
+    if ring {
+        // Ring Full-only restores are valid, but cannot adopt another anchor's SWA.
+        let key = vec![30];
+        let mut p = params(&key, &[3]);
+        p.swa_evicted_seqlen = 1;
+        let c = tree.insert(&p).last_device_node_id.unwrap();
+        let (c_full, c_aux) = tree.build_load_back_spec(c, None).unwrap();
+        assert!(c_aux.is_empty());
+        assert!(matches!(
+            tree.commit_load_back(
+                c,
+                PageValue::from_vec(vec![]),
+                tree.build_load_back_spec(c, None).unwrap().0,
+                {
+                    let (_, mut wrong) = tree.build_load_back_spec(leaves[0], None).unwrap();
+                    wrong.get_mut(&SWA).unwrap()[0].device_indices =
+                        Some(PageValue::from_vec(vec![301]));
+                    wrong
+                },
+            ),
+            Err(TreeCoreRuntimeError::InvalidLoadBackSpec { .. })
+        ));
+        assert!(
+            tree.get_component_device_value(leaves[0], SWA)
+                .unwrap()
+                .is_none()
+        );
+        assert!(tree.get_component_device_value(c, SWA).unwrap().is_none());
+        tree.commit_load_back(c, PageValue::from_vec(vec![]), c_full, c_aux)
+            .unwrap();
     }
     tree.commit_load_back(leaves[1], PageValue::from_vec(vec![]), full, b)
         .unwrap();
