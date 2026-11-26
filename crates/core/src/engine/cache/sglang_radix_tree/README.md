@@ -47,6 +47,14 @@ The mechanical modifications are:
 After those adaptations, `scripts/sglang_radix_core_fixes.patch` applies the
 following local corrections to this pinned revision:
 
+- Require the resumable API for in-window SWA inserts, applying controller
+  actions before resuming so terminal backups observe rebuilt SWA rows. Reject
+  unsafe single-shot calls before mutation; Full-only inserts, entirely
+  tombstoned SWA inputs, and empty continuations retain their single-shot path.
+- Bind SWA backup targets to the anchor's ordered backup window before adopting
+  any Full or auxiliary rows. Compare window handles without copying pool rows.
+- Reject empty SWA load-back batches before committing any component, preserving
+  the normal nonempty transfer path.
 - Apply the existing-target terminal backup predicate after empty continuations
   adopt Mamba checkpoints. Emit only one backup for a retained anchor and keep
   empty roots and already-backed checkpoints as no-backup cases.

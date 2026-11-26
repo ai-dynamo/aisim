@@ -159,6 +159,92 @@ fn radix_lifecycle_matches_recorded_behavior() {
 }
 
 #[test]
+fn radix_completion_ancestor_refresh_matches_recorded_behavior() {
+    let baseline = std::env::var("AISIM_EVICTION_EVIDENCE_SIDE").as_deref() == Ok("baseline");
+    let mut observations = Vec::new();
+    // Completing P -> Q with a private page X refreshes the retained path.
+    // Keep a newer, unrelated B locked while removing Q/X, then compare P/B.
+    let sink = Arc::new(Sink::default());
+    let mut mgr = SglangKvManager::new(24, 4, KvEventPublishers::new(Some(sink.clone())), 0);
+    let p = [1, 2, 3, 4];
+    let pq = [1, 2, 3, 4, 5, 6, 7, 8];
+    let pqx = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let b = [20, 21, 22, 23];
+    for prompt in [&p[..], &pq[..]] {
+        let (_, lease) = admit(&mut mgr, prompt);
+        mgr.finish(prompt, lease);
+    }
+    let (reused, active) = admit(&mut mgr, &pqx);
+    assert_eq!(reused, 8);
+    let (_, initial_b) = admit(&mut mgr, &b);
+    mgr.finish(&b, initial_b);
+    let mut locked_b = RadixRequestLease::default();
+    assert_eq!(
+        mgr.allocate_for_request_lease_capped(&b, &mut locked_b, b.len())
+            .unwrap(),
+        4
+    );
+    mgr.finish(&pqx, active);
+    let first_event = sink.0.lock().unwrap().len();
+    mgr.evict(8);
+    let qx_removed: Vec<_> = sink.0.lock().unwrap()[first_event..]
+        .iter()
+        .flat_map(|event| match &event.data {
+            KvEventData::Removed { block_hashes } => block_hashes.clone(),
+            _ => panic!("eviction must publish only removals"),
+        })
+        .collect();
+    let hashes = compute_seq_hash_for_block(&compute_block_hash_for_seq(&pqx, 4));
+    assert_eq!(
+        qx_removed,
+        if baseline {
+            vec![hashes[1], hashes[2]]
+        } else {
+            vec![hashes[2], hashes[1]]
+        }
+    );
+    mgr.abort(locked_b);
+    let first_event = sink.0.lock().unwrap().len();
+    mgr.evict(4);
+    let removed: Vec<_> = sink.0.lock().unwrap()[first_event..]
+        .iter()
+        .flat_map(|event| match &event.data {
+            KvEventData::Removed { block_hashes } => block_hashes.clone(),
+            _ => panic!("eviction must publish only removals"),
+        })
+        .collect();
+    let b_hashes = compute_seq_hash_for_block(&compute_block_hash_for_seq(&b, 4));
+    assert_eq!(removed, if baseline { vec![hashes[0]] } else { b_hashes });
+    let mut repeat = RadixRequestLease::default();
+    let reused = mgr
+        .allocate_for_request_lease_capped(&p, &mut repeat, p.len())
+        .unwrap();
+    assert_eq!(reused, if baseline { 0 } else { 4 });
+    mgr.abort(repeat);
+    observations.push(json!({
+        "scenario": "complete_with_new_page_refreshes_ancestors",
+        "page_size": 4,
+        "capacity_tokens": 24,
+        "prompt_p": p,
+        "prompt_pq": pq,
+        "prompt_pqx": pqx,
+        "prompt_b": b,
+        "locked_b_eviction_hashes": qx_removed,
+        "removed_block_hashes": removed,
+        "repeat_reused_tokens": reused,
+    }));
+    mgr.evict(24);
+    assert_eq!(mgr.cache.available_tokens(), 24);
+    if let Ok(path) = std::env::var("AISIM_EVICTION_EVIDENCE_OUTPUT") {
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&observations).unwrap() + "\n",
+        )
+        .unwrap();
+    }
+}
+
+#[test]
 #[ignore = "explicit optimized cache-management measurement"]
 fn radix_growth_measurement() {
     let mut observations = Vec::new();

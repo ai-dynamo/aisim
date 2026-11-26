@@ -253,11 +253,21 @@
      ) -> MatchResult<V> {
          result
      }
-@@ -368,6 +370,16 @@
+@@ -368,6 +370,26 @@
          unimplemented!("release_window_lock is SWA-only")
      }
 
 +    /// Recheck dependencies omitted from a staged load-back before any adoption.
++    /// Check that staged auxiliary backups belong to this anchor's window.
++    fn validate_backup_window(
++        &self,
++        _tree_core: &UnifiedTreeCore<K, V>,
++        _node_id: NodeIdx_,
++        _targets: &[crate::engine::cache::sglang_radix_tree::NodeId],
++    ) -> Result<(), TreeCoreRuntimeError> {
++        Ok(())
++    }
++
 +    fn validate_load_back_window(
 +        &self,
 +        tree_core: &UnifiedTreeCore<K, V>,
@@ -333,10 +343,33 @@
          };
          tree_core.component_state_mut(SWA).evict_device_cursor = cursor;
          next
-@@ -912,6 +919,54 @@
+@@ -912,6 +919,77 @@
          }
      }
 
++    fn validate_backup_window(
++        &self,
++        tree_core: &UnifiedTreeCore<K, V>,
++        node_id: NodeIdx_,
++        targets: &[NodeId],
++    ) -> Result<(), TreeCoreRuntimeError> {
++        // Use the planner's window and ordering, without copying pool rows or
++        // inspecting unrelated branches. The vector is bounded by one window.
++        let expected = self.collect_unbacked_swa_nodes_(tree_core, node_id);
++        if !expected
++            .iter()
++            .rev()
++            .map(|&idx| tree_core.arena.node(idx).id)
++            .eq(targets.iter().copied())
++        {
++            return Err(TreeCoreRuntimeError::InvalidBackupSpec {
++                node_id: tree_core.arena.node(node_id).id,
++                component_type: SWA,
++            });
++        }
++        Ok(())
++    }
++
 +    fn validate_load_back_window(
 +        &self,
 +        tree_core: &UnifiedTreeCore<K, V>,
@@ -388,7 +421,7 @@
      fn build_hicache_transfers(
          &self,
          tree_core: &UnifiedTreeCore<K, V>,
-@@ -953,6 +1008,12 @@
+@@ -953,6 +1031,12 @@
                  }])
              }
              CacheTransferPhase::LoadBack => {
@@ -401,7 +434,7 @@
                  // `node` is best_match_node; the SWA validator guarantees every
                  // ancestor within `sliding_window_size` has value or host_value.
                  let mut n_swa = 0;
-@@ -982,6 +1043,7 @@
+@@ -982,6 +1066,7 @@
                  nodes_to_load.reverse();
                  Some(vec![PoolTransfer {
                      name: PoolName::Swa,
@@ -508,7 +541,7 @@
              Some(idx) if idx == self.idx => self.parent = None,
              found => panic!(
                  "detach_from_parent: parent {} has no child {} under key {:?} (found {:?})",
-@@ -739,6 +751,18 @@
+@@ -739,15 +751,41 @@
  #[allow(clippy::enum_variant_names)]
  #[derive(Debug, thiserror::Error)]
  pub enum TreeCoreRuntimeError {
@@ -527,7 +560,14 @@
      /// A public NodeId no longer names a live arena node.
      #[error(transparent)]
      NodeAccess(#[from] NodeAccessError),
-@@ -748,6 +772,15 @@
+     /// `begin_insert`/`insert` called while a resumable insert is suspended.
+     #[error("concurrent insert walks")]
+     ConcurrentInsertWalk,
++    /// SWA rebuilds must be applied by the controller before resuming.
++    #[error(
++        "SWA insert requires begin_insert/resume_insert and action application at each barrier"
++    )]
++    InsertRequiresController,
      /// `resume_insert` called without a suspended insert.
      #[error("no in-flight insert")]
      NoInFlightInsert,
@@ -543,7 +583,7 @@
      /// An arena slot beyond the arena's bounds — never allocated. `size` is the
      /// arena's current slot count, so valid ids are `0..size`.
      #[error("node access out of bounds: id {id} not in [0, {size})")]
-@@ -782,11 +815,33 @@
+@@ -782,11 +820,33 @@
      /// A host insert below a non-root anchor must remain in that anchor's namespace.
      #[error("insert_host namespace does not match non-root anchor {node_id}")]
      InsertHostNamespaceMismatch { node_id: NodeId },
@@ -577,7 +617,7 @@
      /// The retained prefix cannot extend beyond the aligned input key.
      #[error(
          "insert continuation prefix length {prefix_len} exceeds aligned key length {aligned_key_len}"
-@@ -804,6 +859,9 @@
+@@ -804,6 +864,9 @@
          node_prefix_len: usize,
          prefix_len: usize,
      },
@@ -587,7 +627,7 @@
      /// A non-root continuation stays inside the anchor's namespace.
      #[error("insert continuation namespace does not match non-root anchor {node_id}")]
      InsertContinuationNamespaceMismatch { node_id: NodeId },
-@@ -817,6 +875,9 @@
+@@ -817,6 +880,9 @@
          value_len: usize,
          required_len: usize,
      },
@@ -597,7 +637,7 @@
      /// An inspection-only invariant check failed without mutating the tree.
      #[cfg(test)]
      #[error("{0}")]
-@@ -1340,9 +1401,7 @@
+@@ -1340,9 +1406,7 @@
          child: NodeIdx_,
      ) -> Option<NodeIdx_> {
          let namespace = self.node(child).namespace.clone();
@@ -1003,7 +1043,16 @@
 
          if self.enable_external_cache_linker {
              return Self::needs_external_linker_offload_(node)
-@@ -1767,8 +1823,15 @@
+@@ -1742,6 +1798,8 @@
+     }
+
+     /// Insert device values to the tree per the provided key.
++    /// In-window SWA inserts require `begin_insert`/`resume_insert`, with the
++    /// controller applying each action batch before resuming the walk.
+     pub fn insert(&mut self, params: &InsertParams<'_, K, V>) -> InsertResult<V> {
+         self.try_insert(params)
+             .unwrap_or_else(|error| panic!("{error}"))
+@@ -1767,8 +1825,15 @@
      /// root first: access tick and LRU refresh, priority floor, hit count, and the
      /// write-through backup trigger, at O(depth) cost. A chunked insert never bumps
      /// hit counts, so it touches only the anchor. Anchor validation still walks
@@ -1021,7 +1070,7 @@
      /// component overlap hooks (SWA tombstone recovery, duplicate-slot release)
      /// are never replayed because they need the prefix KV, which this API does
      /// not receive.
-@@ -1809,14 +1872,23 @@
+@@ -1809,14 +1874,23 @@
              return Err(TreeCoreRuntimeError::InsertAnchorNotDeviceResident { node_id: anchor.id });
          }
 
@@ -1045,7 +1094,7 @@
              cursor = node.parent();
          }
          if node_prefix_len != prefix_len {
-@@ -1826,28 +1898,8 @@
+@@ -1826,28 +1900,8 @@
                  prefix_len,
              });
          }
@@ -1076,7 +1125,33 @@
          }
          Ok(())
      }
-@@ -1918,11 +1970,31 @@
+@@ -1861,7 +1915,7 @@
+         // Single-shot pump over the resumable walk: run every step inline and
+         // fold the step actions into the result for the caller to apply.
+         let mut actions = Vec::new();
+-        let mut step = self.try_begin_insert_at_(prefix_node_idx, prefix_len, params)?;
++        let mut step = self.try_begin_insert_at_(prefix_node_idx, prefix_len, params, true)?;
+         loop {
+             actions.append(&mut step.actions);
+             if let Some(mut result) = step.result {
+@@ -1884,7 +1938,7 @@
+         params: &InsertParams<'_, K, V>,
+     ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
+         let root_id = self.arena.root();
+-        self.try_begin_insert_at_(root_id, 0, params)
++        self.try_begin_insert_at_(root_id, 0, params, false)
+     }
+
+     fn try_begin_insert_at_(
+@@ -1892,6 +1946,7 @@
+         prefix_node_idx: NodeIdx_,
+         prefix_len: usize,
+         params: &InsertParams<'_, K, V>,
++        single_shot: bool,
+     ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
+         // Insert walks are single-flight; a live walk means re-entrancy.
+         if self.ongoing_insert_walk_state.is_some() {
+@@ -1918,11 +1973,42 @@
                  required_len: value_len,
              });
          }
@@ -1102,6 +1177,17 @@
 +            }
 +        }
          self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
++        // A controller must materialize in-window SWA rows before the terminal
++        // backup predicate (and component LRU refresh) can observe them. Never
++        // pump across those barriers while merely collecting their actions.
++        // Empty continuations and entirely tombstoned inputs have no rebuilds.
++        if single_shot
++            && self.try_component_by_type_(SWA).is_some()
++            && aligned_key_len > prefix_len
++            && params.swa_evicted_seqlen < aligned_key_len
++        {
++            return Err(TreeCoreRuntimeError::InsertRequiresController);
++        }
          if aligned_key_len > 0
 -            && let Some(rotation_base) = params.rotation_base
              && let Some((matched, node_id)) =
@@ -1110,7 +1196,7 @@
          {
              let root_id = self.arena.root();
              self.touch_node_(root_id);
-@@ -1942,23 +2014,52 @@
+@@ -1942,23 +2028,52 @@
          let mut prefix_actions = Vec::new();
          self.visit_retained_prefix_(prefix_node_idx, params, &mut prefix_actions);
          if aligned_key_len == prefix_len {
@@ -1179,7 +1265,7 @@
              });
          }
          // The walk owns only [prefix_len, aligned_key_len); the ragged tail and
-@@ -1966,6 +2067,7 @@
+@@ -1966,6 +2081,7 @@
          self.ongoing_insert_walk_state = Some(InsertWalkState {
              phase: InsertPhase::Walk,
              node_id: prefix_node_idx,
@@ -1187,7 +1273,7 @@
              key: K::from(params.key.as_ref()[prefix_len..aligned_key_len].to_vec()),
              key_offset: prefix_len,
              aligned_key_len,
-@@ -1983,17 +2085,20 @@
+@@ -1983,17 +2099,20 @@
              total_prefix_length: prefix_len,
              is_new_leaf: false,
              target_node_id: None,
@@ -1208,7 +1294,7 @@
              return Ok(InsertStepResult {
                  actions: prefix_actions,
                  result: None,
-@@ -2008,7 +2113,8 @@
+@@ -2008,7 +2127,8 @@
      /// bumps its hit count, which is where write-through backups originate. A
      /// non-chunked continuation replays that root first so LRU, LFU/SLRU, and
      /// write-through behavior match a root insert. Chunked inserts never bump hit
@@ -1218,7 +1304,7 @@
      fn visit_retained_prefix_(
          &mut self,
          anchor: NodeIdx_,
-@@ -2056,7 +2162,7 @@
+@@ -2056,7 +2176,7 @@
          &self,
          params: &InsertParams<'_, K, V>,
          aligned_key_len: usize,
@@ -1227,7 +1313,7 @@
      ) -> Option<(usize, NodeIdx_)> {
          let mut node_id = self.arena.root();
          let mut matched = 0;
-@@ -2069,18 +2175,26 @@
+@@ -2069,18 +2189,26 @@
                  break;
              };
              let child = self.arena.node(child_id);
@@ -1256,7 +1342,7 @@
      }
 
      /// Continue the suspended insert after its step actions were executed.
-@@ -2090,9 +2204,67 @@
+@@ -2090,9 +2218,67 @@
      }
 
      /// Fallible variant of [`Self::resume_insert`].
@@ -1326,7 +1412,7 @@
          }
          Ok(self.advance_insert_())
      }
-@@ -2104,10 +2276,35 @@
+@@ -2104,10 +2290,35 @@
 
      /// Finish the insert (idempotent); returns still-pending actions to drain.
      pub fn end_insert(&mut self) -> Vec<CacheAction<V>> {
@@ -1366,7 +1452,7 @@
      }
 
      /// Run the in-flight insert to its next barrier or to completion.
-@@ -2135,6 +2332,7 @@
+@@ -2135,6 +2346,7 @@
              if !new_actions.is_empty() && !new_actions.iter().all(Self::is_deferrable_action_) {
                  let flushed = std::mem::take(&mut state.pending_actions);
                  self.ongoing_insert_walk_state = Some(state);
@@ -1374,7 +1460,7 @@
                  return InsertStepResult {
                      actions: flushed,
                      result: None,
-@@ -2172,10 +2370,18 @@
+@@ -2172,10 +2384,18 @@
              return;
          };
          let mut node_id = child_id;
@@ -1393,7 +1479,7 @@
              let (split_node_id, action) = self.split_node_(node_id, prefix_len);
              node_id = split_node_id;
              if let Some(action) = action {
-@@ -2185,6 +2391,7 @@
+@@ -2185,6 +2405,7 @@
          {
              let node = self.arena.node_mut(node_id);
              node.priority = node.priority.max(state.priority);
@@ -1401,7 +1487,7 @@
          }
 
          let params = InsertParams {
-@@ -2326,6 +2533,7 @@
+@@ -2326,6 +2547,7 @@
              state.node_id
          };
          state.target_node_id = Some(target_node_id);
@@ -1409,7 +1495,7 @@
 
          // Finalize: let each component attach its data to the target node.
          // e.g. Mamba attaches mamba_value to the leaf node
-@@ -2336,7 +2544,7 @@
+@@ -2336,7 +2558,7 @@
              .as_mut()
              .expect("insert result exists during commit");
          result.prefix_len = state.total_prefix_length;
@@ -1418,7 +1504,7 @@
          let params = InsertParams {
              rotation_base: state.rotation_base,
              key: &state.key,
-@@ -2387,6 +2595,10 @@
+@@ -2387,6 +2609,10 @@
              return self.inc_hit_count_and_check_(target_node_id, state.chunked);
          }
 
@@ -1429,7 +1515,7 @@
          let node = self.arena.node(target_node_id);
          self.enable_hicache
              && node.backuped()
-@@ -2449,7 +2661,7 @@
+@@ -2449,7 +2675,7 @@
              Some(child.creation_counter),
              child_namespace.as_ref(),
          );
@@ -1438,7 +1524,7 @@
              (child_namespace.clone(), key_tail.child_key(page_size)),
              child_id,
          );
-@@ -2614,6 +2826,9 @@
+@@ -2614,6 +2840,9 @@
 
          self.update_evictable_leaf_sets_(new_node_id);
          self.update_evictable_leaf_sets_(parent_id);
@@ -1448,7 +1534,7 @@
          self.record_store_event_(new_node_id, StorageMedium::Gpu, session_id);
          new_node_id
      }
-@@ -2637,6 +2852,9 @@
+@@ -2637,6 +2866,9 @@
              self.inc_evictable_size(FULL, tokens);
          }
          self.update_evictable_leaf_sets_(node_id);
@@ -1458,7 +1544,7 @@
          self.update_full_coexisting_host_tracking_(node_id);
          if let Some(parent_id) = self.arena.node(node_id).try_parent() {
              self.update_evictable_leaf_sets_(parent_id);
-@@ -2846,6 +3064,7 @@
+@@ -2846,6 +3078,7 @@
              || self.arena.device_lock_ref(node_idx, component_type) > 0
              || (component_type == MAMBA && node.is_load_back_pending())
              || !self.device_lru_list(component_type).in_list(Some(node_idx))
@@ -1466,7 +1552,7 @@
          {
              return result;
          }
-@@ -2944,10 +3163,9 @@
+@@ -2944,10 +3177,9 @@
          let mut result = EvictionStepResult::default();
          {
              let node = self.arena.node(node_id);
@@ -1480,7 +1566,7 @@
              // A failed backup never issues the D->H copy, so the subtree root has
              // no host state and no in-flight DMA reading its device slots.
              assert!(!node.backuped() && node.write_through_pending_id.is_none());
-@@ -2963,13 +3181,18 @@
+@@ -2963,13 +3195,18 @@
              .values()
              .copied()
              .collect();
@@ -1499,7 +1585,7 @@
          }
          for &desc_id in descendants.iter().rev() {
              {
-@@ -2991,12 +3214,17 @@
+@@ -2991,12 +3228,17 @@
              );
              self.remove_leaf_from_parent_(desc_id);
          }
@@ -1517,7 +1603,7 @@
          Ok((true, result))
      }
 
-@@ -3178,7 +3406,7 @@
+@@ -3178,7 +3420,7 @@
      ) -> Result<EvictionStepResult<V>, TreeCoreRuntimeError> {
          let node_id = self.arena.resolve(node_id)?;
          let mut result = EvictionStepResult::default();
@@ -1526,7 +1612,7 @@
          if self.arena.node(node_id).is_load_back_pending() {
              return Ok(result);
          }
-@@ -3190,6 +3418,12 @@
+@@ -3190,6 +3432,12 @@
                      evicted: node.evicted(),
                      backuped: node.backuped(),
                  });
@@ -1539,7 +1625,7 @@
              }
          }
          self.demote_(
-@@ -3298,6 +3532,28 @@
+@@ -3298,6 +3546,28 @@
          }
 
          self.update_evictable_leaf_sets_(node_id);
@@ -1568,7 +1654,7 @@
      }
 
      /// Decide whether one component participates in a cascade eviction.
-@@ -3496,6 +3752,12 @@
+@@ -3496,6 +3766,12 @@
          if node.is_device_locked() {
              return false;
          }
@@ -1581,7 +1667,7 @@
          if node.is_load_back_pending() {
              return false;
          }
-@@ -3546,6 +3808,9 @@
+@@ -3546,6 +3822,9 @@
 
      /// Whether the storage tier (L3) is wired; storage attaches after tree construction.
      pub fn set_enable_storage(&mut self, value: bool) {
@@ -1591,7 +1677,7 @@
          self.enable_storage = value;
      }
 
-@@ -3834,6 +4099,33 @@
+@@ -3834,6 +4113,33 @@
          if !anchor.is_root() && anchor.namespace.as_ref() != namespace {
              return Err(TreeCoreRuntimeError::InsertHostNamespaceMismatch { node_id: anchor.id });
          }
@@ -1625,7 +1711,7 @@
          self.touch_node_(node_id);
          if total_len == 0 {
              return Ok(InsertResult {
-@@ -3846,6 +4138,7 @@
+@@ -3846,6 +4152,7 @@
                  mamba_exist: true,
                  swa_branch_inserted: false,
                  adopted_ranges: None,
@@ -1633,7 +1719,7 @@
                  cache_actions: Vec::new(),
              });
          }
-@@ -3887,6 +4180,7 @@
+@@ -3887,6 +4194,7 @@
              mamba_exist: false,
              swa_branch_inserted: false,
              adopted_ranges: None,
@@ -1641,7 +1727,7 @@
              cache_actions,
          };
          if matched_length == total_len {
-@@ -4072,7 +4366,21 @@
+@@ -4072,7 +4380,21 @@
              )
      }
 
@@ -1663,7 +1749,7 @@
      pub fn build_load_back_spec(
          &self,
          node_id: NodeId,
-@@ -4086,6 +4394,7 @@
+@@ -4086,6 +4408,7 @@
      > {
          let anchor_id = node_id;
          let node_id = self.arena.resolve(node_id)?;
@@ -1671,7 +1757,7 @@
          // Component hooks take primitives, not Req: extract its fields here.
          let mamba_pool_idx = req.and_then(|r| r.mamba_pool_idx.as_ref());
          let mut kv_transfers = self
-@@ -4147,6 +4456,8 @@
+@@ -4147,6 +4470,8 @@
                  name: PoolName::Kv,
                  host_indices: Some(V::empty()),
                  nodes_to_load: Some(Vec::new()),
@@ -1680,7 +1766,7 @@
                  ..Default::default()
              };
              return Ok((empty_kv, HashMap::new()));
-@@ -4389,9 +4700,26 @@
+@@ -4389,9 +4714,26 @@
          cache_actions: &mut Vec<CacheAction<V>>,
          mut insert_result: Option<&mut InsertResult<V>>,
          pool_storage_result: Option<&PoolTransferResult>,
@@ -1708,7 +1794,7 @@
          if let Some(insert_result) = insert_result.as_deref() {
              if let Some(last_device_node_id) = insert_result.last_device_node_id {
                  self.arena.resolve(last_device_node_id)?;
-@@ -4415,15 +4743,91 @@
+@@ -4415,15 +4757,93 @@
          Ok(())
      }
 
@@ -1747,6 +1833,8 @@
 +                    .as_deref()
 +                    .filter(|ids| !ids.is_empty())
 +                    .unwrap_or(&anchor);
++                self.component_by_type_(SWA)
++                    .validate_backup_window(self, node_id, targets)?;
 +                let mut total = 0usize;
 +                for &target in targets {
 +                    let node = self.arena.node(self.arena.resolve(target)?);
@@ -1801,7 +1889,7 @@
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          if !host_indices.is_empty() {
              let kv_xfer = PoolTransfer {
-@@ -4469,9 +4873,10 @@
+@@ -4469,9 +4889,10 @@
          device_indices: V,
          mut kv_xfer: PoolTransfer<V>,
          comp_xfers: HashMap<ComponentType, Vec<PoolTransfer<V>>>,
@@ -1813,7 +1901,7 @@
          let loaded_node_indices = kv_xfer
              .nodes_to_load
              .iter()
-@@ -4479,6 +4884,142 @@
+@@ -4479,6 +4900,145 @@
              .map(|&loaded_id| self.arena.resolve(loaded_id))
              .collect::<Result<Vec<_>, _>>()?;
          self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
@@ -1885,6 +1973,9 @@
 +        // when Full has no rows to restore. Check every destination and ordered
 +        // host source before any component adopts rows or publishes events.
 +        for (&component_type, transfers) in &comp_xfers {
++            if component_type == SWA && transfers.is_empty() {
++                return Err(invalid());
++            }
 +            // Mamba's first transfer materializes the anchor's tree checkpoint.
 +            // Later transfers may copy into request-owned slots, but cannot
 +            // stand in for the tree transfer consumed by the component hook.
@@ -1956,7 +2047,7 @@
          let mut cache_actions: Vec<CacheAction<V>> = Vec::new();
          kv_xfer.device_indices = Some(device_indices);
          let nodes_to_load = kv_xfer.nodes_to_load.clone();
-@@ -4547,6 +5088,9 @@
+@@ -4547,6 +5107,9 @@
                  self.arena.node_mut(idx).load_back_pending_id = None;
                  // The pin blocked leaf-set membership; re-evaluate it.
                  self.update_evictable_leaf_sets_(idx);
@@ -1966,7 +2057,7 @@
              }
              self.update_full_coexisting_host_tracking_(idx);
              node_id = self.arena.node(idx).try_parent();
-@@ -4709,8 +5253,12 @@
+@@ -4709,8 +5272,12 @@
              if node.write_through_pending_id == Some(ack_id) {
                  node.write_through_pending_id = None;
                  self.update_full_coexisting_host_tracking_(node_idx);
@@ -1981,7 +2072,7 @@
          }
          Ok(())
      }
-@@ -4830,6 +5378,11 @@
+@@ -4830,6 +5397,11 @@
              if pos + prefix_len <= window_start {
                  continue;
              }
@@ -1993,7 +2084,7 @@
              if self.arena.has_device_value(child_id, SWA) {
                  return Err(format!(
                      "attach_swa_window over live SWA at [{}, {})",
-@@ -5026,7 +5579,8 @@
+@@ -5026,7 +5598,8 @@
          }
          // Parent ↔ child bidirectional consistency
          for &node_id in &all_nodes {
@@ -2003,7 +2094,7 @@
                  let child = self.arena.node(child_id);
                  let child_parent = child.try_parent();
                  if child_parent != Some(node_id) {
-@@ -5601,14 +6155,7 @@
+@@ -5601,14 +6174,7 @@
      /// Whether the node is currently eligible as a Full device leaf.
      pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
          let node_id = self.arena.resolve(node_id)?;
@@ -2019,7 +2110,7 @@
      }
 
      /// Materialize every live tree node handle.
-@@ -5833,6 +6380,12 @@
+@@ -5833,6 +6399,12 @@
          let last_device_node_idx = self.arena.resolve(result.last_device_node_id)?;
          self.arena.resolve(result.last_host_node_id)?;
          let best_match_node_idx = self.arena.resolve(result.best_match_node_id)?;
@@ -2032,7 +2123,7 @@
          Ok(self
              .component_by_type_(component_type)
              .finalize_match_result_in_tree_core(
-@@ -5843,6 +6396,7 @@
+@@ -5843,6 +6415,7 @@
                  params,
                  value_chunks,
                  best_value_len,

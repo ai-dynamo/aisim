@@ -1798,6 +1798,8 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     }
 
     /// Insert device values to the tree per the provided key.
+    /// In-window SWA inserts require `begin_insert`/`resume_insert`, with the
+    /// controller applying each action batch before resuming the walk.
     pub fn insert(&mut self, params: &InsertParams<'_, K, V>) -> InsertResult<V> {
         self.try_insert(params)
             .unwrap_or_else(|error| panic!("{error}"))
@@ -1913,7 +1915,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         // Single-shot pump over the resumable walk: run every step inline and
         // fold the step actions into the result for the caller to apply.
         let mut actions = Vec::new();
-        let mut step = self.try_begin_insert_at_(prefix_node_idx, prefix_len, params)?;
+        let mut step = self.try_begin_insert_at_(prefix_node_idx, prefix_len, params, true)?;
         loop {
             actions.append(&mut step.actions);
             if let Some(mut result) = step.result {
@@ -1936,7 +1938,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         params: &InsertParams<'_, K, V>,
     ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
         let root_id = self.arena.root();
-        self.try_begin_insert_at_(root_id, 0, params)
+        self.try_begin_insert_at_(root_id, 0, params, false)
     }
 
     fn try_begin_insert_at_(
@@ -1944,6 +1946,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         prefix_node_idx: NodeIdx_,
         prefix_len: usize,
         params: &InsertParams<'_, K, V>,
+        single_shot: bool,
     ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
         // Insert walks are single-flight; a live walk means re-entrancy.
         if self.ongoing_insert_walk_state.is_some() {
@@ -1992,6 +1995,17 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             }
         }
         self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
+        // A controller must materialize in-window SWA rows before the terminal
+        // backup predicate (and component LRU refresh) can observe them. Never
+        // pump across those barriers while merely collecting their actions.
+        // Empty continuations and entirely tombstoned inputs have no rebuilds.
+        if single_shot
+            && self.try_component_by_type_(SWA).is_some()
+            && aligned_key_len > prefix_len
+            && params.swa_evicted_seqlen < aligned_key_len
+        {
+            return Err(TreeCoreRuntimeError::InsertRequiresController);
+        }
         if aligned_key_len > 0
             && let Some((matched, node_id)) =
                 self.rotation_conflict_(params, aligned_key_len, params.rotation_base)
@@ -4778,6 +4792,8 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     .as_deref()
                     .filter(|ids| !ids.is_empty())
                     .unwrap_or(&anchor);
+                self.component_by_type_(SWA)
+                    .validate_backup_window(self, node_id, targets)?;
                 let mut total = 0usize;
                 for &target in targets {
                     let node = self.arena.node(self.arena.resolve(target)?);
@@ -4952,6 +4968,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         // when Full has no rows to restore. Check every destination and ordered
         // host source before any component adopts rows or publishes events.
         for (&component_type, transfers) in &comp_xfers {
+            if component_type == SWA && transfers.is_empty() {
+                return Err(invalid());
+            }
             // Mamba's first transfer materializes the anchor's tree checkpoint.
             // Later transfers may copy into request-owned slots, but cannot
             // stand in for the tree transfer consumed by the component hook.

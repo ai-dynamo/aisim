@@ -29,6 +29,8 @@ class CompareRadixTests(unittest.TestCase):
         extra_observation=False,
         missing_observation=False,
         advance_head=False,
+        missing_output=False,
+        empty_output=False,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -47,7 +49,7 @@ class CompareRadixTests(unittest.TestCase):
                     {"scenario": "match_and_lock_compressed_prefix", "removed_block_hashes": [103]},
                 ]
                 if lifecycle
-                else []
+                else [{"scenario": "selection", "removed_block_hashes": [101]}]
             )
             if lifecycle:
                 recorded = [dict(item) for item in observations]
@@ -120,7 +122,10 @@ class CompareRadixTests(unittest.TestCase):
                         "-m",
                         "advance during baseline build",
                     )
-                Path(kwargs["env"]["AISIM_EVICTION_EVIDENCE_OUTPUT"]).write_text(json.dumps(observations))
+                if not missing_output:
+                    Path(kwargs["env"]["AISIM_EVICTION_EVIDENCE_OUTPUT"]).write_text(
+                        json.dumps([] if empty_output else observations)
+                    )
                 return subprocess.CompletedProcess(command, 0)
 
             argv = [
@@ -139,6 +144,13 @@ class CompareRadixTests(unittest.TestCase):
                 patch("sys.argv", argv),
                 patch.object(compare.subprocess, "run", side_effect=run_with_source_edits),
             ):
+                if missing_output or empty_output:
+                    with self.assertRaisesRegex(SystemExit, "selection observations missing or empty"):
+                        compare.main()
+                    self.assertEqual(builds, ["baseline"])
+                    report = json.loads((work / "comparison.json").read_text())
+                    self.assertFalse(report["baseline"]["scenarios"])
+                    return
                 if corrupt_record or corrupt_observation or extra_observation or missing_observation:
                     with self.assertRaisesRegex(SystemExit, "lifecycle observations differ"):
                         compare.main()
@@ -165,6 +177,12 @@ class CompareRadixTests(unittest.TestCase):
 
     def test_selection_overlays_stay_frozen_during_builds(self):
         self.check_frozen_overlays("selection")
+
+    def test_selection_rejects_missing_output(self):
+        self.check_frozen_overlays("selection", missing_output=True)
+
+    def test_selection_rejects_empty_output(self):
+        self.check_frozen_overlays("selection", empty_output=True)
 
     def test_both_head_revisions_stay_frozen_during_builds(self):
         for mode in ("selection", "lifecycle"):

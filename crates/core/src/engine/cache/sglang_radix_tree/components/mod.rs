@@ -371,6 +371,16 @@ pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
     }
 
     /// Recheck dependencies omitted from a staged load-back before any adoption.
+    /// Check that staged auxiliary backups belong to this anchor's window.
+    fn validate_backup_window(
+        &self,
+        _tree_core: &UnifiedTreeCore<K, V>,
+        _node_id: NodeIdx_,
+        _targets: &[crate::engine::cache::sglang_radix_tree::NodeId],
+    ) -> Result<(), TreeCoreRuntimeError> {
+        Ok(())
+    }
+
     fn validate_load_back_window(
         &self,
         tree_core: &UnifiedTreeCore<K, V>,

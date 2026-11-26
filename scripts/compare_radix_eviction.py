@@ -129,6 +129,8 @@ def main() -> None:
         (work / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
         if result.returncode:
             raise SystemExit(f"{side} failed: inspect {work / (side + '.log')}")
+        if not lifecycle and not report[side]["scenarios"]:
+            raise SystemExit(f"{side} selection observations missing or empty: {observed}")
         if lifecycle:
             expected = json.loads(overlays[LIFECYCLE_RECORD])[side]["scenarios"]
             observed_scenarios = report[side]["scenarios"] or []

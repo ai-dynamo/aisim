@@ -769,6 +769,11 @@ pub enum TreeCoreRuntimeError {
     /// `begin_insert`/`insert` called while a resumable insert is suspended.
     #[error("concurrent insert walks")]
     ConcurrentInsertWalk,
+    /// SWA rebuilds must be applied by the controller before resuming.
+    #[error(
+        "SWA insert requires begin_insert/resume_insert and action application at each barrier"
+    )]
+    InsertRequiresController,
     /// `resume_insert` called without a suspended insert.
     #[error("no in-flight insert")]
     NoInFlightInsert,

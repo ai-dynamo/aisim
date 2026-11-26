@@ -2968,6 +2968,50 @@ mod admission_validation_rollback {
         assert!(core.is_empty());
     }
 
+    #[test]
+    fn failed_admission_eviction_publishes_nothing_and_retry_matches_clean_events() {
+        let fixture = || {
+            let mut core = SglangCore::new_with_kv_capture(test_args(5, 4, 32), 0);
+            core.receive(direct_request((0..8).collect(), 0));
+            core.try_execute_hidden_pass(0.0).unwrap();
+            core.receive(direct_request((100..108).collect(), 0));
+            core.try_execute_hidden_pass(1.0).unwrap();
+            core.receive(direct_request((0..4).chain(50..58).collect(), 1));
+            core.drain_kv_events();
+            core
+        };
+        let mut retry = fixture();
+        let before = capacity(&retry);
+        assert_eq!(before.0, 4); // Two new pages require admission-time eviction.
+        let fail = Arc::new(AtomicBool::new(true));
+        install_timing(&mut retry, &fail, false);
+        for now in [2.0, 3.0] {
+            assert!(retry.try_execute_hidden_pass(now).is_err());
+            assert!(retry.drain_kv_events().is_empty());
+            assert_eq!(capacity(&retry), before);
+        }
+        fail.store(false, Ordering::Relaxed);
+        let pass = retry.try_execute_hidden_pass(4.0).unwrap();
+        assert_eq!(pass.admissions[0].reused_input_tokens, 4);
+        let observed = pass.kv_events;
+        assert!(matches!(
+            observed.first().unwrap().data,
+            KvEventData::Removed { .. }
+        ));
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event.data, KvEventData::Stored(_)))
+        );
+
+        let mut control = fixture();
+        install_timing(&mut control, &fail, false);
+        let control_pass = control.try_execute_hidden_pass(4.0).unwrap();
+        // Includes event IDs and ordered Removed/Stored hashes from the real sink.
+        // The control establishes the victim after the prefix split.
+        assert_eq!(observed, control_pass.kv_events);
+    }
+
     #[rstest::rstest]
     fn overlength_rejections_survive_failed_prefill_passes(
         #[values(false, true)] fail_in_prediction: bool,

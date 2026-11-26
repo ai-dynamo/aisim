@@ -919,6 +919,29 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         }
     }
 
+    fn validate_backup_window(
+        &self,
+        tree_core: &UnifiedTreeCore<K, V>,
+        node_id: NodeIdx_,
+        targets: &[NodeId],
+    ) -> Result<(), TreeCoreRuntimeError> {
+        // Use the planner's window and ordering, without copying pool rows or
+        // inspecting unrelated branches. The vector is bounded by one window.
+        let expected = self.collect_unbacked_swa_nodes_(tree_core, node_id);
+        if !expected
+            .iter()
+            .rev()
+            .map(|&idx| tree_core.arena.node(idx).id)
+            .eq(targets.iter().copied())
+        {
+            return Err(TreeCoreRuntimeError::InvalidBackupSpec {
+                node_id: tree_core.arena.node(node_id).id,
+                component_type: SWA,
+            });
+        }
+        Ok(())
+    }
+
     fn validate_load_back_window(
         &self,
         tree_core: &UnifiedTreeCore<K, V>,
