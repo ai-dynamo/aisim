@@ -90,13 +90,15 @@ to a group boundary instead of aborting the sweep.
 Measurement deviation on that route: the M3 history seeding
 (``_initialize_msa_history``, which writes the cached prefix's KV and index
 keys through the sparse backend's pooled writer) is MSA-only and does not run
-for QSA. QSA's main KV cache and its two index side caches therefore keep the
-allocator's zero fill, which is the condition the accepted C3.3 QSA rows were
-measured under. The block choice is score-dependent, but the timed top-k work
-is the selected block count, which the geometry fixes, so a zero-filled
-history does not change the measured kernels' shape. Seeding QSA would move a
-table already in the dataset, so it stays a documented deviation until those
-rows are re-collected.
+for QSA. The collector clears the request and KV pools between points, but
+neither clear zeroes the cache buffers, so a prefixed QSA point reads its
+prefix out of whatever the recycled pages hold — zeros on a page's first use, a
+previous point's K/V afterwards. That is the condition the accepted C3.3 QSA
+rows were measured under. The block choice is score-dependent, but the timed
+top-k work is the selected block count, which the geometry fixes, so the
+recycled content does not change the measured kernels' shape. Seeding QSA
+would move a table already in the dataset, so it stays a documented deviation
+until those rows are re-collected.
 
 Usage (inside the pinned SGLang image, collector/framework_manifest.yaml):
     python3 -m collector.sglang.collect_msa_module --mode context --quick \
