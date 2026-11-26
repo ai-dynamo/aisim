@@ -2138,6 +2138,51 @@ def test_direct_grouped_pd_parallel_configs(grouped_case, pinned, case, error):
             parallel_configs_for(profile["model"], "h200_sxm", **kwargs)
 
 
+@pytest.mark.parametrize("observed_role", ["prefill", "decode"])
+@pytest.mark.parametrize("finalized", [False, True])
+def test_grouped_pd_checks_dtype_when_only_one_role_has_runtime_memory(grouped_case, observed_role, finalized):
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper.config import SearchSpace
+    from aisim.sweeper.search_space import _fpm_parallel_configs
+
+    original, root = grouped_case
+    version = "0.32.0"
+    profile = _with_transfer_markers(_with_prefix_evidence(original, version=version), version=version)
+    measured = profile["deployments"][0]
+    profile["deployments"] = [measured]
+    _write_timings(root, profile, version=version)
+    peer = deepcopy(measured)
+    peer["worker_type"] = "decode" if observed_role == "prefill" else "prefill"
+    del peer["resources"]["runtime_memory"]
+    for field in ("weights_bytes", "activations_bytes", "runtime_overhead_bytes", "comm_overhead_bytes"):
+        peer["resources"][field] = original["deployments"][0]["resources"][field]
+    measured["worker_type"] = observed_role
+    profile["deployments"].append(peer)
+    observation = json.dumps({"runtime_settings": {"model_config": {"dtype": "torch.bfloat16"}}})
+    if finalized:
+        observation = json.dumps({"cell_observations": [{"runtime_memory": {"provenance": observation}}]})
+    memory = measured["resources"]["runtime_memory"]
+    memory.update(provenance=observation, model_dtype="bf16")
+    raw = _pd_prediction(profile, root)
+    raw["engine"]["context_length"] = 1024
+    raw["traffic"]["source"]["input_tokens"] = 128
+    search = _pd_search(profile, root)
+    rank = {"tp": 2, "moe_tp": 2}
+    pinned = {**search, "parallel_configs_by_mode": {"disagg": [{"prefill": rank, "decode": rank}]}}
+
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 2
+    for request in (search, pinned):
+        assert len(_fpm_parallel_configs(SearchSpace.model_validate(request), "disagg")) == 1
+
+    memory["model_dtype"] = "float16"
+    with pytest.raises(ValueError, match="model_dtype conflicts with observed runtime settings"):
+        CorePredictionConfig.model_validate(raw)
+    for request in (search, pinned):
+        with pytest.raises(ValueError, match="model_dtype conflicts with observed runtime settings"):
+            _fpm_parallel_configs(SearchSpace.model_validate(request), "disagg")
+
+
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):
     from aisim.sweeper.config import SmartSearchConfig
     from aisim.sweeper.search_space import enumerate_branches

@@ -1893,13 +1893,14 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | 
     backends = {deployment.attention_backend.lower() for deployment in (prefill_deployment, decode_deployment)}
     if len(backends - {"auto", "unknown"}) > 1:
         return "matching attention_backend when both backends are known"
-    if prefill.runtime_memory is not None and decode.runtime_memory is not None:
+    if prefill.runtime_memory is not None or decode.runtime_memory is not None:
         from aisim import _runtime
 
         try:
             observed = {
                 _runtime.observed_model_dtype(memory.provenance, memory.model_dtype)
                 for memory in (prefill.runtime_memory, decode.runtime_memory)
+                if memory is not None
             }
         except ValueError as error:
             return str(error)
