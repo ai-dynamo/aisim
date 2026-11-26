@@ -243,8 +243,13 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
         f"--container-image={image}",
         "--container-mounts=" + ",".join(f"{path}:{path}" for path in dict.fromkeys(mounts)),
         "--no-container-mount-home",
-        f"--container-workdir={script.parent}",
+        "--container-workdir=/tmp",
+        "env",
+        "TMPDIR=/tmp",
         "python3",
+        # The collector directory contains types.py. Safe-path mode prevents
+        # the script directory from shadowing Python's standard library.
+        "-P",
         str(script),
         "--engine",
         "--snapshot",
