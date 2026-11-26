@@ -70,7 +70,13 @@ class Gemma4MixModel(BaseModel):
         raw = model_info["raw_config"]
         text = raw.get("text_config", raw)
         (swa_heads, swa_dim), (full_heads, full_dim) = gemma4_cache_shapes(
-            text, backend_name, model_info.get("backend_version")
+            text,
+            backend_name,
+            model_info.get("backend_version"),
+            agreement_tp_size=model_config.tp_size,
+            # The SDK model parser accepts inherited window/chunk settings. Config-only
+            # estimates also validate them against the selected serving constructor.
+            validate_inherited_attention=False,
         )
         cfg = replace(
             cfg,

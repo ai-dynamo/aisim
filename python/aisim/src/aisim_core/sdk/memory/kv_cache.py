@@ -128,6 +128,20 @@ _SELECTED_DECODER_ARCHITECTURES = {
     "step3p7": "Step3p5ForCausalLM",
 }
 
+_LLAVA_TEXT_DEFAULTS = {
+    "LlavaForConditionalGeneration": "llama",
+    "LlavaNextForConditionalGeneration": "llama",
+    "LlavaNextVideoForConditionalGeneration": "llama",
+    "LlavaOnevisionForConditionalGeneration": "qwen2",
+}
+
+_VLLM_FP8_WEIGHT_DTYPES = {
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E4M3FNUZ": "float8_e4m3fnuz",
+    "F8_E5M2": "float8_e5m2",
+    "F8_E5M2FNUZ": "float8_e5m2fnuz",
+}
+
 
 # A missing field in a known Transformers config can have a fixed class default.
 # An explicit null still follows the model's own derived-dimension path.
@@ -171,6 +185,14 @@ _DECODER_GEOMETRY_DEFAULTS = {
         "first_k_dense_replace": 3,
     },
 }
+
+
+def _apply_decoder_geometry_defaults(decoder: dict, constructor: str | None) -> None:
+    for field, default in _DECODER_GEOMETRY_DEFAULTS.get(constructor, {}).items():
+        value = decoder.setdefault(field, default)
+        if value is None and field in ("q_lora_rank", "num_key_value_heads"):
+            continue
+        layout_integer(value, field, minimum=0 if field == "first_k_dense_replace" else 1)
 
 
 # Transformers constructor fields and aliases used by the selected expert implementations.
@@ -218,45 +240,45 @@ def _config_only_backend_version(
         return None
 
 
-# Official release index and Linux platform manifest digests for the vLLM
+# Official release index (first) and its Linux platform manifest digests for the vLLM
 # adapters that support both the flat and heterogeneous Transformers readers.
 _GEMMA4_ADAPTER_IMAGES = {
-    ("0.28.0", "vllm"): {
+    ("0.28.0", "vllm"): (
         "sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14",
         "sha256:2a7cde230b59f3ce6cab33dd245ba6bee41aa87b38c9fe84f966ff24016813ce",
         "sha256:2286e8533ca8b6bc777594bae30524f1426ba46ca21797524e06df6a94b06635",
-    },
-    ("0.28.0", "vllm_xpu"): {
+    ),
+    ("0.28.0", "vllm_xpu"): (
         "sha256:4756b66a077627133cee653b551f6f5eaa1b9a981b5eea13edd33fcd3b0d3ca3",
         "sha256:d3e9c5f146a8251c7489107e6353cf512fcd1bf14a16cab17148125a62a537c8",
-    },
-    ("0.29.0", "vllm"): {
+    ),
+    ("0.29.0", "vllm"): (
         "sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1",
         "sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a",
         "sha256:082ca6f035279109041ffd3fe0695cb568b29bc580b35c4f297a66a08b216c1b",
-    },
-    ("0.29.0", "vllm_xpu"): {
+    ),
+    ("0.29.0", "vllm_xpu"): (
         "sha256:96db42e248d48760a4937eb3d04c4878b39d13a9814efea95d510393e097a901",
         "sha256:1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a",
-    },
-    ("0.30.0", "vllm"): {
+    ),
+    ("0.30.0", "vllm"): (
         "sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
         "sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
         "sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40",
-    },
-    ("0.30.0", "vllm_xpu"): {
+    ),
+    ("0.30.0", "vllm_xpu"): (
         "sha256:fc0e112afb64e3a06fe8daff34652435822a629412f38efce8f0f67a46636b8d",
         "sha256:e4446310b1d30015e8fdc1a0a2ef1669ac6bef857cbe772487571ed5c1a926a9",
-    },
-    ("0.31.0", "vllm"): {
+    ),
+    ("0.31.0", "vllm"): (
         "sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3",
         "sha256:3f7dd5b777d34d1724456ce71f87385dca288c3bb23029ab27dee358f5d2b971",
         "sha256:a4a4c0437bf7240089da5f08aa370c4aee17ae5290f7a3b468825ee26c4c3a6b",
-    },
-    ("0.31.0", "vllm_xpu"): {
+    ),
+    ("0.31.0", "vllm_xpu"): (
         "sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7",
         "sha256:0229393589110073085ffb558d3da4ce1114b93e985019a8811433b5fc793bac",
-    },
+    ),
 }
 
 
@@ -298,7 +320,7 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str) -> 
                 and isinstance(digest, str)
                 and digest in digests
                 and name in (repository, image)
-                and (not embedded_digest or embedded_digest == digest)
+                and (not embedded_digest or embedded_digest == digest or embedded_digest == digests[0])
             )
 
 
@@ -323,15 +345,20 @@ def _check_gemma4_adapter_runtime(
     # These vLLM adapters accept both flat and per-layer Transformers implementations.
     tp_size = validate_parallel_size("tp_size", tp_size)
     try:
-        gemma4_cache_shapes(decoder, "vllm", agreement_tp_size=tp_size)
+        gemma4_cache_shapes(decoder, "vllm", version, agreement_tp_size=tp_size, compare_adapter_readers=True)
         return
     except ValueError:
         # An invalid per-layer layout still fails even with a known stock runtime.
-        gemma4_cache_shapes(decoder, "vllm", version)
+        gemma4_cache_shapes(decoder, "vllm", version, agreement_tp_size=tp_size)
 
     if system:
+        strict = perf_database._strict_provenance_enabled(None)
         for root in _config_only_systems_paths(systems_paths):
-            cells = list(perf_database._iter_database_version_paths(system, "vllm", version, root))
+            cells = [
+                directory
+                for directory, data_dir in perf_database._iter_database_version_paths(system, "vllm", version, root)
+                if not perf_database._version_dir_unusable_for_request(directory, data_dir, strict=strict)
+            ]
             if not cells:
                 continue
             spec = _config_only_system_spec(system, [root])
@@ -339,7 +366,7 @@ def _check_gemma4_adapter_runtime(
                 framework = "vllm_xpu" if perf_database.is_xpu_system_spec(spec) else "vllm"
                 images = {
                     stock
-                    for directory, _ in cells
+                    for directory in cells
                     for stock in _gemma4_collection_images(Path(directory), version, framework)
                 }
                 if images == {True}:
@@ -892,6 +919,10 @@ class KVCacheEstimator:
         resolve_sglang_mla_compute(model_config, model_path, backend, database.version, database.system_spec)
         resolve_trtllm_mla_compute(model_config, model_path, backend, database.system_spec)
         model = get_model(model_path, model_config, backend, database.version)
+        if backend == "vllm" and getattr(model, "architecture", None) == "Gemma4ForConditionalGeneration":
+            _check_gemma4_adapter_runtime(
+                _load_model_config_from_model_path(model_path), database.version, tp_size, system, systems_path
+            )
         backend_obj = get_backend(backend)
 
         # num_tokens = max_num_tokens -> activations track BuildConfig.max_num_tokens
@@ -1196,8 +1227,6 @@ class NaiveKVCacheEstimator:
             or (backend in ("sglang", "vllm") and gemma4 and gemma4_cache_requires_release(decoder, backend))
         ):
             backend_version = _config_only_backend_version(system, backend, backend_version, systems_paths)
-            if gemma4 and backend == "vllm" and "per_layer_config" in decoder:
-                _check_gemma4_adapter_runtime(hf_config, backend_version, tp_size, system, systems_paths)
         estimator = cls._from_resolved_hf_config(
             hf_config,
             tp_size=tp_size,
@@ -1207,6 +1236,9 @@ class NaiveKVCacheEstimator:
             backend=backend,
             backend_version=backend_version,
         )
+
+        if backend == "vllm" and gemma4:
+            _check_gemma4_adapter_runtime(hf_config, backend_version, tp_size, system, systems_paths)
 
         if estimator._selected_decoder is not None:
             estimator._vllm_dtype_target = (system, systems_paths)
@@ -1248,9 +1280,7 @@ class NaiveKVCacheEstimator:
         This is the no-I/O counterpart to :meth:`from_model_path`. Callers that
         already loaded a config can reuse it without issuing a second HF request.
         """
-        if backend == "vllm":
-            _check_gemma4_adapter_runtime(hf_config, backend_version, tp_size)
-        return cls._from_resolved_hf_config(
+        estimator = cls._from_resolved_hf_config(
             hf_config,
             tp_size=tp_size,
             pp_size=pp_size,
@@ -1259,6 +1289,9 @@ class NaiveKVCacheEstimator:
             backend=backend,
             backend_version=backend_version,
         )
+        if backend == "vllm":
+            _check_gemma4_adapter_runtime(hf_config, backend_version, tp_size)
+        return estimator
 
     @classmethod
     def _from_resolved_hf_config(
@@ -1279,33 +1312,12 @@ class NaiveKVCacheEstimator:
         # V4.1 shares a compressed representation with source-layer ownership and position-dependent growth.
         # The original V4 checkpoints, including sgl-project's deepseek_ref exports, have no such ownership.
         model_type = hf_config.get("model_type")
-        if decoder_config_key(hf_config) is None and (
+        deepseek_v4 = decoder_config_key(hf_config) is None and (
             model_type in ("deepseek_v4", "deepseek_ref") or architecture == "DeepseekV4ForCausalLM"
-        ):
-            if architecture not in (None, "DeepseekV4ForCausalLM") or model_type not in (
-                None,
-                "deepseek_v4",
-                "deepseek_ref",
-            ):
-                raise ValueError(f"model_type {model_type} conflicts with architecture {architecture}")
-            if any(hf_config.get(field) for field in ("kv_source_layer_ids", "index_source_layer_ids")):
-                raise ValueError("source-layer cache ownership requires native sequence geometry or a runtime profile")
+        )
+        if deepseek_v4 and architecture is None:
             architecture = "DeepseekV4ForCausalLM"
             hf_config = {**hf_config, "architectures": [architecture]}
-            ratios = hf_config.get("compress_ratios")
-            layers = layout_integer(hf_config.get("num_hidden_layers"), "num_hidden_layers")
-            mtp = layout_integer(hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers", minimum=0)
-            if (
-                not isinstance(ratios, list)
-                or len(ratios) not in (layers, layers + mtp)
-                or any(type(ratio) is not int or ratio not in {0, 4, 128} for ratio in ratios)
-                or not any(ratios[:layers])
-                or any(ratios[layers:])
-            ):
-                raise ValueError(
-                    "DeepSeek V4 compress_ratios must cover the decoder and optional MTP layers "
-                    "with supported integer ratios and uncompressed MTP layers"
-                )
         try:
             parsed = _parse_hf_config_json(hf_config)  # supported arch -> normalized parse, or its refusal
         except Exception as error:
@@ -1316,21 +1328,44 @@ class NaiveKVCacheEstimator:
                 ) from error
             parsed = None  # unsupported arch (the fallback's target) -> raw-key read, of its decoder when nested
             key = decoder_config_key(hf_config)
+            if key is None and architecture is None and model_type in _LLAVA_TEXT_DEFAULTS.values():
+                # A bare child with its model_type still identifies the same constructor.
+                hf_config = dict(hf_config)
+                _apply_decoder_geometry_defaults(hf_config, model_type)
             if key is not None:
                 problem = decoder_config_problem(key, hf_config[key])
                 if problem is not None:
                     raise ValueError(f"HF config: {problem}") from error
                 raw_decoder = inherit_decoder_precision(hf_config, hf_config[key])[0]
+                if (
+                    key == "text_config"
+                    and architecture in _LLAVA_TEXT_DEFAULTS
+                    and raw_decoder.setdefault("model_type", _LLAVA_TEXT_DEFAULTS[architecture]) is None
+                ):
+                    raise ValueError(f"{key}.model_type must be a string") from error
                 selected_type = raw_decoder.get("model_type")
                 if selected_type is not None and not isinstance(selected_type, str):
                     raise ValueError(f"{key}.model_type must be a string") from error
-                selected = _SELECTED_DECODER_ARCHITECTURES.get(selected_type)
                 classes = raw_decoder.get("architectures") or []
-                named = classes[0] if isinstance(classes, list) and classes and isinstance(classes[0], str) else None
+                if not isinstance(classes, list) or not all(isinstance(name, str) for name in classes):
+                    raise ValueError(f"HF config architectures must be a list of strings, got {classes!r}") from error
+                named = next(iter(classes), None)
+                # These wrappers construct LlamaModel directly, even when their
+                # training checkpoint names a different class for the text model.
+                if (
+                    key == "text_config"
+                    and architecture in ("Idefics3ForConditionalGeneration", "SmolVLMForConditionalGeneration")
+                    and raw_decoder.get("model_type", "llama") == "llama"
+                ):
+                    selected_type = "llama"
+                    named = "LlamaForCausalLM"
+                    raw_decoder.update(model_type=selected_type, architectures=[named])
+                selected = _SELECTED_DECODER_ARCHITECTURES.get(selected_type)
                 if (
                     selected
                     and named
                     and named != selected
+                    and (named in ARCHITECTURE_TO_MODEL_FAMILY or named in _SELECTED_DECODER_ARCHITECTURES.values())
                     and not (selected == "Step3p5ForCausalLM" and ARCHITECTURE_TO_MODEL_FAMILY.get(named) == "STEP3P7")
                 ):
                     raise ValueError(f"model_type={selected_type!r} conflicts with architectures={named!r}") from error
@@ -1340,11 +1375,7 @@ class NaiveKVCacheEstimator:
                         None,
                     )
                 constructor = "deepseek_v3" if selected_type == "kimi_k2" else selected_type
-                for field, default in _DECODER_GEOMETRY_DEFAULTS.get(constructor, {}).items():
-                    value = raw_decoder.setdefault(field, default)
-                    if value is None and field in ("q_lora_rank", "num_key_value_heads"):
-                        continue
-                    layout_integer(value, field, minimum=0 if field == "first_k_dense_replace" else 1)
+                _apply_decoder_geometry_defaults(raw_decoder, constructor)
                 head_dim, kv_heads = _DECODER_HEAD_DEFAULTS.get(selected_type, (None, None))
                 if selected_type in _DECODER_HEAD_DEFAULTS:
                     # These projection classes read the canonical field, while SGLang sizes its pool separately.
@@ -1356,7 +1387,9 @@ class NaiveKVCacheEstimator:
                     )
                     if backend == "sglang" and (pool_heads is not None or raw_decoder.get("multi_query")):
                         if selected_type == "gemma4_text":
-                            canonical = gemma4_cache_shapes(raw_decoder, backend, backend_version)[1][0]
+                            canonical = gemma4_cache_shapes(
+                                raw_decoder, backend, backend_version, agreement_tp_size=tp_size
+                            )[1][0]
                         if (1 if raw_decoder.get("multi_query") else pool_heads) != canonical:
                             raise ValueError(
                                 "SGLang pool KV heads disagree with the selected decoder's KV projections"
@@ -1376,17 +1409,6 @@ class NaiveKVCacheEstimator:
                     raw_decoder["moe_intermediate_size"] = layout_integer(
                         raw_decoder.setdefault(width, default_width), width
                     )
-                if selected_type == "qwen3" and raw_decoder.get("use_sliding_window"):
-                    raw_decoder.setdefault("sliding_window", 4096)
-                    if raw_decoder["sliding_window"] is None:
-                        raw_decoder["use_sliding_window"] = False
-                    if raw_decoder.get("layer_types") is None:
-                        full = layout_integer(raw_decoder.get("max_window_layers", 28), "max_window_layers", minimum=0)
-                        layers = layout_integer(raw_decoder.get("num_hidden_layers", 32), "num_hidden_layers")
-                        raw_decoder["layer_types"] = [
-                            "sliding_attention" if raw_decoder["use_sliding_window"] and i >= full else "full_attention"
-                            for i in range(layers)
-                        ]
                 if selected_type == "gemma3_text":
                     if "sliding_window_size" not in raw_decoder:
                         raw_decoder.setdefault("sliding_window", 4096)
@@ -1441,8 +1463,31 @@ class NaiveKVCacheEstimator:
                 decoder._set_checkpoint_cache_precision(decoder._selected_decoder, backend, backend_version, hf_config)
                 decoder.architecture = decoder.architecture or architecture
                 return decoder
+        if deepseek_v4:
+            if architecture != "DeepseekV4ForCausalLM" or model_type not in (
+                None,
+                "deepseek_v4",
+                "deepseek_ref",
+            ):
+                raise ValueError(f"model_type {model_type} conflicts with architecture {architecture}")
+            if any(hf_config.get(field) for field in ("kv_source_layer_ids", "index_source_layer_ids")):
+                raise ValueError("source-layer cache ownership requires native sequence geometry or a runtime profile")
+            ratios = hf_config.get("compress_ratios")
+            layers = layout_integer(hf_config.get("num_hidden_layers"), "num_hidden_layers")
+            mtp = layout_integer(hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers", minimum=0)
+            if (
+                not isinstance(ratios, list)
+                or len(ratios) not in (layers, layers + mtp)
+                or any(type(ratio) is not int or ratio not in {0, 4, 128} for ratio in ratios)
+                or not any(ratios[:layers])
+                or any(ratios[layers:])
+            ):
+                raise ValueError(
+                    "DeepSeek V4 compress_ratios must cover the decoder and optional MTP layers "
+                    "with supported integer ratios and uncompressed MTP layers"
+                )
         estimator = cls(
-            cls._geometry(hf_config, parsed, backend, backend_version),
+            cls._geometry(hf_config, parsed, backend, backend_version, tp_size),
             dtype_bytes=cls._dtype_bytes(
                 hf_config,
                 generic=parsed is None
@@ -1735,7 +1780,7 @@ class NaiveKVCacheEstimator:
             # An unregistered decoder can carry an untyped torch_dtype. Its generic estimate defaults to BF16.
             if generic and value is None and not isinstance(hf_config.get("torch_dtype"), str):
                 return 2
-            if "torch_dtype" in hf_config or "dtype" in hf_config:
+            if hf_config.get("torch_dtype") is not None or value is not None:
                 raise ValueError("HF config torch_dtype or dtype must be a nonempty string")
             return 2
         dtype_str = value.strip().lower()
@@ -1793,10 +1838,18 @@ class NaiveKVCacheEstimator:
             key = MULTIMODAL_TEXT_CONFIG_KEY.get(parsed["architecture"])
             hf_config = hf_config.get(key, hf_config)
         gpt_oss = hf_config.get("model_type") == "gpt_oss" or (parsed and parsed["architecture"] == "GptOssForCausalLM")
+        enabled = hf_config.get("use_sliding_window")
+        qwen_sliding = enabled is True and (
+            hf_config.get("model_type") in ("qwen2", "qwen3")
+            or (hf_config.get("architectures") or [None])[0] in ("Qwen2ForCausalLM", "Qwen3ForCausalLM")
+        )
+        if qwen_sliding and "sliding_window" not in hf_config:
+            hf_config = {**hf_config, "sliding_window": 4096}
         window = cache_window(hf_config)
+        if qwen_sliding and hf_config["sliding_window"] is None:
+            enabled = False
         if gpt_oss and "sliding_window" not in hf_config:
             window = 128  # GptOssConfig default.
-        enabled = hf_config.get("use_sliding_window")
         if enabled is not None and type(enabled) is not bool:
             raise ValueError("use_sliding_window must be a boolean")
         if enabled and not window:
@@ -1811,6 +1864,11 @@ class NaiveKVCacheEstimator:
             # The parser trims extra MTP layers from the external layer list to the actual decoder.
             num_swa = extra.attn_layer_pattern.count(0)
             num_global = extra.attn_layer_pattern.count(1)
+        elif qwen_sliding and hf_config.get("layer_types") is None and num_layers:
+            # Qwen2Config and Qwen3Config mark layers at and after max_window_layers as sliding.
+            full = layout_integer(hf_config.get("max_window_layers", 28), "max_window_layers", minimum=0)
+            num_global = min(num_layers, full) if enabled else num_layers
+            num_swa = num_layers - num_global
         elif gpt_oss and hf_config.get("layer_types") is None and num_layers:
             # GptOssConfig defaults even-numbered layers to sliding and odd-numbered layers to full attention.
             num_swa = (num_layers + 1) // 2
@@ -1845,7 +1903,12 @@ class NaiveKVCacheEstimator:
 
     @classmethod
     def _geometry(
-        cls, hf_config: dict, parsed: dict | None, backend: str = "vllm", backend_version: str | None = None
+        cls,
+        hf_config: dict,
+        parsed: dict | None,
+        backend: str = "vllm",
+        backend_version: str | None = None,
+        tp_size: int = 1,
     ) -> dict:
         """Normalized attention/FFN scalars the byte formulas consume.
 
@@ -1871,7 +1934,9 @@ class NaiveKVCacheEstimator:
             swa_heads = swa_dim = swa_queries = None
             if isinstance(extra, Gemma4MixConfig):
                 decoder = hf_config.get("text_config", hf_config)
-                (swa_heads, swa_dim), (heads, dim) = gemma4_cache_shapes(decoder, backend, backend_version)
+                (swa_heads, swa_dim), (heads, dim) = gemma4_cache_shapes(
+                    decoder, backend, backend_version, agreement_tp_size=tp_size
+                )
             elif ARCHITECTURE_TO_MODEL_FAMILY.get(parsed.get("architecture")) == "STEP3P7":
                 key = MULTIMODAL_TEXT_CONFIG_KEY.get(parsed["architecture"])
                 decoder = hf_config.get(key, hf_config)
@@ -1947,7 +2012,9 @@ class NaiveKVCacheEstimator:
         if hf_config.get("model_type") == "gemma4_text":
             if "intermediate_size" not in hf_config:
                 inter = GEMMA4_DEFAULT_INTERMEDIATE_SIZE
-            (swa_heads, swa_dim), (num_kv_heads, head_dim) = gemma4_cache_shapes(hf_config, backend, backend_version)
+            (swa_heads, swa_dim), (num_kv_heads, head_dim) = gemma4_cache_shapes(
+                hf_config, backend, backend_version, agreement_tp_size=tp_size
+            )
         return {
             "layers": layers,
             **({"recurrent_cache": True} if "linear_attention" in (hf_config.get("layer_types") or ()) else {}),
@@ -2081,7 +2148,11 @@ class NaiveKVCacheEstimator:
                 raise ValueError(f"{problem}: {path.name}") from exc
         if not dtypes:
             return "float32"  # vLLM's default when no weights report a dtype.
-        floating = {dtype for dtype in dtypes if dtype.startswith(("F", "BF", "C"))} - {"F8_E4M3", "F8_E5M2"}
+        floating = {dtype for dtype in dtypes if dtype.startswith(("F", "BF", "C"))} - _VLLM_FP8_WEIGHT_DTYPES.keys()
+        if not floating:
+            for header, dtype in _VLLM_FP8_WEIGHT_DTYPES.items():
+                if header in dtypes:
+                    return dtype  # All FP8 formats resolve to the same preferred execution dtype.
         if "F64" in floating and floating <= {"F16", "BF16", "F32", "F64"}:
             return "float64"
         if "F32" in floating and floating <= {"F16", "BF16", "F32"}:
@@ -2100,7 +2171,8 @@ class NaiveKVCacheEstimator:
             return
         if mode == "bfloat16" and self._vllm_check_model_dtype:
             dtype = self._vllm_model_dtype or self._local_vllm_model_dtype()
-            if dtype in ("float32", "fp32", "float", "float64", "double", "bfloat16", "bf16"):
+            fp8 = dtype in _VLLM_FP8_WEIGHT_DTYPES.values()
+            if fp8 or dtype in ("float32", "fp32", "float", "float64", "double", "bfloat16", "bf16"):
                 # vLLM downcasts F32 and unsupported dtypes to the deployment's preferred dtype.
                 spec = _config_only_system_spec(*self._vllm_dtype_target)
                 sm = spec.get("gpu", {}).get("sm_version")
@@ -2108,7 +2180,7 @@ class NaiveKVCacheEstimator:
                     dtype = "bfloat16" if sm >= 80 else "float16"
                 elif spec.get("gpu") and perf_database.is_xpu_system_spec(spec):
                     dtype = "bfloat16"
-                elif dtype in ("float64", "double"):
+                elif fp8 or dtype in ("float64", "double"):
                     raise ValueError("explicit bfloat16 KV cache requires the target's preferred vLLM model dtype")
             if dtype in ("float16", "fp16", "half"):
                 raise ValueError("explicit bfloat16 KV cache dtype disagrees with the vLLM float16 model dtype")

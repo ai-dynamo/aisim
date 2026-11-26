@@ -939,6 +939,7 @@ _GEMMA4_OTHER_DEFAULTS = {
     "chunk_size_feed_forward": 0,
     "is_encoder_decoder": False,
     "problem_type": None,
+    "allow_global_per_layer_attribute_access": False,
     "initializer_range": 0.02,
     "use_cache": True,
     "pad_token_id": 0,
@@ -950,8 +951,27 @@ _GEMMA4_OTHER_DEFAULTS = {
 }
 
 
+def _gemma4_global_labels_match(config: dict, name: str, value: object, count: int) -> bool:
+    labels = config.get("id2label")
+    if isinstance(labels, dict) and len(labels) == count:
+        if name == "label2id":
+            return value == config.get(name)
+        return value == {int(key): label for key, label in labels.items()}
+    if not isinstance(value, dict) or len(value) != count:
+        return False
+    # Compare with the generated label map without allocating one from an unchecked count.
+    if name == "id2label":
+        return all(value.get(i) == f"LABEL_{i}" for i in range(len(value)))
+    return all(value.get(f"LABEL_{i}") == i for i in range(len(value)))
+
+
 def _check_gemma4_layer_attributes(
-    config: dict, layers: dict[int, dict], types: list[str], backend: str, release: Version | None
+    config: dict,
+    layers: dict[int, dict],
+    types: list[str],
+    backend: str,
+    release: Version | None,
+    validate_inherited_attention: bool,
 ) -> None:
     # Transformers first removes overrides that equal the effective global attribute.
     # SGLang flattens only attention geometry. vLLM leaves other overrides attached:
@@ -960,7 +980,15 @@ def _check_gemma4_layer_attributes(
     if defaults["rope_parameters"] is None:
         defaults["rope_parameters"] = _GEMMA4_VLLM_GLOBAL_DEFAULTS["rope_parameters"]
     if defaults["use_bidirectional_attention"] == "all":
+        defaults.setdefault("is_causal", False)
         defaults["sliding_window"] = layout_integer(defaults["sliding_window"], "sliding_window") // 2 + 1
+    # PreTrainedConfig exposes these attributes after loading aliases and initializing label maps.
+    labels = config.get("id2label")
+    defaults.setdefault("num_labels", len(labels) if isinstance(labels, dict) else 2)
+    defaults["name_or_path"] = defaults["_name_or_path"] = config.get("_name_or_path", config.get("name_or_path", ""))
+    # Serving converts a global dtype to a torch.dtype. A non-null layer value remains a JSON string.
+    dtype = config.get("dtype") or config.get("torch_dtype")
+    defaults["dtype"] = defaults["torch_dtype"] = None if dtype is None else object()
 
     global_reads = (_GEMMA4_VLLM_GLOBAL_DEFAULTS.keys() - {"num_experts", "top_k_experts", "moe_intermediate_size"}) | {
         "layer_types",
@@ -994,9 +1022,11 @@ def _check_gemma4_layer_attributes(
         if release is None or release < Version("0.31.0rc1"):
             global_reads.add("expert_intermediate_size")
     guarded = not config.get("allow_global_per_layer_attribute_access")
-    for fields in layers.values():
+    for index in range(len(types)):
+        fields = layers.get(index, {})
         if (
-            fields.get("attention_chunk_size", config.get("attention_chunk_size")) is not None
+            (validate_inherited_attention or "attention_chunk_size" in fields or "sliding_window" in fields)
+            and fields.get("attention_chunk_size", config.get("attention_chunk_size")) is not None
             and fields.get("sliding_window", defaults["sliding_window"]) is not None
         ):
             raise ValueError("Gemma 4 per_layer_config cannot combine attention_chunk_size and sliding_window")
@@ -1008,7 +1038,10 @@ def _check_gemma4_layer_attributes(
         ):
             raise ValueError("Gemma 4 per_layer_config contains an unsupported skip")
         for name in fields.keys() - {"num_key_value_heads", "head_dim", "skip"}:
-            if name not in defaults:
+            if name in ("id2label", "label2id"):
+                if _gemma4_global_labels_match(config, name, fields[name], defaults["num_labels"]):
+                    continue
+            elif name not in defaults:
                 # A custom attribute without a global value must be supplied on every layer.
                 if len(layers) != len(types) or any(name not in row for row in layers.values()):
                     raise ValueError(f"Gemma 4 per_layer_config has no global {name}")
@@ -1028,9 +1061,25 @@ def gemma4_cache_requires_release(config: dict, backend: str) -> bool:
 
 
 def gemma4_cache_shapes(
-    config: dict, backend: str | None = None, backend_version: str | None = None, *, agreement_tp_size: int = 1
+    config: dict,
+    backend: str | None = None,
+    backend_version: str | None = None,
+    *,
+    agreement_tp_size: int = 1,
+    compare_adapter_readers: bool = False,
+    validate_inherited_attention: bool = True,
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     """Return the (KV heads, head dimension) of the sliding and full attention pools."""
+
+    def same_rank_shape(first: tuple[int, int], second: tuple[int, int]) -> bool:
+        tp = layout_integer(agreement_tp_size, "tp_size")
+        return (
+            first[1] == second[1]
+            and config.get("num_attention_heads", 8) % tp == 0
+            and all(max(heads, tp) % min(heads, tp) == 0 for heads in (first[0], second[0]))
+            and max(1, first[0] // tp) == max(1, second[0] // tp)
+        )
+
     has_per_layer_config = "per_layer_config" in config
     heads = config.get("num_key_value_heads", 4)
     dim = config.get("head_dim", 256)
@@ -1082,7 +1131,7 @@ def gemma4_cache_shapes(
                 raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
             by_layer[int(key)] = fields
         types = [*types[:-1], "full_attention"]
-        _check_gemma4_layer_attributes(config, by_layer, types, backend, release)
+        _check_gemma4_layer_attributes(config, by_layer, types, backend, release, validate_inherited_attention)
         shapes = {}
         for i, kind in enumerate(types):
             fields = by_layer.get(i, {})
@@ -1092,11 +1141,17 @@ def gemma4_cache_shapes(
             )
             if guarded_flat_read and shape != base:
                 raise ValueError(f"vLLM {backend_version} cannot read global Gemma 4 heads with per-layer overrides")
-            if shape != shapes.setdefault(kind, shape):
-                raise ValueError("AISim requires one Gemma 4 cache geometry per attention layer type")
+            first = shapes.setdefault(kind, shape)
+            if shape != first:
+                if backend != "vllm" or not same_rank_shape(first, shape):
+                    raise ValueError("AISim requires one Gemma 4 cache geometry per attention layer type")
+                if (release is None or compare_adapter_readers) and not config.get(
+                    "allow_global_per_layer_attribute_access"
+                ):
+                    raise ValueError("Gemma 4 per_layer_config requires the vLLM release or a runtime profile")
         if not flat_vllm:
             explicit_shapes = shapes
-    if explicit_shapes is None or release is None:
+    if explicit_shapes is None or release is None or compare_adapter_readers:
         use_flat_sglang_heads = backend == "sglang" and (flat_sglang or release is None)
         full_heads = (
             config.get("num_global_key_value_heads")
@@ -1128,15 +1183,7 @@ def gemma4_cache_shapes(
                     continue
                 # The 5.14 constructor may guard even the validation-time global head
                 # read. When global reads are allowed, compare each viable rank-local pool.
-                tp = agreement_tp_size
-                if (
-                    tp > 1
-                    and config.get("allow_global_per_layer_attribute_access")
-                    and config.get("num_attention_heads", 8) % tp == 0
-                    and legacy[1] == layered[1]
-                    and all(max(h, tp) % min(h, tp) == 0 for h in (legacy[0], layered[0]))
-                    and max(1, legacy[0] // tp) == max(1, layered[0] // tp)
-                ):
+                if config.get("allow_global_per_layer_attribute_access") and same_rank_shape(legacy, layered):
                     continue
                 name = "SGLang" if backend == "sglang" else "vLLM"
                 raise ValueError(f"Gemma 4 per_layer_config requires the {name} release or a runtime profile")

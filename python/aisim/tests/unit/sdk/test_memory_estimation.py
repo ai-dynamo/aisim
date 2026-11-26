@@ -2316,6 +2316,59 @@ def test_gemma4_uses_the_declared_serving_reader_for_surviving_overrides(tmp_pat
                     estimate_kv_bytes_per_token(model, **args)
 
 
+@pytest.mark.parametrize(
+    ("missing", "reason"),
+    [("vocab_size", "KeyError: 'vocab_size'"), ("num_hidden_layers", "or a parseable layer pattern")],
+)
+def test_registered_gemma4_parser_error_precedes_runtime_evidence(tmp_path, missing, reason):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = document["text_config"]
+    text["per_layer_config"] = {
+        str(i): {"head_dim": 512, "num_key_value_heads": 2}
+        for i, kind in enumerate(text["layer_types"])
+        if kind == "full_attention"
+    }
+    del text["global_head_dim"], text["num_global_key_value_heads"], text[missing]
+    with pytest.raises(ValueError, match=reason):
+        NaiveKVCacheEstimator.from_hf_config(document, tp_size=1, pp_size=1, backend_version="0.28.0")
+    with pytest.raises(ValueError, match=reason):
+        estimate_kv_bytes_per_token(_write_config(tmp_path, document), tp_size=1, pp_size=1, backend_version="0.28.0")
+
+
+@pytest.mark.parametrize("backend,release", [("vllm", "0.32.0"), ("sglang", "0.5.23")])
+def test_gemma4_per_layer_fields_use_the_initialized_configuration(tmp_path, backend, release):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = document["text_config"]
+    text["use_bidirectional_attention"] = "all"
+    text["per_layer_config"] = {
+        str(i): {"head_dim": text["global_head_dim"], "num_key_value_heads": text["num_global_key_value_heads"]}
+        for i, kind in enumerate(text["layer_types"])
+        if kind == "full_attention"
+    }
+    fields = text["per_layer_config"]["0"] = {
+        "is_causal": False,
+        "num_labels": 2,
+        "label2id": {"LABEL_0": 0, "LABEL_1": 1},
+        "allow_global_per_layer_attribute_access": False,
+        "name_or_path": text.get("_name_or_path", ""),
+    }
+    options = dict(tp_size=1, pp_size=1, backend=backend, backend_version=release)
+    assert estimate_kv_bytes_per_token(_write_config(tmp_path, document), **options) == 225_280
+    fields["is_causal"] = True
+    model = _write_config(tmp_path, document)
+    if backend == "sglang":
+        with pytest.raises(ValueError, match="override for is_causal"):
+            estimate_kv_bytes_per_token(model, **options)
+    else:
+        assert estimate_kv_bytes_per_token(model, **options) == 225_280
+
+
 def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
@@ -2345,20 +2398,34 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
     (directory / "gemm_perf.txt").write_text("m,n,k,latency\n1,1,1,1\n")
     metadata = directory / "collection_meta.yaml"
     table = {"gemm_perf": {"rows": 1, "status": "complete"}}
-    for change in (
-        {},
-        {"framework": "vllm"},
-        {"version": "0.29.0"},
-        {"image": "custom/vllm:v0.28.0"},
-        {"image_digest": "sha256:" + "0" * 64},
+    index = runtime["image_digest"]
+    manifest = "sha256:d3e9c5f146a8251c7489107e6353cf512fcd1bf14a16cab17148125a62a537c8"
+    for change, stock in (
+        ({}, True),
+        ({"image": runtime["image"] + "@" + index, "image_digest": manifest}, True),
+        ({"image": runtime["image"] + "@" + manifest, "image_digest": index}, False),
+        ({"framework": "vllm"}, False),
+        ({"version": "0.29.0"}, False),
+        ({"image": "custom/vllm:v0.28.0"}, False),
+        ({"image_digest": "sha256:" + "0" * 64}, False),
     ):
         metadata.write_text(json.dumps({"schema_version": 1, "runtime": runtime | change, "tables": table}))
-        if change:
+        if not stock:
             with pytest.raises(ValueError, match="runtime profile"):
                 estimate_kv_bytes_per_token(path, tp_size=1, **args)
         else:
             assert estimate_kv_bytes_per_token(path, tp_size=1, **args) == 225_280
             assert estimate_kv_bytes_per_token(path, tp_size=4, **args) == 61_440
+    first = tmp_path / "first-root"
+    incomplete = first / directory.relative_to(tmp_path)
+    incomplete.mkdir(parents=True)
+    (first / "test_xpu.yaml").write_bytes((tmp_path / "test_xpu.yaml").read_bytes())
+    (incomplete / "INCOMPLETE.txt").write_text("collection failed")
+    metadata.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": table}))
+    assert (
+        estimate_kv_bytes_per_token(path, tp_size=4, **(args | {"systems_paths": [str(first), str(tmp_path)]}))
+        == 61_440
+    )
     event = dict(collector_ref="test", collector_hash="test", case_plan_hash="test", collected_at="2026-01-01")
     custom = runtime | {"image": "custom/vllm:v0.28.0"}
     for default, measured, stock in (
@@ -2406,6 +2473,97 @@ def test_gemma4_adapter_compares_each_ranks_cache_without_deployment_evidence(tm
                     NaiveKVCacheEstimator.from_hf_config(doc, **args)
                 with pytest.raises(ValueError, match="runtime profile"):
                     estimate_kv_bytes_per_token(path, **args)
+
+
+def test_gemma4_reader_agreement_reaches_native_capacity_and_rank_local_models(tmp_path, monkeypatch):
+    from aisim_core.sdk.config import ModelConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    doc = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = doc["text_config"]
+    text.update(num_global_key_value_heads=8, allow_global_per_layer_attribute_access=True)
+    text["per_layer_config"] = {
+        str(i): {"head_dim": 512, "num_key_value_heads": 2}
+        for i, kind in enumerate(text["layer_types"])
+        if kind == "full_attention"
+    }
+    text["per_layer_config"]["0"] = {"num_key_value_heads": 4}
+    path = _write_config(tmp_path, doc)
+    config = ModelConfig(tp_size=8, moe_tp_size=8, moe_ep_size=1)
+    assert get_model(path, config, "vllm").get_kvcache_bytes_per_sequence(1) == 35_840
+    for release in (None, "0.28.0", "0.32.0"):
+        estimator = NaiveKVCacheEstimator.from_hf_config(doc, tp_size=8, pp_size=1, backend_version=release)
+        assert estimator.kv_bytes_per_token() == 35_840
+    with pytest.raises(ValueError, match="one Gemma 4 cache geometry"):
+        NaiveKVCacheEstimator.from_hf_config(doc, tp_size=8, pp_size=1, backend="sglang", backend_version="0.5.23")
+    with pytest.raises(ValueError, match="one Gemma 4 cache geometry"):
+        NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.32.0")
+
+    del text["per_layer_config"]["0"]
+    model_dir = tmp_path / "native"
+    model_dir.mkdir()
+    path = _write_config(model_dir, doc)
+    monkeypatch.setattr(
+        memory.perf_database, "get_database", lambda *a, **kw: SimpleNamespace(version="0.30.0", system_spec={})
+    )
+    with pytest.raises(ValueError, match="stock collection or a runtime profile"):
+        memory.KVCacheEstimator.from_request(
+            path, "custom", "vllm", "0.30.0", systems_path=str(tmp_path), max_num_tokens=2560, max_batch_size=12
+        )
+
+
+def test_gemma4_adapter_uses_only_global_fields_read_by_its_serving_release():
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    doc = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = doc["text_config"]
+    text.update(
+        global_head_dim=256, num_global_key_value_heads=8, expert_intermediate_size=704, moe_intermediate_size=704
+    )
+    text["per_layer_config"] = {"0": {"expert_intermediate_size": 768}}
+    for release in ("0.31.0", "0.32.0"):
+        assert (
+            NaiveKVCacheEstimator.from_hf_config(
+                doc, tp_size=1, pp_size=1, backend_version=release
+            ).kv_bytes_per_token()
+            == 245_760
+        )
+    with pytest.raises(ValueError, match="expert_intermediate_size"):
+        NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.30.0")
+
+
+def test_gemma4_implicit_and_explicit_layer_settings_use_the_same_chunk_and_window(tmp_path):
+    from aisim_core.sdk.config import ModelConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    doc = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = doc["text_config"]
+    text.update(attention_chunk_size=512, sliding_window=1024, allow_global_per_layer_attribute_access=True)
+    rows = text["per_layer_config"] = {
+        str(i): {"sliding_window": None, "head_dim": 512, "num_key_value_heads": 2}
+        for i, kind in enumerate(text["layer_types"])
+        if kind == "full_attention"
+    }
+    for explicit in (False, True):
+        if explicit:
+            rows["0"] = {}
+        folder = tmp_path / str(explicit)
+        folder.mkdir()
+        config = ModelConfig(tp_size=1, moe_ep_size=1, moe_tp_size=1)
+        assert (
+            get_model(_write_config(folder, doc), config, "vllm", "0.32.0").get_kvcache_bytes_per_sequence(1) == 225_280
+        )
+        with pytest.raises(ValueError, match="cannot combine attention_chunk_size and sliding_window"):
+            NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.32.0")
+    for i, kind in enumerate(text["layer_types"]):
+        if kind == "sliding_attention":
+            rows[str(i)] = {"attention_chunk_size": None}
+    assert (
+        NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.32.0").kv_bytes_per_token()
+        == 225_280
+    )
 
 
 def test_gemma4_agreeing_adapter_readers_use_the_saved_geometry_without_a_catalog(tmp_path, monkeypatch):
@@ -2536,6 +2694,139 @@ def test_selected_qwen2_uses_its_default_ffn_to_size_an_eight_gib_cache(tmp_path
         assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.23", **opts) == 2522
 
 
+def test_onevision_selects_the_qwen2_constructor_when_sizing_weights(tmp_path):
+    text = dict(
+        hidden_size=896,
+        num_attention_heads=14,
+        num_key_value_heads=2,
+        num_hidden_layers=24,
+        vocab_size=152000,
+        tie_word_embeddings=True,
+        torch_dtype="bfloat16",
+    )
+    wrapper = {
+        "architectures": ["LlavaOnevisionForConditionalGeneration"],
+        "model_type": "llava_onevision",
+        "torch_dtype": "float16",
+        "text_config": text,
+    }
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=4 * _GIB)
+    opts.update(memory_fraction_value=1, max_num_tokens=2560, max_batch_size=12)
+    del opts["naive_kv_reservation"]
+    for fields in ({}, {"model_type": "qwen2"}, {"model_type": "qwen2", "intermediate_size": 22_016}):
+        path = _write_config(tmp_path, wrapper | {"text_config": text | fields})
+        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) == 3073
+    path = _write_config(tmp_path, text | {"model_type": "qwen2"})
+    assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) == 3073
+    path = _write_config(tmp_path, wrapper | {"text_config": text | {"model_type": None}})
+    with pytest.raises(ValueError, match="model_type must be a string"):
+        NaiveKVCacheEstimator.from_model_path(path, tp_size=1, pp_size=1, allow_hf_config_download=False)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_qwen2_enabled_sliding_window_uses_its_constructor_default(wrapped):
+    text = dict(
+        model_type="qwen2",
+        architectures=["Qwen2ForCausalLM"],
+        hidden_size=1536,
+        num_hidden_layers=28,
+        num_attention_heads=12,
+        num_key_value_heads=2,
+        vocab_size=151936,
+        intermediate_size=8960,
+        max_position_embeddings=32768,
+        use_sliding_window=True,
+        max_window_layers=0,
+    )
+    doc = {"architectures": ["LlavaForConditionalGeneration"], "text_config": text} if wrapped else text
+    for window in ({}, {"sliding_window": 4096}):
+        text.update(window)
+        estimator = NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.32.0")
+        assert estimator.kv_bytes_per_token() == 28_672
+        assert estimator.geometry["num_swa_layers"] == 28
+        assert estimator.geometry["sliding_window"] == 4096
+    text["sliding_window"] = 0
+    with pytest.raises(ValueError, match="positive sliding window"):
+        NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.32.0")
+
+
+def test_registered_qwen2_sliding_defaults_follow_the_sdk_parser(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    text = dict(
+        architectures=["Qwen2ForCausalLM"],
+        model_type="qwen2",
+        hidden_size=1536,
+        num_hidden_layers=28,
+        num_attention_heads=12,
+        num_key_value_heads=2,
+        vocab_size=151936,
+        intermediate_size=8960,
+        max_position_embeddings=32768,
+        use_sliding_window=True,
+    )
+    layer_error = "must define 'num_hidden_layers' or a parseable layer pattern"
+    for missing, overrides, reason in (
+        ([], {"num_hidden_layers": None}, layer_error),
+        (["num_hidden_layers"], {}, layer_error),
+        (["vocab_size"], {"max_window_layers": "invalid"}, "KeyError: 'vocab_size'"),
+    ):
+        raw = text | overrides
+        for field in missing:
+            del raw[field]
+        path = _write_config(tmp_path, raw)
+        with pytest.raises(ValueError, match=reason):
+            NaiveKVCacheEstimator.from_hf_config(raw, tp_size=1, pp_size=1)
+        with pytest.raises(ValueError, match=reason):
+            estimate_kv_bytes_per_token(path, tp_size=1, pp_size=1)
+    text["max_window_layers"] = "invalid"
+    with pytest.raises(ValueError, match="max_window_layers must be an integer"):
+        estimate_kv_bytes_per_token(_write_config(tmp_path, text), tp_size=1, pp_size=1)
+
+
+@pytest.mark.parametrize("wrapper", ["Idefics3ForConditionalGeneration", "SmolVLMForConditionalGeneration"])
+def test_fixed_llama_wrapper_uses_its_decoder_independently_of_the_training_class(tmp_path, wrapper):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    text = {
+        "model_type": "llama",
+        "architectures": ["VLlama3ForCausalLM"],
+        "num_hidden_layers": 30,
+        "hidden_size": 576,
+        "num_attention_heads": 9,
+        "num_key_value_heads": 3,
+        "intermediate_size": 1536,
+        "vocab_size": 49152,
+    }
+    for arch in ("VLlama3ForCausalLM", "DeepseekV3ForCausalLM"):
+        model = _write_config(tmp_path, {"architectures": [wrapper], "text_config": text | {"architectures": [arch]}})
+        assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == 23_040
+    bare = estimate_kv_bytes_per_token(_write_config(tmp_path, text), tp_size=1, pp_size=1)
+    for decoder_key in ("text_config", "llm_config"):
+        model = _write_config(tmp_path, {"architectures": ["UnknownConditionalGeneration"], decoder_key: text})
+        assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == bare == 23_040
+    text["architectures"] = ["DeepseekV3ForCausalLM"]
+    model = _write_config(tmp_path, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": text})
+    with pytest.raises(ValueError, match="conflicts with architectures"):
+        estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1)
+
+
+@pytest.mark.parametrize("dtype_key", ["dtype", "torch_dtype"])
+def test_registered_decoder_with_an_unset_dtype_matches_its_default_serialization(tmp_path, dtype_key):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    model = _load_pre_downloaded_hf_config("meta-llama/Meta-Llama-3.1-8B")
+    for key in ("dtype", "torch_dtype"):
+        model.pop(key, None)
+    for precision in ({}, {dtype_key: None}, {dtype_key: "float16"}):
+        checkpoint = _write_config(tmp_path, model | precision)
+        assert estimate_kv_bytes_per_token(checkpoint, tp_size=1, pp_size=1) == 131_072
+    checkpoint = _write_config(tmp_path, model | {dtype_key: {"invalid": "dtype"}})
+    with pytest.raises(ValueError, match="must be a nonempty string"):
+        estimate_kv_bytes_per_token(checkpoint, tp_size=1, pp_size=1)
+
+
 def test_selected_llama_uses_its_constructor_hidden_size_for_cache_geometry(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
 
@@ -2624,6 +2915,10 @@ def test_selected_dense_value_dimension_matches_the_serving_pool(tmp_path, backe
         ("0.33.0", ("BF16",), "float16", {"sm_version": 90}, "vLLM float16 model dtype"),
         ("0.33.0", ("F32", "F16"), None, {"sm_version": 90}, None),
         ("0.33.0", ("F32", "F16"), None, {"sm_version": 75}, "vLLM float16 model dtype"),
+        ("0.33.0", ("F8_E4M3",), None, {"sm_version": 90}, None),
+        ("0.33.0", ("F8_E4M3",), None, {"sm_version": 75}, "vLLM float16 model dtype"),
+        ("0.33.0", (), "float8_e4m3fn", {"sm_version": 75}, "vLLM float16 model dtype"),
+        ("0.33.0", ("F8_E5M2", "BF16"), None, {"sm_version": 90}, None),
         ("0.33.0", (), "float32", {"sm_version": 75}, "vLLM float16 model dtype"),
         ("0.33.0", (), "float32", {"name": "Intel B60"}, None),
         ("0.33.0", ("F64", "BF16"), None, {"sm_version": 90}, None),
@@ -2647,7 +2942,7 @@ def test_explicit_vllm_bfloat16_cache_reads_local_weight_headers(tmp_path, relea
         text["dtype"] = configured
     model = _write_config(tmp_path, {"text_config": text})
     for i, dtype in enumerate(headers):
-        size = {"F16": 2, "BF16": 2, "F32": 4, "F64": 8}[dtype]
+        size = {"F8_E4M3": 1, "F8_E5M2": 1, "F16": 2, "BF16": 2, "F32": 4, "F64": 8}[dtype]
         tensor = {"dtype": dtype, "shape": [1], "data_offsets": [0, size]}
         header = json.dumps({f"weight_{i}": tensor}).encode()
         header += b" " * (-len(header) % 8)
