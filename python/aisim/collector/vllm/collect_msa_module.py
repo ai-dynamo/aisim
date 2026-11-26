@@ -115,7 +115,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from collector.case_generator import get_mla_module_model_specs
+from collector.case_generator import MLAModuleModelSpec, get_mla_module_model_specs
 from collector.helper import (
     PerfLogError,
     _resolve_local_model_path,
@@ -1722,8 +1722,25 @@ def _perf_file_for(mode: str) -> str:
     return PerfFile.MSA_CONTEXT_MODULE if mode == "context" else PerfFile.MSA_GENERATION_MODULE
 
 
+def _standalone_model_specs() -> list[MLAModuleModelSpec]:
+    """The model rows this collector can actually run on its own.
+
+    ``get_mla_module_model_specs()`` with no ``attention_type`` returns every
+    ``mla_module`` row, including the full-attention MLA/DSA models this
+    collector does not implement. Offering them as ``--model`` choices, and
+    walking them in a bare ``--quick`` run, hand ``mla`` to ``run_msa_module``,
+    which rejects the type and stops the run: only the two sparse-attention
+    families are choices here.
+    """
+    return [
+        spec
+        for spec in get_mla_module_model_specs(apply_model_filter=False)
+        if spec.attention_type in _MSA_MODULE_ATTENTION_TYPES
+    ]
+
+
 def main():
-    all_model_specs = get_mla_module_model_specs(apply_model_filter=False)
+    all_model_specs = _standalone_model_specs()
     model_names = [spec.model_path for spec in all_model_specs]
 
     parser = argparse.ArgumentParser(description="MSA/QSA module-level collector for vLLM")

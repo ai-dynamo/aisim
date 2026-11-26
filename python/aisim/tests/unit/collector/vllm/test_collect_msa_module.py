@@ -528,3 +528,34 @@ def test_run_msa_module_writes_m3_history_only_on_the_msa_branch(attention_type)
         assert calls["written"] == [], "QSA must keep the constructor's zero fill"
     else:
         assert len(calls["written"]) == 1
+
+
+def test_standalone_cli_offers_only_the_sparse_attention_families():
+    """``--model``'s choices (and a bare ``--quick``) must not list MLA/DSA rows.
+
+    ``get_mla_module_model_specs()`` without an ``attention_type`` returns every
+    ``mla_module`` row, so the unfiltered list offered ``deepseek-ai/DeepSeek-V3``
+    (``mla``) as a model for this collector. ``run_msa_module`` rejects that
+    type, and a bare ``--mode context --quick`` walks the same list, so the run
+    stopped on the first MLA row.
+    """
+    rows = [
+        SimpleNamespace(model_path="MiniMax/MiniMax-M3", attention_type="msa"),
+        SimpleNamespace(model_path="deepseek-ai/DeepSeek-V3", attention_type="mla"),
+        SimpleNamespace(model_path="deepseek-ai/DeepSeek-V3.2", attention_type="dsa"),
+        SimpleNamespace(model_path="Qwen/Qwen3.8-Flash-Next", attention_type="qsa"),
+    ]
+    namespace = {
+        "MLAModuleModelSpec": SimpleNamespace,
+        "_MSA_MODULE_ATTENTION_TYPES": ("msa", "qsa"),
+        "get_mla_module_model_specs": lambda **_kwargs: rows,
+    }
+    exec(
+        compile(ast.Module(body=[_function("_standalone_model_specs")], type_ignores=[]), str(SRC), "exec"),
+        namespace,
+    )
+
+    kept = namespace["_standalone_model_specs"]()
+
+    assert [spec.attention_type for spec in kept] == ["msa", "qsa"]
+    assert [spec.model_path for spec in kept] == ["MiniMax/MiniMax-M3", "Qwen/Qwen3.8-Flash-Next"]
