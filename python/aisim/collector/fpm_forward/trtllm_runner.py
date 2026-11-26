@@ -279,7 +279,9 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
             with socket.create_connection(("127.0.0.1", grpc), timeout=1):
                 return True
 
-        _wait(engine_ready, (engine, frontend), "TRT-LLM gRPC")
+        # A cold Pyxis import and TRT-LLM sampling prewarm both precede
+        # gRPC readiness. The Slurm allocation still bounds the full run.
+        _wait(engine_ready, (engine, frontend), "TRT-LLM gRPC", timeout=480)
         sidecar = stack.enter_context(
             _process(
                 [
