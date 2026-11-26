@@ -949,13 +949,18 @@ def gemma4_cache_shapes(
             )
             if shape != shapes.setdefault(kind, shape):
                 raise ValueError("SGLang requires one Gemma 4 cache geometry per attention layer type")
-        return shapes.get("sliding_attention", shapes["full_attention"]), shapes["full_attention"]
-    full_heads = config.get("num_global_key_value_heads") if legacy or config.get("attention_k_eq_v") else None
-    full_dim = config.get("global_head_dim", 512 if backend in ("sglang", "vllm") else dim)
-    return base, (
-        layout_integer(heads if full_heads is None else full_heads, "num_global_key_value_heads"),
-        layout_integer(dim if full_dim is None else full_dim, "global_head_dim"),
-    )
+        full = shapes["full_attention"]
+        base = shapes.get("sliding_attention", full)
+    else:
+        full_heads = config.get("num_global_key_value_heads") if legacy or config.get("attention_k_eq_v") else None
+        full_dim = config.get("global_head_dim", 512 if backend in ("sglang", "vllm") else dim)
+        full = (
+            layout_integer(heads if full_heads is None else full_heads, "num_global_key_value_heads"),
+            layout_integer(dim if full_dim is None else full_dim, "global_head_dim"),
+        )
+    if backend == "sglang" and config.get("v_head_dim") not in (None, 0, full[1]):
+        raise ValueError("asymmetric SGLang Gemma 4 key/value head dimensions require runtime cache geometry")
+    return base, full
 
 
 def _parse_hf_config_json(config: dict) -> dict:

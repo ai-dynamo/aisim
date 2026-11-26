@@ -1008,7 +1008,7 @@ def test_naive_estimate_of_an_unknown_wrapper_reads_its_decoder(key):
     )
 
 
-@pytest.mark.parametrize("dtype", [{"torch_dtype": 5}, {"dtype": {}}, {"torch_dtype": 5, "dtype": []}])
+@pytest.mark.parametrize("dtype", [{"dtype": {}}, {"torch_dtype": 5, "dtype": []}])
 @pytest.mark.parametrize("nested", [False, True], ids=["flat", "decoder"])
 def test_naive_estimate_refuses_malformed_decoder_precision(nested, dtype):
     decoder = {key: value for key, value in _UNKNOWN_DECODER.items() if key != "torch_dtype"} | dtype
@@ -1017,6 +1017,20 @@ def test_naive_estimate_refuses_malformed_decoder_precision(nested, dtype):
     )
     with pytest.raises(ValueError, match="torch_dtype or dtype must be a nonempty string"):
         NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["flat", "decoder"])
+@pytest.mark.parametrize(
+    ("dtype", "factor"),
+    [({"torch_dtype": None}, 1), ({"torch_dtype": 7}, 1), ({"torch_dtype": 7, "dtype": "float32"}, 2)],
+)
+def test_unregistered_decoder_defaults_an_untyped_torch_dtype(tmp_path, nested, dtype, factor):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    decoder = {**_UNKNOWN_DECODER, **dtype}
+    document = {"architectures": [_UNKNOWN_WRAPPER], "text_config": decoder} if nested else decoder
+    model = _write_config(tmp_path, document)
+    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == factor * _UNKNOWN_DECODER_KV_BYTES
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["flat", "wrapped"])
@@ -2164,6 +2178,19 @@ def test_sglang_gemma4_uses_the_layer_shapes_of_its_release(tmp_path, registered
     assert (
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20") == 122_880
     )
+    for value_dim in (128, 256):
+        raw["v_head_dim"] = value_dim
+        _write_config(tmp_path, document if registered else {"text_config": raw})
+        for version in ("0.5.20", "0.5.23"):
+            if value_dim == 128:
+                assert (
+                    estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version=version)
+                    == 122_880
+                )
+            else:
+                with pytest.raises(ValueError, match="asymmetric SGLang Gemma 4"):
+                    memory.estimate_num_gpu_blocks(model, "missing", "sglang", version, **opts)
+    del raw["v_head_dim"]
     raw["per_layer_config"]["0"]["num_key_value_heads"] = 16
     _write_config(tmp_path, document if registered else {"text_config": raw})
     with pytest.raises(ValueError, match="one Gemma 4 cache geometry"):
@@ -2194,6 +2221,7 @@ def test_selected_moe_weights_use_the_constructor_count_and_routed_width(tmp_pat
 
     opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=24 * _GIB)
     for name, count, width, backend, version in (
+        ("deepseek-ai/DeepSeek-V3", 256, 2048, "sglang", "0.5.20"),
         ("MiniMaxAI/MiniMax-M2.5", 256, 1536, "sglang", "0.5.20"),
         ("Qwen/Qwen3-VL-30B-A3B-Instruct", 60, 768, "sglang", "0.5.20"),
         ("mistralai/Mixtral-8x7B-v0.1", 8, 14336, "vllm", "0.33.0"),
@@ -2202,6 +2230,7 @@ def test_selected_moe_weights_use_the_constructor_count_and_routed_width(tmp_pat
         raw = checkpoint.get("text_config", checkpoint)
         raw.pop("num_local_experts", None)
         raw.pop("num_experts", None)
+        raw.pop("n_routed_experts", None)
         if name.startswith("mistralai/"):
             raw["moe_intermediate_size"] = 1024
         wrapped = {"text_config": raw}
@@ -2252,6 +2281,25 @@ def test_sglang_pool_heads_and_vllm_float_cache_use_the_serving_config(tmp_path)
     _write_config(tmp_path, {"dtype": "bfloat16", "text_config": raw})
     assert estimate_kv_bytes_per_token(model, **width) == 114_688
 
+    raw.pop("dtype")
+    raw.pop("torch_dtype")
+    raw.pop("architectures")
+    raw["multi_query"] = True
+    for subconfig in ("vision_config", "encoder_config"):
+        _write_config(tmp_path, {"text_config": raw, subconfig: {"dtype": "float16"}})
+        with pytest.raises(ValueError, match="vLLM float16 model dtype"):
+            estimate_kv_bytes_per_token(model, **width)
+        _write_config(tmp_path, {"text_config": raw, subconfig: {"dtype": "bfloat16"}})
+        assert estimate_kv_bytes_per_token(model, **width) == 114_688
+
+    llama = _load_pre_downloaded_hf_config("meta-llama/Meta-Llama-3.1-8B")
+    width = dict(tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20")
+    _write_config(tmp_path, {"text_config": dict(llama, n_head_kv=8)})
+    assert estimate_kv_bytes_per_token(model, **width) == 131_072
+    _write_config(tmp_path, {"text_config": dict(llama, n_head_kv=16)})
+    with pytest.raises(ValueError, match="pool KV heads"):
+        estimate_kv_bytes_per_token(model, **width)
+
 
 def test_fp8_expert_tiles_follow_implicit_vllm_tp_and_the_qwen_vl_expert_module(tmp_path):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
@@ -2268,10 +2316,10 @@ def test_fp8_expert_tiles_follow_implicit_vllm_tp_and_the_qwen_vl_expert_module(
     quant = fp8["quantization_config"]
     raw["quantization_config"] = quant
     opts.update(moe_tp_size=8, moe_ep_size=1)
-    for exclusions in (["model.layers.1.mlp.experts"], ["mlp.experts"]):
+    for exclusions in (["model.language_model.layers.1.mlp.experts"], ["mlp.experts"], ["language_model"]):
         quant["modules_to_not_convert"] = exclusions
         _write_config(tmp_path, {"text_config": raw})
-        if exclusions == ["mlp.experts"]:
+        if exclusions != ["model.language_model.layers.1.mlp.experts"]:
             assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts) > 0
         else:
             with pytest.raises(ValueError, match="weight_block_size=128"):
@@ -2453,6 +2501,24 @@ def test_sparse_index_transfer_uses_the_platform_and_resident_layers(tmp_path):
         estimate_kv_bytes_per_token(model, **common, backend="sglang", backend_version="0.5.19", system="h200_sxm")
     with pytest.raises(ValueError, match="index_topk_freq"):
         estimate_kv_bytes_per_token(model, **common, backend_version="0.33.0", system="h200_sxm")
+    raw["index_topk_freq"] = 4
+    raw["index_skip_topk_offset"] = 0
+    _write_config(tmp_path, {"text_config": raw})
+    # The checkpoint's explicit indexer_types wins over the invalid offset on SGLang 0.5.20.
+    assert (
+        estimate_kv_bytes_per_token(model, **common, backend="sglang", backend_version="0.5.20", system="h200_sxm")
+        == 92_628
+    )
+    raw.pop("indexer_types")
+    _write_config(tmp_path, {"text_config": raw})
+    with pytest.raises(ValueError, match="index_skip_topk_offset"):
+        estimate_kv_bytes_per_token(model, **common, backend="sglang", backend_version="0.5.20", system="h200_sxm")
+    raw["index_skip_topk_offset"] = 1
+    _write_config(tmp_path, {"text_config": raw})
+    assert (
+        estimate_kv_bytes_per_token(model, **common, backend="sglang", backend_version="0.5.20", system="h200_sxm")
+        == 92_496
+    )
     raw["index_topk_pattern"] = []
     _write_config(tmp_path, {"text_config": raw})
     assert estimate_kv_bytes_per_token(model, **common, backend_version="0.33.0", system="h200_sxm") == 100_152
@@ -2894,10 +2960,10 @@ def test_sglang_mxfp8_experts_use_the_fixed_checkpoint_block(tmp_path):
     with pytest.raises(ValueError, match="backend version 0.5.9"):
         memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.8.post1", **opts)
 
-    with pytest.raises(ValueError, match="MXFP8 expert weights require a Blackwell"):
+    with pytest.raises(ValueError, match="MXFP8.*require a Blackwell"):
         memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
     (tmp_path / "hopper.yaml").write_text("gpu: {sm_version: 90}\n")
-    with pytest.raises(ValueError, match="MXFP8 expert weights require a Blackwell"):
+    with pytest.raises(ValueError, match="MXFP8.*require a Blackwell"):
         memory.estimate_kv_cache(model, "hopper", "sglang", "0.5.20", **opts)
     (tmp_path / "sm120.yaml").write_text("gpu: {sm_version: 120}\n")
     with pytest.raises(ValueError, match="SM100 family"):
@@ -2938,10 +3004,35 @@ def test_sglang_mxfp8_gpu_requirements_follow_expert_exclusions(tmp_path, estima
     with pytest.raises(ValueError, match="SM100 family"):
         estimate(model, "sm120", "sglang", "0.5.9", **opts)  # This release always quantizes FusedMoE.
 
+    quant.pop("weight_block_size")
+    quant["activation_scheme"] = "static"
+    _write_config(tmp_path, dict(wrapper, quantization_config=quant))
+    assert estimate(model, "sm120", "sglang", "0.5.15.post1", **opts) == plain
+    with pytest.raises(ValueError, match="dynamic activations"):
+        estimate(model, "sm120", "sglang", "0.5.16", **opts)
+    quant["activation_scheme"] = "dynamic"
     quant["modules_to_not_convert"] = ["model.layers.47", "lm_head"]
     _write_config(tmp_path, dict(wrapper, quantization_config=quant))
+    for mode in (None, "bfloat16", "fp8"):
+        with pytest.raises(ValueError, match="SM100 family"):
+            estimate(model, "sm120", "sglang", "0.5.20", **opts, moe_quant_mode=mode)
+    assert estimate(model, "sm100", "sglang", "0.5.20", **opts)
+
+    mixtral = {"text_config": _load_pre_downloaded_hf_config("mistralai/Mixtral-8x7B-v0.1")}
+    _write_config(tmp_path, mixtral)
+    plain = estimate(model, "sm120", "sglang", "0.5.20", **opts)
+    quant["modules_to_not_convert"] = ["model", "lm_head"]
+    _write_config(tmp_path, dict(mixtral, quantization_config=quant))
     with pytest.raises(ValueError, match="SM100 family"):
         estimate(model, "sm120", "sglang", "0.5.20", **opts)
+    quant["modules_to_not_convert"].append("layers")
+    _write_config(tmp_path, dict(mixtral, quantization_config=quant))
+    assert estimate(model, "sm120", "sglang", "0.5.20", **opts) == plain
+
+    dense = {"text_config": _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B"), "quantization_config": quant}
+    _write_config(tmp_path, dense)
+    with pytest.raises(ValueError, match="SM100"):
+        estimate(model, "hopper", "sglang", "0.5.20", **opts)
     assert estimate(model, "sm100", "sglang", "0.5.20", **opts)
 
 

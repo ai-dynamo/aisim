@@ -84,13 +84,14 @@ def agg_pareto(
                 overwritten_model_config,
                 model_path,
                 backend_name,
-                getattr(database, "version", None),
+                database.version,
                 getattr(database, "system_spec", {}),
             )
             model = get_model(
                 model_path=model_path,
                 model_config=overwritten_model_config,
                 backend_name=backend_name,
+                backend_version=database.version,
             )
             backend = get_backend(
                 backend_name,

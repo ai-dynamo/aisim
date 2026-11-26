@@ -661,15 +661,15 @@ def test_registered_build_failure_is_not_direct_fallback(profile_dict, monkeypat
     monkeypatch.setattr(engine, "_literal_backend_version", lambda _s, _b, version, *_args: version)
     observed = []
 
-    def broken_model(_path, config, _backend):
-        observed.append(config.fmha_quant_mode.name)
+    def broken_model(_path, config, _backend, version):
+        observed.append((config.fmha_quant_mode.name, version))
         raise RuntimeError("registered model has an unrelated implementation error")
 
     monkeypatch.setattr(engine, "get_model", broken_model)
     monkeypatch.setattr(engine, "_direct_fpm_spec_json", _fail_graph)
     with pytest.raises(ValueError, match="unrelated implementation error"):
         RustForwardPassPerfModel.best_available(_request(profile_dict))
-    assert observed == ["fp8"]
+    assert observed == [("fp8", profile_dict["deployments"][0]["backend_version"])]
 
 
 @pytest.mark.parametrize(

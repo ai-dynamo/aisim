@@ -348,8 +348,12 @@ class DisaggInferenceSession:
             self._prefill_backend.name.value,
             getattr(self._prefill_database, "system_spec", {}),
         )
-        prefill_model = models.get_model(model_path, prefill_model_config, self._prefill_backend.name.value)
-        decode_model = models.get_model(model_path, decode_model_config, self._decode_backend.name.value)
+        prefill_model = models.get_model(
+            model_path, prefill_model_config, self._prefill_backend.name.value, self._prefill_database.version
+        )
+        decode_model = models.get_model(
+            model_path, decode_model_config, self._decode_backend.name.value, self._decode_database.version
+        )
         prefill_sess = InferenceSession(
             model=prefill_model, database=self._prefill_database, backend=self._prefill_backend
         )
@@ -498,6 +502,11 @@ class DisaggInferenceSession:
         summary_df = pd.DataFrame(columns=common.ColumnsStatic)
         exceptions: list[Exception] = []
         all_configs_oom = True
+        database, backend = (
+            (self._prefill_database, self._prefill_backend)
+            if mode == "static_ctx"
+            else (self._decode_database, self._decode_backend)
+        )
 
         for parallel_config in parallel_config_list:
             # 6-tuple (tp, pp, dp, moe_tp, moe_ep, cp); tolerate legacy 5-tuples.
@@ -524,33 +533,23 @@ class DisaggInferenceSession:
                     resolve_sglang_mla_compute(
                         overwritten_model_config,
                         model_path,
-                        self._prefill_backend.name.value,
-                        getattr(self._prefill_database, "version", None),
-                        getattr(self._prefill_database, "system_spec", {}),
+                        backend.name.value,
+                        database.version,
+                        getattr(database, "system_spec", {}),
                     )
                     resolve_trtllm_mla_compute(
                         overwritten_model_config,
                         model_path,
-                        self._prefill_backend.name.value,
-                        getattr(self._prefill_database, "system_spec", {}),
+                        backend.name.value,
+                        getattr(database, "system_spec", {}),
                     )
                 model = models.get_model(
                     model_path=model_path,
                     model_config=overwritten_model_config,
-                    backend_name=self._prefill_backend.name.value,
+                    backend_name=backend.name.value,
+                    backend_version=database.version,
                 )
-                if mode == "static_ctx":
-                    sess = InferenceSession(
-                        model=model,
-                        database=self._prefill_database,
-                        backend=self._prefill_backend,
-                    )
-                else:
-                    sess = InferenceSession(
-                        model=model,
-                        database=self._decode_database,
-                        backend=self._decode_backend,
-                    )
+                sess = InferenceSession(model=model, database=database, backend=backend)
 
                 for b in b_list:
                     overwritten_runtime_config = copy.deepcopy(runtime_config)

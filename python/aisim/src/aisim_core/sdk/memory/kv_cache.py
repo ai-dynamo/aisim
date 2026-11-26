@@ -133,6 +133,7 @@ _DECODER_HEAD_DEFAULTS = {
     "gemma4_text": (256, 4),
     "glm4_moe": (None, 8),
     "gpt_oss": (64, 8),
+    "llama": (None, None),
     "llama4_text": (128, 8),
     "minimax_m2": (128, 8),
     "mistral": (None, 8),
@@ -149,6 +150,7 @@ _DECODER_HEAD_DEFAULTS = {
 # Transformers constructor fields and aliases used by the selected expert implementations.
 # (count, alias applied after construction, default count, routed intermediate width, default width)
 _DECODER_EXPERT_DEFAULTS = {
+    "deepseek_v3": ("n_routed_experts", "num_local_experts", 256, "moe_intermediate_size", 2048),
     "glm4_moe": ("n_routed_experts", "num_local_experts", 128, "moe_intermediate_size", 1408),
     "gpt_oss": ("num_local_experts", "num_experts", 128, "intermediate_size", 2880),
     "llama4_text": ("num_local_experts", None, 16, "intermediate_size", 8192),
@@ -213,7 +215,7 @@ def _sglang_checkpoint_quant(document: dict, raw: dict) -> dict | None:
 
 
 def _sglang_skips_fused_experts(
-    ignored: list[str], layers: int, release: Version, *, first: int = 0, frequency: int = 1
+    ignored: list[str], layers: int, release: Version, module: str, *, first: int = 0, frequency: int = 1
 ) -> bool:
     """Match the SGLang FP8 exclusions against each routed expert module."""
     bare = {name.removeprefix("model.") for name in ignored}
@@ -232,7 +234,7 @@ def _sglang_skips_fused_experts(
                 return True
         return False
 
-    return all(skipped(f"model.layers.{i}.mlp.experts") for i in range(first, layers) if i % frequency == 0)
+    return all(skipped(module.format(i)) for i in range(first, layers) if i % frequency == 0)
 
 
 def _automatic_decoder_kv_mode(
@@ -1086,7 +1088,7 @@ class NaiveKVCacheEstimator:
                             raise ValueError(
                                 "SGLang pool KV heads disagree with the selected decoder's KV projections"
                             ) from error
-                    for key in ("attention_head_dim", "num_kv_heads", "n_head_kv", "n_kv_heads"):
+                    for key in ("attention_head_dim", "num_kv_heads", "n_head_kv", "n_kv_heads", "multi_query"):
                         raw_decoder.pop(key, None)
                 if head_dim is not None:
                     raw_decoder.setdefault("head_dim", head_dim)
@@ -1162,7 +1164,11 @@ class NaiveKVCacheEstimator:
                 return decoder
         estimator = cls(
             cls._geometry(hf_config, parsed, backend, backend_version),
-            dtype_bytes=cls._dtype_bytes(hf_config),
+            dtype_bytes=cls._dtype_bytes(
+                hf_config,
+                generic=parsed is None
+                and not (isinstance(model_type, str) and model_type in _SELECTED_DECODER_ARCHITECTURES),
+            ),
             tp_size=tp_size,
             pp_size=pp_size,
             moe_ep_size=moe_ep_size,
@@ -1197,9 +1203,16 @@ class NaiveKVCacheEstimator:
         release = parse_support_matrix_version(backend_version)
         self._cache_backend = backend
         self._cache_release = release
-        # vLLM resolves model dtype from the parent config before consulting its text decoder.
+        # vLLM resolves model dtype from the parent, text, vision, then encoder config.
         parent = document or {}
-        dtype = parent.get("dtype") or parent.get("torch_dtype") or raw.get("dtype") or raw.get("torch_dtype")
+        dtype = next(
+            (
+                value
+                for config in (parent, raw, parent.get("vision_config"), parent.get("encoder_config"))
+                if isinstance(config, dict) and (value := config.get("dtype") or config.get("torch_dtype"))
+            ),
+            None,
+        )
         # These model types cannot run FP16 in vLLM and are recast by its automatic dtype selection.
         model_type = parent.get("model_type") or raw.get("model_type")
         self._vllm_bf16_kv_mismatch = (
@@ -1229,6 +1242,13 @@ class NaiveKVCacheEstimator:
                         pattern = ["S" if i % factor else "F" for i in range(layers)]
             if pattern is not None:
                 raw = {**raw, "index_topk_pattern": pattern, "index_topk_freq": 1}
+            elif (
+                backend == "sglang"
+                and release is not None
+                and release >= Version("0.5.14")
+                and raw.get("index_skip_topk_offset") is not None
+            ):
+                layout_integer(raw["index_skip_topk_offset"], "index_skip_topk_offset")
             if (
                 raw.get("index_topk_freq", 1) != 1
                 or raw.get("index_topk_pattern")
@@ -1402,12 +1422,15 @@ class NaiveKVCacheEstimator:
         return None
 
     @staticmethod
-    def _dtype_bytes(hf_config: dict) -> int:
+    def _dtype_bytes(hf_config: dict, *, generic: bool = False) -> int:
         """dtype byte width from ``torch_dtype``/``dtype``. Defaults to 2 (bf16)."""
         value = hf_config.get("torch_dtype")
         if not isinstance(value, str) or not value.strip():
             value = hf_config.get("dtype")
         if not isinstance(value, str) or not value.strip():
+            # An unregistered decoder can carry an untyped torch_dtype. Its generic estimate defaults to BF16.
+            if generic and value is None and not isinstance(hf_config.get("torch_dtype"), str):
+                return 2
             if "torch_dtype" in hf_config or "dtype" in hf_config:
                 raise ValueError("HF config torch_dtype or dtype must be a nonempty string")
             return 2
@@ -2451,15 +2474,25 @@ def estimate_kv_cache(
             intermediate = naive.geometry["moe_inter"]
             if not intermediate or intermediate % expert_tp:
                 raise ValueError("expert intermediate width must be positive and divisible by moe_tp_size") from exc
-        if raw is not None and experts and moe_quant_mode in (None, "fp8_block"):
+        quant = (raw or {}).get("quantization_config") or {}
+        block = quant.get("weight_block_size")
+        mxfp8 = backend == "sglang" and quant.get("quant_method") == "mxfp8"
+        sglang_fp8 = mxfp8 or (backend == "sglang" and quant.get("quant_method") == "fp8" and block is not None)
+        if sglang_fp8 or (raw is not None and experts and moe_quant_mode in (None, "fp8_block")):
             release = parse_support_matrix_version(version)
-            quant = raw.get("quantization_config") or {}
-            sglang_fp8 = backend == "sglang" and (
-                quant.get("quant_method") == "mxfp8"
-                or (quant.get("quant_method") == "fp8" and quant.get("weight_block_size") is not None)
-            )
-            if sglang_fp8 and quant.get("activation_scheme") != "dynamic":
-                raise ValueError("SGLang block-quantized FP8 expert weights require dynamic activations") from exc
+            # Starting in 0.5.16 MXFP8 sets its fixed block shape before checking activations.
+            if (
+                sglang_fp8
+                and quant.get("activation_scheme") != "dynamic"
+                and not (
+                    mxfp8
+                    and block is None
+                    and quant.get("activation_scheme") == "static"
+                    and release is not None
+                    and release < Version("0.5.16")
+                )
+            ):
+                raise ValueError("SGLang block-quantized FP8 weights require dynamic activations") from exc
             sdk_tiles = hasattr(model_class, "_validate_fp8_block_quantized_moe_config") or (
                 model_class is None and "weight_block_size" in quant
             )
@@ -2471,22 +2504,20 @@ def estimate_kv_cache(
                     is MoEQuantMode.fp8_block
                 )
             )
-            quantized_experts = True
+            quantized_experts = bool(experts)
             deepseek = naive.architecture in (
                 "DeepseekV2ForCausalLM",
                 "DeepseekV3ForCausalLM",
                 "DeepseekV32ForCausalLM",
             )
-            if (
-                sglang_fp8
-                and (
-                    naive.architecture == "Qwen3MoeForCausalLM"
-                    or raw.get("model_type") == "qwen3_vl_moe_text"
-                    or deepseek
-                )
-                and release is not None
-                and release >= Version("0.5.10rc0")
-            ):
+            module = None
+            if raw.get("model_type") == "qwen3_vl_moe_text":
+                module = "model.language_model.layers.{}.mlp.experts"
+            elif naive.architecture == "MixtralForCausalLM":
+                module = "layers.{}.block_sparse_moe.experts"
+            elif naive.architecture == "Qwen3MoeForCausalLM" or deepseek:
+                module = "model.layers.{}.mlp.experts"
+            if sglang_fp8 and module is not None and release is not None and release >= Version("0.5.10rc0"):
                 ignored = quant.get("ignored_layers", quant.get("modules_to_not_convert", []))
                 if ignored is None:
                     ignored = []
@@ -2500,21 +2531,21 @@ def estimate_kv_cache(
                 )
                 frequency = layout_integer(raw.get("moe_layer_freq", 1), "moe_layer_freq") if deepseek else 1
                 quantized_experts = not _sglang_skips_fused_experts(
-                    ignored, naive.geometry["layers"], release, first=first, frequency=frequency
+                    ignored, naive.geometry["layers"], release, module, first=first, frequency=frequency
                 )
-            if backend == "sglang" and quant.get("quant_method") == "mxfp8":
+            if mxfp8:
                 if release is None or release < Version("0.5.9"):
-                    raise ValueError("SGLang MXFP8 expert weights require backend version 0.5.9 or later") from exc
+                    raise ValueError("SGLang MXFP8 checkpoints require backend version 0.5.9 or later") from exc
                 sm = _config_only_system_spec(system, systems_path).get("gpu", {}).get("sm_version")
                 if not (sm is not None and sm >= 100):
                     raise ValueError(
-                        "SGLang checkpoints declaring MXFP8 expert weights require a Blackwell GPU (SM100) or later"
+                        "SGLang checkpoints declaring MXFP8 require a Blackwell GPU (SM100) or later"
                     ) from exc
                 if quantized_experts and sm >= 110:
                     raise ValueError(
                         "SGLang MXFP8 expert weights require a Blackwell CUDA GPU in the SM100 family"
                     ) from exc
-            if check_tiles:
+            if experts and check_tiles:
                 validate_fp8_moe_shard(
                     raw,
                     intermediate,

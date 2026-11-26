@@ -733,7 +733,7 @@ def compile_engine(
     else:
         from aisim_core.sdk.models.afd import build_afd_model
 
-        model = build_afd_model(model_path, model_config, backend, afd_pool_role)
+        model = build_afd_model(model_path, model_config, backend, afd_pool_role, literal_version)
     if deployment is not None and forward_model == "fpm":
         from aisim_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY
 

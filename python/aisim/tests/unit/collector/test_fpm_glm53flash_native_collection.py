@@ -64,7 +64,7 @@ PREFILL_COLD = {
     "sample_reasons": ["explicit"],
 }
 # Synthetic accepted forwards follow room for the ten permitted retries in a producer run.
-_FIRST_ACCEPTED_FORWARD = 32
+_FIRST_ACCEPTED_FORWARD = 36
 PREFILL_CACHED = {
     "batch_size": 1,
     "total_prefill_tokens": 64,
@@ -171,7 +171,9 @@ def glm_native_payload(phase: str, *, points: list[dict], rank: int = 0, dp: int
                             **_glm_forward_sample(
                                 point,
                                 fpm["wall_time"],
-                                _FIRST_ACCEPTED_FORWARD + ((benchmark_id - 1) * 15 + i + 6) * steps - 1,
+                                _FIRST_ACCEPTED_FORWARD
+                                + ((benchmark_id - 1) * 15 + i + 6) * (3 if phase == "decode" else 1)
+                                - 1,
                                 steps - 1,
                             ),
                             "sample_index": i,
@@ -303,13 +305,27 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
         fpm = row["fpms"][0]
         raw = fpm.get("benchmark_measurement", {}).get("raw_fpms")
         repetitions = []
+        batch = point["batch_size"]
+        if point["point_type"] == "decode":
+            context, remainder = divmod(point["total_kv_read_tokens"], batch)
+            chunks = [[0, context + int(i < remainder) - 1] for i in range(batch)]
+        elif point.get("rows"):
+            chunks = [[prefix, fresh] for fresh, prefix in point["rows"]]
+        else:
+            prefix, kv_remainder = divmod(point["total_kv_read_tokens"], batch)
+            fresh, new_remainder = divmod(point["total_prefill_tokens"], batch)
+            chunks = [[prefix + int(i < kv_remainder), fresh + int(i < new_remainder)] for i in range(batch)]
+        if point["point_type"] == "decode":
+            rows = {"prompt": [n for _, n in chunks], "context": [n + 1 for _, n in chunks], "measured_decode_step": 2}
+        else:
+            rows = {"prefix": [prefix for prefix, _ in chunks], "new": [n for _, n in chunks]}
         for index in range(15):
             observed = raw[index - 5] if isinstance(raw, list) and 5 <= index < 5 + len(raw) else None
             steps = 2 if point["point_type"] == "decode" else 1
             observed = observed if isinstance(observed, dict) else {}
             sample = observed.get("benchmark_sample")
             sample = sample if isinstance(sample, dict) else {}
-            forward = sample.get("forward_index", forward + steps)
+            forward = sample.get("forward_index", forward + (3 if steps == 2 else 1))
             if not sample:
                 sample = _glm_forward_sample(point, fpm["wall_time"], forward, steps - 1)
             measured = {
@@ -334,12 +350,28 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
                         start_monotonic=boundary - first["wall_time"], end_monotonic=boundary
                     )
                 fpms.insert(0, first)
+            specs = []
+            salts = []
+            for slot, (prefix, fresh) in enumerate(chunks):
+                base = 131 * slot + 17 * point["benchmark_id"]
+                salt = f"run-p{point['benchmark_id']}-s{slot}"
+                if steps == 2:
+                    specs.append([[base, fresh]])
+                elif prefix:
+                    specs.append([[base, prefix], [base + prefix + 1 + 7 * (index + 1), fresh]])
+                else:
+                    specs.append([[base + 53 * index, fresh]])
+                    salt += f"-r{index}"
+                salts.append(salt)
             repetitions.append(
                 {
                     "attempt": index,
                     "repetition": index,
                     "role": "warmup" if index < 5 else "measurement",
+                    "prompt_specs": specs,
+                    "salts": salts,
                     "fpms": fpms,
+                    "prefill_chunks": [chunks],
                     "scheduled_token_counts": [
                         item["scheduled_requests"]["sum_prefill_tokens"]
                         + item["scheduled_requests"]["num_decode_requests"]
@@ -368,7 +400,12 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
                         "num_paddings": 0,
                     },
                 )
-        record = {"benchmark_id": point["benchmark_id"], "point_type": point["point_type"], "repetitions": repetitions}
+        record = {
+            "benchmark_id": point["benchmark_id"],
+            "point_type": point["point_type"],
+            "rows": rows,
+            "repetitions": repetitions,
+        }
         lines.append(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
     for row, line in zip(payload["results"], lines, strict=True):
         row["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
@@ -431,7 +468,7 @@ def _glm_producer_shape(tmp_path, breakage=None):
             walls = [fpm["wall_time"] * (1 + 0.01 * (index - 4)) for index in range(10)]
             tokens = row["point"]["total_prefill_tokens"] or row["point"]["batch_size"]
             samples = []
-            forward += 11 if phase == "decode" else 5
+            forward += 17 if phase == "decode" else 5
             for index, wall in enumerate(walls):
                 sample = copy.deepcopy(templates[phase])
                 start = 100.0 * forward
@@ -440,8 +477,8 @@ def _glm_producer_shape(tmp_path, breakage=None):
                 sample["forward_index"] = forward
                 sample["timing"].update(start_monotonic=start, end_monotonic=start + wall)
                 sample["cudagraph"].update(num_unpadded_tokens=tokens, num_padded_tokens=tokens, num_paddings=0)
-                # A decode repetition records two FPMs, and the second is its steady sample.
-                forward += 2 if phase == "decode" else 1
+                # A decode repetition has one preparation and two pure decode forwards.
+                forward += 3 if phase == "decode" else 1
                 raw = {**copy.deepcopy(fpm), "wall_time": wall, "benchmark_sample": sample}
                 if phase == "decode":
                     raw["kvwarm_steady_sample"] = True
@@ -735,7 +772,7 @@ def _rewrite_sidecar(payload: dict, sidecar: Path, lines: list[bytes]) -> None:
         ),
         (
             lambda record: record["repetitions"][4]["fpms"][-1]["scheduled_requests"].update(sum_prefill_tokens=0),
-            "invalid forward for warmup",
+            "prefix or new tokens",
         ),
         (
             lambda record: record["repetitions"][4]["fpms"][-1]["benchmark_sample"].update(forward_index=3),
@@ -880,7 +917,12 @@ def test_glm_publication_matches_each_dispatch_to_its_scheduled_tokens(tmp_path,
         ("discarded-unknown-zero", None),
         ("discarded-unknown-inter-output", "clock required"),
         ("discarded-without-start", "lacks its recorded identity"),
-        ("discarded-missing-kv", "lacks its measured prefill KV"),
+        ("discarded-missing-kv", "prefix or new tokens"),
+        ("accepted-missing-chunks", "prefill_chunks"),
+        ("repeated-suffix", "suffix rotation"),
+        ("singleton-variance", "variance"),
+        ("partial-cache-hit", "cached prefix"),
+        ("discarded-missing-chunks", "prefill_chunks"),
         ("discarded-unfinished", "finish the prompts"),
         ("overlapping-discarded", None),
         ("false-rejection", "do not support the rejection reason"),
@@ -897,6 +939,12 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
     def corrupt(record):
         warmup = record["repetitions"][0]
         warmup["prefill_chunks"] = [[[PREFILL_CACHED["total_kv_read_tokens"], PREFILL_CACHED["total_prefill_tokens"]]]]
+        if fault == "repeated-suffix":
+            record["repetitions"][1]["prompt_specs"][0][1][0] = warmup["prompt_specs"][0][1][0]
+            return
+        if fault == "accepted-missing-chunks":
+            del warmup["prefill_chunks"]
+            return
         if fault == "prefix":
             warmup["prefill_chunks"][0][0][0] = 0
             return
@@ -906,9 +954,10 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
                 0, {"runtime_mode": "NONE", "num_padded_tokens": 1, "num_unpadded_tokens": 1, "num_paddings": 0}
             )
             return
+        rejected = copy.deepcopy(warmup)
         for repetition in record["repetitions"]:
             repetition["attempt"] += 1
-        rejected = copy.deepcopy(warmup)
+            repetition["prompt_specs"][0][1][0] += 7
         rejected.pop("role")
         rejected.pop("repetition")
         rejected["fpms"][0]["benchmark_sample"]["forward_index"] = 0
@@ -916,14 +965,23 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
         rejected["dispatches"][0] = None
         rejected.update(attempt=0, rejection_reason="missing actual graph dispatch receipt")
         record["rejected_repetitions"] = [rejected]
-        if fault == "rejected-chunk":
+        if fault == "singleton-variance":
+            rejected["fpms"][0]["scheduled_requests"]["var_prefill_length"] = 99
+        elif fault == "partial-cache-hit":
+            rejected["prefill_chunks"][0][0] = [4, 2236]
+            rejected["fpms"][0]["scheduled_requests"].update(sum_prefill_kv_tokens=4, sum_prefill_tokens=2236)
+            rejected["scheduled_token_counts"][0] = 2236
+        elif fault == "rejected-chunk":
             rejected["prefill_chunks"][0][0][1] = 4
         elif fault == "reused-id":
             rejected["attempt"] = warmup["attempt"]
+            rejected["prompt_specs"][0][1][0] += 7
         elif fault == "missing-id":
             record["repetitions"][-1]["attempt"] += 1
+            record["repetitions"][-1]["prompt_specs"][0][1][0] += 7
         elif fault == "trailing-reject":
             rejected["attempt"] = len(record["repetitions"]) + 1
+            rejected["prompt_specs"][0][1][0] += 7 * rejected["attempt"]
         elif fault in {"absent-dispatch", "false-rejection"}:
             rejected["fpms"][0]["benchmark_sample"]["cudagraph"] = warmup["fpms"][0]["benchmark_sample"]["cudagraph"]
             if fault == "false-rejection":
@@ -961,8 +1019,9 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
                     rejected["fpms"][0]["wall_time"] = 0
                 if fault == "discarded-unknown-inter-output":
                     timing["basis"] = "inter_output"
-        elif fault == "discarded-missing-kv":
+        elif fault == "discarded-missing-chunks":
             del rejected["prefill_chunks"]
+        elif fault == "discarded-missing-kv":
             del rejected["fpms"][0]["scheduled_requests"]["sum_prefill_kv_tokens"]
             rejected["rejection_reason"] = "measured_kv_read_mismatch"
         elif fault == "discarded-unfinished":
@@ -987,9 +1046,8 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
         ("hit", "cached prefix"),
         ("mixed", "prefill chunk contradicts"),
         ("no-preparation", "lacks a preparation dispatch"),
-        ("short-preparation", "cannot cover the uncached"),
-        ("over-preparation", "exceed the available prompt"),
-        ("seed-without-rows", "seed lengths disagree"),
+        ("missing-chunks", "prefill_chunks"),
+        ("seed-without-rows", "per-request rows"),
         ("rotation", "rotation disagrees"),
         ("salt", "salt disagrees"),
     ],
@@ -1020,9 +1078,11 @@ def test_glm_published_decode_requires_each_seeded_prompt_and_lockstep(tmp_path,
         elif fault == "seed-without-rows":
             del record["rows"]
             record["seed"] = {"lengths": [4352, 4352], "specs": [[[0, 4352]], [[131, 4352]]]}
-        elif fault in {"no-preparation", "short-preparation", "over-preparation"}:
+        elif fault == "no-preparation":
+            stage["prefill_chunks"] = []
+            counts = []
+        elif fault == "missing-chunks":
             del stage["prefill_chunks"]
-            counts = {"no-preparation": [], "short-preparation": [1], "over-preparation": [8191]}[fault]
         elif fault == "rotation":
             stage["prompt_specs"][1][0][0] += 1
         elif fault == "salt":
@@ -1067,6 +1127,9 @@ def test_glm_variable_decode_contexts_match_the_observed_variance(
     def vary(record):
         record["rows"] = {"context": contexts, "prompt": [n - 1 for n in contexts], "measured_decode_step": 2}
         for stage in record["repetitions"]:
+            for slot, spec in enumerate(stage["prompt_specs"]):
+                spec[0][1] = contexts[slot] - 1
+            stage["prefill_chunks"] = [[[0, n - 1] for n in contexts]]
             stage["fpms"][0]["scheduled_requests"]["var_decode_kv_tokens"] = (4096 - small) ** 2
             stage["fpms"][-1]["scheduled_requests"]["var_decode_kv_tokens"] = measured_variance
         retained = payload["results"][0]["fpms"][0]
@@ -1082,8 +1145,12 @@ def test_glm_variable_decode_contexts_match_the_observed_variance(
     [
         ("retained", "retained var_decode_kv_tokens"),
         ("all-variances-absent", "var_decode_kv_tokens"),
+        ("missing-specs", "per-request prompt specs"),
+        ("missing-salts", "cache salts"),
+        ("runtime-headroom", "runtime_context_length"),
         ("index-gap", "consecutive indices"),
-        ("absent-rows", "decode point total"),
+        ("missing-preparation-index", "account for the preparation dispatches"),
+        ("absent-rows", "per-request rows"),
         ("lockstep-variance", "var_decode_kv_tokens"),
     ],
 )
@@ -1098,7 +1165,14 @@ def test_glm_disagrees_with_the_current_producer_workload(tmp_path, fault, error
     def mutate(record):
         retained = payload["results"][0]["fpms"][0]
         first = record["repetitions"][0]
-        if fault == "retained":
+        if fault == "missing-specs":
+            del first["prompt_specs"]
+        elif fault == "missing-salts":
+            del first["salts"]
+        elif fault == "runtime-headroom":
+            for document in (payload, payload["input_provenance"]):
+                document["context_policy"]["runtime_context_length"] = 4095
+        elif fault == "retained":
             retained["scheduled_requests"]["var_decode_kv_tokens"] += 1
         elif fault == "all-variances-absent":
             for stage in record["repetitions"]:
@@ -1108,8 +1182,11 @@ def test_glm_disagrees_with_the_current_producer_workload(tmp_path, fault, error
                 del fpm["scheduled_requests"]["var_decode_kv_tokens"]
         elif fault == "index-gap":
             first["fpms"][0]["benchmark_sample"]["forward_index"] -= 1
+        elif fault == "missing-preparation-index":
+            for fpm in record["repetitions"][5]["fpms"]:
+                fpm["benchmark_sample"]["forward_index"] -= 1
+            retained["benchmark_measurement"]["raw_fpms"][0]["benchmark_sample"]["forward_index"] -= 1
         elif fault == "lockstep-variance":
-            record.pop("rows", None)
             first["fpms"][0]["scheduled_requests"]["var_decode_kv_tokens"] = 99
         else:
             record.pop("rows", None)
@@ -1145,9 +1222,14 @@ def test_glm_published_requests_follow_the_producer_grid(tmp_path, phase, point,
         "order",
         "unavailable-values",
         "spent-decode",
+        "first-decode-advanced",
+        "mixed-before-first-decode",
         "incomplete-prompts",
         "index-spacing",
         "singleton-variance",
+        "missing-mixed-token",
+        "extra-mixed-token",
+        "negative-implied-index",
     ],
 )
 def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatch(tmp_path, fault):
@@ -1195,12 +1277,31 @@ def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatc
         rejected["scheduled_token_counts"] = [4095, 1, 4096, 1, 1]
         if fault == "context":
             first["scheduled_requests"]["sum_decode_kv_tokens"] = 8190
+        elif fault == "mixed-before-first-decode":
+            # A mixed dispatch advanced the first request while preparing the second.
+            rejected["scheduled_token_counts"][1:3] = [4096, 1]
+            rejected["dispatches"][1], rejected["dispatches"][2] = rejected["dispatches"][2], rejected["dispatches"][1]
+            first["benchmark_sample"]["forward_index"] = 2
+            first["scheduled_requests"]["sum_decode_kv_tokens"] = 4096
+            for fpm in rejected["fpms"][1:]:
+                timing = fpm["benchmark_sample"]["timing"]
+                timing.update(start_monotonic=timing["start_monotonic"] - 1, end_monotonic=timing["end_monotonic"] - 1)
+        elif fault == "first-decode-advanced":
+            first["scheduled_requests"]["sum_decode_kv_tokens"] = 4096
+            rejected["fpms"][-1]["scheduled_requests"]["sum_decode_kv_tokens"] = 4095
         elif fault == "spent-decode":
             for fpm in rejected["fpms"]:
                 fpm["scheduled_requests"]["sum_decode_kv_tokens"] = 4096
         elif fault == "incomplete-prompts":
             rejected["prefill_chunks"][0][0][1] = rejected["scheduled_token_counts"][0] = 1
             rejected["dispatches"][0] = receipt(1, "NONE")
+        elif fault in ("missing-mixed-token", "extra-mixed-token"):
+            output, tokens = (2, 4095) if fault == "missing-mixed-token" else (0, 4096)
+            rejected["scheduled_token_counts"][output] = tokens
+            rejected["dispatches"][output] = receipt(tokens, "NONE")
+        elif fault == "negative-implied-index":
+            for fpm in rejected["fpms"]:
+                fpm["benchmark_sample"]["forward_index"] -= 1
         elif fault == "index-spacing":
             first["benchmark_sample"]["forward_index"] = 0
         elif fault == "singleton-variance":
@@ -1225,7 +1326,9 @@ def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatc
         payload,
         artifact,
         add_discarded_attempt,
-        "contradict|unavailable|preceding output|finish the prompts" if fault else None,
+        None
+        if fault in (None, "mixed-before-first-decode")
+        else "contradict|unavailable|preceding output|finish the prompts|two decode tokens",
     )
 
 
@@ -1248,10 +1351,9 @@ def test_glm_prefill_can_finish_one_request_at_another_requests_cached_prefix(tm
     }
     point = dict(point_type="prefill", batch_size=2, total_prefill_tokens=2240, total_kv_read_tokens=6528)
     counts = [fresh for _, fresh in pairs]
-    for expected in ([[2176, 2176], [4352, 64]], None):
-        assert native_artifact._validate_glm_chunks(
-            stage, tmp_path, point, counts=counts, expected=expected, seeds=[2176, 4352], block=2176
-        ) == [(n, n) for n in counts]
+    assert native_artifact._validate_glm_chunks(
+        stage, tmp_path, point, counts=counts, expected=[[2176, 2176], [4352, 64]], seeds=[2176, 4352], block=2176
+    ) == [(n, n) for n in counts]
 
 
 @pytest.mark.parametrize("record_limit", [True, False])
@@ -1303,7 +1405,7 @@ def test_glm_final_attempt_respects_the_producer_retry_limit(tmp_path, monkeypat
                 attempt = copy.deepcopy(rejected)
                 attempt["attempt"] = index
                 for step, fpm in enumerate(attempt["fpms"]):
-                    fpm["benchmark_sample"]["forward_index"] = 2 * index + step
+                    fpm["benchmark_sample"]["forward_index"] = 3 * index + step + 1
                     timing = fpm["benchmark_sample"]["timing"]
                     end = timing["end_monotonic"] - (rejected_count - index)
                     timing.update(start_monotonic=end - fpm["wall_time"], end_monotonic=end)
@@ -1321,28 +1423,27 @@ def test_glm_final_attempt_respects_the_producer_retry_limit(tmp_path, monkeypat
     )
 
 
-@pytest.mark.parametrize("records_counts", [True, False])
-def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_path, records_counts):
+@pytest.mark.parametrize("missing_count", [False, True])
+def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_path, missing_count):
     cell = glm_cell("decode")
     payload = glm_native_payload("decode", points=[DECODE_POINTS[0]])
     _glm_producer_shape(tmp_path)("decode", payload)
     artifact = write_glm_rank(_pod(tmp_path, cell), payload)
-    sidecar = artifact.with_suffix(".repetitions.jsonl")
-    record = json.loads(sidecar.read_bytes())
-    for repetition in record["repetitions"]:
-        # Split the cold prompt across two preparation steps. The first dispatch receipt may be missing.
+
+    def split_preparation(record):
+        repetition = record["repetitions"][0]
+        # The producer still counts the first preparation output when it has no graph receipt.
         suffix = repetition["scheduled_token_counts"][0] - 2176
         repetition["dispatches"][0].update(num_unpadded_tokens=suffix, num_padded_tokens=suffix)
         repetition["dispatches"].insert(0, None)
-        if records_counts:
-            repetition["scheduled_token_counts"][:1] = [2176, suffix]
-        else:
+        repetition["prefill_chunks"] = [[[0, 2176]], [[2176, suffix]]]
+        repetition["scheduled_token_counts"][:1] = [2176, suffix]
+        if missing_count:
             del repetition["scheduled_token_counts"]
-    line = json.dumps(record).encode()
-    _rewrite_sidecar(payload, sidecar, [line])
-    payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
-    artifact.write_text(json.dumps(payload))
-    assert len(database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)) == 1
+
+    _check_altered_repetition(
+        tmp_path, cell, payload, artifact, split_preparation, "scheduled token counts" if missing_count else None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1407,14 +1508,15 @@ def test_glm_publication_checks_preparation_and_rank_time(tmp_path, corruption, 
         elif corruption in {"chunk-count", "chunk-receipt"}:
             repetition["prefill_chunks"][0][0][1] = 2200
             if corruption == "chunk-receipt":
-                del repetition["scheduled_token_counts"]
+                repetition["dispatches"][0] = None
         elif corruption == "prep-padding":
             repetition["dispatches"][0]["num_padded_tokens"] = 1
         elif corruption == "prep-type":
-            del repetition["scheduled_token_counts"]
             repetition["dispatches"][0] = "unavailable"
         elif corruption == "rejected-alignment":
-            record["rejected_repetitions"] = [{"rejection_reason": "retry", "prefill_chunks": [[[1, 2176]]]}]
+            record["rejected_repetitions"] = [
+                {**repetition, "rejection_reason": "retry", "prefill_chunks": [[[1, 2176]]]}
+            ]
         else:
             for fpm in repetition["fpms"]:
                 interval = fpm["benchmark_sample"]["timing"]

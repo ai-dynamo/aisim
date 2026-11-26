@@ -96,7 +96,9 @@ def _install(monkeypatch, **backend_kwargs) -> tuple[_FakeBackend, list[dict]]:
     monkeypatch.setattr(
         afd_memory,
         "get_database_view",
-        lambda *a, **k: SimpleNamespace(system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}}),
+        lambda system, backend, version, **k: SimpleNamespace(
+            version=version, system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}}
+        ),
     )
     monkeypatch.setattr(
         afd_memory,
@@ -108,7 +110,7 @@ def _install(monkeypatch, **backend_kwargs) -> tuple[_FakeBackend, list[dict]]:
     monkeypatch.setattr(afd_memory, "resolve_context_fmha_by_data", lambda *a, **k: None)
     monkeypatch.setattr(afd_memory, "resolve_dsv4_moe_arch", lambda *a, **k: None)
     monkeypatch.setattr(afd_memory, "_resolve_afd_execution_quantization", lambda *a, **k: None)
-    monkeypatch.setattr(afd_memory, "get_model", lambda path, config, backend: SimpleNamespace(config=config))
+    monkeypatch.setattr(afd_memory, "get_model", lambda path, config, backend, version: SimpleNamespace(config=config))
 
     # Spy on _pool_memory to see the phase/batch/weight selection of the
     # check loop (the real body still runs against the fake backend).
@@ -131,7 +133,7 @@ def test_custom_systems_roots_reach_fit_and_kv_budget(monkeypatch, tmp_path, sel
 
     def database(system, backend, version, **kwargs):
         database_roots.append((system, kwargs["systems_paths"]))
-        return SimpleNamespace(system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}})
+        return SimpleNamespace(version=version, system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}})
 
     def latest(system, backend, **kwargs):
         version_roots.append((system, kwargs["systems_paths"]))
@@ -333,7 +335,7 @@ def test_hetero_pools_resolve_their_own_latest_versions(monkeypatch):
 
     def record_view(system, backend_name, version, **kwargs):
         views.append((system, version))
-        return SimpleNamespace(system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}})
+        return SimpleNamespace(version=version, system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}})
 
     monkeypatch.setattr(afd_memory, "get_database_view", record_view)
     fraction_versions: list[str] = []
@@ -362,7 +364,7 @@ def test_explicit_backend_version_applies_to_both_pools(monkeypatch):
 
     def record_view(system, backend_name, version, **kwargs):
         views.append((system, version))
-        return SimpleNamespace(system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}})
+        return SimpleNamespace(version=version, system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}})
 
     monkeypatch.setattr(afd_memory, "get_database_view", record_view)
 
@@ -567,9 +569,9 @@ def test_memory_keeps_explicit_source_policies(monkeypatch, database_mode):
     _install(monkeypatch, free_fraction=0.9)
     seen = []
 
-    def database(*args, **kwargs):
+    def database(system, backend, version, **kwargs):
         seen.append(kwargs)
-        return SimpleNamespace(system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}})
+        return SimpleNamespace(version=version, system_spec={"gpu": {"mem_capacity": _CAPACITY_BYTES}})
 
     monkeypatch.setattr(afd_memory, "get_database_view", database)
     common = dict(

@@ -43,6 +43,7 @@ TP_SIZES = (1, 2, 4, 8)
 MAX_BATCH = 32
 MAX_NEW = 8192
 MAX_CONTEXT = 131072
+CONTEXT_HEADROOM = 7
 # The smallest power of two above the producer's minimum decode context of 3.
 MIN_CONTEXT = 4
 
@@ -58,7 +59,7 @@ def glm_measured_context(options: FPMCollectionOptions) -> int:
 
     vLLM needs seven positions beyond it, the producer's ``CONTEXT_HEADROOM``.
     """
-    return min(MAX_CONTEXT, options.vllm_max_model_len - 7)
+    return min(MAX_CONTEXT, options.vllm_max_model_len - CONTEXT_HEADROOM)
 
 
 def glm_align_stop(

@@ -84,10 +84,13 @@ included, before the scheduler loads.
   point keeps its true context `c`: the prompt has `c - 1` tokens and the
   cached seed `(c - 2) // hash_block * hash_block`, where `hash_block` is the
   hash block size of the engine.
-- Validation checks recorded chunk starts and lengths against the prompt and
-  available scheduler counts, including starts in rejected attempts. Each
-  observed prefix dispatch must report a runtime mode and consistent padded
-  and unpadded token counts. Older records may omit a preparation observation.
+- Each completed attempt records its prefill chunks, including rejected
+  attempts. Each point records its per-request lengths. Each attempt records
+  its prompt segments, cache salts, scheduled token counts and dispatches.
+  The collector matches chunks to these lengths and counts, including mixed
+  prefill/decode steps in a discarded attempt. A missing graph receipt leaves
+  its runtime mode and padding unknown. Each positive preparation output
+  consumes a forward index before the accepted decode steps.
 - Each point runs 5 warmups and 10 measurements. The table stores the median
   of measurements 2 to 10, which is Dynamo's `adjacent_upper_median` estimate.
   Measurement 1 is a valid measured repetition that this estimate leaves out.
@@ -203,8 +206,8 @@ this producer. The cell selects these rules, not the artifact:
   one fewer KV token per request in the first. The reader verifies each
   forward's rank, scheduled work, positive wall time and order. The unpadded
   token count in each graph dispatch must equal the new prefill tokens or the
-  decode batch size. The producer's per-step scheduled counts, when recorded,
-  must agree with the same workload. The second decode interval starts at the
+  decode batch size. The producer's per-step scheduled counts must agree with
+  the same workload. The second decode interval starts at the
   first forward’s recorded output timestamp. The ten measured forwards match their
   saved raw samples in every field except the
   sample index, which the producer renumbers for publication.
