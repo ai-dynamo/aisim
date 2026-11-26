@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Possible stock Transformers backends. Columns are vLLM release mask (31=1, 32=2, 33=4), class suffix, and class prefixes.
-# A dash represents an empty suffix. See THIRD_PARTY_NOTICES.md for package versions and selection rules.
+# Stock Transformers models. Columns are vLLM release mask (31=1, 32=2, 33=4), class suffix, and class prefixes.
+# Mask 0 means the class exists and is incompatible across all supported releases. A dash means no suffix. See THIRD_PARTY_NOTICES.md.
 4 - Molmo2Adapter
 4 ForCausalLM BailingHybrid Beam Kolibri1
 4 ForConditionalGeneration Molmo2 MossTranscribeDiarize MuseSpark UnlimitedOcr
@@ -25,6 +25,7 @@
 6 PreTrainedModel EmbeddingGemma2 Gte HyperCLOVAXVisionV2 MiniCPMV4_7 MiniCPMV4_7Vision Nemotron3Diarization
 6 PreTrainedModel NemotronH_Omni_Reasoning_V3
 6 PretrainedModel Qwen2_5_VisionTransformer
+7 - PreTrainedModel
 7 - BertLayer BigBirdLayer Blip2TextModelWithProjection Blip2VisionModelWithProjection BltPatcher
 7 - CLIPTextModelWithProjection CLIPVisionModelWithProjection CanineLayer ChameleonVQVAE
 7 - ClapAudioModelWithProjection ClapTextModelWithProjection ConvBertLayer DPRPretrainedReader DPRReader
@@ -306,3 +307,86 @@
 7 PreTrainedModel Wav2Vec2Conformer Whisper XCLIP XLMRoberta XLMRobertaXL Xcodec Xcodec2 Xmod Yolos Youtu Zamba
 7 PreTrainedModel Zamba2 Zaya xLSTM
 7 PretrainedModel Bart Ernie4_5_VLMoeVisionTransformer Ernie4_5_VL_MoeVisionTransformer
+0 - FastSpeech2ConformerHifiGan FastSpeech2ConformerWithHifiGan FlavaImageCodebook ReformerModelWithLMHead
+0 - SLANeXtSLAHead SLANetSLAHead SpeechT5HifiGan
+0 Backbone SLANeXt SLANet
+0 Decoder Clvp ProphetNet
+0 Encoder Clvp ProphetNet
+0 ForAudioFrameClassification WavLM
+0 ForCTC SEWD WavLM
+0 ForCausalImageModeling ImageGPT
+0 ForCausalLM BigBird Bloom Clvp CodeGen CpmAnt Falcon GPTJ GPTNeo GPTNeoXJapanese MegatronBert Mpt Mvp
+0 ForCausalLM ProphetNet RemBert RoFormer Rwkv TrOCR XGLM
+0 ForConditionalGeneration Blip ClvpModel FSMT LED Mvp ProphetNet
+0 ForDepthEstimation GLPN ZoeDepth
+0 ForEntityClassification Luke
+0 ForEntityPairClassification Luke
+0 ForEntitySpanClassification Luke
+0 ForImageAndTextRetrieval Vilt
+0 ForImageClassification Cvt Data2VecVision Dinat DonutSwin Hiera ImageGPT Levit MobileViT MobileViTV2 Pvt PvtV2
+0 ForImageClassification SwiftFormer Swinv2
+0 ForImageClassificationConvProcessing Perceiver
+0 ForImageClassificationFourier Perceiver
+0 ForImageClassificationLearned Perceiver
+0 ForImageClassificationWithTeacher Levit
+0 ForImageSegmentation SegGpt
+0 ForImageSuperResolution Swin2SR
+0 ForImageTextRetrieval Blip
+0 ForImagesAndTextClassification Vilt
+0 ForKeypointMatching SuperGlue
+0 ForMaskedImageModeling Swinv2
+0 ForMaskedLM BigBird ConvBert Deberta DebertaV2 Funnel IBert Longformer Luke MPNet MegatronBert Mra
+0 ForMaskedLM Nystromformer Perceiver Reformer RemBert RoFormer SqueezeBert Tapas Vilt Yoso
+0 ForMultimodalAutoencoding Perceiver
+0 ForMultipleChoice BigBird Canine ConvBert DebertaV2 Flaubert Funnel IBert Longformer Luke MPNet MegatronBert
+0 ForMultipleChoice Mra Nystromformer RemBert RoFormer SqueezeBert VisualBert XLM XLNet Yoso
+0 ForNextSentencePrediction MegatronBert
+0 ForObjectDetection DabDetr GroundingDino MMGroundingDino OmDetTurbo TableTransformer
+0 ForOpticalFlow Perceiver
+0 ForPreTraining BigBird Flava Funnel Hiera Lxmert MegatronBert VisualBert
+0 ForPrediction Autoformer
+0 ForProteinFolding Esm
+0 ForQuestionAnswering BigBird Blip Bloom Canine ConvBert Deberta DebertaV2 Falcon Flaubert Funnel GPTJ GPTNeo
+0 ForQuestionAnswering IBert LED LayoutLMv2 LayoutLMv3 Lilt Longformer Luke Lxmert MPNet MegatronBert Mpt Mra Mvp
+0 ForQuestionAnswering Nystromformer Reformer RemBert RoFormer SqueezeBert Tapas Vilt VisualBert XLM XLNet Yoso
+0 ForQuestionAnsweringSimple Flaubert XLM XLNet
+0 ForRegionToPhraseAlignment VisualBert
+0 ForSceneTextRecognition Mgpstr
+0 ForSemanticSegmentation Data2VecVision MobileViT MobileViTV2
+0 ForSequenceClassification BigBird Bloom Canine ConvBert Deberta DebertaV2 Falcon Flaubert Funnel GPTJ GPTNeo
+0 ForSequenceClassification IBert LayoutLMv2 LayoutLMv3 Lilt Longformer Luke MPNet MegatronBert Mpt Mra Mvp
+0 ForSequenceClassification Nystromformer OpenAIGPT Perceiver Reformer RemBert RoFormer SEWD SqueezeBert Tapas
+0 ForSequenceClassification WavLM XLM XLNet Yoso
+0 ForSpeechToSpeech SpeechT5
+0 ForSpeechToText SpeechT5
+0 ForTableRecognition SLANeXt SLANet
+0 ForTextToSpeech SpeechT5
+0 ForTokenClassification BigBird Bloom Bros BrosSpadeEE BrosSpadeEL Canine ConvBert Deberta DebertaV2 Falcon
+0 ForTokenClassification Flaubert Funnel GPTNeo IBert LayoutLMv2 LayoutLMv3 Lilt Longformer Luke MPNet
+0 ForTokenClassification MegatronBert Mpt Mra Nystromformer RemBert RoFormer SqueezeBert Vilt XLM XLNet Yoso
+0 ForUniversalSegmentation Mask2Former OneFormer
+0 ForVideoClassification Timesformer
+0 ForVideoGrounding Tvp
+0 ForVisualReasoning VisualBert
+0 ForXVector WavLM
+0 FormerModel Mask2 One Ro Swift
+0 FormerPreTrainedModel Mask2 One Ro Swift
+0 FormerSwinModel Mask
+0 FormerSwinPreTrainedModel Mask
+0 Model Autoformer Bark BarkCausal BarkCoarse BarkFine BarkSemantic BigBird Blip BlipTextLMHead BlipVision Bloom
+0 Model Bros Canine Clvp CodeGen ConvBert CpmAnt Cvt DabDetr Data2VecVision Deberta DebertaV2 Dinat DonutSwin
+0 Model FSMT Falcon FastSpeech2Conformer Flaubert FlaubertWithLMHead Flava FlavaImage FlavaMultimodal FlavaText
+0 Model Funnel FunnelBase GLPN GPTJ GPTNeo GPTNeoXJapanese GroundingDino GroupViT GroupViTText GroupViTVision
+0 Model Hiera IBert ImageGPT LED LayoutLMv2 LayoutLMv3 Levit Lilt Longformer Luke Lxmert MMGroundingDino MPNet
+0 Model MegatronBert Mgpstr MobileViT MobileViTV2 Mpt Mra Mvp Nystromformer OpenAIGPT OpenAIGPTDoubleHeads
+0 Model OpenAIGPTLMHead Perceiver PretrainedFSMT ProphetNet Pvt PvtV2 Reformer RemBert Rwkv SEWD SegGpt SpeechT5
+0 Model SqueezeBert Swin2SR Swinv2 TableTransformer Tapas Timesformer Tvp Vilt VisualBert VitDet Vits WavLM XGLM
+0 Model XLM XLMWithLMHead XLNet XLNetLMHead Yoso
+0 PreTrainedModel Autoformer Bark BigBird Blip BlipText Bloom Bros Canine Clvp CodeGen ConvBert CpmAnt Cvt
+0 PreTrainedModel DabDetr Data2VecVision Deberta DebertaV2 Dinat DonutSwin Falcon FastSpeech2Conformer Flaubert
+0 PreTrainedModel Flava Funnel GLPN GPTJ GPTNeo GPTNeoXJapanese GroundingDino GroupViT Hiera IBert ImageGPT LED
+0 PreTrainedModel LayoutLMv2 LayoutLMv3 Levit Lilt Longformer Luke Lxmert MMGroundingDino MPNet MegatronBert
+0 PreTrainedModel Mgpstr MobileViT MobileViTV2 Mpt Mra Mvp Nystromformer OmDetTurbo OpenAIGPT Perceiver
+0 PreTrainedModel ProphetNet Pvt PvtV2 Reformer RemBert Rwkv SEWD SLANeXt SLANet SegGpt SpeechT5 SqueezeBert
+0 PreTrainedModel SuperGlue Swin2SR Swinv2 TableTransformer Tapas Timesformer TrOCR Tvp Vilt VisualBert VitDet
+0 PreTrainedModel Vits WavLM XGLM XLM XLNet Yoso ZoeDepth

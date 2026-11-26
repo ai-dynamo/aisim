@@ -131,11 +131,6 @@ impl TransferMetadata {
     ) -> Self {
         let model = &config["model_config"];
         let resolved = &model["model_arch_config"];
-        let checkpoint = heads::checkpoint(model, source);
-        let top = heads::HfConfig::observed(model, checkpoint.as_ref());
-        let names = resolved
-            .get("architectures")
-            .or_else(|| top.fields.get("architectures"));
         let release = source
             .pointer("/runtime/version")
             .and_then(Value::as_str)
@@ -144,6 +139,11 @@ impl TransferMetadata {
                     .then(|| source["backend_version"].as_str())
                     .flatten()
             });
+        let checkpoint = heads::checkpoint(model, source, release);
+        let top = heads::HfConfig::observed(model, checkpoint.as_ref());
+        let names = resolved
+            .get("architectures")
+            .or_else(|| top.fields.get("architectures"));
         let model_impl = model["model_impl"].as_str().unwrap_or("auto");
         let native = matches!(model_impl, "auto" | "vllm");
         let registered = names
@@ -154,7 +154,7 @@ impl TransferMetadata {
                     names.iter().map(Value::as_str),
                     release,
                     model_impl == "vllm",
-                    top.has_stock_model_lookup(),
+                    top.may_load_dynamic_model(model),
                 )
             });
         let decoder = if native && names.is_none_or(Value::is_null) {
@@ -169,7 +169,7 @@ impl TransferMetadata {
         );
         let family = resolved["model_type"]
             .as_str()
-            .or_else(|| top.fields["model_type"].as_str())
+            .or_else(|| top.model_type(model))
             .or_else(|| decoder.map(Decoder::family));
         let (configured_heads, configured_layers) =
             text.model_geometry(family, use_mla, resolved, top);
@@ -390,6 +390,25 @@ impl Worker {
             });
         let single_head_mla = mla_groups && use_mla == Some(true);
         let mut metadata = TransferMetadata::configured(config, use_mla, architecture, rank);
+        // An ordinary cache spec identifies the layer even if its view shares a NIXL region.
+        if metadata.nemotron_attention_layers.is_some()
+            || !metadata.hybrid_attention_positions.is_empty()
+        {
+            for group in groups
+                .into_iter()
+                .flatten()
+                .filter(|g| g["kind"] == "attention")
+            {
+                for (name, ordinary) in layout::decoder_layers(group) {
+                    if ordinary
+                        && name.starts_with("model.layers.")
+                        && name.ends_with(".mixer.attn")
+                    {
+                        metadata.layer_heads.entry(name.to_owned()).or_default();
+                    }
+                }
+            }
+        }
         metadata.registered_layers = layout::registered_layers(rank);
         if let Some(regions) = groups.and_then(|g| {
             layout::nemotron_state_regions(rank, g, host, metadata.registered_layers.as_ref())
@@ -1596,6 +1615,33 @@ impl NixlIdentity {
                     return Err(conflict("attention layer positions"));
                 }
             }
+            if let Some(logical) = &self.metadata.nemotron_attention_layers {
+                let invalid_layer = self
+                    .metadata
+                    .layer_heads
+                    .keys()
+                    .filter_map(|name| {
+                        name.strip_prefix("model.layers.")?
+                            .strip_suffix(".mixer.attn")?
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .any(|index| logical.binary_search(&index).is_err());
+                // A sparse archive may retain only the number of layers in its groups.
+                let excess_layers = self
+                    .recorded_groups
+                    .iter()
+                    .flatten()
+                    .filter(|g| g["kind"] == "attention")
+                    .any(|g| {
+                        g["num_layers"]
+                            .as_u64()
+                            .is_some_and(|n| n > logical.len() as u64)
+                    });
+                if invalid_layer || excess_layers {
+                    return Err(conflict("attention layer positions"));
+                }
+            }
             if self
                 .nemotron_attention_regions()
                 .is_some_and(|owners| owners.missing(&owners).is_some())
@@ -2299,6 +2345,61 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_measured_attention_must_fit_the_same_models_logical_layers() {
+        let select = |names: &[&str], count| {
+            let mut role = NixlIdentity {
+                architecture: Some("NemotronHForCausalLM".into()),
+                recorded_groups: Some(vec![json!({"kind":"attention","num_layers":count})]),
+                metadata: TransferMetadata {
+                    nemotron_attention_layers: Some(vec![0, 2]),
+                    registered_layers: Some(BTreeSet::from(["model.layers.0.mixer.attn".into()])),
+                    layer_heads: names
+                        .iter()
+                        .map(|n| ((*n).into(), HeadGeometry::default()))
+                        .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            role.select("prefill", None, None, None, None, false)
+        };
+        assert!(
+            select(
+                &["model.layers.0.mixer.attn", "model.layers.2.mixer.attn"],
+                2
+            )
+            .is_ok()
+        );
+        assert!(
+            select(
+                &["model.layers.0.mixer.attn", "model.layers.1.mixer.attn"],
+                2
+            )
+            .is_err()
+        );
+        assert!(select(&["model.layers.2.mixer.attn"], 1).is_ok());
+        assert!(select(&[], 2).is_ok());
+        assert!(select(&[], 3).is_err());
+
+        // An archive may identify the decoder only when the deployment is selected.
+        let name = "model.layers.1.mixer.attn";
+        let rank = json!({"resolved_config":{"model_config":{"hf_overrides":{"hybrid_override_pattern":"*-*-"}}},
+            "cache":{"groups":[{"kind":"attention","layer_names":[name],
+            "spec_type":"vllm.v1.kv_cache_interface.FullAttentionSpec"}]}});
+        let worker = Worker::observed(&rank, None).unwrap();
+        assert!(worker.metadata.layer_heads.contains_key(name));
+        let mut role = NixlIdentity {
+            architecture: Some("NemotronHForCausalLM".into()),
+            workers: vec![worker],
+            ..Default::default()
+        };
+        assert!(
+            role.select("prefill", None, None, None, None, false)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn selected_nemotron_interprets_the_saved_top_level_layer_pattern() {
         let selected = |model: Value, arch: &str| {
             let mut id = observe(json!({"runtime_settings":{"model_config":model}}), "decode");
@@ -2996,6 +3097,79 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_class_precedes_converter_name_and_post_load_mappings() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let bytes = br#"{"model_type":"qwen2","num_attention_heads":8,"num_key_value_heads":8,"hidden_size":512,
+            "extra":[Infinity,-Infinity,NaN,"NaN and \"Infinity\""],"architectures":["Qwen2ForCausalLM"]}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let source = json!({"launch":{"model_config":{"path":path,"sha256":format!("{:x}",Sha256::digest(bytes))}}});
+        for family in ["qwen2_moe", "falcon"] {
+            let mut updates = json!({"model_type":family,"new_decoder_architecture":true,
+                "hidden_size_per_head":128, "auto_map":{"AutoConfig":"custom.FalconConfig"}});
+            let project = |overrides: &Value| {
+                TransferMetadata::configured(
+                    &json!({"model_config":{"hf_overrides":overrides,"trust_remote_code":true}}),
+                    Some(false),
+                    Some("Qwen2ForCausalLM"),
+                    &source,
+                )
+            };
+            let baseline = project(&updates).model_heads;
+            assert_eq!(
+                (baseline.num_kv_heads, baseline.head_size),
+                (Some(8), Some(128))
+            );
+            updates["n_head_kv"] = json!(4);
+            assert_eq!(project(&updates).model_heads.num_kv_heads, Some(4));
+        }
+
+        // Qwen2Config.to_dict() retains the class name even when the instance selects
+        // the Falcon converter. Both aliases hash as one multi-query head.
+        for kv in [8, 4] {
+            let overrides = json!({"model_type":"falcon","new_decoder_architecture":false,
+                "multi_query":true,"n_head_kv":kv});
+            let mut serialized = overrides.clone();
+            serialized["model_type"] = json!("qwen2");
+            let settings =
+                json!({"model_config":{"hf_config":serialized,"hf_overrides":overrides}});
+            let heads =
+                TransferMetadata::configured(&settings, Some(false), None, &source).model_heads;
+            assert_eq!(heads.num_kv_heads, Some(1));
+        }
+    }
+
+    #[test]
+    fn verified_wrappers_initialize_the_child_before_text_overrides() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (family, heads) in [("llava", 32), ("llava_next", 32), ("idefics2", 8)] {
+            let bytes =
+                json!({"model_type":family, "text_config":{"hidden_size":2048}}).to_string();
+            std::fs::write(&path, &bytes).unwrap();
+            let source = json!({"launch":{"model_config":{"path":path,"sha256":format!("{:x}",Sha256::digest(bytes.as_bytes()))}}});
+            let project = |overrides| {
+                TransferMetadata::configured(
+                    &json!({"model_config":{"hf_overrides":overrides}}),
+                    Some(false),
+                    None,
+                    &source,
+                )
+            };
+            let baseline = project(json!({})).model_heads;
+            assert_eq!(
+                (baseline.num_kv_heads, baseline.head_size),
+                (Some(heads), Some(64))
+            );
+            let edited =
+                project(json!({"text_config":{"n_head_kv":4,"hidden_size":4096}})).model_heads;
+            assert_eq!((edited.num_kv_heads, edited.head_size), (Some(4), Some(64)));
+        }
+    }
+
+    #[test]
     fn qwen_vl_initializes_the_text_model_before_serving_overrides() {
         use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
@@ -3135,8 +3309,9 @@ mod tests {
     #[test]
     fn raw_scheduler_limits_are_bound_to_the_launch_and_rank_records() {
         let settings = json!({"scheduler_config":{"max_num_seqs":8,"max_num_batched_tokens":128},
+                              "cache_config":{"gpu_memory_utilization":0.9},
                               "model_config":{"max_model_len":1024}});
-        let launch = json!({"collection":{"max_num_seqs":8,"max_num_batched_tokens":128,"max_model_len":1024}});
+        let launch = json!({"collection":{"max_num_seqs":8,"max_num_batched_tokens":128,"max_model_len":1024,"gpu_memory_utilization":0.9}});
         let raw = json!({"source":"runtime_observations","launch":launch,"runtime_settings":settings,
                          "artifacts":[{"evidence":{"kind":"worker","launch":launch,"resolved_config":settings}}]});
         let validate = |entry: &Value| {
@@ -3145,8 +3320,11 @@ mod tests {
         assert!(validate(&raw).is_ok());
         for path in [
             "/launch/collection/max_num_batched_tokens",
+            "/launch/collection/gpu_memory_utilization",
             "/artifacts/0/evidence/resolved_config/scheduler_config/max_num_seqs",
+            "/artifacts/0/evidence/resolved_config/cache_config/gpu_memory_utilization",
             "/artifacts/0/evidence/launch/collection/max_model_len",
+            "/artifacts/0/evidence/launch/collection/gpu_memory_utilization",
         ] {
             let mut changed = raw.clone();
             *changed.pointer_mut(path).unwrap() = json!(1);
@@ -3156,24 +3334,109 @@ mod tests {
 
     #[test]
     fn ordered_native_fallback_depends_on_the_first_transformers_class() {
-        let select = |first, stock| {
+        let select = |first, may_load_dynamic| {
             registry::select(
                 [Some(first), Some("NemotronHForConditionalGeneration")].into_iter(),
                 Some("0.32.0"),
                 false,
-                stock,
+                may_load_dynamic,
             )
         };
         assert!(
-            select("UnregisteredGenerationName", true).and_then(registry::Registration::decoder)
+            select("UnregisteredGenerationName", false).and_then(registry::Registration::decoder)
                 == Some(Decoder::NemotronH)
         );
-        assert!(select("UnregisteredGenerationName", false).is_none());
+        assert!(select("UnregisteredGenerationName", true).is_none());
         assert!(select("AlbertModel", true).is_none());
+        assert!(select("PreTrainedModel", false).is_none());
         assert!(
             select("ReformerModel", true).and_then(registry::Registration::decoder)
                 == Some(Decoder::NemotronH)
         );
+    }
+
+    #[test]
+    fn model_mapping_applies_only_after_a_missing_literal_and_with_trust() {
+        for (first, map, trust, native) in [
+            ("MissingModel", "AutoConfig", true, true),
+            ("MissingModel", "AutoModelForCausalLM", true, false),
+            ("MissingModel", "AutoModel", false, true),
+            ("ReformerModel", "AutoModel", true, true),
+            ("AlbertModel", "AutoModel", true, false),
+            ("AlbertModel", "AutoConfig", false, false),
+        ] {
+            let config = json!({"model_config":{"trust_remote_code":trust, "hf_config":{
+                "architectures":[first,"NemotronHForConditionalGeneration"],
+                "model_type":"nemotron_h","layer_types":["mlp","full_attention"],
+                "auto_map":{map:"modeling_custom.CustomModel"}
+            }}});
+            let state = TransferMetadata::configured(&config, Some(false), None, &Value::Null);
+            assert_eq!(state.nemotron_attention_layers, native.then_some(vec![1]));
+        }
+    }
+
+    #[test]
+    fn refined_web_connector_and_attention_read_the_initialized_aliases() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for family in ["RefinedWeb", "RefinedWebModel"] {
+            let arch = "FalconForCausalLM";
+            let saved = json!({"model_type":family,"architectures":[arch],"n_head":8,
+                "n_layer":2,"n_head_kv":8,"hidden_size":512,"multi_query":false,
+                "new_decoder_architecture":false});
+            let bytes = serde_json::to_vec(&saved).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let source = json!({"launch":{"model_config":{"path":path,"sha256":format!("{:x}", Sha256::digest(&bytes))}}});
+            let check = |model: Value, hashes, rank_heads, width, layers| {
+                let state = TransferMetadata::configured(
+                    &json!({"model_config":model}),
+                    Some(false),
+                    Some(arch),
+                    &source,
+                );
+                assert_eq!(
+                    (state.model_heads.num_kv_heads, state.model_heads.head_size),
+                    (Some(hashes), Some(width))
+                );
+                assert_eq!(state.num_hidden_layers, Some(layers));
+                let rank = state
+                    .uniform_attention
+                    .unwrap()
+                    .rank_heads(2, Some(arch))
+                    .unwrap();
+                assert_eq!(
+                    (rank.num_kv_heads, rank.head_size),
+                    (Some(rank_heads), Some(width))
+                );
+            };
+            for (updates, hashes, rank_heads, width, layers) in [
+                (json!({}), 8, 4, 64, 2),
+                (json!({"num_kv_heads":4}), 4, 4, 64, 2),
+                (json!({"n_head_kv":4}), 4, 4, 64, 2),
+                (
+                    json!({"num_kv_heads":4, "new_decoder_architecture":true}),
+                    4,
+                    2,
+                    64,
+                    2,
+                ),
+                (json!({"n_head":4, "num_hidden_layers":3}), 8, 2, 128, 3),
+                (json!({"num_attention_heads":4, "n_layer":3}), 8, 2, 128, 3),
+            ] {
+                check(
+                    json!({"hf_overrides":updates}),
+                    hashes,
+                    rank_heads,
+                    width,
+                    layers,
+                );
+            }
+            // RWConfig.to_dict() stores n_head and omits its read-only head_dim.
+            let mut serialized = saved.clone();
+            serialized["hidden_size_per_head"] = json!(128);
+            check(json!({"hf_config":serialized}), 8, 4, 64, 2);
+        }
     }
 
     #[test]

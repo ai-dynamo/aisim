@@ -255,7 +255,7 @@ def _merge_resources(
             # exact bytes instead of copying every rank/layer into each candidate.
             current = observation_format == "source_references_v2"
             if current:
-                from .runtime import _worker_observation_digest, _worker_observations
+                from .runtime import LEGACY_PROVENANCE_SCHEMA, _worker_observation_digest, _worker_observations
 
                 if evidence.get("source") == "vllm_initialized_cache":
                     cell = evidence.get("cell_id")
@@ -265,11 +265,20 @@ def _merge_resources(
                 # Formal observations can retain the original relative launch path.
                 # The verified probe archives the matching checkpoint beside its index.
                 digest = ((evidence.get("launch") or {}).get("model_config") or {}).get("sha256")
+                probe = manifest.get("runtime_probe") or {}
+                legacy_path = None
+                if probe.get("schema_version") == LEGACY_PROVENANCE_SCHEMA and probe.get("observations_index"):
+                    legacy_path = Path(probe["observations_index"]).with_name("model-config.json")
                 staged = next(
                     (
                         Path(item["path"])
-                        for item in (manifest.get("runtime_probe") or {}).get("source_artifacts", [])
-                        if digest and item.get("kind") == "model_config" and item.get("sha256") == digest
+                        for item in probe.get("source_artifacts", [])
+                        if digest
+                        and item.get("sha256") == digest
+                        and (
+                            item.get("kind") == "model_config"
+                            or ("kind" not in item and Path(item["path"]) == legacy_path)
+                        )
                     ),
                     None,
                 )

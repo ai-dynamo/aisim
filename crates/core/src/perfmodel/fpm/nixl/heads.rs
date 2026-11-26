@@ -5,6 +5,10 @@
 // SPDX-FileCopyrightText: Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023 Mistral AI and the HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2023 the Falcon authors and HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023 Microsoft Research & University of Wisconsin-Madison and the HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2023 The vLLM team
+// SPDX-FileCopyrightText: Copyright 2022 the Big Science Workshop and HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -14,7 +18,7 @@
 use std::{
     borrow::Cow,
     fs,
-    io::{BufReader, Seek},
+    io::{self, BufReader, Read, Seek},
     path::Path,
     sync::LazyLock,
 };
@@ -73,6 +77,9 @@ pub(super) struct HfConfig<'a> {
     pub(super) fields: &'a Value,
     complete: bool,
     verified: bool,
+    class: Option<ConfigClass>,
+    text_class: Option<ConfigClass>,
+    stock_only: bool,
 }
 
 /// Keep only configuration fields consumed by the tagged converters and native
@@ -127,8 +134,8 @@ fn text_field(config: &Value) -> Option<&'static str> {
         .find(|&key| config[key].is_object())
 }
 
-fn qwen2_vl_text_type(config: &Value) -> Option<&'static str> {
-    if config["auto_map"].get("AutoConfig").is_some() {
+fn qwen2_vl_text_type(config: &Value, stock_only: bool) -> Option<&'static str> {
+    if !stock_only && config["auto_map"].get("AutoConfig").is_some() {
         return None;
     }
     match config["model_type"].as_str() {
@@ -164,12 +171,70 @@ pub(super) fn hybrid_pattern(config: &Value) -> Option<Cow<'_, str>> {
         .map(Cow::Borrowed)
 }
 
-fn stock_decoder(config: &Value) -> Option<Decoder> {
-    if config["auto_map"].get("AutoConfig").is_some() {
+fn stock_decoder(config: &Value, stock_only: bool) -> Option<Decoder> {
+    if !stock_only && config["auto_map"].get("AutoConfig").is_some() {
         return None;
     }
     let family = config["model_type"].as_str()?;
     Decoder::from_family(family).filter(|decoder| decoder.family() == family)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ConfigClass {
+    Decoder(Decoder),
+    RefinedWeb,
+}
+
+impl ConfigClass {
+    fn observed(config: &Value, stock_only: bool) -> Option<Self> {
+        if refined_web(config) {
+            Some(Self::RefinedWeb)
+        } else {
+            stock_decoder(config, stock_only).map(Self::Decoder)
+        }
+    }
+}
+
+fn wrapper_text_default(config: &Value, stock_only: bool) -> Option<&'static str> {
+    if !stock_only && config["auto_map"].get("AutoConfig").is_some() {
+        return None;
+    }
+    match config["model_type"].as_str()? {
+        "llava" | "llava_next" => Some("llama"),
+        "idefics2" => Some("mistral"),
+        _ => None,
+    }
+}
+
+fn refined_web(config: &Value) -> bool {
+    matches!(
+        config["model_type"].as_str(),
+        Some("RefinedWeb" | "RefinedWebModel")
+    )
+}
+
+// RWConfig stores its public attributes under these names, including after config.update().
+const RW_ATTRIBUTES: [(&str, &str, u64); 3] = [
+    ("num_attention_heads", "n_head", 8),
+    ("num_hidden_layers", "n_layer", 2),
+    ("num_kv_heads", "n_head_kv", 1),
+];
+
+fn apply_rw_attributes(fields: &mut serde_json::Map<String, Value>, values: &Value, init: bool) {
+    for (public, stored, default) in RW_ATTRIBUTES {
+        let value = match (values.get(public), values.get(stored)) {
+            // Initial aliases are passed to the base class after the RW constructor.
+            // Archived override maps do not preserve the order of two conflicting setters.
+            (Some(a), Some(b)) if !init && a != b => Value::Null,
+            (Some(a), _) => a.clone(),
+            (None, Some(Value::Null)) if init && stored == "n_head_kv" => Value::from(1),
+            (None, Some(b)) => b.clone(),
+            (None, None) if init => Value::from(default),
+            _ => continue,
+        };
+        fields.remove(public);
+        fields.insert(stored.into(), value);
+    }
 }
 
 /// Ordinary HF constructors distinguish omitted arguments from explicit nulls.
@@ -224,12 +289,27 @@ fn divided_head_size(hidden_size: &Value, query_heads: &Value) -> Option<u64> {
 }
 
 /// Project the authenticated HF checkpoint before vLLM applies its serving overrides.
-fn checkpoint_geometry(config: &Value) -> Value {
+fn checkpoint_geometry(config: &Value, stock_only: bool) -> Value {
     let mut top = geometry_config(config);
-    if let Some(decoder) = stock_decoder(config) {
+    if refined_web(config) {
+        apply_rw_attributes(&mut top, config, true);
+        let hidden = config
+            .get("n_embed")
+            .filter(|v| !v.is_null())
+            .or_else(|| config.get("hidden_size"))
+            .cloned()
+            .unwrap_or(Value::from(64));
+        if hidden == 8192 {
+            top.insert("new_decoder_architecture".into(), Value::Bool(true));
+        }
+        top.insert("hidden_size".into(), hidden);
+        top.entry("new_decoder_architecture")
+            .or_insert(Value::Bool(false));
+        top.entry("multi_query").or_insert(Value::Bool(true));
+    } else if let Some(decoder) = stock_decoder(config, stock_only) {
         initialize_decoder(config, &mut top, decoder);
     }
-    if let Some(family) = qwen2_vl_text_type(config) {
+    if let Some(family) = qwen2_vl_text_type(config, stock_only) {
         // Both Qwen2 VL constructors consume these flat kwargs, even when an
         // explicit text_config supplies the actual values. Other flat attributes
         // (including head_dim and n_head_kv) stay on the enclosing config.
@@ -254,6 +334,19 @@ fn checkpoint_geometry(config: &Value) -> Value {
         text.entry("model_type")
             .or_insert_with(|| Value::from(family));
         top.insert("text_config".into(), Value::Object(text));
+    } else if let Some(default) = wrapper_text_default(config, stock_only) {
+        // These stock wrappers instantiate CONFIG_MAPPING[text_config.model_type].
+        let mut text = geometry_config(&config["text_config"]);
+        let family = text
+            .entry("model_type")
+            .or_insert(Value::from(default))
+            .as_str();
+        if let Some(decoder) = family.and_then(Decoder::from_family)
+            && Some(decoder.family()) == family
+        {
+            initialize_decoder(&config["text_config"], &mut text, decoder);
+        }
+        top.insert("text_config".into(), Value::Object(text));
     } else if let Some(key) = text_field(config) {
         top.insert(key.into(), Value::Object(geometry_config(&config[key])));
     }
@@ -262,6 +355,7 @@ fn checkpoint_geometry(config: &Value) -> Value {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CheckpointKey {
+    stock_only: bool,
     path: std::path::PathBuf,
     digest: String,
     size: u64,
@@ -271,10 +365,11 @@ struct CheckpointKey {
 }
 
 impl CheckpointKey {
-    fn new(path: &Path, digest: &str, metadata: &fs::Metadata) -> Option<Self> {
+    fn new(path: &Path, digest: &str, metadata: &fs::Metadata, stock_only: bool) -> Option<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         Some(Self {
+            stock_only,
             path: path.to_owned(),
             digest: digest.to_owned(),
             size: metadata.len(),
@@ -292,14 +387,74 @@ impl CheckpointKey {
 
 pub(super) struct Checkpoint {
     fields: Value,
-    plain_decoder: bool,
+    class: Option<ConfigClass>,
+    text_class: Option<ConfigClass>,
 }
 
-pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Checkpoint> {
+/// Python's JSON reader also accepts NaN and infinities in checkpoint settings.
+/// Preserve strings and stream the file. A nonfinite number cannot be a KV dimension.
+struct CheckpointReader<R: Read> {
+    bytes: std::iter::Peekable<io::Bytes<R>>,
+    string: bool,
+    escaped: bool,
+    pending: &'static [u8],
+}
+
+impl<R: Read> Read for CheckpointReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        for (i, slot) in output.iter_mut().enumerate() {
+            if let Some((first, rest)) = self.pending.split_first() {
+                *slot = *first;
+                self.pending = rest;
+                continue;
+            }
+            let Some(byte) = self.bytes.next().transpose()? else {
+                return Ok(i);
+            };
+            *slot = byte;
+            if self.string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.string = false;
+                }
+                continue;
+            }
+            let rest: &[u8] = match byte {
+                b'N' => b"aN",
+                b'I' => b"nfinity",
+                b'-' if matches!(self.bytes.peek(), Some(Ok(b'I'))) => b"Infinity",
+                _ => {
+                    self.string = byte == b'"';
+                    continue;
+                }
+            };
+            for &expected in rest {
+                if self.bytes.next().transpose()? != Some(expected) {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+            }
+            *slot = b' ';
+            self.pending = b"-1 ";
+        }
+        Ok(output.len())
+    }
+}
+
+pub(super) fn checkpoint(
+    model: &Value,
+    source: &Value,
+    release: Option<&str>,
+) -> Option<Checkpoint> {
     // An omitted override table is different from an explicitly empty one:
     // a historical writer may not have captured the serving overrides.
     let overrides = model.get("hf_overrides").filter(|v| v.is_object())?;
-    if model["hf_config"].is_object() {
+    if model["hf_config"].is_object()
+        && !overrides["model_type"].is_string()
+        && !overrides["auto_map"].is_object()
+    {
         return None;
     }
     let reference = &source["launch"]["model_config"];
@@ -315,7 +470,8 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Checkpoint> {
     // Keep only serving geometry, and revalidate when the referenced file changes.
     static SCOPES: LazyLock<Cache<CheckpointKey, Option<std::sync::Arc<Value>>>> =
         LazyLock::new(|| Cache::new(128));
-    let key = CheckpointKey::new(path, digest, &metadata)?;
+    let stock_only = model["trust_remote_code"] == false;
+    let key = CheckpointKey::new(path, digest, &metadata, stock_only)?;
     let saved = SCOPES
         .get_or_insert_with(&key, || -> std::io::Result<_> {
             let mut options = fs::OpenOptions::new();
@@ -328,7 +484,8 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Checkpoint> {
             }
             let mut file = options.open(path)?;
             let opened = file.metadata()?;
-            if !opened.is_file() || CheckpointKey::new(path, digest, &opened).as_ref() != Some(&key)
+            if !opened.is_file()
+                || CheckpointKey::new(path, digest, &opened, stock_only).as_ref() != Some(&key)
             {
                 return Ok(None);
             }
@@ -338,25 +495,33 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Checkpoint> {
                 return Ok(None);
             }
             file.rewind()?;
-            let config = serde_json::from_reader::<_, Value>(BufReader::new(&file)).ok();
+            let reader = CheckpointReader {
+                bytes: BufReader::new(&file).bytes().peekable(),
+                string: false,
+                escaped: false,
+                pending: &[],
+            };
+            let config = serde_json::from_reader::<_, Value>(reader).ok();
             // Keep the scope only if the same descriptor still identifies the hashed file.
-            if CheckpointKey::new(path, digest, &file.metadata()?).as_ref() != Some(&key) {
+            if CheckpointKey::new(path, digest, &file.metadata()?, stock_only).as_ref()
+                != Some(&key)
+            {
                 return Ok(None);
             }
             Ok(config
                 .filter(Value::is_object)
-                .map(|config| std::sync::Arc::new(checkpoint_geometry(&config))))
+                .map(|config| std::sync::Arc::new(checkpoint_geometry(&config, stock_only))))
         })
         .ok()
         .flatten()?;
-    let decoder = stock_decoder(&saved);
-    if decoder.is_some()
-        && let Some(family) = overrides["model_type"].as_str()
+    let decoder = stock_decoder(&saved, stock_only);
+    let rw = refined_web(&saved);
+    if let Some(family) = overrides["model_type"].as_str()
         && saved["model_type"] != family
-        && stock_decoder(overrides).is_none()
+        && (rw || registry::substitutes_config(family, release))
     {
-        // vLLM can select a registered config class before loading the checkpoint.
-        // The original stock constructor does not establish the new class's defaults.
+        // An ordinary model_type update does not change the class AutoConfig loaded.
+        // Registered parser substitutions can instead select a different constructor.
         return None;
     }
     let mut effective = (*saved).clone();
@@ -367,6 +532,9 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Checkpoint> {
         apply_geometry(&mut effective[key], &overrides[key]);
     }
     apply_geometry(&mut effective, overrides);
+    if rw {
+        apply_rw_attributes(effective.as_object_mut()?, overrides, false);
+    }
     if decoder == Some(Decoder::Falcon) {
         // Falcon exposes head_dim as a read-only property of the current scalars.
         effective["head_dim"] =
@@ -389,20 +557,45 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Checkpoint> {
     }
     Some(Checkpoint {
         fields: effective,
-        plain_decoder: decoder.is_some(),
+        class: ConfigClass::observed(&saved, stock_only),
+        text_class: if qwen2_vl_text_type(&saved, stock_only).is_some() {
+            Some(ConfigClass::Decoder(Decoder::Qwen2))
+        } else if wrapper_text_default(&saved, stock_only).is_some() {
+            stock_decoder(&saved["text_config"], true).map(ConfigClass::Decoder)
+        } else {
+            None
+        },
     })
 }
 
 impl<'a> HfConfig<'a> {
     pub(super) fn observed(model: &'a Value, checkpoint: Option<&'a Checkpoint>) -> Self {
         let saved = model.get("hf_config").filter(|v| v.is_object());
+        let fields = saved
+            .or_else(|| checkpoint.map(|c| &c.fields))
+            .unwrap_or(&model["hf_overrides"]);
+        let stock_only = model["trust_remote_code"] == false;
         Self {
-            fields: saved
-                .or_else(|| checkpoint.map(|c| &c.fields))
-                .unwrap_or(&model["hf_overrides"]),
-            complete: saved.is_some() || checkpoint.is_some_and(|c| c.plain_decoder),
-            verified: checkpoint.is_some(),
+            fields,
+            complete: saved.is_some() || checkpoint.is_some_and(|c| c.class.is_some()),
+            verified: saved.is_none() && checkpoint.is_some(),
+            class: checkpoint
+                .map_or_else(|| ConfigClass::observed(fields, stock_only), |c| c.class),
+            text_class: checkpoint.and_then(|c| c.text_class),
+            stock_only,
         }
+    }
+
+    pub(super) fn model_type(self, model: &'a Value) -> Option<&'a str> {
+        // Stock to_dict() serializes the class's model_type even after config.update()
+        // sets a different instance value. vLLM selects its converter from the instance.
+        if (self.class.is_some() || self.text_class.is_some())
+            && model["hf_config"].is_object()
+            && let Some(family) = model["hf_overrides"]["model_type"].as_str()
+        {
+            return Some(family);
+        }
+        self.fields["model_type"].as_str()
     }
 
     pub(super) fn text_config(
@@ -416,9 +609,13 @@ impl<'a> HfConfig<'a> {
                 fields,
                 complete: true,
                 verified: false,
+                class: self
+                    .text_class
+                    .or_else(|| ConfigClass::observed(fields, self.stock_only)),
+                ..self
             };
         }
-        let qwen_vl = qwen2_vl_text_type(self.fields).is_some();
+        let qwen_vl = qwen2_vl_text_type(self.fields, self.stock_only).is_some();
         let nested = text_field(self.fields).or_else(|| {
             // A recorded wrapper can establish that its outer override is not a text field.
             (qwen_vl || registered == Some(registry::Registration::Qwen2Vl))
@@ -427,8 +624,11 @@ impl<'a> HfConfig<'a> {
         if let Some(key) = nested {
             Self {
                 fields: &self.fields[key],
-                complete: (self.complete && !self.verified) || (self.verified && qwen_vl),
-                verified: self.verified,
+                complete: (self.complete && !self.verified) || self.text_class.is_some(),
+                class: self
+                    .text_class
+                    .or_else(|| ConfigClass::observed(&self.fields[key], self.stock_only)),
+                ..self
             }
         } else if referenced
             && !self.complete
@@ -440,29 +640,48 @@ impl<'a> HfConfig<'a> {
                 fields: &Value::Null,
                 complete: false,
                 verified: false,
+                ..self
             }
         } else {
             self
         }
     }
 
-    pub(super) fn has_stock_model_lookup(self) -> bool {
-        (self.complete || self.verified || self.fields.get("auto_map").is_some())
-            && (self.fields["auto_map"].is_null()
-                || self.fields["auto_map"].as_object().is_some_and(|m| {
-                    !m.keys()
-                        .any(|k| k == "AutoConfig" || k.starts_with("AutoModel"))
-                }))
+    pub(super) fn may_load_dynamic_model(self, model: &Value) -> bool {
+        if model["trust_remote_code"] == false {
+            return false;
+        }
+        match self.fields.get("auto_map") {
+            Some(Value::Object(m)) => m.keys().any(|k| k.starts_with("AutoModel")),
+            Some(Value::Null) => false,
+            None => !(self.complete || self.verified),
+            _ => true,
+        }
+    }
+
+    fn attribute(self, name: &str) -> &'a Value {
+        if self.class == Some(ConfigClass::RefinedWeb)
+            && let Some((_, stored, _)) =
+                RW_ATTRIBUTES.iter().find(|(public, _, _)| *public == name)
+            && let Some(value) = self.fields.get(*stored)
+        {
+            return value;
+        }
+        &self.fields[name]
     }
 
     fn divided_head_size(self) -> Option<u64> {
         divided_head_size(
             &self.fields["hidden_size"],
-            &self.fields["num_attention_heads"],
+            self.attribute("num_attention_heads"),
         )
     }
 
     fn base_kv_heads(self) -> Option<u64> {
+        if self.class == Some(ConfigClass::RefinedWeb) {
+            // The first two converter aliases are the same RWConfig attribute.
+            return self.attribute("num_kv_heads").as_u64();
+        }
         for key in [
             "n_head_kv",
             "num_kv_heads",
@@ -491,21 +710,25 @@ impl<'a> HfConfig<'a> {
                 None => {}
             }
         }
-        self.fields["num_attention_heads"].as_u64()
+        self.attribute("num_attention_heads").as_u64()
     }
 
     fn base_head_size(self) -> Option<u64> {
-        // A serialized FalconConfig omits its read-only head_dim property.
+        // FalconConfig and RWConfig omit their read-only head_dim property from to_dict().
         if self.complete
             && self.fields.get("head_dim").is_none()
-            && stock_decoder(self.fields) == Some(Decoder::Falcon)
+            && matches!(
+                self.class,
+                Some(ConfigClass::RefinedWeb | ConfigClass::Decoder(Decoder::Falcon))
+            )
         {
             return self.divided_head_size();
         }
         if let Some(size) = positive(&self.fields["head_dim"]) {
             return Some(size);
         }
-        let qwen2_config = self.verified && self.fields["model_type"] == "qwen2";
+        let qwen2_config =
+            self.verified && self.class == Some(ConfigClass::Decoder(Decoder::Qwen2));
         if !self.complete && !qwen2_config && self.fields.get("head_dim").is_none() {
             return None;
         }
@@ -560,7 +783,7 @@ impl<'a> HfConfig<'a> {
         {
             return (heads, None);
         }
-        let stored_layers = positive(&self.fields["num_hidden_layers"]);
+        let stored_layers = positive(self.attribute("num_hidden_layers"));
         let layers = match family {
             "longcat_flash" => None,
             "nemotron_h" if std::ptr::eq(self.fields, top.fields) => hybrid_pattern(self.fields)
@@ -726,9 +949,9 @@ impl Decoder {
                 config.flag("new_decoder_architecture"),
                 config.flag("multi_query"),
             ) {
-                (Some(true), _) => positive(&config.fields["num_kv_heads"]),
+                (Some(true), _) => positive(config.attribute("num_kv_heads")),
                 (Some(false), Some(true)) => Some(1),
-                (Some(false), Some(false)) => positive(&config.fields["num_attention_heads"]),
+                (Some(false), Some(false)) => positive(config.attribute("num_attention_heads")),
                 _ => None,
             },
             Self::Llama | Self::Mistral

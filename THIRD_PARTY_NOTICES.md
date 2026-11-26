@@ -883,9 +883,23 @@ The checkpoint projection in `crates/core/src/perfmodel/fpm/nixl/heads.rs` is a 
 
 The ordinary Qwen2, Qwen3, Llama, Mistral, Falcon and NemotronH checkpoint projections in the same Rust module follow the corresponding stock Transformers configuration constructors. The Llama configuration is copyright 2022 EleutherAI and the HuggingFace Inc. team. The Mistral configuration is copyright 2023 Mistral AI and the HuggingFace Inc. team. The Falcon configuration is copyright 2023 the Falcon authors and HuggingFace Inc. team. All rights reserved. These sources use Apache-2.0.
 
-The NemotronH model layer list and its computed layer count follow the stock Transformers configuration. Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved. The ordered native loader fallback uses the public Transformers modeling classes from the published wheels allowed by each tagged vLLM release, from Transformers 5.10.4 through 5.20.2. The table in `crates/core/src/perfmodel/fpm/nixl/transformers_models.txt` includes every exported modeling class whose stock `is_backend_compatible` or `_can_set_attn_implementation` can succeed, including classes whose compatibility is unknown. A class present in any permitted Transformers version retains the corresponding vLLM release bit. The underlying class names are factual package metadata.
+The LLaVA and LLaVA-NeXT configurations instantiate a stock text decoder, defaulting to Llama. Idefics2 defaults to Mistral. The LLaVA configuration is copyright 2023 Microsoft Research & University of Wisconsin-Madison and the HuggingFace Inc. team. The LLaVA-NeXT and Idefics2 configurations are copyright 2024 The HuggingFace Inc. team. All rights reserved. These sources use Apache-2.0.
 
-- https://github.com/huggingface/transformers/blob/v5.10.4/src/transformers/modeling_utils.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/llava/configuration_llava.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/llava_next/configuration_llava_next.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/idefics2/configuration_idefics2.py
+
+The RefinedWeb and RefinedWebModel configuration projects the vLLM RWConfig constructor, attribute aliases and computed head dimension. Copyright 2023 The vLLM team. Copyright 2022 the Big Science Workshop and HuggingFace Inc. team. All rights reserved. The upstream source uses Apache-2.0.
+
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/config.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/transformers_utils/config.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/configs/falcon.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/transformers_utils/configs/falcon.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/transformers_utils/configs/falcon.py
+
+The NemotronH model layer list and its computed layer count follow the stock Transformers configuration. Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved. The ordered native loader fallback uses the public Transformers modeling classes from the published wheels allowed by each tagged vLLM release, from Transformers 5.10.4 through 5.20.2. The table in `crates/core/src/perfmodel/fpm/nixl/transformers_models.txt` includes every exported modeling class whose stock `is_backend_compatible` or `_can_set_attn_implementation` can succeed, including classes whose compatibility is unknown. A possible backend in any permitted Transformers version retains the corresponding vLLM release bit. A zero mask identifies a stock class present and incompatible across all permitted versions. vLLM checks a literal class before it tries a dynamic model mapping. The underlying class names are factual package metadata.
+
+- [Transformers 5.10.4 source distribution](https://files.pythonhosted.org/packages/f7/5d/1df789ca27a436ce09de67c8fee6acd2a528d34c28685991f8203e5418ae/transformers-5.10.4.tar.gz), `src/transformers/modeling_utils.py`
 - https://github.com/huggingface/transformers/blob/v5.20.2/src/transformers/modeling_utils.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/requirements/common.txt
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/requirements/common.txt

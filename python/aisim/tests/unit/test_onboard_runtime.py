@@ -299,7 +299,8 @@ def test_snapshot_acceptance_survives_unrelated_probe_progress_but_detects_raw_t
     assert status["integrity_issues"]
 
 
-def test_draft_verifies_bound_geometry_from_its_staged_checkpoint(tmp_path):
+@pytest.mark.parametrize("legacy_inventory", [False, True])
+def test_draft_verifies_bound_geometry_from_its_staged_checkpoint(tmp_path, legacy_inventory):
     from aisim.support.finalization import _merge_resources
     from aisim.support.runtime import runtime_probe_manifest, verify_runtime_profile
     from collector.fpm_forward.runtime_observations import validate_observations
@@ -315,6 +316,15 @@ def test_draft_verifies_bound_geometry_from_its_staged_checkpoint(tmp_path):
     assert any(row.get("model_heads", {}).get("num_kv_heads") == 4 for row in workers)
     expected = verify_runtime_profile(request)
     cell = validate_observations(index, {"tp2": launch})["tp2"]["resources"]
+
+    if legacy_inventory:
+        manifest = {
+            **manifest,
+            "schema_version": "aisimulate-onboarding-runtime-probe/v1",
+            "source_artifacts": [
+                {key: item[key] for key in ("path", "sha256")} for item in manifest["source_artifacts"]
+            ],
+        }
 
     def finalized():
         return _merge_resources([cell], {"runtime_probe": manifest}, source_references=True)

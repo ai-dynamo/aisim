@@ -44,6 +44,78 @@ pub(super) fn at_release(
     }
 }
 
+/// Only these parser branches can select a different config constructor before loading.
+pub(super) fn substitutes_config(family: &str, release: Option<&str>) -> bool {
+    let mask = match family {
+        "afmoe" | "axk1" | "cosmos3_omni" | "diffusion_gemma" | "glm5_next" | "glm5_next_text"
+        | "glm5_next_vision" | "granite4_vision" | "hy_v3" | "lfm2_moe" | "nemotron"
+        | "olmo_hybrid" | "qwen3_5" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_5_text"
+        | "qwen3_next" | "qwen4_exp" | "qwen4_exp_text" => 1,
+        "colpali"
+        | "cosmos3_edge"
+        | "deepseek_v4"
+        | "medusa"
+        | "mlp_speculator"
+        | "modernvbert"
+        | "muse_glimmer"
+        | "muse_glimmer_assistant"
+        | "muse_glimmer_text"
+        | "muse_glimmer_vision"
+        | "qianfan_ocr" => 3,
+        "alpamayo2_super" | "beam" | "dory" | "flint" | "muse_spark" | "muse_spark_audio"
+        | "muse_spark_dspark" | "muse_spark_text" | "muse_spark_vision" | "musespark1x_text"
+        | "step5" | "step5_vl" | "ultravbert" => 4,
+        "longcat_flash" | "unlimited_ocr" => 6,
+        "RefinedWeb"
+        | "RefinedWebModel"
+        | "bagel"
+        | "bailing_moe_v3_vl"
+        | "chatglm"
+        | "colqwen3"
+        | "deepseek_v32"
+        | "deepseek_v41"
+        | "deepseek_vl_v2"
+        | "dots3_note"
+        | "eagle"
+        | "funaudiochat"
+        | "gemma4_text"
+        | "hy_v4"
+        | "hyperclovax"
+        | "inkling_mm_model"
+        | "inkling_model"
+        | "isaac"
+        | "k3_dspark"
+        | "kimi_k2"
+        | "kimi_k25"
+        | "kimi_k3"
+        | "kimi_linear"
+        | "kimi_vl"
+        | "midashenglm"
+        | "minimax_m3_mtp"
+        | "minimax_m3_vl"
+        | "moondream3"
+        | "moss_transcribe_diarize"
+        | "openvla"
+        | "ops_colqwen3"
+        | "ovis"
+        | "qwen3_asr"
+        | "qwen3_vl_nemotron_embed"
+        | "speculators"
+        | "step3_text"
+        | "step3_vl"
+        | "step3p5"
+        | "ultravox"
+        | "unlimited-ocr" => 7,
+        _ => 0,
+    };
+    match release.and_then(|s| s.split('+').next()) {
+        Some("0.31.0") => mask & 1 != 0,
+        Some("0.32.0") => mask & 2 != 0,
+        Some("0.33.0") => mask & 4 != 0,
+        _ => mask != 0,
+    }
+}
+
 /// With no literal stock class the auto loader can choose Transformers before
 /// native normalization. Once a stock name is present, even a normalized first
 /// alternative takes precedence over a later exact entry.
@@ -51,14 +123,13 @@ pub(super) fn select<'a>(
     names: impl Iterator<Item = Option<&'a str>> + Clone,
     release: Option<&str>,
     require_native: bool,
-    stock_model_lookup: bool,
+    may_load_dynamic: bool,
 ) -> Option<Registration> {
     at_release(release, |minor| {
         if !require_native && !names.clone().flatten().any(|n| lookup(n, minor).is_some()) {
-            // Auto first checks the literal first name in Transformers. If it is absent or
-            // incompatible, and there is no dynamic mapping, vLLM tries every native candidate.
+            // An existing literal model takes precedence over AutoModel, even if incompatible.
             let first = names.clone().next().flatten()?;
-            if !stock_model_lookup || possible_transformers_backend(first, minor) {
+            if possible_transformers_backend(first, minor, may_load_dynamic) {
                 return None;
             }
         }
@@ -71,7 +142,7 @@ pub(super) fn select<'a>(
     })
 }
 
-fn possible_transformers_backend(name: &str, minor: u8) -> bool {
+fn possible_transformers_backend(name: &str, minor: u8, may_load_dynamic: bool) -> bool {
     use std::{collections::HashMap, sync::LazyLock};
     static MODELS: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
         let mut names = HashMap::new();
@@ -89,9 +160,11 @@ fn possible_transformers_backend(name: &str, minor: u8) -> bool {
         }
         names
     });
-    MODELS
-        .get(name)
-        .is_some_and(|mask| mask & (1 << (minor - 31)) != 0)
+    match MODELS.get(name) {
+        Some(0) => false, // Present and incompatible in every supported Transformers release.
+        Some(mask) if mask & (1 << (minor - 31)) != 0 => true,
+        _ => may_load_dynamic,
+    }
 }
 
 /// The native registry tries an exact class first. For generation it can

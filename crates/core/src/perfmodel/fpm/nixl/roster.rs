@@ -107,13 +107,33 @@ pub(super) fn validate_probe(probe: &Value) -> Result<(), AicError> {
     Ok(())
 }
 
-fn rank_capacity(entry: &Value) -> Option<u64> {
+fn rank_capacity(entry: &Value) -> Result<Option<u64>, AicError> {
+    let Some(rows) = entry["rank_capacities"].as_array() else {
+        return Ok(None);
+    };
     let mut minimum = None;
-    for row in entry["rank_capacities"].as_array()? {
-        let value = row["kv_cache_bytes"].as_u64().filter(|&n| n > 0)?;
-        minimum = Some(minimum.map_or(value, |m: u64| m.min(value)));
+    let mut complete = true;
+    for row in rows {
+        let bytes = row["kv_cache_bytes"].as_u64();
+        let allocated = row["allocated_cache_bytes"].as_u64();
+        let page = row["page_size_bytes"].as_u64();
+        for (total, blocks) in [(bytes, "initial_free_blocks"), (allocated, "num_blocks")] {
+            if let (Some(total), Some(blocks), Some(page)) = (total, row[blocks].as_u64(), page)
+                && blocks.checked_mul(page) != Some(total)
+            {
+                return Err(super::conflict("kv_cache_bytes"));
+            }
+        }
+        if bytes.zip(allocated).is_some_and(|(b, a)| b > a) {
+            return Err(super::conflict("kv_cache_bytes"));
+        }
+        if let Some(bytes) = bytes.filter(|&n| n > 0) {
+            minimum = Some(minimum.map_or(bytes, |m: u64| m.min(bytes)));
+        } else {
+            complete = false;
+        }
     }
-    minimum
+    Ok(minimum.filter(|_| complete))
 }
 
 fn first_phase_settings(entry: &Value) -> Option<&Value> {
@@ -156,22 +176,7 @@ fn record_memory_settings(expected: &mut Value, memory: &Value) -> Result<(), Ai
     Ok(())
 }
 
-fn record_memory_fraction(expected: &mut Value, entry: &Value) -> Result<(), AicError> {
-    for settings in [&entry["runtime_settings"], &entry["resolved_config"]] {
-        record_memory_field(
-            expected,
-            &settings["cache_config"],
-            "gpu_memory_utilization",
-        )?;
-    }
-    Ok(())
-}
-
-fn record_limits(expected: &mut Value, resources: &Value, entry: &Value) -> Result<(), AicError> {
-    record_memory_field(expected, &resources["runtime_memory"], "max_model_len")?;
-    for key in ["max_num_tokens", "max_batch_size"] {
-        record_memory_field(expected, resources, key)?;
-    }
+fn record_collection_settings(expected: &mut Value, entry: &Value) -> Result<(), AicError> {
     let limits = [
         ("max_num_tokens", "max_num_batched_tokens"),
         ("max_batch_size", "max_num_seqs"),
@@ -187,6 +192,11 @@ fn record_limits(expected: &mut Value, resources: &Value, entry: &Value) -> Resu
         .chain(artifacts.clone().map(|r| &r["resolved_config"]))
     {
         record_memory_field(expected, &settings["model_config"], "max_model_len")?;
+        record_memory_field(
+            expected,
+            &settings["cache_config"],
+            "gpu_memory_utilization",
+        )?;
         for (key, serving) in limits {
             record_field(expected, key, &settings["scheduler_config"][serving])?;
         }
@@ -194,9 +204,18 @@ fn record_limits(expected: &mut Value, resources: &Value, entry: &Value) -> Resu
     for launch in std::iter::once(&entry["launch"]).chain(artifacts.map(|r| &r["launch"])) {
         let collection = &launch["collection"];
         record_memory_field(expected, collection, "max_model_len")?;
+        record_memory_field(expected, collection, "gpu_memory_utilization")?;
         for (key, serving) in limits {
             record_field(expected, key, &collection[serving])?;
         }
+    }
+    Ok(())
+}
+
+fn record_resource_limits(expected: &mut Value, resources: &Value) -> Result<(), AicError> {
+    record_memory_field(expected, &resources["runtime_memory"], "max_model_len")?;
+    for key in ["max_num_tokens", "max_batch_size"] {
+        record_memory_field(expected, resources, key)?;
     }
     Ok(())
 }
@@ -208,7 +227,7 @@ pub(super) fn record_cell_memory(
     expected: &mut Value,
 ) -> Result<Option<u64>, AicError> {
     let memory = &cell["runtime_memory"];
-    let observed = rank_capacity(entry);
+    let observed = rank_capacity(entry)?;
     let saved = memory["kv_cache_bytes"].as_u64();
     let formal = (entry["source"] == "runtime_observations")
         .then(|| compatibility["observed_capacity_bytes"].as_u64())
@@ -225,8 +244,8 @@ pub(super) fn record_cell_memory(
         return Err(super::conflict("kv_cache_bytes"));
     }
     record_memory_settings(expected, memory)?;
-    record_limits(expected, cell, entry)?;
-    record_memory_fraction(expected, entry)?;
+    record_resource_limits(expected, cell)?;
+    record_collection_settings(expected, entry)?;
     if let Some(phase) = first_phase_settings(entry) {
         record_memory_settings(expected, phase)?;
     }
@@ -244,7 +263,8 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
         let resources = &evidence["observed_resources"];
         let memory = &resources["runtime_memory"];
         record_memory_settings(&mut expected, memory)?;
-        record_limits(&mut expected, resources, &evidence["nixl_observation"])?;
+        record_resource_limits(&mut expected, resources)?;
+        record_collection_settings(&mut expected, &evidence["nixl_observation"])?;
         let recorded = memory["kv_cache_bytes"].as_u64();
         if let Some(change) = evidence["user_overrides"].get("runtime_memory.kv_cache_bytes") {
             if change["observed"].as_u64() != recorded
@@ -261,13 +281,29 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
         } else {
             recorded
         }
+    } else if evidence["source"] == "bound_collection_phases"
+        && let Some(phases) = evidence["phases"].as_object()
+    {
+        // The writer retains each phase's own rank capacities and chooses their minimum.
+        let mut capacities = Vec::new();
+        for entry in phases.values() {
+            record_collection_settings(&mut expected, entry)?;
+            capacities.extend(rank_capacity(entry)?);
+        }
+        if let Some(phase) = phases.get("prefill").or_else(|| phases.get("decode"))
+            && let Some(settings) = first_phase_settings(phase)
+        {
+            record_memory_settings(&mut expected, settings)?;
+        }
+        (capacities.len() == phases.len())
+            .then(|| capacities.into_iter().min())
+            .flatten()
     } else if identified_source(evidence) {
-        record_limits(&mut expected, &Value::Null, evidence)?;
-        record_memory_fraction(&mut expected, evidence)?;
+        record_collection_settings(&mut expected, evidence)?;
         if let Some(phase) = first_phase_settings(evidence) {
             record_memory_settings(&mut expected, phase)?;
         }
-        rank_capacity(evidence)
+        rank_capacity(evidence)?
     } else {
         None
     };
@@ -996,6 +1032,43 @@ mod tests {
             "gpu_memory_utilization",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn bound_collection_retains_each_phases_limits_and_minimum_capacity() {
+        let phase = |bytes| {
+            json!({"source":"runtime_observations",
+            "runtime_settings":{"scheduler_config":{"max_num_batched_tokens":1024}},
+            "artifacts":[{"evidence":{"kind":"scheduler","resolved_config":{
+                "cache_config":{"gpu_memory_utilization":0.9}}}}],
+            "rank_capacities":[{"kv_cache_bytes":bytes}]})
+        };
+        let mut entry = json!({"source":"bound_collection_phases",
+            "phases":{"prefill":phase(4096),"decode":phase(2048)}});
+        assert_eq!(
+            selected_memory(&entry).unwrap(),
+            json!({
+            "max_num_tokens":1024,"gpu_memory_utilization":0.9,"kv_cache_bytes":2048})
+        );
+        entry["phases"]["decode"]["launch"] = json!({"collection":{"gpu_memory_utilization":0.8}});
+        assert!(selected_memory(&entry).is_err());
+    }
+
+    #[test]
+    fn measured_rank_bytes_agree_with_retained_block_accounting() {
+        let mut rows = json!({"rank_capacities":[{"initial_free_blocks":98,"num_blocks":100,
+            "page_size_bytes":32768,"kv_cache_bytes":3211264,"allocated_cache_bytes":3276800}]});
+        assert_eq!(rank_capacity(&rows).unwrap(), Some(3211264));
+        for bytes in [0, 6422528] {
+            rows["rank_capacities"][0]["kv_cache_bytes"] = json!(bytes);
+            assert!(rank_capacity(&rows).is_err());
+        }
+        rows["rank_capacities"][0]["page_size_bytes"] = Value::Null;
+        assert!(rank_capacity(&rows).is_err());
+        assert_eq!(
+            rank_capacity(&json!({"rank_capacities":[{}]})).unwrap(),
+            None
+        );
     }
 
     #[test]
