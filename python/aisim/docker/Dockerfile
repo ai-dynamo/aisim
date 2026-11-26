@@ -9,7 +9,7 @@ FROM nvcr.io/nvidia/base/ubuntu:jammy-20250619 AS base
 WORKDIR /workspace
 
 ENV VIRTUAL_ENV=/opt/aisim/venv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13 /uv /uvx /bin/
 RUN mkdir /opt/aisim && \
     uv venv --python 3.13 ${VIRTUAL_ENV} && \
     chmod a+rx /root && \
@@ -30,7 +30,7 @@ ENV MPLCONFIGDIR=/tmp/matplotlib
 # x86_64 default preserves existing local and build-test invocations.
 FROM ${WHEEL_BUILD_BASE} AS build
 WORKDIR /workspace
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13 /uv /uvx /bin/
 
 ENV RUSTUP_HOME=/opt/rust/rustup \
     CARGO_HOME=/opt/rust/cargo \

@@ -803,7 +803,7 @@ jobs:
             echo "::error::expected exactly one application test wheel, found ${#wheels[@]}"
             exit 1
           fi
-          python -m pip install uv
+          python -m pip install uv==0.13.10
           python -m uv pip install --system "${wheels[0]}[dev,learned]"
           echo "AISIM_TEST_WHEEL=${GITHUB_WORKSPACE}/${wheels[0]}" >> "${GITHUB_ENV}"
       - uses: ./.github/actions/prefetch-op-latency-data
