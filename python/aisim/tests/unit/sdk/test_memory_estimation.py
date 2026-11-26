@@ -2069,13 +2069,15 @@ def test_selected_qwen_and_gemma_physical_defaults(tmp_path):
     with pytest.raises(ValueError, match="resident attention layers"):
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=2)
 
-    gemma = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")["text_config"]
+    checkpoint = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    gemma = checkpoint["text_config"]
     for flag, expected in ((True, 225_280), (False, 286_720), (None, 286_720)):
         gemma["attention_k_eq_v"] = flag
         if flag is None:
             del gemma["attention_k_eq_v"]
-        model = _write_config(tmp_path, {"text_config": gemma})
-        assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == expected
+        for document in (checkpoint, dict(gemma, architectures=["Gemma4ForCausalLM"]), {"text_config": gemma}):
+            model = _write_config(tmp_path, document)
+            assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == expected
 
 
 def test_selected_gemma4_uses_its_effective_window_for_single_request_retention():
@@ -2134,11 +2136,26 @@ def test_sglang_expert_tiles_use_checkpoint_scope_and_module_exclusions(tmp_path
         memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
     quant["modules_to_not_convert"] = [f"model.layers.{i}.mlp.experts" for i in range(raw["num_hidden_layers"])]
     _write_config(tmp_path, {"text_config": raw, "compression_config": quant})
-    assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts) > 0
-    quant["modules_to_not_convert"].pop()
-    _write_config(tmp_path, {"text_config": raw, "compression_config": quant})
-    with pytest.raises(ValueError, match="weight_block_size=128"):
-        memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+    explicit = memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+    assert explicit > 0
+    partial = quant["modules_to_not_convert"][:-1]
+
+    for selectors, version, unquantized in (
+        (partial, "0.5.20", False),
+        (["mlp.experts"], "0.5.20", True),
+        (["mlp.expert"], "0.5.10rc0", True),
+        (["mlp.expert"], "0.5.10", True),
+        (["mlp.expert"], "0.5.11", False),
+        (["mlp.experts."], "0.5.12", False),
+        (["mlp.experts."], "0.5.13", True),
+    ):
+        quant["modules_to_not_convert"] = selectors
+        _write_config(tmp_path, {"text_config": raw, "compression_config": quant})
+        if unquantized:
+            assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", version, **opts) == explicit
+        else:
+            with pytest.raises(ValueError, match="weight_block_size=128"):
+                memory.estimate_num_gpu_blocks(model, "missing", "sglang", version, **opts)
 
 
 def test_sparse_index_transfer_uses_the_platform_and_resident_layers(tmp_path):
@@ -2165,6 +2182,16 @@ def test_sparse_index_transfer_uses_the_platform_and_resident_layers(tmp_path):
         estimate_kv_bytes_per_token(
             model, **common, backend_version="0.33.0", system="rtx_pro_6000_server", kvcache_quant_mode="bfloat16"
         )
+    assert (
+        estimate_kv_bytes_per_token(
+            model, **common, backend_version="0.33.0", system="b60", kvcache_quant_mode="bfloat16"
+        )
+        == 78_324
+    )
+    hidden = dict(common, system="rtx_pro_6000_server", systems_paths=[str(tmp_path)], kvcache_quant_mode="bfloat16")
+    with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
+        estimate_kv_bytes_per_token(model, **hidden, backend_version="0.33.0")
+    assert estimate_kv_bytes_per_token(model, **hidden, backend_version="0.22.0") == 78_324
     raw["index_head_dim"] = 64
     _write_config(tmp_path, {"text_config": raw})
     with pytest.raises(ValueError, match="index_head_dim=128"):
@@ -2285,6 +2312,17 @@ def test_sparse_auto_transfer_with_missing_gpu_uses_only_hardware_independent_de
         deployment = prediction_to_replay_spec(config).backend_deployment
         assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == 100_152
         assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == 100_152
+
+    deepseek = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3.2")
+    _write_config(tmp_path, {"text_config": deepseek})
+    worker["timing"] = {"type": "default"}
+    engine.update(hardware="rtx_pro_6000_server", kvcache_quant_mode="bfloat16")
+    with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine}))
+    engine["backend_version"] = "0.23.0"
+    deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
+    assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == 78_324
+    assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == 78_324
 
     raw["learnable_sink"] = True
     _write_config(tmp_path, {"text_config": raw})

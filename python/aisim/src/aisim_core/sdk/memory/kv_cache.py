@@ -107,6 +107,7 @@ from aisim_core.sdk.utils import (
     _load_pre_downloaded_hf_config,
     _load_pre_downloaded_hf_quant_config,
     _parse_hf_config_json,
+    gemma4_global_kv_head_field,
     validate_fp8_moe_shard,
 )
 
@@ -181,6 +182,27 @@ def _sglang_checkpoint_quant(document: dict, raw: dict) -> dict | None:
                 raise ValueError("SGLang checkpoint quantization metadata must be an object")
             return quant
     return None
+
+
+def _sglang_skips_fused_experts(ignored: list[str], layers: int, release: Version) -> bool:
+    """Check every Qwen fused expert path using the selected SGLang FP8 loader's matching rules."""
+    bare = {name.removeprefix("model.") for name in ignored}
+    names = bare | {"model." + name for name in bare}
+    dotted = release >= Version("0.5.11")
+    strip_trailing = release >= Version("0.5.13")
+
+    def skipped(prefix: str) -> bool:
+        for name in names:
+            # A checkpoint can also list a parameter below its fused expert module.
+            if prefix in name:
+                return True
+            if strip_trailing:
+                name = name.rstrip(".")
+            if name in prefix and (not dotted or f".{name}." in f".{prefix}."):
+                return True
+        return False
+
+    return all(skipped(f"model.layers.{i}.mlp.experts") for i in range(layers))
 
 
 def _automatic_decoder_kv_mode(
@@ -856,7 +878,7 @@ class NaiveKVCacheEstimator:
         self._sparse_index_layers: int | None = None
         self._sparse_cache_needs_target = False
         self._vllm_release: Version | None = None
-        self._vllm_bf16_uses_sparse_auto = False
+        self._vllm_sparse_auto_precision: tuple[float, bool] | None = None
 
     @classmethod
     def from_model_path(
@@ -1048,8 +1070,6 @@ class NaiveKVCacheEstimator:
                         raw_decoder["sliding_window"] = (
                             layout_integer(raw_decoder["sliding_window"], "sliding_window") // 2 + 1
                         )
-                    if not raw_decoder.get("attention_k_eq_v", False):
-                        raw_decoder.pop("num_global_key_value_heads", None)
                 if not raw_decoder.get("architectures") and selected_type in (
                     "deepseek_v32",
                     "glm_moe_dsa",
@@ -1157,11 +1177,6 @@ class NaiveKVCacheEstimator:
                     mode is None and unknown_gpu and (release is None or release >= Version("0.24.0rc1"))
                 )
                 sm120 = sm_version is not None and 120 <= sm_version < 130
-                self._vllm_bf16_uses_sparse_auto = (
-                    self.architecture == "DeepseekV32ForCausalLM"
-                    and (release is None or release >= Version("0.24.0rc1"))
-                    and sm120
-                )
                 if sm_version is not None and (
                     (sm120 and (release is None or release >= Version("0.24.0rc1")))
                     or (
@@ -1174,6 +1189,8 @@ class NaiveKVCacheEstimator:
             else:
                 mode = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
         self.dtype_bytes = mode.value.memory if mode is not None else self.weight_dtype_bytes
+        if backend == "vllm" and self.architecture == "DeepseekV32ForCausalLM":
+            self._vllm_sparse_auto_precision = self.dtype_bytes, self._sparse_cache_needs_target
 
     def _resolve_nested_cache(self, decoder: dict, wrapper: str | None, backend: str) -> None:
         """Use the selected decoder's storage declarations before admitting it to the generic scalar estimator."""
@@ -1486,7 +1503,7 @@ class NaiveKVCacheEstimator:
         swa_heads = swa_dim = None
         if hf_config.get("model_type") == "gemma4_text":
             swa_heads, swa_dim = num_kv_heads, head_dim
-            num_kv_heads = dimension(hf_config, "num_global_key_value_heads") or num_kv_heads
+            num_kv_heads = dimension(hf_config, gemma4_global_kv_head_field(hf_config)) or num_kv_heads
             head_dim = dimension(hf_config, "global_head_dim") or head_dim
         return {
             "layers": layers,
@@ -1537,7 +1554,7 @@ class NaiveKVCacheEstimator:
         if self._nested_index_head_dim is not None:
             if self._sparse_cache_needs_target:
                 raise ValueError(
-                    "automatic sparse MLA cache precision requires the target GPU or explicit KV precision"
+                    "automatic sparse MLA cache precision requires the target GPU or a runtime cache profile"
                 )
             if self.dtype_bytes != KVCacheQuantMode.bfloat16.value.memory:
                 # FlashMLA stores per-128 latent scales and BF16 RoPE. Other sparse backends use a different layout.
@@ -1600,9 +1617,10 @@ class NaiveKVCacheEstimator:
 
     def set_kvcache_quant_mode(self, mode: str) -> None:
         """Apply an explicit KV precision independently of the checkpoint's weight width."""
-        if mode == "bfloat16" and self._vllm_bf16_uses_sparse_auto:
-            # DeepSeek V3.2 rewrites BF16 to auto before the SM120 sparse attention backend picks its layout.
-            raise ValueError("DeepSeek V3.2 on SM120 requires runtime latent and indexer cache formats")
+        if mode == "bfloat16" and self._vllm_sparse_auto_precision is not None:
+            # vLLM rewrites DeepSeek V3.2 BF16 to auto before the backend selects its physical cache.
+            self.dtype_bytes, self._sparse_cache_needs_target = self._vllm_sparse_auto_precision
+            return
         if mode == "nvfp4" and self._vllm_release is not None and self._vllm_release < Version("0.20.0rc1"):
             raise ValueError("vLLM NVFP4 KV cache requires backend version 0.20.0 or later")
         if mode == "nvfp4" and (self.geometry.get("kv_lora_rank") or self.architecture == "DeepseekV41ForCausalLM"):
@@ -2338,14 +2356,13 @@ def estimate_kv_cache(
                 sglang_fp8
                 and naive.architecture == "Qwen3MoeForCausalLM"
                 and release is not None
-                and release >= Version("0.5.10")
+                and release >= Version("0.5.10rc0")
             ):
                 ignored = quant.get("ignored_layers", quant.get("modules_to_not_convert", []))
                 if not isinstance(ignored, list) or not all(isinstance(name, str) and name for name in ignored):
                     raise ValueError("SGLang FP8 exclusions must be a list of module names") from exc
                 # SGLang selects an unquantized FusedMoE when its module was explicitly excluded.
-                excluded = {name.removeprefix("model.") for name in ignored}
-                if all(f"layers.{i}.mlp.experts" in excluded for i in range(naive.geometry["layers"])):
+                if _sglang_skips_fused_experts(ignored, naive.geometry["layers"], release):
                     check_tiles = False
             if check_tiles:
                 validate_fp8_moe_shard(

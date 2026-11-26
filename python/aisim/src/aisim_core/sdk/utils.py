@@ -895,6 +895,13 @@ def _parse_llama4_vision_config(
     )
 
 
+def gemma4_global_kv_head_field(config: dict) -> str:
+    """Gemma4TextConfig.per_layer_config uses the global KV-head override only for tied K/V."""
+    if config.get("attention_k_eq_v") and config.get("num_global_key_value_heads") is not None:
+        return "num_global_key_value_heads"
+    return "num_key_value_heads"
+
+
 def _parse_hf_config_json(config: dict) -> dict:
     """
     Convert a HuggingFace config.json dictionary into model configuration parameters.
@@ -1317,9 +1324,7 @@ def _parse_hf_config_json(config: dict) -> dict:
         # head fields as null; fall back to the model-wide values in that case.
         swa_num_kv = config["num_key_value_heads"]
         swa_hd = config["head_dim"]
-        global_num_kv = config.get("num_global_key_value_heads")
-        if global_num_kv is None:
-            global_num_kv = swa_num_kv
+        global_num_kv = config[gemma4_global_kv_head_field(config)]
         global_hd = config.get("global_head_dim")
         if global_hd is None:
             global_hd = swa_hd

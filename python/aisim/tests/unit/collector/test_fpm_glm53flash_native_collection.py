@@ -854,6 +854,12 @@ def test_glm_publication_matches_each_dispatch_to_its_scheduled_tokens(tmp_path,
         ("observed-dispatch", "contradicts its dispatch"),
         ("discarded-rank", "rank, point or sample"),
         ("discarded-forward", "repeated or unordered"),
+        ("discarded-completed-late", "completion precedes"),
+        ("discarded-without-index", "lacks its recorded identity"),
+        ("discarded-without-timing", "lacks its recorded identity"),
+        ("discarded-unknown-start", None),
+        ("discarded-without-start", "lacks its recorded identity"),
+        ("overlapping-discarded", None),
         ("false-rejection", "do not support the rejection reason"),
         ("missing-reason", "rejection reason"),
         ("extra-prefill-dispatch", "invalid|missing dispatch"),
@@ -907,6 +913,20 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
             rejected["fpms"][0]["benchmark_sample"]["forward_index"] = warmup["fpms"][0]["benchmark_sample"][
                 "forward_index"
             ]
+        elif fault in {"discarded-completed-late", "overlapping-discarded"}:
+            fpm = rejected["fpms"][0]
+            timing = fpm["benchmark_sample"]["timing"]
+            # The discarded and accepted schedules may overlap, while completion still follows forward IDs.
+            end = timing["end_monotonic"] + (1 if fault == "discarded-completed-late" else -fpm["wall_time"] / 2)
+            timing.update(start_monotonic=end - fpm["wall_time"], end_monotonic=end)
+        elif fault in {"discarded-without-index", "discarded-without-timing"}:
+            del rejected["fpms"][0]["benchmark_sample"]["forward_index" if fault.endswith("index") else "timing"]
+        elif fault in {"discarded-unknown-start", "discarded-without-start"}:
+            timing = rejected["fpms"][0]["benchmark_sample"]["timing"]
+            if fault == "discarded-unknown-start":
+                timing["start_monotonic"] = None
+            else:
+                del timing["start_monotonic"]
         elif fault == "missing-reason":
             del rejected["rejection_reason"]
         else:
@@ -960,6 +980,33 @@ def test_glm_published_decode_requires_each_seeded_prompt_and_lockstep(tmp_path,
     _check_altered_repetition(tmp_path, cell, payload, artifact, mutate, error)
 
 
+@pytest.mark.parametrize(
+    ("custom_split", "measured_variance", "error"),
+    [
+        (True, 1.0, None),
+        (True, 0.0, "var_decode_kv_tokens"),
+        (False, 1.0, "default context split"),
+    ],
+)
+def test_glm_variable_decode_contexts_match_the_observed_variance(tmp_path, custom_split, measured_variance, error):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[DECODE_POINTS[1]])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    if custom_split:
+        payload["input_provenance"]["decode_contexts_sha256"] = hashlib.sha256(b"[[2,8192,[4095,4097]]]").hexdigest()
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+
+    def vary(record):
+        record["rows"] = {"context": [4095, 4097], "prompt": [4094, 4096], "measured_decode_step": 2}
+        for stage in record["repetitions"]:
+            stage["fpms"][0]["scheduled_requests"]["var_decode_kv_tokens"] = 1.0
+            stage["fpms"][-1]["scheduled_requests"]["var_decode_kv_tokens"] = measured_variance
+        for fpm in payload["results"][0]["fpms"][0]["benchmark_measurement"]["raw_fpms"]:
+            fpm["scheduled_requests"]["var_decode_kv_tokens"] = measured_variance
+
+    _check_altered_repetition(tmp_path, cell, payload, artifact, vary, error)
+
+
 @pytest.mark.parametrize("fault", [None, "count", "mode", "order", "unavailable-values"])
 def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatch(tmp_path, fault):
     cell = glm_cell("decode")
@@ -980,6 +1027,8 @@ def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatc
         rejected["fpms"].append(copy.deepcopy(second))
         for index, fpm in enumerate(rejected["fpms"]):
             fpm["benchmark_sample"].update(forward_index=index, sample_index=index)
+            end = record["repetitions"][0]["fpms"][0]["benchmark_sample"]["timing"]["start_monotonic"] - 3 + index
+            fpm["benchmark_sample"]["timing"].update(start_monotonic=end - fpm["wall_time"], end_monotonic=end)
             fpm["scheduled_requests"]["num_decode_requests"] = 1
 
         def receipt(tokens, mode):
@@ -1036,6 +1085,9 @@ def test_glm_final_attempt_respects_the_producer_retry_limit(tmp_path, monkeypat
                 attempt["attempt"] = index
                 for step, fpm in enumerate(attempt["fpms"]):
                     fpm["benchmark_sample"]["forward_index"] = 2 * index + step
+                    timing = fpm["benchmark_sample"]["timing"]
+                    end = timing["end_monotonic"] - (rejected_count - index)
+                    timing.update(start_monotonic=end - fpm["wall_time"], end_monotonic=end)
                 record["rejected_repetitions"].append(attempt)
         else:
             record.pop("rejected_repetitions", None)
