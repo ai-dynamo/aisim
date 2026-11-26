@@ -107,7 +107,8 @@ from aisim_core.sdk.utils import (
     _load_pre_downloaded_hf_config,
     _load_pre_downloaded_hf_quant_config,
     _parse_hf_config_json,
-    gemma4_global_kv_head_field,
+    gemma4_cache_requires_release,
+    gemma4_cache_shapes,
     validate_fp8_moe_shard,
 )
 
@@ -142,6 +143,20 @@ _DECODER_HEAD_DEFAULTS = {
     "qwen3_moe": (None, 4),
     "qwen3_vl_text": (128, 32),
     "qwen3_vl_moe_text": (None, 16),
+}
+
+
+# Transformers constructor fields and aliases used by the selected expert implementations.
+# (count, alias applied after construction, default count, routed intermediate width, default width)
+_DECODER_EXPERT_DEFAULTS = {
+    "glm4_moe": ("n_routed_experts", "num_local_experts", 128, "moe_intermediate_size", 1408),
+    "gpt_oss": ("num_local_experts", "num_experts", 128, "intermediate_size", 2880),
+    "llama4_text": ("num_local_experts", None, 16, "intermediate_size", 8192),
+    "minimax_m2": ("num_local_experts", "num_experts", 256, "intermediate_size", 1536),
+    "mixtral": ("num_local_experts", "num_experts", 8, "intermediate_size", 14336),
+    "qwen2_moe": ("num_experts", None, 60, "moe_intermediate_size", 1408),
+    "qwen3_moe": ("num_experts", "num_local_experts", 128, "moe_intermediate_size", 768),
+    "qwen3_vl_moe_text": ("num_experts", "num_local_experts", 60, "moe_intermediate_size", 1408),
 }
 
 
@@ -638,7 +653,7 @@ class KVCacheEstimator:
         )
         resolve_sglang_mla_compute(model_config, model_path, backend, database.version, database.system_spec)
         resolve_trtllm_mla_compute(model_config, model_path, backend, database.system_spec)
-        model = get_model(model_path, model_config, backend)
+        model = get_model(model_path, model_config, backend, database.version)
         backend_obj = get_backend(backend)
 
         # num_tokens = max_num_tokens -> activations track BuildConfig.max_num_tokens
@@ -894,6 +909,7 @@ class NaiveKVCacheEstimator:
         self._sparse_cache_needs_target = False
         self._cache_backend: str | None = None
         self._cache_release: Version | None = None
+        self._vllm_bf16_kv_mismatch = False
         self._vllm_sparse_auto_precision: tuple[float, bool] | None = None
         self._vllm_packed_sparse = False
 
@@ -926,7 +942,18 @@ class NaiveKVCacheEstimator:
                 f"insufficient model metadata: no HF config for {model_path!r} (not a local "
                 "directory / not pre-cached, and HF download is disabled)"
             )
-        if decoder_config_key(hf_config) is not None:
+        key = decoder_config_key(hf_config)
+        decoder = hf_config.get(key, hf_config)
+        names = hf_config.get("architectures")
+        architecture = names[0] if isinstance(names, list) and names and isinstance(names[0], str) else None
+        if isinstance(decoder, dict) and (
+            (key is not None and architecture not in ARCHITECTURE_TO_MODEL_FAMILY)
+            or (
+                backend == "sglang"
+                and (architecture == "Gemma4ForConditionalGeneration" or decoder.get("model_type") == "gemma4_text")
+                and gemma4_cache_requires_release(decoder)
+            )
+        ):
             backend_version = _config_only_backend_version(system, backend, backend_version, systems_paths)
         estimator = cls.from_hf_config(
             hf_config,
@@ -1045,26 +1072,35 @@ class NaiveKVCacheEstimator:
                     )
                 head_dim, kv_heads = _DECODER_HEAD_DEFAULTS.get(selected_type, (None, None))
                 if selected_type in _DECODER_HEAD_DEFAULTS:
-                    # The selected Transformers classes read their named attention dimensions.
+                    # These projection classes read the canonical field, while SGLang sizes its pool separately.
+                    canonical = raw_decoder.get("num_key_value_heads", kv_heads) or raw_decoder.get(
+                        "num_attention_heads"
+                    )
+                    pool_heads = next(
+                        (raw_decoder[k] for k in ("n_head_kv", "num_kv_heads") if raw_decoder.get(k) is not None), None
+                    )
+                    if backend == "sglang" and (pool_heads is not None or raw_decoder.get("multi_query")):
+                        if selected_type == "gemma4_text":
+                            canonical = gemma4_cache_shapes(raw_decoder, backend, backend_version)[1][0]
+                        if (1 if raw_decoder.get("multi_query") else pool_heads) != canonical:
+                            raise ValueError(
+                                "SGLang pool KV heads disagree with the selected decoder's KV projections"
+                            ) from error
                     for key in ("attention_head_dim", "num_kv_heads", "n_head_kv", "n_kv_heads"):
                         raw_decoder.pop(key, None)
                 if head_dim is not None:
                     raw_decoder.setdefault("head_dim", head_dim)
                 if kv_heads is not None:
                     raw_decoder.setdefault("num_key_value_heads", kv_heads)
-                if selected_type in ("mixtral", "qwen3_moe"):
-                    # Transformers applies the alternate spelling after the constructor field.
-                    field, alias, default = (
-                        ("num_local_experts", "num_experts", 8)
-                        if selected_type == "mixtral"
-                        else ("num_experts", "num_local_experts", 128)
-                    )
-                    count = raw_decoder.pop(alias, raw_decoder.get(field, default))
+                if selected_type in _DECODER_EXPERT_DEFAULTS:
+                    field, alias, default, width, default_width = _DECODER_EXPERT_DEFAULTS[selected_type]
+                    count = raw_decoder.get(alias, raw_decoder.get(field, default))
+                    for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"):
+                        raw_decoder.pop(name, None)
                     raw_decoder[field] = layout_integer(count, field)
-                    for unrelated in ("n_routed_experts", "moe_num_experts"):
-                        raw_decoder.pop(unrelated, None)
-                if selected_type == "qwen3_moe":
-                    raw_decoder.setdefault("moe_intermediate_size", 768)
+                    raw_decoder["moe_intermediate_size"] = layout_integer(
+                        raw_decoder.setdefault(width, default_width), width
+                    )
                 if selected_type == "qwen3" and raw_decoder.get("use_sliding_window"):
                     raw_decoder.setdefault("sliding_window", 4096)
                     if raw_decoder["sliding_window"] is None:
@@ -1125,7 +1161,7 @@ class NaiveKVCacheEstimator:
                 decoder.architecture = decoder.architecture or architecture
                 return decoder
         estimator = cls(
-            cls._geometry(hf_config, parsed, backend),
+            cls._geometry(hf_config, parsed, backend, backend_version),
             dtype_bytes=cls._dtype_bytes(hf_config),
             tp_size=tp_size,
             pp_size=pp_size,
@@ -1161,6 +1197,18 @@ class NaiveKVCacheEstimator:
         release = parse_support_matrix_version(backend_version)
         self._cache_backend = backend
         self._cache_release = release
+        # vLLM resolves model dtype from the parent config before consulting its text decoder.
+        parent = document or {}
+        dtype = parent.get("dtype") or parent.get("torch_dtype") or raw.get("dtype") or raw.get("torch_dtype")
+        # These model types cannot run FP16 in vLLM and are recast by its automatic dtype selection.
+        model_type = parent.get("model_type") or raw.get("model_type")
+        self._vllm_bf16_kv_mismatch = (
+            backend == "vllm"
+            and release is not None
+            and release >= Version("0.32.1rc0")
+            and dtype in ("float16", "fp16", "half")
+            and model_type not in ("gemma2", "gemma3", "gemma3_text", "glm4")
+        )
         mode = _automatic_decoder_kv_mode(document or {}, raw, backend, backend_version)
         if self._nested_index_head_dim is not None:
             sm_version = (system_spec or {}).get("gpu", {}).get("sm_version")
@@ -1168,7 +1216,28 @@ class NaiveKVCacheEstimator:
             layers = self.geometry["layers"]
             stage_layers = layers // self.pp_size
             self._sparse_index_layers = stage_layers
-            if raw.get("index_topk_freq", 1) != 1 or raw.get("index_topk_pattern"):
+            pattern = raw.get("index_topk_pattern")
+            if backend == "sglang" and release is not None and release >= Version("0.5.18"):
+                indexers = raw.get("indexer_types") if release >= Version("0.5.20") else None
+                if indexers is not None:
+                    if not isinstance(indexers, list):
+                        raise ValueError("SGLang indexer_types must be a layer list")
+                    pattern = ["S" if kind == "shared" else "F" for kind in indexers]
+                elif raw.get("cli_factor") is not None:
+                    factor = layout_integer(raw["cli_factor"], "cli_factor")
+                    if factor > 1:
+                        pattern = ["S" if i % factor else "F" for i in range(layers)]
+            if pattern is not None:
+                raw = {**raw, "index_topk_pattern": pattern, "index_topk_freq": 1}
+            if (
+                raw.get("index_topk_freq", 1) != 1
+                or raw.get("index_topk_pattern")
+                or (
+                    backend == "sglang"
+                    and release is None
+                    and (raw.get("indexer_types") is not None or raw.get("cli_factor"))
+                )
+            ):
                 # Older releases computed shared indices but still allocated an index cache at every layer.
                 shares_storage = (backend == "vllm" and release is not None and release >= Version("0.24.0rc1")) or (
                     backend == "sglang" and release is not None and release >= Version("0.5.18")
@@ -1281,7 +1350,6 @@ class NaiveKVCacheEstimator:
             "num_kv_shared_layers",
             "kv_source_layer_ids",
             "index_source_layer_ids",
-            "per_layer_config",
         )
         step = ARCHITECTURE_TO_MODEL_FAMILY.get(self.architecture) == "STEP3P7"
         # vLLM uses Step's decoder-wide KV heads on every attention layer.
@@ -1290,6 +1358,7 @@ class NaiveKVCacheEstimator:
         )
         if (
             any(decoder.get(key) for key in per_layer)
+            or (decoder.get("per_layer_config") and decoder.get("model_type") != "gemma4_text")
             or (separate_heads and not (self.geometry.get("swa_kv_heads") or self.geometry.get("swa_head_dim")))
             or (decoder.get("attention_other_setting") and not step)
         ):
@@ -1448,7 +1517,9 @@ class NaiveKVCacheEstimator:
         return window, num_swa, num_global
 
     @classmethod
-    def _geometry(cls, hf_config: dict, parsed: dict | None, backend: str = "vllm") -> dict:
+    def _geometry(
+        cls, hf_config: dict, parsed: dict | None, backend: str = "vllm", backend_version: str | None = None
+    ) -> dict:
         """Normalized attention/FFN scalars the byte formulas consume.
 
         From :func:`~aisim_core.sdk.utils._parse_hf_config_json` output when the
@@ -1473,9 +1544,7 @@ class NaiveKVCacheEstimator:
             swa_heads = swa_dim = swa_queries = None
             if isinstance(extra, Gemma4MixConfig):
                 decoder = hf_config.get("text_config", hf_config)
-                heads = decoder.get(gemma4_global_kv_head_field(decoder, backend), extra.global_num_kv_heads)
-                dim = extra.global_head_dim
-                swa_heads, swa_dim = extra.swa_num_kv_heads, extra.swa_head_dim
+                (swa_heads, swa_dim), (heads, dim) = gemma4_cache_shapes(decoder, backend, backend_version)
             elif ARCHITECTURE_TO_MODEL_FAMILY.get(parsed.get("architecture")) == "STEP3P7":
                 key = MULTIMODAL_TEXT_CONFIG_KEY.get(parsed["architecture"])
                 decoder = hf_config.get(key, hf_config)
@@ -1549,9 +1618,7 @@ class NaiveKVCacheEstimator:
             num_kv_heads = 1
         swa_heads = swa_dim = None
         if hf_config.get("model_type") == "gemma4_text":
-            swa_heads, swa_dim = num_kv_heads, head_dim
-            num_kv_heads = dimension(hf_config, gemma4_global_kv_head_field(hf_config, backend)) or num_kv_heads
-            head_dim = dimension(hf_config, "global_head_dim") or head_dim
+            (swa_heads, swa_dim), (num_kv_heads, head_dim) = gemma4_cache_shapes(hf_config, backend, backend_version)
         return {
             "layers": layers,
             **({"recurrent_cache": True} if "linear_attention" in (hf_config.get("layer_types") or ()) else {}),
@@ -1668,6 +1735,8 @@ class NaiveKVCacheEstimator:
             # vLLM rewrites DeepSeek V3.2 BF16 to auto before the backend selects its physical cache.
             self.dtype_bytes, self._sparse_cache_needs_target = self._vllm_sparse_auto_precision
             return
+        if mode == "bfloat16" and self._vllm_bf16_kv_mismatch:
+            raise ValueError("explicit bfloat16 KV cache dtype disagrees with the vLLM float16 model dtype")
         if mode == "bfloat16" and self._vllm_packed_sparse:
             raise ValueError("the vLLM SM120 sparse backend requires the packed FP8 MLA cache")
         if mode == "int8" and self._cache_backend in ("vllm", "sglang"):
@@ -2375,8 +2444,8 @@ def estimate_kv_cache(
                 ) from exc
         raw = naive._selected_decoder
         expert_tp = naive.moe_tp_size
-        if backend == "sglang" and moe_tp_size is None and moe_ep_size is None:
-            # SGLang defaults to EP1. Keep the legacy unsharded weight reservation, but validate its real TP shard.
+        if backend in ("sglang", "vllm") and moe_tp_size is None and moe_ep_size is None:
+            # Both backends default to EP1. Validate the actual shard even with the coarse unsharded reservation.
             expert_tp = tp_size * attention_dp_size * cp_size
         if raw is not None and experts:
             intermediate = naive.geometry["moe_inter"]
@@ -2385,14 +2454,6 @@ def estimate_kv_cache(
         if raw is not None and experts and moe_quant_mode in (None, "fp8_block"):
             release = parse_support_matrix_version(version)
             quant = raw.get("quantization_config") or {}
-            if backend == "sglang" and quant.get("quant_method") == "mxfp8":
-                if release is None or release < Version("0.5.9"):
-                    raise ValueError("SGLang MXFP8 expert weights require backend version 0.5.9 or later") from exc
-                sm = _config_only_system_spec(system, systems_path).get("gpu", {}).get("sm_version")
-                if sm is None or not 100 <= sm < 110:
-                    raise ValueError(
-                        "SGLang MXFP8 expert weights require a Blackwell CUDA GPU in the SM100 family"
-                    ) from exc
             sglang_fp8 = backend == "sglang" and (
                 quant.get("quant_method") == "mxfp8"
                 or (quant.get("quant_method") == "fp8" and quant.get("weight_block_size") is not None)
@@ -2418,7 +2479,11 @@ def estimate_kv_cache(
             )
             if (
                 sglang_fp8
-                and (naive.architecture == "Qwen3MoeForCausalLM" or deepseek)
+                and (
+                    naive.architecture == "Qwen3MoeForCausalLM"
+                    or raw.get("model_type") == "qwen3_vl_moe_text"
+                    or deepseek
+                )
                 and release is not None
                 and release >= Version("0.5.10rc0")
             ):
@@ -2437,6 +2502,18 @@ def estimate_kv_cache(
                 quantized_experts = not _sglang_skips_fused_experts(
                     ignored, naive.geometry["layers"], release, first=first, frequency=frequency
                 )
+            if backend == "sglang" and quant.get("quant_method") == "mxfp8":
+                if release is None or release < Version("0.5.9"):
+                    raise ValueError("SGLang MXFP8 expert weights require backend version 0.5.9 or later") from exc
+                sm = _config_only_system_spec(system, systems_path).get("gpu", {}).get("sm_version")
+                if not (sm is not None and sm >= 100):
+                    raise ValueError(
+                        "SGLang checkpoints declaring MXFP8 expert weights require a Blackwell GPU (SM100) or later"
+                    ) from exc
+                if quantized_experts and sm >= 110:
+                    raise ValueError(
+                        "SGLang MXFP8 expert weights require a Blackwell CUDA GPU in the SM100 family"
+                    ) from exc
             if check_tiles:
                 validate_fp8_moe_shard(
                     raw,

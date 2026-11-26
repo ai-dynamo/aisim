@@ -705,6 +705,13 @@ def _glm_attempt_specs(
         if decode:
             if sum(row[0] + 1 for row in specs) != point["total_kv_read_tokens"]:
                 raise ValueError(f"GLM prompt specs disagree with the decode point total: {path}")
+            if block is not None:
+                derived = [(row[0] - 1) // block * block for row in specs]
+                if (seeds is not None and seeds != derived) or (
+                    "specs" in seed and _glm_spec_lengths(seed["specs"], path) != [[n] for n in derived if n]
+                ):
+                    raise ValueError(f"GLM seed lengths disagree with the recorded prompt specs: {path}")
+                seeds = derived
         else:
             if any(
                 len(row) > 2 or row[-1] % CHUNK_ALIGN or (len(row) == 2 and row[0] % (block or CHUNK_ALIGN))
@@ -780,8 +787,8 @@ def _validate_glm_chunks(
         return None  # Older records did not always serialize chunk observations.
     # The compact records omit request IDs and empty scheduler steps.
     prompt_limit = point["total_kv_read_tokens"] + point["total_prefill_tokens"]
-    if point["point_type"] == "decode" and point["batch_size"] == 1:
-        prompt_limit = max(1, prompt_limit - 1)
+    if point["point_type"] == "decode":
+        prompt_limit -= point["batch_size"]
     lengths = seeds if seed else [sum(parts) for parts in expected] if expected is not None else None
     limits = sorted(lengths, reverse=True) if lengths is not None else None
     accepted_decode = point["point_type"] == "decode" and "repetition" in stage
@@ -842,38 +849,67 @@ def _validate_glm_chunks(
     ):
         raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
 
-    discarded_prefill = point["point_type"] == "prefill" and "rejection_reason" in stage
-    if accepted_decode or discarded_prefill or (seed and limits is not None):
-        # The first chunk for each request can start at a cached prefix. A later chunk must
-        # continue from a previous end. Process a whole step before making its new ends available.
+    decode = point["point_type"] == "decode" and not seed
+    if accepted_decode or "rejection_reason" in stage or (seed and limits is not None):
+        # Offsets are anonymous. At each offset count how many ends could continue in a later step.
+        # A matching start can also be another request's cache hit at a completed prompt length.
         ends: Counter[int] = Counter()
-        initial: list[int] = []
+        initial: Counter[int] = Counter()
+        continuations: Counter[int] = Counter()
         for step in chunks:
             starts = Counter(start for start, _ in step)
-            first = list((starts - ends).elements())
-            initial.extend(first)
-            if seed and any(first):
-                raise ValueError(f"GLM seed chunks must start each fresh prompt at zero and continue it: {path}")
+            initial.update(starts - ends)
+            continuations.update(starts & ends)
             ends -= starts
             ends.update(start + count for start, count in step)
-        if (limits is not None and ends != Counter(n for n in limits if n)) or (
-            (accepted_decode or discarded_prefill)
-            and (
-                ends.total() != point["batch_size"]
-                or sum(end * n for end, n in ends.items())
-                != (point["total_kv_read_tokens"] - point["batch_size"] if accepted_decode else prompt_limit)
-            )
-        ):
-            raise ValueError(f"GLM preparation chunks must finish the prompts recorded for this stage: {path}")
-
-        if accepted_decode and (
-            (block is not None and any(start % block for start in initial))
-            or (
+        if seed and any(initial):
+            raise ValueError(f"GLM seed chunks must start each fresh prompt at zero and continue it: {path}")
+        error = f"GLM preparation chunks must finish the prompts recorded for this stage: {path}"
+        if limits is not None:
+            terminals = Counter(n for n in limits if n)
+            if not ends <= terminals <= ends + continuations:
+                raise ValueError(error)
+            initial.update(terminals - ends)
+        else:
+            # Without per-request lengths, only the batch size and total prompt length are known.
+            additional = point["batch_size"] - ends.total()
+            needed = prompt_limit - sum(ends.elements())
+            unit = block if decode and block is not None else CHUNK_ALIGN
+            if not 0 <= additional <= continuations.total() or needed < 0 or needed % unit:
+                raise ValueError(error)
+            # Choose terminal offsets from the observed continuations. Bit i denotes i alignment units.
+            target = needed // unit
+            mask = (1 << (target + 1)) - 1
+            possible = [1] + [0] * additional
+            available = sorted(seeds) if decode and seeds is not None else None
+            if available is not None:
+                for start in initial.elements():
+                    slot = bisect_left(available, start)
+                    if slot == len(available):
+                        raise ValueError(f"GLM decode preparation starts beyond the available cached prefix: {path}")
+                    available.pop(slot)
+            for end in sorted(continuations.elements(), reverse=True):
+                if end <= needed and end % unit == 0:
+                    for n in range(additional, 0, -1):
+                        if available is None or end <= available[-n]:
+                            possible[n] |= (possible[n - 1] << (end // unit)) & mask
+            if not possible[-1] >> target:
+                raise ValueError(error)
+        if seed and any(initial):
+            raise ValueError(f"GLM seed chunks must start each fresh prompt at zero and continue it: {path}")
+        if decode:
+            if seeds is None and expected is not None and block is not None:
+                seeds = [(row[0] - 1) // block * block for row in expected]
+            if (block is not None and any(start % block for start in initial)) or (
                 seeds is not None
-                and any(start > available for start, available in zip(sorted(initial), sorted(seeds), strict=True))
-            )
-        ):
-            raise ValueError(f"GLM decode preparation starts beyond the available cached prefix: {path}")
+                and any(
+                    start > available
+                    for start, available in zip(
+                        sorted(initial.elements(), reverse=True), sorted(seeds, reverse=True), strict=False
+                    )
+                )
+            ):
+                raise ValueError(f"GLM decode preparation starts beyond the available cached prefix: {path}")
     elif point["point_type"] == "prefill" and "repetition" in stage and expected is not None:
         requested = Counter((parts[-2] if len(parts) > 1 else 0, parts[-1]) for parts in expected)
         if len(chunks) != 1 or Counter(tuple(part) for part in chunks[0]) != requested:
@@ -914,6 +950,8 @@ def _validate_glm_rejected_outputs(
     events = None
     decode = point["point_type"] == "decode"
     prompts = sorted(sum(parts) for parts in specs) if decode and specs is not None else None
+    available_contexts = Counter(p + step for p in (prompts or []) for step in (0, 1))
+    remaining = 2 * point["batch_size"]
     if "fpms" in stage:
         if not isinstance(stage["fpms"], list):
             raise ValueError(f"invalid GLM rejected forwards: {path}")
@@ -932,11 +970,33 @@ def _validate_glm_rejected_outputs(
                 or (fresh == 0) != decode
             ):
                 raise ValueError(f"GLM rejected forward contradicts its recorded phase or scheduled requests: {path}")
+            if decode:
+                remaining -= decodes
+                if remaining < 0 or (
+                    decodes == 1
+                    and "var_decode_kv_tokens" in scheduled
+                    and (
+                        type(scheduled["var_decode_kv_tokens"]) not in (int, float)
+                        or scheduled["var_decode_kv_tokens"] != 0
+                    )
+                ):
+                    raise ValueError(f"GLM rejected decode contradicts its request count or variance: {path}")
             if prompts is not None:
                 # Each request gets two pure or mixed decode steps, reading p or p+1 cached tokens.
                 context = scheduled.get("sum_decode_kv_tokens")
                 if type(context) is not int or not _glm_decode_context_possible(prompts, decodes, context):
                     raise ValueError(f"GLM rejected decode context contradicts the recorded prompts: {path}")
+                if prompts[0] == prompts[-1]:
+                    advanced = context - decodes * prompts[0]
+                    available_contexts[prompts[0]] -= decodes - advanced
+                    available_contexts[prompts[0] + 1] -= advanced
+                elif decodes == 1:
+                    available_contexts[context] -= 1
+                elif decodes == len(prompts) and context in (sum(prompts), sum(prompts) + decodes):
+                    offset = int(context != sum(prompts))
+                    available_contexts.subtract(p + offset for p in prompts)
+                if any(value < 0 for value in available_contexts.values()):
+                    raise ValueError(f"GLM rejected decode contexts contradict the remaining request steps: {path}")
             tokens = fresh + decodes
             sample = fpm.get("benchmark_sample")
             graph = sample.get("cudagraph") if isinstance(sample, dict) else None
@@ -949,7 +1009,8 @@ def _validate_glm_rejected_outputs(
                 raise ValueError(f"GLM unavailable rejected forward dispatch contains observed values: {path}")
             if observed is not None and (not _valid_dispatch(observed) or observed["num_unpadded_tokens"] != tokens):
                 raise ValueError(f"GLM rejected forward contradicts its dispatch or scheduled token count: {path}")
-            events.append((tokens, graph))
+            forward = sample.get("forward_index") if isinstance(sample, dict) else None
+            events.append((tokens, graph, forward))
     if counts is None or (events is None and chunks is None):
         return
     receipts = stage.get("dispatches")
@@ -959,7 +1020,7 @@ def _validate_glm_rejected_outputs(
             return counts[output] is None or counts[output] <= point["batch_size"]
         if event >= len(events):
             return False
-        tokens, graph = events[event]
+        tokens, graph, _ = events[event]
         if counts[output] is not None and counts[output] != tokens:
             return False
         if receipts is None or graph is None:
@@ -971,26 +1032,34 @@ def _validate_glm_rejected_outputs(
 
     if not decode:
         # A one-token prefill request has one FPM for every positive scheduler output.
-        if events is not None and (len(events) != len(counts) or any(not matches(i, i) for i in range(len(counts)))):
+        if events is not None and (
+            len(events) != len(counts)
+            or any(not matches(i, i) for i in range(len(counts)))
+            or len({forward - i for i, (_, _, forward) in enumerate(events) if type(forward) is int}) > 1
+        ):
             raise ValueError(f"GLM rejected prefill forward contradicts its dispatch: {path}")
         return
 
     # Each positive output is either a prefill/mixed step (one chunk list), or pure decode
     # (one FPM). Equal token counts can make the ordering ambiguous, especially with a missing receipt.
-    positions = {0}
+    positions = {(0, None)}
     for output, count in enumerate(counts):
         following = set()
-        for chunk in positions:
-            if matches(output - chunk, output):
-                following.add(chunk)
+        for chunk, offset in positions:
+            event = output - chunk
+            if matches(event, output):
+                forward = events[event][2] if events is not None else None
+                base = forward - output if type(forward) is int else offset
+                if offset is None or base == offset:
+                    following.add((chunk, base))
             if chunks is None or (
                 chunk < len(chunks) and (count is None or chunks[chunk][0] <= count <= chunks[chunk][1])
             ):
-                following.add(chunk + 1)
+                following.add((chunk + 1, offset))
         positions = following
     if not any(
         (chunks is None or chunk == len(chunks)) and (events is None or len(counts) - chunk == len(events))
-        for chunk in positions
+        for chunk, _ in positions
     ):
         raise ValueError(
             f"GLM rejected decode forwards or chunks contradict their dispatches or scheduled token counts: {path}"
@@ -1138,7 +1207,7 @@ def _validate_glm_repetitions(
     for attempt in rejected:
         counts = _glm_scheduled_counts(attempt, path)
         specs = _glm_attempt_specs(attempt, point, expected_specs, seed, seeds, path, block, context_limit)
-        chunks = _validate_glm_chunks(attempt, path, point, counts=counts, expected=specs)
+        chunks = _validate_glm_chunks(attempt, path, point, counts=counts, expected=specs, seeds=seeds, block=block)
         _validate_glm_rejected_outputs(attempt, path, point, counts, chunks, specs)
         attempt_id = attempt.get("attempt")
         if type(attempt_id) is not int or attempt_id < 0 or attempt_id in discarded_forwards:
@@ -1214,14 +1283,21 @@ def _validate_glm_repetitions(
                 raise ValueError(f"{error}: seeded decode lacks a preparation dispatch for the uncached suffix: {path}")
         specs = _glm_attempt_specs(repetition, point, expected_specs, seed, seeds, path, block, context_limit)
         _validate_glm_chunks(repetition, path, point, counts=chunk_counts, expected=specs, seeds=seeds, block=block)
-        if point["point_type"] == "decode" and "prefill_chunks" not in repetition and None not in chunk_counts:
+        if point["point_type"] == "decode" and "prefill_chunks" not in repetition:
+            prompt_tokens = point["total_kv_read_tokens"] - point["batch_size"]
+            if sum(n for n in chunk_counts if n is not None) > prompt_tokens:
+                raise ValueError(f"{error}: preparation dispatches exceed the available prompt tokens: {path}")
             # Even a full hit must leave the final prompt token for logits. Hits end at whole hash blocks.
             uncached = point["batch_size"]
             if seeds is not None:
                 uncached = point["total_kv_read_tokens"] - point["batch_size"] - sum(seeds)
             elif block is not None and specs is not None:
                 uncached = sum((row[0] - 1) % block + 1 for row in specs)
-            if (current_overlay or seeds is not None or specs is not None) and sum(chunk_counts) < uncached:
+            if (
+                None not in chunk_counts
+                and (current_overlay or seeds is not None or specs is not None)
+                and sum(chunk_counts) < uncached
+            ):
                 raise ValueError(f"{error}: preparation dispatches cannot cover the uncached prompt tokens: {path}")
         # The producer records population variance over prompt lengths (prefill) or computed contexts (decode).
         # The second lockstep decode advances each context by one, preserving its variance.
@@ -1249,6 +1325,7 @@ def _validate_glm_repetitions(
                     or (variance is not None and not math.isclose(observed, variance, rel_tol=1e-9, abs_tol=1e-9))
                 ):
                     raise ValueError(f"{error}: {variance_field} contradicts the recorded per-request lengths: {path}")
+                variance = observed
                 if index == len(repetitions) - 1 and step == len(steps) - 1:
                     retained_workload = retained[0]["scheduled_requests"]
                     if (current_overlay or variance_field in retained_workload) and not _same(
@@ -1402,13 +1479,17 @@ def _validate_glm_provenance(
         if not _same(kvwarm.get(key), value):
             raise lacks(f"kvwarm.{key}")
     context_limit = kvwarm.get("max_context")
-    if context_limit is not None and (type(context_limit) is not int or context_limit <= 0):
+    if context_limit is not None and (type(context_limit) is not int or not 0 < context_limit <= MAX_CONTEXT):
         raise lacks("kvwarm.max_context")
     for document in (evidence, payload):
         policy = document.get("context_policy")
         if isinstance(policy, dict) and "measured_context_limit" in policy:
             measured_limit = policy["measured_context_limit"]
-            if type(measured_limit) is not int or measured_limit <= 0 or context_limit not in (None, measured_limit):
+            if (
+                type(measured_limit) is not int
+                or not 0 < measured_limit <= MAX_CONTEXT
+                or context_limit not in (None, measured_limit)
+            ):
                 raise lacks("context_policy.measured_context_limit")
             context_limit = measured_limit
     if not _same(payload.get("timing_boundary"), GLM_TIMING_BOUNDARY):
@@ -1490,7 +1571,7 @@ def _validate_glm_provenance(
                 previous,
                 block,
                 balanced_decode=("decode_contexts_sha256" in evidence and evidence["decode_contexts_sha256"] is None),
-                context_limit=context_limit,
+                context_limit=context_limit or MAX_CONTEXT,
             )
     for row in payload["results"]:
         point = row["point"]

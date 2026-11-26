@@ -729,7 +729,7 @@ def compile_engine(
     ):
         resolve_trtllm_mla_compute(model_config, model_path, backend, load_system_spec(system, systems_path))
     if afd_pool_role is None:
-        model = get_model(model_path, model_config, backend)
+        model = get_model(model_path, model_config, backend, literal_version)
     else:
         from aisim_core.sdk.models.afd import build_afd_model
 

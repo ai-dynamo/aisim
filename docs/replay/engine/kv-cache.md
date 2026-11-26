@@ -902,13 +902,14 @@ state = estimate_state_cache("moonshotai/Kimi-K3", tp_size=8, kvcache_quant_mode
 
 For DeepSeek V4, `state_cache: {}` follows vLLM's allocation. vLLM stores
 `fp8_ds_mla` KV and gives every cache group the same pool row, as wide as the
-widest group. A request holds one row per 256 tokens of compressed KV and
+widest group. Replay models one row per 256 tokens of compressed KV and
 indexer keys (`block_size` 256, `bytes_per_token` one row per 256 tokens), plus
 a 26-row state for its sliding-window groups (SWA KV and compressor states). For
 DeepSeek-V4-Flash, 1,002,240-byte rows give 3915 bytes per token and a
-26,058,240-byte state on every TP rank. The SDK's configuration-based capacity
-estimate reserves this state for one request, then counts whole 256-token
-blocks in the remaining budget.
+26,058,240-byte state on every TP rank. The SDK can derive the marginal byte
+rate from the checkpoint. Its config-only capacity estimate requires runtime
+group allocations to account for live sliding-window and prefill pages and the
+pool-wide null row. [KV-cache capacity reservation](../../perf-model/memory.md#kv-cache-capacity-reservation)
 Leave `block_size` and `bytes_per_token` unset. Speculative decoding (`nextn`
 or `speculation`) widens each sliding window by the draft tokens, so one draft
 token gives 30 rows. These are modeling assumptions: 26 rows is vLLM's decode

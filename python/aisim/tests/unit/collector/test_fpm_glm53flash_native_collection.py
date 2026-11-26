@@ -988,6 +988,8 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
         ("mixed", "prefill chunk contradicts"),
         ("no-preparation", "lacks a preparation dispatch"),
         ("short-preparation", "cannot cover the uncached"),
+        ("over-preparation", "exceed the available prompt"),
+        ("seed-without-rows", "seed lengths disagree"),
         ("rotation", "rotation disagrees"),
         ("salt", "salt disagrees"),
     ],
@@ -997,6 +999,9 @@ def test_glm_published_decode_requires_each_seeded_prompt_and_lockstep(tmp_path,
     payload = glm_native_payload("decode", points=[DECODE_POINTS[1]])
     _glm_producer_shape(tmp_path)("decode", payload)
     artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+
+    if fault == "seed-without-rows":
+        payload["input_provenance"]["decode_contexts_sha256"] = hashlib.sha256(b"custom split").hexdigest()
 
     def mutate(record):
         record["rows"] = {"context": [4096, 4096], "prompt": [4095, 4095], "measured_decode_step": 2}
@@ -1012,9 +1017,12 @@ def test_glm_published_decode_requires_each_seeded_prompt_and_lockstep(tmp_path,
         elif fault == "hit":
             stage["prefill_chunks"] = [[[4092, 3]], [[4092, 3]]]
             counts = [3, 3]
-        elif fault in {"no-preparation", "short-preparation"}:
+        elif fault == "seed-without-rows":
+            del record["rows"]
+            record["seed"] = {"lengths": [4352, 4352], "specs": [[[0, 4352]], [[131, 4352]]]}
+        elif fault in {"no-preparation", "short-preparation", "over-preparation"}:
             del stage["prefill_chunks"]
-            counts = [] if fault == "no-preparation" else [1]
+            counts = {"no-preparation": [], "short-preparation": [1], "over-preparation": [8191]}[fault]
         elif fault == "rotation":
             stage["prompt_specs"][1][0][0] += 1
         elif fault == "salt":
@@ -1076,13 +1084,14 @@ def test_glm_variable_decode_contexts_match_the_observed_variance(
         ("all-variances-absent", "var_decode_kv_tokens"),
         ("index-gap", "consecutive indices"),
         ("absent-rows", "decode point total"),
+        ("lockstep-variance", "var_decode_kv_tokens"),
     ],
 )
 def test_glm_disagrees_with_the_current_producer_workload(tmp_path, fault, error):
     cell = glm_cell("decode")
     payload = glm_native_payload("decode", points=[DECODE_POINTS[1]])
     _glm_producer_shape(tmp_path)("decode", payload)
-    if fault == "absent-rows":
+    if fault in {"absent-rows", "lockstep-variance"}:
         payload["input_provenance"]["decode_contexts_sha256"] = hashlib.sha256(b"attested contexts").hexdigest()
     artifact = write_glm_rank(_pod(tmp_path, cell), payload)
 
@@ -1099,6 +1108,9 @@ def test_glm_disagrees_with_the_current_producer_workload(tmp_path, fault, error
                 del fpm["scheduled_requests"]["var_decode_kv_tokens"]
         elif fault == "index-gap":
             first["fpms"][0]["benchmark_sample"]["forward_index"] -= 1
+        elif fault == "lockstep-variance":
+            record.pop("rows", None)
+            first["fpms"][0]["scheduled_requests"]["var_decode_kv_tokens"] = 99
         else:
             record.pop("rows", None)
             first["prompt_specs"] = [[[0, 5]], [[131, 7]]]
@@ -1122,7 +1134,22 @@ def test_glm_published_requests_follow_the_producer_grid(tmp_path, phase, point,
         database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
 
 
-@pytest.mark.parametrize("fault", [None, "context", "clock", "count", "mode", "order", "unavailable-values"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "context",
+        "clock",
+        "count",
+        "mode",
+        "order",
+        "unavailable-values",
+        "spent-decode",
+        "incomplete-prompts",
+        "index-spacing",
+        "singleton-variance",
+    ],
+)
 def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatch(tmp_path, fault):
     cell = glm_cell("decode")
     payload = glm_native_payload("decode", points=[DECODE_POINTS[1]])
@@ -1168,6 +1195,16 @@ def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatc
         rejected["scheduled_token_counts"] = [4095, 1, 4096, 1, 1]
         if fault == "context":
             first["scheduled_requests"]["sum_decode_kv_tokens"] = 8190
+        elif fault == "spent-decode":
+            for fpm in rejected["fpms"]:
+                fpm["scheduled_requests"]["sum_decode_kv_tokens"] = 4096
+        elif fault == "incomplete-prompts":
+            rejected["prefill_chunks"][0][0][1] = rejected["scheduled_token_counts"][0] = 1
+            rejected["dispatches"][0] = receipt(1, "NONE")
+        elif fault == "index-spacing":
+            first["benchmark_sample"]["forward_index"] = 0
+        elif fault == "singleton-variance":
+            first["scheduled_requests"]["var_decode_kv_tokens"] = 99
         elif fault == "clock":
             interval = rejected["fpms"][-1]["benchmark_sample"]["timing"]
             interval.update(
@@ -1188,8 +1225,53 @@ def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatc
         payload,
         artifact,
         add_discarded_attempt,
-        "contradict|unavailable|preceding output" if fault else None,
+        "contradict|unavailable|preceding output|finish the prompts" if fault else None,
     )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_glm_prefill_can_finish_one_request_at_another_requests_cached_prefix(tmp_path, reverse):
+    pairs = [[0, 4352], [4352, 64]]
+    if reverse:
+        pairs.reverse()
+    stage = {
+        "rejection_reason": "recorded 2 native FPMs, expected 1",
+        "prefill_chunks": [[chunk] for chunk in pairs],
+        "fpms": [
+            {
+                "scheduled_requests": dict(
+                    num_prefill_requests=1, num_decode_requests=0, sum_prefill_kv_tokens=start, sum_prefill_tokens=fresh
+                )
+            }
+            for start, fresh in pairs
+        ],
+    }
+    point = dict(point_type="prefill", batch_size=2, total_prefill_tokens=2240, total_kv_read_tokens=6528)
+    counts = [fresh for _, fresh in pairs]
+    for expected in ([[2176, 2176], [4352, 64]], None):
+        assert native_artifact._validate_glm_chunks(
+            stage, tmp_path, point, counts=counts, expected=expected, seeds=[2176, 4352], block=2176
+        ) == [(n, n) for n in counts]
+
+
+@pytest.mark.parametrize("record_limit", [True, False])
+def test_glm_measured_context_cannot_exceed_the_producer_limit(tmp_path, record_limit):
+    point = {**DECODE_POINTS[1], "total_kv_read_tokens": 2 * (native_artifact.MAX_CONTEXT + 1)}
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[point])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    for doc in [payload, payload["input_provenance"]]:
+        if record_limit:
+            doc["context_policy"]["measured_context_limit"] = 200000
+        else:
+            doc["context_policy"].pop("measured_context_limit", None)
+    if record_limit:
+        payload["kvwarm"]["max_context"] = 200000
+    else:
+        del payload["kvwarm"]["max_context"]
+    write_glm_rank(_pod(tmp_path, cell), payload)
+    with pytest.raises(ValueError, match="max_context|per-request limits"):
+        database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
 
 
 @pytest.mark.parametrize(("total", "possible"), [(104, True), (199, False), (204, True), (302, True), (451, False)])
@@ -1248,10 +1330,12 @@ def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_pa
     sidecar = artifact.with_suffix(".repetitions.jsonl")
     record = json.loads(sidecar.read_bytes())
     for repetition in record["repetitions"]:
-        # The seeded prefix runs before the two counted decode forwards; its dispatch receipt may be missing.
+        # Split the cold prompt across two preparation steps. The first dispatch receipt may be missing.
+        suffix = repetition["scheduled_token_counts"][0] - 2176
+        repetition["dispatches"][0].update(num_unpadded_tokens=suffix, num_padded_tokens=suffix)
         repetition["dispatches"].insert(0, None)
         if records_counts:
-            repetition["scheduled_token_counts"].insert(0, 2176)
+            repetition["scheduled_token_counts"][:1] = [2176, suffix]
         else:
             del repetition["scheduled_token_counts"]
     line = json.dumps(record).encode()

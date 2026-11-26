@@ -46,8 +46,8 @@ def test_direct_context_construction_uses_runtime_precision(monkeypatch, entry, 
     captured = []
     real_get_model = models.get_model
 
-    def capture(model_path, model_config, backend_name):
-        captured.append(real_get_model(model_path, model_config, backend_name))
+    def capture(model_path, model_config, backend_name, backend_version=None):
+        captured.append(real_get_model(model_path, model_config, backend_name, backend_version))
         if entry != "run_disagg" or len(captured) == 2:
             raise ModelBuilt
         return captured[-1]

@@ -24,7 +24,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 import yaml
+from packaging.version import Version
 
+from aisim_core.decoder_config import layout_integer
 from aisim_core.sdk import common
 from aisim_core.sdk.common import (
     ARCHITECTURE_TO_MODEL_FAMILY,
@@ -895,13 +897,65 @@ def _parse_llama4_vision_config(
     )
 
 
-def gemma4_global_kv_head_field(config: dict, backend: str | None = None) -> str:
-    """Resolve the backend's full-attention KV heads independently of the sliding layers."""
+def gemma4_cache_requires_release(config: dict) -> bool:
+    """SGLang switched from flat global fields to Transformers' effective per-layer config in 0.5.22."""
+    return "per_layer_config" in config or (
+        not config.get("attention_k_eq_v")
+        and config.get("num_global_key_value_heads") not in (None, config.get("num_key_value_heads", 4))
+    )
+
+
+def gemma4_cache_shapes(
+    config: dict, backend: str | None = None, backend_version: str | None = None
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return the (KV heads, head dimension) of the sliding and full attention pools."""
+    heads = config.get("num_key_value_heads", 4) or config.get("num_attention_heads")
+    dim = config.get("head_dim", 256)
+    if dim is None:
+        dim = config["hidden_size"] // layout_integer(config["num_attention_heads"], "num_attention_heads")
+    base = (layout_integer(heads, "num_key_value_heads"), layout_integer(dim, "head_dim"))
+    release = common.parse_support_matrix_version(backend_version)
+    if backend == "sglang" and release is None and gemma4_cache_requires_release(config):
+        raise ValueError("Gemma 4 cache geometry requires the SGLang release or a runtime profile")
+    legacy = backend == "sglang" and release is not None and release < Version("0.5.22")
     if backend == "vllm" and "per_layer_config" in config:
         raise ValueError("explicit Gemma 4 per_layer_config requires runtime cache geometry for each layer")
-    if (backend == "sglang" or config.get("attention_k_eq_v")) and config.get("num_global_key_value_heads") is not None:
-        return "num_global_key_value_heads"
-    return "num_key_value_heads"
+    if backend == "sglang" and not legacy and "per_layer_config" in config:
+        overrides = config["per_layer_config"] or {}
+        layers = layout_integer(config["num_hidden_layers"], "num_hidden_layers")
+        types = config.get("layer_types") or [
+            "sliding_attention" if (i + 1) % 6 else "full_attention" for i in range(layers)
+        ]
+        if not isinstance(overrides, dict) or len(types) != layers:
+            raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
+        by_layer = {}
+        for key, fields in overrides.items():
+            if (
+                not str(key).isascii()
+                or not str(key).isdecimal()
+                or not 0 <= int(key) < layers
+                or int(key) in by_layer
+                or not isinstance(fields, dict)
+                or fields.keys() - {"num_key_value_heads", "head_dim"}
+            ):
+                raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
+            by_layer[int(key)] = fields
+        shapes = {}
+        for i, kind in enumerate([*types[:-1], "full_attention"]):
+            fields = by_layer.get(i, {})
+            shape = (
+                layout_integer(fields.get("num_key_value_heads", base[0]), "num_key_value_heads"),
+                layout_integer(fields.get("head_dim", base[1]), "head_dim"),
+            )
+            if shape != shapes.setdefault(kind, shape):
+                raise ValueError("SGLang requires one Gemma 4 cache geometry per attention layer type")
+        return shapes.get("sliding_attention", shapes["full_attention"]), shapes["full_attention"]
+    full_heads = config.get("num_global_key_value_heads") if legacy or config.get("attention_k_eq_v") else None
+    full_dim = config.get("global_head_dim", 512 if backend in ("sglang", "vllm") else dim)
+    return base, (
+        layout_integer(heads if full_heads is None else full_heads, "num_global_key_value_heads"),
+        layout_integer(dim if full_dim is None else full_dim, "global_head_dim"),
+    )
 
 
 def _parse_hf_config_json(config: dict) -> dict:
@@ -1324,12 +1378,7 @@ def _parse_hf_config_json(config: dict) -> dict:
             raise ValueError("Gemma 4 layer_types must contain only 'sliding_attention' or 'full_attention'")
         # Dense Gemma 4 variants (e.g. E2B/E4B/31B) leave the global-attention
         # head fields as null; fall back to the model-wide values in that case.
-        swa_num_kv = config["num_key_value_heads"]
-        swa_hd = config["head_dim"]
-        global_num_kv = config[gemma4_global_kv_head_field(config)]
-        global_hd = config.get("global_head_dim")
-        if global_hd is None:
-            global_hd = swa_hd
+        (swa_num_kv, swa_hd), (global_num_kv, global_hd) = gemma4_cache_shapes(config)
 
         gemma4_vision_config = None
         if vision_cfg is not None:
@@ -1402,7 +1451,7 @@ def _parse_hf_config_json(config: dict) -> dict:
                 standardize=bool(vision_cfg.get("standardize", False)),
             )
         extra_params = common.Gemma4MixConfig(
-            layer_types=tuple(layer_types_raw),
+            layer_types=(*layer_types_raw[:-1], "full_attention"),
             swa_num_kv_heads=swa_num_kv,
             swa_head_dim=swa_hd,
             global_num_kv_heads=global_num_kv,

@@ -207,7 +207,7 @@ def test_native_zero_per_token_raises():
     ],
 )
 def test_native_capacity_discloses_resolved_kv_precision(monkeypatch, override, resolved, token_capacity):
-    def get_model(_path, config, backend):
+    def get_model(_path, config, backend, _version):
         # Exercise real default resolution for an FP8 checkpoint with no KV declaration.
         _apply_model_quant_defaults(config, {"quant_algo": "fp8"}, "Qwen3ForCausalLM", backend)
         # K and V, eight layers, two KV heads, head dimension 64.
@@ -299,7 +299,7 @@ def test_breakdown_applies_nextn_to_model_config(monkeypatch):
     # decoding instead of treating the request as nextn=0.
     captured = {}
 
-    def _fake_get_model(model_path, model_config, backend):
+    def _fake_get_model(model_path, model_config, backend, _version):
         captured["nextn"] = model_config.nextn
         captured["has_nextn_accepted"] = hasattr(model_config, "nextn_accepted")
 
@@ -348,7 +348,7 @@ def test_breakdown_accepts_nextn_without_acceptance_field(monkeypatch):
     # Capacity math consumes only the core-owned draft depth.
     captured = {}
 
-    def _fake_get_model(model_path, model_config, backend):
+    def _fake_get_model(model_path, model_config, backend, _version):
         captured["nextn"] = model_config.nextn
         captured["has_nextn_accepted"] = hasattr(model_config, "nextn_accepted")
 
@@ -2121,6 +2121,163 @@ def test_selected_qwen_and_gemma_physical_defaults(tmp_path):
             memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.33.0", **opts)
 
 
+@pytest.mark.parametrize("registered", [True, False])
+def test_sglang_gemma4_uses_the_layer_shapes_of_its_release(tmp_path, registered):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.config_builders import build_model_config
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    raw = document["text_config"]
+    raw.update(
+        layer_types=["full_attention"] * 30,
+        head_dim=256,
+        num_key_value_heads=8,
+        global_head_dim=128,
+        num_global_key_value_heads=2,
+        attention_k_eq_v=False,
+        per_layer_config={str(i): {"head_dim": 128, "num_key_value_heads": 16} for i in range(30)},
+    )
+    model = _write_config(tmp_path, document if registered else {"text_config": raw})
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=50_531_926_016 + (110 << 20))
+    opts["memory_fraction_value"] = 1.0
+    for version, width in (("0.5.20", 30_720), ("0.5.21", 30_720), ("0.5.22", 245_760), ("0.5.23", 245_760)):
+        assert (
+            estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version=version) == width
+        )
+        if registered:
+            native = get_model(
+                model,
+                build_model_config(tp_size=1, pp_size=1, attention_dp_size=1, moe_tp_size=1, moe_ep_size=1),
+                "sglang",
+                version,
+            )
+            assert native.get_kvcache_bytes_per_sequence(1) == width
+            assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", version, **opts) == (110 << 20) // (
+                16 * width
+            )
+    raw.update(head_dim=128, num_global_key_value_heads=8)
+    for fields in raw["per_layer_config"].values():
+        fields["num_key_value_heads"] = 8
+    _write_config(tmp_path, document if registered else {"text_config": raw})
+    assert (
+        estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20") == 122_880
+    )
+    raw["per_layer_config"]["0"]["num_key_value_heads"] = 16
+    _write_config(tmp_path, document if registered else {"text_config": raw})
+    with pytest.raises(ValueError, match="one Gemma 4 cache geometry"):
+        estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.23")
+
+
+def test_registered_gemma4_with_release_independent_heads_skips_the_catalog(monkeypatch):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
+    monkeypatch.setattr(memory.perf_database, "get_systems_paths", lambda: pytest.fail("unexpected catalog lookup"))
+    for version in (None, "current"):
+        assert (
+            estimate_kv_bytes_per_token(
+                "google/gemma-4-26B-A4B",
+                tp_size=1,
+                pp_size=1,
+                system="h200_sxm",
+                backend="sglang",
+                backend_version=version,
+            )
+            == 225_280
+        )
+
+
+def test_selected_moe_weights_use_the_constructor_count_and_routed_width(tmp_path):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=24 * _GIB)
+    for name, count, width, backend, version in (
+        ("MiniMaxAI/MiniMax-M2.5", 256, 1536, "sglang", "0.5.20"),
+        ("Qwen/Qwen3-VL-30B-A3B-Instruct", 60, 768, "sglang", "0.5.20"),
+        ("mistralai/Mixtral-8x7B-v0.1", 8, 14336, "vllm", "0.33.0"),
+    ):
+        checkpoint = _load_pre_downloaded_hf_config(name)
+        raw = checkpoint.get("text_config", checkpoint)
+        raw.pop("num_local_experts", None)
+        raw.pop("num_experts", None)
+        if name.startswith("mistralai/"):
+            raw["moe_intermediate_size"] = 1024
+        wrapped = {"text_config": raw}
+        model = _write_config(tmp_path, wrapped)
+        shape = NaiveKVCacheEstimator.from_hf_config(wrapped, tp_size=1, pp_size=1).geometry
+        assert (shape["num_experts"], shape["moe_inter"]) == (count, width)
+        for estimate in (memory.estimate_num_gpu_blocks, memory.estimate_kv_cache):
+            with pytest.raises(ValueError, match="no KV budget"):
+                estimate(model, "missing", backend, version, **opts)
+
+
+def test_sglang_pool_heads_and_vllm_float_cache_use_the_serving_config(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
+    raw["n_head_kv"] = 16
+    model = _write_config(tmp_path, {"text_config": raw})
+    with pytest.raises(ValueError, match="pool KV heads"):
+        estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20")
+    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend_version="0.33.0") == 114_688
+    raw.update(n_head_kv=8, num_kv_heads=16, torch_dtype="float16", dtype="float16")
+    _write_config(tmp_path, {"text_config": raw})
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=24 * _GIB)
+    for backend, version, mismatch in (
+        ("sglang", "0.5.20", False),
+        ("vllm", "0.32.0", False),
+        ("vllm", "0.32.1rc0", True),
+        ("vllm", "0.33.0rc0", True),
+        ("vllm", "0.33.0", True),
+    ):
+        width = dict(tp_size=1, pp_size=1, backend=backend, backend_version=version, kvcache_quant_mode="bfloat16")
+        if mismatch:
+            with pytest.raises(ValueError, match="vLLM float16 model dtype"):
+                estimate_kv_bytes_per_token(model, **width)
+            with pytest.raises(ValueError, match="vLLM float16 model dtype"):
+                memory.estimate_num_gpu_blocks(
+                    model, "missing", backend, version, **opts, kvcache_quant_mode="bfloat16"
+                )
+        else:
+            assert estimate_kv_bytes_per_token(model, **width) == 114_688
+            assert (
+                memory.estimate_num_gpu_blocks(
+                    model, "missing", backend, version, **opts, kvcache_quant_mode="bfloat16"
+                )
+                > 0
+            )
+    _write_config(tmp_path, {"dtype": "bfloat16", "text_config": raw})
+    assert estimate_kv_bytes_per_token(model, **width) == 114_688
+
+
+def test_fp8_expert_tiles_follow_implicit_vllm_tp_and_the_qwen_vl_expert_module(tmp_path):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    fp8 = _load_pre_downloaded_hf_config("Qwen/Qwen3-30B-A3B-FP8")
+    model = _write_config(tmp_path, {"text_config": fp8})
+    opts = _missing_system_cache_options(tmp_path, tp_size=8, capacity=192 * _GIB)
+    opts.update(moe_tp_size=None, moe_ep_size=None)
+    for estimate in (memory.estimate_num_gpu_blocks, memory.estimate_kv_cache):
+        with pytest.raises(ValueError, match="weight_block_size=128"):
+            estimate(model, "missing", "vllm", "0.28.0", **opts)
+        assert estimate(model, "missing", "vllm", "0.29.0rc1", **opts)
+    raw = _load_pre_downloaded_hf_config("Qwen/Qwen3-VL-30B-A3B-Instruct")["text_config"]
+    quant = fp8["quantization_config"]
+    raw["quantization_config"] = quant
+    opts.update(moe_tp_size=8, moe_ep_size=1)
+    for exclusions in (["model.layers.1.mlp.experts"], ["mlp.experts"]):
+        quant["modules_to_not_convert"] = exclusions
+        _write_config(tmp_path, {"text_config": raw})
+        if exclusions == ["mlp.experts"]:
+            assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts) > 0
+        else:
+            with pytest.raises(ValueError, match="weight_block_size=128"):
+                memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+
+
 def test_selected_gemma4_uses_its_effective_window_for_single_request_retention():
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
@@ -2282,8 +2439,18 @@ def test_sparse_index_transfer_uses_the_platform_and_resident_layers(tmp_path):
         estimate_kv_bytes_per_token(
             model, **common, backend_version="0.33.0", system="rtx_pro_6000_server", kvcache_quant_mode="bfloat16"
         )
-    raw["index_topk_freq"] = 0
-    _write_config(tmp_path, {"text_config": raw})
+    for freq in (None, 0):
+        if freq is None:
+            del raw["index_topk_freq"]
+        else:
+            raw["index_topk_freq"] = freq
+        _write_config(tmp_path, {"text_config": raw})
+        assert (
+            estimate_kv_bytes_per_token(model, **common, backend="sglang", backend_version="0.5.20", system="h200_sxm")
+            == 92_628
+        )
+    with pytest.raises(ValueError, match="index_topk_freq"):
+        estimate_kv_bytes_per_token(model, **common, backend="sglang", backend_version="0.5.19", system="h200_sxm")
     with pytest.raises(ValueError, match="index_topk_freq"):
         estimate_kv_bytes_per_token(model, **common, backend_version="0.33.0", system="h200_sxm")
     raw["index_topk_pattern"] = []
@@ -2740,6 +2907,42 @@ def test_sglang_mxfp8_experts_use_the_fixed_checkpoint_block(tmp_path):
     _write_config(tmp_path, {"text_config": raw})
     with pytest.raises(ValueError, match="qwen3_moe.*conflicts.*Qwen3ForCausalLM"):
         memory.estimate_num_gpu_blocks(model, "blackwell", "sglang", "0.5.20", **opts)
+
+
+@pytest.mark.parametrize("estimate", [memory.estimate_kv_cache, memory.estimate_num_gpu_blocks])
+def test_sglang_mxfp8_gpu_requirements_follow_expert_exclusions(tmp_path, estimate):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    # InternVL 3.5 uses the BF16 Qwen3-30B-A3B decoder under llm_config.
+    text = _load_pre_downloaded_hf_config("Qwen/Qwen3-30B-A3B")
+    wrapper = {"architectures": ["InternVLChatModel"], "llm_config": text}
+    model = _write_config(tmp_path, wrapper)
+    opts = _missing_system_cache_options(tmp_path, tp_size=2, capacity=80 * _GIB)
+    opts.update(moe_tp_size=2, moe_ep_size=1)
+    for name, sm in (("hopper", 90), ("sm100", 100), ("sm120", 120)):
+        (tmp_path / f"{name}.yaml").write_text(f"gpu: {{sm_version: {sm}}}\n")
+    plain = estimate(model, "sm120", "sglang", "0.5.20", **opts)
+
+    quant = {
+        "quant_method": "mxfp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [1, 32],
+        "modules_to_not_convert": ["model", "lm_head"],
+    }
+    _write_config(tmp_path, dict(wrapper, quantization_config=quant))
+    assert estimate(model, "sm120", "sglang", "0.5.20", **opts) == plain
+    with pytest.raises(ValueError, match="SM100"):
+        estimate(model, "hopper", "sglang", "0.5.20", **opts)
+    with pytest.raises(ValueError, match="backend version 0.5.9"):
+        estimate(model, "sm120", "sglang", "0.5.8.post1", **opts)
+    with pytest.raises(ValueError, match="SM100 family"):
+        estimate(model, "sm120", "sglang", "0.5.9", **opts)  # This release always quantizes FusedMoE.
+
+    quant["modules_to_not_convert"] = ["model.layers.47", "lm_head"]
+    _write_config(tmp_path, dict(wrapper, quantization_config=quant))
+    with pytest.raises(ValueError, match="SM100 family"):
+        estimate(model, "sm120", "sglang", "0.5.20", **opts)
+    assert estimate(model, "sm100", "sglang", "0.5.20", **opts)
 
 
 @pytest.mark.parametrize("named", [True, False])
