@@ -46,7 +46,7 @@ from collections.abc import Callable
 from functools import partial
 from typing import Any
 
-from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
+from aisim_core.decoder_config import cache_window, decoder_config_key, decoder_config_problem
 from aisim_core.sdk import perf_database
 from aisim_core.sdk.backends.factory import get_backend
 from aisim_core.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, DeepSeekV4Config, DefaultHFModels
@@ -799,12 +799,12 @@ class NaiveKVCacheEstimator:
         A bare ``sliding_window`` with no per-layer signal is left unresolved -- the
         split is too model-specific to guess, and linear is the safe default.
         """
+        sliding_window = cache_window(hf_config)
         if parsed is not None and ARCHITECTURE_TO_MODEL_FAMILY.get(parsed.get("architecture")) == "STEP3P7":
             # Step-3.7 checkpoints can include MTP layers in layer_types. The parser retains only decoder layers.
             extra = parsed["extra_params"]
             return extra.sliding_window_size, extra.attn_layer_pattern.count(0), extra.attn_layer_pattern.count(1)
 
-        sliding_window = hf_config.get("sliding_window") or hf_config.get("sliding_window_size")
         num_layers = (
             cls._raw_dimension(parsed, "layers")
             if parsed is not None
@@ -1473,10 +1473,30 @@ def estimate_kv_cache(
             moe_tp_size=int(moe_tp_size or 1),
         )
         if "deepseek_v4" in naive.geometry:
+            # The packed rows and fixed compressor state follow vLLM's unstriped allocator.
+            if backend != "vllm" or cp_size != 1 or dcp_size != 1:
+                raise ValueError("DeepSeek V4 naive cache sizing requires vLLM with CP=1 and DCP=1") from exc
             if kvcache_quant_mode not in (None, "fp8"):
                 raise ValueError("DeepSeek V4 stores fp8_ds_mla KV; use kvcache_quant_mode fp8") from exc
             if nextn:
                 raise ValueError("DeepSeek V4 naive sizing requires nextn=0") from exc
+            model_config = build_model_config(
+                tp_size=naive.tp_size,
+                pp_size=naive.pp_size,
+                attention_dp_size=attention_dp_size,
+                moe_tp_size=moe_tp_size if moe_tp_size is not None else 1,
+                moe_ep_size=moe_ep_size if moe_ep_size is not None else 1,
+                gemm_quant_mode=gemm_quant_mode,
+                moe_quant_mode=moe_quant_mode,
+                fmha_quant_mode=fmha_quant_mode,
+                comm_quant_mode=comm_quant_mode,
+            )
+            _, expert_ranks = model_config.resolve_moe_parallelism()
+            if expert_ranks > naive.geometry["num_experts"]:
+                raise ValueError("DeepSeek V4 moe_ep_size exceeds the number of experts") from exc
+            for weight_mode in (model_config.gemm_quant_mode, model_config.moe_quant_mode):
+                if weight_mode is not None and weight_mode.value.memory != naive.dtype_bytes:
+                    raise ValueError("DeepSeek V4 naive weight sizing requires the checkpoint's weight width") from exc
         estimate = naive.estimate(
             capacity=gpu_memory_capacity_bytes_override,
             naive_kv_reservation=float(naive_kv_reservation),

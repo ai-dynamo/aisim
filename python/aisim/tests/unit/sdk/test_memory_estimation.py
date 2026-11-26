@@ -1351,6 +1351,36 @@ def test_gpt_oss_scheduler_pool_charges_each_concurrent_sliding_window(tmp_path,
     )
 
 
+@pytest.mark.parametrize("window", [-128, True, False, 1.5, "128"])
+def test_gpt_oss_pool_rejects_malformed_sliding_windows(tmp_path, window):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("openai/gpt-oss-20b")
+    model = _write_config(tmp_path, {**raw, "sliding_window": window})
+    args = (model, "missing-memory-spec", "vllm", "0.33.0")
+    options = dict(
+        systems_path=str(tmp_path),
+        max_num_tokens=8192,
+        max_batch_size=32,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        gpu_memory_capacity_bytes_override=64 * _GIB,
+        allow_naive_fallback=True,
+    )
+    with pytest.raises(ValueError, match="sliding_window must be an integer"):
+        memory.estimate_kv_cache(*args, **options)
+    with pytest.raises(ValueError, match="sliding_window must be an integer"):
+        memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16)
+
+
+@pytest.mark.parametrize("window", [None, 0])
+def test_absent_or_disabled_window_preserves_linear_capacity(window):
+    raw = {**_RAW_HYBRID, "sliding_window": window}
+    estimator = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=1, pp_size=1)
+    assert estimator.mode is memory.NaiveKVCacheMode.LINEAR
+    assert estimator.get_kvcache_max_tokens(_GIB, max_batch_size=32) == _GIB // estimator.kv_bytes_per_token()
+
+
 def test_deepseek_v4_sdk_fallback_reserves_each_requests_packed_state(tmp_path):
     hidden, vocab, layers, experts, width = 4096, 129280, 43, 256, 2048
     # The routed experts are distributed across EP8. The shared expert, attention and embeddings use TP8.
@@ -1395,9 +1425,61 @@ def test_deepseek_v4_sdk_fallback_reserves_each_requests_packed_state(tmp_path):
             )
             == blocks
         )
-    for override, reason in [({"kvcache_quant_mode": "bfloat16"}, "fp8_ds_mla"), ({"nextn": 1}, "nextn=0")]:
+    for override, reason in [
+        ({"kvcache_quant_mode": "bfloat16"}, "fp8_ds_mla"),
+        ({"nextn": 1}, "nextn=0"),
+        ({"gemm_quant_mode": "fp8"}, "weight width"),
+        ({"moe_quant_mode": "nvfp4"}, "weight width"),
+    ]:
         with pytest.raises(ValueError, match=reason):
             memory.estimate_kv_cache(*args, **options, **override, gpu_memory_capacity_bytes_override=weight + 64 * row)
+    assert (
+        memory.estimate_num_gpu_blocks(
+            *args,
+            **(options | {"moe_tp_size": None}),
+            gemm_quant_mode="bfloat16",
+            moe_quant_mode="bfloat16",
+            scheduler_block_size=256,
+            gpu_memory_capacity_bytes_override=weight + 64 * row,
+        )
+        == 12
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "tp", "dp", "cp", "dcp", "ep", "reason"),
+    [
+        ("vllm", 8, 1, 1, 2, 8, "CP=1 and DCP=1"),
+        ("vllm", 8, 1, 2, 1, 16, "CP=1 and DCP=1"),
+        ("sglang", 1, 1, 2, 1, 2, "vLLM"),
+        ("sglang", 8, 1, 1, 2, 8, "vLLM"),
+        ("trtllm", 8, 1, 1, 1, 8, "vLLM"),
+        ("vllm", 8, 1, 1, 1, 16, "Parallelism width mismatch"),
+        ("vllm", 8, 2, 1, 1, 8, "Parallelism width mismatch"),
+        ("vllm", 8, 64, 1, 1, 512, "number of experts"),
+    ],
+)
+def test_deepseek_v4_fallback_requires_a_modeled_rank_layout(tmp_path, backend, tp, dp, cp, dcp, ep, reason):
+    args = ("deepseek-ai/DeepSeek-V4-Flash", "missing-memory-spec", backend)
+    options = dict(
+        systems_path=str(tmp_path),
+        max_num_tokens=8192,
+        max_batch_size=2,
+        tp_size=tp,
+        attention_dp_size=dp,
+        cp_size=cp,
+        dcp_size=dcp,
+        moe_ep_size=ep,
+        moe_tp_size=1,
+        memory_fraction_kind="of_free" if backend == "trtllm" else "of_total",
+        memory_fraction_value=0.9,
+        allow_naive_fallback=True,
+        gpu_memory_capacity_bytes_override=100 * _GIB,
+    )
+    with pytest.raises(ValueError, match=reason):
+        memory.estimate_kv_cache(*args, **options)
+    with pytest.raises(ValueError, match=reason):
+        memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=256)
 
 
 # --------------------------------------------------------------------------- #

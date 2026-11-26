@@ -2531,20 +2531,29 @@ def test_glm_publication_policy_uses_frozen_cells_and_checkpoint_rows(tmp_path, 
     path = next((root / "fpm-checkpoint").rglob("fpm_forward.json"))
     checkpoint = json.loads(path.read_bytes())
     publication = checkpoint["database"]
-    # The collecting runner sealed the canonical rows independently of the database sidecar.
-    pair = database.validate_formal_database_commit(Path(publication["parquet"]), Path(publication["metadata"]), plan)
-    assert pair["measurement_policy"] == database.SINGLE_SAMPLE_MEASUREMENT_POLICY
-    publication["cell_rows"] = pair["cell_rows"]
-    _write(path, checkpoint)
+    parquet, metadata = Path(publication["parquet"]), Path(publication["metadata"])
+    sealed = parquet.read_bytes(), metadata.read_bytes()
+    assert json.loads(sealed[1])["measurement_policy"] == database.SINGLE_SAMPLE_MEASUREMENT_POLICY
     if historical:
+        # The collecting runner sealed the canonical rows independently of the database sidecar.
+        pair = database.validate_formal_database_commit(parquet, metadata, plan)
+        publication["cell_rows"] = pair["cell_rows"]
+        _write(path, checkpoint)
         validation_workflow._collection_source(request, root)
         finalize(request, root, tmp_path / "historical")
         del publication["cell_rows"]
         _write(path, checkpoint)
-    with pytest.raises(ValueError, match="rows differ"):
+        error = "rows differ"
+    else:
+        error = "measurement_policy differs from the GLM producer cell"
+        with pytest.raises(ValueError, match=error):
+            database.validate_formal_database_commit(parquet, metadata, plan)
+    with pytest.raises(ValueError, match=error):
         finalize(request, root, tmp_path / "refused")
-    with pytest.raises(ValueError, match="rows differ"):
+    with pytest.raises(ValueError, match=error):
         validation_workflow._collection_source(request, root)
+    assert not (tmp_path / "refused").exists()
+    assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
 
 
 def test_glm_publication_reads_the_hash_block_of_the_accepted_deployment(tmp_path, capsys):

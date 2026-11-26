@@ -2128,24 +2128,29 @@ def test_glm_rows_cannot_join_rows_without_a_measurement_policy(tmp_path):
     assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
 
 
-def test_first_publisher_reuse_requires_the_same_measurement_policy(tmp_path):
+@pytest.mark.parametrize("first_median", [False, True], ids=["single", "median"])
+def test_first_publisher_reuse_requires_the_same_measurement_policy(tmp_path, first_median):
     plan = _glm_plan()
     cell, directory = _producer_cells(tmp_path)["prefill"]
     single = database.aggregate_cell(plan, cell, directory, expected_attempt_id=ATTEMPT_ID, median_policy=False)
     median = database.aggregate_cell(plan, cell, directory, expected_attempt_id=ATTEMPT_ID)
     systems = tmp_path / "systems"
-    parquet, metadata, _ = database.write_formal_database(plan, single, systems_root=systems)
+    first, different = (median, single) if first_median else (single, median)
+    parquet, metadata, _ = database.write_formal_database(plan, first, systems_root=systems)
     sealed = parquet.read_bytes(), metadata.read_bytes()
     for rows in (single, median):
         for row in rows:
             row["collector_attempt_id"] = "f" * 32
-    assert database.write_formal_database(plan, single, systems_root=systems) == (parquet, metadata, (cell.cell_id,))
+    assert database.write_formal_database(plan, first, systems_root=systems) == (parquet, metadata, (cell.cell_id,))
     with pytest.raises(ValueError, match="Publish to a clean destination"):
-        database.write_formal_database(plan, median, systems_root=systems)
-    with pytest.raises(ValueError, match="measurement_policy differs from the GLM producer cell"):
-        database.validate_formal_database_commit(
-            parquet, metadata, plan, required_cells=(cell,), reused_cell_ids=(cell.cell_id,)
-        )
+        database.write_formal_database(plan, different, systems_root=systems)
+    reuse = dict(required_cells=(cell,), reused_cell_ids=(cell.cell_id,))
+    if first_median:
+        saved = database.validate_formal_database_commit(parquet, metadata, plan, **reuse)
+        assert saved["measurement_policy"] == database.VLLM_PREFIX_SEED_MEDIAN_POLICY
+    else:
+        with pytest.raises(ValueError, match="measurement_policy differs from the GLM producer cell"):
+            database.validate_formal_database_commit(parquet, metadata, plan, **reuse)
     assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
 
 
