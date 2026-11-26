@@ -269,17 +269,24 @@ impl Worker {
                 .any(|name| peer.backends.contains(name))
     }
 
-    fn accepts_layout(&self, remote: &str, local: &str, version: Option<&str>) -> bool {
+    fn accepts_layout(
+        &self,
+        remote: &str,
+        local: &str,
+        version: Option<&str>,
+        hybrid_hma: bool,
+    ) -> bool {
         // 0.31 only tests the remote layout in its permute branch. A probe with no connector
         // does not determine a later serving deployment's permute setting.
         remote == local
             || (remote == "LBHNC"
                 && (local == "LBNHC" || version == Some("0.31.0") || version.is_none())
                 && self.permit_permute != Some(false)
-                && !self.requires_hma)
+                && !self.requires_hma
+                && !hybrid_hma)
     }
 
-    fn excludes_layout(&self, decode: &Self, version: Option<&str>) -> bool {
+    fn excludes_layout(&self, decode: &Self, version: Option<&str>, hybrid_hma: bool) -> bool {
         let (Some(remote), Some(local)) = (&self.kv_cache_layout, &decode.kv_cache_layout) else {
             return false;
         };
@@ -288,7 +295,7 @@ impl Worker {
                 local
                     .names()
                     .iter()
-                    .any(|l| decode.accepts_layout(r, l, version))
+                    .any(|l| decode.accepts_layout(r, l, version, hybrid_hma))
             })
     }
 }
@@ -310,6 +317,7 @@ pub(crate) struct NixlIdentity {
     pub(crate) modeled_version: Option<String>,
     pub(crate) disable_hma: Option<String>,
     pub(crate) measured_mamba: bool,
+    pub(crate) hybrid_groups: bool,
     pub(crate) workers: Vec<Worker>,
     pub(crate) engines: layout::Deployment,
     pub(crate) rosters: Vec<Vec<Worker>>,
@@ -354,6 +362,10 @@ impl NixlIdentity {
                 Ok(worker)
             })
             .collect()
+    }
+
+    pub(crate) fn bound_cell_digests(digests: Vec<String>) -> Result<Vec<String>, AicError> {
+        roster::bound_cell_digests(digests)
     }
 
     pub(crate) fn observation_digest(
@@ -436,6 +448,10 @@ impl NixlIdentity {
             return Err(roster::invalid());
         }
         self.settings(&entry["runtime_settings"])?;
+        let formal = entry["source"] == "vllm_initialized_cache";
+        if formal {
+            self.settings(&entry["resolved_config"])?;
+        }
         record(
             &mut self.version,
             entry.pointer("/runtime/version").and_then(Value::as_str),
@@ -454,7 +470,28 @@ impl NixlIdentity {
         // The original finalizer kept the initialized common settings and capacity coordinates,
         // but omitted every worker view. A resolved cache layout still applies to those ranks.
         if capture == Capture::References && complete {
-            let config = &entry["runtime_settings"];
+            let mut config = entry["runtime_settings"].clone();
+            if formal {
+                // The formal writer retained both copies of these initialized worker settings.
+                // Its normalized copy deliberately omits phase-specific cache policy.
+                for (section, key) in [
+                    ("cache_config", "kv_cache_layout"),
+                    ("model_config", "use_mla"),
+                    ("kv_transfer_config", "enable_permute_local_kv"),
+                    ("kv_transfer_config", "kv_buffer_device"),
+                ] {
+                    let other = &entry["resolved_config"][section][key];
+                    if !other.is_null() {
+                        if !config[section][key].is_null() && config[section][key] != *other {
+                            return Err(conflict(key));
+                        }
+                        if !config[section].is_null() && !config[section].is_object() {
+                            return Err(conflict(key));
+                        }
+                        config[section][key] = other.clone();
+                    }
+                }
+            }
             let common = Worker::observed(&serde_json::json!({"resolved_config":config}))?;
             if common.gpu_cache_layout.is_some()
                 || common.use_mla.is_some()
@@ -578,6 +615,7 @@ impl NixlIdentity {
                 let rank = &artifact["evidence"];
                 if rank["kind"].as_str() == Some("worker") {
                     self.settings(&rank["resolved_config"])?;
+                    self.measured_groups(&rank["cache"]["groups"])?;
                     if entry["source"] == "vllm_initialized_cache" {
                         record(
                             &mut self.version,
@@ -640,9 +678,14 @@ impl NixlIdentity {
         Ok(found)
     }
 
-    fn measured_groups(&mut self, resources: &Value) -> Result<(), AicError> {
+    pub(crate) fn measured_groups(&mut self, groups: &Value) -> Result<(), AicError> {
+        self.hybrid_groups |= groups.as_array().is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|g| g["kind"] == "state" || g["sliding_window"].is_u64())
+        });
         // The importer records a prefill checkpoint count (including zero) only for Mamba.
-        if resources["cache_groups"].as_array().is_some_and(|groups| {
+        if groups.as_array().is_some_and(|groups| {
             groups
                 .iter()
                 .any(|g| g["kind"] == "state" && g["prefill_checkpoint_blocks"].is_u64())
@@ -717,7 +760,7 @@ impl NixlIdentity {
             Some(
                 "aisimulate-onboarding-runtime-probe/v1" | "aisimulate-onboarding-runtime-probe/v2",
             ) => {
-                self.measured_groups(&entry["observed_resources"])?;
+                self.measured_groups(&entry["observed_resources"]["cache_groups"])?;
                 let memory = &entry["observed_resources"]["runtime_memory"];
                 self.memory(memory)?;
                 let legacy = entry["schema_version"] == "aisimulate-onboarding-runtime-probe/v1";
@@ -766,6 +809,23 @@ impl NixlIdentity {
             return Ok(identity);
         };
         identity.probe(&evidence)?;
+        if let Some(compatibility) = evidence.get("runtime_compatibility") {
+            let source = compatibility["source_observations_index"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(roster::invalid)?;
+            let probe = &evidence["runtime_probe"];
+            if !matches!(
+                probe["schema_version"].as_str(),
+                Some(
+                    "aisimulate-onboarding-runtime-probe/v1"
+                        | "aisimulate-onboarding-runtime-probe/v2"
+                )
+            ) || probe["observations_index"].as_str() != Some(source)
+            {
+                return Err(roster::invalid());
+            }
+        }
         if let Some(probe) = evidence.get("runtime_probe") {
             identity.probe(probe)?;
         }
@@ -792,6 +852,7 @@ impl NixlIdentity {
             return Err(roster::invalid());
         }
         let mut digests = Vec::new();
+        let mut formal_cells = std::collections::BTreeSet::new();
         if let Some(cells) = evidence["cell_observations"].as_array() {
             for cell in cells {
                 let memory = &cell["runtime_memory"];
@@ -810,9 +871,18 @@ impl NixlIdentity {
                     return Err(roster::invalid());
                 }
                 if roster::identified_source(&nested) {
-                    identity.measured_groups(cell)?;
+                    identity.measured_groups(&cell["cache_groups"])?;
                 }
                 if bound {
+                    if nested["source"] == "vllm_initialized_cache" {
+                        let id = nested["cell_id"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(roster::invalid)?;
+                        if !formal_cells.insert(id.to_owned()) {
+                            return Err(roster::invalid());
+                        }
+                    }
                     let capacities = nested["rank_capacities"]
                         .as_array()
                         .ok_or_else(roster::invalid)?;
@@ -855,8 +925,7 @@ impl NixlIdentity {
                 .map(|v| v.as_str().ok_or_else(roster::invalid))
                 .collect::<Result<Vec<_>, _>>()?;
             expected.sort_unstable();
-            digests.sort_unstable();
-            if expected != digests {
+            if expected != Self::bound_cell_digests(digests)? {
                 return Err(roster::invalid());
             }
         }
@@ -977,20 +1046,7 @@ impl NixlIdentity {
         }
         self.modeled_version = modeled_version.filter(|s| known(s)).map(str::to_owned);
         record(&mut self.version, recorded_version, "vllm_version")?;
-        if let (Some(actual), Some(modeled)) = (
-            self.version.as_deref(),
-            modeled_version.filter(|s| known(s)),
-        ) && !FpmRuntimeMemoryConfig::matches_grouped_version(actual, modeled, prefix_caching)
-        {
-            let field = if recorded_version.is_some() {
-                "runtime_memory.runtime_framework_version"
-            } else {
-                "observed vllm_version"
-            };
-            return Err(AicError::InvalidEngineConfig(format!(
-                "grouped FPM cache P/D requires {field} ({actual}) to equal the deployment's backend_version ({modeled})"
-            )));
-        }
+        self.check_version(recorded_version, prefix_caching)?;
         if let (Some(raw), Some(label)) = (
             self.kv_cache_dtype.as_deref(),
             precision.filter(|s| known(s) && *s != "auto"),
@@ -1007,6 +1063,27 @@ impl NixlIdentity {
             if physical.is_some_and(|value| canonical(value) != canonical(label)) {
                 return Err(conflict("kv_cache_dtype"));
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_version(
+        &self,
+        recorded_version: Option<&str>,
+        prefix_caching: bool,
+    ) -> Result<(), AicError> {
+        if let (Some(actual), Some(modeled)) =
+            (self.version.as_deref(), self.modeled_version.as_deref())
+            && !FpmRuntimeMemoryConfig::matches_grouped_version(actual, modeled, prefix_caching)
+        {
+            let field = if recorded_version.is_some() {
+                "runtime_memory.runtime_framework_version"
+            } else {
+                "observed vllm_version"
+            };
+            return Err(AicError::InvalidEngineConfig(format!(
+                "grouped FPM cache P/D requires {field} ({actual}) to equal the deployment's backend_version ({modeled})"
+            )));
         }
         Ok(())
     }
@@ -1097,7 +1174,12 @@ impl NixlIdentity {
             .as_deref()
             .or(decode.modeled_version.as_deref())
             .map(FpmRuntimeMemoryConfig::modeled_release);
-        if incompatible(&|p, d| p.excludes_layout(d, version)) {
+        // The handshake requires the same HMA setting on both roles. With hybrid cache groups
+        // a known enabled setting therefore rules out receive-side permutation on the decoder.
+        let hybrid_hma = decode.hybrid_groups
+            && [self.disable_hma.as_deref(), decode.disable_hma.as_deref()]
+                .contains(&Some("false"));
+        if incompatible(&|p, d| p.excludes_layout(d, version, hybrid_hma)) {
             return Some((
                 "kv_cache_layout",
                 "prefill workers".into(),
@@ -1107,7 +1189,9 @@ impl NixlIdentity {
         let tp = self
             .tp_size
             .filter(|t| Some(*t) == decode.tp_size && *t > 0);
-        if tp.is_some() && !layout::engines_routable(&self.engines, &decode.engines, version) {
+        if tp.is_some()
+            && !layout::engines_routable(&self.engines, &decode.engines, version, hybrid_hma)
+        {
             return Some((
                 "kv_cache_layout",
                 "prefill engines".into(),
@@ -1122,7 +1206,7 @@ impl NixlIdentity {
                 let d: Vec<_> = decode.workers.iter().filter(at_slot).collect();
                 // A missing prefill observation leaves one freely chosen, immutable layout.
                 // A missing decode observation also leaves the MLA exemption possible.
-                if (p.len() > 1 || d.len() > 1) && !layout::routable(&p, &d, version) {
+                if (p.len() > 1 || d.len() > 1) && !layout::routable(&p, &d, version, hybrid_hma) {
                     return Some((
                         "kv_cache_layout",
                         "prefill workers".into(),
@@ -1158,7 +1242,7 @@ impl NixlIdentity {
                         && !a.excludes_backend(b)
                 };
                 if !roster::can_pair(p, d, |a, b| {
-                    compatible(a, b) && !a.excludes_layout(b, version)
+                    compatible(a, b) && !a.excludes_layout(b, version, hybrid_hma)
                 }) {
                     let field = if roster::can_pair(p, d, compatible) {
                         "kv_cache_layout"
@@ -1505,7 +1589,7 @@ mod tests {
     fn complete_anonymous_cells_must_describe_the_same_physical_workers() {
         let cell = |names: Value| {
             let captures = json!({"source":"runtime_observations","observation_schema":"aisimulate-runtime-observation/v1",
-                "runtime_settings":{"parallel_config":{"tensor_parallel_size":2}},"artifacts":[{"path":"rank.json","sha256":"0".repeat(64)}],"worker_attention_backends":names,
+                "runtime_settings":{"parallel_config":{"tensor_parallel_size":2}},"artifacts":(["worker-a","worker-b","scheduler"].map(|p| json!({"path":p,"sha256":"0".repeat(64)}))),"worker_attention_backends":names,
                 "rank_capacities":[{"phase":"prefill","tp_rank":0,"dp_rank":0},{"phase":"prefill","tp_rank":1,"dp_rank":0}]});
             json!({"runtime_memory":{"provenance":captures.to_string()}})
         };
@@ -1640,7 +1724,7 @@ mod tests {
         assert!(Worker::observed(&row).is_err());
         row["cache"]["layer_tensors"] = json!({});
         let w = Worker::observed(&row).unwrap();
-        assert!(!w.accepts_layout("LBHNC", "LBNHC", Some("0.33.0")));
+        assert!(!w.accepts_layout("LBHNC", "LBNHC", Some("0.33.0"), false));
         row["resolved_config"] = json!({"model_config":{"use_mla":true},"kv_transfer_config":{
             "kv_buffer_device":"cpu","enable_permute_local_kv":true}});
         assert_eq!(
@@ -1793,7 +1877,7 @@ mod tests {
             let entry = json!({
                 "source":"vllm_initialized_cache", "observer_schema_version":"v1",
                 "runtime_settings":{"cache_config":{"kv_cache_layout":layout},"model_config":{"use_mla":false}},
-                "artifacts":[{"path":"rank.json","sha256":"0".repeat(64)}],
+                "artifacts":(["worker","scheduler"].map(|p| json!({"path":p,"sha256":"0".repeat(64)}))),
                 "rank_capacities":[{"dp_rank":0,"tp_rank":0}]
             });
             json!({"observation_provenance":"source_references","cell_observations":[{
@@ -1811,6 +1895,19 @@ mod tests {
             "prefill",
         );
         assert!(disabled.mismatch(&right).is_none());
+        let window = json!([{"kind":"attention", "sliding_window":128}]);
+        let decoder = observe(compact("LBNHC", window), "decode");
+        let mut sender = compact("LBHNC", json!([]));
+        assert!(
+            observe(sender.clone(), "prefill")
+                .mismatch(&decoder)
+                .is_none()
+        );
+        sender["runtime_settings"] =
+            json!({"scheduler_config":{"disable_hybrid_kv_cache_manager":false}});
+        let sender = observe(sender, "prefill");
+        assert_eq!(sender.mismatch(&decoder).unwrap().0, "kv_cache_layout");
+        assert!(sender.mismatch(&right).is_none());
         for count in [0, 1] {
             let mamba = observe(
                 compact(
@@ -1839,17 +1936,17 @@ mod tests {
         let layer_outer = worker(&["LBHNC", "LBNHC", "LHBNC"]);
         let block_outer = worker(&["BLHNC", "BLNHC", "BHLNC"]);
         for (p, d) in [(&layer_outer, &block_outer), (&block_outer, &layer_outer)] {
-            assert!(p.excludes_layout(d, Some("0.32.0")));
-            assert!(!p.excludes_layout(p, Some("0.32.0")));
+            assert!(p.excludes_layout(d, Some("0.32.0"), false));
+            assert!(!p.excludes_layout(p, Some("0.32.0"), false));
         }
         let p = worker(&["LBHNC", "BLHNC"]);
         let mut d = worker(&["LBNHC", "BLNHC"]);
-        assert!(!p.excludes_layout(&d, Some("0.32.0")));
-        assert!(d.excludes_layout(&p, Some("0.32.0")));
+        assert!(!p.excludes_layout(&d, Some("0.32.0"), false));
+        assert!(d.excludes_layout(&p, Some("0.32.0"), false));
         d.permit_permute = Some(false);
-        assert!(p.excludes_layout(&d, Some("0.32.0")));
+        assert!(p.excludes_layout(&d, Some("0.32.0"), false));
         d.use_mla = Some(true);
-        assert!(!p.excludes_layout(&d, Some("0.32.0")));
+        assert!(!p.excludes_layout(&d, Some("0.32.0"), false));
         let mut captured = layer_outer.clone();
         captured.combine(&worker(&["BLNHC", "LHBNC"])).unwrap();
         assert_eq!(captured.kv_cache_layout, Layouts::named("LHBNC"));
@@ -1874,12 +1971,23 @@ mod tests {
         for version in ["0.31.0", "0.32.0", "0.33.0"] {
             let native = local("LBNHC");
             let converted = local("LBHNC");
-            assert!(layout::routable(&[&native], &[&receiver], Some(version)));
-            assert!(layout::routable(&[&converted], &[&receiver], Some(version)));
+            assert!(layout::routable(
+                &[&native],
+                &[&receiver],
+                Some(version),
+                false
+            ));
+            assert!(layout::routable(
+                &[&converted],
+                &[&receiver],
+                Some(version),
+                false
+            ));
             assert!(!layout::routable(
                 &[&native, &converted],
                 &[&receiver],
-                Some(version)
+                Some(version),
+                false
             ));
         }
         let a = local("BLHNC");
@@ -1888,23 +1996,45 @@ mod tests {
             use_mla: Some(true),
             ..b.clone()
         };
-        assert!(!layout::routable(&[], &[&a, &b], Some("0.32.0")));
-        assert!(layout::routable(&[&a, &b], &[], Some("0.32.0")));
-        assert!(!layout::routable(&[&p, &p], &[&a, &b], Some("0.32.0")));
-        assert!(!layout::routable(&[&a, &b], &[&p, &p], Some("0.32.0")));
-        assert!(layout::routable(&[&p, &p], &[&a, &mla], Some("0.32.0")));
-        assert!(layout::routable(&[&p, &p], &[&a, &p], Some("0.32.0")));
+        assert!(!layout::routable(&[], &[&a, &b], Some("0.32.0"), false));
+        assert!(layout::routable(&[&a, &b], &[], Some("0.32.0"), false));
+        assert!(!layout::routable(
+            &[&p, &p],
+            &[&a, &b],
+            Some("0.32.0"),
+            false
+        ));
+        assert!(!layout::routable(
+            &[&a, &b],
+            &[&p, &p],
+            Some("0.32.0"),
+            false
+        ));
+        assert!(layout::routable(
+            &[&p, &p],
+            &[&a, &mla],
+            Some("0.32.0"),
+            false
+        ));
+        assert!(layout::routable(
+            &[&p, &p],
+            &[&a, &p],
+            Some("0.32.0"),
+            false
+        ));
         let remote = local("LBHNC");
         let permuted = local("LBNHC");
         assert!(!layout::routable(
             &[&remote, &permuted],
             &[&permuted, &permuted],
-            Some("0.32.0")
+            Some("0.32.0"),
+            false
         ));
         assert!(!layout::routable(
             &[&remote, &permuted],
             &[&remote, &permuted],
-            Some("0.32.0")
+            Some("0.32.0"),
+            false
         ));
     }
 
@@ -1916,18 +2046,18 @@ mod tests {
             ..Default::default()
         };
         let (p, mut d) = (w("LBHNC"), w("LBNHC"));
-        assert!(!p.excludes_layout(&d, Some("0.33.0")));
-        assert!(d.excludes_layout(&p, Some("0.33.0")));
-        assert!(!p.excludes_layout(&w("BLNHC"), Some("0.31.0")));
-        assert!(p.excludes_layout(&w("BLNHC"), Some("0.32.0")));
+        assert!(!p.excludes_layout(&d, Some("0.33.0"), false));
+        assert!(d.excludes_layout(&p, Some("0.33.0"), false));
+        assert!(!p.excludes_layout(&w("BLNHC"), Some("0.31.0"), false));
+        assert!(p.excludes_layout(&w("BLNHC"), Some("0.32.0"), false));
         d.permit_permute = Some(false);
-        assert!(p.excludes_layout(&d, Some("0.33.0")));
+        assert!(p.excludes_layout(&d, Some("0.33.0"), false));
         d.permit_permute = Some(true);
         d.requires_hma = true;
-        assert!(p.excludes_layout(&d, Some("0.33.0")));
+        assert!(p.excludes_layout(&d, Some("0.33.0"), false));
         for mla in [Some(true), None] {
             d.use_mla = mla;
-            assert!(!p.excludes_layout(&d, Some("0.33.0")));
+            assert!(!p.excludes_layout(&d, Some("0.33.0"), false));
         }
     }
 }

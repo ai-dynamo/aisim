@@ -2291,7 +2291,10 @@ def test_direct_grouped_pd_prefix_policy_checks_each_role(grouped_case, pinned, 
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
-@pytest.mark.parametrize("runtime_version,hash_block", [("0.31.0", None), ("0.31.0+cu130", None), ("0.31.0+cu130", 3)])
+@pytest.mark.parametrize(
+    "runtime_version,hash_block",
+    [("0.31.0", None), ("0.31.0+cu130", None), ("0.31.0+cu130", 3), ("0.31.0+cu130", "unequal_pages")],
+)
 def test_warm_grouped_pd_search_keeps_the_supported_shape(grouped_case, role, runtime_version, hash_block):
     from aisim.sweeper.config import SmartSearchConfig
     from aisim.sweeper.model_hw import NoViableParallelConfig
@@ -2305,6 +2308,8 @@ def test_warm_grouped_pd_search_keeps_the_supported_shape(grouped_case, role, ru
     if hash_block is None:
         memory.update(enable_prefix_caching=False, mamba_cache_mode="none")
         memory.pop("hash_block_size_tokens")
+    elif hash_block == "unequal_pages":
+        cold["resources"]["cache_groups"][1]["page_size_bytes"] *= 2
     else:
         memory["hash_block_size_tokens"] = hash_block
     _write_timings(root, profile, version="0.31.0")
@@ -2335,6 +2340,83 @@ def test_warm_grouped_pd_search_keeps_the_supported_shape(grouped_case, role, ru
         NoViableParallelConfig, match="pinned parallel_configs are legal/KV-feasible for no configured backend"
     ):
         recommend(warm, cold)
+
+
+@pytest.mark.parametrize("warm_role", ["prefill", "decode"])
+@pytest.mark.parametrize(
+    "version,field,peer",
+    [
+        ("0.31.0", "kv_cache_dtype", "bfloat16"),
+        ("0.32.0", "attention_backend", "FLASHINFER"),
+        ("0.33.0", "runtime_framework_version", "0.33.0+cu131"),
+        ("0.32.0", "model_dtype", "half"),
+    ],
+)
+def test_warm_grouped_pd_search_compares_transfer_peers_before_installed_build(
+    grouped_case, warm_role, version, field, peer
+):
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.search_space import enumerate_branches
+
+    original, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(original, version=version), version=version)
+    _write_timings(root, profile, version=version)
+    tensor, dep = profile["deployments"]
+    sender, receiver = ({**deepcopy(tensor), "worker_type": role} for role in ("prefill", "decode"))
+    profile["deployments"] = [sender, receiver, dep]
+    for row in (sender, receiver):
+        row["attention_backend"] = "FLASH_ATTN"
+        row["resources"]["runtime_memory"].update(runtime_framework_version=version + "+cu130", model_dtype="bf16")
+    settings = receiver if field in receiver else receiver["resources"]["runtime_memory"]
+    matching = settings[field]
+    settings[field] = peer
+    flags = {f"{role}_enable_prefix_caching": role == warm_role for role in ("prefill", "decode")}
+    cold = dict.fromkeys(flags, False)
+
+    def recommendation(flags):
+        search = {**_pd_search(profile, root), **flags}
+        smart = SmartSearchConfig(
+            search_space=search, workload=Workload(isl=128, osl=2, concurrency=1, request_count=2)
+        )
+        (branch,) = enumerate_branches(smart, max_seq_len=128)
+        return branch.parallel_configs
+
+    def standalone(flags):
+        return parallel_configs_for(
+            profile["model"],
+            "h200_sxm",
+            gpu_budget=4,
+            deployment_mode="disagg",
+            backend="vllm",
+            backend_version=version,
+            fpm_profile=profile,
+            systems_paths=[str(root)],
+            max_seq_len=128,
+            max_num_tokens=128,
+            max_batch_size=4,
+            **flags,
+        )
+
+    for candidates in (recommendation, standalone):
+        assert {(p.prefill.shape.tp, p.decode.shape.tp) for p in candidates(flags)} == {(1, 1)}
+        assert {(p.prefill.shape.tp, p.decode.shape.tp) for p in candidates(cold)} == {(1, 1)}
+
+    prediction = _pd_prediction(profile, root)
+    prediction["engine"]["context_length"] = 1024
+    prediction["traffic"]["source"]["input_tokens"] = 128
+    for role, rank in prediction["engine"]["workers"].items():
+        rank["parallelism"] = {"tensor": 1, "attention_data": 2, "moe_tensor": 1, "moe_expert": 2}
+        rank["kv_cache"]["prefix_caching"] = role == warm_role
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(prediction))
+    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 2
+
+    # Matching local builds can transfer cold; enabling the modeled warm feature still requires the exact release.
+    settings[field] = matching
+    for candidates in (recommendation, standalone):
+        assert {(p.prefill.shape.tp, p.decode.shape.tp) for p in candidates(cold)} == {(1, 1), (2, 2)}
+        with pytest.raises(ValueError, match="runtime_framework_version.*cu130"):
+            candidates(flags)
 
 
 @pytest.mark.parametrize("observed_role", ["prefill", "decode"])
@@ -2374,12 +2456,38 @@ def test_grouped_pd_checks_dtype_when_only_one_role_has_runtime_memory(grouped_c
     for request in (search, pinned):
         assert len(_fpm_parallel_configs(SearchSpace.model_validate(request), "disagg")) == 1
 
+    def single(warm=False):
+        return parallel_configs_for(
+            profile["model"],
+            "h200_sxm",
+            gpu_budget=2,
+            deployment_mode="agg",
+            worker_type=observed_role,
+            backend="vllm",
+            backend_version=version,
+            fpm_profile=profile,
+            systems_paths=[str(root)],
+            max_seq_len=128,
+            max_num_tokens=128,
+            max_batch_size=4,
+            **{f"{observed_role}_enable_prefix_caching": warm},
+        )
+
+    assert single()
     memory["model_dtype"] = "float16"
     with pytest.raises(ValueError, match="model_dtype conflicts with observed runtime settings"):
         CorePredictionConfig.model_validate(raw)
     for request in (search, pinned):
         with pytest.raises(ValueError, match="model_dtype conflicts with observed runtime settings"):
             _fpm_parallel_configs(SearchSpace.model_validate(request), "disagg")
+
+    with pytest.raises(ValueError, match="model_dtype conflicts with observed runtime settings"):
+        single()
+    memory.update(model_dtype="bfloat16", provenance=json.dumps({"runtime": {"version": version + "+cu130"}}))
+    memory.pop("runtime_framework_version", None)
+    assert single()
+    with pytest.raises(ValueError, match="observed vllm_version.*cu130"):
+        single(warm=True)
 
 
 @pytest.mark.parametrize(

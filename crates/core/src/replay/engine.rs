@@ -288,6 +288,9 @@ impl ReplayRoleConfig {
             Some(u64::from(self.tensor_parallel_size) * u64::from(self.dp_size)),
             Some(u64::from(self.tensor_parallel_size)),
         )?;
+        if let Some(groups) = deployment.and_then(|d| d.pointer("/resources/cache_groups")) {
+            observed.measured_groups(groups)?;
+        }
         let backend = source(
             "attention_backend",
             config["attention_backend"].as_str(),

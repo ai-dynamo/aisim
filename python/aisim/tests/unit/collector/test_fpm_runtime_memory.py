@@ -1052,6 +1052,39 @@ def test_sparse_formal_finalization_still_binds_its_installed_version_and_rank_r
     with pytest.raises(ValueError, match="worker roster"):
         _runtime.grouped_observation_requirement(captured, captured, wrong_width, wrong_width, 2)
 
+    legacy = {}
+    _merge_resources([resources], legacy, source_references=True, observation_format="source_references")
+    memory_copy = legacy["cell_observations"][0]["runtime_memory"]
+    archived = json.loads(memory_copy["provenance"])
+    runtime_model = archived["runtime_settings"]["model_config"]
+    assert runtime_model["model"] == archived["resolved_config"]["model_config"]["model"]
+    del runtime_model["model"]
+    other_model = (json.dumps({"runtime_settings": {"model_config": {"model": "different"}}}), None, "auto")
+    memory_copy["provenance"] = json.dumps(archived)
+    assert "matching model" in _runtime.grouped_observation_requirement((json.dumps(legacy), None, "auto"), other_model)
+    runtime_model["model"] = "different"
+    memory_copy["provenance"] = json.dumps(archived)
+    with pytest.raises(ValueError, match="model conflicts"):
+        _runtime.observed_model_dtype(json.dumps(legacy))
+
+    # A formal collection may contain a separate measurement for each selected cell.
+    second = json.loads(json.dumps(resources))
+    other = json.loads(second["runtime_memory"]["provenance"])
+    other["cell_id"] += "-second"
+    second["runtime_memory"]["provenance"] = json.dumps(other)
+    multi = {}
+    _merge_resources([resources, second], multi, source_references=True)
+    assert _runtime.observed_model_dtype(json.dumps(multi))
+    for i in (0, 1):
+        damaged = json.loads(json.dumps(multi))
+        damaged["cell_observations"].pop(i)
+        for digest in multi["worker_observation_digests"]:
+            damaged["worker_observation_digests"] = [digest]
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(damaged))
+    with pytest.raises(ValueError, match="worker roster"):
+        _merge_resources([resources, resources], {}, source_references=True)
+
     portable["artifacts"].reverse()
     memory["provenance"] = json.dumps(portable)
     assert _runtime.observed_model_dtype(json.dumps(saved))

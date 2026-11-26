@@ -374,6 +374,7 @@ def _profile_parallel_configs(
     from aisim.config.engine import (
         GroupedPrefixEvidenceError,
         GroupedPrefixGeometryError,
+        grouped_pd_observation,
         grouped_pd_pair_requirement,
         grouped_pd_transfer_requirements,
         grouped_prefix_caching_requirements,
@@ -395,6 +396,15 @@ def _profile_parallel_configs(
             and deployment.backend_version == backend_version
             and deployment.worker_type in (None, role)
         }
+
+    observations = {}
+
+    def observe(role, deployment):
+        # Selected model objects live for this enumeration; replicas and peer choices share their identity.
+        key = role, id(deployment)
+        if key not in observations:
+            observations[key] = grouped_pd_observation(role, deployment)
+        return observations[key]
 
     first_prefix_error = None
     unavailable_prefix = (GroupedPrefixEvidenceError, GroupedPrefixGeometryError)
@@ -464,7 +474,20 @@ def _profile_parallel_configs(
                 ReplicaParallelConfig(shape, count) for shape in shapes for count in allowed_counts("agg", shape)
             ]
         if worker_type in ("prefill", "decode"):
-            configs = [config for config in configs if supports_prefix(prefix_requirement(worker_type, config.shape))]
+
+            @cache
+            def viable(shape):
+                deployment = shapes[shape]
+                if deployment.resources.cache_layout != "grouped":
+                    return True
+                observation = observe(worker_type, deployment)
+                if not supports_prefix(prefix_requirement(worker_type, shape)):
+                    return False
+                if prefix_caching[0 if worker_type == "prefill" else 1]:
+                    observation.require_warm_version()
+                return True
+
+            configs = [config for config in configs if viable(config.shape)]
     elif deployment_mode == "disagg":
         prefill_shapes = shapes_for(hardware_sku, "prefill")
         decode_shapes = shapes_for(decode_hardware_sku or hardware_sku, "decode")
@@ -472,14 +495,7 @@ def _profile_parallel_configs(
 
         def compatible(prefill_shape, decode_shape):
             prefill, decode = prefill_shapes[prefill_shape], decode_shapes[decode_shape]
-            prefill_error = prefix_requirement("prefill", prefill_shape)
-            decode_error = prefix_requirement("decode", decode_shape)
-            # A pair lacking warm geometry still has to pass the ordinary transfer checks. Only a viable warm
-            # pair needs the feature-specific installed version on either rank.
-            unavailable = next((e for e in (prefill_error, decode_error) if isinstance(e, unavailable_prefix)), None)
-            requirement = grouped_pd_pair_requirement(
-                prefill, decode, prefix_caching=(False, False) if unavailable else prefix_caching
-            )
+            requirement = grouped_pd_pair_requirement(prefill, decode, observe=observe)
             if requirement:
                 requirements[requirement] = None
                 return False
@@ -487,7 +503,14 @@ def _profile_parallel_configs(
                 return True
             if validate_transfer:
                 grouped_pd_transfer_requirements(prefill, decode, backend_version=backend_version, kv_transfer=None)
-            return supports_prefix(unavailable or prefill_error or decode_error)
+            errors = (prefix_requirement("prefill", prefill_shape), prefix_requirement("decode", decode_shape))
+            unavailable = next((e for e in errors if isinstance(e, unavailable_prefix)), None)
+            if not supports_prefix(unavailable or errors[0] or errors[1]):
+                return False
+            for role, deployment, warm in zip(("prefill", "decode"), (prefill, decode), prefix_caching, strict=True):
+                if warm:
+                    observe(role, deployment).require_warm_version()
+            return True
 
         if candidate_configs is not None:
             # Replica counts do not change a deployment's transfer geometry.

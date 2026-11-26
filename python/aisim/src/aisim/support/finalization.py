@@ -87,7 +87,11 @@ def finalization_manifest(request: SupportRequest) -> dict[str, Any] | None:
         value = json.loads(runtime.provenance)
     except ValueError:
         return None
-    if not isinstance(value, dict) or value.get("schema_version") != _SCHEMA:
+    if not isinstance(value, dict):
+        return None
+    if value.get("schema_version") != _SCHEMA:
+        if "runtime_compatibility" in value and "source_request_id" in value:
+            raise ValueError("invalid indexed finalization schema")
         return None
     if "observation_provenance" in value and value["observation_provenance"] not in (
         "source_references",
@@ -201,6 +205,7 @@ def _merge_resources(
     if source_references and observation_format not in ("source_references", "source_references_v2"):
         raise ValueError("unsupported finalized observation provenance format")
     worker_digests = []
+    formal_cells = set()
     for observation in observations:
         resources = FpmResourceProfile.model_validate(observation)
         if resources.memory_source != "runtime" or resources.cache_layout != "grouped":
@@ -247,6 +252,11 @@ def _merge_resources(
             if current:
                 from .runtime import _worker_observation_digest, _worker_observations
 
+                if evidence.get("source") == "vllm_initialized_cache":
+                    cell = evidence.get("cell_id")
+                    if not isinstance(cell, str) or not cell or cell in formal_cells:
+                        raise ValueError("missing or duplicate formal cell in grouped worker roster")
+                    formal_cells.add(cell)
                 evidence["worker_observations"] = _worker_observations(evidence)
             evidence["artifacts"] = [
                 {
@@ -266,7 +276,9 @@ def _merge_resources(
     assert canonical is not None and minimum is not None
     if source_references:
         if worker_digests:
-            manifest["worker_observation_digests"] = sorted(worker_digests)
+            from aisim import _runtime
+
+            manifest["worker_observation_digests"] = _runtime.nixl_bound_cell_digests(worker_digests)
         manifest["observation_provenance"] = observation_format
     manifest["cell_observations"] = summaries if source_references else observations
     manifest["capacity_policy"] = "minimum observed request-usable rank-local capacity across compatible cells"

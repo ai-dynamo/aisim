@@ -1825,7 +1825,7 @@ def grouped_prefix_caching_requirements(
     # The Rust rule table takes a convolution group as a sliding window, and refuses one that opts out of prefix
     # caching with this text at native startup.
     if any(group.kind == "convolution" and group.prefix_cacheable is False for group in groups):
-        raise ValueError(
+        raise GroupedPrefixGeometryError(
             "kv_cache_groups with enable_prefix_caching=true do not model a convolution group with "
             "prefix_cacheable=false; turn prefix caching off to replay it cold"
         )
@@ -1842,11 +1842,13 @@ def grouped_prefix_caching_requirements(
             "model"
         )
     if memory.mamba_cache_mode != "align" and any(group.kind == "state" and group.prefix_cacheable for group in groups):
-        raise ValueError(
+        raise GroupedPrefixGeometryError(
             "grouped FPM cache prefix caching requires mamba_cache_mode=align for a prefix-cacheable state group"
         )
     if len({group.page_size_bytes for group in groups}) > 1:
-        raise ValueError("grouped FPM cache prefix caching requires equal page_size_bytes across cache groups")
+        raise GroupedPrefixGeometryError(
+            "grouped FPM cache prefix caching requires equal page_size_bytes across cache groups"
+        )
     hash_block = memory.hash_block_size_tokens
     if prefix_match_unit is not None and prefix_match_unit != hash_block:
         raise ValueError(
@@ -1854,7 +1856,8 @@ def grouped_prefix_caching_requirements(
         )
     # The GLM indexer keeps one state for every 4 tokens, so hits and chunk starts stay on that grid.
     if architecture == "Glm5NextForConditionalGeneration" and (hash_block % 4 or max_batched_tokens % 4):
-        raise ValueError(
+        error = ValueError if max_batched_tokens % 4 else GroupedPrefixGeometryError
+        raise error(
             "GLM-5.3-Flash prefix caching requires prefix_match_unit and max_batched_tokens that are multiples of 4"
         )
     if pd_rank or any(group.kind == "convolution" for group in groups):
@@ -1887,7 +1890,30 @@ class GroupedObservationError(ValueError):
     """A selected deployment contains conflicting observations of its own runtime."""
 
 
-def grouped_pd_pair_requirement(prefill_deployment, decode_deployment, *, prefix_caching=(False, False)) -> str | None:
+def grouped_pd_observation(role, deployment):
+    from aisim import _runtime
+
+    memory = deployment.resources.runtime_memory
+    try:
+        return _runtime.GroupedPdObservation(
+            role,
+            (memory.provenance if memory else "", memory.model_dtype if memory else None, deployment.attention_backend),
+            (
+                deployment.kv_cache_dtype,
+                deployment.backend_version,
+                memory.runtime_framework_version if memory else None,
+                deployment.tp * deployment.dp,
+            ),
+            deployment.tp,
+            json.dumps([group.model_dump(exclude_none=True) for group in deployment.resources.cache_groups]),
+        )
+    except ValueError as error:
+        raise GroupedObservationError(str(error)) from error
+
+
+def grouped_pd_pair_requirement(
+    prefill_deployment, decode_deployment, *, prefix_caching=(False, False), observe=grouped_pd_observation
+) -> str | None:
     """Return the first incompatible property of a grouped NIXL pair."""
     prefill, decode = prefill_deployment.resources, decode_deployment.resources
     if prefill.cache_layout != "grouped" and decode.cache_layout != "grouped":
@@ -1898,42 +1924,17 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment, *, prefix
         or prefill.cache_groups != decode.cache_groups
     ):
         return "equal tensor parallelism and identical cache groups"
-    requirement = None
-    if prefill.runtime_memory is not None or decode.runtime_memory is not None:
-        from aisim import _runtime
-
-        def evidence(deployment):
-            memory = deployment.resources.runtime_memory
-            if memory is None:
-                return "", None, deployment.attention_backend
-            return memory.provenance, memory.model_dtype, deployment.attention_backend
-
-        def row(deployment):
-            memory = deployment.resources.runtime_memory
-            return (
-                deployment.kv_cache_dtype,
-                deployment.backend_version,
-                memory.runtime_framework_version if memory else None,
-                deployment.tp * deployment.dp,
-            )
-
-        try:
-            requirement = _runtime.grouped_observation_requirement(
-                evidence(prefill_deployment),
-                evidence(decode_deployment),
-                row(prefill_deployment),
-                row(decode_deployment),
-                prefill_deployment.tp,
-                prefix_caching,
-            )
-        except ValueError as error:
-            raise GroupedObservationError(str(error)) from error
-    if prefill_deployment.kv_cache_dtype != decode_deployment.kv_cache_dtype:
-        return "matching kv_cache_dtype"
-    backends = {deployment.attention_backend.lower() for deployment in (prefill_deployment, decode_deployment)}
-    if len(backends - {"auto", "unknown"}) > 1:
-        return "matching attention_backend when both backends are known"
-    return requirement
+    sender = observe("prefill", prefill_deployment)
+    receiver = observe("decode", decode_deployment)
+    if requirement := sender.requirement(receiver):
+        return requirement
+    try:
+        for rank, warm in zip((sender, receiver), prefix_caching, strict=True):
+            if warm:
+                rank.require_warm_version()
+    except ValueError as error:
+        raise GroupedObservationError(str(error)) from error
+    return None
 
 
 def grouped_pd_requirements(

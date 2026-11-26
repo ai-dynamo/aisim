@@ -113,6 +113,32 @@ pub(crate) fn digest(
     Ok(format!("{:x}", Sha256::digest(contents.to_string())))
 }
 
+/// Each multi-cell receipt also binds the complete set. Removing a cell and its own
+/// receipt leaves every surviving receipt inconsistent, even when the source files are offline.
+pub(super) fn bound_cell_digests(mut digests: Vec<String>) -> Result<Vec<String>, AicError> {
+    digests.sort_unstable();
+    if digests.is_empty()
+        || digests.iter().any(|d| !sha256(d))
+        || digests.windows(2).any(|w| w[0] == w[1])
+    {
+        return Err(invalid());
+    }
+    if digests.len() > 1 {
+        let set = Sha256::digest(digests.concat());
+        for digest in &mut digests {
+            *digest = format!(
+                "{:x}",
+                Sha256::new()
+                    .chain_update(set)
+                    .chain_update(digest.as_bytes())
+                    .finalize()
+            );
+        }
+        digests.sort_unstable();
+    }
+    Ok(digests)
+}
+
 pub(super) fn identified_source(entry: &Value) -> bool {
     let formal = entry["source"] == "vllm_initialized_cache"
         && (entry["observer_schema_version"].is_string() || entry["plan_sha256"].is_string());
@@ -160,6 +186,24 @@ pub(super) fn validate_source(
     let capacities = entry["rank_capacities"].as_array();
     if capture != Capture::Full {
         let capacities = capacities.ok_or_else(invalid)?;
+        if capture == Capture::References {
+            for key in ["artifacts", "runtime_artifacts", "launch_artifacts"] {
+                if let Some(refs) = entry.get(key) {
+                    file_references(refs, "path")?;
+                }
+            }
+            // Both original writers retained one observation per worker and one scheduler per DP pool.
+            let pools = capacities
+                .iter()
+                .map(|r| (r["phase"].as_str(), r["dp_rank"].as_u64()))
+                .collect::<BTreeSet<_>>();
+            if entry["artifacts"]
+                .as_array()
+                .is_none_or(|files| files.len() != capacities.len() + pools.len())
+            {
+                return Err(invalid());
+            }
+        }
         if entry.get("worker_observations").is_none() {
             validate(entry, capacities, width, tp, None, true)?;
             if entry["worker_attention_backends"]
@@ -660,6 +704,12 @@ mod tests {
         entry["rank_capacities"] = json!([
             {"phase":"prefill","dp_rank":0,"tp_rank":0}, {"phase":"prefill","dp_rank":0,"tp_rank":1}
         ]);
+        assert!(validate_source(&entry, Capture::References, None, None).is_err());
+        entry["launch_artifacts"][0]["sha256"] = json!("0".repeat(64));
+        entry["artifacts"] = json!(
+            ["worker-a", "worker-b", "scheduler"]
+                .map(|path| json!({"path":path, "sha256":"0".repeat(64)}))
+        );
         assert!(validate_source(&entry, Capture::References, None, None).unwrap());
     }
 

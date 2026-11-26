@@ -4870,45 +4870,107 @@ fn nixl_observation_digest(
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
-/// Compare runtime evidence for selected prefill and decode rows, including legacy imports.
+#[pyfunction]
+fn nixl_bound_cell_digests(digests: Vec<String>) -> PyResult<Vec<String>> {
+    crate::perfmodel::fpm::NixlIdentity::bound_cell_digests(digests)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+type ObservationRow<'a> = (&'a str, Option<&'a str>, Option<&'a str>, u64);
+
+/// A selected role's measured NIXL identity. Sweeps compare multiple peers without
+/// decoding the same worker archive again.
+#[pyclass(frozen)]
+struct GroupedPdObservation {
+    identity: crate::perfmodel::fpm::NixlIdentity,
+    kv_cache_dtype: Option<String>,
+    recorded_version: Option<String>,
+}
+
+#[pymethods]
+impl GroupedPdObservation {
+    #[new]
+    #[pyo3(signature=(role, evidence, row=None, tp_size=None, groups=None))]
+    fn new(
+        role: &str,
+        evidence: (&str, Option<&str>, &str),
+        row: Option<ObservationRow<'_>>,
+        tp_size: Option<u64>,
+        groups: Option<&str>,
+    ) -> PyResult<Self> {
+        let (provenance, dtype, backend) = evidence;
+        let select = || {
+            let mut identity = crate::perfmodel::fpm::NixlIdentity::observed(
+                dtype,
+                provenance,
+                row.map(|r| r.3),
+                tp_size,
+            )?;
+            if let Some(groups) = groups {
+                identity
+                    .measured_groups(&serde_json::from_str(groups).map_err(|error| {
+                        crate::AicError::InvalidEngineConfig(error.to_string())
+                    })?)?;
+            }
+            identity.select(
+                role,
+                Some(backend),
+                row.map(|r| r.0),
+                row.and_then(|r| r.1),
+                row.and_then(|r| r.2),
+                false,
+            )?;
+            Ok::<_, crate::AicError>(Self {
+                identity,
+                kv_cache_dtype: row.map(|r| r.0.to_owned()),
+                recorded_version: row.and_then(|r| r.2).map(str::to_owned),
+            })
+        };
+        select().map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn requirement(&self, decode: &Self) -> Option<String> {
+        if matches!((&self.kv_cache_dtype, &decode.kv_cache_dtype), (Some(a), Some(b)) if a != b) {
+            return Some("matching kv_cache_dtype".to_owned());
+        }
+        if matches!((&self.identity.attention_backend, &decode.identity.attention_backend), (Some(a), Some(b)) if a != b)
+        {
+            return Some("matching attention_backend when both backends are known".to_owned());
+        }
+        self.identity
+            .mismatch(&decode.identity)
+            .map(|(field, _, _)| format!("matching {field} when both runtimes recorded it"))
+    }
+
+    fn require_warm_version(&self) -> PyResult<()> {
+        self.identity
+            .check_version(self.recorded_version.as_deref(), true)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+/// Compare runtime evidence for two selected rows without retaining their identities.
 #[pyfunction]
 #[pyo3(signature = (prefill, decode, prefill_row=None, decode_row=None, tp_size=None, prefix_caching=(false,false)))]
 fn grouped_observation_requirement(
     prefill: (&str, Option<&str>, &str),
     decode: (&str, Option<&str>, &str),
-    prefill_row: Option<(&str, Option<&str>, Option<&str>, u64)>,
-    decode_row: Option<(&str, Option<&str>, Option<&str>, u64)>,
+    prefill_row: Option<ObservationRow<'_>>,
+    decode_row: Option<ObservationRow<'_>>,
     tp_size: Option<u64>,
     prefix_caching: (bool, bool),
 ) -> PyResult<Option<String>> {
-    let identity = |(provenance, dtype, backend),
-                    role,
-                    prefix,
-                    row: Option<(&str, Option<&str>, Option<&str>, u64)>| {
-        let mut value = crate::perfmodel::fpm::NixlIdentity::observed(
-            dtype,
-            provenance,
-            row.map(|r| r.3),
-            tp_size,
-        )?;
-        value.select(
-            role,
-            Some(backend),
-            row.map(|r| r.0),
-            row.and_then(|r| r.1),
-            row.and_then(|r| r.2),
-            prefix,
-        )?;
-        Ok::<_, crate::AicError>(value)
-    };
-    let check = || {
-        Ok::<_, crate::AicError>(
-            identity(prefill, "prefill", prefix_caching.0, prefill_row)?
-                .mismatch(&identity(decode, "decode", prefix_caching.1, decode_row)?)
-                .map(|(field, _, _)| format!("matching {field} when both runtimes recorded it")),
-        )
-    };
-    check().map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+    let prefill = GroupedPdObservation::new("prefill", prefill, prefill_row, tp_size, None)?;
+    let decode = GroupedPdObservation::new("decode", decode, decode_row, tp_size, None)?;
+    if let Some(reason) = prefill.requirement(&decode) {
+        return Ok(Some(reason));
+    }
+    for (rank, warm) in [(&prefill, prefix_caching.0), (&decode, prefix_caching.1)] {
+        if warm {
+            rank.require_warm_version()?;
+        }
+    }
+    Ok(None)
 }
 
 #[pyfunction]
@@ -5016,7 +5078,9 @@ fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(canonical_timing_config_json, module)?)?;
     module.add_function(wrap_pyfunction!(validate_grouped_prefix_geometry, module)?)?;
     module.add_function(wrap_pyfunction!(observed_model_dtype, module)?)?;
+    module.add_class::<GroupedPdObservation>()?;
     module.add_function(wrap_pyfunction!(grouped_observation_requirement, module)?)?;
+    module.add_function(wrap_pyfunction!(nixl_bound_cell_digests, module)?)?;
     module.add_function(wrap_pyfunction!(nixl_worker_observations, module)?)?;
     module.add_function(wrap_pyfunction!(nixl_observation_digest, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_json, module)?)?;

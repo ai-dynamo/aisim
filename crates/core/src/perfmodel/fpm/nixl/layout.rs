@@ -95,9 +95,14 @@ fn announced(received: &[u8; 6]) -> u8 {
 }
 
 // A partially observed worker may have a TP rank without a DP engine identifier.
-pub(super) fn routable(prefill: &[&Worker], decode: &[&Worker], version: Option<&str>) -> bool {
+pub(super) fn routable(
+    prefill: &[&Worker],
+    decode: &[&Worker],
+    version: Option<&str>,
+    hybrid_hma: bool,
+) -> bool {
     let allowed = |w: &Worker| {
-        let choices = std::array::from_fn(|gpu| transfer(w, gpu, version));
+        let choices = std::array::from_fn(|gpu| transfer(w, gpu, version, hybrid_hma));
         receive_options(&choices, ALL)
     };
     let senders = prefill
@@ -119,7 +124,7 @@ fn mask(layout: Option<&Layouts>) -> u8 {
 /// For each announced layout, the set of remote layouts one decoder configuration can accept.
 /// The host buffer changes LBNHC to LBHNC only for an ordinary attention worker with permutation enabled.
 /// Older receipts retain only the announced layout, so either registration device can explain those observations.
-fn transfer(worker: &Worker, gpu: usize, version: Option<&str>) -> [u8; 6] {
+fn transfer(worker: &Worker, gpu: usize, version: Option<&str>, hybrid_hma: bool) -> [u8; 6] {
     let mut allowed = [0; 6];
     let effective = mask(worker.kv_cache_layout.as_ref());
     if mask(worker.gpu_cache_layout.as_ref()) & (1 << gpu) == 0 {
@@ -147,6 +152,7 @@ fn transfer(worker: &Worker, gpu: usize, version: Option<&str>) -> [u8; 6] {
                 }
                 let can_repack = permute
                     && !worker.requires_hma
+                    && !hybrid_hma
                     && (local == LBNHC || version.is_none_or(|v| v == "0.31.0"));
                 allowed[local] |= if mla {
                     ALL
@@ -178,7 +184,7 @@ pub(super) fn possible_gpu(worker: &Worker) -> u8 {
         return mask(worker.gpu_cache_layout.as_ref());
     }
     (0..LAYOUTS.len()).fold(0, |bits, gpu| {
-        bits | (u8::from(transfer(worker, gpu, None) != [0; 6]) << gpu)
+        bits | (u8::from(transfer(worker, gpu, None, false) != [0; 6]) << gpu)
     })
 }
 
@@ -239,6 +245,7 @@ pub(super) fn engines_routable(
     prefill: &Deployment,
     decode: &Deployment,
     version: Option<&str>,
+    hybrid_hma: bool,
 ) -> bool {
     let observed = |w: &Worker| w.kv_cache_layout.is_some() || w.gpu_cache_layout.is_some();
     if ![prefill, decode].iter().any(|r| {
@@ -278,7 +285,7 @@ pub(super) fn engines_routable(
                 .iter()
                 .map(|e| {
                     let worker = e.workers.get(&rank).unwrap_or(&unknown_worker);
-                    std::array::from_fn(|gpu| transfer(worker, gpu, version))
+                    std::array::from_fn(|gpu| transfer(worker, gpu, version, hybrid_hma))
                 })
                 .collect()
         })

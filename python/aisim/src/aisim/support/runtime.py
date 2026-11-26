@@ -590,6 +590,12 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
 
         finalized = finalization_manifest(request)
         quality = verify_finalized_quality(finalized) if finalized is not None else None
+        if finalized is not None and "runtime_compatibility" in finalized:
+            compatible = finalized["runtime_compatibility"]
+            index = compatible.get("source_observations_index") if isinstance(compatible, dict) else None
+            probe = _probe_provenance(json.dumps(finalized.get("runtime_probe")))
+            if not index or probe is None or probe["observations_index"] != index:
+                raise ValueError("finalized runtime compatibility requires its source runtime probe")
         if finalized is not None and "runtime_probe" in finalized:
             root = Path(finalized["source_directory"])
             original = SupportRequest.from_yaml(root / "request.yaml")

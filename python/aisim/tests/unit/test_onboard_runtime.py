@@ -2648,6 +2648,10 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
             assert "worker_observations" not in compact
             assert "worker_observation_digests" not in saved
             assert _runtime.observed_model_dtype(json.dumps(saved))
+            for incomplete in ([None], [{"path": "missing-sha256"}]):
+                memory["provenance"] = json.dumps({**compact, "artifacts": incomplete})
+                with pytest.raises(ValueError, match="worker roster"):
+                    _runtime.observed_model_dtype(json.dumps(saved))
             for key in ("rank_capacities", "source", "runtime_settings"):
                 memory["provenance"] = json.dumps({k: v for k, v in compact.items() if k != key})
                 with pytest.raises(ValueError, match="worker roster"):
@@ -2743,6 +2747,15 @@ def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_so
     for reference in manifest["source_artifacts"]:
         assert hashlib.sha256(Path(reference["path"]).read_bytes()).hexdigest() == reference["sha256"]
     from aisim import _runtime
+
+    missing_probe = resolved.model_copy(deep=True)
+    missing_probe.profile_deployment().resources.runtime_memory.provenance = json.dumps(
+        {k: v for k, v in manifest.items() if k != "runtime_probe"}
+    )
+    with pytest.raises(ValueError, match="requires its source runtime probe"):
+        verify_runtime_profile(missing_probe)
+    with pytest.raises(ValueError, match="worker roster"):
+        _runtime.observed_model_dtype(missing_probe.profile_deployment().resources.runtime_memory.provenance)
 
     reordered = resolved.model_copy(deep=True)
     reordered_manifest = json.loads(json.dumps(manifest))
