@@ -220,7 +220,7 @@ jobs:
           toolchain: "1.99.0"
       - name: Install wheel builder
         run: |
-          python -m pip install 'uv==0.11.3' 'hatchling==1.27.0'
+          python -m pip install 'uv==0.13.10' 'hatchling==1.27.0'
           python -m pip install --require-hashes -r scripts/release/requirements.txt
           as_root=()
           if [[ "$(id -u)" != 0 ]]; then as_root=(sudo); fi

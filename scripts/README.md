@@ -54,7 +54,7 @@ The other group/output pairs are `e2e-accuracy` → `e2e_accuracy/`,
 `fpm-accuracy` → `fpm_accuracy/`, and `pages`, `readme`, and `release` → the
 same-named directories. The E2E source resolver uses requests and PyYAML; its
 group is also included in Pages, which imports the resolver during validation.
-Fast CI regenerates every group lock with `uv==0.12.6` from the hashed CI lock
+Fast CI regenerates every group lock with `uv==0.13.10` from the hashed CI lock
 when the complete PR or push changes the script manifest, a group lock, uv
 configuration, or the Fast CI lock-validation machinery. Manual runs and
 unavailable comparison history or metadata always regenerate. Unrelated changes
