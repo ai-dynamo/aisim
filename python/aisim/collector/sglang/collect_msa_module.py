@@ -1924,7 +1924,11 @@ def _run_decode_point(
     forward_batch = ForwardBatch.init_new(batch, model_runner, return_hidden_states_before_norm=False)
     point_clock.mark("batch")
 
-    sparse = model_runner.attn_backend.sparse
+    # MiniMax's sparse child owns both the capture-time metadata and
+    # `_max_seqlen_k`. The QSA route's hybrid wrapper exposes no `sparse`
+    # attribute at all (its full-attention child is `full_attn_backend`), so
+    # reading it here would raise before either QSA timing path starts.
+    sparse = None if attention_type == "qsa" else model_runner.attn_backend.sparse
     with _forward_ctx(model_runner, forward_batch):
         model_runner.attn_backend.init_forward_metadata(forward_batch)
         if use_graph:
@@ -1947,7 +1951,7 @@ def _run_decode_point(
     # The KV bound every MSA decode kernel of this point is launched with
     # (minimax_sparse_backend.py:1823 passes it to minimax_sparse_decode). The
     # QSA route labels its own kernel source from the backend it routed to.
-    max_seqlen_k = int(sparse._max_seqlen_k) if attention_type != "qsa" else 0
+    max_seqlen_k = int(sparse._max_seqlen_k) if sparse is not None else 0
     point_clock.mark("metadata")
     # MSA-only, same reason as the context path.
     if attention_type != "qsa":

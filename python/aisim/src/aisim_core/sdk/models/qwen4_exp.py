@@ -260,20 +260,72 @@ class Qwen4ExpModel(Qwen35Model):
         return float(super().get_resident_weights_bytes() + draft + table_delta)
 
     def get_kvcache_elements_per_token(self) -> int:
-        """Full-attention KV plus the indexer's per-block key cache.
+        """Full-attention KV plus both indexer side buffers, in BF16-equivalent
+        elements.
 
-        QSA does not cache indexer queries or values: the indexer keeps one
-        ``index_kv_heads * index_head_dim`` key vector per ``block_size`` tokens.
-        It is priced at the paged-cache element dtype, which matches the
-        checkpoint (the indexer is BF16 even in the FP8 release).
+        QSA does not cache indexer queries or values. It keeps two key buffers,
+        each ``index_kv_heads * index_head_dim`` per ``indexer_compress_ratio``
+        tokens: the raw key ring (``qsa_key_state_buffer_pool``) and the
+        compressed key cache (``qsa_compressed_k_buffer_pool``). The raw ring
+        also stores three int64 MRoPE position axes per token, quoted here as
+        their 12 BF16 words. The side buffers never follow the main pool's
+        dtype, so the byte and capacity methods below re-price them at their
+        real widths instead of multiplying every element by the pool dtype.
+
+        This is SGLang's pool shape, where the raw ring is sized to the
+        request's whole cached length (``qsa_compressed_capacity =
+        ceil(state_size / ratio)``) and therefore scales per token. vLLM instead
+        declares one fixed ring page per request; its collector's generation
+        filter prices that shape separately, because the shared capacity
+        estimator has no request count.
         """
         cfg: common.Qwen4ExpConfig = self.extra_params
         n_qsa = cfg.layer_types.count("full_attention")
         n_kv_per_tp = (self._num_kv_heads + self.config.tp_size - 1) // self.config.tp_size
         per_token = 2 * n_kv_per_tp * self._head_size
+        return n_qsa * per_token + self._qsa_side_elements_per_token()
+
+    def _qsa_side_elements_per_token(self) -> int:
+        """The index side buffers of one token, in BF16 elements (all layers)."""
+        cfg: common.Qwen4ExpConfig = self.extra_params
+        n_qsa = cfg.layer_types.count("full_attention")
         block_size = max(1, cfg.indexer_compress_ratio)
-        indexer_per_token = (cfg.indexer_kv_heads * cfg.indexer_head_dim + block_size - 1) // block_size
-        return n_qsa * (per_token + indexer_per_token)
+        keys = cfg.indexer_kv_heads * cfg.indexer_head_dim
+        keys_per_token = (keys + block_size - 1) // block_size
+        # Two key arrays (raw ring + compressed) and three int64 MRoPE axes,
+        # which are 4 BF16 words each.
+        return n_qsa * (2 * keys_per_token + 12)
+
+    def _qsa_side_bytes_per_token(self) -> float:
+        """True bytes/token of the index side buffers (all layers).
+
+        Both key arrays are BF16 whatever the main pool stores, and the MRoPE
+        position tail is int64, so these bytes cannot be derived by multiplying
+        the element count by the pool's element size.
+        """
+        cfg: common.Qwen4ExpConfig = self.extra_params
+        n_qsa = cfg.layer_types.count("full_attention")
+        block_size = max(1, cfg.indexer_compress_ratio)
+        keys = cfg.indexer_kv_heads * cfg.indexer_head_dim
+        keys_per_token = (keys + block_size - 1) // block_size
+        return n_qsa * (2 * keys_per_token * 2 + 3 * 8)
+
+    def get_kvcache_bytes_per_sequence(self, seq_len: int) -> float:
+        """Token-linear KV bytes, with the side buffers at their real widths."""
+        seq_len = max(0, seq_len)
+        pool_element_bytes = self.config.kvcache_quant_mode.value.memory
+        correction = self._qsa_side_bytes_per_token() - pool_element_bytes * self._qsa_side_elements_per_token()
+        return super().get_kvcache_bytes_per_sequence(seq_len) + seq_len * correction
+
+    def get_kvcache_max_tokens(self, kv_budget_bytes: float) -> int:
+        """Capacity inverse of :meth:`get_kvcache_bytes_per_sequence`."""
+        pool_element_bytes = self.config.kvcache_quant_mode.value.memory
+        main_elements = self.get_kvcache_elements_per_token() - self._qsa_side_elements_per_token()
+        per_token = pool_element_bytes * main_elements + self._qsa_side_bytes_per_token()
+        budget = kv_budget_bytes - self._gdn_state_bytes_per_request()
+        if budget <= 0 or per_token <= 0:
+            return 0
+        return int(budget // per_token)
 
     # ------------------------------------------------------------------
     # Op builders shared by both phases

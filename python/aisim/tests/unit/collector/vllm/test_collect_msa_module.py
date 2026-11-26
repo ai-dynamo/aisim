@@ -437,8 +437,12 @@ def _nullcontext_manager(func):
 
 
 @pytest.mark.parametrize("attention_type", ["msa", "qsa"])
-def test_run_msa_module_dispatches_only_the_arguments_its_builder_accepts(attention_type):
-    """QSA's factory never accepted ``max_query_len``; the dispatcher supplies it to MSA only."""
+def test_run_msa_module_prices_both_builders_from_the_new_token_budget(attention_type):
+    """Both builders size their per-step buffers from ``max_query_len``.
+
+    The serving scheduler budgets NEW tokens per step, so this is ``seq_len``
+    for a context point and ``1`` for generation — never the cached prefix.
+    """
     calls = {"bound": [], "forwards": [], "written": [], "rows": [], "create": None, "caches": None}
     run = _run_msa_module(attention_type=attention_type, calls=calls)
 
@@ -459,13 +463,45 @@ def test_run_msa_module_dispatches_only_the_arguments_its_builder_accepts(attent
     assert latency == 3.5
     assert calls["create"]["max_seq_len"] == 512 + 1024
     assert calls["create"]["max_batch_size"] == 2
-    if attention_type == "qsa":
-        assert "max_query_len" not in calls["create"], "QSA's builder never accepted it"
-    else:
-        assert calls["create"]["max_query_len"] == 1024
+    assert calls["create"]["max_query_len"] == 1024
     assert calls["caches"] == attention_type
     assert calls["rows"] and calls["rows"][0]["item"]["isl"] == 1024
     assert calls["forwards"], "the dry run and the timed kernel must run"
+
+
+@pytest.mark.parametrize("builder", ["_create_msa_attention_module", "_create_qsa_attention_module"])
+def test_builder_sizes_the_step_budget_from_new_tokens_not_the_prefix(builder):
+    """Both builders take ``max_query_len`` and size the step budget from it.
+
+    The serving scheduler budgets NEW tokens per step, and each module
+    allocates its persistent selection/top-k buffer at
+    ``max_num_batched_tokens``. Sizing that from ``max_seq_len`` made a
+    1M-token QSA prefix reserve a ~4 GB packed selection buffer and the M3
+    SM100 indexer up to ~140 GB of score rows, none of which serving allocates.
+    """
+    tree = ast.parse(SRC.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == builder)
+    assert "max_query_len" in [a.arg for a in node.args.args]
+
+    config_calls = [
+        call for call in ast.walk(node) if isinstance(call, ast.Call) and ast.unparse(call.func) == "create_vllm_config"
+    ]
+    assert len(config_calls) == 1
+    options = {kw.arg: kw.value for kw in config_calls[0].keywords}
+    budget = ast.unparse(options["max_num_batched_tokens"])
+    assert "max_query_len" in budget
+    assert "max_seq_len" not in budget
+    assert "131072" in budget
+    # The KV bound still sizes the cache and the model limit.
+    assert "max_seq_len" in ast.unparse(options["num_gpu_blocks"])
+    local = {
+        target.id: ast.unparse(assign.value)
+        for assign in ast.walk(node)
+        if isinstance(assign, ast.Assign)
+        for target in assign.targets
+        if isinstance(target, ast.Name)
+    }
+    assert "max_seq_len" in local["max_model_len"]
 
 
 @pytest.mark.parametrize("attention_type", ["msa", "qsa"])

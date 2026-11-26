@@ -196,15 +196,21 @@ def _kv_does_not_fit(
     total_memory: int,
     *,
     footprint=None,
+    num_requests: int = 1,
 ) -> str | None:
     """Why a generation point's KV cache cannot fit the device, or None when it can.
 
     The module plans do not depend on the device, so the run refuses such a
     point before allocating it. ``footprint`` supplies the checkpoint's own
     bytes/token model (QSA's geometry is nothing like the M3 constants), and
-    defaults to the M3 one.
+    defaults to the M3 one. ``num_requests`` is the batch: QSA's raw-key ring
+    is one fixed-size block per request, so its cost does not follow the token
+    count.
     """
-    needed = (footprint or _generation_kv_footprint_bytes)(total_tokens, num_heads, kv_cache_dtype)
+    if footprint is None:
+        needed = _generation_kv_footprint_bytes(total_tokens, num_heads, kv_cache_dtype)
+    else:
+        needed = footprint(total_tokens, num_heads, kv_cache_dtype, num_requests=num_requests)
     allowed = int(total_memory * _MEMORY_BUDGET_SAFETY_FACTOR)
     if needed <= allowed:
         return None
@@ -265,11 +271,16 @@ def _qsa_generation_kv_footprint_bytes(model_path: str):
     full-attention layer (24 q / 2 kv heads, head_dim 256) plus two index side
     caches — nothing like the M3 ratio/head_dim constants above. Per token:
     the paged main K/V (2 x kv_heads x head_dim; 1 B/elem for the fp8 cache's
-    uint8 storage), the ring key side-cache (index_head_dim bf16, plus its
-    MRoPE position tail when the model uses MRoPE), and the compressed key
-    cache (one state per ``indexer_compress_ratio`` tokens). Module weights,
-    metadata and the selection buffer are excluded so the estimate stays a
-    provable lower bound, exactly like the M3 filter.
+    uint8 storage) and the compressed key cache (one state per
+    ``indexer_compress_ratio`` tokens). Per REQUEST: the raw-key ring, which
+    ``QSAKeyStateCache.get_kv_cache_spec`` declares as a ``CircularBufferSpec``
+    of ``compress_ratio * cdiv(compress_ratio + num_speculative_tokens,
+    compress_ratio)`` rows (one block per request, independent of the cached
+    length) carrying ``index_head_dim`` BF16 keys and three int64 MRoPE axes
+    (``common/qsa_cache.py@v0.32.0``; the module bench sets no speculative
+    tokens, so the capacity is one group). Module weights, metadata and the
+    selection buffer are excluded so the estimate stays a provable lower bound,
+    exactly like the M3 filter.
     """
     text_cfg = _qsa_text_config(model_path)
     head_dim = int(text_cfg["head_dim"])
@@ -278,17 +289,24 @@ def _qsa_generation_kv_footprint_bytes(model_path: str):
     gqa_ratio = max(1, native_q // native_kv)
     index_dim = int(text_cfg["indexer_head_dim"])
     compress_ratio = int(text_cfg["indexer_compress_ratio"])
-    # QSAKeyStateCache appends 3 int64 MRoPE position axes in bf16 units to
-    # the raw key when the model uses MRoPE (_NUM_ROPE_AXES * _BF16_PER_INT64).
-    rope_tail_bytes = 3 * 8 if _uses_mrope_from_config(text_cfg) else 0
+    # QSAKeyStateCache pads the raw key to the int64 word and appends the three
+    # int64 MRoPE axes when the model caches positions; without MRoPE the
+    # stored head is exactly ``index_head_dim`` BF16 elements.
+    if _uses_mrope_from_config(text_cfg):
+        storage_key_words = -(-index_dim // 4) * 4 + 3 * 4
+    else:
+        storage_key_words = index_dim
+    # The module bench runs no speculative decoding, so the ring capacity is
+    # one committed group: compress_ratio * cdiv(compress_ratio, compress_ratio).
+    ring_capacity = compress_ratio
 
-    def footprint(total_tokens: int, num_heads: int, kv_cache_dtype: str) -> int:
+    def footprint(total_tokens: int, num_heads: int, kv_cache_dtype: str, *, num_requests: int) -> int:
         kv_heads = max(1, num_heads // gqa_ratio)
         main_bytes_per_elem = 1 if kv_cache_dtype == "fp8" else 2
         main = 2 * kv_heads * head_dim * main_bytes_per_elem
-        raw_ring = index_dim * 2 + rope_tail_bytes
         compressed = (index_dim * 2) / compress_ratio
-        return int(total_tokens * (main + raw_ring + compressed))
+        ring = num_requests * ring_capacity * storage_key_words * 2
+        return int(total_tokens * (main + compressed)) + ring
 
     return footprint
 
@@ -673,6 +691,7 @@ def _create_qsa_attention_module(
     kv_cache_dtype: str,
     max_seq_len: int,
     max_batch_size: int,
+    max_query_len: int,
     is_context: bool,
     device: str = "cuda:0",
 ):
@@ -685,6 +704,13 @@ def _create_qsa_attention_module(
     as ``Qwen4ExpQSAAttention.__init__`` would divide them under TP (q heads
     ``total // tp``, kv heads ``max(1, total_kv // tp)``); the indexer's 4
     index heads are replicated, not sharded, so they stay checkpoint-exact.
+
+    ``max_query_len`` is the point's per-request new-token count (context
+    ``seq_len``; ``1`` for generation). The serving scheduler budgets NEW
+    tokens per step, so sizing ``max_num_batched_tokens`` from it is what keeps
+    QSA's per-step selection buffer
+    (``packed_output_width * max_num_batched_tokens`` int32 rows,
+    qsa.py:509-511@v0.32.0) independent of the cached prefix.
     """
     from vllm.platforms import current_platform
 
@@ -715,7 +741,10 @@ def _create_qsa_attention_module(
         block_size=_QSA_BLOCK_SIZE,
         num_gpu_blocks=1 + _ceil_div(max_seq_len + 1, _QSA_BLOCK_SIZE) * max_batch_size,
         max_num_seqs=max_batch_size,
-        max_num_batched_tokens=max(max_batch_size * max_seq_len, 131072) if is_context else max_batch_size,
+        # Same new-token budget as the MSA builder (see its comment): the
+        # selection buffer is allocated at this width, so counting cached
+        # tokens would scale it with the prefix. Keep the 131072 floor below.
+        max_num_batched_tokens=max(max_batch_size * max_query_len, 131072) if is_context else max_batch_size,
         # QSA dequantizes fp8 inside its own Triton kernel
         # (Qwen4ExpQSAFlashAttentionImpl.forward_qsa), so the cache dtype is
         # serving's global --kv-cache-dtype and nothing else.
@@ -1331,6 +1360,7 @@ def run_msa_module(
             kv_cache_dtype,
             torch.cuda.get_device_properties(device).total_memory,
             footprint=footprint,
+            num_requests=batch_size,
         )
         if reason is not None:
             raise RuntimeError(reason)
@@ -1346,9 +1376,9 @@ def run_msa_module(
     )
 
     # 1. Create attention module (framework builds and dispatches the impls).
-    # `max_query_len` sizes the M3 module's static buffers. QSA's builder has
-    # never accepted it: its metadata builders take the query length from the
-    # point itself, so pass it only on the MSA branch.
+    # `max_query_len` is the point's new-token count. Both builders size their
+    # persistent per-step buffers from it — the M3 top-k/score buffers and the
+    # QSA selection buffer — so it is passed to both.
     create_module = _create_qsa_attention_module if attention_type == "qsa" else _create_msa_attention_module
     module_kwargs = dict(
         model_path=model_path,
@@ -1357,11 +1387,10 @@ def run_msa_module(
         kv_cache_dtype=kv_cache_dtype,
         max_seq_len=prefix_len + seq_len,
         max_batch_size=batch_size,
+        max_query_len=seq_len if is_context else 1,
         is_context=is_context,
         device=device,
     )
-    if attention_type != "qsa":
-        module_kwargs["max_query_len"] = seq_len if is_context else 1
     attn_module, vllm_config, original_architecture = create_module(**module_kwargs)
 
     # 2. Create KV caches + metadata via the framework's builders, then bind

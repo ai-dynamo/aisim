@@ -430,22 +430,72 @@ def test_vllm_qsa_generation_footprint_is_the_checkpoint_geometry(monkeypatch):
     """The QSA filter must price the checkpoint's own KV, not the M3 constants.
 
     Per token at 24 heads: paged main K/V (2 x 2 heads x 256 dim x 2 B =
-    2048), the raw-key ring (128 x 2 B + 3 int64 MRoPE axes = 280) and the
-    compressed key (128 x 2 B / 4 = 64) = 2392 B. The M3 fallback prices
-    768 B, i.e. three times more tokens admitted than the device can hold.
+    2048) plus the compressed key (128 x 2 B / 4 = 64) = 2112 B. The raw-key
+    ring is NOT token-linear: ``QSAKeyStateCache.get_kv_cache_spec`` declares a
+    ``CircularBufferSpec`` of ``compress_ratio`` rows per request
+    (``common/qsa_cache.py:844-862@v0.32.0``), each carrying a 128-dim BF16 key
+    rounded to the int64 word plus three int64 MRoPE axes (140 words), so one
+    request costs 4 * 140 * 2 = 1120 B whatever its cached length. The M3
+    fallback prices 768 B/token, i.e. three times more tokens admitted than the
+    device can hold.
     """
     module = _load_backend(monkeypatch, "vllm")
 
     footprint = module._qsa_generation_kv_footprint_bytes(QWEN4EXP_PATH)
 
-    assert footprint(1, 24, "bfloat16") == 2392
-    assert footprint(1, 24, "fp8") == 1368
-    # A TP-sharded head shard keeps one KV head (max(1, 6 // 12)) and the
-    # per-request index state does not shrink with it.
-    assert footprint(1, 6, "bfloat16") == 1368
-    assert footprint(8192, 24, "bfloat16") == 2392 * 8192
+    assert footprint(1, 24, "bfloat16", num_requests=1) == 2112 + 1120
+    assert footprint(1, 24, "fp8", num_requests=1) == 1088 + 1120
+    # A TP-sharded head shard keeps one KV head (max(1, 6 // 12)).
+    assert footprint(1, 6, "bfloat16", num_requests=1) == 1088 + 1120
+    # The ring follows the batch, not the token count.
+    assert footprint(1, 24, "bfloat16", num_requests=8) == 2112 + 8 * 1120
+    assert footprint(8192, 24, "bfloat16", num_requests=1) == 2112 * 8192 + 1120
     # The M3 default filter is the one this replaces.
     assert module._generation_kv_footprint_bytes(1, 24, "bfloat16") == 768
+
+
+def test_vllm_qsa_generation_filter_charges_the_ring_per_request(monkeypatch):
+    """The batch reaches the footprint, and the boundary follows the ring.
+
+    A per-token total that folded the ring in would grow with the cached
+    prefix and shrink with the batch; the per-request ring does neither. Check
+    the forwarding and a device budget that sits between the two totals.
+    """
+    module = _load_backend(monkeypatch, "vllm")
+    footprint = module._qsa_generation_kv_footprint_bytes(QWEN4EXP_PATH)
+
+    seen = []
+
+    def probe(total_tokens, num_heads, dtype, *, num_requests):
+        seen.append(num_requests)
+        return 1
+
+    assert module._kv_does_not_fit(10, 24, "bfloat16", 1 << 40, footprint=probe, num_requests=8) is None
+    assert seen == [8]
+
+    total_tokens, batch = 8192, 8
+    corrected = footprint(total_tokens, 24, "bfloat16", num_requests=batch)
+    # The old per-token charge: ring (128 x 2 B + 3 int64 axes) per token.
+    old_per_token_total = total_tokens * (2112 + 280)
+    assert corrected < old_per_token_total
+
+    safety = module._MEMORY_BUDGET_SAFETY_FACTOR
+    inside = (corrected + old_per_token_total) / 2
+    assert (
+        module._kv_does_not_fit(
+            total_tokens,
+            24,
+            "bfloat16",
+            inside / safety,
+            footprint=footprint,
+            num_requests=batch,
+        )
+        is None
+    )
+    below = module._kv_does_not_fit(
+        total_tokens, 24, "bfloat16", (corrected - 4096) / safety, footprint=footprint, num_requests=batch
+    )
+    assert below is not None and "does not fit" in below
 
 
 def test_vllm_mrope_detection_follows_the_rope_parameters(monkeypatch):

@@ -228,11 +228,37 @@ def test_ple_branch_prices_every_checkpoint_module():
     assert {ctx[name]._scale_factor for name in expected if name != "context_ple_ngram_embedding"} == {1.0}
 
 
-def test_kv_cache_prices_the_qsa_indexer_block_keys():
+def test_kv_cache_prices_both_qsa_index_key_buffers():
     model = _build()
-    # 12 QSA layers x (2 kv heads ceil-sharded to 1 x 256 dims x 2) = 6144,
-    # plus indexer keys: 1 kv head x 128 dims per 4-token block = 384.
-    assert model.get_kvcache_elements_per_token() == 6528
+    # 12 QSA layers x (2 kv heads ceil-sharded to 1 x 256 dims x 2) = 6144.
+    # Each layer's index state is TWO key arrays at one 128-dim key per 4-token
+    # block (raw ring + compressed) plus three int64 MRoPE axes quoted as 12
+    # BF16 words: 2 x 32 + 12 = 76 per layer, 912 across the model.
+    assert model.get_kvcache_elements_per_token() == 6144 + 912 == 7056
+    # The side buffers are BF16/int64 whatever the main pool stores, so the
+    # byte figure is not elements x pool width: 6144 x 2 + 12 x (2 x 32 x 2 + 24)
+    # = 12,288 + 1,824 = 14,112 at BF16. The constant GDN state the parent adds
+    # is held out by differencing two lengths.
+    assert model.get_kvcache_bytes_per_sequence(1) - model.get_kvcache_bytes_per_sequence(0) == 14112
+    assert model.get_kvcache_bytes_per_sequence(10) - model.get_kvcache_bytes_per_sequence(0) == 141120
+    # An fp8 main pool halves only the main K/V; the side buffers do not move.
+    model_fp8 = models.get_model(
+        FP8,
+        dataclasses.replace(_model_config(), kvcache_quant_mode=common.KVCacheQuantMode.fp8),
+        "vllm",
+    )
+    assert model_fp8.config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
+    fp8_token_bytes = model_fp8.get_kvcache_bytes_per_sequence(1) - model_fp8.get_kvcache_bytes_per_sequence(0)
+    assert fp8_token_bytes == 6144 + 1824 == 7968
+    # Capacity is the exact inverse of that curve at both pool widths: the
+    # largest admitted length fits the token-linear budget, one more does not.
+    budget = 1 << 30
+    for candidate in (model, model_fp8):
+        gdn = candidate._gdn_state_bytes_per_request()
+        tokens = candidate.get_kvcache_max_tokens(budget)
+        per_token = candidate.get_kvcache_bytes_per_sequence(1) - candidate.get_kvcache_bytes_per_sequence(0)
+        assert tokens == int((budget - gdn) // per_token)
+        assert (tokens + 1) * per_token > budget - gdn
 
 
 @pytest.mark.parametrize(
