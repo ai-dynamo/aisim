@@ -52,7 +52,7 @@ import enum
 import json
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from functools import partial
 from itertools import pairwise
 from pathlib import Path
@@ -150,6 +150,26 @@ _DECODER_HEAD_DEFAULTS = {
 }
 
 
+# Structural defaults read by KV and weight sizing from Qwen3Config and DeepseekV3Config.
+# Both Kimi-K2.5 serving loaders instantiate its kimi_k2 text config as DeepseekV3Config.
+_DECODER_GEOMETRY_DEFAULTS = {
+    "qwen3": {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32, "intermediate_size": 22016},
+    "deepseek_v3": {
+        "hidden_size": 7168,
+        "num_hidden_layers": 61,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 128,
+        "intermediate_size": 18432,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1536,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "first_k_dense_replace": 3,
+    },
+}
+
+
 # Transformers constructor fields and aliases used by the selected expert implementations.
 # (count, alias applied after construction, default count, routed intermediate width, default width)
 _DECODER_EXPERT_DEFAULTS = {
@@ -195,6 +215,43 @@ def _config_only_backend_version(
         return None
 
 
+def _check_gemma4_adapter_runtime(
+    decoder: dict, version: str | None, system: str | None, systems_paths: str | list[str] | None
+) -> None:
+    release = parse_support_matrix_version(version)
+    if release is None or not Version("0.28.0rc1") <= release < Version("0.32.0rc0"):
+        return
+    # These vLLM adapters accept both flat and per-layer Transformers implementations.
+    try:
+        gemma4_cache_shapes(decoder, "vllm")
+        return
+    except ValueError:
+        # An invalid per-layer layout still fails even with a known stock runtime.
+        gemma4_cache_shapes(decoder, "vllm", version)
+
+    if system:
+        for root in _config_only_systems_paths(systems_paths):
+            cells = list(perf_database._iter_database_version_paths(system, "vllm", version, root))
+            if not cells:
+                continue
+            for directory, _ in cells:
+                meta = Path(directory) / perf_database.COLLECTION_META_MARKER
+                if meta.is_file() and perf_database._database_version_dir_has_perf_files(directory):
+                    collection = perf_database._load_collection_meta_yaml(str(meta))
+                    runtime = collection.get("runtime", {})
+                    if (
+                        collection.get("schema_version") == 2
+                        and collection.get("tables")
+                        and runtime.get("framework") == "vllm"
+                        and runtime.get("version") == version
+                        and runtime.get("image") == f"vllm/vllm-openai:v{version}"
+                        and runtime.get("image_digest")
+                    ):
+                        return
+            break
+    raise ValueError(f"vLLM {version} Gemma 4 per_layer_config needs a stock CUDA collection or a runtime profile")
+
+
 def _config_only_system_spec(system: str | None, systems_path: str | list[str] | None) -> dict:
     """Load the named platform offline, including non-CUDA targets without an SM version."""
     try:
@@ -219,17 +276,17 @@ def _sglang_checkpoint_quant(document: dict, raw: dict) -> dict | None:
 
 def _sglang_skips_modules(
     ignored: list[str],
-    layers: int,
+    layers: Collection[int],
     release: Version,
     module: str,
     *,
-    first: int = 0,
-    frequency: int = 1,
     shards: tuple[str, ...] = (),
 ) -> bool:
-    """Match SGLang FP8 exclusions against every copy of a projection or routed expert module."""
-    bare = {name.removeprefix("model.") for name in ignored}
-    names = bare | {"model." + name for name in bare}
+    """Match SGLang FP8 exclusions against the layers that instantiate this module."""
+    names = set(ignored)
+    if release >= Version("0.5.10rc0"):
+        bare = {name.removeprefix("model.") for name in names}
+        names = bare | {"model." + name for name in bare}
     dotted = release >= Version("0.5.11")
     strip_trailing = release >= Version("0.5.13")
 
@@ -257,8 +314,8 @@ def _sglang_skips_modules(
         return skipped(prefix)
 
     all_skipped = True
-    for i in range(first, layers):
-        if i % frequency == 0 and not layer_skipped(module.format(i)):
+    for i in layers:
+        if not layer_skipped(module.format(i)):
             if not shards:
                 return False
             all_skipped = False  # A different layer can still contain a partially quantized fused projection.
@@ -273,40 +330,45 @@ def _validate_sglang_dense_fp8(
     release: Version | None,
     ignored: list[str],
     layer_prefix: str,
+    dense_layers: Collection[int],
 ) -> None:
-    """Check the merged Q/K/V and gate/up output shards and the row-parallel O and down inputs."""
+    """Check the actual dense MLP and ordinary attention shards of the selected decoder."""
     block_n, block_k = fp8_weight_block_shape(quant, sglang=True)
-    intermediate = layout_integer(geom["inter"], "intermediate_size")
-    if intermediate % dense_tp:
-        raise ValueError("dense intermediate_size must be divisible by the tensor parallel size")
-    mlp_shard = intermediate // dense_tp
-    query_heads = layout_integer(geom["num_attention_heads"], "num_attention_heads")
-    kv_heads = layout_integer(geom["num_kv_heads"], "num_key_value_heads")
-    if query_heads % attn_tp or max(kv_heads, attn_tp) % min(kv_heads, attn_tp):
-        raise ValueError("dense attention heads must partition or replicate uniformly over the tensor parallel ranks")
-    query_shard = query_heads // attn_tp * geom["head_dim"]
-    kv_shard = max(1, kv_heads // attn_tp) * geom["head_dim"]
-    checks = [
-        ("mlp.gate_up_proj", (mlp_shard,), block_n),
-        ("self_attn.qkv_proj", (query_shard, kv_shard), block_n),
-    ]
-    if dense_tp > 1:
-        checks.append(("mlp.down_proj", (mlp_shard,), block_k))
-    if attn_tp == dense_tp and attn_tp > 1:
-        checks.append(("self_attn.o_proj", (query_shard,), block_k))
+    checks = []
+    if dense_layers:
+        intermediate = layout_integer(geom["inter"], "intermediate_size")
+        if intermediate % dense_tp:
+            raise ValueError("dense intermediate_size must be divisible by the tensor parallel size")
+        mlp_shard = intermediate // dense_tp
+        checks.append(("mlp.gate_up_proj", (mlp_shard,), block_n, dense_layers))
+        if dense_tp > 1:
+            checks.append(("mlp.down_proj", (mlp_shard,), block_k, dense_layers))
+    if not geom.get("kv_lora_rank") and not geom.get("num_experts") and geom.get("head_dim"):
+        layers = range(geom["layers"])
+        query_heads = layout_integer(geom["num_attention_heads"], "num_attention_heads")
+        kv_heads = layout_integer(geom["num_kv_heads"], "num_key_value_heads")
+        if query_heads % attn_tp or max(kv_heads, attn_tp) % min(kv_heads, attn_tp):
+            raise ValueError(
+                "dense attention heads must partition or replicate uniformly over the tensor parallel ranks"
+            )
+        query_shard = query_heads // attn_tp * geom["head_dim"]
+        kv_shard = max(1, kv_heads // attn_tp) * geom["head_dim"]
+        checks.append(("self_attn.qkv_proj", (query_shard, kv_shard), block_n, layers))
+        # Since 0.5.22 the validator reads the TP group of the linear layer itself.
+        if attn_tp > 1 and (attn_tp == dense_tp or release is None or release >= Version("0.5.22")):
+            checks.append(("self_attn.o_proj", (query_shard,), block_k, layers))
     fused = {}
     if release is not None and release >= Version("0.5.11"):
+        # The CUDA loader supplies the serving model's packed modules, replacing checkpoint mappings.
         fused = {"gate_up_proj": ("gate_proj", "up_proj"), "qkv_proj": ("q_proj", "k_proj", "v_proj")}
-    if release is not None and release >= Version("0.5.10rc0"):
-        fused.update(quant.get("packed_modules_mapping") or {})
-    for module, widths, block in checks:
+    for module, widths, block, layers in checks:
         aligned = all(width % block == 0 for width in widths)
         shards = fused.get(module.rsplit(".", 1)[-1], ())
         if (
             ignored
             and release is not None
             and (shards or not aligned)
-            and _sglang_skips_modules(ignored, geom["layers"], release, layer_prefix + module, shards=shards)
+            and _sglang_skips_modules(ignored, layers, release, layer_prefix + module, shards=shards)
         ):
             continue
         if not aligned:
@@ -992,6 +1054,7 @@ class NaiveKVCacheEstimator:
         self._cache_release: Version | None = None
         self._vllm_check_model_dtype = False
         self._vllm_model_dtype: str | None = None
+        self._vllm_dtype_target: tuple[str | None, str | list[str] | None] = (None, None)
         self._checkpoint_dir: Path | None = None
         self._vllm_sparse_auto_precision: tuple[float, bool] | None = None
         self._vllm_packed_sparse = False
@@ -1029,15 +1092,16 @@ class NaiveKVCacheEstimator:
         decoder = hf_config.get(key, hf_config)
         names = hf_config.get("architectures")
         architecture = names[0] if isinstance(names, list) and names and isinstance(names[0], str) else None
+        gemma4 = isinstance(decoder, dict) and (
+            architecture == "Gemma4ForConditionalGeneration" or decoder.get("model_type") == "gemma4_text"
+        )
         if isinstance(decoder, dict) and (
             (key is not None and architecture not in ARCHITECTURE_TO_MODEL_FAMILY)
-            or (
-                backend in ("sglang", "vllm")
-                and (architecture == "Gemma4ForConditionalGeneration" or decoder.get("model_type") == "gemma4_text")
-                and gemma4_cache_requires_release(decoder, backend)
-            )
+            or (backend in ("sglang", "vllm") and gemma4 and gemma4_cache_requires_release(decoder, backend))
         ):
             backend_version = _config_only_backend_version(system, backend, backend_version, systems_paths)
+            if gemma4 and backend == "vllm" and "per_layer_config" in decoder:
+                _check_gemma4_adapter_runtime(decoder, backend_version, system, systems_paths)
         estimator = cls.from_hf_config(
             hf_config,
             tp_size=tp_size,
@@ -1049,6 +1113,7 @@ class NaiveKVCacheEstimator:
         )
 
         if estimator._selected_decoder is not None:
+            estimator._vllm_dtype_target = (system, systems_paths)
             # Load the adjacent sidecar for this exact config, including a replaced file in a local checkpoint.
             sidecar = None
             if os.path.isdir(model_path):
@@ -1154,6 +1219,12 @@ class NaiveKVCacheEstimator:
                         (kind for kind, name in _SELECTED_DECODER_ARCHITECTURES.items() if name == named),
                         None,
                     )
+                constructor = "deepseek_v3" if selected_type == "kimi_k2" else selected_type
+                for field, default in _DECODER_GEOMETRY_DEFAULTS.get(constructor, {}).items():
+                    value = raw_decoder.setdefault(field, default)
+                    if value is None and field in ("q_lora_rank", "num_key_value_heads"):
+                        continue
+                    layout_integer(value, field, minimum=0 if field == "first_k_dense_replace" else 1)
                 head_dim, kv_heads = _DECODER_HEAD_DEFAULTS.get(selected_type, (None, None))
                 if selected_type in _DECODER_HEAD_DEFAULTS:
                     # These projection classes read the canonical field, while SGLang sizes its pool separately.
@@ -1176,10 +1247,8 @@ class NaiveKVCacheEstimator:
                     raw_decoder.setdefault("head_dim", head_dim)
                 if kv_heads is not None:
                     raw_decoder.setdefault("num_key_value_heads", kv_heads)
-                # Both Kimi-K2.5 loaders construct the kimi_k2 text config as DeepseekV3Config.
-                expert_type = "deepseek_v3" if selected_type == "kimi_k2" else selected_type
-                if expert_type in _DECODER_EXPERT_DEFAULTS:
-                    field, alias, default, width, default_width = _DECODER_EXPERT_DEFAULTS[expert_type]
+                if constructor in _DECODER_EXPERT_DEFAULTS:
+                    field, alias, default, width, default_width = _DECODER_EXPERT_DEFAULTS[constructor]
                     count = raw_decoder.get(alias, raw_decoder.get(field, default))
                     for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"):
                         raw_decoder.pop(name, None)
@@ -1224,7 +1293,9 @@ class NaiveKVCacheEstimator:
                     # These layouts require the native parser even when the class is omitted.
                     raw_decoder = {**raw_decoder, "architectures": [selected]}
                 decoder = cls.from_hf_config(
-                    raw_decoder,
+                    # The native timing parser also projects context and vocabulary. A selected
+                    # decoder can supply KV geometry without either; weights still require vocabulary.
+                    {"max_position_embeddings": None, "vocab_size": None, **raw_decoder},
                     tp_size=tp_size,
                     pp_size=pp_size,
                     moe_ep_size=moe_ep_size,
@@ -1889,6 +1960,8 @@ class NaiveKVCacheEstimator:
         if not dtypes:
             return "float32"  # vLLM's default when no weights report a dtype.
         floating = {dtype for dtype in dtypes if dtype.startswith(("F", "BF", "C"))} - {"F8_E4M3", "F8_E5M2"}
+        if "F64" in floating and floating <= {"F16", "BF16", "F32", "F64"}:
+            return "float64"
         if "F32" in floating and floating <= {"F16", "BF16", "F32"}:
             return "float32"
         if floating == {"BF16"}:
@@ -1905,6 +1978,12 @@ class NaiveKVCacheEstimator:
             return
         if mode == "bfloat16" and self._vllm_check_model_dtype:
             dtype = self._vllm_model_dtype or self._local_vllm_model_dtype()
+            if dtype in ("float64", "double"):
+                # F64 wins lossless promotion, then vLLM selects the deployment's preferred dtype.
+                sm = _config_only_system_spec(*self._vllm_dtype_target).get("gpu", {}).get("sm_version")
+                if sm is None:
+                    raise ValueError("explicit bfloat16 KV cache requires the target's preferred vLLM model dtype")
+                dtype = "bfloat16" if sm >= 80 else "float16"
             if dtype in ("float16", "fp16", "half"):
                 raise ValueError("explicit bfloat16 KV cache dtype disagrees with the vLLM float16 model dtype")
         if mode == "bfloat16" and self._vllm_packed_sparse:
@@ -2670,7 +2749,14 @@ def estimate_kv_cache(
                     ignored = []
                 if not isinstance(ignored, list) or not all(isinstance(name, str) and name for name in ignored):
                     raise ValueError("SGLang FP8 exclusions must be a list of module names") from exc
-                if not experts and not naive.geometry.get("kv_lora_rank") and naive.geometry.get("head_dim"):
+                layers = range(naive.geometry["layers"])
+                routed = set(layers) if experts else set()
+                if deepseek and experts:
+                    first = layout_integer(raw.get("first_k_dense_replace", 0), "first_k_dense_replace", minimum=0)
+                    frequency = layout_integer(raw.get("moe_layer_freq", 1), "moe_layer_freq")
+                    routed = {i for i in layers if i >= first and i % frequency == 0}
+                dense_layers = [i for i in layers if i not in routed]
+                if dense_layers:
                     dense_tp = tp_size * attention_dp_size * cp_size
                     # Qwen3 shards attention across the attention TP group. Llama and Qwen2 use the full TP group.
                     attn_tp = (
@@ -2679,19 +2765,18 @@ def estimate_kv_cache(
                         else tp_size
                     )
                     _validate_sglang_dense_fp8(
-                        quant, naive.geometry, attn_tp, dense_tp, release, ignored, naive._sglang_layer_prefix
+                        quant,
+                        naive.geometry,
+                        attn_tp,
+                        dense_tp,
+                        release,
+                        ignored,
+                        naive._sglang_layer_prefix,
+                        dense_layers,
                     )
-            if sglang_fp8 and module is not None and release is not None and release >= Version("0.5.10rc0"):
-                # SGLang selects an unquantized FusedMoE when its module was explicitly excluded.
-                first = (
-                    layout_integer(raw.get("first_k_dense_replace", 0), "first_k_dense_replace", minimum=0)
-                    if deepseek
-                    else 0
-                )
-                frequency = layout_integer(raw.get("moe_layer_freq", 1), "moe_layer_freq") if deepseek else 1
-                quantized_experts = not _sglang_skips_modules(
-                    ignored, naive.geometry["layers"], release, module, first=first, frequency=frequency
-                )
+                if module is not None and release is not None and release >= Version("0.5.10rc0"):
+                    # SGLang can select an unquantized FusedMoE for its routed layers.
+                    quantized_experts = not _sglang_skips_modules(ignored, routed, release, module)
             if mxfp8:
                 if release is None or release < Version("0.5.9"):
                     raise ValueError("SGLang MXFP8 checkpoints require backend version 0.5.9 or later") from exc

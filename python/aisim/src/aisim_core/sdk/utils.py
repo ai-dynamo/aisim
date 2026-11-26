@@ -957,7 +957,13 @@ def gemma4_cache_shapes(
                 or not 0 <= int(key) < layers
                 or int(key) in by_layer
                 or not isinstance(fields, dict)
-                or fields.keys() - {"num_key_value_heads", "head_dim"}
+            ):
+                raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
+            # Transformers drops empty skips and overrides equal to their global value.
+            # Its explicit serialization can write those same global values on every layer.
+            extra = fields.keys() - {"num_key_value_heads", "head_dim", "skip"}
+            if fields.get("skip", []) != [] or any(
+                name not in config or fields[name] != config[name] for name in extra
             ):
                 raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
             by_layer[int(key)] = fields
@@ -986,7 +992,7 @@ def gemma4_cache_shapes(
                 raise ValueError("this vLLM release has no Gemma 4 model")
             if flat_vllm and config.get("global_head_dim", 512) is None:
                 raise ValueError(f"vLLM {backend_version} needs the flat Gemma 4 global_head_dim")
-            if config.get("attention_k_eq_v") and full_heads is None:
+            if flat_vllm and config.get("attention_k_eq_v") and full_heads is None:
                 raise ValueError(
                     "tied Gemma 4 heads require flat num_global_key_value_heads or a per-layer vLLM release"
                 )
@@ -995,7 +1001,8 @@ def gemma4_cache_shapes(
             layout_integer(heads if full_heads is None else full_heads, "num_global_key_value_heads"),
             layout_integer(dim if full_dim is None else full_dim, "global_head_dim"),
         )
-        # Three-argument SDK callers have no release. Both readers must agree on each active layer type.
+        # Release-free calls require agreement with the adapter that falls back to the base heads
+        # when an older Transformers config has no global KV head count.
         if explicit_shapes is not None and (
             explicit_shapes.get("sliding_attention", base) != base or explicit_shapes["full_attention"] != full
         ):
