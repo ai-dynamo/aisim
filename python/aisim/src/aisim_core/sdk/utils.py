@@ -897,6 +897,127 @@ def _parse_llama4_vision_config(
     )
 
 
+# Gemma4TextConfig defaults for attributes read globally by the vLLM decoder.
+# Its only per-layer reads are head_dim and num_key_value_heads.
+GEMMA4_DEFAULT_INTERMEDIATE_SIZE = 9216
+_GEMMA4_VLLM_GLOBAL_DEFAULTS = {
+    "hidden_size": 2304,
+    "intermediate_size": GEMMA4_DEFAULT_INTERMEDIATE_SIZE,
+    "num_hidden_layers": 30,
+    "num_attention_heads": 8,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "max_position_embeddings": 131_072,
+    "rms_norm_eps": 1e-6,
+    "attention_bias": False,
+    "attention_k_eq_v": False,
+    "sliding_window": 512,
+    "rope_parameters": {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10_000.0},
+        "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1_000_000.0},
+    },
+    "num_kv_shared_layers": 0,
+    "use_double_wide_mlp": False,
+    "num_experts": None,
+    "top_k_experts": None,
+    "moe_intermediate_size": None,
+    "vocab_size": 262_144,
+    "tie_word_embeddings": True,
+    "vocab_size_per_layer_input": 262_144,
+    "hidden_size_per_layer_input": 256,
+    "final_logit_softcapping": None,
+}
+
+# These Gemma4TextConfig fields also exist when omitted from the JSON. SGLang
+# rejects a surviving override of any of them before constructing its decoder.
+_GEMMA4_OTHER_DEFAULTS = {
+    "model_type": "gemma4_text",
+    "architectures": None,
+    "transformers_version": None,
+    "return_dict": True,
+    "output_hidden_states": False,
+    "output_attentions": False,
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": False,
+    "problem_type": None,
+    "initializer_range": 0.02,
+    "use_cache": True,
+    "pad_token_id": 0,
+    "eos_token_id": 1,
+    "bos_token_id": 2,
+    "attention_dropout": 0.0,
+    "use_bidirectional_attention": None,
+    "enable_moe_block": False,
+}
+
+
+def _check_gemma4_layer_attributes(
+    config: dict, layers: dict[int, dict], types: list[str], backend: str, release: Version | None
+) -> None:
+    # Transformers first removes overrides that equal the effective global attribute.
+    # SGLang flattens only attention geometry. vLLM leaves other overrides attached:
+    # a global read then raises unless the checkpoint explicitly permits that access.
+    defaults = {**_GEMMA4_OTHER_DEFAULTS, **_GEMMA4_VLLM_GLOBAL_DEFAULTS, **config, "layer_types": types}
+    if defaults["rope_parameters"] is None:
+        defaults["rope_parameters"] = _GEMMA4_VLLM_GLOBAL_DEFAULTS["rope_parameters"]
+    if defaults["use_bidirectional_attention"] == "all":
+        defaults["sliding_window"] = layout_integer(defaults["sliding_window"], "sliding_window") // 2 + 1
+
+    global_reads = (_GEMMA4_VLLM_GLOBAL_DEFAULTS.keys() - {"num_experts", "top_k_experts", "moe_intermediate_size"}) | {
+        "layer_types",
+        "attn_logit_softcapping",
+    }
+    if backend == "vllm" and release is not None and release < Version("0.28.0rc1"):
+        defaults.setdefault("global_head_dim", 512)
+        defaults.setdefault("num_global_key_value_heads", None)
+        global_reads.add("global_head_dim")
+        if defaults["attention_k_eq_v"]:
+            global_reads.add("num_global_key_value_heads")
+    else:
+        # From Transformers 5.15 the constructor consumes these legacy kwargs
+        # before attaching per_layer_config, so they cannot satisfy a sparse override.
+        defaults.pop("global_head_dim", None)
+        defaults.pop("num_global_key_value_heads", None)
+    if "sliding_attention" in types and "sliding_attention" not in defaults["rope_parameters"]:
+        global_reads.add("rope_local_base_freq")
+    expert_layer = False
+    if release is None or release < Version("0.32.0rc0"):
+        global_reads.add("enable_moe_block")
+        if not defaults["enable_moe_block"]:
+            global_reads.add("use_second_mlp_block")
+        expert_layer = defaults["enable_moe_block"] or config.get("use_second_mlp_block")
+    if release is None or release >= Version("0.32.0rc0"):
+        global_reads.add("num_experts")
+        expert_layer = expert_layer or defaults["num_experts"] is not None
+    if expert_layer:
+        global_reads.update(("num_experts", "top_k_experts", "moe_intermediate_size"))
+        # Older constructors evaluate the fallback argument to getattr eagerly.
+        if release is None or release < Version("0.31.0rc1"):
+            global_reads.add("expert_intermediate_size")
+    guarded = not config.get("allow_global_per_layer_attribute_access")
+    for fields in layers.values():
+        if (
+            fields.get("attention_chunk_size", config.get("attention_chunk_size")) is not None
+            and fields.get("sliding_window", defaults["sliding_window"]) is not None
+        ):
+            raise ValueError("Gemma 4 per_layer_config cannot combine attention_chunk_size and sliding_window")
+        skip = fields.get("skip", [])
+        if (
+            not isinstance(skip, list)
+            or not all(isinstance(name, str) for name in skip)
+            or (skip and backend == "sglang")
+        ):
+            raise ValueError("Gemma 4 per_layer_config contains an unsupported skip")
+        for name in fields.keys() - {"num_key_value_heads", "head_dim", "skip"}:
+            if name not in defaults:
+                # A custom attribute without a global value must be supplied on every layer.
+                if len(layers) != len(types) or any(name not in row for row in layers.values()):
+                    raise ValueError(f"Gemma 4 per_layer_config has no global {name}")
+            elif fields[name] == defaults[name]:
+                continue
+            if backend == "sglang" or (guarded and name in global_reads):
+                raise ValueError(f"{backend} cannot read Gemma 4 per_layer_config override for {name}")
+
+
 def gemma4_cache_requires_release(config: dict, backend: str) -> bool:
     """Identify Gemma cache fields whose serving semantics changed between releases."""
     return "per_layer_config" in config or (
@@ -907,7 +1028,7 @@ def gemma4_cache_requires_release(config: dict, backend: str) -> bool:
 
 
 def gemma4_cache_shapes(
-    config: dict, backend: str | None = None, backend_version: str | None = None
+    config: dict, backend: str | None = None, backend_version: str | None = None, *, agreement_tp_size: int = 1
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     """Return the (KV heads, head dimension) of the sliding and full attention pools."""
     has_per_layer_config = "per_layer_config" in config
@@ -959,16 +1080,11 @@ def gemma4_cache_shapes(
                 or not isinstance(fields, dict)
             ):
                 raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
-            # Transformers drops empty skips and overrides equal to their global value.
-            # Its explicit serialization can write those same global values on every layer.
-            extra = fields.keys() - {"num_key_value_heads", "head_dim", "skip"}
-            if fields.get("skip", []) != [] or any(
-                name not in config or fields[name] != config[name] for name in extra
-            ):
-                raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
             by_layer[int(key)] = fields
+        types = [*types[:-1], "full_attention"]
+        _check_gemma4_layer_attributes(config, by_layer, types, backend, release)
         shapes = {}
-        for i, kind in enumerate([*types[:-1], "full_attention"]):
+        for i, kind in enumerate(types):
             fields = by_layer.get(i, {})
             shape = (
                 layout_integer(fields.get("num_key_value_heads", base[0]), "num_key_value_heads"),
@@ -1003,11 +1119,27 @@ def gemma4_cache_shapes(
         )
         # Release-free calls require agreement with the adapter that falls back to the base heads
         # when an older Transformers config has no global KV head count.
-        if explicit_shapes is not None and (
-            explicit_shapes.get("sliding_attention", base) != base or explicit_shapes["full_attention"] != full
-        ):
-            name = "SGLang" if backend == "sglang" else "vLLM"
-            raise ValueError(f"Gemma 4 per_layer_config requires the {name} release or a runtime profile")
+        if explicit_shapes is not None:
+            for legacy, layered in (
+                (base, explicit_shapes.get("sliding_attention", base)),
+                (full, explicit_shapes["full_attention"]),
+            ):
+                if legacy == layered:
+                    continue
+                # The 5.14 constructor may guard even the validation-time global head
+                # read. When global reads are allowed, compare each viable rank-local pool.
+                tp = agreement_tp_size
+                if (
+                    tp > 1
+                    and config.get("allow_global_per_layer_attribute_access")
+                    and config.get("num_attention_heads", 8) % tp == 0
+                    and legacy[1] == layered[1]
+                    and all(max(h, tp) % min(h, tp) == 0 for h in (legacy[0], layered[0]))
+                    and max(1, legacy[0] // tp) == max(1, layered[0] // tp)
+                ):
+                    continue
+                name = "SGLang" if backend == "sglang" else "vLLM"
+                raise ValueError(f"Gemma 4 per_layer_config requires the {name} release or a runtime profile")
     else:
         full = explicit_shapes["full_attention"]
         base = explicit_shapes.get("sliding_attention", full)
@@ -1429,6 +1561,8 @@ def _parse_hf_config_json(config: dict) -> dict:
         # Gemma 4 hybrid attention + dense-MLP-plus-MoE FFN. Layer kind per `layer_types`.
         # Q/K/V head_dim and KV-head count differ between SWA and global layers; global
         # layers may set attention_k_eq_v (no v_proj, V reuses K projection output).
+        if "intermediate_size" not in config:
+            inter_size = GEMMA4_DEFAULT_INTERMEDIATE_SIZE
         layer_types_raw = config.get("layer_types", [])
         if len(layer_types_raw) != layers:
             raise ValueError(f"Gemma 4 layer_types length {len(layer_types_raw)} != num_hidden_layers {layers}")

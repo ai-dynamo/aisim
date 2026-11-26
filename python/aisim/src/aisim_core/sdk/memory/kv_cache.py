@@ -52,7 +52,7 @@ import enum
 import json
 import math
 import os
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterator
 from functools import partial
 from itertools import pairwise
 from pathlib import Path
@@ -100,6 +100,7 @@ from aisim_core.sdk.models.helpers import (
     resolve_trtllm_mla_compute,
 )
 from aisim_core.sdk.utils import (
+    GEMMA4_DEFAULT_INTERMEDIATE_SIZE,
     _attach_inferred_quant_fields,
     _download_hf_config,
     _download_hf_json,
@@ -150,9 +151,11 @@ _DECODER_HEAD_DEFAULTS = {
 }
 
 
-# Structural defaults read by KV and weight sizing from Qwen3Config and DeepseekV3Config.
+# Structural defaults of the selected Transformers constructors used for KV and weight sizing.
 # Both Kimi-K2.5 serving loaders instantiate its kimi_k2 text config as DeepseekV3Config.
 _DECODER_GEOMETRY_DEFAULTS = {
+    "llama": {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32, "intermediate_size": 11008},
+    "qwen2": {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32, "intermediate_size": 22016},
     "qwen3": {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32, "intermediate_size": 22016},
     "deepseek_v3": {
         "hidden_size": 7168,
@@ -215,15 +218,112 @@ def _config_only_backend_version(
         return None
 
 
+# Official release index and Linux platform manifest digests for the vLLM
+# adapters that support both the flat and heterogeneous Transformers readers.
+_GEMMA4_ADAPTER_IMAGES = {
+    ("0.28.0", "vllm"): {
+        "sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14",
+        "sha256:2a7cde230b59f3ce6cab33dd245ba6bee41aa87b38c9fe84f966ff24016813ce",
+        "sha256:2286e8533ca8b6bc777594bae30524f1426ba46ca21797524e06df6a94b06635",
+    },
+    ("0.28.0", "vllm_xpu"): {
+        "sha256:4756b66a077627133cee653b551f6f5eaa1b9a981b5eea13edd33fcd3b0d3ca3",
+        "sha256:d3e9c5f146a8251c7489107e6353cf512fcd1bf14a16cab17148125a62a537c8",
+    },
+    ("0.29.0", "vllm"): {
+        "sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1",
+        "sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a",
+        "sha256:082ca6f035279109041ffd3fe0695cb568b29bc580b35c4f297a66a08b216c1b",
+    },
+    ("0.29.0", "vllm_xpu"): {
+        "sha256:96db42e248d48760a4937eb3d04c4878b39d13a9814efea95d510393e097a901",
+        "sha256:1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a",
+    },
+    ("0.30.0", "vllm"): {
+        "sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
+        "sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
+        "sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40",
+    },
+    ("0.30.0", "vllm_xpu"): {
+        "sha256:fc0e112afb64e3a06fe8daff34652435822a629412f38efce8f0f67a46636b8d",
+        "sha256:e4446310b1d30015e8fdc1a0a2ef1669ac6bef857cbe772487571ed5c1a926a9",
+    },
+    ("0.31.0", "vllm"): {
+        "sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3",
+        "sha256:3f7dd5b777d34d1724456ce71f87385dca288c3bb23029ab27dee358f5d2b971",
+        "sha256:a4a4c0437bf7240089da5f08aa370c4aee17ae5290f7a3b468825ee26c4c3a6b",
+    },
+    ("0.31.0", "vllm_xpu"): {
+        "sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7",
+        "sha256:0229393589110073085ffb558d3da4ce1114b93e985019a8811433b5fc793bac",
+    },
+}
+
+
+def _gemma4_collection_images(directory: Path, version: str, framework: str) -> Iterator[bool]:
+    """Yield whether each retained measurement of this framework used the pinned official image."""
+    path = directory / perf_database.COLLECTION_META_MARKER
+    digests = _GEMMA4_ADAPTER_IMAGES.get((version, framework))
+    if not digests or not path.is_file():
+        return
+    collection = perf_database._load_collection_meta_yaml(str(path))
+    tables = collection.get("tables")
+    if not isinstance(tables, dict):
+        return
+    files = {
+        item.stem
+        for item in directory.iterdir()
+        if item.suffix in (".parquet", ".txt") and item.is_file() and item.stat().st_size
+    }
+    repository = "vllm/vllm-openai-xpu" if framework == "vllm_xpu" else "vllm/vllm-openai"
+    image = f"{repository}:v{version}"
+    for table in files.intersection(tables):
+        data = tables[table]
+        if not isinstance(data, dict):
+            continue
+        # Schema v1 records one collection per table. In v2 an individual
+        # measurement can override the directory's runtime.
+        for event in data.get("collections", [data]):
+            runtime = event.get("runtime", collection.get("runtime"))
+            if not isinstance(runtime, dict) or type(event.get("rows")) is not int or event["rows"] <= 0:
+                continue
+            if runtime.get("framework") != framework:
+                continue
+            reference = runtime.get("image", "")
+            reference = reference.removeprefix("docker.io/") if isinstance(reference, str) else ""
+            name, _, embedded_digest = reference.partition("@")
+            digest = runtime.get("image_digest", embedded_digest)
+            yield (
+                runtime.get("version") == version
+                and isinstance(digest, str)
+                and digest in digests
+                and name in (repository, image)
+                and (not embedded_digest or embedded_digest == digest)
+            )
+
+
 def _check_gemma4_adapter_runtime(
-    decoder: dict, version: str | None, system: str | None, systems_paths: str | list[str] | None
+    document: dict,
+    version: str | None,
+    tp_size: int,
+    system: str | None = None,
+    systems_paths: str | list[str] | None = None,
 ) -> None:
     release = parse_support_matrix_version(version)
     if release is None or not Version("0.28.0rc1") <= release < Version("0.32.0rc0"):
         return
+    decoder = document.get(decoder_config_key(document), document)
+    if not isinstance(decoder, dict) or "per_layer_config" not in decoder:
+        return
+    names = document.get("architectures")
+    if decoder.get("model_type") != "gemma4_text" and not (
+        isinstance(names, list) and names[:1] == ["Gemma4ForConditionalGeneration"]
+    ):
+        return
     # These vLLM adapters accept both flat and per-layer Transformers implementations.
+    tp_size = validate_parallel_size("tp_size", tp_size)
     try:
-        gemma4_cache_shapes(decoder, "vllm")
+        gemma4_cache_shapes(decoder, "vllm", agreement_tp_size=tp_size)
         return
     except ValueError:
         # An invalid per-layer layout still fails even with a known stock runtime.
@@ -234,22 +334,18 @@ def _check_gemma4_adapter_runtime(
             cells = list(perf_database._iter_database_version_paths(system, "vllm", version, root))
             if not cells:
                 continue
-            for directory, _ in cells:
-                meta = Path(directory) / perf_database.COLLECTION_META_MARKER
-                if meta.is_file() and perf_database._database_version_dir_has_perf_files(directory):
-                    collection = perf_database._load_collection_meta_yaml(str(meta))
-                    runtime = collection.get("runtime", {})
-                    if (
-                        collection.get("schema_version") == 2
-                        and collection.get("tables")
-                        and runtime.get("framework") == "vllm"
-                        and runtime.get("version") == version
-                        and runtime.get("image") == f"vllm/vllm-openai:v{version}"
-                        and runtime.get("image_digest")
-                    ):
-                        return
+            spec = _config_only_system_spec(system, [root])
+            if spec.get("gpu"):
+                framework = "vllm_xpu" if perf_database.is_xpu_system_spec(spec) else "vllm"
+                images = {
+                    stock
+                    for directory, _ in cells
+                    for stock in _gemma4_collection_images(Path(directory), version, framework)
+                }
+                if images == {True}:
+                    return
             break
-    raise ValueError(f"vLLM {version} Gemma 4 per_layer_config needs a stock CUDA collection or a runtime profile")
+    raise ValueError(f"vLLM {version} Gemma 4 per_layer_config needs a stock collection or a runtime profile")
 
 
 def _config_only_system_spec(system: str | None, systems_path: str | list[str] | None) -> dict:
@@ -1101,8 +1197,8 @@ class NaiveKVCacheEstimator:
         ):
             backend_version = _config_only_backend_version(system, backend, backend_version, systems_paths)
             if gemma4 and backend == "vllm" and "per_layer_config" in decoder:
-                _check_gemma4_adapter_runtime(decoder, backend_version, system, systems_paths)
-        estimator = cls.from_hf_config(
+                _check_gemma4_adapter_runtime(hf_config, backend_version, tp_size, system, systems_paths)
+        estimator = cls._from_resolved_hf_config(
             hf_config,
             tp_size=tp_size,
             pp_size=pp_size,
@@ -1152,6 +1248,30 @@ class NaiveKVCacheEstimator:
         This is the no-I/O counterpart to :meth:`from_model_path`. Callers that
         already loaded a config can reuse it without issuing a second HF request.
         """
+        if backend == "vllm":
+            _check_gemma4_adapter_runtime(hf_config, backend_version, tp_size)
+        return cls._from_resolved_hf_config(
+            hf_config,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            moe_ep_size=moe_ep_size,
+            moe_tp_size=moe_tp_size,
+            backend=backend,
+            backend_version=backend_version,
+        )
+
+    @classmethod
+    def _from_resolved_hf_config(
+        cls,
+        hf_config: dict,
+        *,
+        tp_size: int,
+        pp_size: int,
+        moe_ep_size: int,
+        moe_tp_size: int,
+        backend: str,
+        backend_version: str | None,
+    ) -> NaiveKVCacheEstimator:
         architectures = hf_config.get("architectures") or []
         if not isinstance(architectures, list) or not all(isinstance(name, str) for name in architectures):
             raise ValueError(f"HF config architectures must be a list of strings, got {architectures!r}")
@@ -1280,10 +1400,6 @@ class NaiveKVCacheEstimator:
                 if selected_type == "gemma4_text":
                     raw_decoder.setdefault("global_head_dim", 512)
                     raw_decoder.setdefault("sliding_window", 512)
-                    if raw_decoder.get("use_bidirectional_attention") == "all":
-                        raw_decoder["sliding_window"] = (
-                            layout_integer(raw_decoder["sliding_window"], "sliding_window") // 2 + 1
-                        )
                 if not raw_decoder.get("architectures") and selected_type in (
                     "deepseek_v32",
                     "glm_moe_dsa",
@@ -1292,7 +1408,7 @@ class NaiveKVCacheEstimator:
                 ):
                     # These layouts require the native parser even when the class is omitted.
                     raw_decoder = {**raw_decoder, "architectures": [selected]}
-                decoder = cls.from_hf_config(
+                decoder = cls._from_resolved_hf_config(
                     # The native timing parser also projects context and vocabulary. A selected
                     # decoder can supply KV geometry without either; weights still require vocabulary.
                     {"max_position_embeddings": None, "vocab_size": None, **raw_decoder},
@@ -1303,6 +1419,10 @@ class NaiveKVCacheEstimator:
                     backend=backend,
                     backend_version=backend_version,
                 )
+                if selected_type == "gemma4_text" and raw_decoder.get("use_bidirectional_attention") == "all":
+                    # The layer-map reader above consumes the original serialized window.
+                    window = layout_integer(raw_decoder["sliding_window"], "sliding_window") // 2 + 1
+                    decoder.geometry["sliding_window"] = raw_decoder["sliding_window"] = window
                 if hf_config.get("hf_quant_config") is not None:
                     raw_decoder = attach_quantization_sidecar(raw_decoder, hf_config["hf_quant_config"])
                 # The family supplies deployment capabilities. Ordinary raw geometry does not require a
@@ -1311,7 +1431,7 @@ class NaiveKVCacheEstimator:
                 if backend == "sglang":
                     if architecture == "LlavaForConditionalGeneration":
                         decoder._sglang_layer_prefix = "language_model.model.layers.{}."
-                    elif selected_type == "qwen3_vl_text":
+                    elif selected_type in ("qwen3_vl_text", "qwen3_vl_moe_text"):
                         decoder._sglang_layer_prefix = "model.language_model.layers.{}."
                     quant = _sglang_checkpoint_quant(hf_config, raw_decoder)
                     if quant is not None:
@@ -1825,6 +1945,8 @@ class NaiveKVCacheEstimator:
             num_kv_heads = 1
         swa_heads = swa_dim = None
         if hf_config.get("model_type") == "gemma4_text":
+            if "intermediate_size" not in hf_config:
+                inter = GEMMA4_DEFAULT_INTERMEDIATE_SIZE
             (swa_heads, swa_dim), (num_kv_heads, head_dim) = gemma4_cache_shapes(hf_config, backend, backend_version)
         return {
             "layers": layers,
@@ -1978,12 +2100,16 @@ class NaiveKVCacheEstimator:
             return
         if mode == "bfloat16" and self._vllm_check_model_dtype:
             dtype = self._vllm_model_dtype or self._local_vllm_model_dtype()
-            if dtype in ("float64", "double"):
-                # F64 wins lossless promotion, then vLLM selects the deployment's preferred dtype.
-                sm = _config_only_system_spec(*self._vllm_dtype_target).get("gpu", {}).get("sm_version")
-                if sm is None:
+            if dtype in ("float32", "fp32", "float", "float64", "double", "bfloat16", "bf16"):
+                # vLLM downcasts F32 and unsupported dtypes to the deployment's preferred dtype.
+                spec = _config_only_system_spec(*self._vllm_dtype_target)
+                sm = spec.get("gpu", {}).get("sm_version")
+                if sm is not None:
+                    dtype = "bfloat16" if sm >= 80 else "float16"
+                elif spec.get("gpu") and perf_database.is_xpu_system_spec(spec):
+                    dtype = "bfloat16"
+                elif dtype in ("float64", "double"):
                     raise ValueError("explicit bfloat16 KV cache requires the target's preferred vLLM model dtype")
-                dtype = "bfloat16" if sm >= 80 else "float16"
             if dtype in ("float16", "fp16", "half"):
                 raise ValueError("explicit bfloat16 KV cache dtype disagrees with the vLLM float16 model dtype")
         if mode == "bfloat16" and self._vllm_packed_sparse:
@@ -2737,12 +2863,13 @@ def estimate_kv_cache(
                 "DeepseekV32ForCausalLM",
             )
             module = None
-            if raw.get("model_type") == "qwen3_vl_moe_text":
-                module = "model.language_model.layers.{}.mlp.experts"
-            elif naive.architecture == "MixtralForCausalLM":
+            if naive.architecture == "MixtralForCausalLM":
+                # Mixtral constructs its layer list with the literal "layers" prefix.
                 module = "layers.{}.block_sparse_moe.experts"
-            elif naive.architecture == "Qwen3MoeForCausalLM" or deepseek:
-                module = "model.layers.{}.mlp.experts"
+            elif (
+                naive.architecture == "Qwen3MoeForCausalLM" or raw.get("model_type") == "qwen3_vl_moe_text" or deepseek
+            ):
+                module = naive._sglang_layer_prefix + "mlp.experts"
             if sglang_fp8:
                 ignored = quant.get("ignored_layers", quant.get("modules_to_not_convert", []))
                 if ignored is None:
@@ -2758,6 +2885,14 @@ def estimate_kv_cache(
                 dense_layers = [i for i in layers if i not in routed]
                 if dense_layers:
                     dense_tp = tp_size * attention_dp_size * cp_size
+                    if (
+                        cp_size > 1
+                        and naive.architecture == "DeepseekV3ForCausalLM"
+                        and release is not None
+                        and release >= Version("0.5.13")
+                    ):
+                        # The SGLang DeepSeek MLA prefill-CP override replicates its dense MLPs.
+                        dense_tp = 1
                     # Qwen3 shards attention across the attention TP group. Llama and Qwen2 use the full TP group.
                     attn_tp = (
                         dense_tp
