@@ -16,7 +16,7 @@ has_compatible_uv() {
 }
 
 if ! has_compatible_uv; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+  curl -LsSf https://astral.sh/uv/0.13.10/install.sh | sh
   sudo ln -sf "${HOME}/.local/bin/uv" /usr/local/bin/uv
   hash -r
 fi
