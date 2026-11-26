@@ -77,6 +77,16 @@ def _walk(phase_ops):
             yield op
 
 
+def _hc_op_modes(model):
+    """GEMM precisions of the built hyper-connection ops, both phases."""
+    return {
+        op._quant_mode
+        for phase in (model.context_ops, model.generation_ops)
+        for op in _walk(phase)
+        if "_hc_" in op._name and getattr(op, "_quant_mode", None) is not None
+    }
+
+
 def _replicated_weights_bytes(model):
     """Per-rank bytes of weights that are *not* TP-sharded.
 
@@ -283,6 +293,9 @@ def test_quant_modes_follow_checkpoint_exclusions(model_path, moe_mode):
     assert model._hc_gemm_quant_mode == common.GEMMQuantMode.bfloat16
     assert model._ple_gemm_quant_mode == common.GEMMQuantMode.bfloat16
     assert model._mtp_fc_gemm_quant_mode == common.GEMMQuantMode.bfloat16
+    # The built ops agree: every hyper-connection GEMM — down, up and the
+    # below-grid injection — is BF16 under the checkpoint's exclusions.
+    assert _hc_op_modes(model) == {common.GEMMQuantMode.bfloat16}
 
 
 def test_explicit_gemm_mode_reaches_the_families_the_checkpoint_excludes():
@@ -304,6 +317,9 @@ def test_explicit_gemm_mode_reaches_the_families_the_checkpoint_excludes():
     assert model._hc_gemm_quant_mode == explicit
     assert model._ple_gemm_quant_mode == explicit
     assert model._mtp_fc_gemm_quant_mode == explicit
+    # The resolver property is not enough: the injection GEMM used to hardcode
+    # BF16 while its down/up siblings followed the resolver.
+    assert _hc_op_modes(model) == {explicit}
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])

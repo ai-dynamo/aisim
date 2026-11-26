@@ -378,7 +378,7 @@ class Qwen4ExpModel(Qwen35Model):
                 count,
                 cfg.hc_count,
                 hc_w,
-                common.GEMMQuantMode.bfloat16,
+                self._hc_gemm_quant_mode,
                 below_grid_sol=True,
             ),
         ]
