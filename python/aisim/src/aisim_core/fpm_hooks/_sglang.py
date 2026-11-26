@@ -103,6 +103,10 @@ def accept_lengths(result, num_requests: int) -> list[int] | None:
         values = [int(c) + bonus for c in correct]
     if len(values) != num_requests:
         return None
+    # A grammar can stop a request's run early; SGLang then commits only the retained tokens.
+    retained = getattr(result, "grammar_retained_tokens", None)
+    if retained is not None and len(retained) == num_requests:
+        values = [v if r is None else len(r) for v, r in zip(values, retained, strict=True)]
     return [int(v) for v in values]
 
 
@@ -159,8 +163,10 @@ def fill_decode_seq_lens(batch, context) -> bool:
     iterates ``batch.seq_lens_cpu`` and raises. When the record is emitted the
     step's tokens are already appended, so the schedule-time length is
     ``req.seqlen`` minus the tokens this step committed (``accept_lens`` when on
-    the CPU, else one). Returns ``True`` when the attribute was set, so the
-    caller restores ``None`` afterwards and SGLang's own state is unchanged.
+    the CPU, else one) and minus the pending bonus token, which speculative
+    ``seq_lens`` leaves out of the KV prefix. Returns ``True`` when the attribute
+    was set, so the caller restores ``None`` afterwards and SGLang's own state is
+    unchanged.
     """
     mode = getattr(batch, "forward_mode", None)
     if mode is None or not mode.is_decode() or getattr(batch, "seq_lens_cpu", 0) is not None:
@@ -168,7 +174,12 @@ def fill_decode_seq_lens(batch, context) -> bool:
     reqs = list(getattr(batch, "reqs", None) or [])
     committed = accept_lengths(context[0], len(reqs)) if context is not None else None
     committed = committed or [1] * len(reqs)
-    batch.seq_lens_cpu = [max(int(getattr(req, "seqlen", 0)) - n, 0) for req, n in zip(reqs, committed, strict=True)]
+    # Only speculative decode leaves seq_lens_cpu unset; skip the pending token if SGLang says otherwise.
+    spec = getattr(batch, "spec_algorithm", None)
+    pending = 0 if spec is not None and spec.is_none() else 1
+    batch.seq_lens_cpu = [
+        max(int(getattr(req, "seqlen", 0)) - n - pending, 0) for req, n in zip(reqs, committed, strict=True)
+    ]
     return True
 
 

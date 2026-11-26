@@ -536,9 +536,9 @@ def test_sglang_hook_survives_speculative_decode_without_cpu_seq_lens(fake_sglan
     _, reporter = fake_sglang
     sglang.patch_sglang_metrics_reporter(reporter)
     mixin = reporter.SchedulerMetricsReporter(spec=(3, 4))
-    # the step's committed tokens (3 and 2) are already appended to req.seqlen
+    # req.seqlen holds the KV prefix (700, 90), the pending bonus token and this step's committed tokens (3, 2)
     batch = types.SimpleNamespace(
-        forward_mode=_Mode("decode"), reqs=[_Req(seqlen=703), _Req(seqlen=92)], seq_lens_cpu=None
+        forward_mode=_Mode("decode"), reqs=[_Req(seqlen=704), _Req(seqlen=93)], seq_lens_cpu=None
     )
     mixin.forward_pass_device_timer.finish(0.02, "target_verify")
     mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(accept_lens=_Lens([3, 2])))
@@ -550,6 +550,33 @@ def test_sglang_hook_survives_speculative_decode_without_cpu_seq_lens(fake_sglan
     mixin.forward_pass_device_timer.finish(0.02, "target_verify")
     mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(accept_lens=_Lens([3, 2], is_cpu=False)))
     assert mixin.published[-1][1].past_kv_lengths == [702, 91]
+
+
+def test_sglang_reconstructed_spec_seq_lens_match_the_cpu_ones(fake_sglang):
+    """The same speculative forward reports the same KV prefix with and without CPU seq lens."""
+    _, reporter = fake_sglang
+    sglang.patch_sglang_metrics_reporter(reporter)
+    mixin = reporter.SchedulerMetricsReporter(spec=(3, 4))
+    for seq_lens_cpu in ([700], None):
+        batch = types.SimpleNamespace(forward_mode=_Mode("decode"), reqs=[_Req(seqlen=704)], seq_lens_cpu=seq_lens_cpu)
+        mixin.forward_pass_device_timer.finish(0.02, "target_verify")
+        mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(accept_lens=_Lens([3])))
+        m = mixin.published[-1][1]
+        assert m.past_kv_lengths == [700] and m.sum_decode_kv_tokens == 700
+
+
+def test_sglang_accept_lengths_count_only_grammar_retained_tokens(fake_sglang):
+    """A grammar that terminates after two of four accepted tokens commits two."""
+    _, reporter = fake_sglang
+    sglang.patch_sglang_metrics_reporter(reporter)
+    mixin = reporter.SchedulerMetricsReporter(spec=(3, 4))
+    batch = types.SimpleNamespace(
+        forward_mode=_Mode("decode"), reqs=[_Req(seqlen=11), _Req(seqlen=21)], seq_lens_cpu=[10, 20]
+    )
+    result = types.SimpleNamespace(accept_lens=_Lens([4, 3]), grammar_retained_tokens=[[7, 8], None])
+    mixin.forward_pass_device_timer.finish(0.02, "target_verify")
+    mixin._emit_forward_pass_metrics(batch, result)
+    assert mixin.published[-1][1].spec_accept_lengths == [2, 3]
 
 
 @pytest.fixture
