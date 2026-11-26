@@ -299,7 +299,23 @@ def _deployment(
             paths = engine.systems_paths
             if worker is not None and worker.timing.systems_paths is not None:
                 paths = worker.timing.systems_paths
-            root_kwargs[role] = {"systems_paths": list(resolve_systems_paths(paths))}
+            root_kwargs[role] = {
+                "systems_paths": list(
+                    resolve_systems_paths(
+                        paths,
+                        dataset_config={
+                            "model": engine.model,
+                            "system": worker.hardware or engine.hardware,
+                            "backend": engine.backend,
+                            "backend_version": engine.backend_version,
+                            "estimation_mode": worker.timing.estimation_mode or engine.estimation_mode,
+                            "estimator_config": worker.timing.estimator_config
+                            if worker.timing.estimator_config is not None
+                            else engine.estimator_config,
+                        },
+                    )
+                )
+            }
             if (
                 worker is not None
                 and worker.hardware is not None
@@ -1029,7 +1045,7 @@ def _worker_engine_args(
     if worker.timing.type == "default" and engine.workers.encoder is None:
         from aisim_core.sdk import ForwardPassPerfModelConfig
 
-        from .sweeper.forward_pass_estimator import resolve_systems_paths
+        from .sweeper.forward_pass_estimator import request_systems_paths
         from .sweeper.state_snapshot import saved_snapshot_config, snapshot_pinned_controls, spell_as_saved
 
         timing = worker.timing
@@ -1076,13 +1092,13 @@ def _worker_engine_args(
             estimator_config=estimator_config,
             database_mode=timing.database_mode or engine.database_mode,
             transfer_policy=timing.transfer_policy if timing.transfer_policy is not None else engine.transfer_policy,
-            systems_paths=resolve_systems_paths(
+            systems_paths=request_systems_paths(
                 timing.systems_paths or engine.systems_paths, require_directories=not snapshot
             ),
             # A rank hosting the vision tower prices encoder calls through the same estimator.
             encoder_parallel=vision.encoder_parallel if vision is not None else None,
         )
-        timing_config = omit_inactive_moe_controls(canonical.to_dict())
+        timing_config = omit_inactive_moe_controls(canonical.to_dict(resolve_systems_paths=False))
         if saved:
             # Restoration compares the saved identity exactly, including how
             # it spells unset context parallelism, MoE and model controls.

@@ -27,31 +27,53 @@ class ForwardPassEstimatorResolutionError(ValueError):
     """A configured forward-pass estimator identity cannot be resolved exactly."""
 
 
-def resolve_systems_paths(configured: list[str] | None, *, require_directories: bool = True) -> tuple[str, ...]:
+def resolve_systems_paths(
+    configured: list[str] | None,
+    *,
+    require_directories: bool = True,
+    dataset_config: dict[str, Any] | None = None,
+) -> tuple[str, ...]:
     """Expand and validate request-scoped system roots without setting globals."""
 
-    from aisim_core.sdk.rust_engine_step import _resolve_forward_pass_systems_paths
+    from aisim_core.sdk.rust_engine_step import _ensure_dataset, _resolve_forward_pass_systems_paths
+
+    if dataset_config is not None:
+        from aisim_core.data.ensure import pin_from_environment
+
+        pin = pin_from_environment()
+        # Hardware/version/capacity preflight precedes topology enumeration. An operation-data pin is already
+        # fully specified at that point; FPM pins need the complete candidate identity at best_available().
+        if pin is not None and pin.categories == ("op-latency",):
+            ensured = _ensure_dataset({**dataset_config, "systems_paths": request_systems_paths(configured)}, pin)
+            if ensured is not None:
+                configured = ensured.config["systems_paths"]
 
     return tuple(_resolve_forward_pass_systems_paths(tuple(configured or ()), require_directories=require_directories))
 
 
-def request_systems_paths(configured: list[str] | None) -> tuple[str, ...]:
-    """Roots for a forward-pass request: ``resolve_systems_paths`` plus a preserved explicit ``default``.
+def request_systems_paths(configured: list[str] | None, *, require_directories: bool = True) -> tuple[str, ...]:
+    """Request roots, preserving unset roots and an explicit ``default`` until dataset selection.
 
-    Unset roots and the literal ``default`` expand to the same default root, but only the literal token is a
+    Unset roots and the literal ``default`` eventually expand to the same default root, but only the literal token is a
     choice that outranks the source saved by ``aisim init``. The token is resolved again when the native
     configuration is built, so keeping it in the request only keeps that choice visible.
     """
 
+    from aisim_core.sdk.rust_engine_step import _resolve_forward_pass_systems_paths
+
     entries = tuple(configured or ())
-    resolved = resolve_systems_paths(configured)
+    resolved = tuple(
+        _resolve_forward_pass_systems_paths(entries, require_directories=require_directories, resolve_default=False)
+    )
     if not any(isinstance(entry, str) and entry.strip().lower() == "default" for entry in entries):
         return resolved
     # Resolve each entry next to the token, never alone: a lone default-root path is read as an expansion of unset roots
     # and swapped for AICONFIGURATOR_SYSTEMS_PATH, which would move it ahead of the explicit custom roots.
     return tuple(
         dict.fromkeys(
-            "default" if entry.strip().lower() == "default" else resolve_systems_paths([entry, "default"])[0]
+            "default"
+            if entry.strip().lower() == "default"
+            else resolve_systems_paths([entry, "default"], require_directories=require_directories)[0]
             for entry in entries
         )
     )

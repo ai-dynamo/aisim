@@ -171,7 +171,7 @@ def _mixed_budget_candidates(search_space, backend: str, custom_by_role) -> list
             search_space.model_name,
             search_space.hardware_sku_for(role),
             backend=backend,
-            **_estimator_root_kwargs(search_space, role),
+            **_estimator_root_kwargs(search_space, role, backend),
         )
         shapes = [
             shape
@@ -330,11 +330,29 @@ def _engine_memory_kwargs(search_space):
     }
 
 
-def _estimator_root_kwargs(search_space, role):
+def _estimator_root_kwargs(search_space, role, backend):
     paths = search_space.systems_paths_for(role)
     from .forward_pass_estimator import resolve_systems_paths
 
-    return {"systems_paths": list(resolve_systems_paths(paths))}
+    return {
+        "systems_paths": list(
+            resolve_systems_paths(
+                paths,
+                dataset_config={
+                    "model": search_space.model_name,
+                    "system": search_space.hardware_sku_for(role),
+                    "backend": backend,
+                    "backend_version": search_space.requested_backend_version(backend),
+                    "estimation_mode": search_space.role_estimator_controls.get(role, {}).get(
+                        "estimation_mode", search_space.estimation_mode
+                    ),
+                    "estimator_config": search_space.role_estimator_controls.get(role, {}).get(
+                        "estimator_config", search_space.estimator_config
+                    ),
+                },
+            )
+        )
+    }
 
 
 def _role_runtime(search_space, backend: str, role: str) -> tuple[int, int, float, int | None]:
@@ -389,7 +407,7 @@ def _heterogeneous_disagg_configs(
     backend_version = search_space.requested_backend_version(backend)
     if backend_version is None:
         role_versions = {
-            role: resolve_backend_version(hardware, backend, **_estimator_root_kwargs(search_space, role))
+            role: resolve_backend_version(hardware, backend, **_estimator_root_kwargs(search_space, role, backend))
             for role, hardware in role_hardware.items()
         }
         if len(set(role_versions.values())) != 1:
@@ -420,7 +438,7 @@ def _heterogeneous_disagg_configs(
                     else None
                 ),
                 **_engine_memory_kwargs(search_space),
-                **_estimator_root_kwargs(search_space, role),
+                **_estimator_root_kwargs(search_space, role, backend),
                 **({"fpm_profile": search_space.fpm_profile} if search_space.fpm_profile is not None else {}),
                 **(
                     {"candidate_configs": list(dict.fromkeys(getattr(config, role) for config in candidate_configs))}
@@ -472,7 +490,7 @@ def _legal_parallel_configs(search_space, deployment_mode, backend, max_seq_len,
         role_runtime=_runtime_by_role(search_space, backend, deployment_mode),
         role_max_seq_len=_context_by_role(search_space, deployment_mode, max_seq_len),
         **_engine_memory_kwargs(search_space),
-        **_estimator_root_kwargs(search_space, role),
+        **_estimator_root_kwargs(search_space, role, backend),
         **({"fpm_profile": search_space.fpm_profile} if search_space.fpm_profile is not None else {}),
         **({"candidate_configs": candidate_configs} if candidate_configs is not None else {}),
     )
@@ -617,7 +635,7 @@ def _afd_roles_branch(config, mode, max_seq_len, runner_capabilities):
                 if legacy_role != "agg"
                 else None,
                 **_engine_memory_kwargs(ss),
-                **_estimator_root_kwargs(ss, legacy_role),
+                **_estimator_root_kwargs(ss, legacy_role, backend),
                 **({"candidate_configs": pinned} if pinned else {}),
             )
             if pinned:

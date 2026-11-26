@@ -537,10 +537,14 @@ class RustForwardPassPerfModel:
 
     @staticmethod
     def normalize_config(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> dict[str, Any]:
-        """Expand and validate the Rust-owned configuration without constructing a model."""
+        """Validate the Rust-owned configuration, leaving unset data roots for dataset selection."""
         import aisim_core
 
-        return json.loads(aisim_core.RustForwardPassPerfModel.normalize_config(_forward_pass_config_json(config)))
+        return json.loads(
+            aisim_core.RustForwardPassPerfModel.normalize_config(
+                _forward_pass_config_json(config, resolve_default_systems_paths=False)
+            )
+        )
 
     @staticmethod
     def learned_identity(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> dict[str, Any]:
@@ -1079,18 +1083,19 @@ def _names_systems_paths(config: ForwardPassPerfModelConfig | Mapping[str, Any])
     return bool(roots) and not _is_default_systems_roots(roots)
 
 
-def _forward_pass_config_json(config: ForwardPassPerfModelConfig | Mapping[str, Any]) -> str:
-    payload = config.to_dict() if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
-    # ``to_dict`` already resolved a typed config's roots. Resolving them again would read an explicit ``default``
-    # (now the default root's path) as an expansion of unset roots and let AICONFIGURATOR_SYSTEMS_PATH replace it.
-    if not isinstance(config, ForwardPassPerfModelConfig) and (
-        payload.get("estimation_mode") not in {"fpm_regression", "fpm_learned"} or payload.get("systems_paths")
-    ):
+def _forward_pass_config_json(
+    config: ForwardPassPerfModelConfig | Mapping[str, Any], *, resolve_default_systems_paths: bool = True
+) -> str:
+    payload = (
+        config.to_dict(resolve_systems_paths=False) if isinstance(config, ForwardPassPerfModelConfig) else dict(config)
+    )
+    if payload.get("estimation_mode") not in {"fpm_regression", "fpm_learned"} or payload.get("systems_paths"):
         # A snapshot owns its packed performance data; Rust points those paths
         # into the snapshot before it reads them.
         payload["systems_paths"] = _resolve_forward_pass_systems_paths(
             tuple(payload.get("systems_paths") or ()),
             require_directories=not _carries_state_snapshot(payload.get("estimator_config")),
+            resolve_default=resolve_default_systems_paths,
         )
     if "transfer_policy" in payload:
         payload["transfer_policy"] = _resolve_forward_pass_transfer_policy(payload["transfer_policy"])
@@ -1148,7 +1153,9 @@ def _is_default_systems_roots(roots: Iterable[str]) -> bool:
     return default is not None and bool(roots) and all(root == default for root in roots)
 
 
-def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_directories: bool = True) -> list[str]:
+def _resolve_forward_pass_systems_paths(
+    entries: tuple[str, ...], *, require_directories: bool = True, resolve_default: bool = True
+) -> list[str]:
     env_root = os.environ.get("AICONFIGURATOR_SYSTEMS_PATH")
     if not entries:
         from aisim_core.sdk import perf_database
@@ -1158,7 +1165,10 @@ def _resolve_forward_pass_systems_paths(entries: tuple[str, ...], *, require_dir
         if env_root is not None and perf_database.explicit_systems_paths() is None:
             entries = (env_root,)
         else:
-            entries = tuple(perf_database.get_systems_paths())
+            roots = perf_database.explicit_systems_paths()
+            if roots is None and not resolve_default:
+                return []  # dataset selection owns the default; schema validation must not fetch it
+            entries = tuple(perf_database.get_systems_paths() if roots is None else roots)
     if env_root is not None and _is_default_systems_roots(entries):
         # The default root alone is a caller's expansion of unset roots; preserve the environment's choice. A literal
         # ``default`` is an explicit request for the default data (the sweeper keeps the token), so it never equals

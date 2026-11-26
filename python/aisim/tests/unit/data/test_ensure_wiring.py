@@ -115,7 +115,7 @@ def test_a_saved_source_never_replaces_the_literal_default_roots(monkeypatch, mo
 
 
 def _sweeper_request(model, systems_paths=None, mode="op_level"):
-    """The request the recommendation consumer builds; it expands unset roots to the default ones itself."""
+    """Build a request through the recommendation consumer."""
     from aisim.sweeper.config import SearchSpace
     from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
 
@@ -143,6 +143,37 @@ def _sweeper_request(model, systems_paths=None, mode="op_level"):
     return resolver, resolver._request(sample, "prefill")
 
 
+@pytest.fixture
+def replay_dataset(native_dataset, tmp_path):  # noqa: F811
+    """Add decode coverage to the prefill fixture so full replay passes its readiness check."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from tests.unit.data.test_op_publish import _build
+
+    _, systems, config = native_dataset
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "batch_size": 1,
+                    "isl": 4,
+                    "step": 1,
+                    "num_heads": 2,
+                    "num_key_value_heads": 2,
+                    "head_dim": 4,
+                    "kv_cache_dtype": "bfloat16",
+                    "latency": 3.0,
+                }
+            ]
+        ),
+        systems / "data/h200_sxm/attention/vllm/1.0/generation_attention_perf.parquet",
+    )
+    published = tmp_path / "replay-published"
+    _build(systems, published)
+    return published, systems, config
+
+
 @pytest.mark.parametrize("mode", ["op_level", "auto"])
 @pytest.mark.parametrize("configure_defaults", [False, True])
 def test_the_recommendation_consumer_gets_the_saved_source_unless_the_user_names_roots(
@@ -160,9 +191,9 @@ def test_the_recommendation_consumer_gets_the_saved_source_unless_the_user_names
     if configure_defaults:
         res._configure_default_data_roots()
 
-    # No roots given: the consumer still expands them to the default ones, and the saved source wins over those.
+    # No roots given: dataset selection must run before the default roots are expanded.
     resolver, request = _sweeper_request(model, mode=mode)
-    assert request.systems_paths, "the consumer hands over the expanded default roots"
+    assert not request.systems_paths
     shutil.rmtree(systems / "data")
     built = res.RustForwardPassPerfModel.best_available(request)
     assert built.dataset_revisions == {"op-latency": SHA}
@@ -175,6 +206,107 @@ def test_the_recommendation_consumer_gets_the_saved_source_unless_the_user_names
     own.mkdir()
     _, request = _sweeper_request(model, systems_paths=[str(own)], mode=mode)
     assert res._ensure_dataset(request, None) is None
+
+
+@pytest.mark.parametrize("consumer", ["prediction", "pd-prediction", "recommendation"])
+@pytest.mark.parametrize("source", ["local", "on-demand", "hardware"])
+@pytest.mark.parametrize("offline", [False, True])
+def test_consumers_select_data_before_composing_default_roots(
+    replay_dataset,
+    monkeypatch,
+    consumer,
+    source,
+    offline,
+):
+    """A cold default cache must not block a prediction backed by the selected data."""
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config.cli import CorePredictionConfig
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.search import Sweeper
+
+    published, systems, config = replay_dataset
+    transport = FakeTransport(_tree(published))
+    monkeypatch.setattr("aisim_core.data.fetch.HfTransport", lambda: transport)
+    monkeypatch.setattr("aisim.data_cli.HfTransport", lambda: transport)
+    if source == "local":
+        monkeypatch.setenv("AISIM_DATA_LOCAL", str(published))
+    else:
+        flags = ["--on-demand"] if source == "on-demand" else ["--hardware", "h200_sxm", "--no-models"]
+        assert main(["init", *flags, "--repo", REPO, "--revision", SHA]) == 0
+        if offline and source == "on-demand":
+            assert main(["data", "fetch", "--category", "op-latency", "--hardware", "h200_sxm"]) == 0
+    monkeypatch.setenv("AISIM_DATA_OFFLINE", str(int(offline)))
+    opened_before = len(transport.opened)
+
+    def no_default(*args, **kwargs):
+        pytest.fail("selected data must be resolved before composing the release default dataset")
+
+    monkeypatch.setattr(default_systems, "_compose", no_default)
+    shutil.rmtree(systems / "data")  # the consumer must read the published data
+    if consumer == "recommendation":
+        resolver, request = _sweeper_request(config.model)
+        selected = resolver._resolve(request, "prefill")
+        built = res.RustForwardPassPerfModel.best_available(selected.config)
+        try:
+            assert built.predict_prefill_latency(1, 4) >= 7.0  # the synthetic fixture's 7 ms attention cost alone
+        finally:
+            built.close()
+        sweep = SmartSearchConfig(
+            search_space={
+                "model_name": config.model,
+                "hardware_sku": "h200_sxm",
+                "backend": ["vllm"],
+                "backend_version": "1.0",
+                "deployment_mode": ["agg"],
+                "gpu_budget": 1,
+                "context_length": 128,
+                "parallel_configs": [{"tp": 1, "replicas": 1}],
+                "agg_max_num_batched_tokens": [4],
+                "agg_max_num_seqs": [1],
+                "agg_num_gpu_blocks": 16,
+                "agg_block_size": 64,
+            },
+            workload={"isl": 4, "osl": 1, "request_count": 1, "concurrency": 1},
+            sweep={"max_rounds": 1, "candidates_per_round": 1, "parallel_evals": 1},
+        )
+        result = Sweeper(runner_factory=EngineReplayRunnerFactory(), show_progress=False).run(sweep, top_n=None)
+        assert result.model_dump(mode="json")["counts"]["feasible"] == 1
+    else:
+        roles = ("aggregated",) if consumer == "prediction" else ("prefill", "decode")
+        prediction = CorePredictionConfig.model_validate(
+            {
+                "engine": {
+                    "model": config.model,
+                    "hardware": "h200_sxm",
+                    "backend": "vllm",
+                    "backend_version": "1.0",
+                    "context_length": 128,
+                    "enable_shared_layer": False,
+                    "mode": "aggregated" if consumer == "prediction" else "disaggregated",
+                    "workers": {
+                        role: {
+                            "kv_cache": {"capacity": {"type": "fixed", "blocks": 16}},
+                            "scheduler": {"max_batched_tokens": 4},
+                        }
+                        for role in roles
+                    },
+                },
+                "traffic": {
+                    "source": {"type": "synthetic", "input_tokens": 4, "output_tokens": 1},
+                    "load": {"type": "concurrency", "concurrency": 1},
+                    "stop": {"requests": 1},
+                },
+            }
+        )
+        replay = prediction_to_replay_spec(prediction)
+        runner = EngineReplayRunnerFactory().create(0)
+        try:
+            assert runner.run(replay).metrics["completed_requests"] == 1
+        finally:
+            runner.close()
+    if offline or source == "local":
+        assert len(transport.opened) == opened_before
 
 
 @pytest.mark.parametrize("mode", ["op_level", "auto"])
