@@ -476,17 +476,52 @@ pub(super) fn single_head_mla(group: &Value) -> bool {
             .is_none_or(|heads| heads.is_null() || *heads == 1)
     };
     if group["spec_type"] == UNIFORM_SPEC {
-        return group["layer_names"].as_array().is_some_and(|names| {
-            !names.is_empty()
-                && names
-                    .iter()
-                    .all(|name| name.as_str().is_some_and(|n| mla(&group["layer_specs"][n])))
-        });
+        return group["num_kv_heads"]
+            .as_u64()
+            .is_none_or(|heads| heads == 1)
+            && group["layer_names"].as_array().is_some_and(|names| {
+                !names.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| name.as_str().is_some_and(|n| mla(&group["layer_specs"][n])))
+            });
     }
     mla(group)
         && group["layer_specs"]
             .as_object()
             .is_none_or(|layers| layers.values().all(mla))
+}
+
+/// The raw uniform wrapper names its layers. The normalized observation supplies
+/// their concrete specs; some instrumented releases record those specs only there.
+pub(super) fn raw_mla_group(raw: &Value, normalized: &[Value]) -> bool {
+    if raw["spec_type"] != UNIFORM_SPEC {
+        return single_head_mla(raw);
+    }
+    let Some(names) = raw["layer_names"]
+        .as_array()
+        .filter(|names| !names.is_empty())
+    else {
+        return false;
+    };
+    normalized.iter().any(|g| {
+        g["spec_type"] == UNIFORM_SPEC
+            && single_head_mla(g)
+            && raw["num_kv_heads"].as_u64().is_none_or(|heads| heads == 1)
+            && g["layer_names"].as_array().is_some_and(|other| {
+                names.len() == other.len() && names.iter().all(|name| other.contains(name))
+            })
+            && raw["layer_specs"].as_object().is_none_or(|specs| {
+                specs.iter().all(|(name, spec)| {
+                    let measured = &g["layer_specs"][name];
+                    !measured.is_null()
+                        && spec["spec_type"]
+                            .as_str()
+                            .is_none_or(|t| measured["spec_type"] == t)
+                        && spec["num_kv_heads"].as_u64().is_none_or(|h| h == 1)
+                })
+            })
+    })
 }
 
 pub(super) fn check_layer_specs(group: &Value) -> Result<(), AicError> {
@@ -547,13 +582,146 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
         })
 }
 
-/// Layer-major, disjoint ordinary caches register every layer's buffer under its own name.
-/// Packed rows, shared views and incomplete captures do not establish that region set.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub(super) struct StateRegions {
+    possible: BTreeSet<usize>,
+    required: BTreeSet<usize>,
+}
+
+impl StateRegions {
+    pub(super) fn new(possible: BTreeSet<usize>, first_attention: Option<usize>) -> Self {
+        // NIXL visits the native mixers in layer order and keeps the first name at each address.
+        let required = possible
+            .first()
+            .copied()
+            .filter(|i| first_attention.is_none_or(|a| *i < a))
+            .into_iter()
+            .collect();
+        Self { possible, required }
+    }
+
+    pub(super) fn merge(&mut self, other: &Self) {
+        self.possible.retain(|name| other.possible.contains(name));
+        self.required.extend(&other.required);
+    }
+
+    pub(super) fn missing(&self, peer: &Self) -> Option<usize> {
+        self.required.difference(&peer.possible).next().copied()
+    }
+}
+
+/// A Mamba position is a possible region name. An aliased state can never replace an
+/// earlier mixer at its address. The GPU probe retains the starts of its state views.
+pub(super) fn nemotron_state_regions(
+    rank: &Value,
+    groups: &[Value],
+    host: bool,
+) -> Option<StateRegions> {
+    let mut names = BTreeMap::new();
+    let mut first_attention = None;
+    for g in groups {
+        let state = match g["kind"].as_str()? {
+            "state" => true,
+            "attention" => false,
+            _ => return None,
+        };
+        for layer in g["layer_names"].as_array()?.iter() {
+            let name = layer.as_str()?;
+            let suffix = if state { ".mixer" } else { ".mixer.attn" };
+            let index = name
+                .strip_prefix("model.layers.")?
+                .strip_suffix(suffix)?
+                .parse::<usize>()
+                .ok()?;
+            if state {
+                if concrete_spec(g, name)? != "vllm.v1.kv_cache_interface.MambaSpec" {
+                    return None;
+                }
+                names.insert(index, name);
+            } else {
+                first_attention = Some(first_attention.map_or(index, |i: usize| i.min(index)));
+            }
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let mut regions = StateRegions::new(names.keys().copied().collect(), first_attention);
+    if host {
+        return Some(regions);
+    }
+    let cache = &rank["cache"];
+    let mut addresses = BTreeSet::new();
+    for (&i, &name) in names
+        .iter()
+        .take_while(|(i, _)| first_attention.is_none_or(|a| **i < a))
+    {
+        let views = layer_views(&cache["layer_tensors"][name], block_first_probe(rank));
+        let Some((id, offset)) = views.first().and_then(|v| {
+            let id = v["storage_id"].as_str()?;
+            let allocation = cache["tensor_allocations"]
+                .as_array()?
+                .iter()
+                .find(|allocation| {
+                    allocation["storage_id"] == id
+                        && allocation["layers"]
+                            .as_array()
+                            .is_some_and(|ns| ns.iter().any(|n| *n == name))
+                })?;
+            let start = v["storage_offset_bytes"].as_u64()?;
+            (on_gpu(cache, allocation, v, block_first_probe(rank))
+                && views.iter().all(|v| {
+                    v["storage_id"] == id
+                        && v["storage_offset_bytes"]
+                            .as_u64()
+                            .is_some_and(|offset| offset >= start)
+                }))
+            .then_some((id, start))
+        }) else {
+            break; // Later aliases can refer to this unobserved address.
+        };
+        if addresses.insert((id, offset)) {
+            regions.required.insert(i);
+        } else {
+            regions.possible.remove(&i);
+        }
+    }
+    Some(regions)
+}
+
+/// For a block-outer allocation NIXL registers per-layer pointers only when each
+/// tensor row is contiguous and has exactly one physical cache page.
+fn contiguous_page(
+    group: &Value,
+    name: &str,
+    view: &Value,
+    axes: &[(u64, u64)],
+    item: u64,
+) -> Option<u128> {
+    let pool_block = group["block_size_tokens"].as_u64()?;
+    let kernel_block = view["kernel_block_size_tokens"].as_u64()?;
+    if kernel_block == 0 || !pool_block.is_multiple_of(kernel_block) {
+        return None;
+    }
+    let page = group["layer_specs"][name]["page_size_bytes"]
+        .as_u64()
+        .or_else(|| shared_spec(group).and(group["spec_page_size_bytes"].as_u64()))?;
+    let bytes = axes.iter().rev().try_fold(item, |width, &(n, stride)| {
+        (n > 0 && (n == 1 || stride == width))
+            .then(|| width.checked_mul(n))
+            .flatten()
+    })?;
+    (bytes > 0 && bytes.checked_mul(pool_block / kernel_block) == Some(page))
+        .then_some(u128::from(bytes))
+}
+
+/// Disjoint ordinary cache pages register each layer under its own name. Two
+/// pages may occupy separate spans within the same strided allocation.
 pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
     let cache = &rank["cache"];
     let block_first = block_first_probe(rank);
     let groups = cache["groups"].as_array()?;
-    let mut names = BTreeSet::new();
+    let mut by_name = BTreeMap::new();
     for group in groups {
         let layers = group["layer_names"].as_array()?;
         if group["kind"] != "attention"
@@ -563,12 +731,12 @@ pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
             return None;
         }
         for layer in layers {
-            if !names.insert(layer.as_str()?.to_owned()) {
+            if by_name.insert(layer.as_str()?, group).is_some() {
                 return None;
             }
         }
     }
-    if cache["layer_tensors"].as_object()?.len() != names.len() {
+    if cache["layer_tensors"].as_object()?.len() != by_name.len() {
         return None;
     }
     let blocks = cache["num_blocks"].as_u64().filter(|&n| n > 0)?;
@@ -582,6 +750,7 @@ pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
         }
         for layer in layers {
             let name = layer.as_str()?;
+            let group = by_name.get(name)?;
             let [view] = layer_views(&cache["layer_tensors"][name], block_first) else {
                 return None;
             };
@@ -596,6 +765,7 @@ pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
             let start = view["storage_offset_bytes"].as_u64()?;
             let stride = view["stride_bytes"][0].as_u64().filter(|&n| n > 0)?;
             let mut span = u128::from(blocks) * u128::from(block_stride);
+            let mut page = None;
             if let Some(shape) = view["shape"].as_array() {
                 let steps = view["stride_bytes"].as_array()?;
                 let dims = shape
@@ -614,7 +784,10 @@ pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
                     return None;
                 }
                 // Head- or plane-major views can extend beyond the first run of blocks.
-                span = span.max(view_span(&dims, view["element_size_bytes"].as_u64()?)?);
+                let item = view["element_size_bytes"].as_u64()?;
+                span = span.max(view_span(&dims, item)?);
+                page = contiguous_page(group, name, view, &dims[1..], item)
+                    .filter(|width| *width <= u128::from(stride));
             } else if block_first || stride != block_stride {
                 return None;
             }
@@ -622,17 +795,30 @@ pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
                 storage,
                 u128::from(start),
                 u128::from(start).checked_add(span)?,
+                u128::from(stride),
+                page,
             ));
         }
     }
     ranges.sort_unstable();
-    if ranges
-        .windows(2)
-        .any(|pair| pair[0].0 == pair[1].0 && pair[0].2 > pair[1].1)
-    {
-        return None;
+    for (i, &(storage, start, end, stride, page)) in ranges.iter().enumerate() {
+        for &(peer, next, _, step, width) in &ranges[i + 1..] {
+            if peer != storage || next >= end {
+                break;
+            }
+            // BL* can interleave per-layer pages inside every physical block.
+            // Only equal strides and disjoint occupied bytes prove this layout.
+            let delta = (next - start) % stride;
+            if stride != step
+                || !page
+                    .zip(width)
+                    .is_some_and(|(a, b)| a <= delta && b <= stride - delta)
+            {
+                return None;
+            }
+        }
     }
-    (!names.is_empty() && names == placed).then_some(names)
+    (!by_name.is_empty() && by_name.len() == placed.len()).then_some(placed)
 }
 
 pub(super) fn from_strides(
@@ -844,7 +1030,7 @@ mod tests {
                 };
                 let mut rank = json!({"schema_version":"aisimulate-runtime-observation/v1",
                     "runtime":{"version":version}, "cache":{"num_blocks":40,
-                        "groups":[{"kind":"attention", "layer_names":["a","b"], "block_size_tokens":16 * per_block,
+                        "groups":[{"kind":"attention", "layer_names":["a","b"], "block_size_tokens":16 * per_block,"spec_page_size_bytes":pool_stride,
                                    "spec_type":"vllm.v1.kv_cache_interface.FullAttentionSpec"}],
                         "storages":[{"storage_id":"s0", "size_bytes":2 * layer_bytes, "device":"cuda:0"}],
                         "tensor_allocations":[{"storage_id":"s0", "layers":["a","b"],
@@ -857,6 +1043,41 @@ mod tests {
                     registered_layers(&rank).as_ref(),
                     Some(&names),
                     "{version} {per_block}"
+                );
+                let mut interleaved = rank.clone();
+                let al = &mut interleaved["cache"]["tensor_allocations"][0];
+                al["block_stride"] = json!(2 * pool_stride);
+                al["layer_stride"] = json!(16_384);
+                for (i, name) in ["a", "b"].iter().enumerate() {
+                    let layer = &mut interleaved["cache"]["layer_tensors"][name];
+                    let tensor = if version == "0.32.0" {
+                        layer
+                    } else {
+                        &mut layer[0]
+                    };
+                    tensor["stride_bytes"][0] = json!(32_768);
+                    tensor["storage_offset_bytes"] = json!(i * 16_384);
+                }
+                assert_eq!(registered_layers(&interleaved).as_ref(), Some(&names));
+                let layer = &mut interleaved["cache"]["layer_tensors"]["b"];
+                let tensor = if version == "0.32.0" {
+                    layer
+                } else {
+                    &mut layer[0]
+                };
+                tensor["storage_offset_bytes"] = json!(8_192);
+                assert!(registered_layers(&interleaved).is_none());
+                let layer = &mut interleaved["cache"]["layer_tensors"]["b"];
+                let tensor = if version == "0.32.0" {
+                    layer
+                } else {
+                    &mut layer[0]
+                };
+                tensor["storage_offset_bytes"] = json!(16_384);
+                tensor["stride_bytes"] = json!([32_768, 512, 1024, 2]);
+                assert!(
+                    registered_layers(&interleaved).is_none(),
+                    "non-contiguous rows alias the backing"
                 );
                 rank["cache"]["layer_tensors"]["b"] = view(0);
                 assert!(registered_layers(&rank).is_none(), "aliased {version}");

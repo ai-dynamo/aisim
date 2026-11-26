@@ -128,7 +128,11 @@ pub(super) fn same_memory_setting(key: &str, lhs: &Value, rhs: &Value) -> bool {
 }
 
 fn record_memory_field(expected: &mut Value, memory: &Value, key: &str) -> Result<(), AicError> {
-    if let Some(value) = memory.get(key).filter(|v| !v.is_null()) {
+    record_field(expected, key, &memory[key])
+}
+
+fn record_field(expected: &mut Value, key: &str, value: &Value) -> Result<(), AicError> {
+    if !value.is_null() {
         if expected
             .get(key)
             .is_some_and(|old| !same_memory_setting(key, old, value))
@@ -187,6 +191,19 @@ pub(super) fn record_cell_memory(
         return Err(super::conflict("kv_cache_bytes"));
     }
     record_memory_settings(expected, memory)?;
+    record_memory_field(expected, memory, "max_model_len")?;
+    for key in ["max_num_tokens", "max_batch_size"] {
+        record_memory_field(expected, cell, key)?;
+    }
+    for settings in [&entry["runtime_settings"], &entry["resolved_config"]] {
+        record_memory_field(expected, &settings["model_config"], "max_model_len")?;
+        for (key, serving) in [
+            ("max_num_tokens", "max_num_batched_tokens"),
+            ("max_batch_size", "max_num_seqs"),
+        ] {
+            record_field(expected, key, &settings["scheduler_config"][serving])?;
+        }
+    }
     record_memory_fraction(expected, entry)?;
     if let Some(phase) = first_phase_settings(entry) {
         record_memory_settings(expected, phase)?;
@@ -884,6 +901,40 @@ pub(super) fn backends_fit(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn finalized_pool_keeps_its_captured_scheduler_and_context_limits() {
+        let cell = json!({"max_num_tokens":1024,"max_batch_size":64,
+            "runtime_memory":{"max_model_len":4096,"kv_cache_bytes":1622016}});
+        let entry = json!({"runtime_settings":{
+            "model_config":{"max_model_len":4096}, "scheduler_config":{"max_num_batched_tokens":1024,"max_num_seqs":64}}});
+        let mut identity = super::super::NixlIdentity::default();
+        assert_eq!(
+            record_cell_memory(&cell, &entry, &Value::Null, &mut identity.recorded_memory).unwrap(),
+            Some(1622016)
+        );
+        let memory = &cell["runtime_memory"];
+        let caps = Some((Some(1024), Some(64)));
+        assert!(identity.selected_memory(memory, caps).is_ok());
+        assert!(
+            identity
+                .selected_memory(memory, Some((Some(512), Some(64))))
+                .is_err()
+        );
+        assert!(
+            identity
+                .selected_memory(memory, Some((Some(1024), Some(32))))
+                .is_err()
+        );
+        assert!(
+            identity
+                .selected_memory(&json!({"max_model_len":8192}), caps)
+                .is_err()
+        );
+        let mut edited = cell.clone();
+        edited["max_num_tokens"] = json!(512);
+        assert!(record_cell_memory(&edited, &entry, &Value::Null, &mut json!({})).is_err());
+    }
 
     #[test]
     fn measured_pool_retains_its_gpu_memory_fraction() {

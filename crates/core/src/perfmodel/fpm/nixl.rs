@@ -9,11 +9,13 @@
 //! <https://github.com/vllm-project/vllm/tree/4ba787ec9959e566d3b587a796dff07673324da5>
 //! See THIRD_PARTY_NOTICES.md for upstream paths and the Apache-2.0 license.
 
+mod heads;
 mod layout;
 mod roster;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use heads::{Decoder, HeadGeometry, UniformAttention};
 use layout::Layouts;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,25 +67,6 @@ fn positive(value: &Value) -> Option<u64> {
     value.as_u64().filter(|&n| n > 0)
 }
 
-fn configured_kv_heads(text: &Value, complete: bool) -> Option<u64> {
-    // An omitted higher-priority alias can still come from the checkpoint when this is an overlay.
-    for key in [
-        "n_head_kv",
-        "num_kv_heads",
-        "num_key_value_heads",
-        "multi_query_group_num",
-        "num_attention_groups",
-    ] {
-        match text.get(key) {
-            Some(Value::Null) => {}
-            Some(value) => return positive(value),
-            None if !complete => return None,
-            None => {}
-        }
-    }
-    positive(&text["num_attention_heads"])
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum TransferMode {
@@ -113,139 +96,6 @@ impl TransferMode {
 }
 
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-struct HeadGeometry {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    num_kv_heads: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    head_size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content_size: Option<u64>,
-}
-
-impl HeadGeometry {
-    fn is_empty(&self) -> bool {
-        self == &Self::default()
-    }
-
-    fn mismatch(&self, peer: &Self) -> Option<(&'static str, String, String)> {
-        [
-            ("num_kv_heads", self.num_kv_heads, peer.num_kv_heads),
-            ("head_size", self.head_size, peer.head_size),
-            ("kv_cache_head_width", self.content_size, peer.content_size),
-        ]
-        .into_iter()
-        .find_map(|(field, a, b)| match (a, b) {
-            (Some(a), Some(b)) if a != b => Some((field, a.to_string(), b.to_string())),
-            _ => None,
-        })
-    }
-
-    fn merge(&mut self, other: &Self) -> Result<(), AicError> {
-        merge_observed(&mut self.num_kv_heads, other.num_kv_heads, "num_kv_heads")?;
-        merge_observed(&mut self.head_size, other.head_size, "head_size")?;
-        merge_observed(
-            &mut self.content_size,
-            other.content_size,
-            "kv_cache_head_width",
-        )
-    }
-}
-
-/// The ordinary decoder's constructor fields. Its KV head count is global until the selected TP is known.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-struct UniformAttention {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    architecture: Option<String>,
-    #[serde(flatten)]
-    heads: HeadGeometry,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    divided_head_size: Option<u64>,
-}
-
-impl UniformAttention {
-    fn configured(text: &Value, complete: bool) -> Option<Self> {
-        let family_architecture = match text["model_type"].as_str() {
-            Some("llama") => Some("LlamaForCausalLM"),
-            Some("mistral") => Some("MistralForCausalLM"),
-            Some("qwen2") => Some("Qwen2ForCausalLM"),
-            Some("qwen3") => Some("Qwen3ForCausalLM"),
-            Some(_) => return None,
-            None => None,
-        };
-        let mut architecture = family_architecture;
-        if let Some(names) = text.get("architectures") {
-            let [name] = names.as_array()?.as_slice() else {
-                return None;
-            };
-            let name = name.as_str()?;
-            if !matches!(
-                name,
-                "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen2ForCausalLM" | "Qwen3ForCausalLM"
-            ) || family_architecture.is_some_and(|expected| expected != name)
-            {
-                return None;
-            }
-            architecture = Some(name);
-        }
-        let divided_head_size = positive(&text["hidden_size"])
-            .zip(positive(&text["num_attention_heads"]))
-            .and_then(|(size, heads)| size.checked_div(heads))
-            .filter(|&size| size > 0);
-        let mut heads = HeadGeometry {
-            head_size: positive(&text["head_dim"]).or_else(|| {
-                (complete || text.get("head_dim").is_some())
-                    .then_some(divided_head_size)
-                    .flatten()
-            }),
-            num_kv_heads: positive(&text["num_key_value_heads"]),
-            ..Default::default()
-        };
-        if architecture == Some("Qwen2ForCausalLM") {
-            heads.head_size = None;
-        }
-        let divided_head_size = divided_head_size
-            .filter(|_| architecture.is_none_or(|name| name == "Qwen2ForCausalLM"));
-        (!heads.is_empty() || divided_head_size.is_some()).then(|| Self {
-            architecture: architecture.map(str::to_owned),
-            heads,
-            divided_head_size,
-        })
-    }
-
-    fn rank_heads(&self, tp: u64, architecture: Option<&str>) -> Option<HeadGeometry> {
-        let architecture = architecture?;
-        if self
-            .architecture
-            .as_deref()
-            .is_some_and(|expected| expected != architecture)
-            || tp == 0
-        {
-            return None;
-        }
-        // Qwen2 divides hidden size even when the HF converter reports an explicit head_dim.
-        let head_size = match architecture {
-            "Qwen2ForCausalLM" => self.divided_head_size,
-            "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" => self.heads.head_size,
-            _ => return None,
-        };
-        let num_kv_heads = self.heads.num_kv_heads.and_then(|heads| {
-            if heads.is_multiple_of(tp) {
-                Some(heads / tp)
-            } else if tp.is_multiple_of(heads) {
-                Some(1)
-            } else {
-                None
-            }
-        });
-        Some(HeadGeometry {
-            num_kv_heads,
-            head_size,
-            ..Default::default()
-        })
-    }
-}
-
-#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub(crate) struct TransferMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     transfer_mode: Option<TransferMode>,
@@ -267,6 +117,8 @@ pub(crate) struct TransferMetadata {
     // A compact writer can retain the top-level override without the checkpoint architecture.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     hybrid_attention_positions: BTreeSet<Vec<usize>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nemotron_state_regions: Option<layout::StateRegions>,
 }
 
 impl TransferMetadata {
@@ -276,96 +128,77 @@ impl TransferMetadata {
             .filter(|p| !p.is_empty() && p.bytes().all(|c| matches!(c, b'*' | b'M' | b'-' | b'E')))
     }
 
-    fn configured(config: &Value, use_mla: Option<bool>) -> Self {
+    fn configured(
+        config: &Value,
+        use_mla: Option<bool>,
+        architecture: Option<&str>,
+        source: &Value,
+    ) -> Self {
         let model = &config["model_config"];
         let resolved = &model["model_arch_config"];
-        let overrides = &model["hf_overrides"];
-        let effective = model
-            .get("hf_text_config")
-            .filter(|v| v.is_object())
-            .or_else(|| {
-                let hf = model.get("hf_config")?.as_object()?;
-                Some(hf.get("text_config").unwrap_or(&model["hf_config"]))
-            });
-        let text = effective.unwrap_or_else(|| overrides.get("text_config").unwrap_or(overrides));
-        // Only use HF overrides for model types whose tagged converter reads these fields.
-        // For example Falcon's multi-query mode ignores n_head_kv; an unidentified
-        // checkpoint can select that converter even if it exposes an ordinary KV cache.
-        let family = text["model_type"].as_str();
-        let standard = matches!(
-            family,
-            Some("llama" | "mistral" | "qwen2" | "qwen3" | "nemotron_h")
+        let checkpoint = heads::checkpoint(model, source);
+        let (top, text) = heads::HfConfig::observed(
+            model,
+            checkpoint.as_ref(),
+            source["launch"]["model_config"].is_object(),
         );
-        let known_layers = standard
-            || family == Some("falcon")
-            || (family.is_none()
-                && Self::hybrid_pattern(text).is_some_and(|pattern| {
-                    text["num_hidden_layers"].as_u64() == Some(pattern.len() as u64)
-                }));
+        let decoder = Decoder::observed(top.fields, architecture);
+        let family = resolved["model_type"]
+            .as_str()
+            .or_else(|| top.fields["model_type"].as_str())
+            .or_else(|| decoder.map(Decoder::family));
+        let (configured_heads, configured_layers) =
+            text.model_geometry(family, use_mla, resolved, top);
         let mut facts = Self {
             transfer_mode: TransferMode::configured(config),
-            num_hidden_layers: resolved["total_num_hidden_layers"].as_u64().or_else(|| {
-                known_layers
-                    .then(|| positive(&text["num_hidden_layers"]))
-                    .flatten()
-            }),
+            num_hidden_layers: resolved["total_num_hidden_layers"]
+                .as_u64()
+                .or(configured_layers)
+                .or_else(|| {
+                    let pattern = Self::hybrid_pattern(top.fields)?;
+                    (family.is_none()
+                        && architecture.is_none()
+                        && top.fields["num_hidden_layers"].as_u64() == Some(pattern.len() as u64))
+                    .then_some(pattern.len() as u64)
+                }),
             speculative: config["speculative_config"].is_object().then_some(true),
             model_heads: HeadGeometry {
-                num_kv_heads: positive(&resolved["total_num_kv_heads"]),
-                head_size: positive(&resolved["head_size"]),
+                num_kv_heads: resolved["total_num_kv_heads"]
+                    .as_u64()
+                    .or(configured_heads.num_kv_heads),
+                head_size: resolved["head_size"]
+                    .as_u64()
+                    .or(configured_heads.head_size),
                 ..Default::default()
             },
             ..Self::default()
         };
+        if use_mla != Some(true) {
+            let ordered = top.fields["architectures"].is_array();
+            facts.uniform_attention = decoder.and_then(|d| d.physical_heads(top, text, ordered));
+        }
         // NemotronHModel constructs its layers from the top-level HF pattern. A nested text
         // config and the separate hidden-layer count do not select its attention mixers.
-        let top = model
-            .get("hf_config")
-            .filter(|v| v.is_object())
-            .unwrap_or(overrides);
+        let top = top.fields;
         let top_family = top["model_type"].as_str();
         let architectures = top.get("architectures");
         if top_family.is_none_or(|name| name == "nemotron_h")
-            && architectures.is_none_or(|v| {
-                v.as_array()
-                    .is_some_and(|a| a.len() == 1 && a[0] == "NemotronHForCausalLM")
-            })
+            && architectures.is_none_or(|_| decoder == Some(Decoder::NemotronH))
             && let Some(pattern) = Self::hybrid_pattern(top)
         {
-            let positions = pattern.match_indices('*').map(|(index, _)| index).collect();
+            let positions = pattern
+                .match_indices('*')
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            facts.nemotron_state_regions = Some(layout::StateRegions::new(
+                pattern.match_indices('M').map(|(i, _)| i).collect(),
+                positions.first().copied(),
+            ));
             if top_family == Some("nemotron_h") || architectures.is_some() {
                 facts.nemotron_attention_layers = Some(positions);
             } else {
                 facts.hybrid_attention_positions.insert(positions);
             }
-        }
-        if use_mla != Some(true) {
-            facts.uniform_attention = UniformAttention::configured(text, effective.is_some());
-        }
-        if (standard || family == Some("falcon")) && use_mla == Some(false) {
-            facts.model_heads.num_kv_heads = facts.model_heads.num_kv_heads.or_else(|| {
-                if family == Some("falcon") {
-                    let flag =
-                        |key: &str| text[key].as_bool().or(effective.is_some().then_some(false));
-                    match (flag("new_decoder_architecture"), flag("multi_query")) {
-                        (Some(false), Some(true)) => return Some(1),
-                        (Some(true), _) | (_, Some(false)) => {}
-                        _ => return None,
-                    }
-                }
-                configured_kv_heads(text, effective.is_some())
-            });
-            facts.model_heads.head_size = facts
-                .model_heads
-                .head_size
-                .or_else(|| positive(&text["head_dim"]))
-                .or_else(|| {
-                    effective?;
-                    positive(&text["hidden_size_per_head"]).or_else(|| {
-                        positive(&text["hidden_size"])?
-                            .checked_div(positive(&text["num_attention_heads"])?)
-                    })
-                });
         }
         facts
     }
@@ -402,6 +235,7 @@ impl TransferMetadata {
                 "head_size",
             )?;
             saved.heads.merge(&attention.heads)?;
+            saved.ordered_architecture |= attention.ordered_architecture;
         }
         if let Some(names) = &other.registered_layers {
             if self.registered_layers.get_or_insert_with(|| names.clone()) != names {
@@ -410,6 +244,11 @@ impl TransferMetadata {
         }
         self.hybrid_attention_positions
             .extend(other.hybrid_attention_positions.iter().cloned());
+        if let Some(other) = &other.nemotron_state_regions {
+            self.nemotron_state_regions
+                .get_or_insert_with(|| other.clone())
+                .merge(other);
+        }
         if let Some(layers) = &other.nemotron_attention_layers
             && self
                 .nemotron_attention_layers
@@ -471,7 +310,7 @@ impl Worker {
         names
     }
 
-    fn observed(rank: &Value) -> Result<Self, AicError> {
+    fn observed(rank: &Value, architecture: Option<&str>) -> Result<Self, AicError> {
         let config = &rank["resolved_config"];
         let groups = rank.pointer("/cache/groups").and_then(Value::as_array);
         // Only an entirely identified ordinary attention stack establishes non-MLA operation.
@@ -503,8 +342,13 @@ impl Worker {
                 && groups
                     .iter()
                     .all(|g| g["kind"] == "attention" && layout::single_head_mla(g))
-        }) && raw_groups
-            .is_none_or(|groups| !groups.is_empty() && groups.iter().all(layout::single_head_mla));
+        }) && raw_groups.is_none_or(|raw| {
+            !raw.is_empty()
+                && groups.is_some_and(|normalized| {
+                    raw.len() == normalized.len()
+                        && raw.iter().all(|g| layout::raw_mla_group(g, normalized))
+                })
+        });
         let use_mla = config
             .pointer("/model_config/use_mla")
             .and_then(Value::as_bool)
@@ -521,7 +365,13 @@ impl Worker {
                 .then_some(true)
             });
         let single_head_mla = mla_groups && use_mla == Some(true);
-        let mut metadata = TransferMetadata::configured(config, use_mla);
+        let mut metadata = TransferMetadata::configured(config, use_mla, architecture, rank);
+        if let Some(regions) = groups.and_then(|g| layout::nemotron_state_regions(rank, g, host)) {
+            metadata
+                .nemotron_state_regions
+                .get_or_insert_with(|| regions.clone())
+                .merge(&regions);
+        }
         metadata.registered_layers = layout::registered_layers(rank);
         let physical = if groups.is_some() {
             layout::from_strides(rank, &mut metadata.layer_heads)?
@@ -744,12 +594,19 @@ pub(crate) struct NixlIdentity {
 }
 
 impl NixlIdentity {
-    pub(crate) fn compact_workers(records: &[Value]) -> Result<Value, AicError> {
-        Ok(serde_json::json!(Self::project_workers(records.iter())?))
+    pub(crate) fn compact_workers(
+        records: &[Value],
+        architecture: Option<&str>,
+    ) -> Result<Value, AicError> {
+        Ok(serde_json::json!(Self::project_workers(
+            records.iter(),
+            architecture
+        )?))
     }
 
     fn project_workers<'a>(
         records: impl Iterator<Item = &'a Value> + Clone,
+        architecture: Option<&str>,
     ) -> Result<Vec<Worker>, AicError> {
         let mut schedulers = BTreeMap::new();
         for row in records.clone().filter(|r| r["kind"] == "scheduler") {
@@ -766,7 +623,7 @@ impl NixlIdentity {
         records
             .filter(|r| r["kind"] != "scheduler")
             .map(|row| {
-                let mut worker = Worker::observed(row)?;
+                let mut worker = Worker::observed(row, architecture)?;
                 if let Some(layout) = schedulers.get(&(row["phase"].as_str(), worker.dp_rank)) {
                     if worker
                         .gpu_cache_layout
@@ -826,11 +683,13 @@ impl NixlIdentity {
         )
     }
 
-    fn common_settings(&mut self, config: &Value) -> Result<(), AicError> {
+    fn common_settings(&mut self, config: &Value, source: &Value) -> Result<(), AicError> {
         self.settings(config)?;
         self.metadata.merge(&TransferMetadata::configured(
             config,
             config["model_config"]["use_mla"].as_bool(),
+            self.architecture.as_deref(),
+            source,
         ))
     }
 
@@ -874,10 +733,10 @@ impl NixlIdentity {
         {
             return Err(roster::invalid());
         }
-        self.common_settings(&entry["runtime_settings"])?;
+        self.common_settings(&entry["runtime_settings"], entry)?;
         let formal = entry["source"] == "vllm_initialized_cache";
         if formal {
-            self.common_settings(&entry["resolved_config"])?;
+            self.common_settings(&entry["resolved_config"], entry)?;
         }
         record(
             &mut self.version,
@@ -919,7 +778,10 @@ impl NixlIdentity {
                     }
                 }
             }
-            let common = Worker::observed(&serde_json::json!({"resolved_config":config}))?;
+            let common = Worker::observed(
+                &serde_json::json!({"resolved_config":config,"launch":entry["launch"]}),
+                self.architecture.as_deref(),
+            )?;
             if common.gpu_cache_layout.is_some()
                 || common.use_mla.is_some()
                 || common.permit_permute.is_some()
@@ -971,12 +833,17 @@ impl NixlIdentity {
                         _ => return Err(roster::invalid()),
                     }
                 }
-                self.workers
-                    .push(serde_json::from_value(worker.clone()).map_err(|e| {
-                        AicError::InvalidEngineConfig(format!(
-                            "invalid grouped worker observation: {e}"
-                        ))
-                    })?);
+                let mut worker: Worker = serde_json::from_value(worker.clone()).map_err(|e| {
+                    AicError::InvalidEngineConfig(format!(
+                        "invalid grouped worker observation: {e}"
+                    ))
+                })?;
+                worker.metadata.uniform_attention = worker
+                    .metadata
+                    .uniform_attention
+                    .take()
+                    .and_then(|attention| attention.for_selected(self.architecture.as_deref()));
+                self.workers.push(worker);
             }
         } else if let Some(names) = entry["worker_attention_backends"].as_array() {
             // An optional backend list has no TP coordinates. The verified importer emits the
@@ -1099,6 +966,7 @@ impl NixlIdentity {
                     .iter()
                     .map(|a| &a["evidence"])
                     .filter(|r| matches!(r["kind"].as_str(), Some("worker" | "scheduler"))),
+                self.architecture.as_deref(),
             )?);
         }
         let count = self.workers.len() - start;
@@ -1205,10 +1073,23 @@ impl NixlIdentity {
         Ok(())
     }
 
-    pub(crate) fn selected_memory(&self, selected: &Value) -> Result<(), AicError> {
+    pub(crate) fn selected_memory(
+        &self,
+        selected: &Value,
+        limits: Option<(Option<u64>, Option<u64>)>,
+    ) -> Result<(), AicError> {
         if let Some(fields) = self.recorded_memory.as_object() {
             for (field, value) in fields {
-                if !roster::same_memory_setting(field, &selected[field], value) {
+                let limit = match field.as_str() {
+                    "max_num_tokens" => limits.map(|v| v.0),
+                    "max_batch_size" => limits.map(|v| v.1),
+                    _ => None,
+                };
+                if matches!(field.as_str(), "max_num_tokens" | "max_batch_size") {
+                    if limit.is_some_and(|n| n != value.as_u64()) {
+                        return Err(conflict(field));
+                    }
+                } else if !roster::same_memory_setting(field, &selected[field], value) {
                     return Err(conflict(field));
                 }
             }
@@ -1362,10 +1243,12 @@ impl NixlIdentity {
         provenance: &str,
         phase_width: Option<u64>,
         tp_size: Option<u64>,
+        architecture: Option<&str>,
     ) -> Result<Self, AicError> {
         let mut identity = Self {
             phase_width,
             tp_size,
+            architecture: architecture.map(str::to_owned),
             model_dtype: recorded_dtype.and_then(FpmRuntimeMemoryConfig::normalize_model_dtype),
             ..Self::default()
         };
@@ -1586,6 +1469,17 @@ impl NixlIdentity {
         Ok(identity)
     }
 
+    fn nemotron_decoder(&self) -> bool {
+        self.metadata
+            .uniform_attention
+            .as_ref()
+            .filter(|heads| heads.ordered_architecture)
+            .and_then(|heads| heads.architecture.as_deref())
+            .or(self.architecture.as_deref())
+            .and_then(Decoder::from_name)
+            == Some(Decoder::NemotronH)
+    }
+
     pub fn select(
         &mut self,
         phase: &str,
@@ -1618,7 +1512,15 @@ impl NixlIdentity {
         for worker in &self.workers {
             self.metadata.merge(&worker.metadata)?;
         }
-        if self.architecture.as_deref() == Some("NemotronHForCausalLM") {
+        if self.nemotron_decoder() {
+            if self
+                .metadata
+                .nemotron_state_regions
+                .as_ref()
+                .is_some_and(|r| r.missing(r).is_some())
+            {
+                return Err(conflict("Mamba layer positions"));
+            }
             let mut positions = std::mem::take(&mut self.metadata.hybrid_attention_positions);
             // The tagged NemotronH decoder registers each attention mixer under this name.
             if let Some(names) = &self.metadata.registered_layers
@@ -1780,8 +1682,8 @@ impl NixlIdentity {
         {
             return Some(("cache region names", format!("{a:?}"), format!("{b:?}")));
         }
-        if self.architecture.as_deref() == Some("NemotronHForCausalLM")
-            && self.architecture == decode.architecture
+        if self.nemotron_decoder()
+            && decode.nemotron_decoder()
             && let (Some(a), Some(b)) = (
                 &self.metadata.nemotron_attention_layers,
                 &decode.metadata.nemotron_attention_layers,
@@ -1793,6 +1695,25 @@ impl NixlIdentity {
                 format!("{a:?}"),
                 format!("{b:?}"),
             ));
+        }
+        if self.nemotron_decoder()
+            && decode.nemotron_decoder()
+            && let (Some(a), Some(b)) = (
+                &self.metadata.nemotron_state_regions,
+                &decode.metadata.nemotron_state_regions,
+            )
+        {
+            for (local, peer, transpose) in [(a, b, false), (b, a, true)] {
+                if let Some(i) = local.missing(peer) {
+                    let name = format!("model.layers.{i}.mixer");
+                    let missing = "absent".to_string();
+                    return Some(if transpose {
+                        ("Mamba layer positions", missing, name)
+                    } else {
+                        ("Mamba layer positions", name, missing)
+                    });
+                }
+            }
         }
         if let Some(tp) = self.tp_size.filter(|size| Some(*size) == decode.tp_size) {
             let configured = |rank: &Self| {
@@ -2027,7 +1948,8 @@ mod tests {
     use serde_json::json;
 
     fn observe(evidence: Value, phase: &str) -> NixlIdentity {
-        let mut identity = NixlIdentity::observed(None, &evidence.to_string(), None, None).unwrap();
+        let mut identity =
+            NixlIdentity::observed(None, &evidence.to_string(), None, None, None).unwrap();
         identity
             .select(phase, None, None, None, None, false)
             .unwrap();
@@ -2155,7 +2077,7 @@ mod tests {
                 .is_err()
         );
         evidence["artifacts"][0]["evidence"]["backend_version"] = json!("0.33.0");
-        assert!(NixlIdentity::observed(None, &evidence.to_string(), None, None).is_err());
+        assert!(NixlIdentity::observed(None, &evidence.to_string(), None, None, None).is_err());
     }
 
     #[test]
@@ -2170,6 +2092,7 @@ mod tests {
                 &json!({"cell_observations":cells}).to_string(),
                 Some(4),
                 Some(2),
+                None,
             )
         };
         let first = cell("prefill", 0, json!(["a", "b"]));
@@ -2193,7 +2116,7 @@ mod tests {
         let draft = |names: Value, phase, width| {
             let saved = legacy_probe(names);
             let mut identity =
-                NixlIdentity::observed(None, &saved.to_string(), width, None).unwrap();
+                NixlIdentity::observed(None, &saved.to_string(), width, None, None).unwrap();
             identity
                 .select(phase, None, None, None, None, false)
                 .unwrap();
@@ -2212,9 +2135,9 @@ mod tests {
                 .map(|n| json!({"attention_backend":n}))
                 .collect::<Vec<_>>();
             let saved =
-                json!({"worker_observations": NixlIdentity::compact_workers(&raw).unwrap()});
+                json!({"worker_observations": NixlIdentity::compact_workers(&raw, None).unwrap()});
             let mut id =
-                NixlIdentity::observed(None, &saved.to_string(), Some(4), Some(4)).unwrap();
+                NixlIdentity::observed(None, &saved.to_string(), Some(4), Some(4), None).unwrap();
             id.select(phase, None, None, None, None, false).unwrap();
             id
         };
@@ -2246,8 +2169,10 @@ mod tests {
                 .is_some()
         );
         let impossible = legacy_probe(two_phases);
-        assert!(NixlIdentity::observed(None, &impossible.to_string(), Some(3), None).is_err());
-        assert!(NixlIdentity::observed(None, &impossible.to_string(), None, None).is_ok());
+        assert!(
+            NixlIdentity::observed(None, &impossible.to_string(), Some(3), None, None).is_err()
+        );
+        assert!(NixlIdentity::observed(None, &impossible.to_string(), None, None, None).is_ok());
         for names in [json!([b, null]), json!([null, b])] {
             let partial = draft(names.clone(), "decode", Some(2));
             assert!(uniform.mismatch(&partial).is_some());
@@ -2315,6 +2240,23 @@ mod tests {
         };
         let arch = "NemotronHForCausalLM";
         let compact = json!({"hf_overrides":{"hybrid_override_pattern":"--**"}});
+        let role = |p, arch: &str| {
+            let evidence = json!({"runtime_settings":{"model_config":{"hf_overrides":{"hybrid_override_pattern":p}}}});
+            let mut id =
+                NixlIdentity::observed(None, &evidence.to_string(), None, None, Some(arch))
+                    .unwrap();
+            id.select("prefill", None, None, None, None, false).unwrap();
+            id
+        };
+        let puzzle = "NemotronHPuzzleForCausalLM";
+        assert!(role("**--", puzzle).mismatch(&role("**--", arch)).is_none());
+        assert_eq!(
+            role("**--", puzzle)
+                .mismatch(&role("--**", puzzle))
+                .unwrap()
+                .0,
+            "attention layer positions"
+        );
         assert_eq!(selected(compact.clone(), arch), Some(vec![2, 3]));
         assert!(selected(compact, "LlamaForCausalLM").is_none());
         assert!(selected(json!({"hf_overrides":{}}), arch).is_none());
@@ -2371,7 +2313,7 @@ mod tests {
         ] {
             let mut corrupt = raw.clone();
             corrupt["artifacts"][0]["evidence"]["resolved_config"][section][key] = json!(value);
-            assert!(NixlIdentity::observed(None, &corrupt.to_string(), None, None).is_err());
+            assert!(NixlIdentity::observed(None, &corrupt.to_string(), None, None, None).is_err());
         }
     }
 
@@ -2380,10 +2322,10 @@ mod tests {
         let raw = json!({"tp_rank":0,"dp_rank":0,"phase":"prefill"});
         let mut probe = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v2",
             "nixl_observation":{"runtime":{"version":"0.33.0"},"runtime_settings":{"model_config":{"model":"example","dtype":"bfloat16"},"cache_config":{"cache_dtype":"auto"}},
-            "worker_observations":NixlIdentity::compact_workers(&[raw]).unwrap()}});
-        assert!(NixlIdentity::observed(None, &probe.to_string(), Some(1), Some(1)).is_err());
+            "worker_observations":NixlIdentity::compact_workers(&[raw], None).unwrap()}});
+        assert!(NixlIdentity::observed(None, &probe.to_string(), Some(1), Some(1), None).is_err());
         probe["nixl_observation"]["worker_observations"][0]["dp_rank"] = Value::Null;
-        assert!(NixlIdentity::observed(None, &probe.to_string(), Some(1), Some(1)).is_err());
+        assert!(NixlIdentity::observed(None, &probe.to_string(), Some(1), Some(1), None).is_err());
     }
 
     #[test]
@@ -2392,11 +2334,12 @@ mod tests {
             let width = names.as_array().unwrap().len() as u64;
             let probe = legacy_probe(names);
             let mut id =
-                NixlIdentity::observed(None, &probe.to_string(), Some(width), Some(tp)).unwrap();
+                NixlIdentity::observed(None, &probe.to_string(), Some(width), Some(tp), None)
+                    .unwrap();
             id.select(phase, None, None, None, None, false).unwrap();
             id
         }
-        let mut missing = NixlIdentity::observed(None, "", Some(2), Some(1)).unwrap();
+        let mut missing = NixlIdentity::observed(None, "", Some(2), Some(1), None).unwrap();
         missing
             .select("prefill", None, None, None, None, false)
             .unwrap();
@@ -2439,7 +2382,7 @@ mod tests {
             let profile =
                 json!({"observation_provenance":"source_references","cell_observations":cells});
             let mut id =
-                NixlIdentity::observed(None, &profile.to_string(), Some(2), Some(2)).unwrap();
+                NixlIdentity::observed(None, &profile.to_string(), Some(2), Some(2), None).unwrap();
             id.select("prefill", None, None, None, None, false)
         };
         assert!(select(vec![cell(json!(["a", "b"])), cell(json!(["b", "a"]))]).is_ok());
@@ -2462,11 +2405,17 @@ mod tests {
         let cell =
             json!({"cell_observations":[{"runtime_memory":{"provenance":future.to_string()}}]});
         for value in [future.clone(), json!({"runtime_probe":future}), cell] {
-            assert!(NixlIdentity::observed(None, &value.to_string(), None, None).is_err());
+            assert!(NixlIdentity::observed(None, &value.to_string(), None, None, None).is_err());
         }
         assert!(
-            NixlIdentity::observed(None, r#"{"schema_version":"unrelated/v99"}"#, None, None)
-                .is_ok()
+            NixlIdentity::observed(
+                None,
+                r#"{"schema_version":"unrelated/v99"}"#,
+                None,
+                None,
+                None
+            )
+            .is_ok()
         );
     }
 
@@ -2489,6 +2438,7 @@ mod tests {
                 &json!({"artifacts":artifacts}).to_string(),
                 Some(layouts.len() as u64),
                 Some(2),
+                None,
             )?;
             id.select(phase, None, None, Some("0.33.0"), None, false)?;
             Ok::<_, AicError>(id)
@@ -2554,23 +2504,23 @@ mod tests {
             "cache":{"groups":[{"kind":"attention","layer_classes":{"a":standard,"b":standard}},wrapped],
             "tensor_allocations":[{"layers":["a","b"],"host_resident":false,"layer_stride":1024}],
             "layer_tensors":{"a":[view],"b":[view]}}});
-        let w = Worker::observed(&row).unwrap();
+        let w = Worker::observed(&row, None).unwrap();
         assert_eq!(w.gpu_cache_layout, Layouts::named("BLHNC"));
         assert!(w.requires_hma);
         let mut mixed = row.clone();
         mixed["cache"]["groups"][0]["layer_classes"]["b"] = json!("custom.UnknownAttention");
-        let w = Worker::observed(&mixed).unwrap();
+        let w = Worker::observed(&mixed, None).unwrap();
         assert_eq!(w.use_mla, None);
         assert_eq!(w.gpu_cache_layout, Layouts::named("BLHNC"));
         row["raw_cache_config"] = json!({"kv_cache_layout":"LBNHC"});
-        assert!(Worker::observed(&row).is_err());
+        assert!(Worker::observed(&row, None).is_err());
         row["cache"]["layer_tensors"] = json!({});
-        let w = Worker::observed(&row).unwrap();
+        let w = Worker::observed(&row, None).unwrap();
         assert!(!w.accepts_layout("LBHNC", "LBNHC", Some("0.33.0"), false));
         row["resolved_config"] = json!({"model_config":{"use_mla":true},"kv_transfer_config":{
             "kv_buffer_device":"cpu","enable_permute_local_kv":true}});
         assert_eq!(
-            Worker::observed(&row).unwrap().kv_cache_layout,
+            Worker::observed(&row, None).unwrap().kv_cache_layout,
             Layouts::named("LBNHC")
         );
     }
@@ -2583,7 +2533,7 @@ mod tests {
             "cache":{"groups":[{"kind":"attention","layer_names":["a","b"],"layer_classes":{"a":subclass,"b":subclass}}],
                 "tensor_allocations":[{"layers":["a","b"],"host_resident":false,"layer_stride":4096}],
                 "layer_tensors":{"a":[view],"b":[view]}}});
-        let class_only = Worker::observed(&rank).unwrap();
+        let class_only = Worker::observed(&rank, None).unwrap();
         assert_eq!(class_only.use_mla, Some(false));
         assert_eq!(class_only.gpu_cache_layout, Layouts::named("BLHNC"));
         for (spec, ordinary) in [
@@ -2606,7 +2556,7 @@ mod tests {
                     group["spec_type"] = json!(spec);
                     group.as_object_mut().unwrap().remove("layer_specs");
                 }
-                let worker = Worker::observed(&rank).unwrap();
+                let worker = Worker::observed(&rank, None).unwrap();
                 assert_eq!(worker.use_mla, ordinary.then_some(false));
                 if ordinary {
                     assert_eq!(worker.gpu_cache_layout, Layouts::named("BLHNC"));
@@ -2629,7 +2579,7 @@ mod tests {
                 "tensor_allocations":[{"layers":["a"],"host_resident":false,"layer_stride":0},
                     {"layers":["b","c"],"host_resident":false,"layer_stride":128}],
                 "layer_tensors":{"a":view,"b":view,"c":view}}});
-        let worker = Worker::observed(&row).unwrap();
+        let worker = Worker::observed(&row, None).unwrap();
         assert_eq!(worker.gpu_cache_layout, Layouts::named("BLHNC"));
         assert_eq!(
             worker.metadata.layer_heads.keys().collect::<Vec<_>>(),
@@ -2637,14 +2587,14 @@ mod tests {
         );
         row["cache"]["groups"][0]["layer_specs"] = json!({"a":{"spec_type":"unknown"}});
         assert_eq!(
-            Worker::observed(&row).unwrap().metadata.layer_heads["a"].num_kv_heads,
+            Worker::observed(&row, None).unwrap().metadata.layer_heads["a"].num_kv_heads,
             Some(2)
         );
         row["cache"]["groups"][0]["layer_specs"] = json!({"a":{"spec_type":sliding}});
-        assert!(Worker::observed(&row).is_err());
+        assert!(Worker::observed(&row, None).is_err());
         row["cache"]["groups"][0]["spec_type"] =
             json!("vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs");
-        assert!(Worker::observed(&row).is_ok());
+        assert!(Worker::observed(&row, None).is_ok());
     }
 
     #[test]
@@ -2656,12 +2606,13 @@ mod tests {
                 "raw_cache_config":{"groups":[{"spec_type":spec,"layer_names":["a"],"num_kv_heads":heads,"head_size":dim}]},
                 "cache":{"groups":[{"kind":"attention","spec_type":spec,"layer_names":["a"]}]}});
             let evidence = if compact {
-                json!({"worker_observations":NixlIdentity::compact_workers(&[row]).unwrap()})
+                json!({"worker_observations":NixlIdentity::compact_workers(&[row], None).unwrap()})
             } else {
                 json!({"artifacts":[{"evidence":row}]})
             };
             let mut id =
-                NixlIdentity::observed(None, &evidence.to_string(), Some(2), Some(2)).unwrap();
+                NixlIdentity::observed(None, &evidence.to_string(), Some(2), Some(2), None)
+                    .unwrap();
             id.select("decode", None, None, None, None, false).unwrap();
             id
         };
@@ -2684,6 +2635,7 @@ mod tests {
         let model = |count, width| {
             observe(
                 json!({"runtime_settings":{"model_config":{"use_mla":false,
+            "hf_config":{"model_type":"llama"},
             "hf_text_config":{"model_type":"llama","num_key_value_heads":count,"head_dim":width}}}}),
                 "decode",
             )
@@ -2733,13 +2685,13 @@ mod tests {
             (
                 json!({"model_type":"qwen2","n_head_kv":null,"num_kv_heads":null,"num_key_value_heads":4}),
                 Value::Null,
-                Some(4),
+                None,
             ),
         ] {
             let config =
                 json!({"model_config":{"hf_overrides":overlay,"hf_text_config":effective}});
             assert_eq!(
-                TransferMetadata::configured(&config, Some(false))
+                TransferMetadata::configured(&config, Some(false), None, &Value::Null)
                     .model_heads
                     .num_kv_heads,
                 expected
@@ -2751,6 +2703,242 @@ mod tests {
             "num_hidden_layers"
         );
         assert!(layers(3).mismatch(&model(json!({}))).is_none());
+    }
+
+    #[test]
+    fn compact_model_hash_and_rank_geometry_follow_the_selected_decoder() {
+        let role = |arch, model: Value, measured: Option<(u64, u64)>| {
+            let mut evidence = json!({"runtime_settings":{"model_config":model}});
+            if let Some((heads, dim)) = measured {
+                let spec = "vllm.v1.kv_cache_interface.FullAttentionSpec";
+                evidence["artifacts"] = json!([{"evidence":{"kind":"worker","schema_version":"aisimulate-runtime-observation/v1",
+                    "raw_cache_config":{"groups":[{"spec_type":spec,"layer_names":["a"],"num_kv_heads":heads,"head_size":dim}]},
+                    "cache":{"groups":[{"kind":"attention","spec_type":spec,"layer_names":["a"]}]}}}]);
+            }
+            let mut id =
+                NixlIdentity::observed(None, &evidence.to_string(), Some(2), Some(2), Some(arch))
+                    .unwrap();
+            id.select("decode", None, None, None, None, false).unwrap();
+            id
+        };
+        let qwen = |width, measured| {
+            role(
+                "Qwen2ForCausalLM",
+                json!({
+                    "use_mla":false,"hf_overrides":{"head_dim":width}
+                }),
+                measured,
+            )
+        };
+        for measured in [None, Some((4, 64))] {
+            // The checkpoint's 512 hidden channels / 8 query heads give both physical caches
+            // width 64. NIXL hashes the selected model converter's explicit 64 or 128.
+            let a = qwen(64, measured);
+            assert!(a.mismatch(&qwen(64, None)).is_none());
+            assert_eq!(
+                a.mismatch(&qwen(128, Some((4, 64)))).unwrap().0,
+                "head_size"
+            );
+        }
+        let nemotron = |query, kv, dim| {
+            role(
+                "NemotronHForCausalLM",
+                json!({"hf_overrides":{
+                    "num_attention_heads":query,"num_key_value_heads":kv,"head_dim":dim
+                }}),
+                None,
+            )
+        };
+        let a = nemotron(8, 4, 128);
+        let b = nemotron(16, 8, 64);
+        // Projection shapes and cache page bytes agree. At TP2 this is 2 x 128 versus 4 x 64.
+        assert!(a.mismatch(&nemotron(8, 4, 128)).is_none());
+        assert!(a.mismatch(&b).is_some());
+        assert!(b.mismatch(&a).is_some());
+        let sparse = |observed| role("NemotronHForCausalLM", json!({}), observed);
+        assert!(a.mismatch(&sparse(None)).is_none());
+        assert!(a.mismatch(&sparse(Some((2, 128)))).is_none());
+        assert_eq!(
+            a.mismatch(&sparse(Some((4, 64)))).unwrap().0,
+            "num_kv_heads"
+        );
+        assert_eq!(
+            sparse(Some((4, 64))).mismatch(&a).unwrap().0,
+            "num_kv_heads"
+        );
+    }
+
+    #[test]
+    fn converter_and_constructor_read_their_own_hf_configuration() {
+        let configured = |arch, model: Value| {
+            TransferMetadata::configured(
+                &json!({"model_config":model}),
+                None,
+                Some(arch),
+                &Value::Null,
+            )
+        };
+        let arch = "NemotronHForCausalLM";
+        let settings = json!({"hf_config":{"model_type":"nemotron_h","head_dim":128,"num_key_value_heads":4,
+            "text_config":{"model_type":"qwen2","n_head_kv":8,"head_dim":96,"num_hidden_layers":16}},
+            "hf_overrides":{"num_key_value_heads":16,"head_dim":32}});
+        let facts = configured(arch, settings.clone());
+        assert_eq!(facts.model_heads.num_kv_heads, Some(8));
+        assert_eq!(facts.model_heads.head_size, Some(96));
+        assert_eq!(facts.num_hidden_layers, Some(16));
+        let rank = facts
+            .uniform_attention
+            .unwrap()
+            .rank_heads(2, Some(arch))
+            .unwrap();
+        assert_eq!(rank.num_kv_heads, Some(2));
+        assert_eq!(rank.head_size, Some(128));
+        let mut resolved = settings;
+        resolved["model_arch_config"] = json!({"head_size":112,"total_num_kv_heads":12});
+        let direct = configured(arch, resolved);
+        assert_eq!(direct.model_heads.head_size, Some(112));
+        assert_eq!(direct.model_heads.num_kv_heads, Some(12));
+
+        // Rank heads use num_key_value_heads. The ordinary converter's higher-priority
+        // KV aliases and head-size fallback can remain on an unobserved checkpoint.
+        let sparse = |hf| configured("Qwen2ForCausalLM", json!({"hf_overrides":hf}));
+        assert!(
+            sparse(json!({"num_key_value_heads":4,"hidden_size_per_head":64}))
+                .model_heads
+                .is_empty()
+        );
+        let explicit = sparse(json!({"n_head_kv":8,"head_dim":null,"hidden_size_per_head":96}));
+        assert_eq!(explicit.model_heads.num_kv_heads, Some(8));
+        assert_eq!(explicit.model_heads.head_size, Some(96));
+        for family in ["falcon", "RefinedWeb", "RefinedWebModel"] {
+            let falcon = configured(
+                "FalconForCausalLM",
+                json!({"hf_overrides":{"model_type":family,
+                "new_decoder_architecture":false,"multi_query":true,"n_head_kv":8}}),
+            );
+            assert_eq!(falcon.model_heads.num_kv_heads, Some(1));
+        }
+        let base = configured(
+            "OtherArchitecture",
+            json!({"hf_overrides":{"model_type":"gpt_neox","n_head_kv":8,"head_dim":96}}),
+        );
+        assert_eq!(base.model_heads.num_kv_heads, Some(8));
+        assert_eq!(base.model_heads.head_size, Some(96));
+        assert!(base.uniform_attention.is_none());
+        let mla = configured(
+            "DeepseekV3ForCausalLM",
+            json!({"use_mla":false,"hf_overrides":{
+            "model_type":"deepseek_v3","kv_lora_rank":512,"head_dim":128}}),
+        );
+        assert_eq!(mla.model_heads.head_size, None);
+        let unidentified = configured(
+            "OtherArchitecture",
+            json!({"hf_text_config":{"model_type":"qwen2","head_dim":96}}),
+        );
+        assert!(unidentified.model_heads.is_empty());
+    }
+
+    #[test]
+    fn source_scope_and_native_architecture_order_survive_compaction() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let outer = json!({"model_type":"qwen2_vl","architectures":["Qwen2VLForConditionalGeneration"],
+                          "text_config":{"model_type":"qwen2_vl_text","architectures":["Qwen2ForCausalLM"],"num_key_value_heads":8}}).to_string();
+        std::fs::write(&path, &outer).unwrap();
+        let source = json!({"launch":{"model_config":{"path":path, "sha256": format!("{:x}", Sha256::digest(outer.as_bytes()))}}});
+        let settings = |overrides| json!({"model_config":{"hf_overrides":overrides}});
+        let arch = Some("Qwen2ForCausalLM");
+        let project = |v| TransferMetadata::configured(&settings(v), Some(false), arch, &source);
+        assert_eq!(project(json!({"head_dim":128})).model_heads.head_size, None);
+        assert_eq!(
+            project(json!({"text_config":{"head_dim":128}}))
+                .model_heads
+                .head_size,
+            Some(128)
+        );
+        let local = project(json!({"num_key_value_heads":2,"text_config":{"hidden_size":512,"num_attention_heads":8}}))
+            .uniform_attention.unwrap().rank_heads(2, arch).unwrap();
+        assert_eq!((local.num_kv_heads, local.head_size), (Some(4), Some(64)));
+        std::fs::write(&path, r#"{"model_type":"qwen2"}"#).unwrap();
+        assert_eq!(project(json!({"head_dim":128})).model_heads.head_size, None);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(project(json!({"head_dim":128})).model_heads.head_size, None);
+
+        let base = json!({"architectures":["Qwen2ForCausalLM"],"model_type":"qwen2","n_head_kv":4,
+            "head_dim":64,"num_key_value_heads":8,"num_attention_heads":8,"hidden_size":512,"num_hidden_layers":12}).to_string();
+        std::fs::write(&path, &base).unwrap();
+        let source = json!({"launch":{"model_config":{"path":path,"sha256":format!("{:x}",Sha256::digest(base.as_bytes()))}}});
+        let read = |overrides| {
+            TransferMetadata::configured(&settings(overrides), Some(false), arch, &source)
+        };
+        let a = read(json!({"n_head_kv":8,"head_dim":128}));
+        let b = read(json!({"num_kv_heads":8,"hidden_size_per_head":128}));
+        assert_eq!(a.model_heads.num_kv_heads, Some(8));
+        assert_eq!(b.model_heads.num_kv_heads, Some(4));
+        assert_eq!(b.model_heads.head_size, Some(64));
+        assert_eq!(b.num_hidden_layers, Some(12));
+        assert_eq!(
+            read(json!({"n_head_kv":null})).model_heads.num_kv_heads,
+            None
+        );
+        assert_eq!(
+            read(json!({"head_dim":null,"hidden_size_per_head":96}))
+                .model_heads
+                .head_size,
+            Some(96)
+        );
+
+        let effective = json!({"resolved_config":settings(json!({"architectures":["Qwen2ForCausalLM","LlamaForCausalLM"],
+                           "hidden_size":512,"num_attention_heads":8,"num_key_value_heads":8,"head_dim":128}))});
+        let projected =
+            NixlIdentity::compact_workers(&[effective], Some("LlamaForCausalLM")).unwrap();
+        let worker: Worker = serde_json::from_value(projected[0].clone()).unwrap();
+        assert_eq!(worker.metadata.model_heads.head_size, Some(128));
+        let physical = worker
+            .metadata
+            .uniform_attention
+            .unwrap()
+            .for_selected(Some("LlamaForCausalLM"))
+            .unwrap();
+        assert_eq!(
+            physical
+                .rank_heads(2, Some("LlamaForCausalLM"))
+                .unwrap()
+                .head_size,
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn nemotron_state_registration_respects_aliased_mixers() {
+        let role = |pattern| {
+            let fields = json!({"hf_overrides":{"architectures":["NemotronHForCausalLM","LlamaForCausalLM"],
+              "hybrid_override_pattern":pattern}});
+            let arch = "NemotronHForCausalLM";
+            let mut identity = NixlIdentity::observed(
+                None,
+                &json!({"runtime_settings":{"model_config":fields}}).to_string(),
+                None,
+                Some(2),
+                Some(arch),
+            )
+            .unwrap();
+            identity
+                .select("prefill", None, None, None, None, false)
+                .unwrap();
+            identity
+        };
+        let a = role("MMMM-**");
+        assert!(a.mismatch(&role("MMM-M**")).is_none());
+        assert_eq!(
+            a.mismatch(&role("-MMMM**")).unwrap().0,
+            "Mamba layer positions"
+        );
+        assert_eq!(
+            role("-MMMM**").mismatch(&a).unwrap().0,
+            "Mamba layer positions"
+        );
     }
 
     #[test]
@@ -2869,7 +3057,7 @@ mod tests {
                 "cache":{"groups":[{"kind":"attention","layer_names":["a"],"spec_type":"vllm.v1.kv_cache_interface.MLAAttentionSpec","num_kv_heads":heads}]},
                 "resolved_config":{"model_config":{"use_mla":flag},"kv_transfer_config":{"kv_connector":"NixlPushConnector"}}});
             let evidence = if compact {
-                json!({"worker_observations":NixlIdentity::compact_workers(&[row]).unwrap()})
+                json!({"worker_observations":NixlIdentity::compact_workers(&[row], None).unwrap()})
             } else {
                 json!({"artifacts":[{"evidence":row}]})
             };
@@ -2899,6 +3087,28 @@ mod tests {
     }
 
     #[test]
+    fn normalized_uniform_mla_specs_identify_the_singleton_head_for_push() {
+        let regions = |layout, raw_heads| {
+            let uniform = "vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs";
+            let mla = "vllm.v1.kv_cache_interface.MLAAttentionSpec";
+            let names = ["latent", "indexer"];
+            let raw = json!({"spec_type":uniform,"layer_names":names,"num_kv_heads":raw_heads});
+            let group = json!({"kind":"attention","spec_type":uniform,"layer_names":names,
+                "layer_specs":{"latent":{"spec_type":mla,"num_kv_heads":1},"indexer":{"spec_type":mla,"num_kv_heads":1}}});
+            let row = json!({"kind":"worker","phase":"decode","tp_rank":0,"dp_rank":0,
+                "raw_cache_config":{"kv_cache_layout":layout,"groups":[raw]}, "cache":{"groups":[group]},
+                "resolved_config":{"model_config":{"use_mla":true},"kv_transfer_config":{"kv_connector":"NixlPushConnector"}}});
+            observe(json!({"artifacts":[{"evidence":row}]}), "decode")
+        };
+        let outer = regions("BLHNC", None);
+        assert!(outer.mismatch(&regions("BLNHC", None)).is_none());
+        assert_eq!(
+            outer.mismatch(&regions("BLNHC", Some(2))).unwrap().0,
+            "kv_cache_layout"
+        );
+    }
+
+    #[test]
     fn grouped_workers_preserve_their_initialized_layout_and_buffer_restrictions() {
         let wrap = |name| {
             json!({"kind":"state","spec_type":"vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs",
@@ -2908,7 +3118,7 @@ mod tests {
             "cache":{"groups":[wrap("vllm.v1.kv_cache_interface.CircularBufferSpec")]},
             "resolved_config":{"kv_transfer_config":{"kv_buffer_device":"cpu"},"cache_config":{"kv_cache_layout":"NHD"}}});
         assert_eq!(
-            Worker::observed(&row).unwrap().gpu_cache_layout,
+            Worker::observed(&row, None).unwrap().gpu_cache_layout,
             Layouts::named("LBNHC")
         );
         let selected = |row: &Value| {
@@ -2917,6 +3127,7 @@ mod tests {
                 &json!({"artifacts":[{"evidence":row}]}).to_string(),
                 Some(1),
                 Some(1),
+                None,
             )?;
             id.select("decode", None, None, Some("0.33.0"), None, false)
         };
@@ -2930,11 +3141,11 @@ mod tests {
         assert!(selected(&row).is_err());
         row["resolved_config"]["cache_config"]["kv_cache_layout"] = json!("HND");
         assert_eq!(
-            Worker::observed(&row).unwrap().gpu_cache_layout,
+            Worker::observed(&row, None).unwrap().gpu_cache_layout,
             Layouts::named("LBHNC")
         );
         row["resolved_config"]["cache_config"]["kv_cache_layout"] = json!("LBLNC");
-        assert!(Worker::observed(&row).is_err());
+        assert!(Worker::observed(&row, None).is_err());
     }
 
     #[test]
@@ -2957,6 +3168,7 @@ mod tests {
                 &portable.to_string(),
                 Some(capacities.len() as u64),
                 Some(ranks.len() as u64),
+                None,
             )?;
             id.select(phase, None, None, Some("0.33.0"), None, false)?;
             Ok::<_, AicError>(id)
@@ -2990,7 +3202,9 @@ mod tests {
             json!({"observation_provenance":"source_references","worker_observation_digests":[]});
         let null_snapshot = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v1","nixl_observation":null});
         for record in [probe, compact, null_snapshot] {
-            assert!(NixlIdentity::observed(None, &record.to_string(), Some(1), Some(1)).is_err());
+            assert!(
+                NixlIdentity::observed(None, &record.to_string(), Some(1), Some(1), None).is_err()
+            );
         }
     }
 

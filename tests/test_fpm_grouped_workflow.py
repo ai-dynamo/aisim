@@ -2612,6 +2612,7 @@ def test_grouped_pd_checks_dtype_when_only_one_role_has_runtime_memory(grouped_c
         ("attention_backend", "FLASH_ATTN", "FLASHINFER"),
         ("attention_backend", ["GDN_ATTN", "FLASHINFER_MLA_SPARSE"], "FLASH_ATTN"),
         ("head_size", 128, 64),
+        ("model_head_size", 64, 128),
     ],
 )
 @pytest.mark.parametrize("changed_role", ["prefill", "decode"])
@@ -2625,7 +2626,7 @@ def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, ini
     version = "0.32.0"
     profile = _with_transfer_markers(_with_prefix_evidence(profile, version=version), version=version)
     shared = profile["deployments"][0]
-    if field == "head_size":
+    if field in ("head_size", "model_head_size"):
         profile.update(architecture="Qwen2ForCausalLM", num_experts=0)
         (Path(profile["model"]) / "config.json").write_text(json.dumps({"architectures": [profile["architecture"]]}))
         shared["resources"]["cache_groups"] = shared["resources"]["cache_groups"][:1]
@@ -2637,8 +2638,16 @@ def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, ini
         kv_cache_dtype="fp8",
         attention_backend="FLASH_ATTN",
         head_size=None,
+        model_head_size=None,
         compact=False,
     ):
+        if model_head_size is not None:
+            # Qwen2's layer divides the checkpoint hidden size by its query heads. The
+            # ordinary model converter uses the explicit head_dim in the connector hash.
+            settings = {"model_config": {"use_mla": False, "hf_overrides": {"head_dim": model_head_size}}}
+            if compact:
+                return json.dumps({"runtime_settings": settings})
+            return json.dumps({"artifacts": [{"evidence": {"kind": "worker", "resolved_config": settings}}]})
         if head_size is not None:
             if compact:
                 model_config = {
@@ -2689,11 +2698,12 @@ def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, ini
                     deployment["resources"]["runtime_memory"]["provenance"] = changed_evidence
             return _runtime.run_replay_json(json.dumps(payload))
 
-    with pytest.raises(RuntimeError, match=f"matching {field}"):
+    handshake_field = "head_size" if field == "model_head_size" else field
+    with pytest.raises(RuntimeError, match=f"matching {handshake_field}"):
         EngineReplayRunnerFactory(runtime=ChangedWorker()).create(0).run(spec)
     row = next(item for item in profile["deployments"] if item["worker_type"] == changed_role)
     row["resources"]["runtime_memory"]["provenance"] = changed_evidence
-    with pytest.raises(ValueError, match=f"matching {field}"):
+    with pytest.raises(ValueError, match=f"matching {handshake_field}"):
         CorePredictionConfig.model_validate(raw)
     search = _pd_search(profile, root)
     rank = {"tp": 2, "moe_tp": 2}
@@ -2702,7 +2712,7 @@ def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, ini
         "parallel_configs_by_mode": {"disagg": [{"prefill": rank, "decode": rank}]},
     }
     for request in (search, pinned):
-        with pytest.raises(ValueError, match=f"matching {field}"):
+        with pytest.raises(ValueError, match=f"matching {handshake_field}"):
             _fpm_parallel_configs(SearchSpace.model_validate(request), "disagg")
 
 

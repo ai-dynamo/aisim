@@ -1543,24 +1543,34 @@ sub-block matching without an explicit full-state scratch count.
   An indexed import of both phases keeps prefill's cache groups and prefix
   settings. Mamba's block size can differ in a cold decode phase. Replay checks
   each phase's ranks against one another and checks the selected profile against
-  the retained geometry, prefix settings and usable capacity. A warm rank uses
-  the selected hash block size. A finalized profile uses the minimum measured
-  capacity across compatible cells at their recorded GPU memory utilization.
+  the retained geometry, prefix settings and usable capacity. A profiled warm
+  rank requires measured prefix caching and a matching positive hash block size.
+  A finalized profile uses the minimum measured capacity across compatible cells
+  at their recorded GPU memory utilization, scheduler limits and context limit.
   A draft can record an explicit capacity override.
 
   Replay compares recorded KV head counts and dimensions for ordinary attention.
   At equal tensor parallelism, an initialized layer's cache spec or GPU view can
   establish incompatible per-rank dimensions even when its page bytes match.
   For an identified ordinary decoder, its recorded constructor settings can
-  establish the corresponding dimensions in a compact profile. Qwen2 takes
-  its layer width from the hidden size divided by the attention-head count,
-  including when both roles use compact profiles.
-  An override only establishes the model-wide KV-head count when the runtime's
-  higher-priority checkpoint aliases are known. When the probe records a
-  disjoint GPU byte range for each cache in an ordinary attention model, replay
-  compares the registered layer names. One pool block can span
-  several kernel blocks. For NemotronH, a saved top-level layer pattern also
-  identifies the attention positions when the compact profile omits the views.
+  establish the corresponding dimensions in a compact profile. NemotronH takes
+  its physical KV heads and head width from the top-level model configuration.
+  Qwen2 takes its layer width from the selected text decoder's hidden size
+  divided by its attention-head count. Its NIXL model hash uses the converter's
+  head width, which can come from an explicit `head_dim`. Two Qwen2 roles can
+  therefore have identical cache tensors and incompatible connector hashes.
+  Native dispatch uses the first loadable architecture in the recorded list.
+  A scalar override on an enclosing model applies to that model. A saved
+  effective configuration takes precedence. A matching checkpoint reference
+  supplies the original fields, and the recorded overrides apply to the outer
+  model or its nested text configuration. Fields from an unavailable checkpoint
+  remain unknown. An override establishes the model-wide KV-head count when
+  the runtime's higher-priority checkpoint aliases are known. When the probe
+  records disjoint GPU pages for each ordinary attention layer, replay compares the
+  registered names, including layers interleaved within each block. One pool
+  block can span several kernel blocks. A saved NemotronH pattern identifies
+  attention positions and possible Mamba region names. The first cache at each
+  address owns its registered name, so moving an aliased state can preserve it.
   An Inkling convolution window also constrains the physical GPU layout.
   When serving evidence identifies the NIXL connector, both roles must use the
   same transfer mode. `NixlConnector` is the pull alias. An explicit push
@@ -1568,6 +1578,8 @@ sub-block matching without an explicit full-state scratch count.
   across participating workers. A cache made entirely of single-head MLA
   latents has the same byte order when only the position of the head axis changes.
   The measured MLA cache specs and their head counts can identify that case.
+  An observer can record the concrete latent and indexer specs in the normalized
+  group and retain only their shared uniform wrapper in the raw cache config.
   Pull can use the decode-side permutation.
   Replay compares a recorded effective hidden-layer count, including layers
   without a KV cache. It reads checkpoint overrides when their model converter

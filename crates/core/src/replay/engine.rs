@@ -287,24 +287,32 @@ impl ReplayRoleConfig {
                 .unwrap_or_default(),
             Some(u64::from(self.tensor_parallel_size) * u64::from(self.dp_size)),
             Some(u64::from(self.tensor_parallel_size)),
+            profile.and_then(|p| p["architecture"].as_str()),
         )?;
-        observed.architecture = profile
-            .and_then(|p| p["architecture"].as_str())
-            .map(str::to_owned);
-        if let Some(memory) = memory {
-            observed.selected_memory(memory)?;
-            if self.rank.enable_prefix_caching {
-                ensure!(
-                    memory["enable_prefix_caching"] != false,
-                    "warm grouped rank requires prefix caching in the selected runtime memory"
-                );
-                if let Some(unit) = memory["hash_block_size_tokens"].as_u64() {
-                    ensure!(
-                        self.rank.prefix_match_unit.map(|n| n as u64) == Some(unit),
-                        "grouped rank prefix_match_unit must match the selected hash_block_size_tokens ({unit})"
-                    );
-                }
-            }
+        if let (Some(memory), Some(resources)) =
+            (memory, deployment.and_then(|d| d.get("resources")))
+        {
+            observed.selected_memory(
+                memory,
+                Some((
+                    resources["max_num_tokens"].as_u64(),
+                    resources["max_batch_size"].as_u64(),
+                )),
+            )?;
+        }
+        if profile.is_some() && self.rank.enable_prefix_caching {
+            ensure!(
+                memory.is_some_and(|m| m["enable_prefix_caching"] == true),
+                "warm grouped rank requires prefix caching in the selected runtime memory"
+            );
+            let unit = memory
+                .and_then(|m| m["hash_block_size_tokens"].as_u64())
+                .filter(|n| *n > 0)
+                .context("warm grouped rank requires a measured hash_block_size_tokens")?;
+            ensure!(
+                self.rank.prefix_match_unit.map(|n| n as u64) == Some(unit),
+                "grouped rank prefix_match_unit must match the selected hash_block_size_tokens ({unit})"
+            );
         }
         if let Some(groups) = deployment.and_then(|d| d.pointer("/resources/cache_groups")) {
             observed.selected_groups(groups)?;
@@ -1180,6 +1188,34 @@ mod disaggregated_tests {
             role.grouped_transfer_identity()
                 .is_err_and(|error| error.to_string().contains("hash_block_size_tokens"))
         );
+        role.rank.prefix_match_unit = Some(64);
+        for (memory, reason) in [
+            (
+                Some(serde_json::json!({"hash_block_size_tokens":64})),
+                "prefix caching",
+            ),
+            (
+                Some(serde_json::json!({"enable_prefix_caching":true})),
+                "hash_block_size_tokens",
+            ),
+            (None, "prefix caching"),
+        ] {
+            let TimingModelConfig::External { config, .. } = &mut role.rank.timing_model else {
+                unreachable!()
+            };
+            let resources = config["fpm_profile"]["deployments"][0]["resources"]
+                .as_object_mut()
+                .unwrap();
+            if let Some(memory) = memory {
+                resources.insert("runtime_memory".into(), memory);
+            } else {
+                resources.remove("runtime_memory");
+            }
+            assert!(
+                role.grouped_transfer_identity()
+                    .is_err_and(|e| e.to_string().contains(reason))
+            );
+        }
         role.rank.enable_prefix_caching = false;
         role.rank.prefix_match_unit = None;
         role.grouped_transfer_identity().map(|_| ()).unwrap();

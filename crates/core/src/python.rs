@@ -4832,18 +4832,19 @@ fn validate_grouped_prefix_geometry(
 #[pyfunction]
 #[pyo3(signature = (provenance, model_dtype=None))]
 fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult<Option<String>> {
-    crate::perfmodel::fpm::NixlIdentity::observed(model_dtype, provenance, None, None)
+    crate::perfmodel::fpm::NixlIdentity::observed(model_dtype, provenance, None, None, None)
         .map(|identity| identity.model_dtype)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
 /// Compact initialized worker fields for a hash-bound onboarding observation.
 #[pyfunction]
-fn nixl_worker_observations(records: &str) -> PyResult<String> {
+#[pyo3(signature = (records, architecture=None))]
+fn nixl_worker_observations(records: &str, architecture: Option<&str>) -> PyResult<String> {
     let parsed: Vec<serde_json::Value> = serde_json::from_str(records)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(
-        crate::perfmodel::fpm::NixlIdentity::compact_workers(&parsed)
+        crate::perfmodel::fpm::NixlIdentity::compact_workers(&parsed, architecture)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
             .to_string(),
     )
@@ -4893,7 +4894,7 @@ struct GroupedPdObservation {
 #[pymethods]
 impl GroupedPdObservation {
     #[new]
-    #[pyo3(signature=(role, evidence, row=None, tp_size=None, groups=None, architecture=None, memory=None))]
+    #[pyo3(signature=(role, evidence, row=None, tp_size=None, groups=None, architecture=None, memory=None, scheduler_limits=None))]
     fn new(
         role: &str,
         evidence: (&str, Option<&str>, &str),
@@ -4902,41 +4903,44 @@ impl GroupedPdObservation {
         groups: Option<&str>,
         architecture: Option<&str>,
         memory: Option<&str>,
+        scheduler_limits: Option<(u64, u64)>,
     ) -> PyResult<Self> {
         let (provenance, dtype, backend) = evidence;
-        let select =
-            || {
-                let mut identity = crate::perfmodel::fpm::NixlIdentity::observed(
-                    dtype,
-                    provenance,
-                    row.map(|r| r.3),
-                    tp_size,
+        let select = || {
+            let mut identity = crate::perfmodel::fpm::NixlIdentity::observed(
+                dtype,
+                provenance,
+                row.map(|r| r.3),
+                tp_size,
+                architecture,
+            )?;
+            if let Some(memory) = memory {
+                identity.selected_memory(
+                    &serde_json::from_str(memory)
+                        .map_err(|error| crate::AicError::InvalidEngineConfig(error.to_string()))?,
+                    scheduler_limits.map(|(tokens, batch)| (Some(tokens), Some(batch))),
                 )?;
-                identity.architecture = architecture.map(str::to_owned);
-                if let Some(memory) = memory {
-                    identity.selected_memory(&serde_json::from_str(memory).map_err(
-                        |error| crate::AicError::InvalidEngineConfig(error.to_string()),
-                    )?)?;
-                }
-                if let Some(groups) = groups {
-                    identity.selected_groups(&serde_json::from_str(groups).map_err(
-                        |error| crate::AicError::InvalidEngineConfig(error.to_string()),
-                    )?)?;
-                }
-                identity.select(
-                    role,
-                    Some(backend),
-                    row.map(|r| r.0),
-                    row.and_then(|r| r.1),
-                    row.and_then(|r| r.2),
-                    false,
-                )?;
-                Ok::<_, crate::AicError>(Self {
-                    identity,
-                    kv_cache_dtype: row.map(|r| r.0.to_owned()),
-                    recorded_version: row.and_then(|r| r.2).map(str::to_owned),
-                })
-            };
+            }
+            if let Some(groups) = groups {
+                identity
+                    .selected_groups(&serde_json::from_str(groups).map_err(|error| {
+                        crate::AicError::InvalidEngineConfig(error.to_string())
+                    })?)?;
+            }
+            identity.select(
+                role,
+                Some(backend),
+                row.map(|r| r.0),
+                row.and_then(|r| r.1),
+                row.and_then(|r| r.2),
+                false,
+            )?;
+            Ok::<_, crate::AicError>(Self {
+                identity,
+                kv_cache_dtype: row.map(|r| r.0.to_owned()),
+                recorded_version: row.and_then(|r| r.2).map(str::to_owned),
+            })
+        };
         select().map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -4980,6 +4984,7 @@ fn grouped_observation_requirement(
         None,
         architecture,
         None,
+        None,
     )?;
     let decode = GroupedPdObservation::new(
         "decode",
@@ -4988,6 +4993,7 @@ fn grouped_observation_requirement(
         tp_size,
         None,
         architecture,
+        None,
         None,
     )?;
     if let Some(reason) = prefill.requirement(&decode) {

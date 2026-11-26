@@ -394,13 +394,13 @@ def _worker_attention_backends(evidence: dict[str, Any]) -> list:
     ]
 
 
-def _worker_observations(evidence: dict[str, Any]) -> list:
+def _worker_observations(evidence: dict[str, Any], architecture: str | None = None) -> list:
     from aisim import _runtime
 
     records = [
         item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] in ("worker", "scheduler")
     ]
-    return json.loads(_runtime.nixl_worker_observations(json.dumps(records)))
+    return json.loads(_runtime.nixl_worker_observations(json.dumps(records), architecture))
 
 
 def _worker_observation_digest(
@@ -462,7 +462,8 @@ def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str, invent
     if schema == LEGACY_PROVENANCE_SCHEMA:
         snapshot["worker_attention_backends"] = _worker_attention_backends(evidence)
     else:
-        snapshot["worker_observations"] = _worker_observations(evidence)
+        architecture = inventory.get("model_metadata", {}).get("architecture")
+        snapshot["worker_observations"] = _worker_observations(evidence, architecture)
         if version := evidence.get("runtime", {}).get("version"):
             snapshot["runtime"] = {"version": version}
         snapshot["worker_observations_sha256"] = _worker_observation_digest(snapshot, evidence, inventory, draft=True)

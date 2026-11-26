@@ -1910,6 +1910,7 @@ def grouped_pd_observation(role, deployment, architecture=None):
             json.dumps([group.model_dump(exclude_none=True) for group in deployment.resources.cache_groups]),
             architecture,
             memory.model_dump_json(exclude={"provenance"}, exclude_none=True) if memory else None,
+            (deployment.resources.max_num_tokens, deployment.resources.max_batch_size),
         )
     except ValueError as error:
         raise GroupedObservationError(str(error)) from error
