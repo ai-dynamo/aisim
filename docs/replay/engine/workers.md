@@ -261,11 +261,18 @@ transfer-held work does not. A skipped decode waiting for an in-flight
 completion neither retracts requests nor decays the ratio.
 
 The output budget in these checks is the request's requested maximum, as
-SGLang reserves room for `max_new_tokens`. A Rust API request that carries
-exact output tokens and a larger `max_output_tokens` stops generating at the
-exact tokens, while admission, the running reservation, the retraction
-estimate and decode preallocation keep using `max_output_tokens`. Workload
-files require the two to be equal, so they are unaffected.
+SGLang reserves room for `max_new_tokens`. A request that carries exact output
+tokens and a larger maximum stops generating at the exact tokens, while
+admission, the running reservation, the retraction estimate and decode
+preallocation keep using the maximum. A Rust API request (`max_output_tokens`)
+and an inline `ReplaySpec.requests` entry (`output_tokens`) can carry such a
+pair. Trace files cannot: their loaders reject an exact-token count that
+differs from the output length.
+
+With HiCache, a retracted request that loads its prefix back from the host
+needs room for its remaining output budget only, and it recomputes the prefix
+when that load could never fit in the pool. This holds whether or not the
+maximum equals the exact token count.
 
 ### SGLang computed KV at completion
 
