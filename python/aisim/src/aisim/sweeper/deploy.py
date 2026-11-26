@@ -271,20 +271,13 @@ def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any],
     payload.setdefault("max_model_len", profile.context_length)
 
 
-def _kv_systems_args(sample: dict[str, Any], role: str) -> dict[str, Any]:
-    from .forward_pass_estimator import resolve_systems_paths
-
-    paths = sample_systems_paths(sample, role)
-    return {"systems_paths": list(resolve_systems_paths(paths))}
-
-
 def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:
     if sample.get("fpm_profile") is None:
         return {
             "backend": sample["backend"],
             "backend_version": backend_version,
             "system": _role_hardware_sku(sample, role),
-            **_kv_systems_args(sample, role),
+            "systems_paths": sample_systems_paths(sample, role),
         }
     prefix = _role_prefix(role)
     return {
@@ -457,7 +450,7 @@ def _build_afd_roles_deployment(sample, backend_version, estimators, encoder):
             backend=sample["backend"],
             backend_version=backend_version,
             system=topology.get("a_system") or _role_hardware_sku(sample, "prefill"),
-            **_kv_systems_args(sample, "prefill"),
+            systems_paths=sample_systems_paths(sample, "prefill"),
             pp_size=1,
             moe_tp_size=1,
             moe_ep_size=1,  # Per-request A-replica geometry, not the F-pool width.

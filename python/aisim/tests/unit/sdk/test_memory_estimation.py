@@ -2057,6 +2057,25 @@ def test_selected_qwen_and_gemma_physical_defaults(tmp_path):
     with pytest.raises(ValueError, match="no KV budget"):
         memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
 
+    mixtral = _load_pre_downloaded_hf_config("mistralai/Mixtral-8x7B-v0.1")
+    del mixtral["num_local_experts"]
+    model = _write_config(tmp_path, {"text_config": mixtral})
+    with pytest.raises(ValueError, match="no KV budget"):
+        memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+    for text, fields, count in (
+        (mixtral, {"num_experts": 3, "num_local_experts": 2}, 3),
+        (qwen, {"num_experts": 3, "num_local_experts": 2}, 2),
+    ):
+        estimator = memory.NaiveKVCacheEstimator.from_hf_config(
+            {"text_config": {**text, **fields}}, tp_size=1, pp_size=1
+        )
+        assert estimator.geometry["num_experts"] == count
+
+    qwen8b = _load_pre_downloaded_hf_config("Qwen/Qwen3-8B")
+    del qwen8b["architectures"], qwen8b["num_key_value_heads"]
+    model = _write_config(tmp_path, {"text_config": dict(qwen8b, n_kv_heads=8)})
+    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == 589_824
+
     dense = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
     dense.pop("head_dim")
     dense.update(attention_head_dim=64, use_sliding_window=True, max_window_layers=0)
@@ -2068,6 +2087,9 @@ def test_selected_qwen_and_gemma_physical_defaults(tmp_path):
     _write_config(tmp_path, {"text_config": dense})
     with pytest.raises(ValueError, match="resident attention layers"):
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=2)
+    dense["sliding_window"] = None
+    _write_config(tmp_path, {"text_config": dense})
+    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=2) == 57_344
 
     checkpoint = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
     gemma = checkpoint["text_config"]
@@ -2078,6 +2100,25 @@ def test_selected_qwen_and_gemma_physical_defaults(tmp_path):
         for document in (checkpoint, dict(gemma, architectures=["Gemma4ForCausalLM"]), {"text_config": gemma}):
             model = _write_config(tmp_path, document)
             assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == expected
+            assert (
+                estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20")
+                == 225_280
+            )
+
+    gemma.update(attention_k_eq_v=True, attention_head_dim=64)
+    del gemma["head_dim"]
+    model = _write_config(tmp_path, {"text_config": gemma})
+    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == 225_280
+    gemma["head_dim"] = 256
+    gemma["per_layer_config"] = {
+        f"{i:02}": {"head_dim": 128, "num_key_value_heads": 16} for i in range(gemma["num_hidden_layers"])
+    }
+    for document in (checkpoint, {"text_config": gemma}):
+        model = _write_config(tmp_path, document)
+        with pytest.raises(ValueError, match="per_layer_config requires runtime cache geometry"):
+            estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend_version="0.33.0")
+        with pytest.raises(ValueError, match="per_layer_config requires runtime cache geometry"):
+            memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.33.0", **opts)
 
 
 def test_selected_gemma4_uses_its_effective_window_for_single_request_retention():
@@ -2120,6 +2161,34 @@ def test_selected_runtime_validates_kv_scales_and_explicit_dtype(tmp_path):
             rate("0.14.0")
         if symmetric:
             assert rate("0.15.0") == 114_688
+            (tmp_path / "hopper.yaml").write_text("data_dir: data/hopper\n")
+            (tmp_path / "data/hopper/vllm/0.32.0").mkdir(parents=True)
+            (tmp_path / "query_versions.yaml").write_text(
+                "schema_version: 1\noverrides: {hopper: {vllm: {current: '0.32.0', previous: '0.14.0'}}}\n"
+            )
+            roots = dict(system="hopper", systems_paths=[str(tmp_path)])
+            for slot in (None, "current"):
+                assert rate(slot, **roots) == rate("0.32.0", **roots) == 57_344
+            with pytest.raises(ValueError, match="symmetric FP8"):
+                rate("previous", **roots)
+
+
+@pytest.mark.parametrize(
+    ("backend", "before", "supported"), [("vllm", "0.14.0", "0.20.0rc1"), ("sglang", "0.5.15.post1", "0.5.16")]
+)
+def test_selected_decoder_override_requires_the_serving_cache_dtype(tmp_path, backend, before, supported):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    model = _write_config(tmp_path, {"text_config": _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")})
+    args = dict(tp_size=1, pp_size=1, backend=backend)
+    for version in (before, supported):
+        with pytest.raises(ValueError, match="no literal int8 KV cache"):
+            estimate_kv_bytes_per_token(model, **args, backend_version=version, kvcache_quant_mode="int8")
+        assert estimate_kv_bytes_per_token(model, **args, backend_version=version, kvcache_quant_mode="fp8") == 57_344
+    with pytest.raises(ValueError, match="NVFP4 KV cache requires"):
+        estimate_kv_bytes_per_token(model, **args, backend_version=before, kvcache_quant_mode="nvfp4")
+    assert estimate_kv_bytes_per_token(model, **args, backend_version=supported, kvcache_quant_mode="nvfp4") == 32_256
 
 
 def test_sglang_expert_tiles_use_checkpoint_scope_and_module_exclusions(tmp_path):
@@ -2157,6 +2226,32 @@ def test_sglang_expert_tiles_use_checkpoint_scope_and_module_exclusions(tmp_path
             with pytest.raises(ValueError, match="weight_block_size=128"):
                 memory.estimate_num_gpu_blocks(model, "missing", "sglang", version, **opts)
 
+    aligned = dict(opts, tp_size=2, moe_tp_size=2)
+    quant["modules_to_not_convert"] = []
+    _write_config(tmp_path, {"text_config": raw, "compression_config": quant})
+    expected = memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **aligned)
+    quant["modules_to_not_convert"] = None
+    _write_config(tmp_path, {"text_config": raw, "compression_config": quant})
+    assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **aligned) == expected
+    omitted = {key: value for key, value in opts.items() if key not in ("moe_tp_size", "moe_ep_size")}
+    with pytest.raises(ValueError, match="weight_block_size=128"):
+        memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **omitted)
+    quant.update(modules_to_not_convert=["mlp.experts"], weight_block_size=[128])
+    _write_config(tmp_path, {"text_config": raw, "compression_config": quant})
+    with pytest.raises(ValueError, match="two positive integer"):
+        memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+
+    raw = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3")
+    opts.update(tp_size=32, moe_tp_size=32)
+    for exclusions in (["mlp"], []):
+        raw["quantization_config"]["modules_to_not_convert"] = exclusions
+        _write_config(tmp_path, {"text_config": raw})
+        if exclusions:
+            assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts) > 0
+        else:
+            with pytest.raises(ValueError, match="weight_block_size=128"):
+                memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+
 
 def test_sparse_index_transfer_uses_the_platform_and_resident_layers(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
@@ -2176,7 +2271,28 @@ def test_sparse_index_transfer_uses_the_platform_and_resident_layers(tmp_path):
         estimate_kv_bytes_per_token(model, **common, backend_version="0.33.0", system="h200_sxm")
         == 78 * 1152 + 21 * 132
     )
+    for system in ("h200_sxm", "b200_sxm"):
+        assert (
+            estimate_kv_bytes_per_token(
+                model, **common, backend_version="0.33.0", system=system, kvcache_quant_mode="bfloat16"
+            )
+            == 92_628
+        )
+    with pytest.raises(ValueError, match="SM120 sparse backend"):
+        estimate_kv_bytes_per_token(
+            model, **common, backend_version="0.33.0", system="rtx_pro_6000_server", kvcache_quant_mode="bfloat16"
+        )
+    raw["index_topk_freq"] = 0
+    _write_config(tmp_path, {"text_config": raw})
+    with pytest.raises(ValueError, match="index_topk_freq"):
+        estimate_kv_bytes_per_token(model, **common, backend_version="0.33.0", system="h200_sxm")
+    raw["index_topk_pattern"] = []
+    _write_config(tmp_path, {"text_config": raw})
+    assert estimate_kv_bytes_per_token(model, **common, backend_version="0.33.0", system="h200_sxm") == 100_152
     raw = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3.2")
+    _write_config(tmp_path, {"text_config": dict(raw, index_head_dim=64)})
+    with pytest.raises(ValueError, match="divisible by 128"):
+        estimate_kv_bytes_per_token(model, **common, backend_version="0.33.0", system="h200_sxm")
     _write_config(tmp_path, {"text_config": raw})
     with pytest.raises(ValueError, match="runtime latent and indexer"):
         estimate_kv_bytes_per_token(
@@ -2243,7 +2359,7 @@ def test_nested_sparse_mla_marginal_includes_indexer_and_bf16_rope(tmp_path, nam
 
 def test_weight_only_sparse_mla_uses_the_default_cache_of_its_serving_gpu(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
-    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config, _load_pre_downloaded_hf_quant_config
 
     raw = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3.2")
     model = _write_config(tmp_path, {"text_config": raw})
@@ -2263,6 +2379,18 @@ def test_weight_only_sparse_mla_uses_the_default_cache_of_its_serving_gpu(tmp_pa
                     estimate_kv_bytes_per_token(model, **args)
             else:
                 assert estimate_kv_bytes_per_token(model, **args) == 61 * (512 * 2 + 64 * 2 + 132) == 78_324
+
+    name = "nvidia/DeepSeek-V3.2-NVFP4"
+    raw = _load_pre_downloaded_hf_config(name)
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(_load_pre_downloaded_hf_quant_config(name)))
+    _write_config(tmp_path, {"text_config": raw})
+    args = dict(tp_size=8, pp_size=1, backend="vllm", backend_version="0.33.0", systems_paths=[str(tmp_path)])
+    for system in ("hopper", "blackwell"):
+        assert estimate_kv_bytes_per_token(model, **args, system=system, kvcache_quant_mode="bfloat16") == 78_324
+        with pytest.raises(ValueError, match="runtime latent and indexer cache formats"):
+            estimate_kv_bytes_per_token(model, **args, system=system)
+    with pytest.raises(ValueError, match="runtime latent and indexer cache formats"):
+        estimate_kv_bytes_per_token(model, **args, system="sm120", kvcache_quant_mode="bfloat16")
 
 
 def test_sparse_auto_transfer_with_missing_gpu_uses_only_hardware_independent_defaults(tmp_path):
@@ -2604,6 +2732,9 @@ def test_sglang_mxfp8_experts_use_the_fixed_checkpoint_block(tmp_path):
     (tmp_path / "hopper.yaml").write_text("gpu: {sm_version: 90}\n")
     with pytest.raises(ValueError, match="MXFP8 expert weights require a Blackwell"):
         memory.estimate_kv_cache(model, "hopper", "sglang", "0.5.20", **opts)
+    (tmp_path / "sm120.yaml").write_text("gpu: {sm_version: 120}\n")
+    with pytest.raises(ValueError, match="SM100 family"):
+        memory.estimate_num_gpu_blocks(model, "sm120", "sglang", "0.5.20", **opts)
 
     raw["architectures"] = ["Qwen3ForCausalLM"]
     _write_config(tmp_path, {"text_config": raw})

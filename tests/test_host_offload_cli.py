@@ -437,7 +437,7 @@ def test_agentic_g2_public_config_preserves_role_scopes_through_native_payload(
 def test_prediction_host_offload_auto_geometry_uses_aggregated_shape(
     monkeypatch,
 ) -> None:
-    from aisim.sweeper.forward_pass_estimator import resolve_systems_paths
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
 
     engine = _prediction_engine()
     engine["workers"]["aggregated"]["parallelism"]["tensor"] = 4
@@ -464,10 +464,45 @@ def test_prediction_host_offload_auto_geometry_uses_aggregated_shape(
             "backend": "vllm",
             "backend_version": None,
             "system": "h200_sxm",
-            "systems_paths": list(resolve_systems_paths(None)),
+            "systems_paths": None,
             "kvcache_quant_mode": None,
         }
     ]
+
+
+def test_fixed_timing_host_offload_compiles_without_an_op_dataset(monkeypatch):
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
+
+    def unexpected_catalog():
+        pytest.fail("fixed timing and dense cache geometry do not use the performance catalog")
+
+    monkeypatch.setattr("aisim_core.sdk.perf_database.get_systems_paths", unexpected_catalog)
+    monkeypatch.setattr("aisim_core.data.default_systems.default_systems_path", unexpected_catalog)
+    engine = _prediction_engine()
+    engine.update(model="Qwen/Qwen3-0.6B", backend_version="0.32.0")
+    engine["workers"]["aggregated"]["kv_cache"].update(bytes_per_token="auto", host_offload=_host_offload())
+    deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
+    assert deployment.agg_engine_args["kv_cache_bytes_per_token"] == 114_688
+
+    worker = engine["workers"]["aggregated"]
+    worker["parallelism"]["preset"] = False
+    config = CoreRecommendationConfig.model_validate(
+        {"engine": engine, "optimization": {"constraints": {"max_candidate_gpus": 1}}}
+    )
+    sample = unroll_sample(
+        search_space=recommendation_to_sweeper(config).search_space,
+        selection={
+            "backend": "vllm",
+            "deployment_mode": "agg",
+            "agg_max_num_batched_tokens": 8192,
+            "agg_max_num_seqs": 4,
+        },
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1),
+    )
+    assert (
+        build_backend_deployment(sample, backend_version="0.32.0").agg_engine_args["kv_cache_bytes_per_token"]
+        == 114_688
+    )
 
 
 def test_prediction_auto_transfer_geometry_uses_prefill_source_shape(

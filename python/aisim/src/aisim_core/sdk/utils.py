@@ -895,9 +895,11 @@ def _parse_llama4_vision_config(
     )
 
 
-def gemma4_global_kv_head_field(config: dict) -> str:
-    """Gemma4TextConfig.per_layer_config uses the global KV-head override only for tied K/V."""
-    if config.get("attention_k_eq_v") and config.get("num_global_key_value_heads") is not None:
+def gemma4_global_kv_head_field(config: dict, backend: str | None = None) -> str:
+    """Resolve the backend's full-attention KV heads independently of the sliding layers."""
+    if backend == "vllm" and "per_layer_config" in config:
+        raise ValueError("explicit Gemma 4 per_layer_config requires runtime cache geometry for each layer")
+    if (backend == "sglang" or config.get("attention_k_eq_v")) and config.get("num_global_key_value_heads") is not None:
         return "num_global_key_value_heads"
     return "num_key_value_heads"
 
@@ -1878,6 +1880,7 @@ def validate_fp8_moe_shard(
     *,
     sglang_tp_size: int | None = None,
     vllm_refine_hidden_size: int | None = None,
+    quantized_experts: bool = True,
 ) -> None:
     """Check the checkpoint blocks partitioned by the gate/up and SGLang down projections."""
     quantization = _get_language_quantization_config(raw_config) or {}
@@ -1886,6 +1889,8 @@ def validate_fp8_moe_shard(
         shape = [1, 32]  # SGLang's MXFP8 reader fixes both axes even when the checkpoint supplies another shape.
     if not isinstance(shape, (list, tuple)) or len(shape) != 2 or any(type(n) is not int or n <= 0 for n in shape):
         raise ValueError("weight_block_size must supply two positive integer expert block dimensions")
+    if not quantized_experts:
+        return
     shard = intermediate_size // moe_tp_size
     if vllm_refine_hidden_size and math.gcd(*shape, shard, vllm_refine_hidden_size) >= 32:
         return  # vLLM can split serialized block scales losslessly down to this common tile.

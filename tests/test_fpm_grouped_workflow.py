@@ -2189,6 +2189,7 @@ def test_grouped_plan_saved_cold_with_its_reason_verifies_when_a_later_release_p
 ):
     # A later release that models one more vLLM version plans this profile warm. A plan that was saved cold, with
     # its reason or without it, keeps verifying until `onboard plan --overwrite` writes it again.
+    from aisim import _runtime
     from aisim.config import engine
     from aisim.support import plan as plan_module
 
@@ -2205,6 +2206,14 @@ def test_grouped_plan_saved_cold_with_its_reason_verifies_when_a_later_release_p
     later = ("0.30.0", *engine.GROUPED_PREFIX_CACHING_VERSIONS)
     monkeypatch.setattr(engine, "GROUPED_PREFIX_CACHING_VERSIONS", later)
     monkeypatch.setattr(plan_module, "GROUPED_PREFIX_CACHING_VERSIONS", later)
+    validate_geometry = getattr(_runtime, "validate_grouped_prefix_geometry", None)
+
+    if validate_geometry is not None:
+
+        def validate_later_geometry(groups, hash_block, version):
+            return validate_geometry(groups, hash_block, "0.31.0" if version == "0.30.0" else version)
+
+        monkeypatch.setattr(_runtime, "validate_grouped_prefix_geometry", validate_later_geometry)
     # The stand-in for the later release plans the profile warm.
     current, documents = plan_module._plan_documents(request, plan)
     assert "prefix_caching_reason" not in current["fpm"]

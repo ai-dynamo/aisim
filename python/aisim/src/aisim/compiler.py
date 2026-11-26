@@ -1242,8 +1242,6 @@ def _resolve_kv_bytes_per_token(
 ) -> int:
     if configured != "auto":
         return configured
-    from .sweeper.forward_pass_estimator import resolve_systems_paths
-
     paths = worker.timing.systems_paths or engine.systems_paths
     parallel = worker.parallelism
     return estimate_kv_bytes_per_token(
@@ -1255,7 +1253,7 @@ def _resolve_kv_bytes_per_token(
         backend=engine.backend,
         backend_version=engine.backend_version,
         system=worker.hardware or engine.hardware,
-        **({"systems_paths": list(resolve_systems_paths(paths))} if engine.fpm_profile is None else {}),
+        **({"systems_paths": paths} if engine.fpm_profile is None else {}),
         **(
             {
                 "fpm_profile": engine.fpm_profile.model_dump(mode="json"),

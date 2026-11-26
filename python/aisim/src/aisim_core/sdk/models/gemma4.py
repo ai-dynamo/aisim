@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import aisim_core.sdk.operations as ops
 from aisim_core.sdk import common
 from aisim_core.sdk.models.base import BaseModel, register_model
 from aisim_core.sdk.models.blocks.vit import build_gemma4_vision_encoder_ops
 from aisim_core.sdk.models.helpers import mtp_scale_factor, quant_exclude_patterns
+from aisim_core.sdk.utils import gemma4_global_kv_head_field
 
 
 @register_model("GEMMA4MIX")
@@ -63,7 +66,13 @@ class Gemma4MixModel(BaseModel):
             raw_config=model_info["raw_config"],
             allow_checkpoint_split=not model_info["gemm_quant_mode_is_explicit"],
         )
-        model.set_gemma4_config(model_info["extra_params"])
+        cfg = model_info["extra_params"]
+        raw = model_info["raw_config"]
+        text = raw.get("text_config", raw)
+        field = gemma4_global_kv_head_field(text, backend_name)
+        if text.get(field) is not None:
+            cfg = replace(cfg, global_num_kv_heads=text[field])
+        model.set_gemma4_config(cfg)
         return model
 
     def __init__(
