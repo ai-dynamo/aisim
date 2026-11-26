@@ -124,7 +124,10 @@ def _completion(url, model, prompt, output_tokens, start=None):
 def _drive(url, model, phase):
     rng = random.Random(18335)
     prefill = phase == "prefill"
-    length, out = (2048, 1) if prefill else (8192, 384)
+    # A full 8192-token prompt consumes the entire scheduler token budget.
+    # Leave room for active decodes as the next context is admitted, then let
+    # generation grow the batch's KV length through the planned coordinate.
+    length, out = (2048, 1) if prefill else (8000, 384)
     prompts = [[rng.randrange(100, 10000) for _ in range(length)] for _ in range(80 if prefill else 4)]
     start = None if prefill else Barrier(4)
     with ThreadPoolExecutor(max_workers=20 if prefill else 4) as pool:
