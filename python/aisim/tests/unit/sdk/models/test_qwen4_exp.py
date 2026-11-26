@@ -322,6 +322,41 @@ def test_mtp_draft_layer_owns_a_kv_slot():
     assert plain.get_kvcache_max_tokens(budget) > draft.get_kvcache_max_tokens(budget)
 
 
+def test_draft_residency_follows_physical_layers_not_the_step_count():
+    """``nextn`` draft steps reuse the checkpoint's resident MTP layer(s).
+
+    ``Qwen4ExpMultiTokenPredictor`` builds ``mtp_num_hidden_layers`` draft
+    layers and selects one per step with ``spec_step_idx % num_mtp_layers``
+    (``vllm/models/qwen4_exp/nvidia/mtp.py`` @0.32.0). A second draft step is
+    therefore a second pass over the same weights, so the op counts scale with
+    the step count (that is the timed work) while the footprint must not.
+    """
+    one, two, plain = _build(nextn=1), _build(nextn=2), _build(nextn=0)
+
+    def draft_op_weights(model):
+        return sum(op.get_weights() for op in model.generation_ops if op._name.startswith("draft_"))
+
+    # Timed work doubles: the graph prices two draft passes per decode.
+    assert draft_op_weights(two) == 2 * draft_op_weights(one) > 0
+
+    # Footprint does not. One draft layer's contribution is its draft ops plus
+    # its own QSA projections (the module op reports zero weights).
+    projections = one._qsa_projection_elements_per_layer() * one._projection_gemm_quant_mode.value.memory
+    per_layer = draft_op_weights(one) + projections
+    assert one.get_resident_weights_bytes() - plain.get_resident_weights_bytes() == per_layer
+    assert two.get_resident_weights_bytes() - plain.get_resident_weights_bytes() == per_layer
+
+    # KV follows the physical layer too: the extra step appends to the same
+    # slot, so capacity is identical for one step and two.
+    assert two._qsa_cache_layers() == one._qsa_cache_layers() == 13
+    assert two.get_kvcache_elements_per_token() == one.get_kvcache_elements_per_token()
+
+    # A checkpoint that ships two MTP layers is two resident copies.
+    two.extra_params = dataclasses.replace(two.extra_params, mtp_num_hidden_layers=2)
+    assert two._qsa_cache_layers() == 14
+    assert two.get_resident_weights_bytes() - plain.get_resident_weights_bytes() == 2 * per_layer
+
+
 @pytest.mark.parametrize(
     ("model_path", "moe_mode"),
     [(BF16, common.MoEQuantMode.bfloat16), (FP8, common.MoEQuantMode.fp8_block)],

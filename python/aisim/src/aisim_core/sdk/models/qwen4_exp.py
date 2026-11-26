@@ -26,11 +26,13 @@ ways, each of which is priced explicitly below:
    hidden_size, hidden_size]``), a depthwise ``conv1d`` over the manifold and
    the ``norm_key``/``norm_query``/``norm_conv`` group norms. Only the table is
    TP-sharded; the projections and norms are replicated like the mixers.
-4. **MTP draft layer is QSA, not GDN.** The draft stack is a single
-   full-attention (QSA) MoE layer with its own hyper-connection blocks and
+4. **MTP draft layer is QSA, not GDN.** The draft stack is
+   ``mtp_num_hidden_layers`` (one in this checkpoint) full-attention (QSA) MoE
+   layers with their own hyper-connection blocks and
    ``fc_embedding``/``fc_hidden`` projections, so the mixed decoder stack cannot
    be scaled by ``mtp_scale_factor`` without assigning the draft to the wrong op
-   class (12 QSA layers would become 12.25 instead of 13).
+   class (12 QSA layers would become 12.25 instead of 13). Additional ``nextn``
+   steps reuse those resident layers.
 
 Geometry is taken from the checkpoint, not inferred: GDN is 16 key / 48 value
 heads at 128 dims (``in_proj_qkv`` 10240 = 2*16*128 + 48*128), QSA is 24 q / 2 kv
@@ -263,12 +265,13 @@ class Qwen4ExpModel(Qwen35Model):
     # ------------------------------------------------------------------
 
     def get_resident_weights_bytes(self) -> float:
-        """Phase inventory, the QSA projection weights, and the MTP draft layer.
+        """Phase inventory, the QSA projection weights, and the MTP draft layers.
 
-        The QSA draft layer shares no weights with the GDN decoder stack, so the
+        The QSA draft stack shares no weights with the GDN decoder stack, so the
         context-op inventory cannot imply it. Draft ops are ``draft_``-prefixed
         and therefore excluded from the base sum; they are added back here at
-        their own (nextn-scaled) weight.
+        one physical draft layer's weight (``_mtp_physical_layers``), even though
+        their op counts carry the per-decode draft step count.
 
         ``Op::MsaContext``/``Op::MsaGeneration`` report zero resident weight
         bytes, which is right for MiniMax-M3 (its module row is silicon-only) but
@@ -283,12 +286,31 @@ class Qwen4ExpModel(Qwen35Model):
         the ``Embedding``.
         """
         draft = sum(op.get_weights() for op in self.generation_ops if op._name.startswith(_DRAFT_PREFIX))
+        if draft:
+            # ``_draft_ops`` scales every draft op by the decode's draft *steps*
+            # (``nextn``), but the module holds only the checkpoint's physical
+            # MTP layers and cycles through them per step. Resident bytes follow
+            # the layers; only the per-step work follows the step count.
+            draft = draft * self._mtp_physical_layers() / max(1, int(self._nextn))
         qsa_projections = (
             self._qsa_cache_layers()
             * self._qsa_projection_elements_per_layer()
             * self._projection_gemm_quant_mode.value.memory
         )
         return float(super().get_resident_weights_bytes() + qsa_projections + draft)
+
+    def _mtp_physical_layers(self) -> int:
+        """Physical MTP draft layers the checkpoint ships.
+
+        ``nextn`` is the number of draft *steps* per decode, not a layer count:
+        ``Qwen4ExpMultiTokenPredictor`` builds
+        ``getattr(config, "mtp_num_hidden_layers", 1)`` layers and selects one
+        per step with ``spec_step_idx % num_mtp_layers``
+        (``vllm/models/qwen4_exp/nvidia/mtp.py`` @0.32.0). With the checkpoint's
+        single draft layer every extra step reuses the same resident weights, so
+        the step count scales the draft compute but not its footprint.
+        """
+        return max(1, int(self.extra_params.mtp_num_hidden_layers))
 
     def _qsa_cache_layers(self) -> int:
         """QSA layers that own a KV slot: the decoder's plus any MTP draft's.
@@ -300,12 +322,17 @@ class Qwen4ExpModel(Qwen35Model):
         something when the draft layers take their own slot in the same paged
         pool, and each one runs the full QSA attention with its own indexer, so
         their per-token K/V and index side buffers are additional layers, not
-        shares of the decoder's. Gated on the MTP scheme because scheme-based
-        speculation rewrites ``_nextn`` to a verify width post-construction.
+        shares of the decoder's.
+
+        The count is the checkpoint's *physical* MTP layers
+        (``mtp_num_hidden_layers``), not the draft step count: a step that
+        reuses a layer appends to that layer's existing slot. Gated on the MTP
+        scheme because scheme-based speculation rewrites ``_nextn`` to a verify
+        width post-construction.
         """
         cfg: common.Qwen4ExpConfig = self.extra_params
         return cfg.layer_types.count("full_attention") + (
-            self.spec_scheme.depth if isinstance(self.spec_scheme, MTPScheme) else 0
+            self._mtp_physical_layers() if isinstance(self.spec_scheme, MTPScheme) else 0
         )
 
     def _qsa_projection_elements_per_layer(self) -> int:
@@ -841,7 +868,7 @@ class Qwen4ExpModel(Qwen35Model):
         if n_ple:
             self.generation_ops.extend(self._ple_ops("generation", "generation_ple", n_ple, cfg))
 
-        # --- MTP draft stack: nextn x (QSA layer + MoE + 2 HC blocks + mixer) ---
+        # --- MTP draft stack: nextn steps x (QSA layer + MoE + 2 HC blocks + mixer) ---
         if self._nextn > 0:
             self.generation_ops.extend(self._draft_ops(cfg, workload_dist, h, moe_tp, moe_ep, attn_dp))
 
@@ -861,13 +888,20 @@ class Qwen4ExpModel(Qwen35Model):
         moe_ep: int,
         attn_dp: int,
     ) -> list:
-        """MTP draft stack at ``nextn`` layers: one QSA+MoE layer and its inputs.
+        """MTP draft stack priced at ``nextn`` draft steps.
 
         The draft layer is full-attention (from ``text_config.mtp.layer_types``),
         so pricing it by scaling the mixed GDN/QSA decoder would move 1/12 of the
         QSA work onto GDN. ``fc_embedding``/``fc_hidden`` project the draft token
         embedding and the final manifold state into the draft hidden width; the
         model-level ``hyper_connection_mixer`` appears once per draft stack.
+
+        Every op here carries the draft step count as its token/ repetition
+        count: the module holds only ``mtp_num_hidden_layers`` physical layers
+        and cycles through them per step (``spec_step_idx % num_mtp_layers``),
+        so ``nextn`` steps mean ``nextn`` passes over one resident layer. That
+        makes these counts right for the timed work and wrong for the footprint,
+        which ``get_resident_weights_bytes`` divides back out.
 
         Widths follow ``vllm/models/qwen4_exp/nvidia/mtp.py`` @v0.31.0:
 
