@@ -53,19 +53,20 @@ silicon-true row to collect. NVFP4 exists upstream as a ModelOpt derivative but
 requires Blackwell; no SM100+ system is qualified for this model, so the
 checkpoint is not registered.
 
-The FP8 release quantizes **routed experts only**. Its
+The FP8 release quantizes **routed experts and the n-gram table**. Its
 `modules_to_not_convert` covers `self_attn.*`, `indexer`, `linear_attn.*`,
 `mlp.shared_expert.*`, `mlp.gate*`, the attention/MLP hyper-connections, `ple.*`,
 `visual.*`, `mtp.*`, `lm_head` and `embed_tokens`. QSA, its KV pool and the
-indexer therefore run in BF16 under both artifacts. The SDK keeps KV and FMHA
-quantization in BF16 for this architecture even though the checkpoint reports
-the model-wide `fp8_block` mode; an explicit `kv_cache_quant_algo` or
-`kvcache_quant_mode` still wins and fails loudly when the data are missing. The
-same applies to `gemm_quant_mode`: when it is set explicitly it prices every
-GEMM family at that mode, hyper-connections, PLE and the MTP FC pair included;
-without one, `modules_to_not_convert` keeps those families in BF16.
-Consequently the QSA module rows carry exactly one precision triple
-(`compute`, `kv_cache`, `gemm` = BF16) and serve both artifacts.
+indexer therefore run in BF16 under both artifacts, as do the PLE projections
+and norms — only the 51.2e9-parameter table is stored quantized (F8_E4M3). The
+SDK keeps KV and FMHA quantization in BF16 for this architecture even though the
+checkpoint reports the model-wide `fp8_block` mode; an explicit
+`kv_cache_quant_algo` or `kvcache_quant_mode` still wins and fails loudly when
+the data are missing. The same applies to `gemm_quant_mode`: when it is set
+explicitly it prices every GEMM family at that mode, hyper-connections, PLE and
+the MTP FC pair included; without one, `modules_to_not_convert` keeps those
+families in BF16. Consequently the QSA module rows carry exactly one precision
+triple (`compute`, `kv_cache`, `gemm` = BF16) and serve both artifacts.
 
 ## QSA collection
 
@@ -93,9 +94,9 @@ A module row is one phase and head shard for one checkpoint, with every
   (`arg_groups/model_overrides/qwen4_exp.py@v0.5.21`), not M3's 128.
 - **Capacity.** The prefixed extend path keeps the case's KV pool resident and
   allocates a per-shape gather workspace on top of it. Bounding the pool alone
-  admitted 215 of 11888 shapes that OOM'd mid-sweep on H200, so the worker
-  refuses a point whose pool plus workspace cannot fit, before allocating it,
-  with a `FIXME(kernel-limit): does not fit` reason. The remaining shapes still
+  admits shapes that OOM mid-sweep on H200, so the worker refuses a point whose
+  pool plus workspace cannot fit, before allocating it, with a
+  `FIXME(kernel-limit): does not fit` reason. The remaining shapes still
   measure; the refusal is recorded, not silently dropped.
 
 Inspect the retained plan before a GPU run:
@@ -123,8 +124,9 @@ collection or serving run must pin the flag:
 | vLLM | `--engram-config '{"cpu_offload": false}'` |
 | SGLang | `--no-ple-offload-embedding` |
 
-Leaving the defaults keeps the whole 102.4 GB BF16 table in pinned host memory
-and breaks the memory identity between model and process.
+Leaving the defaults keeps the whole table in pinned host memory — 102.4 GB in
+BF16, 51.2 GB in the FP8 release — and breaks the memory identity between model
+and process.
 
 Sharding is deliberately uneven and was read off the pinned runtime source. The
 n-gram table is a `VocabParallelEmbedding`, but the gated-residual projections,
@@ -173,8 +175,8 @@ rows are the measured anchor.
 The C3.5 evidence bundle
 ([`benchmarks/evidence/collector/qwen38-c3.5/`](../../../benchmarks/evidence/collector/qwen38-c3.5/README.md))
 records the staged tables, the disjoint merge check, the architecture-keyed
-consumer queries (TP8/EP8, one 8192-token request: vLLM 144.09 ms prefill /
-5.85 ms decode, SGLang 162.71 ms / 5.61 ms) and a default `aisimulate predict`
+consumer queries at TP8/EP8 on one 8192-token request (per-backend prefill and
+decode latencies are tabulated there) and a default `aisimulate predict`
 smoke. Those are plumbing checks, not accuracy results. The tables reach a
 default install only through an `ai-dynamo/aisim-data` revision and the pin bump
 above.

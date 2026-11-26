@@ -19,7 +19,7 @@ about the mechanism.
 
 ## Method
 
-`model-onboarding/c5/05-probe/probe.sh`, run in `qwen38-tiny-prefill` on the
+`benchmarks/evidence/collector/qwen38-c5-serving/configs/probe.sh`, run in `qwen38-tiny-prefill` on the
 same node, image (`vllm-openai:v0.31.0`, `sha256:c1c9f6fd…67c3`) and topology
 (TP8/EP8, BF16) as the C3.7 collection, with the serving flags of the C5 cells.
 
@@ -29,7 +29,7 @@ through `POST /v1/completions` with an explicit token-id prompt (`max_tokens 1`,
 request after `/health` returns; then prefill=4; then three warmups at 64; then
 20 × prefill=1 and 5 × each of 4/8/16/32/64/97.
 
-Raw log: `model-onboarding/c5/logs/tiny-prefill.log`.
+Raw log: `benchmarks/evidence/collector/qwen38-c5-serving/logs/tiny-prefill.log`.
 Server side: 43.53 GiB/rank, model load 295.9 s.
 
 ## Results
@@ -78,8 +78,8 @@ right tail, and no row there is repeatability-qualified.
 ```bash
 export KUBECONFIG=~/psap/kubeconfig-psap-janus
 kubectl -n aisimulate-qwen38 create configmap qwen38-tiny-prefill \
-  --from-file=probe.sh=model-onboarding/c5/05-probe/probe.sh --dry-run=client -o yaml \
+  --from-file=probe.sh=benchmarks/evidence/collector/qwen38-c5-serving/configs/probe.sh --dry-run=client -o yaml \
   | kubectl apply -f -
-kubectl apply -f model-onboarding/c5/05-tiny-prefill-probe.yaml
+kubectl apply -f benchmarks/evidence/collector/qwen38-c5-serving/configs/05-tiny-prefill-probe.yaml
 kubectl -n aisimulate-qwen38 logs -f qwen38-tiny-prefill
 ```

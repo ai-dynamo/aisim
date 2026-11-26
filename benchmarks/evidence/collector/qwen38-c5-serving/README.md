@@ -133,7 +133,7 @@ what was discarded.
 | SGLang FP8 | 2 | accepted |
 
 Two harness defects were found by these runs and are now pinned in
-`model-onboarding/c5/00-serving-harness-configmap.yaml`: SGLang's
+`benchmarks/evidence/collector/qwen38-c5-serving/configs/00-serving-harness-configmap.yaml`: SGLang's
 `--random-range-ratio` default is not a fixed length, and `random-ids` +
 `--tokenize-prompt` is the only offline-safe way to get exact token counts
 (vLLM's random dataset samples vocabulary ids, so the regime matches).
@@ -160,8 +160,8 @@ Two harness defects were found by these runs and are now pinned in
 
 ```bash
 export KUBECONFIG=~/psap/kubeconfig-psap-janus
-kubectl apply -f model-onboarding/c5/00-serving-harness-configmap.yaml
-kubectl apply -f model-onboarding/c5/01-vllm-bf16.yaml     # or 02/03/04
+kubectl apply -f benchmarks/evidence/collector/qwen38-c5-serving/configs/00-serving-harness-configmap.yaml
+kubectl apply -f benchmarks/evidence/collector/qwen38-c5-serving/configs/01-vllm-bf16.yaml     # or 02/03/04
 kubectl -n aisimulate-qwen38 logs -f qwen38-serve-vllm-bf16
 ```
 
@@ -169,6 +169,6 @@ The predictor side is the matching `predict-*.yaml` at concurrency 1 / 8
 requests:
 
 ```bash
-aisimulate predict --stack engine --config model-onboarding/c5/predict-vllm-bf16.yaml \
-  --format json --output-dir model-onboarding/c5/out/predict-vllm-bf16-conc1
+aisimulate predict --stack engine --config benchmarks/evidence/collector/qwen38-c5-serving/configs/predict-vllm-bf16.yaml \
+  --format json --output-dir ./out/predict-vllm-bf16-conc1
 ```

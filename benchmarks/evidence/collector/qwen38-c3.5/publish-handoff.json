@@ -266,6 +266,7 @@
         "preferred": true,
         "steps": [
           "apply the 18 payload files and the five reuse groups in a checkout that carries python/aisim/src/aisim_core/systems/data/",
+          "commit the applied payload: build refuses a dirty tree unless --allow-dirty is passed, and that flag must not be used for the publication build because the manifests would then stamp the previous HEAD as source_commit",
           "run tools/perf_database/publish_op_latency_tree.py build --out <dir> so the manifests stamp a real source_commit",
           "upload <dir>/data/op-latency, <dir>/catalog/op-latency.json and <dir>/catalog/op-latency",
           "update catalog/dataset.json categories.op-latency.index to the uploaded catalog/op-latency.json bytes/sha256, keeping the e2e and fpm references"
@@ -276,14 +277,14 @@
         "id": "one-off-bundle-upload",
         "preferred": false,
         "steps": [
-          "hf upload ai-dynamo/aisim-data <bundle>/data/op-latency data/op-latency --repo-type dataset --create-pr",
-          "hf upload ai-dynamo/aisim-data <bundle>/catalog/op-latency.json catalog/op-latency.json --repo-type dataset --create-pr",
-          "hf upload ai-dynamo/aisim-data <bundle>/catalog/op-latency catalog/op-latency --repo-type dataset --create-pr",
+          "hf upload ai-dynamo/aisim-data <bundle>/data/op-latency data/op-latency --repo-type dataset --create-pr  # opens the PR; N below is its number",
+          "hf upload ai-dynamo/aisim-data <bundle>/catalog/op-latency.json catalog/op-latency.json --repo-type dataset --revision refs/pr/N",
+          "hf upload ai-dynamo/aisim-data <bundle>/catalog/op-latency catalog/op-latency --repo-type dataset --revision refs/pr/N",
           "update catalog/dataset.json categories.op-latency.index to the uploaded catalog/op-latency.json bytes/sha256, keeping the e2e and fpm references"
         ]
       }
     ],
-    "command_note": "Hugging Face opens the pull request as a refs/pr/N revision inside the source repository, so write access to ai-dynamo/aisim-data is required; a fork does not work. hf upload only adds or overwrites, so the six system-level auxiliary files under b200_sxm/ stay in place.",
+    "command_note": "Hugging Face opens the pull request as a refs/pr/N revision inside the source repository, so write access to ai-dynamo/aisim-data is required; a fork does not work. Only the first upload passes --create-pr; the rest target that PR's refs/pr/N so every artifact lands in one reviewed revision. hf upload only adds or overwrites, so the six system-level auxiliary files under b200_sxm/ stay in place.",
     "do_not_upload": [
       "catalog/dataset.json from the bundle (single-category index; the dataset copy names e2e, fpm and op-latency)",
       "catalog/op-latency-reuse.parquet and catalog/systems.parquet are byte-identical to the base, so re-uploading them is a no-op"

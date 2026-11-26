@@ -308,13 +308,14 @@ def test_explicit_gemm_mode_reaches_the_families_the_checkpoint_excludes():
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 def test_fp8_qsa_module_keys_on_the_bf16_kernels_the_runtime_runs(backend):
-    """The FP8 release quantizes routed experts only, so QSA and KV stay BF16.
+    """The FP8 release keeps attention in BF16, so the QSA module and KV do too.
 
-    The checkpoint carries no ``kv_cache_scheme`` and lists every attention
-    projection in ``modules_to_not_convert``; both runtimes run the QSA module
-    at the projection dtype. Inferring an FP8 KV pool from the weight precision
-    alone produced a DsaKey (``kv=fp8``, and ``fmha=fp8`` on SGLang) that no
-    collected row can satisfy — the FP8 checkpoint was unpriceable in SILICON.
+    Only routed experts and the n-gram table are quantized; the checkpoint
+    carries no ``kv_cache_scheme`` and lists every attention projection in
+    ``modules_to_not_convert``, so both runtimes run the QSA module at the
+    projection dtype. Inferring an FP8 KV pool from the model-wide mode alone
+    produced a DsaKey (``kv=fp8``, and ``fmha=fp8`` on SGLang) that no collected
+    row can satisfy — the FP8 checkpoint was unpriceable in SILICON.
     """
     for model_path in (BF16, FP8):
         model = models.get_model(model_path, _model_config(), backend)
