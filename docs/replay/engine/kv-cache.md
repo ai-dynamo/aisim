@@ -53,12 +53,12 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 | `capacity.memory_fraction` | vLLM/TensorRT-LLM `0.9`, SGLang `0.88` | Searchable; fixed by default | In `(0, 1]`. `default` capacity only. Same meaning as vLLM `gpu_memory_utilization`, SGLang `mem_fraction_static`, TensorRT-LLM `free_gpu_memory_fraction`. |
 | `capacity.cuda_graph_reserved_bytes` | `0` | predict only | Bytes held back from G1 for CUDA graphs. `default` capacity only. |
 | `capacity.blocks` | Unset | fixed | G1 blocks per attention-DP rank. `fixed` capacity only. |
-| `capacity.bytes` | Unset | predict only | G1 bytes per attention-DP rank, instead of `blocks`. Requires explicit `block_size` and numeric `bytes_per_token`, unless `state_cache: {}` infers them. |
+| `capacity.bytes` | Unset | predict only | G1 bytes per attention-DP rank, instead of `blocks`. Requires explicit `block_size` and numeric `bytes_per_token`, unless `state_cache: {}` or Gemma 4's [automatic state cache](#gemma-4-on-vllm) infers them. |
 | `host_offload` | Unset (off) | fixed | G2 block; see [host offload](#host-offload-g2). |
 | `hicache` | Unset (off) | Rejected | SGLang host KV cache for aggregated prediction; see [SGLang HiCache](#sglang-hicache). |
 | `g3_offload` | Unset (off) | Rejected | G3 block; see [G3 offload](#g3-offload). |
 | `kvcr` | Unset (off) | Rejected | KVCR block; see [KVCR peer fetch](#kvcr-peer-fetch). |
-| `state_cache` | Unset (off) | Rejected | Recurrent-state block; see [state cache](#state-cache). |
+| `state_cache` | Unset (off); automatic for Gemma 4 on vLLM | Rejected | Recurrent-state block; see [state cache](#state-cache). Gemma 4 vLLM workers, including `recommend` candidates, get a sliding-window state when it is unset; see [Gemma 4 on vLLM](#gemma-4-on-vllm). |
 | `prefix_match_unit` | Unset | Rejected | Prefix-matching granularity with `state_cache`. For a grouped FPM cache with prefix caching, it is the profile's `hash_block_size_tokens`: unset uses it, and a set value must equal it. See [grouped caches](#other-cache-modes). |
 
 The block-size defaults above are simulation defaults. When a Sweeper candidate's
@@ -934,6 +934,8 @@ replay copies the state, so a full pool with nothing to evict skips the
 boundary. This model needs inferred geometry: with `bytes_per_request` set,
 DeepSeek V4 falls back to one recurrent-style checkpoint per request.
 
+<a id="gemma-4-on-vllm"></a>
+
 Gemma 4 on vLLM gets a sliding-window state automatically; leave `state_cache`
 unset. vLLM keeps only the last `sliding_window` tokens (1,024) of the sliding
 layers. It unifies every layer's page size by growing the block of the smaller
@@ -946,10 +948,15 @@ and the state takes 111,411,200 bytes per rank. Prefix hits resume at block
 boundaries that keep a window snapshot, as with DeepSeek V4. A fixed
 `capacity.blocks` counts these resolved blocks (128 tokens of global-layer KV at
 TP2), not 64-token blocks of every layer, and each request also takes its state
-from the same pool. An FP8-KV checkpoint, such as Gemma-4-26B-A4B-NVFP4, sizes
-in FP8 as vLLM's `--kv-cache-dtype auto` does. A worker with a grouped
-`engine.fpm_profile`, or with a profile that records no `runtime_memory`, keeps
-its existing capacity path.
+from the same pool. KV precision follows the usual order: an explicit
+`kvcache_quant_mode`, then the FPM profile's `kv_cache_dtype`, then the
+checkpoint, so an FP8-KV checkpoint such as Gemma-4-26B-A4B-NVFP4 sizes in FP8
+as vLLM's `--kv-cache-dtype auto` does. An explicit precision that contradicts
+the profile is rejected. A worker with a grouped `engine.fpm_profile`, or with a
+profile that records no `runtime_memory`, keeps its existing capacity path. In
+disaggregated mode, decode resumes from the transferred state, so prefill and
+decode take the window state together: if either role keeps its existing path,
+both do.
 
 The full window is charged even to a request shorter than it, so below about
 1,024 tokens replay reserves more than vLLM, which holds only `cdiv(L, 64)`
@@ -965,7 +972,12 @@ its window snapshot, so a Gemma 4 vLLM worker rejects it:
   draft tokens in the window, and token bytes follow vLLM's cache groups.
 
 `recommend` sizes Gemma 4 vLLM candidates the same way, so a saved candidate and
-`predict` agree.
+`predict` agree. A role timed by a
+[state snapshot](../../perf-model/configuration.md#recommending-with-a-calibrated-snapshot)
+is rejected when the snapshot's deployed `kv_block_size` differs from the
+pool's global block (TP1 and TP2: 64 becomes 128), because the saved identity
+could not be restored; at TP4 and above the block is unchanged and the snapshot
+is accepted.
 
 DeepSeek V4 and Kimi K3 still have this bug. Their state cache is opt-in
 (`state_cache: {}`), so a worker without it, and every `recommend` candidate

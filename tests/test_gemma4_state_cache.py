@@ -494,3 +494,31 @@ def test_the_sweeper_gives_disaggregated_roles_the_window_state_together(prefill
         for role in ("prefill", "decode")
     ]
     assert [state is not None for state in states] == [prefill_runtime_memory] * 2
+
+
+@pytest.mark.parametrize("mode", ["aggregated", "disaggregated"])
+def test_the_rust_engine_accepts_the_compiled_gemma4_window_state(mode):
+    # Through the native runtime, not a recording stub: Rust validates the sliding-window state,
+    # the 128-token block and the global-only token bytes, and allocates from that pool.
+    payload = _payload(tensor=2, prefix_caching=True)
+    payload["traffic"]["source"] = {"type": "synthetic", "input_tokens": 1500, "output_tokens": 4}
+    payload["traffic"]["stop"] = {"requests": 2}
+    if mode == "disaggregated":
+        engine = payload["engine"]
+        worker = engine["workers"].pop("aggregated")
+        engine.update(mode="disaggregated", workers={"prefill": worker, "decode": deepcopy(worker)})
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(payload))
+    deployment = spec.backend_deployment
+    roles = (
+        [deployment.agg_engine_args]
+        if mode == "aggregated"
+        else [
+            deployment.prefill_engine_args,
+            deployment.decode_engine_args,
+        ]
+    )
+    for args in roles:
+        assert (args["block_size"], args["kv_cache_bytes_per_token"]) == (128, 10240)
+        assert args["state_cache"]["sliding_window"] == {"lookahead_tokens": 0}
+    metrics = EngineReplayRunnerFactory().create(0).run(spec).metrics
+    assert metrics["completed_requests"] == 2
