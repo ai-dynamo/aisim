@@ -110,8 +110,8 @@ Field tables on these pages use the following columns:
 | `engine.context_length` | `max` | fixed | Positive prompt-plus-output token limit, or `max`. With a number, prompts at or above the limit are rejected and generation stops at the limit. `max` applies the model config's maximum on vLLM; SGLang and TensorRT-LLM then run without a limit. |
 | `engine.workers` | Required | Per mode | Role mappings; see [Worker roles](#worker-roles). A role may be `{}` to use all defaults. |
 | `engine.ais_perf_model` | Unset | fixed | One perf-model config, or a list with one config per worker type. Sets the estimator of each worker and replaces the deprecated estimator fields; see [Perf model](#ais-perf-model). Rejected with AFD, an encoder pool, and `fixed` or `polynomial` timing. |
-| `engine.tokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Tokenizes each request on its worker before the engine; see [Request tokenization](#tokenization). Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and SGLang frontend stages (which already price the tokenizer) are rejected. |
-| `engine.extra_cpu_overhead` | Unset (off) | predict only | Optional `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Delays every request before the engine by `base_ms + per_input_token_us × input tokens` without queueing; see [Extra CPU overhead](#extra-cpu-overhead). Same replay support and rejections as `engine.tokenization`. |
+| `engine.tokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Tokenizes each request on its worker before the engine; see [Request tokenization](#tokenization). A caller that opts in to [measured CPU overhead](#measured-cpu-overhead) fills it when unset. Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and SGLang frontend stages (which already price the tokenizer) are rejected. |
+| `engine.extra_cpu_overhead` | Unset (off) | predict only | Optional `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Delays every request before the engine by `base_ms + per_input_token_us × input tokens` without queueing; see [Extra CPU overhead](#extra-cpu-overhead). Filled like `engine.tokenization` by [measured CPU overhead](#measured-cpu-overhead). Same replay support and rejections as `engine.tokenization`. |
 | `engine.detokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_output_us` (finite and non-negative, default `0`). Detokenizes each pass's outputs on the worker that emits tokens before the client receives them; see [Response detokenization](#detokenization). Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and `traffic.load.agentic_profile` are rejected. |
 
 <a id="tokenization"></a>
@@ -208,6 +208,41 @@ engine:
   while delayed, and both costs `0` is the same as omitting the block.
 - Like tokenization, it is a replay stage in front of the engine, not part of
   the forward-pass estimator: it does not change `estimate_forward_pass_time_ms`.
+
+<a id="measured-cpu-overhead"></a>
+
+### Measured CPU overhead
+
+Both stages can be filled from measurements instead of by hand. A caller opts
+in by naming the request endpoint, for example
+`prediction_to_replay_spec(config, cpu_overhead_endpoint="chat")`; the AgentX
+accuracy harness does this. Replay then reads the
+[host-cost data](../../reference/host-cost-schema.md) of the dataset revision
+pinned in `aisim_core/data/host_cost_pin.json`, keyed by backend, backend
+version, endpoint, host CPU and tokenizer:
+
+- `engine.tokenization` comes from the tokenizer measurement, and
+  `engine.extra_cpu_overhead` from the unqueued measurement (client TTFT minus
+  engine time at one request in flight). The unqueued per-token term is the
+  measured total less the tokenizer slope, so the two stages reproduce the
+  measured total.
+- A field the config sets, including an explicit zero, always wins; only unset
+  fields are filled.
+- An uncollected backend version reuses the closest collected one (at or
+  below it, else the nearest above). Host CPU, tokenizer and endpoint must
+  match exactly.
+- A deployment with no tokenizer measurement gets nothing: there is no
+  default. Online replay, adapters, AFD, encoder pools and SGLang frontend
+  stages are left unchanged.
+- `AISIM_HOST_COST_LOCAL=<dir>` reads a local dataset copy and
+  `AISIM_HOST_COST_DATASET=<repo>@<revision>` another revision.
+
+Measured on B300 (Intel Xeon Platinum 8559C):
+
+| Deployment | `engine.tokenization` | `engine.extra_cpu_overhead` |
+|---|---|---|
+| vLLM 0.31.0, chat, Qwen2 tokenizer | 1.532 µs/token | 29.5 ms + 0.149 µs/token |
+| SGLang 0.5.20 (unqueued) and 0.5.21 (tokenizer), chat, GLM tokenizer | 0.29 ms + 1.217 µs/token | 12.6 ms + 0.342 µs/token |
 
 <a id="detokenization"></a>
 

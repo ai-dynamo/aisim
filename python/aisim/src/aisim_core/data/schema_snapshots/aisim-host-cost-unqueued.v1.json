@@ -1,0 +1,54 @@
+{
+  "$id": "aisim-host-cost-unqueued/v1",
+  "additionalProperties": false,
+  "description": "One measured run of the unqueued overhead: ``outside engine = base_ms + total_per_input_token_us * tokens``.\n\n``outside engine`` is client TTFT minus the engine's prefill span, per request, at one lane. ``requests`` and\n``r2`` are null when the run was summarized without its per-request fit statistics.",
+  "properties": {
+    "base_ms": {
+      "title": "Base Ms",
+      "type": "number"
+    },
+    "r2": {
+      "anyOf": [
+        {
+          "maximum": 1,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "R2"
+    },
+    "requests": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Requests"
+    },
+    "run": {
+      "minLength": 1,
+      "title": "Run",
+      "type": "string"
+    },
+    "total_per_input_token_us": {
+      "minimum": 0,
+      "title": "Total Per Input Token Us",
+      "type": "number"
+    }
+  },
+  "required": [
+    "run",
+    "base_ms",
+    "total_per_input_token_us"
+  ],
+  "title": "UnqueuedRunRow",
+  "type": "object"
+}

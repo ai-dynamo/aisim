@@ -1,0 +1,8 @@
+requests 163 matched 163
+  before engine        median   213.2 ms  mean   282.8 ms
+  engine prefill span  median   192.4 ms  mean   418.2 ms
+  after engine         median     2.1 ms  mean     0.7 ms
+  fit before engine          =   23.7 ms + 1.501 us/token x input   (R2 0.86)
+  fit after engine           =   -4.3 ms + 0.029 us/token x input   (R2 0.00)
+  fit outside engine (sum)   =   19.5 ms + 1.530 us/token x input   (R2 0.81)
+  median input 133775 tokens; median prefilled 2311

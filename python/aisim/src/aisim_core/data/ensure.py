@@ -592,6 +592,9 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         selection = loader.select(out.config)
     except SelectionError as exc:
         raise MissingDataError(f"cannot derive a {category} selection from the configuration: {exc}") from exc
+    if category == "host-cost":
+        _ensure_host_cost(out, loader, selection, pin, transport)
+        return
     # A configuration ID names one entry of a category. Operation families are complementary inputs of one root,
     # so there it chooses only among the entries of its own family and every other family still arrives.
     if pin.configuration_id and category != "op-latency":
@@ -685,6 +688,91 @@ def _ensure_category(out: EnsuredData, category: str, pin: DataPin, transport: T
         "revision": revision,
         "source": source,
         "configuration_id": entry.configuration_id,
+        "downloaded_bytes": downloaded,
+    }
+
+
+def _ensure_host_cost(
+    out: EnsuredData, loader, selection: Selection, pin: DataPin, transport: Transport | None
+) -> None:
+    """Wire ``config["host_cost"]``: the measured tokenizer and unqueued overhead, or ``None`` when unmeasured.
+
+    The configuration names ``system``, ``backend``, ``backend_version``, ``model`` and ``endpoint``. Entries are
+    chosen from the catalog first (closest collected version, tokenizer of the model, the system's host CPU), so only
+    the chosen ones are fetched. An unmeasured deployment is not an error: it has no default, so it wires ``None``.
+    """
+    from aisim_core.host_cost.lookup import choose, overhead, tokenizer_key
+
+    config = out.config
+    missing = [name for name in ("backend_version", "model", "endpoint") if not config.get(name)]
+    if missing:
+        raise MissingDataError(f"a host-cost selection needs {', '.join(missing)} in the configuration")
+    if pin.local_root is not None:
+        root = Path(pin.local_root).absolute()
+        where, revision, source = str(root), f"local:{root}", "local"
+        catalog = _matching_entries(root, selection)
+    else:
+        where, revision = f"{pin.repo}@{pin.revision}", pin.revision
+        try:
+            index = _remote_category_index(pin, transport, "host-cost", out)
+        except SelectionError:
+            index = None  # this revision publishes no host-cost category
+        catalog = [e for e in index.entries if selection.matches(e)] if index is not None else []
+        source = "hf-cache"
+    try:
+        key = tokenizer_key(config["model"], catalog)
+        tokenizer, unqueued = (
+            choose(
+                catalog,
+                framework=config["backend"],
+                version=config["backend_version"],
+                endpoint=config["endpoint"],
+                system=config["system"],
+                tokenizer=key,
+            )
+            if key is not None
+            else (None, None)
+        )
+    except ValueError as exc:
+        raise DataConflictError(f"host-cost data in {where}: {exc}") from exc
+    chosen = [c for c in (tokenizer, unqueued) if c is not None]
+    downloaded = 0
+    if chosen and pin.local_root is None:
+        ids = tuple(c.entry.configuration_id for c in chosen)
+        result = _fetch_pinned(replace(selection, configuration_ids=ids), pin, transport, out)
+        root, downloaded = result.root, result.downloaded_bytes
+        source = "hf-download" if downloaded else "hf-cache"
+    manifests = []
+    for choice in chosen:
+        try:
+            manifest = loader.load(root, choice.entry.manifest.path)
+        except (LoaderError, ValueError) as exc:
+            raise MissingDataError(
+                f"host-cost data {choice.entry.configuration_id} in {where} failed verification: {exc}",
+                selection=selection,
+                source=where,
+            ) from exc
+        if (manifest.configuration_id, manifest.purpose, manifest.identity) != (
+            choice.entry.configuration_id,
+            choice.entry.purpose,
+            choice.entry.identity,
+        ):
+            raise MissingDataError(f"host-cost catalog and manifest identity differ in {where}", source=where)
+        manifests.append(manifest)
+    config["host_cost"] = (
+        overhead(
+            config["backend_version"],
+            (tokenizer, manifests[0]),
+            (unqueued, manifests[1]) if unqueued is not None else None,
+        ).to_dict()
+        if tokenizer is not None
+        else None
+    )
+    out.datasets["host-cost"] = {
+        "repo": pin.repo,
+        "revision": revision,
+        "source": source,
+        "configuration_ids": [c.entry.configuration_id for c in chosen],
         "downloaded_bytes": downloaded,
     }
 

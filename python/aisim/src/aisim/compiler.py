@@ -53,8 +53,15 @@ def prediction_to_replay_spec(
     *,
     adapter_specs: dict[str, AdapterReplaySpec] | None = None,
     execution_mode: str = "offline",
+    cpu_overhead_endpoint: str | None = None,
 ) -> ReplaySpec:
-    """Compile one concrete public prediction config."""
+    """Compile one concrete public prediction config.
+
+    ``cpu_overhead_endpoint`` (for example ``"chat"``) opts in to the measured serving-path CPU overhead of the
+    pinned ``host-cost`` dataset (:mod:`aisim_core.host_cost.replay`) for offline token replay without adapters. It
+    fills ``engine.tokenization`` and ``engine.extra_cpu_overhead`` only where the config leaves them unset, and only
+    for a deployment that has been measured; there is no default for any other.
+    """
 
     if (
         config.engine.speculation is not None
@@ -74,6 +81,8 @@ def prediction_to_replay_spec(
     workload, concurrency = _traffic(config)
     deployment = _deployment(config.engine, workload=workload)
     deployment = _pin_estimator_version_aliases(deployment, config.engine)
+    if cpu_overhead_endpoint is not None and execution_mode == "offline" and not adapter_specs:
+        deployment = _apply_measured_cpu_overhead(deployment, config.engine, cpu_overhead_endpoint)
     metadata = dict(deployment.performance_model_metadata)
     for role, field in (
         ("aggregated", "agg_engine_args"),
@@ -264,6 +273,48 @@ def _extra_cpu_overhead(engine: EnginePredictionConfig) -> dict[str, JSONValue] 
     if extra is None or not extra.active:
         return None
     return {"base_ms": extra.base_ms, "per_input_token_ms": extra.per_input_token_us / 1000.0}
+
+
+def _apply_measured_cpu_overhead(
+    deployment: BackendDeploymentSpec, engine: EnginePredictionConfig, endpoint: str
+) -> BackendDeploymentSpec:
+    """Fill the CPU-overhead stages the config leaves unset from the measured data of this exact deployment."""
+    if engine.tokenization is not None and engine.extra_cpu_overhead is not None:
+        return deployment  # the caller set both; caller-set fields always win
+    if has_afd(engine.workers) or engine.workers.encoder is not None:
+        return deployment
+    worker = engine.workers.aggregated if engine.mode == "aggregated" else engine.workers.prefill
+    if worker is None or worker.frontend is not None or worker.host_profile is not None:
+        return deployment  # an SGLang frontend stage already prices the request path
+    version = deployment.backend_version
+    if not version or version in {"current", "previous", "next"}:
+        return deployment  # no literal version to key the measurement by
+    from aisim_core.host_cost.replay import measured_overhead
+
+    measured = measured_overhead(
+        backend=engine.backend,
+        backend_version=version,
+        endpoint=endpoint,
+        system=worker.hardware or engine.hardware,
+        model=engine.model,
+    )
+    if measured is None:
+        return deployment
+    updates: dict[str, JSONValue] = {}
+    if engine.tokenization is None:
+        tokenization = measured.tokenization
+        updates["tokenization"] = {
+            "workers": tokenization["workers"],
+            "base_ms": tokenization["base_ms"],
+            "per_input_token_ms": tokenization["per_input_token_us"] / 1000.0,
+        }
+    if engine.extra_cpu_overhead is None and measured.extra_cpu_overhead is not None:
+        extra = measured.extra_cpu_overhead
+        updates["extra_cpu_overhead"] = {
+            "base_ms": extra["base_ms"],
+            "per_input_token_ms": extra["per_input_token_us"] / 1000.0,
+        }
+    return replace(deployment, **updates) if updates else deployment
 
 
 def _detokenization(engine: EnginePredictionConfig) -> dict[str, JSONValue] | None:

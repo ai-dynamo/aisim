@@ -5,6 +5,7 @@
 import argparse
 import hashlib
 import importlib.resources
+import inspect
 import json
 import os
 import sys
@@ -69,7 +70,13 @@ def predict(config_path, output):
     if not data_file.is_file():
         return {"outcome": "unsupported", "reason": "database_unavailable", "prediction_backend_version": version}
     parsed = api.CorePredictionConfig.model_validate(config)
-    spec = compiler.prediction_to_replay_spec(parsed)
+    # AgentX replays real chat requests: apply the measured serving-path CPU overhead where the wheel has it.
+    overhead = (
+        {"cpu_overhead_endpoint": "chat"}
+        if "cpu_overhead_endpoint" in inspect.signature(compiler.prediction_to_replay_spec).parameters
+        else {}
+    )
+    spec = compiler.prediction_to_replay_spec(parsed, **overhead)
     factory = api.EngineReplayRunnerFactory()
     try:
         factory.capabilities().require_compatible(spec)
