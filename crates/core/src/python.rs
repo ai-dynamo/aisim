@@ -4828,8 +4828,30 @@ fn validate_grouped_prefix_geometry(
 #[pyfunction]
 #[pyo3(signature = (provenance, model_dtype=None))]
 fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult<Option<String>> {
-    crate::perfmodel::FpmRuntimeMemoryConfig::observed_model_dtype(model_dtype, provenance)
+    crate::perfmodel::fpm::NixlIdentity::observed(model_dtype, provenance)
+        .map(|identity| identity.model_dtype)
         .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// Compare runtime evidence for selected prefill and decode rows, including legacy imports.
+#[pyfunction]
+fn grouped_observation_requirement(
+    prefill: (&str, Option<&str>, &str),
+    decode: (&str, Option<&str>, &str),
+) -> PyResult<Option<String>> {
+    let identity = |(provenance, dtype, backend)| {
+        let mut value = crate::perfmodel::fpm::NixlIdentity::observed(dtype, provenance)?;
+        value.resolve_backend(Some(backend))?;
+        Ok::<_, crate::AicError>(value)
+    };
+    let check = || {
+        Ok::<_, crate::AicError>(
+            identity(prefill)?
+                .mismatch(&identity(decode)?)
+                .map(|(field, _, _)| format!("matching {field} when both runtimes recorded it")),
+        )
+    };
+    check().map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
 }
 
 #[pyfunction]
@@ -4937,6 +4959,7 @@ fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(canonical_timing_config_json, module)?)?;
     module.add_function(wrap_pyfunction!(validate_grouped_prefix_geometry, module)?)?;
     module.add_function(wrap_pyfunction!(observed_model_dtype, module)?)?;
+    module.add_function(wrap_pyfunction!(grouped_observation_requirement, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_with_artifacts_json, module)?)?;
     module.add_function(wrap_pyfunction!(scan_weka_requests, module)?)?;

@@ -1536,7 +1536,10 @@ sub-block matching without an explicit full-state scratch count.
 
   In `mode: disaggregated`, the prefill and decode deployments need equal
   tensor parallelism, identical cache groups and the same `kv_cache_dtype`.
-  When both deployments name an `attention_backend`, the backends must match.
+  When both deployments identify an attention backend, the backends must match.
+  Replay also compares the initialized model path and literal cache dtype when
+  both runtimes recorded them. For example, `fp8` and `fp8_e4m3` can use the same
+  FPM table label and still yield different handshake hashes.
   vLLM hashes the model ID, cache dtype and resolved attention backend during
   the NIXL handshake. See [v0.31.0](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L182-L199),
   [v0.32.0](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L185-L202)

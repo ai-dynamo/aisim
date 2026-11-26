@@ -94,7 +94,15 @@ transfer that moves at least one token.
 The two workers must agree on their model, KV dtype, attention backend and
 observed model dtype when those facts are available. The selected deployment's
 `runtime_memory.model_dtype` records vLLM's initialized `ModelConfig.dtype`.
-Older observation and finalization records retain it in their runtime settings.
+Older observation and finalization records can retain it in their runtime settings.
+For a measured deployment, the literal `ModelConfig.model` and
+`CacheConfig.cache_dtype` enter the handshake. The probe can identify a backend
+selected by `auto` when every worker records the same single backend. A sorted
+list of several layer backends leaves the handshake backend unknown. New
+imports and compact finalizations retain the worker observations. Older compact
+profiles can contain only source references.
+Search skips pairs with incompatible workers. Contradictory observations within
+a selected worker's profile raise a configuration error.
 Grouped prefill and decode workers require a nonempty original prompt. A one-token
 prompt is valid even when the decode worker receives zero remote tokens. See vLLM v0.31.0
 [`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517),

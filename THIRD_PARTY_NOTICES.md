@@ -785,7 +785,8 @@ and take the bytes that the connector reads for one block of each group from
 the profile, so one set of rules covers them.
 `crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
 tests of these rules. The native replay pair validation in
-`crates/core/src/replay/engine.rs` and profile pairing in
+`crates/core/src/replay/engine.rs`, the initialized identity comparison in
+`crates/core/src/perfmodel/fpm/resources.rs`, and profile pairing in
 `python/aisim/src/aisim/config/engine.py` adapt the observable model identity,
 version, attention backend and cache dtype checks of the NIXL handshake.
 

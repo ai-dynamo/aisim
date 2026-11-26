@@ -359,9 +359,14 @@ def _profile_parallel_configs(
     worker_type: str = "aggregated",
     candidate_configs: list[ReplicaParallelConfig] | list[DisaggParallelConfig] | None = None,
     validate_transfer: bool = True,
+    deferred_observation_errors: dict[tuple[ParallelShape, ParallelShape], ValueError] | None = None,
 ):
     """Enumerate only declared deployment shapes; replicas do not change a cell."""
-    from aisim.config.engine import grouped_pd_pair_requirement, grouped_pd_transfer_requirements
+    from aisim.config.engine import (
+        GroupedObservationError,
+        grouped_pd_pair_requirement,
+        grouped_pd_transfer_requirements,
+    )
 
     def shapes_for(system, role):
         return {
@@ -401,7 +406,16 @@ def _profile_parallel_configs(
 
         def compatible(prefill_shape, decode_shape):
             prefill, decode = prefill_shapes[prefill_shape], decode_shapes[decode_shape]
-            if requirement := grouped_pd_pair_requirement(prefill, decode):
+            try:
+                requirement = grouped_pd_pair_requirement(prefill, decode)
+            except GroupedObservationError as error:
+                if deferred_observation_errors is None:
+                    raise
+                # Search applies role and replica domains after enumerating shapes. Surface the
+                # data error only if an affected pair survives those constraints.
+                deferred_observation_errors[prefill_shape, decode_shape] = error
+                return True
+            if requirement:
                 requirements[requirement] = None
                 return False
             if validate_transfer and prefill.resources.cache_layout == "grouped":

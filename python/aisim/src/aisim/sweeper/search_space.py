@@ -242,6 +242,10 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
 
     profile = load_fpm_profile(search_space.fpm_profile)
     raw_pinned = search_space.parallel_configs_by_mode.get(deployment_mode, search_space.parallel_configs)
+    custom = search_space.parallel_custom_configs_by_mode.get(deployment_mode, {})
+    domains = search_space.parallel_independent_by_mode.get(deployment_mode, {})
+    bounds = search_space.parallel_independent_log_ranges_by_mode.get(deployment_mode, {})
+    errors = {}
     configs = _profile_parallel_configs(
         profile,
         hardware_sku=search_space.hardware_sku_for("agg" if deployment_mode == "agg" else "prefill"),
@@ -256,22 +260,18 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
         else None,
         # The search validates transfer evidence after applying its role and topology domains.
         validate_transfer=False,
+        deferred_observation_errors=errors if custom or domains or bounds else None,
     )
-    for role, entries in search_space.parallel_custom_configs_by_mode.get(deployment_mode, {}).items():
+    for role, entries in custom.items():
         choices = {_replica_from_dict(entry) for entry in entries}
         configs = [config for config in configs if _parallel_role(config, role) in choices]
-    domains = search_space.parallel_independent_by_mode.get(deployment_mode, {})
-    bounds = search_space.parallel_independent_log_ranges_by_mode.get(deployment_mode, {})
-    return [
-        config
-        for config in configs
-        if all(
-            bounds[name][0] <= value <= bounds[name][1]
-            if name in bounds
-            else domains.get(name) is None or value in domains[name]
-            for name, value in _parallel_leaf_values(config).items()
-        )
-    ]
+    if domains or bounds:
+        configs = [config for config in configs if matches_parallel_domains(config, domains, bounds)]
+    if errors:
+        for config in configs:
+            if error := errors.get((config.prefill.shape, config.decode.shape)):
+                raise error
+    return configs
 
 
 def branch_knob_choices(search_space, deployment_mode: str) -> dict[str, list[Any]]:

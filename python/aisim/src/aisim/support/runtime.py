@@ -359,6 +359,27 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
     return value
 
 
+def _worker_attention_backends(evidence: dict[str, Any]) -> list:
+    return [
+        item["evidence"].get("attention_backend")
+        for item in evidence["artifacts"]
+        if item["evidence"]["kind"] == "worker"
+    ]
+
+
+def _observed_transfer_settings(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Retain the initialized NIXL fields when an import replaces raw rank records with source hashes."""
+    settings = evidence["runtime_settings"]
+    return {
+        "runtime_settings": {
+            section: {key: settings[section][key] for key in fields if key in settings[section]}
+            for section, fields in (("model_config", ("model", "dtype")), ("cache_config", ("cache_dtype",)))
+            if section in settings
+        },
+        "worker_attention_backends": _worker_attention_backends(evidence),
+    }
+
+
 def _resource_values(resources: dict[str, Any]) -> dict[str, Any]:
     values = deepcopy(resources)
     values.pop("provenance", None)
@@ -479,7 +500,8 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
                 original,
                 observations,
                 evidence,
-                source_references=finalized.get("observation_provenance") == "source_references",
+                source_references="observation_provenance" in finalized,
+                keep_worker_backends=finalized.get("observation_provenance") == "source_references_v2",
             )
             if request.profile_deployment().resources.model_dump(mode="json") != expected:
                 raise ValueError("finalized runtime resources differ from verified formal observations")
@@ -512,6 +534,10 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     if _request_launch(request, launch) != launch:
         raise ValueError("runtime-affecting draft edits require a compatible fresh probe")
     expected = as_saved_resources(manifest["observed_resources"], _resource_values(result["resources"]))
+    if "nixl_observation" in manifest and manifest["nixl_observation"] != _observed_transfer_settings(
+        result["provenance"]
+    ):
+        raise ValueError("saved NIXL settings differ from immutable runtime evidence")
     if manifest["observed_resources"] != expected:
         raise ValueError("saved observed resources differ from immutable runtime evidence")
     selected = request.profile_deployment()
@@ -898,6 +924,7 @@ def _draft(
             {"path": str(path), "sha256": _hash(path)} for path in sorted(snapshot.parent.rglob("*")) if path.is_file()
         ],
         "observed_resources": _resource_values(result["resources"]),
+        "nixl_observation": _observed_transfer_settings(result["provenance"]),
         "model_metadata": {key: getattr(profile, key) for key in ("architecture", "context_length", "num_experts")},
         "user_overrides": {},
         "review_status": "requires_review",

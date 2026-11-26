@@ -79,6 +79,7 @@ pub use model::{
 };
 pub use options::{CorrectionMode, ForwardPassPerfOptions};
 pub use regression::ForwardPassSplineDiagnostics;
+pub(crate) use resources::NixlIdentity;
 pub use resources::{
     FpmCacheBudget, FpmCacheBudgetAdjusted, FpmCacheBudgetRequest, FpmCacheGroup, FpmCacheKind,
     FpmCacheLayout, FpmMambaCache, FpmMambaCacheMode, FpmResourceConfig, FpmRuntimeMemoryConfig,

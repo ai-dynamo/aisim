@@ -1875,6 +1875,10 @@ GROUPED_PD_REPLAY_WINDOW_TEXT = (
 )
 
 
+class GroupedObservationError(ValueError):
+    """A selected deployment contains conflicting observations of its own runtime."""
+
+
 def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | None:
     """Return the first incompatible property of a grouped NIXL pair."""
     prefill, decode = prefill_deployment.resources, decode_deployment.resources
@@ -1896,16 +1900,16 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | 
     if prefill.runtime_memory is not None or decode.runtime_memory is not None:
         from aisim import _runtime
 
+        def evidence(deployment):
+            memory = deployment.resources.runtime_memory
+            if memory is None:
+                return "", None, deployment.attention_backend
+            return memory.provenance, memory.model_dtype, deployment.attention_backend
+
         try:
-            observed = {
-                _runtime.observed_model_dtype(memory.provenance, memory.model_dtype)
-                for memory in (prefill.runtime_memory, decode.runtime_memory)
-                if memory is not None
-            }
+            return _runtime.grouped_observation_requirement(evidence(prefill_deployment), evidence(decode_deployment))
         except ValueError as error:
-            return str(error)
-        if len(observed - {None}) > 1:
-            return "matching model_dtype when both runtimes recorded it"
+            raise GroupedObservationError(str(error)) from error
     return None
 
 

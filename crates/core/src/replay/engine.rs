@@ -117,10 +117,32 @@ impl Default for ReplayRoleConfig {
     }
 }
 
+/// An injected timing model can carry either spelling from the canonical timing schema.
+fn timing_alias<'a>(
+    config: &'a Value,
+    name: &str,
+    legacy: &str,
+) -> anyhow::Result<Option<&'a Value>> {
+    let value = config.get(name).filter(|v| !v.is_null());
+    let fallback = config.get(legacy).filter(|v| !v.is_null());
+    if let (Some(a), Some(b)) = (value, fallback) {
+        let equal = a == b
+            || name.ends_with("_quant_mode")
+                && a.as_str()
+                    .zip(b.as_str())
+                    .is_some_and(|(x, y)| x.eq_ignore_ascii_case(y));
+        anyhow::ensure!(equal, "conflicting timing aliases {name} and {legacy}");
+    }
+    Ok(value.or(fallback))
+}
+
 impl ReplayRoleConfig {
     /// Match the rank, estimator, and selected deployment before comparing NIXL's
     /// model ID, KV dtype, attention backend and model dtype across the pair.
-    fn grouped_transfer_identity(&self) -> anyhow::Result<[Option<String>; 4]> {
+    fn grouped_transfer_identity(
+        &self,
+    ) -> anyhow::Result<[crate::perfmodel::fpm::NixlIdentity; 2]> {
+        use crate::perfmodel::fpm::NixlIdentity;
         use crate::perfmodel::{ForwardPassPerfModelConfig, FpmCacheGroup, FpmRuntimeMemoryConfig};
         use anyhow::{Context, bail, ensure};
 
@@ -130,12 +152,17 @@ impl ReplayRoleConfig {
         if !matches!(provider.as_str(), "aic" | "ais") {
             return Ok(Default::default());
         }
-        let alias = |name, legacy| {
-            config
-                .get(name)
-                .filter(|value| !value.is_null())
-                .or_else(|| config.get(legacy).filter(|value| !value.is_null()))
-        };
+        // Duration may be supplied by the caller, bypassing the ordinary timing descriptor reader.
+        for (name, legacy) in [
+            ("gemm_quant_mode", "gemm_dtype"),
+            ("moe_quant_mode", "moe_dtype"),
+            ("fmha_quant_mode", "fmha_dtype"),
+            ("fpm_fmha_quant_mode", "fpm_fmha_dtype"),
+            ("comm_quant_mode", "comm_dtype"),
+            ("enable_shared_layer", "shared_layer"),
+        ] {
+            timing_alias(config, name, legacy)?;
+        }
         let known = |value: &&str| {
             !value.eq_ignore_ascii_case("auto") && !value.eq_ignore_ascii_case("unknown")
         };
@@ -146,7 +173,7 @@ impl ReplayRoleConfig {
         );
         // Injected providers may omit identity fields. Use the rank's geometry for
         // those defaults; parse recorded sizes and their aliases with the FPM types.
-        let model = alias("model", "model_path").and_then(Value::as_str);
+        let model = timing_alias(config, "model", "model_path")?.and_then(Value::as_str);
         let mut selector = serde_json::json!({
             "model": model.unwrap_or_default(), "system": config["system"].as_str().unwrap_or_default(),
             "backend": config["backend"].as_str().unwrap_or("vllm"), "worker_type": role,
@@ -154,8 +181,12 @@ impl ReplayRoleConfig {
             "attention_dp": self.dp_size, "cp_size": config["cp_size"], "dcp": config["dcp"],
             "moe_tp_size": config["moe_tp_size"], "moe_ep_size": config["moe_ep_size"]
         });
-        for (key, legacy) in [("tp", "tp_size"), ("attention_dp", "attention_dp_size")] {
-            if let Some(value) = alias(key, legacy) {
+        for (key, legacy) in [
+            ("tp", "tp_size"),
+            ("pp", "pp_size"),
+            ("attention_dp", "attention_dp_size"),
+        ] {
+            if let Some(value) = timing_alias(config, key, legacy)? {
                 selector[key] = value.clone();
             }
         }
@@ -167,6 +198,7 @@ impl ReplayRoleConfig {
         );
         for (field, recorded, rank) in [
             ("tp", timing.tp, self.tensor_parallel_size),
+            ("pp", timing.pp, 1),
             ("attention_dp", timing.attention_dp, self.dp_size),
             (
                 "cp_size",
@@ -235,29 +267,36 @@ impl ReplayRoleConfig {
         let model_dtype = config["model_dtype"]
             .as_str()
             .and_then(FpmRuntimeMemoryConfig::normalize_model_dtype);
-        let observed = memory
-            .map(|m| {
-                FpmRuntimeMemoryConfig::observed_model_dtype(
-                    m["model_dtype"].as_str(),
-                    m["provenance"].as_str().unwrap_or_default(),
-                )
-            })
-            .transpose()?
-            .flatten();
-        Ok([
-            model.map(str::to_owned),
-            source(
+        let mut observed = NixlIdentity::observed(
+            memory.and_then(|m| m["model_dtype"].as_str()),
+            memory
+                .and_then(|m| m["provenance"].as_str())
+                .unwrap_or_default(),
+        )?;
+        let labels = NixlIdentity {
+            model: model.map(str::to_owned),
+            kv_cache_dtype: source(
                 "kv_cache_dtype",
-                alias("kvcache_quant_mode", "kv_cache_dtype").and_then(Value::as_str),
+                timing_alias(config, "kvcache_quant_mode", "kv_cache_dtype")?
+                    .and_then(Value::as_str),
                 deployment.and_then(|d| d["kv_cache_dtype"].as_str()),
-            )?,
-            source(
+            )?
+            .map(|s| s.to_ascii_lowercase()),
+            attention_backend: source(
                 "attention_backend",
                 config["attention_backend"].as_str(),
                 deployment.and_then(|d| d["attention_backend"].as_str()),
-            )?,
-            source("model_dtype", model_dtype.as_deref(), observed.as_deref())?,
-        ])
+            )?
+            .map(|s| s.to_ascii_lowercase()),
+            model_dtype,
+        };
+        observed.model_dtype = source(
+            "model_dtype",
+            labels.model_dtype.as_deref(),
+            observed.model_dtype.as_deref(),
+        )?;
+        observed.resolve_backend(labels.attention_backend.as_deref())?;
+        Ok([labels, observed])
     }
 }
 
@@ -415,27 +454,8 @@ impl ReplayEngineConfig {
                     };
                     let prefill_identity = identity(&prefill_role)?;
                     let decode_identity = identity(&decode_role)?;
-                    for (i, field) in [
-                        "model",
-                        "kv_cache_dtype",
-                        "attention_backend",
-                        "model_dtype",
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let (Some(p), Some(d)) = (
-                            prefill_identity[i].as_deref(),
-                            decode_identity[i].as_deref(),
-                        ) else {
-                            continue;
-                        };
-                        let same = if field == "model" {
-                            p == d
-                        } else {
-                            p.eq_ignore_ascii_case(d)
-                        };
-                        if !same {
+                    for (prefill, decode) in prefill_identity.iter().zip(&decode_identity) {
+                        if let Some((field, p, d)) = prefill.mismatch(decode) {
                             return Err(ReplayError::InvalidSpec(format!(
                                 "grouped prefill and decode roles require matching {field} ({p} and {d})"
                             )));
@@ -956,11 +976,15 @@ fn pipeline_parallel_size(timing: &crate::engine::TimingModelConfig) -> Result<u
     if !matches!(provider.as_str(), "aic" | "ais") {
         return Ok(1);
     }
-    let Some((key, value)) = ["pp", "pp_size"]
-        .iter()
-        .find_map(|key| config.get(key).map(|value| (key, value)))
+    let Some(value) = timing_alias(config, "pp", "pp_size")
+        .map_err(|e| ReplayError::InvalidSpec(e.to_string()))?
     else {
         return Ok(1);
+    };
+    let key = if config["pp"].is_null() {
+        "pp_size"
+    } else {
+        "pp"
     };
     if value.as_str() == Some(crate::UNKNOWN_IDENTITY) {
         return Ok(1);
@@ -1089,6 +1113,70 @@ mod disaggregated_tests {
             role.as_mut().unwrap().rank.kv_cache_groups.clear();
         }
         config.validate_topology(&topology).unwrap();
+    }
+
+    #[test]
+    fn grouped_injected_providers_check_timing_aliases_before_selecting_a_spelling() {
+        let cases = [
+            ("tp", "tp_size", serde_json::json!(1), serde_json::json!(4)),
+            ("pp", "pp_size", serde_json::json!(1), serde_json::json!(2)),
+            (
+                "attention_dp",
+                "attention_dp_size",
+                serde_json::json!(1),
+                serde_json::json!(2),
+            ),
+            (
+                "model",
+                "model_path",
+                serde_json::json!("/mnt/M"),
+                serde_json::json!("/mnt/m"),
+            ),
+            (
+                "kvcache_quant_mode",
+                "kv_cache_dtype",
+                serde_json::json!("fp8"),
+                serde_json::json!("bf16"),
+            ),
+            (
+                "fmha_quant_mode",
+                "fmha_dtype",
+                serde_json::json!("fp8"),
+                serde_json::json!("bf16"),
+            ),
+        ];
+        for provider in ["ais", "aic"] {
+            for (name, alias, a, b) in &cases {
+                let read = |first: &Value, second: &Value| {
+                    let role = ReplayRoleConfig {
+                        rank: EngineConfig {
+                            timing_model: TimingModelConfig::External {
+                                provider: provider.to_owned(),
+                                config: serde_json::json!({ *name: first, *alias: second }),
+                            },
+                            ..EngineConfig::default()
+                        },
+                        ..ReplayRoleConfig::default()
+                    };
+                    role.grouped_transfer_identity().map(|_| ())
+                };
+                assert!(
+                    read(a, b)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("conflicting timing aliases")
+                );
+                assert!(
+                    read(b, a)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("conflicting timing aliases")
+                );
+                read(a, a).unwrap();
+                read(a, &Value::Null).unwrap();
+                read(&Value::Null, a).unwrap();
+            }
+        }
     }
 
     #[test]

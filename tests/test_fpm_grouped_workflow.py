@@ -2183,6 +2183,95 @@ def test_grouped_pd_checks_dtype_when_only_one_role_has_runtime_memory(grouped_c
             _fpm_parallel_configs(SearchSpace.model_validate(request), "disagg")
 
 
+@pytest.mark.parametrize(
+    "field,changed",
+    [("model", "/other/M"), ("kv_cache_dtype", "fp8_e4m3"), ("attention_backend", "FLASHINFER")],
+)
+def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, changed):
+    from aisim import _runtime
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper.config import SearchSpace
+    from aisim.sweeper.search_space import _fpm_parallel_configs
+
+    profile, root = grouped_case
+    version = "0.32.0"
+    profile = _with_transfer_markers(_with_prefix_evidence(profile, version=version), version=version)
+    shared = profile["deployments"][0]
+    _write_timings(root, {**profile, "deployments": [shared]}, version=version)
+    profile["deployments"] = [dict(deepcopy(shared), worker_type=role) for role in ("prefill", "decode")]
+
+    def observed(model="/source/M", kv_cache_dtype="fp8", attention_backend="FLASH_ATTN"):
+        return json.dumps(
+            {
+                "runtime_settings": {"model_config": {"model": model}, "cache_config": {"cache_dtype": kv_cache_dtype}},
+                "artifacts": [{"evidence": {"kind": "worker", "attention_backend": attention_backend}}],
+            }
+        )
+
+    for deployment in profile["deployments"]:
+        deployment["resources"]["runtime_memory"]["provenance"] = observed()
+    raw = _pd_prediction(profile, root)
+    raw["engine"]["context_length"] = 1024
+    raw["traffic"]["source"]["input_tokens"] = 128
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 2
+
+    changed_evidence = observed(**{field: changed})
+
+    class ChangedWorker:
+        def run_replay_json(self, serialized):
+            payload = json.loads(serialized)
+            rank = payload["spec"]["engine"]["decode"]["rank"]
+            for deployment in rank["timing_model"]["config"]["fpm_profile"]["deployments"]:
+                if deployment["worker_type"] == "decode":
+                    deployment["resources"]["runtime_memory"]["provenance"] = changed_evidence
+            return _runtime.run_replay_json(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match=f"matching {field}"):
+        EngineReplayRunnerFactory(runtime=ChangedWorker()).create(0).run(spec)
+    profile["deployments"][1]["resources"]["runtime_memory"]["provenance"] = changed_evidence
+    with pytest.raises(ValueError, match=f"matching {field}"):
+        CorePredictionConfig.model_validate(raw)
+    search = _pd_search(profile, root)
+    with pytest.raises(ValueError, match=f"matching {field}"):
+        _fpm_parallel_configs(SearchSpace.model_validate(search), "disagg")
+
+
+def test_grouped_pd_surfaces_conflicting_evidence_only_for_reachable_shapes(grouped_case):
+    from aisim.sweeper.config import SearchSpace
+    from aisim.sweeper.search_space import _fpm_parallel_configs
+
+    original, root = grouped_case
+    version = "0.32.0"
+    profile = _with_transfer_markers(_with_prefix_evidence(original, version=version), version=version)
+    bad, good = profile["deployments"]
+    memory = bad["resources"]["runtime_memory"]
+    memory.update(
+        model_dtype="half",
+        provenance=json.dumps(
+            {
+                "schema_version": "aisimulate-onboarding-runtime-probe/v1",
+                "observed_resources": {"runtime_memory": {"model_dtype": "bf16"}},
+            }
+        ),
+    )
+    search = _pd_search(profile, root)
+    bad_pin = {"tp": bad["tp"], "moe_tp": bad["moe_tp"]}
+    good_pin = {"tp": good["tp"], "attention_dp": good["dp"], "moe_ep": good["moe_ep"]}
+    for raw in (
+        search,
+        {**search, "parallel_configs_by_mode": {"disagg": [{"prefill": p, "decode": p} for p in (good_pin, bad_pin)]}},
+    ):
+        with pytest.raises(ValueError, match="model_dtype conflicts with observed runtime settings"):
+            _fpm_parallel_configs(SearchSpace.model_validate(raw), "disagg")
+    for raw in (
+        {**search, "parallel_configs_by_mode": {"disagg": [{"prefill": good_pin, "decode": good_pin}]}},
+        {**search, "parallel_independent_by_mode": {"disagg": {"prefill_tp": [1], "decode_tp": [1]}}},
+    ):
+        (candidate,) = _fpm_parallel_configs(SearchSpace.model_validate(raw), "disagg")
+        assert candidate.prefill.shape.tp == candidate.decode.shape.tp == 1
+
+
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):
     from aisim.sweeper.config import SmartSearchConfig
     from aisim.sweeper.search_space import enumerate_branches

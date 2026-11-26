@@ -2563,6 +2563,40 @@ def test_capacity_revision_requires_acceptance_and_exact_formal_observations(tmp
         finalize(original, root, tmp_path / "superseded", memory_config=memory_config)
 
 
+def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evidence(tmp_path, capsys):
+    from aisim.support.finalization import _merge_resources
+    from aisim.support.runtime import runtime_probe_manifest, verify_runtime_profile
+
+    _, _, request, _ = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    direct = verify_runtime_profile(request)
+    manifest = runtime_probe_manifest(request)
+    expected = direct["provenance"]["runtime_settings"]
+    settings = manifest["nixl_observation"]["runtime_settings"]
+    assert settings["model_config"]["model"] == expected["model_config"]["model"]
+    assert settings["cache_config"]["cache_dtype"] == expected["cache_config"]["cache_dtype"]
+    manifest["nixl_observation"]["runtime_settings"]["model_config"]["model"] += "/edited"
+    request.profile_deployment().resources.runtime_memory.provenance = json.dumps(manifest)
+    with pytest.raises(ValueError, match="saved NIXL settings differ"):
+        verify_runtime_profile(request)
+
+    observation = direct["resources"]
+    evidence = json.loads(observation["runtime_memory"]["provenance"])
+    workers = [item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] == "worker"]
+    for rank in workers:
+        rank["attention_backend"] = "FLASHINFER"
+    workers[-1]["attention_backend"] = ["FLASH_ATTN", "FLASHINFER"]
+    observation["runtime_memory"]["provenance"] = json.dumps(evidence)
+    for retain, version in [(False, "source_references"), (True, "source_references_v2")]:
+        saved = {}
+        _merge_resources([observation], saved, source_references=True, keep_worker_backends=retain)
+        assert saved["observation_provenance"] == version
+        compact = json.loads(saved["cell_observations"][0]["runtime_memory"]["provenance"])
+        assert all(set(artifact) == {"path", "sha256"} for artifact in compact["artifacts"])
+        assert compact.get("worker_attention_backends") == (
+            [w["attention_backend"] for w in workers] if retain else None
+        )
+
+
 def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_sources(tmp_path, capsys):
     from aisim.support.finalization import _merge_resources, _verify_collection, finalization_manifest
     from aisim.support.runtime import verify_runtime_profile
