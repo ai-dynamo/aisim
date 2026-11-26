@@ -303,10 +303,9 @@ def glm_plan_manifest(
     The third value is the canonical JSON of the dropped counts of ``glm_points``. The planner resolves
     ``options.max_prefill_isl`` first. Both phases take one token budget, ``options.max_prefill_isl``; the function does
     not read ``options.max_num_batched_tokens``. A phase whose batch limit neither its own option nor
-    ``options.max_num_seqs`` sets takes the ``max_batch_size`` that the deployments share, which the runner renders for
-    its cells. The cells of a plan share one list, so the deployments must share one hash block and one prefill
-    checkpoint alignment. For the same reason a phase that the plan collects is refused when it has no batch limit and
-    the deployments hold different ``max_batch_size`` values: one list would leave out the larger points of one of them.
+    ``options.max_num_seqs`` sets takes each deployment's ``max_batch_size`` capped at the producer's ``MAX_BATCH``.
+    The cells share one list, so the deployments must share one hash block and one prefill checkpoint alignment.
+    A collected phase with different effective batch limits is refused because one list would omit larger points.
     A phase that the plan does not collect is never measured, and its points take the smallest value. The capacity rule
     compares each deployment's own block requirement with its usable pool capacity.
     """
@@ -344,10 +343,8 @@ def glm_plan_manifest(
     for phase, own in (("prefill", options.max_prefill_batch_size), ("decode", options.max_decode_batch_size)):
         limit = own or options.max_num_seqs
         if limit is None:
-            # The runner renders the max_batch_size of each cell's deployment for a phase without a limit. The list is
-            # one list for every deployment, so for deployments of different batch sizes it would leave out the larger
-            # points of one of them.
-            sizes = {deployment.resources.max_batch_size for deployment in deployments}
+            # The runner renders each deployment's own limit. The producer measures batches through MAX_BATCH.
+            sizes = {min(MAX_BATCH, deployment.resources.max_batch_size) for deployment in deployments}
             if len(sizes) > 1 and phase in options.workload_kinds:
                 shared = [deployment.tp for deployment in deployments]
                 held = ", ".join(

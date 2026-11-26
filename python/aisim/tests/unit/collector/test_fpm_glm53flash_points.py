@@ -960,6 +960,22 @@ def test_plan_manifest_gives_a_phase_that_the_plan_does_not_collect_the_smallest
     assert (canonical, digest) == (expected, expected_digest)
 
 
+@pytest.mark.parametrize(("prefill", "decode"), [(None, None), (4, None), (None, 8)])
+def test_plan_shares_point_lists_when_both_batch_limits_reach_the_producer_cap(prefill, decode):
+    deployments = [_deployment(*[(1, 16)] * 4), _deployment(*[(1, 16)] * 4)]
+    for deployment, batch in zip(deployments, [64, 256], strict=True):
+        deployment.resources.max_batch_size = batch
+    options = SimpleNamespace(
+        **{**vars(_OPTIONS), "max_num_seqs": None, "max_prefill_batch_size": prefill, "max_decode_batch_size": decode},
+        workload_kinds=("prefill", "decode"),
+    )
+    both = glm_plan_manifest(options, deployments)
+    assert all(glm_plan_manifest(options, [deployment]) == both for deployment in deployments)
+    points = json.loads(both[0])
+    assert max(p["batch_size"] for p in points["prefill"]) == (prefill or 32)
+    assert max(p["batch_size"] for p in points["decode"]) == (decode or 32)
+
+
 def test_a_phase_without_a_point_is_refused(caplog):
     caplog.set_level(logging.INFO, logger=_GENERATOR_LOGGER)
     # A measured context of 3 tokens holds one decode context and no prefill point: the shortest prefill is 4 tokens.

@@ -492,6 +492,7 @@ def _verify_collection(
                     expected_gpu_memory_utilization=request.collection.memory_fraction,
                     expected_model_revision=request.identity.model_revision,
                     expected_compilation_config=expected_graph,
+                    deployment=deployment,
                 )
             )
     runtime_compatibility = None

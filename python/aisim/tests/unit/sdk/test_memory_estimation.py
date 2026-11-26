@@ -1005,14 +1005,47 @@ def test_naive_estimate_refuses_malformed_decoder_precision(nested, dtype):
         NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
 
 
-def test_wrapped_gpt_oss_retains_its_sliding_window(tmp_path):
+@pytest.mark.parametrize("wrapped", [False, True], ids=["flat", "wrapped"])
+def test_gpt_oss_retains_its_sliding_window(tmp_path, wrapped):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     decoder = _load_pre_downloaded_hf_config("openai/gpt-oss-20b")
-    wrapped = _write_config(tmp_path, {"architectures": [_UNKNOWN_WRAPPER], "text_config": decoder})
-    estimator = NaiveKVCacheEstimator.from_model_path(wrapped, tp_size=1, pp_size=1, allow_hf_config_download=False)
+    config = {"architectures": [_UNKNOWN_WRAPPER], "text_config": decoder} if wrapped else decoder
+    checkpoint = _write_config(tmp_path, config)
+    estimator = NaiveKVCacheEstimator.from_model_path(checkpoint, tp_size=1, pp_size=1, allow_hf_config_download=False)
     # 12 global layers grow at 2,048 bytes per token each, 12 sliding layers retain only 128 tokens.
     assert estimator.get_kvcache_max_tokens(96 * 1024**2) == (96 * 1024**2) // (12 * 2048) - 128 == 3968
+
+
+@pytest.mark.parametrize("layer_count", [2, 26])
+def test_gpt_oss_rejects_a_window_pattern_that_does_not_cover_its_decoder(layer_count):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    base = _load_pre_downloaded_hf_config("openai/gpt-oss-20b")
+    config = {**base, "layer_types": ["sliding_attention", "full_attention"] * (layer_count // 2)}
+    with pytest.raises(ValueError, match=rf"layer_types has {layer_count} entries for 24 decoder layers"):
+        NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1)
+
+
+@pytest.mark.parametrize("wrapper", [None, "Step3p7ForConditionalGeneration", _UNKNOWN_WRAPPER])
+def test_step3p7_cache_capacity_counts_only_decoder_layers(tmp_path, wrapper):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    base = _load_pre_downloaded_hf_config("stepfun-ai/Step-3.7-Flash")
+    decoder = {
+        **base,
+        "architectures": ["Step3p5ForCausalLM"],
+        "layer_types": base["layer_types"] + ["sliding_attention"] * base["num_nextn_predict_layers"],
+    }
+    config = {"architectures": [wrapper], "text_config": decoder} if wrapper else decoder
+    checkpoint = _write_config(tmp_path, config)
+    estimator = NaiveKVCacheEstimator.from_model_path(checkpoint, tp_size=1, pp_size=1, allow_hf_config_download=False)
+
+    # Each of the 45 decoder layers stores eight 128-wide bf16 K/V heads. Twelve layers grow past 512 tokens.
+    bytes_per_layer = 2 * 8 * 128 * 2
+    assert estimator.kv_bytes_per_token() == 45 * bytes_per_layer
+    assert estimator.get_kvcache_max_tokens(64 * 1024**2) == 364
+    assert estimator.get_kvcache_max_tokens((45 * 512 + 12) * bytes_per_layer) == 513
 
 
 def test_malformed_torch_dtype_keeps_the_explicit_decoder_dtype():
@@ -1288,6 +1321,83 @@ def test_naive_fallback_hybrid_beats_linear_capacity(monkeypatch):
     assert out["source"] == "naive_fallback"
     linear_tokens = out["total_kv_size_bytes"] // out["kv_size_per_token_bytes"]
     assert out["total_kv_size_tokens"] > linear_tokens
+
+
+@pytest.mark.parametrize(("batch", "capacity", "adjusted"), [(1, 3968, 1920), (4, 3584, 1536), (32, 2048, 1024)])
+def test_gpt_oss_scheduler_pool_charges_each_concurrent_sliding_window(tmp_path, batch, capacity, adjusted):
+    hidden, vocab, layers, experts = 2880, 201088, 24, 32
+    weight = 2 * (2 * vocab * hidden + layers * (4 * hidden**2 + experts * 3 * hidden**2))
+    args = ("openai/gpt-oss-20b", "missing-memory-spec", "vllm", "0.33.0")
+    options = dict(
+        systems_path=str(tmp_path),
+        max_num_tokens=8192,
+        max_batch_size=batch,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        gpu_memory_capacity_bytes_override=weight + 96 * 1024**2,
+        allow_naive_fallback=True,
+        naive_kv_reservation=1.0,
+    )
+    result = memory.estimate_kv_cache(*args, **options, tolerance_fraction=0.5)
+    assert result["source"] == "naive_fallback"
+    assert result["total_kv_size_bytes"] == 96 * 1024**2
+    assert result["kv_size_per_token_bytes"] == 49_152
+    assert result["total_kv_size_tokens"] == capacity
+    assert result["tolerance_adjusted"]["total_kv_size_tokens"] == adjusted
+    assert memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16) == capacity // 16
+    assert (
+        memory.estimate_num_gpu_blocks(*args, **options, scheduler_block_size=16, tolerance_fraction=0.5)
+        == adjusted // 16
+    )
+
+
+def test_deepseek_v4_sdk_fallback_reserves_each_requests_packed_state(tmp_path):
+    hidden, vocab, layers, experts, width = 4096, 129280, 43, 256, 2048
+    # The routed experts are distributed across EP8. The shared expert, attention and embeddings use TP8.
+    weight = 2 * (2 * vocab * hidden + layers * (4 * hidden**2 + (1 + experts) * 3 * hidden * width)) // 8
+    row = 1_002_240
+    args = ("deepseek-ai/DeepSeek-V4-Flash", "missing-memory-spec", "vllm", "0.33.0")
+    options = dict(
+        systems_path=str(tmp_path),
+        max_num_tokens=8192,
+        max_batch_size=2,
+        tp_size=8,
+        moe_ep_size=8,
+        moe_tp_size=1,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        allow_naive_fallback=True,
+        naive_kv_reservation=1.0,
+    )
+    result = memory.estimate_kv_cache(
+        *args, **options, gpu_memory_capacity_bytes_override=weight + 64 * row, tolerance_fraction=0.125
+    )
+    assert result["source"] == "naive_fallback"
+    assert result["kv_size_per_token_bytes"] == 3915
+    assert result["total_kv_size_bytes"] == 64 * row
+    # Each of the two requests needs 26 rows before compressed tokens can use whole 256-token rows.
+    assert result["total_kv_size_tokens"] == (64 - 52) * 256
+    assert result["tolerance_adjusted"]["total_kv_size_tokens"] == (56 - 52) * 256
+    assert (
+        memory.estimate_num_gpu_blocks(
+            *args,
+            **options,
+            scheduler_block_size=256,
+            gpu_memory_capacity_bytes_override=weight + 64 * row,
+            tolerance_fraction=0.125,
+        )
+        == 4
+    )
+    for extra, blocks in [(-1, 0), (0, 1)]:
+        assert (
+            memory.estimate_num_gpu_blocks(
+                *args, **options, scheduler_block_size=256, gpu_memory_capacity_bytes_override=weight + 53 * row + extra
+            )
+            == blocks
+        )
+    for override, reason in [({"kvcache_quant_mode": "bfloat16"}, "fp8_ds_mla"), ({"nextn": 1}, "nextn=0")]:
+        with pytest.raises(ValueError, match=reason):
+            memory.estimate_kv_cache(*args, **options, **override, gpu_memory_capacity_bytes_override=weight + 64 * row)
 
 
 # --------------------------------------------------------------------------- #

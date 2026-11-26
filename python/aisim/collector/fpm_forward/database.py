@@ -640,6 +640,12 @@ def validate_formal_database_commit(
         selected = grouped.get(cell.cell_id, [])
         if not selected:
             raise ValueError(f"committed FPM database does not cover required cell {cell.cell_id}")
+        if (
+            plan.backend == "vllm"
+            and cell.glm_producer_digests is not None
+            and payload.get("measurement_policy") != VLLM_PREFIX_SEED_MEDIAN_POLICY
+        ):
+            raise ValueError(f"committed FPM measurement_policy differs from the GLM producer cell: {cell.cell_id}")
         expected_identity = {
             "model_path": plan.model_path,
             "system": plan.system,
@@ -912,6 +918,25 @@ def write_formal_database(
                 f"existing FPM database runtime version mismatch: actual={sorted(existing_versions)!r} "
                 f"expected={version!r}"
             )
+        # Schema 8 binds every row to the power-window policy, so one pair
+        # cannot hold power-window and latency-only rows. Refuse the merge
+        # before anything is written; the existing pair stays as committed.
+        policies = {row.get("measurement_policy") for row in [*merged, *rows]}
+        powered = POWER_WINDOW_MEASUREMENT_POLICY in policies
+        if powered and policies != {POWER_WINDOW_MEASUREMENT_POLICY}:
+            raise ValueError(
+                "cannot mix power-window and latency-only FPM rows in one database: schema 8 requires every "
+                f"row to carry measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}. Publish to a clean "
+                f"destination, or collect every cell with the same --fpm-measure-power setting: {parquet_path}"
+            )
+        # The loader reads the measurement policy of the sidecar, and the median policy binds every row to it.
+        median = next((policy for policy in _MEDIAN_PROTOCOLS if policy in policies), None)
+        if median and policies != {median}:
+            raise ValueError(
+                "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
+                f"measurement_policy, and {median!r} binds every row. Publish to a clean "
+                f"destination: {parquet_path}"
+            )
         existing_identities = _run_identities_by_cell(merged, source="existing")
         skipped_cells: list[str] = []
         for cell_id, incoming_identity in sorted(incoming_identities.items()):
@@ -934,25 +959,6 @@ def write_formal_database(
                     "identity; database left unchanged"
                 )
                 return parquet_path, metadata_path, tuple(skipped_cells)
-        # Schema 8 binds every row to the power-window policy, so one pair
-        # cannot hold power-window and latency-only rows. Refuse the merge
-        # before anything is written; the existing pair stays as committed.
-        policies = {row.get("measurement_policy") for row in [*merged, *rows]}
-        powered = POWER_WINDOW_MEASUREMENT_POLICY in policies
-        if powered and policies != {POWER_WINDOW_MEASUREMENT_POLICY}:
-            raise ValueError(
-                "cannot mix power-window and latency-only FPM rows in one database: schema 8 requires every "
-                f"row to carry measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}. Publish to a clean "
-                f"destination, or collect every cell with the same --fpm-measure-power setting: {parquet_path}"
-            )
-        # The loader reads the measurement policy of the sidecar, and the median policy binds every row to it.
-        median = next((policy for policy in _MEDIAN_PROTOCOLS if policy in policies), None)
-        if median and policies != {median}:
-            raise ValueError(
-                "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
-                f"measurement_policy, and {median!r} binds every row. Publish to a clean "
-                f"destination: {parquet_path}"
-            )
         if powered:
             for row in [*merged, *rows]:
                 row.setdefault("power_w", None)

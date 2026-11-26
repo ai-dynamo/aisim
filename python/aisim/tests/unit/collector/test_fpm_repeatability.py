@@ -394,7 +394,8 @@ def _read_the_staged_lists(monkeypatch):
     checkpoint. The point-list receipts, the freeze, the sample plans and the comparison of coordinates stay real.
     """
 
-    def collection(cell, raw_root, *, expected_plan_sha256, expected_attempt_id):
+    def collection(cell, raw_root, *, expected_plan_sha256, expected_attempt_id, deployment):
+        assert deployment.resources.runtime_memory.hash_block_size_tokens == 2176
         listed = json.loads((raw_root.parent / runner.POINTS_FILENAME).read_text())[cell.workload_kind]
         points = tuple(
             NativePointMeasurement(
@@ -516,6 +517,47 @@ def test_formal_glm_source_freezes_in_both_modes(monkeypatch, tmp_path, mode):
     frozen = repeatability.freeze_repeatability_plan(plan, source, checkpoint, comparison_mode=mode)
     assert [item["cell_id"] for item in frozen["cells"]] == [cell.cell_id for cell in plan.cells]
     assert frozen["policy"]["comparison_mode"] == mode
+
+
+def test_glm_repeatability_rejects_a_different_hash_block_in_the_source_and_sample(monkeypatch, tmp_path):
+    from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
+
+    from .test_fpm_glm53flash_native_collection import PREFILL_COLD, glm_native_payload, write_glm_rank
+
+    plan = _glm_short_request_plan(tmp_path, "prefill")
+    [cell] = plan.cells
+    run = tmp_path / "run"
+    _, _, checkpoint = _staged_run(monkeypatch, run, plan, smoke=False)
+    source = run / "artifacts" / plan.sha256[:16]
+    sample_checkpoint = run / "checkpoint" / "fpm_forward.json"
+    sample_checkpoint.parent.mkdir()
+    sample_checkpoint.write_text(json.dumps(checkpoint))
+    raw = source / "cells" / cell.cell_id / "raw"
+    pod = raw / "pod-0"
+    attempt = checkpoint["cells"][cell.cell_id]["attempt_id"]
+    (pod / "collector-provenance.json").write_text(
+        json.dumps(
+            {
+                "schema_name": "aic_fpm_collector_provenance",
+                "schema_version": 1,
+                "cell_id": cell.cell_id,
+                "plan_sha256": plan.sha256,
+                "attempt_id": attempt,
+                "runtime": {"backend": "vllm", "backend_version": "0.33.0"},
+            }
+        )
+    )
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD])
+    payload["execution_identity"] = dict(zip(EXECUTION_COLUMNS, cell.execution_identity, strict=True))
+    payload["serving_config"].update(block_size=4352, hash_block_size=4352)
+    write_glm_rank(pod, payload)
+    # The artifact is self-consistent. The selected deployment is the evidence that its hash block must be 2,176.
+    assert validate_native_collection(cell, raw, expected_plan_sha256=plan.sha256, expected_attempt_id=attempt).points
+    mismatch = "hash_block_size differs from the accepted deployment: expected 2176, found 4352"
+    with pytest.raises(ValueError, match=mismatch):
+        repeatability.freeze_repeatability_plan(plan, source, sample_checkpoint)
+    with pytest.raises(ValueError, match=mismatch):
+        repeatability._sample_evidence(plan, {"cell_id": cell.cell_id}, run)
 
 
 @pytest.mark.parametrize("mode", ["full_grid", "bounded"])

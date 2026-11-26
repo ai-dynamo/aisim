@@ -12,7 +12,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY
 
@@ -32,6 +32,9 @@ from .runtime.fpm_memory_observer import (
     audited_release,
 )
 from .types import ParallelTopology
+
+if TYPE_CHECKING:
+    from aisim_core.sdk.fpm_profile import FpmDeploymentProfile
 
 _CELL_EXECUTION_FIELDS = frozenset({"execution_identity", "input_text_sha256"})
 # The spec classes that the shared class table maps to FPM cache kinds, and the uniform wrapper of their inner specs.
@@ -803,6 +806,7 @@ def resolve_runtime_resources(
     expected_gpu_memory_utilization: float,
     expected_model_revision: str | None = None,
     expected_compilation_config: dict[str, Any] | None = None,
+    deployment: FpmDeploymentProfile | None = None,
 ) -> dict[str, Any]:
     """Require complete matching native timings and initialized rank/pool evidence.
 
@@ -831,7 +835,11 @@ def resolve_runtime_resources(
     if release is None:
         raise ValueError(f"runtime memory conversion currently supports vLLM {', '.join(MEMORY_SUPPORTED_VERSIONS)}")
     collection = validate_native_collection(
-        cell, raw_root, expected_plan_sha256=expected_plan_sha256, expected_attempt_id=expected_attempt_id
+        cell,
+        raw_root,
+        expected_plan_sha256=expected_plan_sha256,
+        expected_attempt_id=expected_attempt_id,
+        deployment=deployment,
     )
     if collection.backend_version != expected_backend_version:
         raise ValueError("native timing runtime version differs from the memory profile")

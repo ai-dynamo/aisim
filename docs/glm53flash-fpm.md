@@ -484,14 +484,13 @@ A direct `collector --fpm` call can pass its own manifest with
 `--smoke`. Guided onboarding passes a batch limit for both phases. A direct
 call can leave a phase without one: it sets neither `--fpm-max-num-seqs` nor
 the limit of that phase, `--fpm-max-prefill-batch-size` or
-`--fpm-max-decode-batch-size`. The generated list of such a phase takes the
-`max_batch_size` that the selected deployments share. If the plan collects
-such a phase and the selected deployments hold different `max_batch_size`
-values, the planner refuses the plan, because one list would leave out the
-larger points of one deployment. Two changes build a plan: select
-deployments that share one `max_batch_size` with `--fpm-gpu-counts` or
-`--fpm-parallel-presets`, or probe the runtime again so that the deployments
-record one `max_batch_size`.
+`--fpm-max-decode-batch-size`. In that case the producer caps each
+deployment's `max_batch_size` at 32. Limits of 64 and 256 yield the same
+batches. If a collected phase still has different batch limits after that cap,
+the planner refuses it because one list would leave out the larger points of
+one deployment. Set a phase limit within every selected deployment's capacity
+or select deployments with the same effective limit using `--fpm-gpu-counts`
+or `--fpm-parallel-presets`.
 
 Cached prefill rows and decode rows publish the regime `real_kv`, the only
 regime that the consumer accepts for them. A prefill row without a prefix

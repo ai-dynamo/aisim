@@ -43,6 +43,7 @@ import enum
 import math
 import os
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
@@ -782,13 +783,13 @@ class NaiveKVCacheEstimator:
         return None
 
     @classmethod
-    def _swa_layout(cls, hf_config: dict) -> tuple[int | None, int | None, int | None]:
+    def _swa_layout(cls, hf_config: dict, parsed: dict | None = None) -> tuple[int | None, int | None, int | None]:
         """Sliding-window size + (SWA, global) layer counts from an HF config.
 
         Returns ``(sliding_window, num_swa_layers, num_global_layers)`` for a hybrid
         sliding-window model, or ``(None, None, None)`` when the layout cannot be
-        pinned down (so the estimator stays on its linear per-token mode). Two
-        signals are recognized, in order:
+        pinned down (so the estimator stays on its linear per-token mode). Step-3.7
+        uses its parsed decoder pattern. Otherwise two raw signals are recognized:
 
         - ``layer_types`` (Gemma-3/4-style explicit per-layer list): count the
           ``sliding_*`` entries vs the rest.
@@ -798,13 +799,24 @@ class NaiveKVCacheEstimator:
         A bare ``sliding_window`` with no per-layer signal is left unresolved -- the
         split is too model-specific to guess, and linear is the safe default.
         """
+        if parsed is not None and ARCHITECTURE_TO_MODEL_FAMILY.get(parsed.get("architecture")) == "STEP3P7":
+            # Step-3.7 checkpoints can include MTP layers in layer_types. The parser retains only decoder layers.
+            extra = parsed["extra_params"]
+            return extra.sliding_window_size, extra.attn_layer_pattern.count(0), extra.attn_layer_pattern.count(1)
+
         sliding_window = hf_config.get("sliding_window") or hf_config.get("sliding_window_size")
+        num_layers = (
+            cls._raw_dimension(parsed, "layers")
+            if parsed is not None
+            else cls._raw_dimension(hf_config, "num_hidden_layers", "n_layer", "num_layers")
+        )
         layer_types = hf_config.get("layer_types")
         if isinstance(layer_types, list) and layer_types:
+            if sliding_window and num_layers and len(layer_types) != num_layers:
+                raise ValueError(f"layer_types has {len(layer_types)} entries for {num_layers} decoder layers")
             num_swa = sum(1 for t in layer_types if "sliding" in str(t).lower())
             return sliding_window, num_swa, len(layer_types) - num_swa
 
-        num_layers = cls._raw_dimension(hf_config, "num_hidden_layers", "n_layer", "num_layers")
         pattern = hf_config.get("sliding_window_pattern")
         if sliding_window and num_layers and pattern and int(pattern) > 0:
             num_global = int(num_layers) // int(pattern)
@@ -821,7 +833,7 @@ class NaiveKVCacheEstimator:
         keys directly (unsupported architecture). Missing values stay ``None`` /
         ``0`` so the formulas can fail closed.
         """
-        sliding_window, num_swa_layers, num_global_layers = cls._swa_layout(hf_config)
+        sliding_window, num_swa_layers, num_global_layers = cls._swa_layout(hf_config, parsed)
         if parsed is not None:
             extra = parsed.get("extra_params")
             if isinstance(extra, dict):
@@ -951,6 +963,9 @@ class NaiveKVCacheEstimator:
         layers = geom.get("layers")
         vocab = geom.get("vocab")
         inter = geom.get("inter")
+        if "deepseek_v4" in geom and geom.get("num_experts"):
+            # Every decoder FFN is MoE. This family declares only the expert intermediate width.
+            inter = geom.get("moe_inter")
         if not hidden or not layers or not vocab or not inter:
             return None
         hidden = int(hidden)
@@ -972,6 +987,9 @@ class NaiveKVCacheEstimator:
             moe_divisor = self.moe_tp_size * self.moe_ep_size
             expert_params = n_experts * 3 * hidden * moe_inter // moe_divisor
             non_expert_params = embed_params + layers * attn_params_per_layer
+            if "deepseek_v4" in geom:
+                # The shared experts execute on every EP rank and follow the attention TP partition.
+                non_expert_params += layers * geom["deepseek_v4"].n_shared_experts * 3 * hidden * moe_inter
             non_expert_bytes = non_expert_params * self.dtype_bytes // (tp * pp)
             expert_bytes = layers * expert_params * self.dtype_bytes // pp
             return non_expert_bytes + expert_bytes
@@ -987,24 +1005,28 @@ class NaiveKVCacheEstimator:
         """HYBRID when the config exposes a usable sliding-window layout, else LINEAR."""
         return NaiveKVCacheMode.HYBRID if self._hybrid_tokens_from_bytes() is not None else NaiveKVCacheMode.LINEAR
 
-    def get_kvcache_max_tokens(self, kv_budget_bytes: float, mode: NaiveKVCacheMode | None = None) -> int:
+    def get_kvcache_max_tokens(
+        self, kv_budget_bytes: float, mode: NaiveKVCacheMode | None = None, *, max_batch_size: int = 1
+    ) -> int:
         """KV byte budget -> token capacity, mirroring ``Model.get_kvcache_max_tokens``.
 
         ``mode`` defaults to :attr:`mode` (auto: HYBRID when a sliding-window layout
         is known, else LINEAR); pass it explicitly to force one. HYBRID caps the SWA
         layers at the window while global layers keep growing; LINEAR floor-divides
         the budget by the per-token size. An explicit HYBRID with no usable layout
-        falls back to LINEAR. DeepSeek V4 always reserves one request's state
-        and assigns the remaining budget in whole compressed-KV blocks.
+        falls back to LINEAR. Each concurrent request may fill a whole sliding
+        window. DeepSeek V4 reserves its fixed state per request and assigns the
+        remaining budget in whole compressed-KV blocks.
         """
+        validate_parallel_size("max_batch_size", max_batch_size)
         if "deepseek_v4" in self.geometry:
             if self.pp_size != 1:
                 raise ValueError("DeepSeek V4 cache sizing requires PP=1")
             pool = self._deepseek_v4_pool()
-            # Reserve one request's window and compressor state before assigning whole compressed-KV blocks.
-            blocks = max(0, int(kv_budget_bytes - pool["bytes_per_request"]) // pool["bytes_per_block"])
+            state_bytes = max_batch_size * pool["bytes_per_request"]
+            blocks = max(0, int(kv_budget_bytes - state_bytes) // pool["bytes_per_block"])
             return blocks * pool["block_size"]
-        hybrid = self._hybrid_tokens_from_bytes()
+        hybrid = self._hybrid_tokens_from_bytes(max_batch_size)
         use_hybrid = mode is NaiveKVCacheMode.HYBRID or (mode is None and hybrid is not None)
         if use_hybrid and hybrid is not None:
             return hybrid(kv_budget_bytes)
@@ -1016,6 +1038,7 @@ class NaiveKVCacheEstimator:
         capacity: int | None,
         naive_kv_reservation: float,
         cuda_graph_reserved_bytes: int = 0,
+        max_batch_size: int = 1,
     ) -> dict[str, Any]:
         """Conservative naive estimate: reserve ``naive_kv_reservation`` of post-weight memory.
 
@@ -1062,20 +1085,21 @@ class NaiveKVCacheEstimator:
                 f"KV-cache memory limit (capacity={int(max(capacity_bytes, 0.0))} bytes)"
             )
 
+        tokens_from_kv_bytes = partial(self.get_kvcache_max_tokens, max_batch_size=max_batch_size)
         return {
             "total_gpu_capacity_bytes": int(max(capacity_bytes, 0.0)),
             "total_kv_size_bytes": math.floor(total_kv_size_bytes_f),
             "kv_size_per_token_bytes": math.floor(kv_per_token),
-            "total_kv_size_tokens": self.get_kvcache_max_tokens(total_kv_size_bytes_f),
+            "total_kv_size_tokens": tokens_from_kv_bytes(total_kv_size_bytes_f),
             # Carried so _apply_tolerance derives adjusted tokens the same way;
             # stripped by estimate_kv_cache before returning.
-            "tokens_from_kv_bytes": self.get_kvcache_max_tokens,
+            "tokens_from_kv_bytes": tokens_from_kv_bytes,
             "source": "naive_fallback",
             "memory_breakdown": None,
             "tolerance_adjusted": None,
         }
 
-    def _hybrid_tokens_from_bytes(self) -> TokensFromBytes | None:
+    def _hybrid_tokens_from_bytes(self, max_batch_size: int = 1) -> TokensFromBytes | None:
         """Piecewise sliding-window inverse closure, or ``None`` when not hybrid.
 
         For a STANDARD-attention model with a known sliding-window layout: caps the
@@ -1096,7 +1120,8 @@ class NaiveKVCacheEstimator:
         if not window or not num_swa or num_global is None or not head_dim or not num_kv_heads:
             return None
 
-        window = int(window)
+        # With T live tokens, the sliding layers can retain up to min(T, batch * window).
+        window = int(window) * max_batch_size
         kv_heads_per_rank = -(-int(num_kv_heads) // max(self.tp_size, 1))  # ceil division
         per_layer = 2 * kv_heads_per_rank * int(head_dim) * self.dtype_bytes
         swa_const = int(num_swa) * per_layer  # bytes/token for the window-capped layers
@@ -1439,17 +1464,24 @@ def estimate_kv_cache(
                 f"unsupported model/backend/GPU for KV-cache estimation: "
                 f"model={model_path}, backend={backend}, gpu_sku={system}: {exc}"
             ) from exc
-        estimate = NaiveKVCacheEstimator.from_model_path(
+        naive = NaiveKVCacheEstimator.from_model_path(
             model_path,
             tp_size=int(tp_size),
             pp_size=int(pp_size),
             allow_hf_config_download=allow_hf_config_download,
             moe_ep_size=int(moe_ep_size or 1),
             moe_tp_size=int(moe_tp_size or 1),
-        ).estimate(
+        )
+        if "deepseek_v4" in naive.geometry:
+            if kvcache_quant_mode not in (None, "fp8"):
+                raise ValueError("DeepSeek V4 stores fp8_ds_mla KV; use kvcache_quant_mode fp8") from exc
+            if nextn:
+                raise ValueError("DeepSeek V4 naive sizing requires nextn=0") from exc
+        estimate = naive.estimate(
             capacity=gpu_memory_capacity_bytes_override,
             naive_kv_reservation=float(naive_kv_reservation),
             cuda_graph_reserved_bytes=cuda_graph_reserved_bytes,
+            max_batch_size=int(max_batch_size),
         )
     else:
         # Native model built: budget-math failures (no KV budget, zero per-token)

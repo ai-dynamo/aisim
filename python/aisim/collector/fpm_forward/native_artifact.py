@@ -493,6 +493,8 @@ def _validate_glm_repetitions(
         else None
     )
     raw = measurement.get("raw_fpms") if isinstance(measurement, dict) else None
+    if not isinstance(raw, list) or len(raw) != measured:
+        raise ValueError(f"{error}: expected {measured} saved raw samples: {path}")
     scheduled = _expected_scheduled(point)
     steps = [scheduled]
     if point["point_type"] == "decode":
@@ -531,7 +533,7 @@ def _validate_glm_repetitions(
             if type(forward) is not int or forward <= previous_forward or not _same(sample.get("sample_index"), step):
                 raise ValueError(f"{error}: missing, repeated or unordered forward at repetition {index}: {path}")
             previous_forward = forward
-        if index >= warmups and isinstance(raw, list) and len(raw) == measured:
+        if index >= warmups:
             position = index - warmups
             fpm = fpms[-1]
             expected_raw = {**fpm, "benchmark_sample": {**fpm["benchmark_sample"], "sample_index": position}}

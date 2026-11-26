@@ -120,6 +120,17 @@ def glm_native_payload(phase: str, *, points: list[dict], rank: int = 0, dp: int
             }
             for dp_rank in range(dp)
         ]
+        steps = 2 if phase == "decode" else 1
+        for fpm in fpms:
+            fpm["benchmark_measurement"] = {
+                "raw_fpms": [
+                    {
+                        **copy.deepcopy(fpm),
+                        "benchmark_sample": {"sample_index": i, "forward_index": (i + 6) * steps - 1},
+                    }
+                    for i in range(10)
+                ]
+            }
         if phase == "decode":
             regime = "real_kv"
         else:
@@ -329,6 +340,7 @@ def _glm_producer_shape(tmp_path, breakage=None):
         for position, (row, group) in enumerate(zip(payload["results"], payload["iteration_groups"], strict=True)):
             fpm = group["rank_results"][0]["fpms"][0]
             assert row["fpms"][0] is fpm
+            del fpm["benchmark_measurement"]
             walls = [fpm["wall_time"] * (1 + 0.01 * (index - 4)) for index in range(10)]
             tokens = row["point"]["total_prefill_tokens"] or row["point"]["batch_size"]
             samples = []
@@ -465,6 +477,31 @@ def test_glm_producer_artifact_without_repetition_evidence_is_refused(tmp_path):
     (pod / EVIDENCE_FILE).unlink()
     with pytest.raises(ValueError, match="native GLM-5.3-Flash result lacks valid repetition_evidence_manifest"):
         _validate(tmp_path, cell)
+
+
+@pytest.mark.parametrize("count", [None, 9, 10, 11])
+def test_glm_collection_requires_all_ten_saved_raw_samples_for_each_point(tmp_path, count):
+    from collector.fpm_forward.runner import _recover_completed_attempt, _runtime_collection_summary
+
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=DECODE_POINTS)
+    record = payload["results"][-1]["fpms"][0]["benchmark_measurement"]
+    if count is None:
+        del record["raw_fpms"]
+    else:
+        record["raw_fpms"] = (record["raw_fpms"] * 2)[:count]
+    cell_dir = tmp_path / "cells" / cell.cell_id
+    write_glm_rank(_pod(cell_dir, cell), payload)
+    entry = {"status": "failed", "attempt_id": ATTEMPT_ID}
+    recovered = _recover_completed_attempt(_glm_plan(), cell, tmp_path, entry)
+    if count == 10:
+        assert recovered["status"] == "passed"
+        return
+    assert recovered is None
+    with pytest.raises(ValueError, match="expected 10 saved raw samples"):
+        _runtime_collection_summary(
+            cell, cell_dir / "raw", expected_plan_sha256=PLAN_SHA256, expected_attempt_id=ATTEMPT_ID
+        )
 
 
 def test_glm_producer_row_regime_must_follow_its_point(tmp_path):
@@ -2088,6 +2125,27 @@ def test_glm_rows_cannot_join_rows_without_a_measurement_policy(tmp_path):
         "measurement_policy, and 'vllm_native_fpm_prefix_seed_median_v1' binds every row. Publish to a clean "
         f"destination: {parquet}"
     )
+    assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
+
+
+def test_first_publisher_reuse_requires_the_same_measurement_policy(tmp_path):
+    plan = _glm_plan()
+    cell, directory = _producer_cells(tmp_path)["prefill"]
+    single = database.aggregate_cell(plan, cell, directory, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    median = database.aggregate_cell(plan, cell, directory, expected_attempt_id=ATTEMPT_ID)
+    systems = tmp_path / "systems"
+    parquet, metadata, _ = database.write_formal_database(plan, single, systems_root=systems)
+    sealed = parquet.read_bytes(), metadata.read_bytes()
+    for rows in (single, median):
+        for row in rows:
+            row["collector_attempt_id"] = "f" * 32
+    assert database.write_formal_database(plan, single, systems_root=systems) == (parquet, metadata, (cell.cell_id,))
+    with pytest.raises(ValueError, match="Publish to a clean destination"):
+        database.write_formal_database(plan, median, systems_root=systems)
+    with pytest.raises(ValueError, match="measurement_policy differs from the GLM producer cell"):
+        database.validate_formal_database_commit(
+            parquet, metadata, plan, required_cells=(cell,), reused_cell_ids=(cell.cell_id,)
+        )
     assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
 
 
