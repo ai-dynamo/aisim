@@ -53,7 +53,7 @@ pub(super) fn get_new_batch_prefill(
         .iter()
         .map(|req| {
             let remaining_output = req
-                .remaining_output_tokens()
+                .remaining_budget_tokens()
                 .min(config.clip_max_new_tokens);
             remaining_output as f64 * new_token_ratio
         })
@@ -137,7 +137,7 @@ pub(super) fn get_new_batch_prefill(
             let remaining_total = capacity as f64 - total_offset;
             let whole_request_tokens = (extend_input + host_tokens) as f64
                 + req
-                    .remaining_output_tokens()
+                    .remaining_budget_tokens()
                     .min(config.clip_max_new_tokens) as f64
                 + config.block_size as f64;
             if first_admission && whole_request_tokens >= remaining_total {
@@ -170,14 +170,28 @@ pub(super) fn get_new_batch_prefill(
             let output_reserve = if chunk_tokens < extend_input {
                 0
             } else {
-                req.max_output_tokens.min(config.clip_max_new_tokens)
+                req.budget_max_output_tokens.min(config.clip_max_new_tokens)
             };
 
             if host_tokens > 0 {
+                // SGLang's load-back counts `min(max_new_tokens - len(output_ids), reserve)`:
+                // a retracted request's sequence already holds its generated outputs.
+                let load_reserve = output_reserve.min(req.remaining_budget_tokens());
                 let required = host_tokens
                     + ceil_to_block(chunk_tokens, config.block_size)
-                    + output_reserve
+                    + load_reserve
                     + config.block_size;
+                // A load the whole pool cannot hold would wait for ever. Recompute the prefix
+                // instead, as SGLang re-selects without the host hit when a load-back commits
+                // nothing.
+                let pool = kv_manager
+                    .cache()
+                    .total_tokens()
+                    .saturating_sub(matched.device_tokens);
+                if required > pool {
+                    host_tokens = 0;
+                    continue;
+                }
                 match kv_manager.load_host_prefix(
                     &req.kv_lease,
                     &req.sequence_tokens,

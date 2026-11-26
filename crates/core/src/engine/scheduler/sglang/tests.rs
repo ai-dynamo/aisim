@@ -2239,6 +2239,7 @@ fn zero_output_completion_survives_decode_reservation_failure() {
             sequence_tokens: vec![1, 2, 3, 4],
             prompt_len: 4,
             max_output_tokens: 0,
+            budget_max_output_tokens: 0,
             planned_output_ids: None,
             kv_lease: zero_alloc.lease,
             materialized_tokens: 4,
@@ -2253,6 +2254,7 @@ fn zero_output_completion_survives_decode_reservation_failure() {
             sequence_tokens: vec![5, 6, 7, 8, 9],
             prompt_len: 4,
             max_output_tokens: 2,
+            budget_max_output_tokens: 2,
             planned_output_ids: None,
             kv_lease: normal_alloc.lease,
             materialized_tokens: 4,
@@ -2307,6 +2309,7 @@ fn retraction_ratio_is_estimated_from_survivors_before_the_forward() {
             sequence_tokens: vec![1, 2, 3, 10, 11],
             prompt_len: 3,
             max_output_tokens: 3,
+            budget_max_output_tokens: 3,
             planned_output_ids: None,
             kv_lease: r1_alloc.lease,
             materialized_tokens: 4,
@@ -2321,6 +2324,7 @@ fn retraction_ratio_is_estimated_from_survivors_before_the_forward() {
             sequence_tokens: vec![5, 6, 7, 8, 9],
             prompt_len: 4,
             max_output_tokens: 5,
+            budget_max_output_tokens: 5,
             planned_output_ids: None,
             kv_lease: r2_alloc.lease,
             materialized_tokens: 4,
@@ -2362,6 +2366,7 @@ fn committed_decode_membership_excludes_retracted_requests() {
             sequence_tokens: tokens,
             prompt_len,
             max_output_tokens,
+            budget_max_output_tokens: max_output_tokens,
             planned_output_ids: None,
             kv_lease: allocation.lease,
             materialized_tokens: 4,
@@ -2405,6 +2410,7 @@ fn fresh_prefill_tracks_cache_owned_prefix_pages_and_pressure_event() {
         sequence_tokens: prompt.clone(),
         prompt_len: prompt.len(),
         max_output_tokens: 1,
+        budget_max_output_tokens: 1,
         planned_output_ids: None,
         materialized_tokens: 0,
         kv_lease: RadixRequestLease::default(),
@@ -2442,6 +2448,7 @@ fn fresh_prefill_tracks_cache_owned_prefix_pages_and_pressure_event() {
         sequence_tokens: blocker_tokens,
         prompt_len: 7,
         max_output_tokens: 1,
+        budget_max_output_tokens: 1,
         planned_output_ids: None,
         kv_lease: blocker_alloc.lease,
         materialized_tokens: 7,
@@ -2511,6 +2518,7 @@ mod decode_retraction {
             sequence_tokens,
             prompt_len: prompt.len(),
             max_output_tokens: 8,
+            budget_max_output_tokens: 8,
             planned_output_ids: None,
             kv_lease: allocation.lease,
             materialized_tokens: sequence_len,
@@ -2538,6 +2546,7 @@ mod decode_retraction {
             sequence_tokens,
             prompt_len: prompt.len(),
             max_output_tokens: 1,
+            budget_max_output_tokens: 1,
             planned_output_ids: None,
             kv_lease: allocation.lease,
             materialized_tokens: prompt.len(),
@@ -4119,6 +4128,7 @@ mod scheduling {
                 sequence_tokens: vec![9, 8, 7],
                 prompt_len: 3,
                 max_output_tokens: 1,
+                budget_max_output_tokens: 1,
                 planned_output_ids: None,
                 materialized_tokens: 0,
                 kv_lease: RadixRequestLease::default(),
@@ -4133,6 +4143,7 @@ mod scheduling {
                 sequence_tokens: vec![1, 2, 3, 4, 5, 6, 7],
                 prompt_len: 5,
                 max_output_tokens: 1,
+                budget_max_output_tokens: 1,
                 planned_output_ids: None,
                 materialized_tokens: 0,
                 kv_lease: RadixRequestLease::default(),
@@ -4170,6 +4181,7 @@ mod scheduling {
                 sequence_tokens: duplicate_prefix.clone(),
                 prompt_len: duplicate_prefix.len(),
                 max_output_tokens: 1,
+                budget_max_output_tokens: 1,
                 planned_output_ids: None,
                 materialized_tokens: 0,
                 kv_lease: RadixRequestLease::default(),
@@ -4186,6 +4198,7 @@ mod scheduling {
             sequence_tokens: (100..132).collect(),
             prompt_len: 32,
             max_output_tokens: 1,
+            budget_max_output_tokens: 1,
             planned_output_ids: None,
             materialized_tokens: 0,
             kv_lease: RadixRequestLease::default(),
@@ -4314,6 +4327,7 @@ mod core_behavior {
                 allocated_tokens: prompt.len(),
                 sequence_tokens: prompt,
                 max_output_tokens: 4,
+                budget_max_output_tokens: 4,
                 planned_output_ids: None,
                 kv_lease: alloc.lease,
                 images: Vec::new(),
@@ -4464,6 +4478,7 @@ mod core_behavior {
             sequence_tokens: vec![1; 16],
             prompt_len: 16,
             max_output_tokens: 2,
+            budget_max_output_tokens: 2,
             planned_output_ids: None,
             materialized_tokens: 0,
             kv_lease: RadixRequestLease::default(),
@@ -4508,6 +4523,7 @@ mod core_behavior {
             sequence_tokens: vec![1, 2, 3, 4, 5, 6],
             prompt_len: 6,
             max_output_tokens: 4,
+            budget_max_output_tokens: 4,
             planned_output_ids: None,
             kv_lease: alloc.lease,
             materialized_tokens: 6,
@@ -4569,6 +4585,7 @@ mod core_behavior {
             sequence_tokens: vec![1, 2, 3, 4],
             prompt_len: 4,
             max_output_tokens: 4,
+            budget_max_output_tokens: 4,
             planned_output_ids: None,
             kv_lease: base_alloc.lease,
             materialized_tokens: 4,
@@ -4586,6 +4603,7 @@ mod core_behavior {
             sequence_tokens: vec![1, 2, 3, 4],
             prompt_len: 4,
             max_output_tokens: 4,
+            budget_max_output_tokens: 4,
             planned_output_ids: None,
             kv_lease: fast_alloc.lease,
             materialized_tokens: 4,
@@ -4639,6 +4657,7 @@ mod core_behavior {
                 sequence_tokens: vec![1, 2, 3, 4, 11, 12, 13, 14, 15],
                 prompt_len: 4,
                 max_output_tokens: 10,
+                budget_max_output_tokens: 10,
                 planned_output_ids: None,
                 kv_lease: RadixRequestLease::from_parts(first, 8, 4, kv_manager.cache().root()),
                 materialized_tokens: 8,
@@ -4653,6 +4672,7 @@ mod core_behavior {
                 sequence_tokens: vec![9, 8, 7, 6, 21],
                 prompt_len: 4,
                 max_output_tokens: 10,
+                budget_max_output_tokens: 10,
                 planned_output_ids: None,
                 kv_lease: RadixRequestLease::from_parts(second, 5, 4, kv_manager.cache().root()),
                 materialized_tokens: 5,
@@ -4690,6 +4710,7 @@ mod core_behavior {
             sequence_tokens: vec![1, 2, 3, 4],
             prompt_len: 4,
             max_output_tokens: 5,
+            budget_max_output_tokens: 5,
             planned_output_ids: None,
             kv_lease: alloc.lease,
             materialized_tokens: 4,
@@ -6707,6 +6728,7 @@ mod host_loop_passes {
             sequence_tokens: prompt.iter().copied().chain([99]).collect(),
             prompt_len: 8,
             max_output_tokens: 1,
+            budget_max_output_tokens: 1,
             planned_output_ids: None,
             kv_lease: alloc.lease,
             materialized_tokens: 8,
@@ -6762,6 +6784,7 @@ mod host_loop_passes {
                 sequence_tokens: finishing,
                 prompt_len: 4,
                 max_output_tokens: 1,
+                budget_max_output_tokens: 1,
                 planned_output_ids: None,
                 kv_lease: finishing_alloc.lease,
                 materialized_tokens: 4,
@@ -6776,6 +6799,7 @@ mod host_loop_passes {
                 sequence_tokens: continuing,
                 prompt_len: 4,
                 max_output_tokens: 5,
+                budget_max_output_tokens: 5,
                 planned_output_ids: None,
                 kv_lease: continuing_alloc.lease,
                 materialized_tokens: 4,
@@ -7003,6 +7027,7 @@ mod vision_batches {
                 sequence_tokens: tokens,
                 prompt_len,
                 max_output_tokens: 3,
+                budget_max_output_tokens: 3,
                 planned_output_ids: None,
                 kv_lease: allocation.lease,
                 materialized_tokens: 4,
@@ -7267,5 +7292,697 @@ mod uncharged_decode {
                 1 + usize::from(phases)
             );
         }
+    }
+}
+
+/// The requested maximum (`DirectRequest.max_output_tokens` beside an exact output plan) budgets
+/// admission and the retraction estimate, as SGLang's `sampling_params.max_new_tokens` does. The
+/// plan still decides where generation stops.
+mod requested_max_budget {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::engine::TimingModelConfig;
+    use crate::engine::common::perf_model::PerfModel;
+    use crate::engine::timing::built_in_timing_model;
+
+    const PAGE: usize = 4;
+
+    /// The outputs request `id` is planned to generate.
+    fn plan(id: u128, planned: usize) -> Vec<u32> {
+        (0..planned as u32).map(|n| 1000 * id as u32 + n).collect()
+    }
+
+    /// A prompt that shares no page with another request's.
+    fn prompt(id: u128, len: usize) -> Vec<u32> {
+        (0..len as u32).map(|n| 100 * id as u32 + n).collect()
+    }
+
+    /// A request with an exact output plan and a separately requested maximum.
+    fn planned_request(
+        id: u128,
+        prompt: Vec<u32>,
+        planned: usize,
+        requested_max: usize,
+    ) -> DirectRequest {
+        DirectRequest {
+            uuid: Some(Uuid::from_u128(id)),
+            output_token_ids: Some(plan(id, planned)),
+            ..direct_request(prompt, requested_max)
+        }
+    }
+
+    /// A queued request as `build_request` leaves it: generation stops after `planned` outputs
+    /// and admission budgets `requested_max`.
+    fn queued(id: u128, prompt_len: usize, planned: usize, requested_max: usize) -> SglangRequest {
+        let request = planned_request(id, prompt(id, prompt_len), planned, requested_max);
+        let mut request = SglangRequest::new(request, PAGE, 0);
+        request.budget_max_output_tokens = requested_max;
+        request
+    }
+
+    fn generate(request: &mut SglangRequest, outputs: usize) {
+        for _ in 0..outputs {
+            let token = request.next_output_token();
+            request.append_output_token(token, PAGE);
+        }
+    }
+
+    /// What a scheduler run did.
+    #[derive(Debug, Default, PartialEq)]
+    struct Outcome {
+        /// The requests each admitting pass admitted.
+        admitted: Vec<Vec<u128>>,
+        /// Every request's output tokens, in order.
+        outputs: BTreeMap<u128, Vec<u32>>,
+        /// Requests in completion order.
+        completed: Vec<u128>,
+        /// Runs of identical passes as `(count, pass)`. A pass lists the admitted, retracted
+        /// and token-producing (`!` = completed) request ids, then the waiting and running
+        /// ids after it, and the new-token ratio when the pass raised it.
+        passes: Vec<(usize, String)>,
+        /// When the last pass ended.
+        end_ms: f64,
+    }
+
+    fn run_pass(core: &mut SglangCore, outcome: &mut Outcome) {
+        fn join(ids: impl Iterator<Item = Uuid>) -> String {
+            ids.map(|id| id.as_u128().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        let ratio_before = core.new_token_ratio;
+        let pass = core.execute_hidden_pass(outcome.end_ms);
+        outcome.end_ms = pass.end_ms;
+        if !pass.admissions.is_empty() {
+            outcome.admitted.push(
+                pass.admissions
+                    .iter()
+                    .map(|event| event.uuid.as_u128())
+                    .collect(),
+            );
+        }
+        let mut tokens = Vec::new();
+        for signal in &pass.output_signals {
+            assert!(!signal.rejected);
+            let id = signal.uuid.as_u128();
+            if let Some(token) = signal.token_id {
+                outcome.outputs.entry(id).or_default().push(token);
+            }
+            if signal.completed {
+                outcome.completed.push(id);
+            }
+            tokens.push(format!("{id}{}", if signal.completed { "!" } else { "" }));
+        }
+        let mut line = format!(
+            "admit[{}] retract[{}] tokens[{}] waiting[{}] running[{}]",
+            join(pass.admissions.iter().map(|event| event.uuid)),
+            join(pass.pressure_events.iter().map(|event| event.request_id)),
+            tokens.join(","),
+            join(core.waiting.iter().map(|request| request.uuid)),
+            join(core.running.iter().map(|request| request.uuid)),
+        );
+        if core.new_token_ratio > ratio_before {
+            line.push_str(&format!(" ratio {:.4}", core.new_token_ratio));
+        }
+        match outcome.passes.last_mut() {
+            Some((count, last)) if *last == line => *count += 1,
+            _ => outcome.passes.push((1, line)),
+        }
+    }
+
+    fn drain(core: &mut SglangCore, outcome: &mut Outcome) {
+        for _ in 0..400 {
+            if core.is_drained() {
+                return;
+            }
+            run_pass(core, outcome);
+        }
+        panic!("the scheduler did not drain: {outcome:#?}");
+    }
+
+    /// `SglangCore::build_request`, as SGLang's `handle_generate_request` cuts `max_new_tokens`
+    /// to `max_req_len - input_len - 1`.
+    ///
+    /// A 1008-token pool (63 pages of 16) and a 900-token prompt. The engine's limit on outputs
+    /// is the smaller of
+    ///   max request length - prompt - 1 = 1007 - 900 - 1 = 106 and
+    ///   pool - prompt pages - one page - 1 = 1008 - 912 - 16 - 1 = 79;
+    /// with `max_model_len` 960 the first is 959 - 900 - 1 = 58.
+    #[rstest::rstest]
+    #[case::below_the_limit(None, Some(10), 50, 10, 50)]
+    #[case::cut_to_the_limit(None, Some(10), 100, 10, 79)]
+    #[case::cut_to_the_model_length(Some(960), Some(10), 100, 10, 58)]
+    #[case::never_below_the_plan(None, Some(10), 4, 10, 10)]
+    #[case::plan_and_maximum_both_cut(None, Some(90), 200, 79, 79)]
+    #[case::no_plan(None, None, 50, 50, 50)]
+    #[case::no_plan_cut_to_the_limit(None, None, 100, 79, 79)]
+    fn arrival_cuts_the_requested_maximum_to_the_engine_limit_but_not_below_the_plan(
+        #[case] max_model_len: Option<usize>,
+        #[case] planned: Option<usize>,
+        #[case] requested_max: usize,
+        #[case] generated: usize,
+        #[case] budget: usize,
+    ) {
+        let mut args = test_args(63, 16, 8192);
+        args.max_model_len = max_model_len;
+        let mut core = SglangCore::new(args);
+        core.receive(DirectRequest {
+            output_token_ids: planned.map(|planned| plan(1, planned)),
+            ..direct_request((0..900).collect(), requested_max)
+        });
+        assert_eq!(core.waiting[0].max_output_tokens, generated);
+        assert_eq!(core.waiting[0].budget_max_output_tokens, budget);
+    }
+
+    #[test]
+    fn the_budget_left_counts_down_from_the_requested_maximum() {
+        // A request with no plan budgets the length it generates.
+        let unplanned = SglangRequest::new(direct_request(prompt(1, 8), 4), PAGE, 0);
+        assert_eq!(unplanned.budget_max_output_tokens, 4);
+        assert_eq!(unplanned.remaining_budget_tokens(), 4);
+
+        let mut request = queued(1, 8, 4, 20);
+        assert_eq!(request.remaining_output_tokens(), 4);
+        assert_eq!(request.remaining_budget_tokens(), 20);
+        generate(&mut request, 3);
+        assert_eq!(request.remaining_output_tokens(), 1);
+        assert_eq!(request.remaining_budget_tokens(), 17);
+    }
+
+    /// `PrefillAdder.add_one_req`: a new request is admitted when its prompt, what is left of
+    /// its `max_new_tokens` and one page are less than the free pool.
+    ///
+    /// An 8-token prompt with 4 planned outputs on an empty 32-token pool.
+    #[rstest::rstest]
+    // 8 + 4 + 4 = 16 < 32.
+    #[case::the_plan(4, 1)]
+    // 8 + 19 + 4 = 31 < 32.
+    #[case::the_largest_that_fits(19, 1)]
+    // 8 + 20 + 4 = 32 is not less than 32. Its plan alone (16) would fit.
+    #[case::one_more(20, 0)]
+    fn a_new_request_needs_room_for_its_requested_maximum(
+        #[case] requested_max: usize,
+        #[case] admitted: usize,
+    ) {
+        let config = SglangConfig::from_args(&test_args(8, PAGE, 64));
+        let mut manager = SglangKvManager::new(32, PAGE, KvEventPublishers::default(), 0);
+        let mut waiting = WaitingQueue::from([queued(1, 8, 4, requested_max)]);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
+        assert_eq!(result.can_run.len(), admitted);
+        assert_eq!(waiting.len(), 1 - admitted);
+        // Nothing runs, so a request that does not fit leaves the batch open.
+        assert!(!result.batch_is_full);
+    }
+
+    /// A retracted request keeps its outputs, so what it may still generate is its requested
+    /// maximum less those.
+    ///
+    /// An 8-token prompt with 5 of 8 planned outputs and a requested maximum of 20, retracted:
+    /// it recomputes 13 tokens and may generate 20 - 5 = 15 more, so it needs
+    /// 13 + 15 + 4 = 32 (13 + 3 + 4 = 20 by its plan, 13 + 20 + 4 = 37 by the whole maximum).
+    #[rstest::rstest]
+    // 32 is not less than 32.
+    #[case(32, 0)]
+    // 32 < 36.
+    #[case(36, 1)]
+    fn a_retracted_request_needs_room_for_the_rest_of_its_requested_maximum(
+        #[case] pool_tokens: usize,
+        #[case] admitted: usize,
+    ) {
+        let config = SglangConfig::from_args(&test_args(pool_tokens / PAGE, PAGE, 64));
+        let mut manager = SglangKvManager::new(pool_tokens, PAGE, KvEventPublishers::default(), 0);
+        let mut request = queued(1, 8, 8, 20);
+        generate(&mut request, 5);
+        request.retracted = true;
+        let mut waiting = WaitingQueue::from([request]);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
+        assert_eq!(result.can_run.len(), admitted);
+        assert_eq!(waiting.len(), 1 - admitted);
+    }
+
+    /// Re-admits a retracted request on an empty 64-token pool. Its 12-token prompt is on the
+    /// host only and it has `outputs` of 12 planned outputs. Returns the prompt tokens it loads
+    /// from the host and the tokens it recomputes, or `None` when it is left waiting.
+    fn readmit_with_host_prompt(outputs: usize, requested_max: usize) -> Option<(usize, usize)> {
+        let config = SglangConfig::from_args(&test_args(64 / PAGE, PAGE, 64));
+        let mut manager = SglangKvManager::new(64, PAGE, KvEventPublishers::default(), 0);
+        manager.enable_hicache(
+            crate::engine::SglangHiCacheConfig {
+                d2h_bandwidth_gbps: 0.0,
+                h2d_bandwidth_gbps: 1.0,
+                ..crate::engine::SglangHiCacheConfig::new(16)
+            },
+            1_000_000,
+        );
+        let tokens = prompt(1, 12);
+        let cached = manager.allocate_for_request(&tokens).unwrap();
+        manager.finish(&tokens, cached.lease);
+        manager.complete_host_boundary(0.0);
+        manager.evict(12);
+        assert_eq!(manager.cache().available_tokens(), 64);
+
+        let mut request = queued(1, 12, 12, requested_max);
+        generate(&mut request, outputs);
+        request.retracted = true;
+        let mut waiting = WaitingQueue::from([request]);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
+        assert_eq!(result.can_run.len() + waiting.len(), 1);
+        let admission = result.admissions.first()?;
+        Some((
+            admission.reused_input_tokens,
+            result.prefill_fpm[0].tokens_computed,
+        ))
+    }
+
+    /// Loading a retracted request's prompt back from the host cache needs room for what it may
+    /// still generate, not for its whole requested maximum: SGLang's load-back counts
+    /// `min(max_new_tokens - len(output_ids), reserve)`.
+    ///
+    /// With 8 outputs the request loads 12 tokens, recomputes its 8 outputs and may generate
+    /// its requested maximum - 8 more, so the load needs 12 + 8 + (maximum - 8) + 4 =
+    /// maximum + 16 free tokens. Counting the whole maximum would need maximum + 24, which no
+    /// pool state can give once the maximum is above 40.
+    #[rstest::rstest]
+    #[case::fits_either_way(40)] // 56 <= 64, and 64 <= 64 by the whole maximum
+    #[case::one_more(41)] // 57 <= 64, although the whole maximum would need 65
+    #[case::the_engine_limit(47)] // 64 - 12 - 4 - 1 = 47: 63 <= 64
+    fn a_retracted_request_loads_its_host_prefix_within_its_remaining_budget(
+        #[case] requested_max: usize,
+    ) {
+        assert_eq!(readmit_with_host_prompt(8, requested_max), Some((12, 8)));
+    }
+
+    /// The load counts the recomputed outputs in whole pages; the admission check does not. At
+    /// the engine limit, a requested maximum of 47, the load needs
+    /// 12 + (outputs rounded up to 4) + (47 - outputs) + 4, which can be more than the whole
+    /// pool. Such a load can never fit, so the request recomputes its prompt instead of
+    /// waiting at the head of the queue for ever, as SGLang re-selects without the host hit
+    /// when a load-back commits nothing.
+    #[rstest::rstest]
+    #[case::one_output(1, 0, 13)] // 12 + 4 + 46 + 4 = 66 > 64: recomputes all 13 tokens
+    #[case::two_outputs(2, 0, 14)] // 12 + 4 + 45 + 4 = 65 > 64: recomputes all 14 tokens
+    #[case::three_outputs(3, 12, 3)] // 12 + 4 + 44 + 4 = 64: loads 12, recomputes 3
+    fn a_host_load_the_pool_can_never_hold_recomputes_the_prefix(
+        #[case] outputs: usize,
+        #[case] loaded: usize,
+        #[case] computed: usize,
+    ) {
+        assert_eq!(
+            readmit_with_host_prompt(outputs, 47),
+            Some((loaded, computed))
+        );
+    }
+
+    /// `PrefillAdder._update_prefill_budget`: an admitted request reserves its prompt, a page
+    /// and its whole `max_new_tokens` against the requests behind it.
+    ///
+    /// A 48-token pool with nothing running. A and B have 8-token prompts and 4 planned outputs.
+    /// B requests no more than its plan, so it needs 8 + 4 + 4 = 16 less than what A leaves.
+    #[rstest::rstest]
+    // A reserves 8 + 4 + 4 = 16 and leaves 32.
+    #[case::the_plan(4, 2)]
+    // A reserves 8 + 4 + 19 = 31 and leaves 17.
+    #[case::the_largest_that_leaves_room(19, 2)]
+    // A reserves 8 + 4 + 20 = 32 and leaves 16, which is not more than B needs.
+    #[case::one_more(20, 1)]
+    fn an_admitted_request_reserves_its_requested_maximum(
+        #[case] requested_max: usize,
+        #[case] admitted: usize,
+    ) {
+        let config = SglangConfig::from_args(&test_args(12, PAGE, 64));
+        let mut manager = SglangKvManager::new(48, PAGE, KvEventPublishers::default(), 0);
+        let mut waiting = WaitingQueue::from([queued(1, 8, 4, requested_max), queued(2, 8, 4, 4)]);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.7,
+            &[],
+            false,
+            Some(0),
+        );
+        assert_eq!(result.can_run.len(), admitted);
+        assert_eq!(result.can_run[0].uuid, Uuid::from_u128(1));
+        assert_eq!(waiting.len(), 2 - admitted);
+        assert_eq!(result.batch_is_full, admitted == 1);
+    }
+
+    /// `PrefillAdder.__init__`: each running request holds back what is left of its
+    /// `max_new_tokens`, scaled by the new-token ratio.
+    ///
+    /// A 32-token pool. R runs with a 4-token prompt and 2 of its 4 planned outputs on 2 pages,
+    /// so 24 tokens are free. W (8-token prompt, 4 planned and requested outputs) needs
+    /// 8 + 4 + 4 = 16 less than 24 minus what R holds back at ratio 0.5.
+    #[rstest::rstest]
+    // R holds back (4 - 2) * 0.5 = 1 and leaves 23.
+    #[case::the_plan(4, 1)]
+    // R holds back (17 - 2) * 0.5 = 7.5 and leaves 16.5.
+    #[case::the_largest_that_leaves_room(17, 1)]
+    // R holds back (18 - 2) * 0.5 = 8 and leaves 16, which is not more than W needs.
+    #[case::one_more(18, 0)]
+    fn a_running_request_holds_back_the_rest_of_its_requested_maximum(
+        #[case] requested_max: usize,
+        #[case] admitted: usize,
+    ) {
+        let config = SglangConfig::from_args(&test_args(8, PAGE, 64));
+        let mut manager = SglangKvManager::new(32, PAGE, KvEventPublishers::default(), 0);
+        let mut running = queued(1, 4, 4, requested_max);
+        generate(&mut running, 2);
+        manager
+            .allocate_for_request_lease_capped(&running.sequence_tokens, &mut running.kv_lease, 0)
+            .unwrap();
+        running.materialized_tokens = 6;
+        running.allocated_tokens = 8;
+        running.debug_assert_invariants(PAGE);
+        assert_eq!(manager.cache().available_tokens(), 24);
+        let mut waiting = WaitingQueue::from([queued(2, 8, 4, 4)]);
+        let result = get_new_batch_prefill(
+            &mut waiting,
+            &mut manager,
+            &config,
+            0.5,
+            &[running],
+            false,
+            Some(0),
+        );
+        assert_eq!(result.can_run.len(), admitted);
+        assert_eq!(waiting.len(), 1 - admitted);
+        assert_eq!(result.batch_is_full, admitted == 0);
+    }
+
+    /// A 52-token pool (13 pages of 4) and three 8-token prompts with 4 planned outputs, queued
+    /// together. A request is admitted when prompt + output budget + one page is less than what
+    /// is left, and then reserves that much.
+    ///   By the plans: 8 + 4 + 4 = 16 each. 16 < 52, 16 < 36 and 16 < 20: all three run together.
+    ///   By a requested maximum of 20: 8 + 20 + 4 = 32 each. 32 < 52 admits the first; 32 is not
+    ///   less than 52 - 32 = 20, so the second waits and the batch is full until the first is done.
+    /// Each request generates exactly its plan either way.
+    #[rstest::rstest]
+    #[case::the_plan(4, vec![vec![1, 2, 3]])]
+    #[case::above_the_plan(20, vec![vec![1], vec![2], vec![3]])]
+    fn a_pool_that_fits_three_plans_admits_one_requested_maximum_at_a_time(
+        #[case] requested_max: usize,
+        #[case] admitted: Vec<Vec<u128>>,
+    ) {
+        let mut core = SglangCore::new(test_args(13, PAGE, 64));
+        for id in 1..=3 {
+            core.receive(planned_request(id, prompt(id, 8), 4, requested_max));
+        }
+        let mut outcome = Outcome::default();
+        drain(&mut core, &mut outcome);
+        assert_eq!(outcome.admitted, admitted);
+        assert_eq!(
+            outcome.outputs,
+            (1..=3).map(|id| (id, plan(id, 4))).collect()
+        );
+        assert_eq!(outcome.completed, vec![1, 2, 3]);
+    }
+
+    #[rstest::rstest]
+    fn generation_stops_at_the_plan_below_the_requested_maximum(
+        #[values(1, 3)] planned: usize,
+        #[values(false, true)] host_loop: bool,
+    ) {
+        let mut args = test_args(64, PAGE, 64);
+        args.sglang.as_mut().unwrap().host_loop = host_loop;
+        let mut core = SglangCore::new(args);
+        core.receive(planned_request(1, prompt(1, 8), planned, 30));
+        if !host_loop {
+            // Under the host loop the request is still in the scheduler's inbox.
+            assert_eq!(core.waiting[0].max_output_tokens, planned);
+            assert_eq!(core.waiting[0].budget_max_output_tokens, 30);
+        }
+        let mut outcome = Outcome::default();
+        drain(&mut core, &mut outcome);
+        assert_eq!(outcome.outputs, BTreeMap::from([(1, plan(1, planned))]));
+        assert_eq!(outcome.completed, vec![1]);
+    }
+
+    /// The batch of `retraction_ratio_is_estimated_from_survivors_before_the_forward`: r2 is
+    /// retracted and r1 survives with 2 of its 3 planned outputs decoded. SGLang's
+    /// `retract_decode` estimate is (decoded + 20 per survivor) / (survivors' `max_new_tokens`
+    /// + 1), at most 1. The retracted request's maximum is not part of it.
+    #[rstest::rstest]
+    // (2 + 20) / (3 + 1) = 5.5, capped.
+    #[case::the_plan(3, 1.0)]
+    // (2 + 20) / (43 + 1).
+    #[case::above_the_plan(43, 0.5)]
+    fn retraction_estimate_divides_by_the_requested_maximum(
+        #[case] requested_max: usize,
+        #[case] estimate: f64,
+    ) {
+        let config = SglangConfig::from_args(&test_args(2, PAGE, 16));
+        let mut kv_manager = SglangKvManager::new(8, PAGE, KvEventPublishers::default(), 0);
+        let r1_alloc = kv_manager.allocate_for_request(&[1, 2, 3, 10]).unwrap();
+        let r2_alloc = kv_manager.allocate_for_request(&[5, 6, 7, 8]).unwrap();
+        let mut running = vec![
+            SglangRequest {
+                is_decode_handoff: false,
+                retracted: false,
+                uuid: Uuid::from_u128(1),
+                sequence_tokens: vec![1, 2, 3, 10, 11],
+                prompt_len: 3,
+                max_output_tokens: 3,
+                budget_max_output_tokens: requested_max,
+                planned_output_ids: None,
+                kv_lease: r1_alloc.lease,
+                materialized_tokens: 4,
+                allocated_tokens: 4,
+                images: Vec::new(),
+                pending_terminal: false,
+            },
+            SglangRequest {
+                is_decode_handoff: false,
+                retracted: false,
+                uuid: Uuid::from_u128(2),
+                sequence_tokens: vec![5, 6, 7, 8, 9],
+                prompt_len: 4,
+                max_output_tokens: 5,
+                budget_max_output_tokens: 500,
+                planned_output_ids: None,
+                kv_lease: r2_alloc.lease,
+                materialized_tokens: 4,
+                allocated_tokens: 4,
+                images: Vec::new(),
+                pending_terminal: false,
+            },
+        ];
+        let result = simulate_decode_step(&mut running, &mut kv_manager, &config, 0.0, false);
+        assert_eq!(result.requests.len(), 1);
+        assert_eq!(result.requests[0].uuid, Uuid::from_u128(2));
+        assert_eq!(result.new_token_ratio_estimate, Some(estimate));
+        // r1 still stops at its plan: its third output is its last.
+        assert!(running.is_empty());
+        assert!(matches!(
+            result.output_signals.as_slice(),
+            [OutputSignal {
+                uuid,
+                token_id: Some(_),
+                completed: true,
+                ..
+            }] if *uuid == Uuid::from_u128(1)
+        ));
+    }
+
+    /// A run under KV pressure: a running request holds back admission, a decode retraction
+    /// re-estimates the ratio and the retracted request is prefilled again in two chunks.
+    /// Requests 1 and 2 plan 80 and 50 outputs and request `extra` more than they plan;
+    /// request 3 has no plan. A prefill forward takes 10 ms and a decode forward 2 ms.
+    fn pressure_run(extra: usize) -> Outcome {
+        let args = MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .block_size(PAGE)
+            .num_gpu_blocks(24)
+            .max_num_seqs(Some(4))
+            .speedup_ratio(1.0)
+            .perf_model(Arc::new(PerfModel::External {
+                timing: built_in_timing_model(&TimingModelConfig::Fixed {
+                    prefill_ms: 10.0,
+                    decode_ms: 2.0,
+                })
+                .unwrap(),
+            }))
+            .sglang(Some(SglangArgs {
+                page_size: Some(PAGE),
+                chunked_prefill_size: Some(32),
+                schedule_conservativeness: Some(0.3),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+        let mut core = SglangCore::new(args);
+        let mut outcome = Outcome::default();
+        core.receive(planned_request(1, prompt(1, 4), 80, 80 + extra));
+        run_pass(&mut core, &mut outcome);
+        core.receive(planned_request(2, prompt(2, 4), 50, 50 + extra));
+        core.receive(DirectRequest {
+            uuid: Some(Uuid::from_u128(3)),
+            ..direct_request(prompt(3, 32), 6)
+        });
+        drain(&mut core, &mut outcome);
+        outcome
+    }
+
+    /// The expected run was recorded from the scheduler as it was before requests kept a
+    /// requested maximum (AISim main 9f2db246e), where a plan's length was the only budget.
+    #[test]
+    fn a_requested_maximum_equal_to_the_plan_changes_nothing() {
+        let outcome = pressure_run(0);
+        let passes = outcome
+            .passes
+            .iter()
+            .map(|(count, pass)| (*count, pass.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            passes,
+            [
+                (1, "admit[1] retract[] tokens[1] waiting[] running[1]"),
+                (1, "admit[2] retract[] tokens[2] waiting[3] running[1,2]"),
+                (44, "admit[] retract[] tokens[1,2] waiting[3] running[1,2]"),
+                // (45 + 20) / (80 + 1).
+                (
+                    1,
+                    "admit[] retract[2] tokens[1] waiting[3,2] running[1] ratio 0.8025"
+                ),
+                (33, "admit[] retract[] tokens[1] waiting[3,2] running[1]"),
+                (1, "admit[] retract[] tokens[1!] waiting[3,2] running[]"),
+                (1, "admit[3] retract[] tokens[3] waiting[2] running[3]"),
+                (1, "admit[2] retract[] tokens[] waiting[2] running[3]"),
+                (1, "admit[] retract[] tokens[2] waiting[] running[3,2]"),
+                (3, "admit[] retract[] tokens[3,2] waiting[] running[3,2]"),
+                (1, "admit[] retract[] tokens[3,2!] waiting[] running[3]"),
+                (1, "admit[] retract[] tokens[3!] waiting[] running[]"),
+            ]
+        );
+        // 5 prefill forwards and 84 decode forwards.
+        assert_eq!(outcome.end_ms, 5.0 * 10.0 + 84.0 * 2.0);
+        assert_eq!(outcome.outputs[&1], plan(1, 80));
+        assert_eq!(outcome.outputs[&2], plan(2, 50));
+        assert_eq!(outcome.outputs[&3].len(), 6);
+    }
+
+    /// The same run with 20 more requested than planned. After request 1's prefill 92 of the 96
+    /// tokens are free and the ratio is 0.7 * 0.3 = 0.21.
+    ///   By the plans request 1 holds back (80 - 1) * 0.21 = 16.59 and request 2 needs
+    ///   4 + 50 + 4 = 58 < 92 - 16.59: it joins request 1, and is retracted later.
+    ///   Request 1's requested 100 is cut to the engine limit, 96 - 4 - 4 - 1 = 87. It holds
+    ///   back (87 - 1) * 0.21 = 18.06, and request 2 needs 4 + 70 + 4 = 78, which is not less
+    ///   than 92 - 18.06: it waits for request 1, and nothing is retracted.
+    #[test]
+    fn a_larger_requested_maximum_makes_the_same_run_wait_instead_of_retract() {
+        let outcome = pressure_run(20);
+        assert_eq!(outcome.admitted, vec![vec![1], vec![2], vec![3]]);
+        assert!(
+            outcome
+                .passes
+                .iter()
+                .all(|(_, pass)| pass.contains("retract[]"))
+        );
+        assert_eq!(outcome.completed, vec![1, 2, 3]);
+        assert_eq!(outcome.outputs[&1], plan(1, 80));
+        assert_eq!(outcome.outputs[&2], plan(2, 50));
+        assert_eq!(outcome.outputs[&3].len(), 6);
+    }
+
+    /// A P/D decode worker with one-token pages and a 4-token reserve for each active request.
+    fn decode_core(capacity: usize) -> SglangCore {
+        let mut args = test_args(capacity, 1, capacity);
+        args.worker_type = crate::engine::common::protocols::WorkerType::Decode;
+        args.max_num_seqs = Some(8);
+        args.sglang.as_mut().unwrap().num_reserved_decode_tokens = Some(4);
+        SglangCore::new(args)
+    }
+
+    /// Offers the decode worker a transferred request. True when its KV was reserved at once.
+    fn reserve_destination(
+        core: &mut SglangCore,
+        id: u128,
+        prompt_len: usize,
+        planned: usize,
+        requested_max: usize,
+    ) -> bool {
+        let effects = core
+            .apply_command_effects(
+                SchedulerCommand::ReserveDestination {
+                    handoff_id: HandoffId::from(Uuid::from_u128(id)),
+                    request: planned_request(id, prompt(id, prompt_len), planned, requested_max),
+                },
+                true,
+            )
+            .unwrap();
+        !effects.lifecycle_events.is_empty()
+    }
+
+    /// Decode pre-allocation counts a transferred request's requested maximum. On a 64-token
+    /// pool request 1 holds its 20-token prompt, so 44 tokens are free; one active request
+    /// reserves 4, which leaves 40. Request 2 (8-token prompt, plan 4) needs
+    /// max(8 + 4 reserve, 8 + requested maximum).
+    #[rstest::rstest]
+    #[case::the_plan(4, true)] // max(12, 12) = 12
+    #[case::just_fits(32, true)] // 40 is not more than 40
+    #[case::one_more(33, false)] // 41 is more than 40, although the plan needs only 12
+    fn a_transferred_request_needs_room_for_its_requested_maximum(
+        #[case] requested_max: usize,
+        #[case] reserved: bool,
+    ) {
+        let mut core = decode_core(64);
+        assert!(reserve_destination(&mut core, 1, 20, 4, 4));
+        assert_eq!(core.kv_manager.cache().available_tokens(), 44);
+        assert_eq!(
+            reserve_destination(&mut core, 2, 8, 4, requested_max),
+            reserved
+        );
+    }
+
+    /// Decode pre-allocation keeps room for a running request to reach its requested maximum
+    /// with every other request retracted. Request 1 (20-token prompt, plan 4) runs and has 2
+    /// outputs, the second not yet computed: 64 - 20 - 1 = 43 tokens are free. The guard is its
+    /// requested maximum - 2 and the reserve is the larger of the guard and the fixed 4.
+    /// Request 2 (8-token prompt, plan and maximum 2) needs 8 + 4 = 12 of what is left.
+    #[rstest::rstest]
+    #[case::the_plan(4, true)] // guard 2, reserve 4: 12 is not more than 39
+    #[case::just_fits(33, true)] // guard 31: 12 is not more than 12
+    #[case::one_more(34, false)] // guard 32: 12 is more than 11, although the plan's guard is 2
+    fn a_running_decode_request_keeps_room_for_its_requested_maximum(
+        #[case] requested_max: usize,
+        #[case] reserved: bool,
+    ) {
+        let mut core = decode_core(64);
+        assert!(reserve_destination(&mut core, 1, 20, 4, requested_max));
+        core.apply_command(SchedulerCommand::ActivateDestination {
+            handoff_id: HandoffId::from(Uuid::from_u128(1)),
+        })
+        .unwrap();
+        let first = core.execute_hidden_pass(0.0);
+        core.execute_hidden_pass(first.end_ms);
+        assert_eq!(core.running[0].output_len(), 2);
+        assert_eq!(core.kv_manager.cache().available_tokens(), 43);
+        assert_eq!(reserve_destination(&mut core, 2, 8, 2, 2), reserved);
     }
 }

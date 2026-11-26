@@ -76,7 +76,10 @@ pub struct Request {
     pub tokens: Vec<u32>,
     /// Requested output length.
     pub max_output_tokens: usize,
-    /// Optional exact output IDs. Its length overrides `max_output_tokens`.
+    /// Optional exact output IDs. Generation stops at its length, which
+    /// overrides `max_output_tokens`. The SGLang scheduler still budgets
+    /// admission and retraction from a larger `max_output_tokens`, as SGLang
+    /// reserves room for the requested `max_new_tokens`.
     /// When absent, each output token is derived from `request_id` and its
     /// output position, so reusing a request ID reproduces the same stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
