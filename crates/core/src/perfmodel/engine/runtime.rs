@@ -1436,10 +1436,15 @@ impl Engine {
                 "qualified Mamba ops are not supported beside DSv4.1 stages".into(),
             ));
         }
-        // Replay attributes a mixed rank's operations to a pass by name and
-        // splits every operation by token share when names collide, which
-        // would mix prefill and decode Mamba work.
+        // Operation-graph Replay attributes a mixed rank's operations to a
+        // pass by name and splits every operation by token share when names
+        // collide, which would mix prefill and decode Mamba work. Whole-model
+        // FPM keeps draft tails in separate pass buckets (see fpm_split).
         if seen[0]
+            && !matches!(
+                (spec.context_ops.first(), spec.generation_ops.first()),
+                (Some(Op::FpmForward(_)), Some(Op::FpmForward(_)))
+            )
             && let Err(name) = mixed_pass_map(&spec.context_ops, &spec.generation_ops)
         {
             return Err(AicError::InvalidEngineConfig(format!(
@@ -11251,6 +11256,82 @@ pub(crate) mod tests {
         spec.generation_ops.push(dup);
         let err = Engine::build(spec, Arc::new(db)).unwrap_err();
         assert!(err.to_string().contains("exactly one FpmForward"), "{err}");
+    }
+
+    #[test]
+    fn fpm_hybrid_keeps_same_named_draft_tails_in_separate_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut attention = crate::operators::glm53flash::tests::attention("kda");
+        attention.name = "block".into();
+        attention.is_context = false;
+        let (mut spec, mut db) = fpm_hybrid_spec(
+            tmp.path(),
+            Some(7),
+            8,
+            vec![Op::Glm53Attention(attention)],
+            vec![
+                qualified_mamba(true, 1),
+                Op::Elementwise(ElementwiseOp::new("block", 2.0)),
+            ],
+        );
+        // The GLM draft tail has no measured SILICON composition; HYBRID
+        // explicitly permits its analytical estimate beside the FPM target.
+        spec.engine.database_mode = DatabaseMode::Hybrid;
+        db.database_mode = DatabaseMode::Hybrid;
+        // These names collide in the operation-graph pass map. FPM instead
+        // reports each draft tail in its own pass, preserving both rows.
+        assert_eq!(
+            mixed_pass_map(&spec.context_ops, &spec.generation_ops),
+            Err("draft_block".into())
+        );
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        assert!(engine.mix_step_passes().is_none());
+        let (shared, context, decode) = engine
+            .mixed_step_breakdown_per_op(2048, 1, 2048, 2, 0, 1.0, 1.0)
+            .unwrap();
+        assert!(context.is_empty());
+        for pass in [&shared, &decode] {
+            let rows: Vec<_> = pass.iter().filter(|row| row.0 == "draft_block").collect();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].1 > 0.0);
+        }
+        // The context block moves 2 B for each of 2048 prefill tokens.
+        // HYBRID uses B200's 3 us launch and 80% bandwidth calibration.
+        let block_ms = shared.iter().find(|row| row.0 == "draft_block").unwrap().1;
+        let expected_ms = 0.003 + 4096.0 / (0.8 * engine.db.system_spec.gpu.mem_bw) * 1000.0;
+        assert!((block_ms - expected_ms).abs() < 1e-12);
+        let scalar = engine
+            .mixed_step_latency(2048, 1, 2048, 2, 0, 1.0, 1.0)
+            .unwrap();
+        let detailed: f64 = shared.iter().chain(&decode).map(|row| row.1).sum();
+        assert!((detailed - scalar).abs() < 1e-12);
+    }
+
+    #[test]
+    fn packed_qualified_graph_rejects_same_named_cross_pass_tails() {
+        let db =
+            Arc::new(PerfDatabase::load(&systems_root(), "b200_sxm", "vllm", "0.24.0").unwrap());
+        let mut attention = crate::operators::glm53flash::tests::attention("kda");
+        attention.name = "draft_block".into();
+        attention.is_context = false;
+        let error = Engine::build(
+            EngineSpec::new(
+                fixture_engine_config(Some(7)),
+                vec![
+                    qualified_mamba(true, 1),
+                    Op::Elementwise(ElementwiseOp::new("draft_block", 2.0)),
+                ],
+                vec![Op::Glm53Attention(attention)],
+            ),
+            db,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("operation name draft_block belongs to two mixed-step passes"),
+            "{error}"
+        );
     }
 
     #[test]
