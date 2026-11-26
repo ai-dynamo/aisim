@@ -886,7 +886,7 @@ This gives eight 1024-byte blocks. Each request's state takes two blocks
 | `state_cache.mamba_cache_dtype` | `auto` | Kimi K3 only. `auto` (model dtype), `float16` or `float32`. Used when bytes are inferred. |
 | `state_cache.indexer_cache_dtype` | `auto` | DeepSeek V4 only. `auto` (vLLM's FP8), `fp8` or `mxfp4`; vLLM supports `mxfp4` only on Blackwell datacenter GPUs. Used when bytes are inferred. |
 | `state_cache.retention_interval` | Unset (every block boundary) | DeepSeek V4 with inferred bytes only. vLLM's `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`: `0` or a multiple of the resolved `block_size`. DeepSeek V4 rejects `prefix_match_unit`. |
-| `state_cache.sliding_window_lookahead_tokens` | Inferred (DeepSeek V4: 64) | Tokens past the full-attention hit that the MTP layer's sliding-window group reads; sizing fills it. Set it only with explicit `bytes_per_request`, to replay a state resolved earlier. |
+| `state_cache.sliding_window_lookahead_tokens` | Inferred (DeepSeek V4: 64; Gemma 4: 0) | Tokens past the full-attention hit that the MTP layer's sliding-window group reads; sizing fills it. Set it only with explicit `bytes_per_request`, to replay a state resolved earlier. |
 | `prefix_match_unit` | Unset (`block_size`) | Positive divisor of `block_size`. Lets prefixes match at a finer granularity than the physical block. |
 
 `state_cache: {}` infers Kimi K3 geometry from the model. `block_size` is then
@@ -945,15 +945,22 @@ global group only, and each request holds a fixed state of
 `cdiv(1024, 64) + 1 = 17` blocks per sliding group, 85 in all. At TP2 with BF16
 KV, the 64-token request block grows to 128 tokens of 10,240 bytes per token,
 and the state takes 111,411,200 bytes per rank. Prefix hits resume at block
-boundaries that keep a window snapshot, as with DeepSeek V4. A fixed
+boundaries that keep a window snapshot, as with DeepSeek V4; Gemma 4 has no
+in-checkpoint MTP layer, so its `sliding_window_lookahead_tokens` is 0. A fixed
 `capacity.blocks` counts these resolved blocks (128 tokens of global-layer KV at
 TP2), not 64-token blocks of every layer, and each request also takes its state
-from the same pool. KV precision follows the usual order: an explicit
+from the same pool. Each window snapshot replay keeps for a prefix hit is a
+full state copy (85 blocks at TP2), where vLLM shares window blocks between
+neighbouring boundaries, so a small pool can drop hits vLLM would keep. KV
+precision follows the usual order: an explicit
 `kvcache_quant_mode`, then the FPM profile's `kv_cache_dtype`, then the
 checkpoint, so an FP8-KV checkpoint such as Gemma-4-26B-A4B-NVFP4 sizes in FP8
 as vLLM's `--kv-cache-dtype auto` does. An explicit precision that contradicts
 the profile is rejected. A worker with a grouped `engine.fpm_profile`, or with a
-profile that records no `runtime_memory`, keeps its existing capacity path. In
+profile that records no `runtime_memory`, keeps its existing capacity path.
+Sizing from a linear profile's recorded `runtime_memory` is tested at compile
+time only: no Gemma 4 FPM profile with timing data exists, and a profile
+requires default timing, so that path has not run end to end. In
 disaggregated mode, decode resumes from the transferred state, so prefill and
 decode take the window state together: if either role keeps its existing path,
 both do.

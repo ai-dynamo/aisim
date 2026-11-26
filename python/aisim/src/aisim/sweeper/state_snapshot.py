@@ -416,9 +416,10 @@ def derive_snapshot_roles(value: dict[str, Any]) -> dict[str, Any]:
         return value
     for role, snapshot in snapshots.items():
         _check_role_identity(value, snapshot)
-        _reject_window_state_snapshot(snapshot)
         _pin_block_size(value, snapshot)
         shape = _pin_parallel_shape(value, snapshot)
+        # After the shape is pinned: an unknown saved width takes the role's explicit value.
+        _reject_window_state_snapshot(snapshot, tp=shape["tp"])
         if snapshot.fitted:
             _check_fitted_shape(snapshot, shape)
             _pin_deployment_limits(value, snapshot)
@@ -471,7 +472,7 @@ def _check_role_identity(value: dict[str, Any], snapshot: SnapshotRole) -> None:
         )
 
 
-def _reject_window_state_snapshot(snapshot: SnapshotRole) -> None:
+def _reject_window_state_snapshot(snapshot: SnapshotRole, *, tp: int) -> None:
     """Reject a Gemma 4 vLLM snapshot whose role would run two different KV block sizes.
 
     vLLM grows the global group's block to match the sliding layers' page (64 to 128 at TP1 and
@@ -487,21 +488,18 @@ def _reject_window_state_snapshot(snapshot: SnapshotRole) -> None:
     identity = snapshot.identity
     if identity["backend"] != "vllm" or not _is_gemma4(str(identity["model"])):
         return
-    saved = identity["kv_block_size"]
-    shape = (identity.get("tp") or 1, identity.get("pp") or 1)
-    if UNKNOWN not in (saved, *shape):
-        state = estimate_state_cache(
-            str(identity["model"]), backend="vllm", tp_size=int(shape[0]), pp_size=int(shape[1]), block_size=int(saved)
-        )
-        if state["block_size"] == int(saved):
-            return
-        reason = (
-            f"at tp={shape[0]} the window-state pool's KV block differs from vLLM's requested block, and the "
-            f"snapshot's kv_block_size={saved} does not record which of the two it is"
-        )
-    else:
-        reason = "its tensor width or kv_block_size is unknown, so the window-state pool's KV block cannot be checked"
-    raise ValueError(f"{snapshot.describe()} cannot time a Gemma 4 vLLM role: {reason}")
+    saved = int(identity["kv_block_size"])
+    # Replay runs pipeline 1 only, so the pinned tensor width fixes the block.
+    if (
+        estimate_state_cache(str(identity["model"]), backend="vllm", tp_size=tp, block_size=saved)["block_size"]
+        == saved
+    ):
+        return
+    raise ValueError(
+        f"{snapshot.describe()} cannot time a Gemma 4 vLLM role: at tp={tp} the window-state pool's KV block "
+        f"differs from vLLM's requested block, and the snapshot's kv_block_size={saved} does not record which "
+        "of the two it is"
+    )
 
 
 def _pin_block_size(value: dict[str, Any], snapshot: SnapshotRole) -> None:

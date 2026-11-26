@@ -396,65 +396,68 @@ def test_the_sweeper_rejects_a_kv_dtype_that_contradicts_the_profile():
         gemma4_window_geometry(sample, "agg", 64, backend_version="0.32.0", fpm_profile=profile)
 
 
-def _gemma4_snapshot(backend="vllm", tp=1, kv_block_size=64):
+def _gemma4_snapshot(backend="vllm", tp=1, kv_block_size=64, pp=1):
     from aisim.sweeper.state_snapshot import SnapshotRole
 
     identity = {
         "model": GEMMA4,
         "backend": backend,
+        "backend_version": "0.32.0",
         "system": "h200_sxm",
         "kv_block_size": kv_block_size,
         "tp": tp,
-        "pp": 1,
+        "pp": pp,
     }
-    summary = {"identity": identity, "selected_estimation_mode": "fpm_regression", "kind": "regression"}
+    summary = {"identity": identity, "selected_estimation_mode": "op_level", "kind": "native"}
     return SnapshotRole(role="agg", path="/snapshots/gemma4", summary=summary, config={})
 
 
-def test_recommend_rejects_a_gemma4_vllm_snapshot_whose_block_grows(monkeypatch):
+def _derive_snapshot_role(monkeypatch, snapshot, **space):
+    """Run recommend's snapshot intake on an aggregated Gemma 4 role timed by ``snapshot``."""
     from aisim.sweeper import state_snapshot
 
-    monkeypatch.setattr(state_snapshot, "load_snapshot_role", lambda role, reference: _gemma4_snapshot(tp=1))
+    monkeypatch.setattr(state_snapshot, "load_snapshot_role", lambda role, reference: snapshot)
     value = {
         "model_name": GEMMA4,
         "hardware_sku": "h200_sxm",
         "deployment_mode": ["agg"],
-        "role_estimator_controls": {"agg": {"estimator_config": {"state_snapshot": {"path": "/snapshots/gemma4"}}}},
+        "role_estimator_controls": {"agg": {"estimator_config": {"state_snapshot": {"path": snapshot.path}}}},
+        **space,
     }
-    # At TP1 a deployment's 64-token block gives the window-state pool 128-token global blocks.
-    with pytest.raises(ValueError, match="at tp=1 .* kv_block_size=64 does not record which"):
-        state_snapshot.derive_snapshot_roles(value)
-
-
-def test_a_snapshot_saved_from_a_compiled_gemma4_model_is_rejected_for_the_same_reason():
-    from aisim.sweeper.state_snapshot import _reject_window_state_snapshot
-
-    # An AISim-compiled TP2 model saves the pool block (128), which a deployment launched with
-    # --block-size 128 (pool block 256) would also record; the value cannot tell them apart.
-    with pytest.raises(ValueError, match="at tp=2 .* kv_block_size=128 does not record which"):
-        _reject_window_state_snapshot(_gemma4_snapshot(tp=2, kv_block_size=128))
-
-
-def test_a_gemma4_snapshot_with_an_unknown_tensor_width_is_rejected():
-    from aisim.sweeper.state_snapshot import UNKNOWN, _reject_window_state_snapshot
-
-    with pytest.raises(ValueError, match="tensor width or kv_block_size is unknown"):
-        _reject_window_state_snapshot(_gemma4_snapshot(tp=UNKNOWN))
+    return state_snapshot.derive_snapshot_roles(value)
 
 
 @pytest.mark.parametrize(
-    "snapshot",
+    "tp,kv_block_size",
     [
-        # At TP4 both page sizes match, so the pool keeps the deployed 64-token block.
-        _gemma4_snapshot(tp=4),
-        _gemma4_snapshot(backend="sglang"),
+        # A deployment's 64-token block gives the window-state pool 128-token global blocks.
+        (1, 64),
+        # An AISim-compiled TP2 model saves the pool block (128), which a deployment launched with
+        # --block-size 128 (pool block 256) would also record; the value cannot tell them apart.
+        (2, 128),
     ],
-    ids=["tp4", "sglang"],
 )
-def test_gemma4_snapshots_whose_block_restores_pass_the_guard(snapshot):
+def test_recommend_rejects_a_gemma4_vllm_snapshot_whose_block_changes(monkeypatch, tp, kv_block_size):
+    snapshot = _gemma4_snapshot(tp=tp, kv_block_size=kv_block_size)
+    with pytest.raises(ValueError, match=f"at tp={tp} .* kv_block_size={kv_block_size} does not record which"):
+        _derive_snapshot_role(monkeypatch, snapshot)
+
+
+def test_a_gemma4_tp4_snapshot_with_an_unknown_pipeline_takes_the_explicit_one(monkeypatch):
+    from aisim.sweeper.state_snapshot import UNKNOWN
+
+    # At TP4 both page sizes match, so the pool keeps the deployed 64-token block. The unknown saved
+    # pipeline width is resolved from the role's single explicit value before the block check.
+    snapshot = _gemma4_snapshot(tp=4, pp=UNKNOWN)
+    value = _derive_snapshot_role(monkeypatch, snapshot, parallel_independent_by_mode={"agg": {"pp": [1]}})
+    assert value["agg_block_size"] == 64
+    assert value["parallel_independent_by_mode"]["agg"]["tp"] == [4]
+
+
+def test_a_gemma4_snapshot_on_another_backend_passes_the_window_state_guard():
     from aisim.sweeper.state_snapshot import _reject_window_state_snapshot
 
-    _reject_window_state_snapshot(snapshot)
+    _reject_window_state_snapshot(_gemma4_snapshot(backend="sglang"), tp=1)
 
 
 def _pd_profile(prefill_runtime_memory):
@@ -538,3 +541,41 @@ def test_the_rust_engine_accepts_the_compiled_gemma4_window_state(mode):
         assert args["state_cache"]["sliding_window"] == {"lookahead_tokens": 0}
     metrics = EngineReplayRunnerFactory().create(0).run(spec).metrics
     assert metrics["completed_requests"] == 2
+
+
+def test_gemma4_window_state_runs_with_host_offload_in_the_rust_engine():
+    # A rank-local G2 pool keeps the window state too. An unset connector defaults to
+    # offloading_v0_24, which a rank-local window-state pool runs as vLLM 0.32's OffloadingConnector.
+    for connector in (None, "offloading_v0_24", "offloading_v0_32"):
+        # The host pool must exceed one 85-block state checkpoint.
+        host_offload = {"num_host_blocks": 256, **({"connector": connector} if connector else {})}
+        payload = _payload(tensor=2, prefix_caching=True, host_offload=host_offload)
+        spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(payload))
+        args = spec.backend_deployment.agg_engine_args
+        assert args["native_host_offload"]["num_host_blocks"] == 256
+        assert "sliding_window" in args["state_cache"]
+        assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 1
+
+
+def test_a_gemma4_prefix_hit_resumes_at_a_window_snapshot_boundary():
+    # Replay keeps each boundary's window as a full 85-block state copy; with 400 blocks only the
+    # newest three fit and the 896-token one is evicted, where vLLM shares window blocks instead.
+    payload = _payload(tensor=2, prefix_caching=True, capacity={"type": "fixed", "blocks": 4000})
+    # The second request shares 1,000 prompt tokens with the first. Window snapshots exist only at
+    # 128-token block boundaries, so it resumes after 7 blocks: 896 tokens.
+    payload["traffic"]["source"] = {
+        "type": "synthetic",
+        "input_tokens": 1500,
+        "output_tokens": 2,
+        "cached_prefix_tokens": 1000,
+    }
+    payload["traffic"]["stop"] = {"requests": 2}
+    metrics = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(prediction_to_replay_spec(CorePredictionConfig.model_validate(payload)))
+        .metrics
+    )
+    assert metrics["completed_requests"] == 2
+    assert metrics["committed_prefill_tokens"] == 2 * 1500 - 896
+    assert metrics["prefix_cache_reused_ratio"] == pytest.approx(896 / 3000)
