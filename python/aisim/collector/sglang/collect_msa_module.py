@@ -2489,7 +2489,10 @@ def main():
     for _0, batch, heads, kv_dtype, compute, gemm, model, row_tp, points in plan(
         f"msa_{args.mode}_module", "sglang", get_sm_version()
     ).rows:
-        if model != args.model or heads != num_heads or kv_dtype != args.kv_cache_dtype:
+        # Compare against the row the CLI resolved, not the raw spelling: an
+        # artifact alias (``...-FP8``) resolves to its canonical row, and the
+        # plan only ever names the canonical path.
+        if model != model_spec.model_path or heads != num_heads or kv_dtype != args.kv_cache_dtype:
             continue
         if args.batch_size is not None and batch != args.batch_size:
             continue

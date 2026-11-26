@@ -556,3 +556,30 @@ def test_decode_point_reads_the_sparse_child_only_on_the_msa_branch(monkeypatch,
         assert calls["history"] == [4096]
         assert calls["kernel_bound"] == [4096], "the MSA decode kernel is launched with the captured bound"
         assert kernel_source == "minimax_msa_decode"
+
+
+def test_the_full_sweep_dispatches_an_artifact_alias_to_its_canonical_row(monkeypatch):
+    """``--model ...-FP8`` must run the row its canonical spelling runs.
+
+    ``_resolve_model_spec`` accepts aliases, but the full-sweep loop compared
+    the plan's canonical path against raw ``args.model``, so the FP8 spelling
+    matched no row and the run exited having measured nothing.
+    """
+    mod = _import_module(monkeypatch)
+    canonical = "Qwen/Qwen3.8-Flash-Next"
+    alias = canonical + "-FP8"
+    row = (0, 2, 24, "bfloat16", "bfloat16", "bfloat16", canonical, 1, [(2, 2048, 0)])
+    monkeypatch.setattr(
+        mod,
+        "_resolve_model_spec",
+        lambda path: types.SimpleNamespace(model_path=canonical, attention_type="qsa", native_num_heads=24),
+    )
+    monkeypatch.setattr(mod, "plan", lambda *_args: types.SimpleNamespace(rows=[row]))
+    ran = []
+    monkeypatch.setattr(mod, "run_msa_module", lambda **kwargs: ran.append(kwargs))
+
+    for spelling in (canonical, alias):
+        ran.clear()
+        monkeypatch.setattr(sys, "argv", ["collect", "--mode", "generation", "--model", spelling])
+        mod.main()
+        assert [call["model_path"] for call in ran] == [canonical], spelling
