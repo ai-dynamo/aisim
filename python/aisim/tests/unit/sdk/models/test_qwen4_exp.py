@@ -510,6 +510,35 @@ def test_draft_weights_are_part_of_the_resident_inventory():
 
 
 @pytest.mark.parametrize("model_path", [BF16, FP8])
+def test_qsa_projection_weights_are_part_of_the_resident_inventory(model_path):
+    """Qwen4-Exp's only attention op reports zero weights, so price them here.
+
+    ``Op::MsaContext``/``Op::MsaGeneration`` return 0 resident bytes; that is
+    MiniMax-M3's silicon-only accounting and would silently drop every QSA
+    projection from this checkpoint's inventory. The delta over the op sum is
+    the 12 decoder layers' Q/K/V/O plus the indexer at the checkpoint's
+    resolved projection precision (BF16 for both repositories).
+    """
+    model = _build(model_path, nextn=0)
+    op_sum = sum(op.get_weights() for op in model.context_ops)
+    projections = model.get_resident_weights_bytes() - op_sum
+
+    tp = model.config.tp_size
+    local_heads = max(1, model._num_heads // tp)
+    local_kv_heads = max(1, model._num_kv_heads // tp)
+    cfg = model.extra_params
+    index_width = (cfg.indexer_n_heads + cfg.indexer_kv_heads) * cfg.indexer_head_dim
+    per_layer = model._hidden_size * (
+        2 * local_heads * model._head_size
+        + 2 * local_kv_heads * model._head_size
+        + local_heads * model._head_size
+        + index_width
+    )
+    layers = cfg.layer_types.count("full_attention")
+    assert projections == layers * per_layer * model._projection_gemm_quant_mode.value.memory
+
+
+@pytest.mark.parametrize("model_path", [BF16, FP8])
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
 def test_sol_prices_both_phases_through_the_rust_engine(model_path, backend):
     """The whole graph must be priceable, not merely constructible.

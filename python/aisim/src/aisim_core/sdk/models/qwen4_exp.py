@@ -263,12 +263,19 @@ class Qwen4ExpModel(Qwen35Model):
     # ------------------------------------------------------------------
 
     def get_resident_weights_bytes(self) -> float:
-        """Phase inventory plus the MTP draft layer.
+        """Phase inventory, the QSA projection weights, and the MTP draft layer.
 
         The QSA draft layer shares no weights with the GDN decoder stack, so the
         context-op inventory cannot imply it. Draft ops are ``draft_``-prefixed
         and therefore excluded from the base sum; they are added back here at
         their own (nextn-scaled) weight.
+
+        ``Op::MsaContext``/``Op::MsaGeneration`` report zero resident weight
+        bytes, which is right for MiniMax-M3 (its module row is silicon-only) but
+        leaves Qwen4-Exp with no attention weights in the inventory at all — the
+        MSA module op is its only attention op. The projections are priced here
+        from the same formula the op's own SOL memory uses, at the checkpoint's
+        resolved projection precision.
 
         The n-gram table is priced by its op at the checkpoint dtype (FP8
         releases store it as F8_E4M3), so the base inventory already counts it
@@ -276,7 +283,12 @@ class Qwen4ExpModel(Qwen35Model):
         the ``Embedding``.
         """
         draft = sum(op.get_weights() for op in self.generation_ops if op._name.startswith(_DRAFT_PREFIX))
-        return float(super().get_resident_weights_bytes() + draft)
+        qsa_projections = (
+            self._qsa_cache_layers()
+            * self._qsa_projection_elements_per_layer()
+            * self._projection_gemm_quant_mode.value.memory
+        )
+        return float(super().get_resident_weights_bytes() + qsa_projections + draft)
 
     def _qsa_cache_layers(self) -> int:
         """QSA layers that own a KV slot: the decoder's plus any MTP draft's.
@@ -294,6 +306,36 @@ class Qwen4ExpModel(Qwen35Model):
         cfg: common.Qwen4ExpConfig = self.extra_params
         return cfg.layer_types.count("full_attention") + (
             self.spec_scheme.depth if isinstance(self.spec_scheme, MTPScheme) else 0
+        )
+
+    def _qsa_projection_elements_per_layer(self) -> int:
+        """Parameters of one QSA layer's projections, per TP/EP rank.
+
+        ``Op::MsaContext``/``Op::MsaGeneration`` return zero resident weight
+        bytes (``crates/core/src/perfmodel/operators/op.rs`` keeps MiniMax-M3's
+        zero-width accounting, where the module row is silicon-only). Qwen4-Exp's
+        only attention op *is* that module, so without this the resident
+        inventory has no attention weights at all. The terms mirror the module's
+        own SOL memory (``operators/msa.rs`` ``gemm_weight_elems``): Q, K+V, O,
+        indexer Q, and the two slices Qwen4-Exp fuses into those projections —
+        the sigmoid output gate that shares q_proj's weight and the indexer K
+        half of ``index_qk_proj``.
+
+        Sharding follows the runtime: q/k/v/o are Column/Row-parallel, while the
+        indexer's ``index_qk_proj`` is a ``ReplicatedLinear``
+        (``indexer_qsa.py``), so its width stays checkpoint-exact on every rank.
+        Norm weights are not counted, matching the shared attention ops.
+        """
+        tp = self.config.tp_size
+        local_heads = max(1, self._num_heads // tp)
+        local_kv_heads = max(1, self._num_kv_heads // tp)
+        cfg: common.Qwen4ExpConfig = self.extra_params
+        index_width = (cfg.indexer_n_heads + cfg.indexer_kv_heads) * cfg.indexer_head_dim
+        return self._hidden_size * (
+            2 * local_heads * self._head_size  # q_proj, doubled by the output gate
+            + 2 * local_kv_heads * self._head_size  # k_proj + v_proj
+            + local_heads * self._head_size  # o_proj
+            + index_width  # replicated indexer Q and the fused K half
         )
 
     def get_kvcache_elements_per_token(self) -> int:
