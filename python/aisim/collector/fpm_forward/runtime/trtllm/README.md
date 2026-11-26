@@ -50,3 +50,36 @@ records to confirm contiguous iteration IDs, per-rank timings, shape, counter
 bounds and the out-of-span diagnostic. The leader is the only process that
 publishes the native rank artifact. The integrated launch and publication
 qualification are tracked separately in AISIM-2520 PR 3.
+
+## Run the collector pilot
+
+From a one-node exclusive Slurm job with two assigned H200 SXM GPUs, use the
+collector environment with the built AISim Rust extension, PyArrow and pynvml.
+The stock OpenEngine bindings and Dynamo sidecar interpreter must be available
+on the node. Use the following point file:
+
+```json
+{
+  "schema_version": 1,
+  "prefill": [{"batch_size": 4, "total_prefill_tokens": 8192, "total_kv_read_tokens": 0}],
+  "decode": [{"batch_size": 4, "total_prefill_tokens": 0, "total_kv_read_tokens": 32768}]
+}
+```
+
+```bash
+python -m collector.fpm_forward --backend trtllm --gpu h200_sxm \
+  --model-path Qwen/Qwen3-32B-FP8 --fpm-max-gpus 2 \
+  --fpm-benchmark-points-file points.json \
+  --fpm-trtllm-model-snapshot "$SNAPSHOT" \
+  --fpm-trtllm-bindings "$OPENENGINE_BINDINGS" \
+  --fpm-trtllm-sidecar-python "$DYNAMO_PYTHON" \
+  --fpm-artifact-root "$FRESH_ARTIFACT_ROOT" --fpm-database-root "$FRESH_DATABASE_ROOT"
+```
+
+Add `--plan-only` to print the fixed two-point plan without a Slurm allocation.
+Each phase serves identical seeded traffic with the observer off and on.
+The collector requires the same two GPU UUIDs across both phases, stores the
+observed decode coordinate, and publishes a schema-8 pair through the shared
+finalizer. `acceptance.json` reports the serving-frame rate and mean power
+deltas. `profile-query.json` contains the native FPM query for both points.
+The command exits unsuccessfully when either point lacks qualified power.

@@ -24,7 +24,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="python -m collector.fpm_forward",
         description="Plan or run a Generator-resolved Dynamo-native FPM campaign.",
     )
-    parser.add_argument("--backend", choices=("vllm",), default="vllm")
+    parser.add_argument("--backend", choices=("vllm", "trtllm"), default="vllm")
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--model-architecture", default=None)
     parser.add_argument("--model-cases", default=None, help="Optional model cases YAML path.")
@@ -40,6 +40,10 @@ def _parser() -> argparse.ArgumentParser:
         help="Retry failed cells while resuming; requires --resume.",
     )
     parser.add_argument("--checkpoint-dir", default=".collector_checkpoint")
+    trtllm = parser.add_argument_group("TRT-LLM rc29 Slurm pilot")
+    trtllm.add_argument("--fpm-trtllm-model-snapshot")
+    trtllm.add_argument("--fpm-trtllm-bindings")
+    trtllm.add_argument("--fpm-trtllm-sidecar-python")
     validation = parser.add_argument_group("Repeatability validation")
     validation.add_argument("--repeatability-source-campaign", default=None, help="Existing frozen campaign directory.")
     validation.add_argument(
@@ -88,6 +92,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not repeatability and not args.gpu:
         parser.error("FPM requires --gpu for a new campaign")
 
+    if args.backend == "trtllm":
+        from .trtllm_runner import run_cli
+
+        try:
+            return run_cli(args, parser)
+        except _INPUT_ERRORS as error:
+            parser.error(str(error))
     try:
         if repeatability:
             from .repeatability import (
