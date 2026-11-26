@@ -39,6 +39,7 @@ class FakeExecutor:
     def __init__(self, rank):
         self.global_rank = rank
         self.hooks = []
+        self.model_engine = SimpleNamespace(_warmup_timer=SimpleNamespace(purpose="final_executor"))
 
     def _prepare_and_schedule_batch(self):
         self.hooks.append("schedule")
@@ -55,6 +56,18 @@ class FakeExecutor:
     def shutdown(self):
         self.hooks.append("shutdown")
         return "shutdown complete"
+
+
+def test_profiling_executor_is_not_observed(tmp_path, monkeypatch):
+    class Executor(FakeExecutor):
+        pass
+
+    observer.install_hooks(Executor, context(), tmp_path)
+    executor = Executor(0)
+    executor.model_engine._warmup_timer.purpose = "memory_profiling"
+    monkeypatch.setattr(observer, "device_uuid", lambda _: pytest.fail("profiling used the observer"))
+    assert executor._prepare_and_schedule_batch() == ("batch", None)
+    assert not hasattr(executor, "_aisim_trtllm_observer")
 
 
 def run(

@@ -155,8 +155,10 @@ class Observer:
         self.context, self.directory, self.rank, self.clock = context, directory, rank, clock
         self.energy = energy
         self.settings = settings
-        if any(type(settings[k]) is not type(v) or settings[k] != v for k, v in SETTINGS.items()):
-            raise ValueError("TRT-LLM FPM pinned serving settings mismatch")
+        for name, expected in SETTINGS.items():
+            actual = settings[name]
+            if type(actual) is not type(expected) or actual != expected:
+                raise ValueError(f"TRT-LLM FPM pinned serving setting {name}: expected {expected!r}, got {actual!r}")
         if type(settings["max_batch_size"]) is not int or settings["max_batch_size"] < 4:
             raise ValueError("TRT-LLM FPM requires max_batch_size >= 4")
         self.phase = context["phase"]
@@ -442,7 +444,9 @@ def install_hooks(executor_class, context, directory):
 
     def schedule_hook(self, *args, **kwargs):
         result = schedule(self, *args, **kwargs)
-        if not self.is_warmup:
+        # py_executor_creator._create_py_executor_impl labels the final engine
+        # after tearing down the temporary executor used for KV-cache profiling.
+        if not self.is_warmup and self.model_engine._warmup_timer.purpose == "final_executor":
             observer = getattr(self, "_aisim_trtllm_observer", None)
             if observer is None:
                 if (self.dist.tp_size, self.dist.pp_size, self.enable_attention_dp) != (2, 1, False):
