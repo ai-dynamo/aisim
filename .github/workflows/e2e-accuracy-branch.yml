@@ -190,7 +190,7 @@ jobs:
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
           PIP_CONFIG_FILE=/dev/null "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-accuracy-dataset
           path: ${{ runner.temp }}/accuracy-dataset
@@ -309,11 +309,11 @@ jobs:
           wheel = next((Path(os.environ['RUNNER_TEMP']) / 'accuracy-wheel').glob('*.whl'))
           print(wheel_identity(wheel))
           PYCODE
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-accuracy-dataset
           path: ${{ runner.temp }}/accuracy-dataset
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-accuracy-measurements-${{ inputs.artifact_key }}
           path: ${{ runner.temp }}/accuracy-measurements-encrypted
@@ -429,11 +429,11 @@ jobs:
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
           PIP_CONFIG_FILE=/dev/null "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-accuracy-dataset
           path: ${{ runner.temp }}/accuracy-dataset
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: e2e-accuracy-results-${{ inputs.artifact_key }}-shard-*
           path: ${{ runner.temp }}/accuracy-shards-encrypted
@@ -550,7 +550,7 @@ jobs:
           url: ${{ vars.WHEEL_STORAGE_URL }}
           repo: ${{ vars.WHEEL_STORAGE_REPO }}
           token: ${{ secrets.ARTIFACTORY_TOKEN }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: e2e-accuracy-dataset
           path: ${{ runner.temp }}/agentx-dataset
@@ -648,7 +648,7 @@ jobs:
         run: |
           python -I -m venv "${RUNNER_TEMP}/trusted-venv"
           PIP_CONFIG_FILE=/dev/null "${RUNNER_TEMP}/trusted-venv/bin/pip" install --require-hashes -r trusted/scripts/e2e_accuracy/requirements.txt
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: agentx-private-${{ inputs.artifact_key }}-*
           path: ${{ runner.temp }}/agentx-encrypted
