@@ -20,6 +20,19 @@ from collections import Counter
 from collections.abc import Mapping
 from typing import Any
 
+FPM_DECODER_ARCHITECTURES = {
+    "llama": "LlamaForCausalLM",
+    "mistral": "MistralForCausalLM",
+    "mixtral": "MixtralForCausalLM",
+    "qwen2": "Qwen2ForCausalLM",
+    "qwen3": "Qwen3ForCausalLM",
+    "qwen3_moe": "Qwen3MoeForCausalLM",
+    "minimax_m2": "MiniMaxM2ForCausalLM",
+    "glm_moe_dsa": "GlmMoeDsaForCausalLM",
+    "deepseek_v3": "DeepseekV3ForCausalLM",
+    "deepseek_v32": "DeepseekV32ForCausalLM",
+}
+
 RECURRENT_STATE_FIELDS = (
     "ssm_cfg",
     "mamba_d_state",

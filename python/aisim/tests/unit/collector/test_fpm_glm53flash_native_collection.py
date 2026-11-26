@@ -823,6 +823,41 @@ def test_glm_publication_matches_each_dispatch_to_its_scheduled_tokens(tmp_path,
     _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, "scheduled token count")
 
 
+@pytest.mark.parametrize(
+    ("fault", "reason"),
+    [
+        ("prefix", "prefix or new tokens"),
+        ("rejected-chunk", "scheduled token counts|prefix or new tokens"),
+        ("reused-id", "invalid accepted"),
+    ],
+)
+def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_path, fault, reason):
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_CACHED])
+    _glm_producer_shape(tmp_path)("prefill", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+
+    def corrupt(record):
+        warmup = record["repetitions"][0]
+        warmup["prefill_chunks"] = [[[PREFILL_CACHED["total_kv_read_tokens"], PREFILL_CACHED["total_prefill_tokens"]]]]
+        if fault == "prefix":
+            warmup["prefill_chunks"][0][0][0] = 0
+            return
+        for repetition in record["repetitions"]:
+            repetition["attempt"] += 1
+        rejected = copy.deepcopy(warmup)
+        rejected.pop("role")
+        rejected.pop("repetition")
+        rejected.update(attempt=0, rejection_reason="discarded sample")
+        record["rejected_repetitions"] = [rejected]
+        if fault == "rejected-chunk":
+            rejected["prefill_chunks"][0][0][1] = 4
+        else:
+            rejected["attempt"] = warmup["attempt"]
+
+    _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, reason)
+
+
 @pytest.mark.parametrize("records_counts", [True, False])
 def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_path, records_counts):
     cell = glm_cell("decode")
@@ -856,6 +891,7 @@ def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_pa
         ("chunk-outside-prompt", "exceeds the recorded prompt"),
         ("chunk-count", "contradicts the scheduled token counts"),
         ("chunk-receipt", "contradicts the scheduled token counts"),
+        ("decode-prefix", "finish the prompts"),
         ("prep-padding", "preparation dispatch receipt or padding"),
         ("prep-type", "preparation dispatch receipt or padding"),
         ("rejected-alignment", "aligned starts"),
@@ -888,6 +924,8 @@ def test_glm_publication_checks_preparation_and_rank_time(tmp_path, corruption, 
             repetition["prefill_chunks"][1][0][0] = 2177
         elif corruption == "chunk-length":
             repetition["prefill_chunks"][0][0][1] = 0
+        elif corruption == "decode-prefix":
+            repetition["prefill_chunks"][1][0][0] = 0
         elif corruption == "chunk-outside-prompt":
             repetition["prefill_chunks"][0][0][1] = 21760
         elif corruption in {"chunk-count", "chunk-receipt"}:

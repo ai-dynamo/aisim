@@ -125,18 +125,6 @@ _INKLING_CACHE_SOURCE = (
     "vllm/models/inkling/nvidia/sconv_swa_attn.py"
 )
 
-_ARCHITECTURES = {
-    "llama": "LlamaForCausalLM",
-    "mistral": "MistralForCausalLM",
-    "mixtral": "MixtralForCausalLM",
-    "qwen2": "Qwen2ForCausalLM",
-    "qwen3": "Qwen3ForCausalLM",
-    "qwen3_moe": "Qwen3MoeForCausalLM",
-    "minimax_m2": "MiniMaxM2ForCausalLM",
-    "glm_moe_dsa": "GlmMoeDsaForCausalLM",
-    "deepseek_v3": "DeepseekV3ForCausalLM",
-    "deepseek_v32": "DeepseekV32ForCausalLM",
-}
 _DENSE = frozenset(("LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"))
 _FULL_ATTENTION = _DENSE | {"MixtralForCausalLM", "Qwen3MoeForCausalLM", "MiniMaxM2ForCausalLM"}
 # MLA/DSA decoders: intake asks for their cache accounting instead of leaving it to the runtime probe.
@@ -287,6 +275,8 @@ def _require_finite(value: Any, field: str) -> None:
 
 
 def _architecture(raw: Mapping[str, Any]) -> str | None:
+    from aisim_core.decoder_config import FPM_DECODER_ARCHITECTURES
+
     architectures = raw.get("architectures")
     architecture = None
     if architectures is not None:
@@ -294,7 +284,7 @@ def _architecture(raw: Mapping[str, Any]) -> str | None:
             raise ValueError("architectures must identify exactly one decoder architecture")
         architecture = _text(architectures[0], "architectures[0]")
     model_type = _text(raw["model_type"], "model_type") if "model_type" in raw else None
-    expected = _ARCHITECTURES.get(model_type)
+    expected = FPM_DECODER_ARCHITECTURES.get(model_type)
     if expected and architecture and expected != architecture:
         raise ValueError(f"model_type={model_type!r} conflicts with architectures={architecture!r}")
     return architecture or expected
@@ -570,12 +560,14 @@ def _layout_notes(raw: Mapping[str, Any], architecture: str | None, runtime: tup
 
 
 def _validate_architecture(raw: Mapping[str, Any], architecture: str | None, experts: int | None) -> None:
+    from aisim_core.decoder_config import FPM_DECODER_ARCHITECTURES
+
     experts_per_token = raw.get("num_experts_per_tok")
     if experts and experts_per_token is not None and experts_per_token > experts:
         raise ValueError("num_experts_per_tok cannot exceed the routed expert count")
     if architecture in _DENSE and experts not in (None, 0):
         raise ValueError("num_experts conflicts with the declared dense architecture")
-    if architecture in set(_ARCHITECTURES.values()) - _DENSE and experts == 0:
+    if architecture in set(FPM_DECODER_ARCHITECTURES.values()) - _DENSE and experts == 0:
         raise ValueError("num_experts must be positive for the declared MoE architecture")
 
 

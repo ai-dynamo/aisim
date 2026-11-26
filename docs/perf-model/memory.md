@@ -103,6 +103,18 @@ an FPM profile and without `state_cache`, is a naive estimate and has the same
 refusals. So is `engine.kv_transfer.bytes_per_token: auto` of a disaggregated
 engine without an FPM profile and without `state_cache` on its prefill role.
 
+When this fallback selects a nested decoder, it uses the decoder's supported
+`model_type` if the optional `architectures` entry is absent. Automatic sizing
+uses each backend's checkpoint metadata. For example, the ModelOpt sidecar for
+Llama-3.1-70B-Instruct-FP8 selects a 20,480-byte FP8 cache per token at TP8.
+BF16 takes 40,960 bytes. An explicit `kvcache_quant_mode` selects the cache
+width. Uniform pipeline stages use their resident decoder layers. Uneven stages
+and stages with mixed attention layouts require the rank-local layout. Pipeline
+capacity for an unquantized dense Llama or Qwen decoder at TP1 reserves a full
+embedding or output head on the endpoint stage. Other pipeline layouts need
+the runtime's resident weight measurements. Speculative
+decoding capacity also needs the runtime draft weights and cache allocation.
+
 For a sliding-window decoder, the config-only shared pool estimate allows every
 scheduled token to be present in every attention layer. A prefill can occupy the
 retained window and its in-flight tokens at the same time. The runtime's
@@ -116,7 +128,9 @@ schedulable 16-token blocks (2,032 tokens).
 Groups with different KV widths can share a physical page size. Each independent
 scheduler block may open a page in every layer. For Gemma-4-26B at TP1/BF16, 32
 independent 16-token prompts use 120 MiB across 25 sliding and five global layers.
-vLLM reserves one additional 640 KiB row for its null block. A 110 MiB config-only
+vLLM reserves one additional 640 KiB row for its null block in the hybrid
+allocator. When the allocator mode is unknown, the estimate also covers the
+full-attention pool's null row. A 110 MiB config-only
 budget yields 29 independently schedulable 16-token blocks. The scalar API accepts
 `scheduler_block_size` to reserve that row once. Without a block size it allows
 room for a null row even if the caller chooses just one large scheduler block.
@@ -133,7 +147,9 @@ including Kimi K2.5's DeepSeek language decoder. [vLLM expert placement](https:/
 A selected sparse MLA decoder stores a latent, BF16 rotary keys, and a scaled
 FP8 index per layer. For GLM-5.3-NVFP4 with BF16 KV, each of 78 layers stores
 512 × 2 + 64 × 2 + 132 bytes, or 100,152 bytes per token across the decoder.
-Shared capacity also needs the runtime indexer allocation. Recurrent and
+Quantized sparse MLA requires the selected backend's latent and indexer formats.
+For example, FlashMLA stores an extra four FP32 scales in a 512-element FP8
+latent. Shared capacity also needs the runtime indexer allocation. Recurrent and
 other per-layer layouts require their runtime state or group measurements.
 Gemma 4 normalizes its final decoder layer to full attention even when an
 explicit list declares it sliding.

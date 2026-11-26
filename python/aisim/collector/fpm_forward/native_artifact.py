@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import statistics
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -524,6 +525,28 @@ def _observed_forward(sample: dict, wall_time: float, *, glm: bool, path: Path) 
     return timing["basis"], graph, reasons
 
 
+def _glm_scheduled_counts(stage: dict, path: Path) -> list | None:
+    """Read each observed scheduler output, preserving a missing dispatch as an unknown count."""
+    counts, receipts = stage.get("scheduled_token_counts"), stage.get("dispatches")
+    if "scheduled_token_counts" in stage and (
+        not isinstance(counts, list) or any(type(count) is not int or count <= 0 for count in counts)
+    ):
+        raise ValueError(f"invalid GLM scheduled token count: {path}")
+    if "dispatches" not in stage:
+        return counts
+    if not isinstance(receipts, list) or (counts is not None and len(counts) != len(receipts)):
+        raise ValueError(f"GLM scheduled token counts must align with dispatch receipts: {path}")
+    observed = []
+    for index, receipt in enumerate(receipts):
+        if receipt is not None and (not _valid_dispatch(receipt) or receipt["num_unpadded_tokens"] <= 0):
+            raise ValueError(f"invalid GLM preparation dispatch receipt or padding: {path}")
+        value = receipt["num_unpadded_tokens"] if receipt is not None else None
+        if counts is not None and value is not None and counts[index] != value:
+            raise ValueError(f"GLM dispatch contradicts its scheduled token count: {path}")
+        observed.append(value)
+    return counts if counts is not None else observed
+
+
 def _validate_glm_chunks(stage: dict, path: Path, point: dict, *, counts: list | None = None) -> None:
     chunks = stage.get("prefill_chunks", [])
     if not isinstance(chunks, list) or any(
@@ -543,8 +566,8 @@ def _validate_glm_chunks(stage: dict, path: Path, point: dict, *, counts: list |
     ):
         raise ValueError(f"native GLM-5.3-Flash prefill_chunks require aligned starts and positive lengths: {path}")
 
-    if not chunks:
-        return
+    if "prefill_chunks" not in stage:
+        return  # Older records did not always serialize chunk observations.
     # The compact records omit request IDs and empty scheduler steps. A chunk must fit a
     # real prompt and its tokens must fit one distinct, ordered scheduler output.
     prompt_limit = point["total_kv_read_tokens"] + point["total_prefill_tokens"]
@@ -568,7 +591,7 @@ def _validate_glm_chunks(stage: dict, path: Path, point: dict, *, counts: list |
     limits = None
     if isinstance(lengths, list) and lengths and all(type(n) is int and n >= 0 for n in lengths):
         limits = sorted((min(prompt_limit, n) for n in lengths), reverse=True)
-    schedule = iter(counts or ())
+    chunk_totals = []
     for step in chunks:
         ends = sorted((start + tokens for start, tokens in step), reverse=True)
         if (
@@ -580,12 +603,52 @@ def _validate_glm_chunks(stage: dict, path: Path, point: dict, *, counts: list |
             )
         ):
             raise ValueError(f"native GLM-5.3-Flash prefill chunk exceeds the recorded prompt: {path}")
-        total = sum(tokens for _, tokens in step)
-        if counts is not None and not any(
-            count is None or (type(count) is int and (total <= count <= total + point["batch_size"] - len(step)))
-            for count in schedule
-        ):
+        chunk_totals.append(sum(tokens for _, tokens in step))
+
+    minimums = chunk_totals.copy()
+    maximums = [total + point["batch_size"] - len(step) for total, step in zip(chunk_totals, chunks, strict=True)]
+    if point["point_type"] == "prefill" and "fpms" in stage:
+        # The producer records one FPM for every forward with prefill requests, including rejected attempts.
+        fpms = stage["fpms"]
+        if not isinstance(fpms, list) or len(fpms) != len(chunks):
+            raise ValueError(f"GLM prefill chunk steps must match the recorded prefill forwards: {path}")
+        for pos, (step, total, fpm) in enumerate(zip(chunks, chunk_totals, fpms, strict=True)):
+            scheduled = fpm.get("scheduled_requests") if isinstance(fpm, dict) else None
+            if not isinstance(scheduled, dict) or not all(
+                (
+                    _same(scheduled.get("num_prefill_requests"), len(step)),
+                    _same(scheduled.get("sum_prefill_kv_tokens"), sum(start for start, _ in step)),
+                    _same(scheduled.get("sum_prefill_tokens"), total),
+                )
+            ):
+                raise ValueError(
+                    f"GLM prefill chunks disagree with the prefix or new tokens read by that forward: {path}"
+                )
+            decodes = scheduled.get("num_decode_requests")
+            if type(decodes) is not int or not 0 <= decodes <= point["batch_size"] - len(step):
+                raise ValueError(f"GLM prefill forward has an invalid count of decode requests: {path}")
+            minimums[pos] = maximums[pos] = total + decodes
+
+    if counts is not None:
+        # Chunk lists omit decode-only outputs. Each such output can schedule at most one
+        # token per request. Unknown receipts and mixed steps may admit more than one match.
+        positions = {0}
+        for count in counts:
+            following = set(positions) if count is None or count <= point["batch_size"] else set()
+            for pos in positions:
+                if pos < len(chunks) and (count is None or (minimums[pos] <= count <= maximums[pos])):
+                    following.add(pos + 1)
+            positions = following
+        if len(chunks) not in positions:
             raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
+
+    if point["point_type"] == "decode" and "repetition" in stage and chunks:
+        # The final preparation chunks finish these prompts before the first accepted pure-decode forward.
+        ends = [start + tokens for start, tokens in chunks[-1]]
+        if (limits is not None and Counter(ends) - Counter(limits)) or (
+            len(ends) == point["batch_size"] and sum(ends) != point["total_kv_read_tokens"] - point["batch_size"]
+        ):
+            raise ValueError(f"GLM final preparation chunks must finish the prompts read by the decode forward: {path}")
 
 
 def _validate_glm_repetitions(
@@ -628,8 +691,13 @@ def _validate_glm_repetitions(
     rejected = record.get("rejected_repetitions", [])
     if not isinstance(rejected, list) or any(not isinstance(attempt, dict) for attempt in rejected):
         raise ValueError(f"{error}: invalid rejected repetitions: {path}")
+    rejected_ids = set()
     for attempt in rejected:
-        _validate_glm_chunks(attempt, path, point)
+        _validate_glm_chunks(attempt, path, point, counts=_glm_scheduled_counts(attempt, path))
+        attempt_id = attempt.get("attempt")
+        if type(attempt_id) is not int or attempt_id < 0 or attempt_id in rejected_ids:
+            raise ValueError(f"{error}: invalid or duplicate rejected attempt ID: {path}")
+        rejected_ids.add(attempt_id)
     previous_forward, previous_output = previous
     previous_attempt = -1
     for index, repetition in enumerate(repetitions):
@@ -640,6 +708,7 @@ def _validate_glm_repetitions(
             or repetition.get("role") != role
             or type(repetition.get("attempt")) is not int
             or repetition["attempt"] <= previous_attempt
+            or repetition["attempt"] in rejected_ids
             or "rejection_reason" in repetition
         ):
             raise ValueError(f"{error}: invalid accepted {role} at repetition {index}: {path}")
@@ -653,27 +722,7 @@ def _validate_glm_repetitions(
         # Earlier dispatches can build the prefix. Only the final ones are the forwards of this repetition.
         receipts = dispatches[-len(steps) :]
         counts = repetition.get("scheduled_token_counts")
-        if "scheduled_token_counts" in repetition and (not isinstance(counts, list) or len(counts) != len(dispatches)):
-            raise ValueError(f"{error}: scheduled token count list must align with the dispatch receipts: {path}")
-        for pos, dispatch in enumerate(dispatches[: -len(steps)]):
-            # Older records can omit a preparation observation or the scheduler counts.
-            if dispatch is not None and (not _valid_dispatch(dispatch) or dispatch["num_unpadded_tokens"] <= 0):
-                raise ValueError(f"{error}: invalid preparation dispatch receipt or padding: {path}")
-            if counts is not None:
-                count = counts[pos]
-                if (
-                    type(count) is not int
-                    or count <= 0
-                    or (dispatch is not None and dispatch["num_unpadded_tokens"] != count)
-                ):
-                    raise ValueError(f"{error}: preparation dispatch contradicts its scheduled token count: {path}")
-        chunk_counts = (
-            counts
-            if counts is not None
-            else [
-                dispatch.get("num_unpadded_tokens") if isinstance(dispatch, dict) else None for dispatch in dispatches
-            ]
-        )
+        chunk_counts = _glm_scheduled_counts(repetition, path)
         if point["point_type"] == "decode":
             chunk_counts = chunk_counts[: -len(steps)]
         _validate_glm_chunks(repetition, path, point, counts=chunk_counts)
