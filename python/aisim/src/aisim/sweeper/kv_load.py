@@ -14,6 +14,7 @@ from .config import ENGINE_MODEL_CONTROL_FIELDS, Workload
 from .forward_pass_estimator import resolve_systems_paths
 from .kv_estimate import DEFAULT_MEMORY_FRACTION, estimate_grouped_cache_budget, estimate_kv_tokens
 from .parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
+from .sample import sample_systems_paths
 
 
 class InfeasibleKVCapacity(ValueError):
@@ -107,7 +108,7 @@ def _role_capacity_tokens(
         if not roots and resolved.get("systems_path"):
             roots = [resolved["systems_path"]]
         if not roots:
-            roots = sample.get("systems_paths")
+            roots = sample_systems_paths(sample, role)
         profile = resolved.get("fpm_profile", sample.get("fpm_profile"))
         model_controls = {
             name: resolved.get(name, sample.get(name))
@@ -223,7 +224,7 @@ def _role_grouped_capacity(
                 if sample.get(f"{role}_gpu_memory_utilization") is not None
                 else DEFAULT_MEMORY_FRACTION
             ),
-            systems_paths=list(resolve_systems_paths(roots or sample.get("systems_paths"))),
+            systems_paths=list(resolve_systems_paths(roots or sample_systems_paths(sample, role))),
             model_controls=controls,
             nextn=int(resolved.get("nextn", sample.get("aic_nextn")) or 0),
         )

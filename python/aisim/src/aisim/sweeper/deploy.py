@@ -13,6 +13,7 @@ from ..capacity import estimate_kv_bytes_per_token, materialize_aic_num_gpu_bloc
 from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control, omit_inactive_moe_controls
 from ..config.engine import NgramSpeculationConfig, resolve_block_size
 from .replay import BackendDeploymentSpec, EncoderPoolSpec, ForwardPassEstimatorSpec
+from .sample import sample_systems_paths
 
 # `--chunked-prefill-size` when SGLang is launched without one.
 SGLANG_DEFAULT_CHUNKED_PREFILL_SIZE = 8192
@@ -59,8 +60,8 @@ def _performance_model_metadata(sample: dict[str, Any], role: str, *, backend_ve
         config["fpm_parquet_path"] = sample[f"{role}_fpm_parquet_path"]
     if sample.get("speculation") is not None:
         config["speculation"] = NgramSpeculationConfig.model_validate(sample["speculation"]).cost_config()
-    if sample.get("systems_paths") is not None:
-        config["systems_paths"] = sample["systems_paths"]
+    if (paths := sample_systems_paths(sample, role)) is not None:
+        config["systems_paths"] = paths
     return {"provider": "aic", "config": config}
 
 
@@ -114,10 +115,11 @@ def _engine_args_payload(
         if sample.get("aic_nextn") or sample.get("speculation") is not None:
             raise ValueError("decode_radix_cache is incompatible with speculative decoding for SGLang decode")
         payload["sglang"] = {"disaggregation_decode_enable_radix_cache": True}
-    if sample.get("systems_paths") is not None and sample.get(f"{role}_timing_model") is not None:
+    paths = sample_systems_paths(sample, role)
+    if paths is not None and sample.get(f"{role}_timing_model") is not None:
         from .forward_pass_estimator import resolve_systems_paths
 
-        payload["systems_path"] = list(resolve_systems_paths(sample["systems_paths"]))
+        payload["systems_path"] = list(resolve_systems_paths(paths))
     if role in ("agg", "prefill") and backend == "sglang":
         # Ahead of the capacity materialization below, which deducts the tower and cache.
         payload.update(_native_vl_engine_args(sample, role))
@@ -269,13 +271,20 @@ def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any],
     payload.setdefault("max_model_len", profile.context_length)
 
 
+def _kv_systems_args(sample: dict[str, Any], role: str) -> dict[str, Any]:
+    from .forward_pass_estimator import resolve_systems_paths
+
+    paths = sample_systems_paths(sample, role)
+    return {"systems_paths": list(resolve_systems_paths(paths))} if paths else {}
+
+
 def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:
     if sample.get("fpm_profile") is None:
         return {
             "backend": sample["backend"],
             "backend_version": backend_version,
             "system": _role_hardware_sku(sample, role),
-            **({"systems_paths": sample["systems_paths"]} if sample.get("systems_paths") else {}),
+            **_kv_systems_args(sample, role),
         }
     prefix = _role_prefix(role)
     return {
@@ -448,7 +457,7 @@ def _build_afd_roles_deployment(sample, backend_version, estimators, encoder):
             backend=sample["backend"],
             backend_version=backend_version,
             system=topology.get("a_system") or _role_hardware_sku(sample, "prefill"),
-            **({"systems_paths": sample["systems_paths"]} if sample.get("systems_paths") else {}),
+            **_kv_systems_args(sample, "prefill"),
             pp_size=1,
             moe_tp_size=1,
             moe_ep_size=1,  # Per-request A-replica geometry, not the F-pool width.

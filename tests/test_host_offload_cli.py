@@ -25,7 +25,7 @@ from aisim.config.engine import KvCachePredictionConfig
 from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
 from aisim.runner import EngineReplayRunnerFactory
 from aisim.sweeper.deploy import build_backend_deployment
-from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
 from aisim.sweeper.replay import ReplayOutputRequirements, ReplaySpec, RunnerCapabilities
 from aisim.sweeper.sample import unroll_sample
 
@@ -574,6 +574,84 @@ def test_recommendation_carries_fixed_host_descriptor_without_search_dimension()
     assert space.agg_kv_bytes_per_token == 131_072
     assert space.agg_native_host_offload == _host_offload()
     assert "host" not in space.engine_float_ranges
+
+
+@pytest.mark.parametrize(
+    ("feature", "valid_shared", "override_role", "can_size"),
+    [
+        ("transfer", True, None, True),
+        ("transfer", False, "prefill", True),
+        ("transfer", True, "prefill", False),
+        ("transfer", True, "decode", True),
+        ("aggregated", False, "aggregated", True),
+        ("prefill", True, "prefill", False),
+        ("decode", False, "decode", True),
+    ],
+)
+def test_recommendation_and_prediction_use_the_same_worker_roots_for_auto_kv(
+    tmp_path, feature, valid_shared, override_role, can_size
+):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("zai-org/GLM-5-FP8")
+    (tmp_path / "config.json").write_text(json.dumps({**raw, "architectures": ["LocalMultimodal"], "text_config": raw}))
+    hopper, empty = tmp_path / "hopper", tmp_path / "empty"
+    hopper.mkdir()
+    empty.mkdir()
+    (hopper / "h200_sxm.yaml").write_text("gpu: {sm_version: 90}\n")
+    mode = "aggregated" if feature == "aggregated" else "disaggregated"
+    engine = _prediction_engine(mode=mode)
+    engine.update(model=str(tmp_path), backend_version="0.33.0", systems_paths=[str(hopper if valid_shared else empty)])
+    for role, worker in engine["workers"].items():
+        worker["parallelism"]["tensor"] = 1
+        worker["timing"] = {"type": "default"}
+        if role == override_role:
+            worker["timing"]["systems_paths"] = [str(empty if valid_shared else hopper)]
+    if feature == "transfer":
+        engine["kv_transfer"] = {"bytes_per_token": "auto", "bandwidth_gb_per_second": 80}
+    else:
+        engine["workers"][feature]["kv_cache"].update(bytes_per_token="auto", host_offload=_host_offload())
+    prediction = CorePredictionConfig.model_validate({"engine": engine})
+    for worker in engine["workers"].values():
+        worker["parallelism"] = {"preset": False, **worker["parallelism"]}
+    config = CoreRecommendationConfig.model_validate(
+        {"engine": engine, "optimization": {"constraints": {"max_candidate_gpus": 2}}}
+    )
+    space = recommendation_to_sweeper(config).search_space
+    selection = {"backend": "vllm", "deployment_mode": "agg" if mode == "aggregated" else "disagg"}
+    for role in engine["workers"]:
+        prefix = "agg" if role == "aggregated" else role
+        selection.update({f"{prefix}_max_num_batched_tokens": 8192, f"{prefix}_max_num_seqs": 4})
+    rank = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
+    sample = unroll_sample(
+        search_space=space,
+        selection=selection,
+        parallel_config=rank if mode == "aggregated" else DisaggParallelConfig(rank, rank),
+    )
+    source = engine["workers"]["prefill" if feature == "transfer" else feature]
+    paths = source["timing"].get("systems_paths", engine["systems_paths"])
+    if can_size:
+        assert (
+            estimate_kv_bytes_per_token(
+                str(tmp_path), tp_size=1, pp_size=1, backend_version="0.33.0", system="h200_sxm", systems_paths=paths
+            )
+            == 100_152
+        )
+    for compile_deployment in (
+        lambda: prediction_to_replay_spec(prediction).backend_deployment,
+        lambda: build_backend_deployment(sample, backend_version="0.33.0"),
+    ):
+        if not can_size:
+            with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
+                compile_deployment()
+        elif feature == "transfer":
+            deployment = compile_deployment()
+            assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == 100_152
+            assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == 100_152
+        else:
+            role = "agg" if feature == "aggregated" else feature
+            assert getattr(compile_deployment(), f"{role}_engine_args")["kv_cache_bytes_per_token"] == 100_152
 
 
 def test_recommendation_materializes_concrete_host_offload_prediction() -> None:
