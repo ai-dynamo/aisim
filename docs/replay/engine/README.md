@@ -223,9 +223,9 @@ version, endpoint, host CPU and tokenizer:
 
 - `engine.tokenization` comes from the tokenizer measurement, and
   `engine.extra_cpu_overhead` from the unqueued measurement (client TTFT minus
-  engine time at one request in flight). The unqueued per-token term is the
-  measured total less the tokenizer slope, so the two stages reproduce the
-  measured total.
+  engine time at one request in flight). The unqueued fixed and per-token
+  terms are the measured totals less the tokenizer's, so the two stages
+  reproduce the measured total.
 - A field the config sets, including an explicit zero, always wins; only unset
   fields are filled.
 - An uncollected backend version reuses the closest collected one (at or
@@ -242,7 +242,7 @@ Measured on B300 (Intel Xeon Platinum 8559C):
 | Deployment | `engine.tokenization` | `engine.extra_cpu_overhead` |
 |---|---|---|
 | vLLM 0.31.0, chat, Qwen2 tokenizer | 1.532 µs/token | 29.5 ms + 0.149 µs/token |
-| SGLang 0.5.20 (unqueued) and 0.5.21 (tokenizer), chat, GLM tokenizer | 0.29 ms + 1.217 µs/token | 12.6 ms + 0.342 µs/token |
+| SGLang 0.5.20 (unqueued) and 0.5.21 (tokenizer), chat, GLM tokenizer | 0.29 ms + 1.217 µs/token | 12.29 ms + 0.342 µs/token |
 
 <a id="detokenization"></a>
 

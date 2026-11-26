@@ -7,8 +7,11 @@ IDs and the raw SGLang seed-42 inputs are in `aisim-data-internal` under
 
 | Entry | Runs | Outside engine (mean) | Tokenizer entry | Unqueued |
 |---|---|---|---|---|
-| SGLang 0.5.20, GLM-5.3-NVFP4, chat | seed 42 (exact config), seed 7 | 12.58 ms + 1.559 µs/token | SGLang 0.5.21 `glm`, 1.217 µs/token | 12.58 ms + 0.342 µs/token |
+| SGLang 0.5.20, GLM-5.3-NVFP4, chat | seed 42 (exact config), seed 7 | 12.58 ms + 1.559 µs/token | SGLang 0.5.21 `glm`, 0.29 ms + 1.217 µs/token | 12.58 ms + 0.342 µs/token |
 | vLLM 0.31.0, Qwen3.5-397B-A17B, chat | l1/l4 midpoint | 29.5 ms + 1.681 µs/token | vLLM 0.31.0 `qwen2`, 1.532 µs/token | 29.5 ms + 0.149 µs/token |
+
+Replay subtracts the paired tokenizer's clamped `base_ms` and slope from these totals: the SGLang unqueued term
+replay uses is 12.29 ms + 0.342 µs/token.
 
 ## SGLang
 

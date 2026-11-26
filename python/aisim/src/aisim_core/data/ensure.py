@@ -703,6 +703,12 @@ def _ensure_host_cost(
     """
     from aisim_core.host_cost.lookup import choose, overhead, tokenizer_key
 
+    if pin.configuration_id:
+        # Entries are chosen by deployment (closest version, tokenizer, host CPU); an ID cannot pick one of them.
+        raise DataConflictError(
+            f"configuration {pin.configuration_id} cannot select host-cost data: host-cost entries are chosen from "
+            "backend, backend_version, endpoint, system and model; unset AISIM_DATA_CONFIGURATION for host-cost"
+        )
     config = out.config
     missing = [name for name in ("backend_version", "model", "endpoint") if not config.get(name)]
     if missing:

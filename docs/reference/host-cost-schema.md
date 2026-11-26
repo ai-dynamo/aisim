@@ -67,8 +67,8 @@ versions are recollected only every one or two releases, so an uncollected versi
 one (at or below it, else the nearest above) and the result names the version that stood in.
 `LookupResult.engine_tokenization()` returns the `engine.tokenization` block; a negative fitted `base_ms` is
 clamped to 0. `choose(...)` picks the tokenizer and unqueued entries of one deployment from catalog identities, and
-`overhead(...)` shapes them as replay blocks: the unqueued per-token term is the stored total less the tokenizer slope
-it is paired with. `aisim_core.host_cost.replay.measured_overhead(...)` does both through `ensure_data` with a
+`overhead(...)` shapes them as replay blocks: the unqueued `base_ms` and per-token terms are the stored totals less
+the tokenizer terms they are paired with. `aisim_core.host_cost.replay.measured_overhead(...)` does both through `ensure_data` with a
 `host-cost` pin.
 
 ## Limits

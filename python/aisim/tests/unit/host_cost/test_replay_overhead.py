@@ -12,7 +12,7 @@ import pytest
 from aisim.compiler import prediction_to_replay_spec
 from aisim.config.cli import CorePredictionConfig
 from aisim_core.data import DatasetIndex, Manifest
-from aisim_core.data.ensure import DataPin, MissingDataError, ensure_data
+from aisim_core.data.ensure import DataConflictError, DataPin, MissingDataError, ensure_data
 from aisim_core.data.host_cost import (
     check_entry,
     read_fit,
@@ -167,14 +167,15 @@ def test_both_measured_deployments_read_tokenization_and_unqueued_overhead(local
     vllm = _measured()
     assert vllm.tokenization["workers"] == 1
     assert vllm.tokenization["per_input_token_us"] == pytest.approx(_tokenizer_us(local, "vllm"))
-    assert vllm.extra_cpu_overhead["base_ms"] == pytest.approx(29.5)
+    assert vllm.tokenization["base_ms"] + vllm.extra_cpu_overhead["base_ms"] == pytest.approx(29.5)
     # The two stages reproduce the measured total outside the engine.
     total = vllm.tokenization["per_input_token_us"] + vllm.extra_cpu_overhead["per_input_token_us"]
     assert total == pytest.approx(1.7)
 
     sglang = _measured(backend="sglang", backend_version="0.5.20", model=GLM)
     assert sglang.tokenization["per_input_token_us"] == pytest.approx(_tokenizer_us(local, "sglang"))
-    assert sglang.extra_cpu_overhead["base_ms"] == pytest.approx(12.6)
+    # Neither term is counted twice: the stages split the measured fixed cost too.
+    assert sglang.tokenization["base_ms"] + sglang.extra_cpu_overhead["base_ms"] == pytest.approx(12.6)
     assert sglang.tokenization["per_input_token_us"] + sglang.extra_cpu_overhead["per_input_token_us"] == (
         pytest.approx(1.56)
     )
@@ -201,7 +202,8 @@ def test_unmeasured_deployments_have_no_default(local, kwargs):
 def test_ensure_data_wires_host_cost_and_names_the_entries(local):
     config = {"system": "b300_sxm", "backend": "vllm", "backend_version": "0.31.0", "model": QWEN, "endpoint": "chat"}
     ensured = ensure_data(config, DataPin(local_root=local, categories=("host-cost",)))
-    assert ensured.config["host_cost"]["extra_cpu_overhead"]["base_ms"] == pytest.approx(29.5)
+    host_cost = ensured.config["host_cost"]
+    assert host_cost["tokenization"]["base_ms"] + host_cost["extra_cpu_overhead"]["base_ms"] == pytest.approx(29.5)
     assert len(ensured.datasets["host-cost"]["configuration_ids"]) == 2
 
     unmeasured = ensure_data({**config, "system": "h200_sxm"}, DataPin(local_root=local, categories=("host-cost",)))
@@ -212,6 +214,13 @@ def test_ensure_data_wires_host_cost_and_names_the_entries(local):
         ensure_data(
             {k: v for k, v in config.items() if k != "endpoint"}, DataPin(local_root=local, categories=("host-cost",))
         )
+
+
+def test_a_configuration_id_cannot_pick_host_cost_entries(local):
+    config = {"system": "b300_sxm", "backend": "vllm", "backend_version": "0.31.0", "model": QWEN, "endpoint": "chat"}
+    pin = DataPin(local_root=local, categories=("host-cost",), configuration_id="cfg-" + "0" * 64)
+    with pytest.raises(DataConflictError, match="cannot select host-cost data"):
+        ensure_data(config, pin)
 
 
 def test_the_shipped_pin_names_a_full_commit():
@@ -247,13 +256,16 @@ def test_compiler_applies_the_measured_overhead_only_when_asked(local):
         }
     )
     assert on.extra_cpu_overhead == pytest.approx(
-        {"base_ms": 29.5, "per_input_token_ms": measured.extra_cpu_overhead["per_input_token_us"] / 1000}
+        {
+            "base_ms": measured.extra_cpu_overhead["base_ms"],
+            "per_input_token_ms": measured.extra_cpu_overhead["per_input_token_us"] / 1000,
+        }
     )
 
     glm = prediction_to_replay_spec(
         _prediction(backend="sglang", version="0.5.20", model=GLM), cpu_overhead_endpoint="chat"
     ).backend_deployment
-    assert glm.extra_cpu_overhead["base_ms"] == pytest.approx(12.6)
+    assert glm.tokenization["base_ms"] + glm.extra_cpu_overhead["base_ms"] == pytest.approx(12.6)
 
     unmeasured = prediction_to_replay_spec(
         _prediction(hardware="h200_sxm"), cpu_overhead_endpoint="chat"
@@ -279,4 +291,4 @@ def test_caller_set_fields_win_over_the_measured_overhead(local):
         _prediction(tokenization={"per_input_token_us": 0}), cpu_overhead_endpoint="chat"
     ).backend_deployment
     assert partial.tokenization is None
-    assert partial.extra_cpu_overhead["base_ms"] == pytest.approx(29.5)
+    assert partial.extra_cpu_overhead["base_ms"] == pytest.approx(_measured().extra_cpu_overhead["base_ms"])

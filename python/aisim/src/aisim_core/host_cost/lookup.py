@@ -9,8 +9,8 @@ version reuses the closest collected one (at or below it, else the nearest above
 
 Two entry purposes pair up (see :mod:`aisim_core.data.host_cost`): the tokenizer entry gives the queued
 ``engine.tokenization``; the unqueued entry gives ``engine.extra_cpu_overhead``. The unqueued entry stores the
-measured total per-token cost outside the engine, so its per-token term is the total less the tokenizer slope it is
-paired with here, and the two together reproduce the measured total. A deployment with no tokenizer entry has no
+measured cost outside the engine, so its terms are the total less the tokenizer terms it is paired with here, and the
+two together reproduce the measured total. A deployment with no tokenizer entry has no
 default at all.
 """
 
@@ -253,9 +253,10 @@ def overhead(
     if unqueued is not None:
         unqueued_choice, unqueued_manifest = unqueued
         fit = read_unqueued_fit(unqueued_manifest)
-        # Split the measured total against the slope replay actually queues, so the two reproduce the total.
+        # Split the measured total against the tokenizer stage replay actually queues (fixed and per-token terms), so
+        # the two stages reproduce the measured total.
         extra = {
-            "base_ms": fit.base_ms,
+            "base_ms": max(fit.base_ms - tokenization["base_ms"], 0.0),
             "per_input_token_us": max(fit.total_per_input_token_us - tokenization["per_input_token_us"], 0.0),
         }
         provenance["extra_cpu_overhead"] = {
