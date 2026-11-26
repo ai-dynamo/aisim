@@ -818,6 +818,7 @@ def test_native_grouped_pd_checks_resolved_nixl_identity(grouped_case, field, ti
         ("model", "require matching model"),
         ("backend_version", "vllm_version .* must match timing backend_version"),
         ("runtime_framework_version", "runtime_memory.runtime_framework_version .* to equal the deployment's"),
+        ("model_dtype", "require matching model_dtype"),
     ],
 )
 def test_native_grouped_pd_binds_timing_model_and_version_to_the_handoff(grouped_case, field, error):
@@ -825,13 +826,17 @@ def test_native_grouped_pd_binds_timing_model_and_version_to_the_handoff(grouped
     from aisim.runner import EngineReplayRunnerFactory
 
     profile, root = grouped_case
-    if field == "runtime_framework_version":
+    if field in {"runtime_framework_version", "model_dtype"}:
         profile = _with_prefix_evidence(_with_state_group(profile), version="0.32.0")
+    if field == "model_dtype":
+        for deployment in profile["deployments"]:
+            deployment["fmha_quant_mode"] = deployment["kv_cache_dtype"] = "fp8"
+            deployment["resources"]["runtime_memory"]["model_dtype"] = "torch.bfloat16"
     profile = _with_transfer_markers(profile, version="0.32.0")
     profile["deployments"] = [profile["deployments"][0]]
     _write_timings(root, profile, version="0.32.0")
     raw = _pd_prediction(profile, root)
-    if field == "runtime_framework_version":
+    if field in {"runtime_framework_version", "model_dtype"}:
         raw["engine"]["context_length"] = 1024
         raw["traffic"]["source"]["input_tokens"] = 256
     config = CorePredictionConfig.model_validate(raw)
@@ -858,7 +863,9 @@ def test_native_grouped_pd_binds_timing_model_and_version_to_the_handoff(grouped
                 version = "0.33.0"
                 timing["backend_version"] = measured["deployments"][0]["backend_version"] = version
             else:
-                measured["deployments"][0]["resources"]["runtime_memory"]["runtime_framework_version"] = "0.33.0"
+                measured["deployments"][0]["resources"]["runtime_memory"][field] = (
+                    "torch.float16" if field == "model_dtype" else "0.33.0"
+                )
             _write_timings(systems, measured, version=version)
             return _runtime.run_replay_json(json.dumps(payload))
 
@@ -2015,6 +2022,34 @@ def test_grouped_search_checks_incompatible_deployments_before_creating_replica_
         )
 
 
+def test_linear_pd_search_shares_decode_replicas_and_constructs_only_in_budget(grouped_case, monkeypatch):
+    from aisim.fpm_profile import load_fpm_profile
+    from aisim.sweeper import model_hw
+
+    profile = _mixed_profile(grouped_case[0])
+    profile["deployments"] = [{**profile["deployments"][0], "tp": 1, "moe_tp": 1}]
+    options = dict(
+        hardware_sku="h200_sxm",
+        backend="vllm",
+        backend_version="0.25.1",
+        gpu_budget=512,
+        deployment_mode="disagg",
+    )
+    profile = load_fpm_profile(profile)
+    pairs = model_hw._profile_parallel_configs(profile, min_gpu_budget=None, **options)
+    assert len(pairs) == 512 * 511 // 2
+    assert len({id(pair.decode) for pair in pairs}) == 511
+    constructor = model_hw.DisaggParallelConfig
+
+    def in_budget(prefill, decode):
+        assert prefill.total_gpus + decode.total_gpus == 512
+        return constructor(prefill, decode)
+
+    monkeypatch.setattr(model_hw, "DisaggParallelConfig", in_budget)
+    pairs = model_hw._profile_parallel_configs(profile, min_gpu_budget=512, **options)
+    assert [(pair.prefill.replicas, pair.decode.replicas) for pair in pairs] == [(p, 512 - p) for p in range(1, 512)]
+
+
 @pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize(
     "case, error",
@@ -2023,6 +2058,8 @@ def test_grouped_search_checks_incompatible_deployments_before_creating_replica_
         ("tp", "equal tensor parallelism and identical cache groups"),
         ("dtype", "matching kv_cache_dtype"),
         ("backend", "matching attention_backend"),
+        ("model_dtype", "matching model_dtype"),
+        ("same_model_dtype", None),
         ("markers", "transfer_bytes_per_block"),
         ("version", "vLLM 0.31.0"),
         ("runtime_version", "runtime_memory.runtime_framework_version"),
@@ -2040,7 +2077,7 @@ def test_direct_grouped_pd_parallel_configs(grouped_case, pinned, case, error):
 
     profile, root = grouped_case
     version = "0.34.0" if case == "version" else "0.32.0"
-    if case == "runtime_version":
+    if case in {"runtime_version", "model_dtype", "same_model_dtype"}:
         profile = _with_prefix_evidence(profile, version=version)
     profile = _with_transfer_markers(profile, version=version)
     tensor, dep = profile["deployments"]
@@ -2050,6 +2087,15 @@ def test_direct_grouped_pd_parallel_configs(grouped_case, pinned, case, error):
         decode["kv_cache_dtype"] = "int8"
     if case == "backend":
         decode["attention_backend"] = "fa3"
+    if case in {"model_dtype", "same_model_dtype"}:
+        for deployment in (prefill, decode):
+            deployment["kv_cache_dtype"] = deployment["fmha_quant_mode"] = "fp8"
+        prefill["resources"]["runtime_memory"]["model_dtype"] = "torch.bfloat16"
+        measured_dtype = "torch.float16" if case == "model_dtype" else "bf16"
+        observed = json.dumps({"runtime_settings": {"model_config": {"dtype": measured_dtype}}})
+        decode["resources"]["runtime_memory"]["provenance"] = json.dumps(
+            {"cell_observations": [{"runtime_memory": {"provenance": observed}}]}
+        )
     if case == "runtime_version":
         decode["resources"]["runtime_memory"]["runtime_framework_version"] = "0.33.0"
     profile["deployments"] = [prefill, decode]
@@ -3365,6 +3411,57 @@ def test_grouped_vllm_0330_plan_with_an_unmarked_window_group_is_cold_without_a_
         assert worker["kv_cache"]["prefix_caching"] is False
     with pytest.raises(ValidationError, match="every cache group to declare prefix_cacheable"):
         CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, "0.33.0"))
+
+
+def test_convolution_with_larger_checkpointed_state_plans_and_runs_cold(grouped_case, tmp_path, monkeypatch):
+    profile, root = grouped_case
+    version = "0.32.0"
+    profile = _with_prefix_evidence(_with_state_group(profile), hash_block=4, version=version)
+    for deployment in profile["deployments"]:
+        resources = deployment["resources"]
+        resources["runtime_memory"]["kv_cache_bytes"] = 32_768
+        resources["cache_groups"] = [
+            {**_CONVOLUTION_GROUP, "block_size_tokens": 4},
+            {
+                **resources["cache_groups"][-1],
+                "block_size_tokens": 16,
+                "prefill_checkpoint_blocks": 1,
+                "prefill_checkpoint_alignment": 4,
+            },
+        ]
+    with pytest.raises(ValidationError, match="smallest block_size_tokens"):
+        CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, version))
+    plan, output = _plan_and_validate_weka(profile, tmp_path, monkeypatch, version=version, context_length=1024)
+    for path in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        worker = yaml.safe_load((plan / path).read_text())["engine"]["workers"]["aggregated"]
+        assert worker["kv_cache"]["prefix_caching"] is False
+    assert json.loads((output / "validation.json").read_text())["status"] == "covered"
+
+
+@reads_saved_config
+def test_saved_warm_convolution_pilots_verify_with_their_original_geometry(grouped_case, tmp_path, capsys, monkeypatch):
+    from aisim import _runtime
+    from aisim.support import plan as plan_module
+
+    profile = _with_prefix_evidence(_with_state_group(grouped_case[0]), hash_block=4, version="0.32.0")
+    for deployment in profile["deployments"]:
+        resources = deployment["resources"]
+        resources["runtime_memory"]["kv_cache_bytes"] = 32_768
+        resources["cache_groups"] = [
+            {**_CONVOLUTION_GROUP, "block_size_tokens": 4},
+            {
+                **resources["cache_groups"][-1],
+                "block_size_tokens": 16,
+                "prefill_checkpoint_blocks": 1,
+                "prefill_checkpoint_alignment": 4,
+            },
+        ]
+    with monkeypatch.context() as patch:
+        patch.setattr(_runtime, "validate_grouped_prefix_geometry", lambda *args: None)
+        _onboarding_plan(profile, tmp_path, capsys, "0.32.0")
+    saved = tmp_path / "collection"
+    assert _prefix_caching_of(saved) == [True, True]
+    plan_module.check_plan(SupportRequest.from_yaml(saved / "request.yaml"), saved)
 
 
 def test_grouped_vllm_0330_profile_without_checkpoint_fields_is_refused_by_native_replay(grouped_case):

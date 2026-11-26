@@ -118,44 +118,145 @@ impl Default for ReplayRoleConfig {
 }
 
 impl ReplayRoleConfig {
-    /// NIXL hashes the model ID, cache dtype and attention backend. The
-    /// materialized AIC timing descriptor records these facts. Fixed timings
-    /// do not identify a model or a cache dtype.
-    fn grouped_transfer_identity(&self) -> ReplayResult<[Option<&str>; 3]> {
+    /// Match the rank, estimator, and selected deployment before comparing NIXL's
+    /// model ID, KV dtype, attention backend and model dtype across the pair.
+    fn grouped_transfer_identity(&self) -> anyhow::Result<[Option<String>; 4]> {
+        use crate::perfmodel::{ForwardPassPerfModelConfig, FpmCacheGroup, FpmRuntimeMemoryConfig};
+        use anyhow::{Context, bail, ensure};
+
         let TimingModelConfig::External { provider, config } = &self.rank.timing_model else {
-            return Ok([None; 3]);
+            return Ok(Default::default());
         };
-        if provider != "aic" {
-            return Ok([None; 3]);
+        if !matches!(provider.as_str(), "aic" | "ais") {
+            return Ok(Default::default());
         }
+        let alias = |name, legacy| {
+            config
+                .get(name)
+                .filter(|value| !value.is_null())
+                .or_else(|| config.get(legacy).filter(|value| !value.is_null()))
+        };
         let known = |value: &&str| {
             !value.eq_ignore_ascii_case("auto") && !value.eq_ignore_ascii_case("unknown")
         };
-        if let Some(version) = config
-            .get("backend_version")
-            .and_then(Value::as_str)
-            .filter(known)
-            && let Some(rank_version) = &self.rank.vllm_version
-            && version != rank_version
-        {
-            return Err(ReplayError::InvalidSpec(format!(
-                "grouped rank vllm_version ({rank_version}) must match timing backend_version ({version})"
-            )));
+        let role = serde_json::json!(self.rank.worker_type);
+        ensure!(
+            config["worker_type"].is_null() || config["worker_type"] == role,
+            "estimator worker_type does not match replay role"
+        );
+        // Injected providers may omit identity fields. Use the rank's geometry for
+        // those defaults; parse recorded sizes and their aliases with the FPM types.
+        let model = alias("model", "model_path").and_then(Value::as_str);
+        let mut selector = serde_json::json!({
+            "model": model.unwrap_or_default(), "system": config["system"].as_str().unwrap_or_default(),
+            "backend": config["backend"].as_str().unwrap_or("vllm"), "worker_type": role,
+            "backend_version": config["backend_version"], "tp": self.tensor_parallel_size,
+            "attention_dp": self.dp_size, "cp_size": config["cp_size"], "dcp": config["dcp"],
+            "moe_tp_size": config["moe_tp_size"], "moe_ep_size": config["moe_ep_size"]
+        });
+        for (key, legacy) in [("tp", "tp_size"), ("attention_dp", "attention_dp_size")] {
+            if let Some(value) = alias(key, legacy) {
+                selector[key] = value.clone();
+            }
         }
+        let timing: ForwardPassPerfModelConfig =
+            serde_json::from_value(selector).context("invalid grouped timing identity")?;
+        ensure!(
+            timing.backend == crate::BackendKind::Vllm,
+            "grouped rank requires timing backend=vllm"
+        );
+        for (field, recorded, rank) in [
+            ("tp", timing.tp, self.tensor_parallel_size),
+            ("attention_dp", timing.attention_dp, self.dp_size),
+            (
+                "cp_size",
+                timing.cp_size.unwrap_or(1),
+                self.prefill_context_parallel_size,
+            ),
+        ] {
+            let unknown = field != "cp_size" && recorded == crate::UNKNOWN_SIZE;
+            ensure!(
+                unknown || recorded == rank,
+                "grouped timing {field} ({recorded}) must match the replay rank ({rank})"
+            );
+        }
+        let profile = config.get("fpm_profile").filter(|v| !v.is_null());
+        ensure!(
+            timing.dcp.is_none_or(|size| size == 1 && profile.is_none()),
+            "grouped replay does not model timing dcp for an FPM profile or a striped cache"
+        );
+        let deployment = match profile {
+            Some(value) => Some(timing.matching_fpm_deployment(
+                value.as_object().context("fpm_profile must be an object")?,
+            )?),
+            None => None,
+        };
+        let memory = deployment.and_then(|d| d.pointer("/resources/runtime_memory"));
+        for (field, version) in [
+            ("timing backend_version", timing.backend_version.as_deref()),
+            (
+                "runtime_memory.runtime_framework_version",
+                memory.and_then(|m| m["runtime_framework_version"].as_str()),
+            ),
+        ] {
+            if let Some(version) = version.filter(known)
+                && let Some(rank_version) = &self.rank.vllm_version
+                && version != rank_version
+            {
+                bail!("grouped rank vllm_version ({rank_version}) must match {field} ({version})");
+            }
+        }
+        if let Some(resources) = deployment.and_then(|d| d.get("resources")) {
+            ensure!(
+                resources["cache_layout"]
+                    .as_str()
+                    .is_none_or(|layout| layout == "grouped"),
+                "grouped rank requires a grouped selected deployment"
+            );
+            if let Some(groups) = resources.get("cache_groups") {
+                let measured: Vec<FpmCacheGroup> = serde_json::from_value(groups.clone())
+                    .context("invalid selected cache groups")?;
+                ensure!(
+                    measured == self.rank.kv_cache_groups,
+                    "grouped rank kv_cache_groups must match the selected deployment"
+                );
+            }
+        }
+        let source = |field, declared: Option<&str>, observed: Option<&str>| -> anyhow::Result<_> {
+            let declared = declared.filter(known);
+            let observed = observed.filter(known);
+            if let (Some(a), Some(b)) = (declared, observed)
+                && !a.eq_ignore_ascii_case(b)
+            {
+                bail!("grouped timing {field} ({a}) must match the selected deployment ({b})");
+            }
+            Ok(declared.or(observed).map(str::to_owned))
+        };
+        let model_dtype = config["model_dtype"]
+            .as_str()
+            .and_then(FpmRuntimeMemoryConfig::normalize_model_dtype);
+        let observed = memory
+            .map(|m| {
+                FpmRuntimeMemoryConfig::observed_model_dtype(
+                    m["model_dtype"].as_str(),
+                    m["provenance"].as_str().unwrap_or_default(),
+                )
+            })
+            .transpose()?
+            .flatten();
         Ok([
-            config
-                .get("model")
-                .or_else(|| config.get("model_path"))
-                .and_then(Value::as_str),
-            config
-                .get("kvcache_quant_mode")
-                .or_else(|| config.get("kv_cache_dtype"))
-                .and_then(Value::as_str)
-                .filter(known),
-            config
-                .get("attention_backend")
-                .and_then(Value::as_str)
-                .filter(known),
+            model.map(str::to_owned),
+            source(
+                "kv_cache_dtype",
+                alias("kvcache_quant_mode", "kv_cache_dtype").and_then(Value::as_str),
+                deployment.and_then(|d| d["kv_cache_dtype"].as_str()),
+            )?,
+            source(
+                "attention_backend",
+                config["attention_backend"].as_str(),
+                deployment.and_then(|d| d["attention_backend"].as_str()),
+            )?,
+            source("model_dtype", model_dtype.as_deref(), observed.as_deref())?,
         ])
     }
 }
@@ -308,13 +409,25 @@ impl ReplayEngineConfig {
                             "vllm_version must be identical on the prefill and decode roles".into(),
                         ));
                     }
-                    let prefill_identity = prefill_role.grouped_transfer_identity()?;
-                    let decode_identity = decode_role.grouped_transfer_identity()?;
-                    for (i, field) in ["model", "kv_cache_dtype", "attention_backend"]
-                        .into_iter()
-                        .enumerate()
+                    let identity = |role: &ReplayRoleConfig| {
+                        role.grouped_transfer_identity()
+                            .map_err(|e| ReplayError::InvalidSpec(format!("{e:#}")))
+                    };
+                    let prefill_identity = identity(&prefill_role)?;
+                    let decode_identity = identity(&decode_role)?;
+                    for (i, field) in [
+                        "model",
+                        "kv_cache_dtype",
+                        "attention_backend",
+                        "model_dtype",
+                    ]
+                    .into_iter()
+                    .enumerate()
                     {
-                        let (Some(p), Some(d)) = (prefill_identity[i], decode_identity[i]) else {
+                        let (Some(p), Some(d)) = (
+                            prefill_identity[i].as_deref(),
+                            decode_identity[i].as_deref(),
+                        ) else {
                             continue;
                         };
                         let same = if field == "model" {

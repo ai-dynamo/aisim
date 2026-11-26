@@ -1691,7 +1691,10 @@ def _configuration(
             # differ from the dataset label of the launch. Records without hybrid evidence, of vLLM 0.27.0, 0.28.0
             # and 0.32.0, keep their bytes.
             **(
-                {"runtime_framework_version": bundle.manifest["runtime"]["version"]}
+                {
+                    "runtime_framework_version": bundle.manifest["runtime"]["version"],
+                    "model_dtype": canonical_settings["model_config"]["dtype"],
+                }
                 if prefix_caching[record_phase] is not None
                 else {}
             ),

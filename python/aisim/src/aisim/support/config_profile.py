@@ -1624,17 +1624,18 @@ def linear_runtime_resources(resources: Mapping[str, Any]) -> dict[str, Any] | N
 
     Every group must be an attention group without a window, all groups must have one block size of at least 2
     tokens, and the exact sum of page_size_bytes / block_size_tokens must be a whole number of bytes per token.
-    Every other field, such as runtime_memory and the resource provenance, is kept, except the vLLM version of the
-    cache group evidence. Import, acceptance,
+    Every other field, such as runtime_memory and the resource provenance, is kept, except the grouped cache's
+    observed version and model dtype. Import, acceptance,
     finalization and validation all use this function.
     """
     if _linear_layout_gap(resources) is not None:
         return None
     linear = {key: deepcopy(value) for key, value in resources.items() if key != "cache_groups"}
     linear.update(cache_layout="linear", kv_bytes_per_token=int(_measured_kv_bytes(resources)))
-    # The version of the cache group evidence leaves with the groups, so a linear profile keeps its bytes.
+    # Grouped handoff evidence leaves with the groups, so a linear profile keeps its bytes.
     if isinstance(linear.get("runtime_memory"), dict):
         linear["runtime_memory"].pop("runtime_framework_version", None)
+        linear["runtime_memory"].pop("model_dtype", None)
     return linear
 
 

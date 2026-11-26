@@ -4804,6 +4804,34 @@ fn run_replay_with_artifacts_json(py: Python<'_>, payload: &str) -> PyResult<Str
         .map_err(replay_python_error)
 }
 
+/// Check the cache group's rules before planning a prefix-cached pilot.
+#[pyfunction]
+fn validate_grouped_prefix_geometry(
+    groups_json: &str,
+    hash_block: usize,
+    version: &str,
+) -> PyResult<()> {
+    let validate = || -> anyhow::Result<()> {
+        let groups: Vec<crate::perfmodel::FpmCacheGroup> = serde_json::from_str(groups_json)?;
+        for group in &groups {
+            group.validate()?;
+        }
+        let version = crate::engine::VllmRuleVersion::parse(version)
+            .ok_or_else(|| anyhow!("unsupported grouped prefix caching version {version}"))?;
+        crate::engine::GroupedPrefixRules::new(&groups, hash_block, version)?;
+        Ok(())
+    };
+    validate().map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// Model dtype recorded by an initialized worker, if this profile has that evidence.
+#[pyfunction]
+#[pyo3(signature = (provenance, model_dtype=None))]
+fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult<Option<String>> {
+    crate::perfmodel::FpmRuntimeMemoryConfig::observed_model_dtype(model_dtype, provenance)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
 #[pyfunction]
 fn canonical_timing_config_json(payload: &str, worker_type: &str) -> PyResult<String> {
     let convert = || -> anyhow::Result<String> {
@@ -4907,6 +4935,8 @@ fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(canonical_timing_config_json, module)?)?;
+    module.add_function(wrap_pyfunction!(validate_grouped_prefix_geometry, module)?)?;
+    module.add_function(wrap_pyfunction!(observed_model_dtype, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_with_artifacts_json, module)?)?;
     module.add_function(wrap_pyfunction!(scan_weka_requests, module)?)?;

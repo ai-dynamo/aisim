@@ -73,8 +73,10 @@ block included. When the prefill stops one token short, the transferred prompt
 leaves out the last prompt token, as the [request flow](#handoff) shows.
 `fixed_bytes` holds one block of each state group and the window blocks of
 each group with a `sliding_window`. Such a group moves only the blocks of the
-transferred prompt inside the window of the next token. The decode worker
-allocates only these blocks. With `T` transferred tokens, that is
+transferred prompt inside the window of the next token. The decode worker also
+reserves room for the first forward. When a full transfer recomputes the last
+prompt token, that forward can need an earlier window page. With `T` transferred
+tokens, the connector moves
 `cdiv(T, block) - floor(max(0, T - window + 1) / block)` blocks. `block` is the
 group's own `block_size_tokens`. The bytes of one block come from the profile's
 `transfer_bytes_per_block`. `bytes_per_full_block` adds them up over the
@@ -89,6 +91,10 @@ a block of each full-attention group. No full-attention spec of vLLM 0.31.0,
 0.32.0 or 0.33.0 opts out of prefix caching. Only a profile that describes no
 deployment of these versions has such a group. The state moves with every
 transfer that moves at least one token.
+The two workers must agree on their model, KV dtype, attention backend and
+observed model dtype when those facts are available. The selected deployment's
+`runtime_memory.model_dtype` records vLLM's initialized `ModelConfig.dtype`.
+Older observation and finalization records retain it in their runtime settings.
 Grouped prefill and decode workers require a nonempty original prompt. A one-token
 prompt is valid even when the decode worker receives zero remote tokens. See vLLM v0.31.0
 [`input_processor.py:516-517`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/input_processor.py#L516-L517),

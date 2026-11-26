@@ -23,7 +23,11 @@ from typing import Any
 import yaml
 
 from aisim.config import CorePredictionConfig, CoreRecommendationConfig
-from aisim.config.engine import GROUPED_PREFIX_CACHING_VERSIONS, grouped_prefix_caching_requirements
+from aisim.config.engine import (
+    GROUPED_PREFIX_CACHING_VERSIONS,
+    GroupedPrefixGeometryError,
+    grouped_prefix_caching_requirements,
+)
 
 from .config_profile import _cache_group_shapes, linear_block_size, linear_runtime_resources
 from .fpm import fpm_cli_args
@@ -47,6 +51,7 @@ class _PlannerVersion(IntEnum):
     BEFORE_STATE_STARTUP_BOUND = auto()
     BEFORE_WINDOW_STARTUP_BOUND = auto()
     BEFORE_CONVOLUTION_PREFIX_CACHING = auto()
+    BEFORE_CONVOLUTION_GEOMETRY_CHECK = auto()
     CURRENT = auto()
 
 
@@ -152,8 +157,9 @@ def _probe_observed_resources(request: SupportRequest) -> dict[str, Any] | None:
 
 
 def _configs(
-    request: SupportRequest, root: Path, *, grouped_cold: bool = False
+    request: SupportRequest, root: Path, *, grouped_cold: bool = False, restore_unchecked_convolution: bool = False
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, int]]]:
+    historical_warm = False
     preset = request.parallelism()
     workload = request.workload
     common = {
@@ -205,6 +211,14 @@ def _configs(
                 prefix_caching = (
                     not grouped_cold and _evidence_version(request, deployment) == deployment.backend_version
                 )
+            except GroupedPrefixGeometryError:
+                # The immediately preceding planner wrote the warm flag for this
+                # geometry. Reconstruct it only when verifying that saved manifest.
+                historical_warm = (
+                    restore_unchecked_convolution
+                    and _evidence_version(request, deployment) == deployment.backend_version
+                )
+                prefix_caching = False
             except ValueError:
                 prefix_caching = False
             worker.setdefault("kv_cache", {})["prefix_caching"] = prefix_caching
@@ -217,6 +231,8 @@ def _configs(
     if request.worker_type in {"prefill", "decode"}:
         # A role is independently collectable. A complete P/D serving config
         # also needs the independently accepted counterpart and runtime support.
+        if historical_warm:
+            worker["kv_cache"]["prefix_caching"] = True
         worker["timing"]["systems_paths"] = [str(root / "systems")]
         return (
             {
@@ -250,6 +266,9 @@ def _configs(
         "optimizer": {"algorithm": "random", "max_trials": 1, "parallelism": 1, "seed": request.search.seed},
     }
     CoreRecommendationConfig.model_validate(recommendation)
+    if historical_warm:
+        # The two validated pilot documents share this worker's cache settings.
+        worker["kv_cache"]["prefix_caching"] = True
     return prediction, {"pilot": recommendation}, [preset]
 
 
@@ -381,9 +400,18 @@ def _plan_documents(
     if request.identity.framework_version is None:
         return _pending_version_documents(request, root, legacy_cli=legacy_cli)
     grouped_cold = planner <= _PlannerVersion.BEFORE_GROUPED_PREFIX_CACHING
-    if not grouped_cold and planner < _PlannerVersion.CURRENT and request.fpm_profile is not None:
+    if (
+        not grouped_cold
+        and planner <= _PlannerVersion.BEFORE_CONVOLUTION_PREFIX_CACHING
+        and request.fpm_profile is not None
+    ):
         grouped_cold = any(group.kind == "convolution" for group in request.profile_deployment().resources.cache_groups)
-    prediction, recommendations, presets = _configs(request, root, grouped_cold=grouped_cold)
+    prediction, recommendations, presets = _configs(
+        request,
+        root,
+        grouped_cold=grouped_cold,
+        restore_unchecked_convolution=planner == _PlannerVersion.BEFORE_CONVOLUTION_GEOMETRY_CHECK,
+    )
     commands = _commands(request, root, list(recommendations), legacy_cli=legacy_cli)
     runtime_prerequisite = (
         "Prepare and verify the declared model/tokenizer snapshots, visible GPUs, model access and compatible "

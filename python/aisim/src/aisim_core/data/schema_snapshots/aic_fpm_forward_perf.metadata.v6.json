@@ -615,6 +615,20 @@
           "title": "Max Model Len",
           "type": "integer"
         },
+        "model_dtype": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Dtype"
+        },
         "provenance": {
           "minLength": 1,
           "pattern": "\\S",

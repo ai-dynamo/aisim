@@ -1373,7 +1373,8 @@ impl GroupedPrefixCoordinator {
         self.blocks_to_allocate(
             pool,
             hit,
-            loaded_tokens,
+            // A full load must retain the window of the token decode recomputes.
+            loaded_tokens.min(prompt_tokens.saturating_sub(1)),
             loaded_tokens,
             prompt_tokens,
             false,

@@ -2220,6 +2220,7 @@ impl VllmKvManager {
             .expect("a grouped destination needs the transfer rules of a decode rank");
         let prompt = sequence.num_input_tokens();
         let transfer = rules.transfer_tokens(prompt);
+        let computed = rules.computed_after_load(prompt);
         let full_blocks = rules.full_blocks(transfer);
         let (lease, hit, transfer_units) = match &mut self.grouped_prefix {
             Some(coordinator) => {
@@ -2241,7 +2242,7 @@ impl VllmKvManager {
                 };
                 let free = pool.capacity_blocks() - pool.active_blocks();
                 let state_copy = coordinator.destination_state_copy_blocks(lease, prompt, transfer);
-                if coordinator.destination_admission_blocks(pool, &hit, transfer, prompt) > free
+                if coordinator.destination_admission_blocks(pool, &hit, computed, prompt) > free
                     || (coordinator.destination_load_blocks(pool, &hit, transfer, prompt) as u64)
                         .saturating_add(self.grouped_inflight_need)
                         .saturating_add(local_prefill_need)
@@ -2260,7 +2261,7 @@ impl VllmKvManager {
                     prompt,
                     transfer,
                     transfer,
-                    transfer,
+                    computed,
                     None,
                 ) {
                     // Undo the pin, so that the hit blocks return to the
@@ -2307,14 +2308,20 @@ impl VllmKvManager {
                 let Some(load_bytes) = grouped.required_bytes(transfer, transfer) else {
                     return VllmAcquire::CapacityExhausted;
                 };
+                // A full load still recomputes the final prompt token. Its forward may
+                // read one more page of each window than the load itself holds.
+                let Some(forward_bytes) = grouped.required_bytes(computed, transfer) else {
+                    return VllmAcquire::CapacityExhausted;
+                };
+                let recompute_bytes = forward_bytes.saturating_sub(load_bytes);
                 let prompt_bytes = destination_admission_bytes(
                     grouped.groups(),
                     grouped.fixed_request_bytes(),
-                    transfer,
+                    computed,
                     prompt,
                     limits,
                 );
-                if prompt_bytes > free
+                if prompt_bytes.max(forward_bytes) > free
                     || load_bytes
                         .saturating_add(self.grouped_inflight_need)
                         .saturating_add(local_prefill_need)
@@ -2331,7 +2338,8 @@ impl VllmKvManager {
                 // The same count in bytes, where a state group holds its
                 // fixed blocks already.
                 grouped_lease.first_pass_need =
-                    remaining_bytes(grouped.groups(), transfer, prompt, limits);
+                    remaining_bytes(grouped.groups(), transfer, prompt, limits)
+                        .saturating_add(recompute_bytes);
                 (grouped_lease, None, full_blocks)
             }
         };
@@ -2401,14 +2409,14 @@ impl VllmKvManager {
             .grouped_transfer
             .as_ref()
             .expect("a grouped destination needs the transfer rules of a decode rank");
-        let transfer = rules.transfer_tokens(prompt_tokens);
+        let computed = rules.computed_after_load(prompt_tokens);
         // A prompt that the pool cannot project never fits.
         Some(match grouped.block_pool() {
             Some(pool) => grouped
-                .projected_blocks(transfer, prompt_tokens)
+                .projected_blocks(computed, prompt_tokens)
                 .map_or(u64::MAX, |blocks| pool.bytes(blocks)),
             None => grouped
-                .required_bytes(transfer, prompt_tokens)
+                .required_bytes(computed, prompt_tokens)
                 .unwrap_or(u64::MAX),
         })
     }

@@ -369,8 +369,8 @@ def _resource_values(resources: dict[str, Any]) -> dict[str, Any]:
 # Cache group fields that sessions imported before these fields existed did not save. The import of a vLLM 0.33.0
 # record writes prefix_cacheable and no transfer_bytes_per_block.
 _LATER_GROUP_FIELDS = ("prefix_cacheable", "transfer_bytes_per_block")
-# The runtime memory field that such sessions did not save. The import of a vLLM 0.33.0 record writes it.
-_LATER_MEMORY_FIELDS = ("runtime_framework_version",)
+# Later observations of the vLLM version and initialized model dtype.
+_LATER_MEMORY_FIELDS = ("runtime_framework_version", "model_dtype")
 
 
 def as_saved_resources(saved: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:

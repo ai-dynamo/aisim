@@ -216,6 +216,9 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
     # _prefix_caching owns the validation order and error text shared with Rust; export its nonblank rule too.
     runtime_framework_version: Annotated[str, Field(json_schema_extra={"minLength": 1, "pattern": r"\S"})] | None = None
 
+    # The initialized vLLM ModelConfig.dtype, separate from the KV cache and FMHA precision.
+    model_dtype: _Nonempty | None = None
+
     @model_validator(mode="after")
     def _prefix_caching(self) -> FpmRuntimeMemoryProfile:
         # Same order as Rust, so the same invalid record gives the same first error.
@@ -236,6 +239,7 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
             "mamba_cache_mode",
             "hash_block_size_tokens",
             "runtime_framework_version",
+            "model_dtype",
         ):
             if getattr(self, name) is None:
                 result.pop(name, None)

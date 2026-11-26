@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
@@ -1769,6 +1770,10 @@ def require_runtime_version(memory, *, backend_version: str | None, feature: str
 GROUPED_PREFIX_CACHING_VERSIONS = ("0.31.0", "0.32.0", "0.33.0")
 
 
+class GroupedPrefixGeometryError(ValueError):
+    """The evidence enables prefix caching, but the native cache geometry cannot run it."""
+
+
 def grouped_prefix_caching_requirements(
     deployment,
     *,
@@ -1845,6 +1850,15 @@ def grouped_prefix_caching_requirements(
         raise ValueError(
             "GLM-5.3-Flash prefix caching requires prefix_match_unit and max_batched_tokens that are multiples of 4"
         )
+    if any(group.kind == "convolution" for group in groups):
+        from aisim import _runtime
+
+        try:
+            _runtime.validate_grouped_prefix_geometry(
+                json.dumps([group.model_dump(exclude_none=True) for group in groups]), hash_block, backend_version
+            )
+        except ValueError as error:
+            raise GroupedPrefixGeometryError(str(error)) from error
     return hash_block
 
 
@@ -1879,6 +1893,18 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | 
     backends = {deployment.attention_backend.lower() for deployment in (prefill_deployment, decode_deployment)}
     if len(backends - {"auto", "unknown"}) > 1:
         return "matching attention_backend when both backends are known"
+    if prefill.runtime_memory is not None and decode.runtime_memory is not None:
+        from aisim import _runtime
+
+        try:
+            observed = {
+                _runtime.observed_model_dtype(memory.provenance, memory.model_dtype)
+                for memory in (prefill.runtime_memory, decode.runtime_memory)
+            }
+        except ValueError as error:
+            return str(error)
+        if len(observed - {None}) > 1:
+            return "matching model_dtype when both runtimes recorded it"
     return None
 
 

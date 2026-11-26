@@ -24,6 +24,7 @@ or infer another topology's resources from its GPU count.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import Any
 
 from aisim.generator.naive import _estimate_model_weight_bytes
@@ -428,21 +429,24 @@ def _profile_parallel_configs(
                 counts = range(1, min(d, (gpu_budget - d) // p) + 1)
                 return any(gpu_budget - (gpu_budget - count * p) % d >= min_gpu_budget for count in counts)
 
+            # Replica configurations are immutable. Share each selected decode shape/count across prefill candidates.
+            decode_replica = cache(ReplicaParallelConfig)
             for shape in prefill_shapes:
                 destinations = [dest for dest in decode_shapes if fits_budget(shape, dest) and compatible(shape, dest)]
                 if not destinations:
                     continue
-                for replica in replicas(shape, gpu_budget):
+                for replica in replicas(shape, gpu_budget - min(dest.gpus_per_worker for dest in destinations)):
                     available = gpu_budget - replica.total_gpus
-                    configs.extend(
-                        DisaggParallelConfig(prefill=replica, decode=destination)
-                        for decode_shape in destinations
-                        for destination in replicas(decode_shape, available)
-                    )
+                    for dest in destinations:
+                        width = dest.gpus_per_worker
+                        needed = max(0, (min_gpu_budget or 0) - replica.total_gpus)
+                        minimum = max(1, (needed + width - 1) // width)
+                        for count in range(minimum, available // width + 1):
+                            configs.append(DisaggParallelConfig(prefill=replica, decode=decode_replica(dest, count)))
         if requirements and not configs:
             raise NoViableParallelConfig(f"no prefill/decode deployment pair with {' and '.join(requirements)}")
     else:
         raise ValueError("FPM profiles support only agg or disagg deployment modes")
-    if candidate_configs is not None or min_gpu_budget is None:
+    if deployment_mode == "disagg" or candidate_configs is not None or min_gpu_budget is None:
         return configs
     return [config for config in configs if config.total_gpus >= min_gpu_budget]

@@ -59,6 +59,8 @@ pub use handoff::{
     HandoffId, HandoffTransferTiming, TransferTimingMode, prefill_handoff_delay_ms,
     transfer_delay_ms,
 };
+#[cfg(feature = "python")]
+pub(crate) use kv_manager::{GroupedPrefixRules, VllmRuleVersion};
 pub use kvcr::{KvcrG3Stats, KvcrLocalG2Stats, KvcrPullCounts, KvcrStats};
 pub use protocol::{
     Admission, CacheTierAttribution, Command, CommandEffects, CommandResult, DecodeAcceptance,

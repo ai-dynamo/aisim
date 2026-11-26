@@ -3747,11 +3747,13 @@ def test_import_records_the_vllm_version_of_the_cache_group_evidence(tmp_path):
 
     resources = _import(_campaign_from_fixture(tmp_path / "live", FIXTURES / "glm53flash_vllm_0330_probe"))["resources"]
     assert resources["runtime_memory"]["runtime_framework_version"] == "0.33.0"
+    assert resources["runtime_memory"]["model_dtype"] == "torch.bfloat16"
     # The import of a vLLM 0.28.0 record holds no prefix-caching evidence, and its result keeps its bytes.
     path, launches = observation_fixture(tmp_path / "attention", layout="attention")
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "complete", result["diagnostics"]
     assert "runtime_framework_version" not in result["resources"]["runtime_memory"]
+    assert "model_dtype" not in result["resources"]["runtime_memory"]
     # A vLLM 0.33.0 record of one attention group has a linear layout. That layout has no cache groups, so it does not
     # hold the version of their evidence.
     path, launches = observation_fixture(tmp_path / "kernel", layout="kernel_view")
@@ -3760,6 +3762,7 @@ def test_import_records_the_vllm_version_of_the_cache_group_evidence(tmp_path):
     linear = linear_runtime_resources(result["resources"])
     assert linear is not None and "cache_groups" not in linear
     assert "runtime_framework_version" not in linear["runtime_memory"]
+    assert "model_dtype" not in linear["runtime_memory"]
 
 
 def test_the_live_glm53flash_record_of_vllm_0330_passes_the_grouped_prefix_caching_gate(tmp_path):

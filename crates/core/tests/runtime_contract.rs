@@ -1379,6 +1379,127 @@ fn grouped_pd_accepts_equal_tensor_parallel_sizes() {
 }
 
 #[test]
+fn injected_grouped_replay_checks_the_selected_canonical_timing_identity() {
+    use aisim_core::{BackendKind, ForwardPassPerfModelConfig, ForwardPassWorkerType};
+    use serde_json::{Value, json};
+
+    struct Timing;
+    impl TimingModel for Timing {
+        fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+            Ok(1.0)
+        }
+        fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+            Ok(1.0)
+        }
+    }
+
+    let run = |provider: &str, case: &str| {
+        let mut spec = disaggregated_grouped_spec(vec![request("canonical", 0.0, 32, 2)]);
+        let rank = spec.engine["rank"].clone();
+        for (name, worker) in [
+            ("prefill", ForwardPassWorkerType::Prefill),
+            ("decode", ForwardPassWorkerType::Decode),
+        ] {
+            let mut timing =
+                ForwardPassPerfModelConfig::new("org/Model", name, BackendKind::Vllm, worker);
+            timing.backend_version = Some("0.31.0".into());
+            let mut row = json!({
+                "system":name, "backend":"vllm", "backend_version":"0.31.0", "worker_type":name,
+                "tp":1, "pp":1, "dp":1, "moe_tp":1, "moe_ep":1, "kv_cache_dtype":"fp8", "attention_backend":"fa3",
+                "resources":{"cache_layout":"grouped", "cache_groups":rank["kv_cache_groups"],
+                    "runtime_memory":{"model_dtype":"torch.bfloat16","runtime_framework_version":"0.31.0"}}
+            });
+            // Another deployment was observed on a different runtime with a different dtype.
+            let mut other = row.clone();
+            other["system"] = "other".into();
+            other["resources"]["runtime_memory"] =
+                json!({"model_dtype":"half", "runtime_framework_version":"0.33.0"});
+            let mut config = serde_json::to_value(&timing).unwrap();
+            if name == "decode" {
+                match case {
+                    "sparse" => {
+                        config["tp"] = Value::Null;
+                        config["attention_dp"] = Value::Null;
+                    }
+                    "unknown" => {
+                        config["attention_backend"] = "auto".into();
+                        row["resources"]["runtime_memory"]["model_dtype"] = "BF16".into();
+                    }
+                    "kv_cache_dtype" | "attention_backend" => row[case] = "other".into(),
+                    "model_dtype" => {
+                        row["resources"]["runtime_memory"]["model_dtype"] = "half".into()
+                    }
+                    "runtime_framework_version" => {
+                        row["resources"]["runtime_memory"][case] = "0.32.0".into()
+                    }
+                    "kv_cache_groups" => {
+                        row["resources"]["cache_groups"][0]["num_layers"] = 1.into()
+                    }
+                    "conflicting_model_dtype" => {
+                        row["resources"]["runtime_memory"]["provenance"] =
+                            json!({"runtime_settings":{"model_config":{"dtype":"half"}}})
+                                .to_string()
+                                .into()
+                    }
+                    "backend" => config["backend"] = "sglang".into(),
+                    "worker_type" => config["worker_type"] = "prefill".into(),
+                    "dcp" | "tp" | "attention_dp" | "cp_size" => config[case] = 2.into(),
+                    "profile_dcp" | "single_dcp" => config["dcp"] = 1.into(),
+                    _ => {}
+                }
+            }
+            if case != "single_dcp" {
+                config["fpm_profile"] = json!({"model":"org/Model", "deployments":[other, row]});
+            }
+            let mut role = rank.clone();
+            role["timing_model"] = json!({"type":"external","provider":provider,"config":config});
+            spec.engine[name] = json!({"rank":role});
+        }
+        Replayer::new(
+            spec,
+            ReplayEngineFactory::with_timing_model(Arc::new(Timing)),
+        )
+        .unwrap()
+        .run()
+    };
+
+    for provider in ["ais", "aic"] {
+        for case in ["control", "unknown", "sparse", "single_dcp"] {
+            assert_eq!(
+                run(provider, case)
+                    .unwrap()
+                    .request_counts
+                    .completed_requests,
+                1,
+                "{provider}/{case}"
+            );
+        }
+        for case in [
+            "kv_cache_dtype",
+            "attention_backend",
+            "model_dtype",
+            "runtime_framework_version",
+            "kv_cache_groups",
+            "conflicting_model_dtype",
+            "backend",
+            "worker_type",
+            "dcp",
+            "tp",
+            "attention_dp",
+            "cp_size",
+            "profile_dcp",
+        ] {
+            let error = run(provider, case).unwrap_err().to_string();
+            let field = case
+                .strip_prefix("profile_")
+                .or_else(|| case.strip_prefix("conflicting_"))
+                .unwrap_or(case);
+            assert!(error.contains(field), "{provider}/{case}: {error}");
+        }
+    }
+}
+
+#[test]
 fn linear_pd_accepts_unequal_tensor_parallel_sizes() {
     for role in ["prefill", "decode"] {
         let mut spec = aggregated_spec(
@@ -1876,6 +1997,37 @@ fn decode_admissions(record: &aisim_core::replay::PerRequestRecord) -> Vec<f64> 
         .filter(|admission| admission.pool == ReplayRequestPool::Decode)
         .map(|admission| admission.at_ms)
         .collect()
+}
+
+#[test]
+fn full_window_handoffs_reserve_the_first_decode_forward() {
+    let mut spec = disaggregated_grouped_spec(distinct_requests(&[(8, 2, 0.0); 4]));
+    let rank = &mut spec.engine["rank"];
+    rank["kv_cache_groups"] = serde_json::json!([{
+        "name": "window", "kind": "attention", "num_layers": 1, "block_size_tokens": 4,
+        "page_size_bytes": 64, "sliding_window": 5, "prefix_cacheable": true,
+        "transfer_bytes_per_block": 64
+    }]);
+    rank["max_num_batched_tokens"] = 32.into();
+    rank["kv_transfer_bandwidth"] = serde_json::Value::Null;
+    let mut decode = rank.clone();
+    // A full 8-token load has one live page. Computing token 8 from a
+    // watermark of 7 still needs both window pages.
+    decode["kv_cache_capacity_bytes"] = (4 * 64).into();
+    spec.engine["decode"] = serde_json::json!({"rank": decode});
+    let report = run_within_60_s(spec.clone());
+    assert_eq!(report.request_counts.completed_requests, 4);
+
+    spec.engine["decode"]["rank"]["kv_cache_capacity_bytes"] = 64.into();
+    let report = run_within_60_s(spec);
+    assert_eq!(report.request_counts.completed_requests, 0);
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|record| record.destination_reserved_ms.is_none()
+                && record.terminal_status == aisim_core::replay::ReplayTerminalStatus::Failed)
+    );
 }
 
 #[test]

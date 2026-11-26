@@ -409,9 +409,74 @@ pub struct FpmRuntimeMemoryConfig {
     /// `backend_version`, which is a dataset label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_framework_version: Option<String>,
+    /// Initialized vLLM ModelConfig.dtype, independent of KV and FMHA precision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_dtype: Option<String>,
 }
 
 impl FpmRuntimeMemoryConfig {
+    /// Legacy imports keep vLLM's ModelConfig.dtype in runtime_settings. A finalized
+    /// cell or a bound collection wraps those settings; both producers verify the
+    /// same effective configuration across their observations.
+    pub(crate) fn observed_model_dtype(
+        recorded: Option<&str>,
+        provenance: &str,
+    ) -> Result<Option<String>, AicError> {
+        use serde_json::Value;
+        let mut dtype = recorded.and_then(Self::normalize_model_dtype);
+        let Ok(evidence) = serde_json::from_str::<Value>(provenance) else {
+            return Ok(dtype);
+        };
+        let mut check = |candidate: Option<&str>| -> Result<(), AicError> {
+            if let Some(candidate) = candidate.and_then(Self::normalize_model_dtype) {
+                if dtype.as_ref().is_some_and(|known| *known != candidate) {
+                    return Err(invalid(
+                        "grouped model_dtype conflicts with observed runtime settings",
+                    ));
+                }
+                dtype = Some(candidate);
+            }
+            Ok(())
+        };
+        let mut check_observation = |record: &Value| -> Result<(), AicError> {
+            let path = "/runtime_settings/model_config/dtype";
+            check(record.pointer(path).and_then(Value::as_str))?;
+            if let Some(phases) = record["phases"].as_object() {
+                for phase in phases.values() {
+                    check(phase.pointer(path).and_then(Value::as_str))?;
+                }
+            }
+            Ok(())
+        };
+        check_observation(&evidence)?;
+        if let Some(cells) = evidence["cell_observations"].as_array() {
+            for cell in cells {
+                if let Some(nested) = cell
+                    .pointer("/runtime_memory/provenance")
+                    .and_then(Value::as_str)
+                    && let Ok(record) = serde_json::from_str(nested)
+                {
+                    check_observation(&record)?;
+                }
+            }
+        }
+        Ok(dtype)
+    }
+
+    pub(crate) fn normalize_model_dtype(dtype: &str) -> Option<String> {
+        let lower = dtype.trim().to_ascii_lowercase();
+        Some(
+            match lower.strip_prefix("torch.").unwrap_or(&lower) {
+                "" | "auto" | "unknown" => return None,
+                "half" | "fp16" => "float16",
+                "bf16" => "bfloat16",
+                "float" | "fp32" => "float32",
+                other => other,
+            }
+            .to_owned(),
+        )
+    }
+
     pub fn validate(&self) -> Result<(), AicError> {
         if self.kv_cache_bytes == 0
             || self.kv_cache_bytes > MAX_EXACT_BYTES
@@ -441,6 +506,13 @@ impl FpmRuntimeMemoryConfig {
             .is_some_and(|version| version.trim().is_empty())
         {
             return Err(invalid("runtime_framework_version must be nonempty"));
+        }
+        if self
+            .model_dtype
+            .as_deref()
+            .is_some_and(|dtype| dtype.trim().is_empty())
+        {
+            return Err(invalid("model_dtype must be nonempty"));
         }
         Ok(())
     }
@@ -765,9 +837,16 @@ impl ForwardPassPerfModelConfig {
     }
 
     pub(super) fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
-        let Some(profile) = &self.fpm_profile else {
-            return Ok(None);
-        };
+        self.fpm_profile
+            .as_ref()
+            .map(|profile| self.matching_fpm_deployment(profile))
+            .transpose()
+    }
+
+    pub(crate) fn matching_fpm_deployment<'a>(
+        &self,
+        profile: &'a serde_json::Map<String, serde_json::Value>,
+    ) -> Result<&'a serde_json::Value, AicError> {
         if profile.get("model").and_then(serde_json::Value::as_str) != Some(self.model.as_str()) {
             return Err(invalid("FPM profile model identity mismatch"));
         }
@@ -830,7 +909,7 @@ impl ForwardPassPerfModelConfig {
         if matching.next().is_some() {
             return Err(invalid("duplicate FPM deployment resources"));
         }
-        Ok(Some(deployment))
+        Ok(deployment)
     }
 }
 
@@ -1124,6 +1203,7 @@ mod tests {
                 mamba_cache_mode: None,
                 hash_block_size_tokens: None,
                 runtime_framework_version: None,
+                model_dtype: None,
             }),
             ..resources()
         }
