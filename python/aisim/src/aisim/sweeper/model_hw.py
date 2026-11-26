@@ -58,6 +58,10 @@ class NoViableParallelConfig(ValueError):
     """No parallel config can hold the model+sequence within the GPU budget."""
 
 
+class NoWarmParallelConfig(NoViableParallelConfig):
+    """Every compatible deployment in the requested domain lacks the requested prefix policy."""
+
+
 @dataclass(frozen=True)
 class ModelHardware:
     """Per-(model, hardware, backend) facts that bound the parallel search."""
@@ -367,15 +371,19 @@ def _profile_parallel_configs(
     decode_hardware_sku: str | None = None,
     worker_type: str = "aggregated",
     candidate_configs: list[ReplicaParallelConfig] | list[DisaggParallelConfig] | None = None,
+    kv_transfer=None,
     validate_transfer: bool = True,
+    require_pinned_pairs: bool = False,
+    filter_warm_aggregate: bool = False,
+    validate_grouped_role=None,
     replica_counts: Callable[[str, ParallelShape, int, int | None], Sequence[int]] | None = None,
 ):
     """Enumerate only declared deployment shapes; replicas do not change a cell."""
     from aisim.config.engine import (
         GroupedPrefixEvidenceError,
-        GroupedPrefixGeometryError,
         grouped_pd_observation,
         grouped_pd_pair_requirement,
+        grouped_pd_transfer_geometry,
         grouped_pd_transfer_requirements,
         grouped_prefix_caching_requirements,
     )
@@ -407,14 +415,13 @@ def _profile_parallel_configs(
         return observations[key]
 
     first_prefix_error = None
-    unavailable_prefix = (GroupedPrefixEvidenceError, GroupedPrefixGeometryError)
 
     @cache
     def prefix_requirement(role, shape):
-        if not prefix_caching[0 if role == "prefill" else 1]:
+        if role != "agg" and not prefix_caching[0 if role == "prefill" else 1]:
             return None
         system = (decode_hardware_sku or hardware_sku) if role == "decode" else hardware_sku
-        deployment = shapes_for(system, role)[shape]
+        deployment = shapes_for(system, worker_type if role == "agg" else role)[shape]
         if deployment.resources.cache_layout != "grouped":
             return None
         try:
@@ -425,7 +432,7 @@ def _profile_parallel_configs(
                 prefix_match_unit=None,
                 max_batched_tokens=max_batched_tokens_for(role) if max_batched_tokens_for else DEFAULT_MAX_NUM_TOKENS,
                 field=f"{role}_enable_prefix_caching",
-                pd_rank=True,
+                pd_rank=role != "agg",
             )
         except ValueError as error:
             return error
@@ -433,12 +440,19 @@ def _profile_parallel_configs(
 
     def supports_prefix(error):
         nonlocal first_prefix_error
-        if isinstance(error, unavailable_prefix):
+        if isinstance(error, GroupedPrefixEvidenceError):
             first_prefix_error = first_prefix_error or error
             return False
         if error is not None:
             raise error
         return True
+
+    @cache
+    def validate_role(role, shape):
+        system = (decode_hardware_sku or hardware_sku) if role == "decode" else hardware_sku
+        deployment = shapes_for(system, worker_type if role == "agg" else role)[shape]
+        if deployment.resources.cache_layout == "grouped":
+            validate_grouped_role(role, deployment)
 
     def replicas(shape, budget):
         return (
@@ -471,8 +485,16 @@ def _profile_parallel_configs(
             configs = [config for config in candidate_configs if config.shape in shapes]
         else:
             configs = [
-                ReplicaParallelConfig(shape, count) for shape in shapes for count in allowed_counts("agg", shape)
+                ReplicaParallelConfig(shape, count)
+                for shape in shapes
+                for count in allowed_counts("agg", shape)
+                if count * shape.gpus_per_worker >= (min_gpu_budget or 0)
             ]
+        if filter_warm_aggregate:
+            configs = [c for c in configs if supports_prefix(prefix_requirement("agg", c.shape))]
+        if validate_grouped_role is not None:
+            for shape in dict.fromkeys(config.shape for config in configs):
+                validate_role("agg", shape)
         if worker_type in ("prefill", "decode"):
 
             @cache
@@ -481,6 +503,7 @@ def _profile_parallel_configs(
                 if deployment.resources.cache_layout != "grouped":
                     return True
                 observation = observe(worker_type, deployment)
+                grouped_pd_transfer_geometry(deployment, backend_version=backend_version)
                 if not supports_prefix(prefix_requirement(worker_type, shape)):
                     return False
                 if prefix_caching[0 if worker_type == "prefill" else 1]:
@@ -497,14 +520,23 @@ def _profile_parallel_configs(
             prefill, decode = prefill_shapes[prefill_shape], decode_shapes[decode_shape]
             requirement = grouped_pd_pair_requirement(prefill, decode, observe=observe)
             if requirement:
+                if require_pinned_pairs:
+                    raise ValueError(
+                        f"grouped FPM cache P/D requires prefill and decode deployments with {requirement}"
+                    )
                 requirements[requirement] = None
                 return False
             if prefill.resources.cache_layout != "grouped":
                 return True
+            if validate_grouped_role is not None:
+                validate_role("prefill", prefill_shape)
+                validate_role("decode", decode_shape)
             if validate_transfer:
-                grouped_pd_transfer_requirements(prefill, decode, backend_version=backend_version, kv_transfer=None)
+                grouped_pd_transfer_requirements(
+                    prefill, decode, backend_version=backend_version, kv_transfer=kv_transfer
+                )
             errors = (prefix_requirement("prefill", prefill_shape), prefix_requirement("decode", decode_shape))
-            unavailable = next((e for e in errors if isinstance(e, unavailable_prefix)), None)
+            unavailable = next((e for e in errors if isinstance(e, GroupedPrefixEvidenceError)), None)
             if not supports_prefix(unavailable or errors[0] or errors[1]):
                 return False
             for role, deployment, warm in zip(("prefill", "decode"), (prefill, decode), prefix_caching, strict=True):
@@ -571,7 +603,5 @@ def _profile_parallel_configs(
     else:
         raise ValueError("FPM profiles support only agg or disagg deployment modes")
     if not configs and first_prefix_error is not None:
-        raise first_prefix_error
-    if deployment_mode == "disagg" or candidate_configs is not None or min_gpu_budget is None:
-        return configs
-    return [config for config in configs if config.total_gpus >= min_gpu_budget]
+        raise NoWarmParallelConfig(str(first_prefix_error)) from first_prefix_error
+    return configs

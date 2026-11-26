@@ -1778,8 +1778,8 @@ class GroupedPrefixEvidenceError(ValueError):
     """A measured grouped deployment cannot supply the requested warm prefix policy."""
 
 
-class GroupedPrefixGeometryError(ValueError):
-    """The evidence enables prefix caching, but the native cache geometry cannot run it."""
+class GroupedPrefixGeometryError(GroupedPrefixEvidenceError):
+    """Native geometry check omitted by historical pilot-plan writers."""
 
 
 def grouped_prefix_caching_requirements(
@@ -1825,7 +1825,7 @@ def grouped_prefix_caching_requirements(
     # The Rust rule table takes a convolution group as a sliding window, and refuses one that opts out of prefix
     # caching with this text at native startup.
     if any(group.kind == "convolution" and group.prefix_cacheable is False for group in groups):
-        raise GroupedPrefixGeometryError(
+        raise GroupedPrefixEvidenceError(
             "kv_cache_groups with enable_prefix_caching=true do not model a convolution group with "
             "prefix_cacheable=false; turn prefix caching off to replay it cold"
         )
@@ -1842,11 +1842,11 @@ def grouped_prefix_caching_requirements(
             "model"
         )
     if memory.mamba_cache_mode != "align" and any(group.kind == "state" and group.prefix_cacheable for group in groups):
-        raise GroupedPrefixGeometryError(
+        raise GroupedPrefixEvidenceError(
             "grouped FPM cache prefix caching requires mamba_cache_mode=align for a prefix-cacheable state group"
         )
     if len({group.page_size_bytes for group in groups}) > 1:
-        raise GroupedPrefixGeometryError(
+        raise GroupedPrefixEvidenceError(
             "grouped FPM cache prefix caching requires equal page_size_bytes across cache groups"
         )
     hash_block = memory.hash_block_size_tokens
@@ -1856,7 +1856,7 @@ def grouped_prefix_caching_requirements(
         )
     # The GLM indexer keeps one state for every 4 tokens, so hits and chunk starts stay on that grid.
     if architecture == "Glm5NextForConditionalGeneration" and (hash_block % 4 or max_batched_tokens % 4):
-        error = ValueError if max_batched_tokens % 4 else GroupedPrefixGeometryError
+        error = ValueError if max_batched_tokens % 4 else GroupedPrefixEvidenceError
         raise error(
             "GLM-5.3-Flash prefix caching requires prefix_match_unit and max_batched_tokens that are multiples of 4"
         )
@@ -1957,14 +1957,20 @@ def grouped_pd_transfer_requirements(
     prefill_deployment, decode_deployment, *, backend_version: str | None, kv_transfer
 ) -> None:
     """Check the transfer evidence for a pair with compatible grouped cache layouts."""
+    grouped_pd_transfer_geometry(prefill_deployment, backend_version=backend_version)
+    require_runtime_version(decode_deployment.resources.runtime_memory, backend_version=backend_version, feature="P/D")
+    if kv_transfer is not None and kv_transfer.bytes_per_token != "auto":
+        raise ValueError("grouped FPM cache derives kv_transfer.bytes_per_token from its cache groups; set it to auto")
+
+
+def grouped_pd_transfer_geometry(deployment, *, backend_version: str | None) -> None:
+    """Check the rank-local transfer requirements shared by selected P/D workers."""
     # The versions come first, as in the Rust gate and the prefix-caching rule: no marker makes P/D of another
     # version run.
     if backend_version not in GROUPED_PD_VERSIONS:
         raise ValueError(GROUPED_PD_VERSION_TEXT)
-    for deployment in (prefill_deployment, decode_deployment):
-        require_runtime_version(deployment.resources.runtime_memory, backend_version=backend_version, feature="P/D")
-    # The transfer rules read both markers. The pair's groups are identical, so the prefill groups stand for both.
-    groups = prefill_deployment.resources.cache_groups
+    require_runtime_version(deployment.resources.runtime_memory, backend_version=backend_version, feature="P/D")
+    groups = deployment.resources.cache_groups
     if any(group.prefix_cacheable is None or group.transfer_bytes_per_block is None for group in groups):
         raise ValueError(
             "grouped FPM cache P/D requires every cache group to declare prefix_cacheable and "
@@ -1990,8 +1996,6 @@ def grouped_pd_transfer_requirements(
             "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across "
             "full-attention groups"
         )
-    if kv_transfer is not None and kv_transfer.bytes_per_token != "auto":
-        raise ValueError("grouped FPM cache derives kv_transfer.bytes_per_token from its cache groups; set it to auto")
 
 
 def _validate_prediction_prefix_match_unit(engine: EnginePredictionConfig) -> None:

@@ -23,7 +23,7 @@ pub(super) fn cell_source(entry: &Value) -> Option<&str> {
     }
 }
 
-fn sha256(s: &str) -> bool {
+pub(super) fn sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -187,6 +187,14 @@ pub(super) fn validate_source(
     if capture != Capture::Full {
         let capacities = capacities.ok_or_else(invalid)?;
         if capture == Capture::References {
+            if entry["source"] == "runtime_observations" {
+                let index = &entry["observations_index"];
+                if index["path"].as_str().is_none_or(str::is_empty)
+                    || !index["sha256"].as_str().is_some_and(sha256)
+                {
+                    return Err(invalid());
+                }
+            }
             for key in ["artifacts", "runtime_artifacts", "launch_artifacts"] {
                 if let Some(refs) = entry.get(key) {
                     file_references(refs, "path")?;
@@ -710,6 +718,8 @@ mod tests {
             ["worker-a", "worker-b", "scheduler"]
                 .map(|path| json!({"path":path, "sha256":"0".repeat(64)}))
         );
+        assert!(validate_source(&entry, Capture::References, None, None).is_err());
+        entry["observations_index"] = json!({"path":"observations.json","sha256":"0".repeat(64)});
         assert!(validate_source(&entry, Capture::References, None, None).unwrap());
     }
 

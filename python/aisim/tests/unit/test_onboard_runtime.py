@@ -2652,6 +2652,10 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
                 memory["provenance"] = json.dumps({**compact, "artifacts": incomplete})
                 with pytest.raises(ValueError, match="worker roster"):
                     _runtime.observed_model_dtype(json.dumps(saved))
+            for index in ({"path": "observations.json"}, {"path": "", "sha256": "0" * 64}):
+                memory["provenance"] = json.dumps({**compact, "observations_index": index})
+                with pytest.raises(ValueError, match="worker roster"):
+                    _runtime.observed_model_dtype(json.dumps(saved))
             for key in ("rank_capacities", "source", "runtime_settings"):
                 memory["provenance"] = json.dumps({k: v for k, v in compact.items() if k != key})
                 with pytest.raises(ValueError, match="worker roster"):
@@ -2748,14 +2752,29 @@ def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_so
         assert hashlib.sha256(Path(reference["path"]).read_bytes()).hexdigest() == reference["sha256"]
     from aisim import _runtime
 
-    missing_probe = resolved.model_copy(deep=True)
-    missing_probe.profile_deployment().resources.runtime_memory.provenance = json.dumps(
-        {k: v for k, v in manifest.items() if k != "runtime_probe"}
-    )
-    with pytest.raises(ValueError, match="requires its source runtime probe"):
-        verify_runtime_profile(missing_probe)
+    damaged = resolved.model_copy(deep=True)
+    memory = damaged.profile_deployment().resources.runtime_memory
+    for keys in ({"runtime_probe"}, {"runtime_compatibility"}, {"runtime_probe", "runtime_compatibility"}):
+        memory.provenance = json.dumps({k: v for k, v in manifest.items() if k not in keys})
+        with pytest.raises(ValueError, match="requires its source runtime probe"):
+            verify_runtime_profile(damaged)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(memory.provenance)
+    probe = {"schema_version": "aisimulate-onboarding-runtime-probe/v1"}
+    probe["observations_index"] = manifest["runtime_probe"]["observations_index"]
+    memory.provenance = json.dumps({**manifest, "runtime_probe": probe})
+    with pytest.raises(ValueError, match="invalid onboarding runtime probe"):
+        verify_runtime_profile(damaged)
     with pytest.raises(ValueError, match="worker roster"):
-        _runtime.observed_model_dtype(missing_probe.profile_deployment().resources.runtime_memory.provenance)
+        _runtime.observed_model_dtype(memory.provenance)
+    memory.provenance = json.dumps({**manifest, "schema_version": "aisimulate-onboarding-finalization/v999"})
+    with pytest.raises(ValueError, match="finalization schema"):
+        verify_runtime_profile(damaged)
+    with pytest.raises(ValueError, match="finalization schema"):
+        _runtime.observed_model_dtype(memory.provenance)
+    memory.provenance = json.dumps({"source": "operator", "source_request_id": "job", "runtime_compatibility": None})
+    assert verify_runtime_profile(damaged) is None
+    assert _runtime.observed_model_dtype(memory.provenance) is None
 
     reordered = resolved.model_copy(deep=True)
     reordered_manifest = json.loads(json.dumps(manifest))

@@ -21,7 +21,9 @@ use serde_json::Value;
 use super::FpmRuntimeMemoryConfig;
 use crate::AicError;
 
+const FINALIZATION: &str = "aisimulate-onboarding-finalization/v1";
 const PROBE_FAMILY: &str = "aisimulate-onboarding-runtime-probe/";
+const UNIFORM_SPEC: &str = "vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs";
 
 fn conflict(field: &str) -> AicError {
     AicError::InvalidEngineConfig(format!(
@@ -45,8 +47,197 @@ fn record(slot: &mut Option<String>, value: Option<&str>, field: &str) -> Result
     Ok(())
 }
 
+fn merge_observed<T: Copy + Eq>(
+    stored: &mut Option<T>,
+    value: Option<T>,
+    field: &str,
+) -> Result<(), AicError> {
+    if let Some(value) = value {
+        if stored.is_some_and(|s| s != value) {
+            return Err(conflict(field));
+        }
+        *stored = Some(value);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TransferMode {
+    Pull,
+    Push,
+}
+
+impl TransferMode {
+    fn configured(config: &Value) -> Option<Self> {
+        let transfer = &config["kv_transfer_config"];
+        // An explicitly configured external module overrides vLLM's connector registry.
+        if !matches!(
+            transfer["kv_connector_module_path"].as_str(),
+            None | Some(
+                "vllm.distributed.kv_transfer.kv_connector.v1.nixl"
+                    | "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector"
+            )
+        ) {
+            return None;
+        }
+        match transfer["kv_connector"].as_str()? {
+            "NixlConnector" | "NixlPullConnector" => Some(Self::Pull),
+            "NixlPushConnector" => Some(Self::Push),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+struct HeadGeometry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_kv_heads: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_size: Option<u64>,
+}
+
+impl HeadGeometry {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn mismatch(&self, peer: &Self) -> Option<(&'static str, String, String)> {
+        [
+            ("num_kv_heads", self.num_kv_heads, peer.num_kv_heads),
+            ("head_size", self.head_size, peer.head_size),
+            ("kv_cache_head_width", self.content_size, peer.content_size),
+        ]
+        .into_iter()
+        .find_map(|(field, a, b)| match (a, b) {
+            (Some(a), Some(b)) if a != b => Some((field, a.to_string(), b.to_string())),
+            _ => None,
+        })
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<(), AicError> {
+        merge_observed(&mut self.num_kv_heads, other.num_kv_heads, "num_kv_heads")?;
+        merge_observed(&mut self.head_size, other.head_size, "head_size")?;
+        merge_observed(
+            &mut self.content_size,
+            other.content_size,
+            "kv_cache_head_width",
+        )
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub(crate) struct TransferMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transfer_mode: Option<TransferMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_hidden_layers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speculative: Option<bool>,
+    // The model reports global KV heads. A cache spec or a view describes one layer on one TP rank.
+    #[serde(default, skip_serializing_if = "HeadGeometry::is_empty")]
+    model_heads: HeadGeometry,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    layer_heads: BTreeMap<String, HeadGeometry>,
+}
+
+impl TransferMetadata {
+    fn configured(config: &Value, use_mla: Option<bool>) -> Self {
+        let model = &config["model_config"];
+        let resolved = &model["model_arch_config"];
+        let overrides = &model["hf_overrides"];
+        let text = overrides.get("text_config").unwrap_or(overrides);
+        // Only use HF overrides for model types whose tagged converter reads these fields.
+        // For example Falcon's multi-query mode ignores n_head_kv; an unidentified
+        // checkpoint can select that converter even if it exposes an ordinary KV cache.
+        let family = text["model_type"].as_str();
+        let standard = matches!(
+            family,
+            Some("llama" | "mistral" | "qwen2" | "qwen3" | "nemotron_h")
+        );
+        let hybrid_pattern = text["hybrid_override_pattern"].as_str().is_some_and(|p| {
+            !p.is_empty()
+                && text["num_hidden_layers"].as_u64() == Some(p.len() as u64)
+                && p.bytes().all(|c| matches!(c, b'*' | b'M' | b'-' | b'E'))
+        });
+        let known_layers =
+            standard || family == Some("falcon") || (family.is_none() && hybrid_pattern);
+        let positive = |v: &Value| v.as_u64().filter(|n| *n > 0);
+        let mut facts = Self {
+            transfer_mode: TransferMode::configured(config),
+            num_hidden_layers: resolved["total_num_hidden_layers"].as_u64().or_else(|| {
+                known_layers
+                    .then(|| positive(&text["num_hidden_layers"]))
+                    .flatten()
+            }),
+            speculative: config["speculative_config"].is_object().then_some(true),
+            model_heads: HeadGeometry {
+                num_kv_heads: positive(&resolved["total_num_kv_heads"]),
+                head_size: positive(&resolved["head_size"]),
+                ..Default::default()
+            },
+            ..Self::default()
+        };
+        if (standard || family == Some("falcon")) && use_mla == Some(false) {
+            facts.model_heads.num_kv_heads = facts.model_heads.num_kv_heads.or_else(|| {
+                if family == Some("falcon") {
+                    return match (
+                        text["new_decoder_architecture"].as_bool(),
+                        text["multi_query"].as_bool(),
+                    ) {
+                        (Some(false), Some(true)) => Some(1),
+                        (Some(true), _) | (_, Some(false)) => positive(&text["n_head_kv"]),
+                        _ => None,
+                    };
+                }
+                // hf_overrides is an overlay. Lower-priority aliases can be shadowed by
+                // the checkpoint's num_key_value_heads even if that key is absent here.
+                positive(&text["n_head_kv"]).or_else(|| {
+                    let canonical = positive(&text["num_key_value_heads"])?;
+                    Some(positive(&text["num_kv_heads"]).unwrap_or(canonical))
+                })
+            });
+            facts.model_heads.head_size = facts
+                .model_heads
+                .head_size
+                .or_else(|| positive(&text["head_dim"]));
+        }
+        facts
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<(), AicError> {
+        merge_observed(
+            &mut self.transfer_mode,
+            other.transfer_mode,
+            "transfer_mode",
+        )?;
+        merge_observed(
+            &mut self.num_hidden_layers,
+            other.num_hidden_layers,
+            "num_hidden_layers",
+        )?;
+        merge_observed(
+            &mut self.speculative,
+            other.speculative,
+            "speculative_config",
+        )?;
+        self.model_heads.merge(&other.model_heads)?;
+        for (name, heads) in &other.layer_heads {
+            self.layer_heads
+                .entry(name.clone())
+                .or_default()
+                .merge(heads)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub(crate) struct Worker {
+    #[serde(flatten)]
+    metadata: TransferMetadata,
     tp_rank: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dp_rank: Option<u64>,
@@ -93,6 +284,7 @@ impl Worker {
         let mut mamba = false;
         if let Some(groups) = groups {
             for group in groups {
+                layout::check_layer_specs(group)?;
                 mamba |= Self::contains_spec(group, "vllm.v1.kv_cache_interface.MambaSpec");
                 hybrid |= group["kind"] == "state" || group["sliding_window"].as_u64().is_some();
                 if group["kind"] == "attention" {
@@ -113,8 +305,9 @@ impl Worker {
             .pointer("/model_config/use_mla")
             .and_then(Value::as_bool)
             .or_else(|| (ordinary == Some(true)).then_some(false));
+        let mut metadata = TransferMetadata::configured(config, use_mla);
         let physical = if groups.is_some() {
-            layout::from_strides(rank)?
+            layout::from_strides(rank, &mut metadata.layer_heads)?
         } else {
             None
         };
@@ -126,6 +319,7 @@ impl Worker {
         }
         let layout = named.or(physical);
         Ok(Self {
+            metadata,
             tp_rank: rank["tp_rank"].as_u64(),
             dp_rank: rank["dp_rank"].as_u64(),
             phase: rank["phase"].as_str().map(str::to_owned),
@@ -190,7 +384,7 @@ impl Worker {
     fn contains_spec(spec: &Value, wanted: &str) -> bool {
         match spec["spec_type"].as_str() {
             Some(name) if name == wanted => true,
-            Some("vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs") => spec["layer_specs"]
+            Some(UNIFORM_SPEC) => spec["layer_specs"]
                 .as_object()
                 .is_some_and(|layers| layers.values().any(|s| Self::contains_spec(s, wanted))),
             _ => false,
@@ -211,6 +405,7 @@ impl Worker {
     }
 
     fn combine(&mut self, other: &Self) -> Result<(), AicError> {
+        self.metadata.merge(&other.metadata)?;
         if self.backends.is_empty() {
             self.backends.clone_from(&other.backends);
         } else if !other.backends.is_empty() {
@@ -274,7 +469,7 @@ impl Worker {
         remote: &str,
         local: &str,
         version: Option<&str>,
-        hybrid_hma: bool,
+        no_repack: bool,
     ) -> bool {
         // 0.31 only tests the remote layout in its permute branch. A probe with no connector
         // does not determine a later serving deployment's permute setting.
@@ -283,10 +478,10 @@ impl Worker {
                 && (local == "LBNHC" || version == Some("0.31.0") || version.is_none())
                 && self.permit_permute != Some(false)
                 && !self.requires_hma
-                && !hybrid_hma)
+                && !no_repack)
     }
 
-    fn excludes_layout(&self, decode: &Self, version: Option<&str>, hybrid_hma: bool) -> bool {
+    fn excludes_layout(&self, decode: &Self, version: Option<&str>, no_repack: bool) -> bool {
         let (Some(remote), Some(local)) = (&self.kv_cache_layout, &decode.kv_cache_layout) else {
             return false;
         };
@@ -295,7 +490,7 @@ impl Worker {
                 local
                     .names()
                     .iter()
-                    .any(|l| decode.accepts_layout(r, l, version, hybrid_hma))
+                    .any(|l| decode.accepts_layout(r, l, version, no_repack))
             })
     }
 }
@@ -309,6 +504,7 @@ enum Capture {
 
 #[derive(Default)]
 pub(crate) struct NixlIdentity {
+    pub(crate) metadata: TransferMetadata,
     pub model: Option<String>,
     pub kv_cache_dtype: Option<String>,
     pub attention_backend: Option<String>,
@@ -317,6 +513,7 @@ pub(crate) struct NixlIdentity {
     pub(crate) modeled_version: Option<String>,
     pub(crate) disable_hma: Option<String>,
     pub(crate) measured_mamba: bool,
+    pub(crate) recorded_groups: Option<Vec<Value>>,
     pub(crate) hybrid_groups: bool,
     pub(crate) workers: Vec<Worker>,
     pub(crate) engines: layout::Deployment,
@@ -407,6 +604,14 @@ impl NixlIdentity {
         )
     }
 
+    fn common_settings(&mut self, config: &Value) -> Result<(), AicError> {
+        self.settings(config)?;
+        self.metadata.merge(&TransferMetadata::configured(
+            config,
+            config["model_config"]["use_mla"].as_bool(),
+        ))
+    }
+
     fn memory(&mut self, data: &Value) -> Result<(), AicError> {
         let dtype = data["model_dtype"]
             .as_str()
@@ -447,10 +652,10 @@ impl NixlIdentity {
         {
             return Err(roster::invalid());
         }
-        self.settings(&entry["runtime_settings"])?;
+        self.common_settings(&entry["runtime_settings"])?;
         let formal = entry["source"] == "vllm_initialized_cache";
         if formal {
-            self.settings(&entry["resolved_config"])?;
+            self.common_settings(&entry["resolved_config"])?;
         }
         record(
             &mut self.version,
@@ -615,7 +820,11 @@ impl NixlIdentity {
                 let rank = &artifact["evidence"];
                 if rank["kind"].as_str() == Some("worker") {
                     self.settings(&rank["resolved_config"])?;
-                    self.measured_groups(&rank["cache"]["groups"])?;
+                    if roster::identified_source(entry) {
+                        self.worker_groups(&rank["cache"])?;
+                    } else {
+                        self.measured_groups(&rank["cache"]["groups"])?;
+                    }
                     if entry["source"] == "vllm_initialized_cache" {
                         record(
                             &mut self.version,
@@ -678,7 +887,88 @@ impl NixlIdentity {
         Ok(found)
     }
 
-    pub(crate) fn measured_groups(&mut self, groups: &Value) -> Result<(), AicError> {
+    fn worker_groups(&mut self, cache: &Value) -> Result<(), AicError> {
+        let Some(groups) = cache["groups"].as_array() else {
+            return Ok(());
+        };
+        // The importer uses the allocation of one shared pool block for every group.
+        // spec_page_size_bytes is the page of a single layer or spec, not that allocation.
+        let page = cache["allocated_cache_bytes"]
+            .as_u64()
+            .zip(cache["num_blocks"].as_u64())
+            .and_then(|(bytes, count)| {
+                (count > 0 && bytes > 0 && bytes % count == 0).then(|| bytes / count)
+            });
+        let normalized: Vec<_> = groups.iter().map(|g| serde_json::json!({
+            "kind":g["kind"], "num_layers":g["layer_names"].as_array().map(Vec::len),
+            "block_size_tokens":g["block_size_tokens"], "page_size_bytes":page,
+            "sliding_window":g["sliding_window"], "blocks_per_request":g["state"]["blocks_per_request"],
+            "prefill_checkpoint_blocks":g["state"]["num_prefill_checkpoint_blocks"],
+            "prefill_checkpoint_alignment":g["state"]["prefill_checkpoint_alignment"],
+        })).collect();
+        self.normalized_groups(&Value::Array(normalized))
+    }
+
+    // A normalized cell or probe records shared-pool geometry. Keep optional fields
+    // that its writer actually recorded; older receipts can be augmented with markers.
+    fn normalized_groups(&mut self, groups: &Value) -> Result<(), AicError> {
+        self.measured_groups(groups)?;
+        let Some(groups) = groups.as_array().filter(|g| !g.is_empty()) else {
+            return Ok(());
+        };
+        let saved = self
+            .recorded_groups
+            .get_or_insert_with(|| vec![Value::Null; groups.len()]);
+        if saved.len() != groups.len() {
+            return Err(conflict("cache_groups"));
+        }
+        for (recorded, group) in saved.iter_mut().zip(groups) {
+            // A missing sliding window denotes full attention in the normalized profile.
+            for field in [
+                "kind",
+                "num_layers",
+                "block_size_tokens",
+                "page_size_bytes",
+                "sliding_window",
+                "blocks_per_request",
+                "prefix_cacheable",
+                "transfer_bytes_per_block",
+                "prefill_checkpoint_blocks",
+                "prefill_checkpoint_alignment",
+            ] {
+                let value = &group[field];
+                if value.is_null() && !(field == "sliding_window" && group["kind"] == "attention") {
+                    continue;
+                }
+                if recorded.get(field).is_some_and(|v| v != value) {
+                    return Err(conflict(field));
+                }
+                recorded[field] = value.clone();
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn selected_groups(&mut self, groups: &Value) -> Result<(), AicError> {
+        if let Some(saved) = &self.recorded_groups {
+            let selected = groups
+                .as_array()
+                .filter(|g| g.len() == saved.len())
+                .ok_or_else(|| conflict("cache_groups"))?;
+            for (recorded, selected) in saved.iter().zip(selected) {
+                if let Some(fields) = recorded.as_object() {
+                    for (field, value) in fields {
+                        if selected[field] != *value {
+                            return Err(conflict(field));
+                        }
+                    }
+                }
+            }
+        }
+        self.measured_groups(groups)
+    }
+
+    fn measured_groups(&mut self, groups: &Value) -> Result<(), AicError> {
         self.hybrid_groups |= groups.as_array().is_some_and(|groups| {
             groups
                 .iter()
@@ -760,7 +1050,7 @@ impl NixlIdentity {
             Some(
                 "aisimulate-onboarding-runtime-probe/v1" | "aisimulate-onboarding-runtime-probe/v2",
             ) => {
-                self.measured_groups(&entry["observed_resources"]["cache_groups"])?;
+                self.normalized_groups(&entry["observed_resources"]["cache_groups"])?;
                 let memory = &entry["observed_resources"]["runtime_memory"];
                 self.memory(memory)?;
                 let legacy = entry["schema_version"] == "aisimulate-onboarding-runtime-probe/v1";
@@ -809,22 +1099,17 @@ impl NixlIdentity {
             return Ok(identity);
         };
         identity.probe(&evidence)?;
-        if let Some(compatibility) = evidence.get("runtime_compatibility") {
-            let source = compatibility["source_observations_index"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(roster::invalid)?;
-            let probe = &evidence["runtime_probe"];
-            if !matches!(
-                probe["schema_version"].as_str(),
-                Some(
-                    "aisimulate-onboarding-runtime-probe/v1"
-                        | "aisimulate-onboarding-runtime-probe/v2"
-                )
-            ) || probe["observations_index"].as_str() != Some(source)
-            {
-                return Err(roster::invalid());
-            }
+        let schema = evidence["schema_version"].as_str().unwrap_or_default();
+        let finalized = schema == FINALIZATION;
+        if !finalized
+            && (schema.starts_with("aisimulate-onboarding-finalization/")
+                || (evidence["source_request_id"].is_string()
+                    && evidence["source_collection_plan_sha256"].is_string()
+                    && evidence["cell_observations"].is_array()))
+        {
+            return Err(AicError::InvalidEngineConfig(
+                "invalid indexed finalization schema".into(),
+            ));
         }
         if let Some(probe) = evidence.get("runtime_probe") {
             identity.probe(probe)?;
@@ -853,6 +1138,7 @@ impl NixlIdentity {
         }
         let mut digests = Vec::new();
         let mut formal_cells = std::collections::BTreeSet::new();
+        let mut indexed_cell = false;
         if let Some(cells) = evidence["cell_observations"].as_array() {
             for cell in cells {
                 let memory = &cell["runtime_memory"];
@@ -870,8 +1156,9 @@ impl NixlIdentity {
                 {
                     return Err(roster::invalid());
                 }
+                indexed_cell |= nested["source"] == "runtime_observations";
                 if roster::identified_source(&nested) {
-                    identity.measured_groups(&cell["cache_groups"])?;
+                    identity.normalized_groups(&cell["cache_groups"])?;
                 }
                 if bound {
                     if nested["source"] == "vllm_initialized_cache" {
@@ -912,6 +1199,40 @@ impl NixlIdentity {
                 } else if !identity.collection(&nested, capture)? {
                     identity.workers.push(Worker::default());
                 }
+            }
+        }
+        if finalized
+            && (indexed_cell
+                || evidence.get("runtime_compatibility").is_some()
+                || evidence.get("runtime_probe").is_some())
+        {
+            let source = evidence["runtime_compatibility"]["source_observations_index"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(roster::invalid)?;
+            let probe = &evidence["runtime_probe"];
+            if !matches!(
+                probe["schema_version"].as_str(),
+                Some(
+                    "aisimulate-onboarding-runtime-probe/v1"
+                        | "aisimulate-onboarding-runtime-probe/v2"
+                )
+            ) || probe["observations_index"].as_str() != Some(source)
+                || ["checkpoint", "configuration"]
+                    .iter()
+                    .any(|key| probe[key].as_str().is_none_or(str::is_empty))
+                || ["observed_resources", "model_metadata", "user_overrides"]
+                    .iter()
+                    .any(|key| !probe[key].is_object())
+                || probe["source_artifacts"].as_array().is_none_or(|files| {
+                    !files.iter().any(|f| f["path"].as_str() == Some(source))
+                        || files.iter().any(|f| {
+                            f["path"].as_str().is_none_or(str::is_empty)
+                                || !f["sha256"].as_str().is_some_and(roster::sha256)
+                        })
+                })
+            {
+                return Err(roster::invalid());
             }
         }
         if bound {
@@ -985,6 +1306,14 @@ impl NixlIdentity {
             for roster in &mut self.rosters {
                 roster.retain(selected);
             }
+        }
+        for worker in &self.workers {
+            self.metadata.merge(&worker.metadata)?;
+        }
+        if matches!(phase, "prefill" | "decode") && self.metadata.speculative == Some(true) {
+            return Err(AicError::InvalidEngineConfig(
+                "grouped FPM cache requires vLLM without speculative decoding".into(),
+            ));
         }
         self.rosters
             .retain(|r| !r.is_empty() && self.phase_width.is_some_and(|n| r.len() as u64 == n));
@@ -1089,6 +1418,34 @@ impl NixlIdentity {
     }
 
     pub fn mismatch(&self, decode: &Self) -> Option<(&'static str, String, String)> {
+        if let (Some(a), Some(b)) = (self.metadata.transfer_mode, decode.metadata.transfer_mode)
+            && a != b
+        {
+            return Some(("transfer_mode", format!("{a:?}"), format!("{b:?}")));
+        }
+        if let (Some(a), Some(b)) = (
+            self.metadata.num_hidden_layers,
+            decode.metadata.num_hidden_layers,
+        ) && a != b
+        {
+            return Some(("num_hidden_layers", a.to_string(), b.to_string()));
+        }
+        if let Some(difference) = self
+            .metadata
+            .model_heads
+            .mismatch(&decode.metadata.model_heads)
+        {
+            return Some(difference);
+        }
+        if self.tp_size.is_some() && self.tp_size == decode.tp_size {
+            for (layer, a) in &self.metadata.layer_heads {
+                if let Some(b) = decode.metadata.layer_heads.get(layer)
+                    && let Some(difference) = a.mismatch(b)
+                {
+                    return Some(difference);
+                }
+            }
+        }
         for (field, a, b) in [
             ("model", &self.model, &decode.model),
             (
@@ -1174,12 +1531,33 @@ impl NixlIdentity {
             .as_deref()
             .or(decode.modeled_version.as_deref())
             .map(FpmRuntimeMemoryConfig::modeled_release);
-        // The handshake requires the same HMA setting on both roles. With hybrid cache groups
-        // a known enabled setting therefore rules out receive-side permutation on the decoder.
-        let hybrid_hma = decode.hybrid_groups
-            && [self.disable_hma.as_deref(), decode.disable_hma.as_deref()]
-                .contains(&Some("false"));
-        if incompatible(&|p, d| p.excludes_layout(d, version, hybrid_hma)) {
+        // Pull performs the full handshake on decode. Push performs it on prefill and does
+        // not run Pull's receive-side cache permutation. Model Push with one common GPU layout.
+        let push = self
+            .metadata
+            .transfer_mode
+            .or(decode.metadata.transfer_mode)
+            == Some(TransferMode::Push);
+        let (remote, local) = if push { (decode, self) } else { (self, decode) };
+        let common_gpu = || {
+            self.workers
+                .iter()
+                .chain(&decode.workers)
+                .fold(u8::MAX, |domain, w| domain & layout::possible_gpu(w))
+                != 0
+        };
+        let no_repack = push
+            || local.hybrid_groups
+                && [self.disable_hma.as_deref(), decode.disable_hma.as_deref()]
+                    .contains(&Some("false"));
+        let excludes = |p: &Worker, d: &Worker| {
+            if push {
+                d.excludes_layout(p, version, no_repack)
+            } else {
+                p.excludes_layout(d, version, no_repack)
+            }
+        };
+        if (push && !common_gpu()) || incompatible(&excludes) {
             return Some((
                 "kv_cache_layout",
                 "prefill workers".into(),
@@ -1190,7 +1568,7 @@ impl NixlIdentity {
             .tp_size
             .filter(|t| Some(*t) == decode.tp_size && *t > 0);
         if tp.is_some()
-            && !layout::engines_routable(&self.engines, &decode.engines, version, hybrid_hma)
+            && !layout::engines_routable(&remote.engines, &local.engines, version, no_repack)
         {
             return Some((
                 "kv_cache_layout",
@@ -1202,11 +1580,11 @@ impl NixlIdentity {
             for slot in 0..tp {
                 let at_slot =
                     |w: &&Worker| w.tp_rank == Some(slot) || (tp == 1 && w.tp_rank.is_none());
-                let p: Vec<_> = self.workers.iter().filter(at_slot).collect();
-                let d: Vec<_> = decode.workers.iter().filter(at_slot).collect();
+                let p: Vec<_> = remote.workers.iter().filter(at_slot).collect();
+                let d: Vec<_> = local.workers.iter().filter(at_slot).collect();
                 // A missing prefill observation leaves one freely chosen, immutable layout.
                 // A missing decode observation also leaves the MLA exemption possible.
-                if (p.len() > 1 || d.len() > 1) && !layout::routable(&p, &d, version, hybrid_hma) {
+                if (p.len() > 1 || d.len() > 1) && !layout::routable(&p, &d, version, no_repack) {
                     return Some((
                         "kv_cache_layout",
                         "prefill workers".into(),
@@ -1241,9 +1619,7 @@ impl NixlIdentity {
                     (a.tp_rank.is_none() || b.tp_rank.is_none() || a.tp_rank == b.tp_rank)
                         && !a.excludes_backend(b)
                 };
-                if !roster::can_pair(p, d, |a, b| {
-                    compatible(a, b) && !a.excludes_layout(b, version, hybrid_hma)
-                }) {
+                if !roster::can_pair(p, d, |a, b| compatible(a, b) && !excludes(a, b)) {
                     let field = if roster::can_pair(p, d, compatible) {
                         "kv_cache_layout"
                     } else {
@@ -1589,7 +1965,7 @@ mod tests {
     fn complete_anonymous_cells_must_describe_the_same_physical_workers() {
         let cell = |names: Value| {
             let captures = json!({"source":"runtime_observations","observation_schema":"aisimulate-runtime-observation/v1",
-                "runtime_settings":{"parallel_config":{"tensor_parallel_size":2}},"artifacts":(["worker-a","worker-b","scheduler"].map(|p| json!({"path":p,"sha256":"0".repeat(64)}))),"worker_attention_backends":names,
+                "observations_index":{"path":"observations.json","sha256":"0".repeat(64)},"runtime_settings":{"parallel_config":{"tensor_parallel_size":2}},"artifacts":(["worker-a","worker-b","scheduler"].map(|p| json!({"path":p,"sha256":"0".repeat(64)}))),"worker_attention_backends":names,
                 "rank_capacities":[{"phase":"prefill","tp_rank":0,"dp_rank":0},{"phase":"prefill","tp_rank":1,"dp_rank":0}]});
             json!({"runtime_memory":{"provenance":captures.to_string()}})
         };
@@ -1772,6 +2148,178 @@ mod tests {
                     assert_eq!(worker.gpu_cache_layout, None);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn inkling_windows_constrain_layout_without_reporting_ordinary_head_dimensions() {
+        let class = "vllm.models.inkling.nvidia.sconv_swa_attn.InklingConvState";
+        let full = "vllm.v1.kv_cache_interface.FullAttentionSpec";
+        let sliding = "vllm.v1.kv_cache_interface.SlidingWindowSpec";
+        let view = json!({"shape":[8,2,4,8],"stride_bytes":[256,64,16,2],"block_axis":0});
+        let mut row = json!({"schema_version":"aisimulate-runtime-observation/v1","runtime":{"version":"0.32.0"},
+            "cache":{"groups":[{"kind":"attention","spec_type":full,"layer_names":["a"]},
+                {"kind":"convolution","spec_type":sliding,"layer_classes":{"b":class,"c":class}}],
+                "tensor_allocations":[{"layers":["a"],"host_resident":false,"layer_stride":0},
+                    {"layers":["b","c"],"host_resident":false,"layer_stride":128}],
+                "layer_tensors":{"a":view,"b":view,"c":view}}});
+        let worker = Worker::observed(&row).unwrap();
+        assert_eq!(worker.gpu_cache_layout, Layouts::named("BLHNC"));
+        assert_eq!(
+            worker.metadata.layer_heads.keys().collect::<Vec<_>>(),
+            ["a"]
+        );
+        row["cache"]["groups"][0]["layer_specs"] = json!({"a":{"spec_type":"unknown"}});
+        assert_eq!(
+            Worker::observed(&row).unwrap().metadata.layer_heads["a"].num_kv_heads,
+            Some(2)
+        );
+        row["cache"]["groups"][0]["layer_specs"] = json!({"a":{"spec_type":sliding}});
+        assert!(Worker::observed(&row).is_err());
+        row["cache"]["groups"][0]["spec_type"] =
+            json!("vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs");
+        assert!(Worker::observed(&row).is_ok());
+    }
+
+    #[test]
+    fn observed_head_geometry_and_connector_mode_survive_worker_compaction() {
+        let identity = |heads: u64, dim: u64, compact: bool, connector: &str| {
+            let spec = "vllm.v1.kv_cache_interface.FullAttentionSpec";
+            let row = json!({"schema_version":"aisimulate-runtime-observation/v1","kind":"worker",
+                "resolved_config":{"kv_transfer_config":{"kv_connector":connector}},
+                "raw_cache_config":{"groups":[{"spec_type":spec,"layer_names":["a"],"num_kv_heads":heads,"head_size":dim}]},
+                "cache":{"groups":[{"kind":"attention","spec_type":spec,"layer_names":["a"]}]}});
+            let evidence = if compact {
+                json!({"worker_observations":NixlIdentity::compact_workers(&[row]).unwrap()})
+            } else {
+                json!({"artifacts":[{"evidence":row}]})
+            };
+            let mut id =
+                NixlIdentity::observed(None, &evidence.to_string(), Some(2), Some(2)).unwrap();
+            id.select("decode", None, None, None, None, false).unwrap();
+            id
+        };
+        let prefill = identity(2, 128, false, "NixlPullConnector");
+        for compact in [false, true] {
+            for (heads, width, connector, expected) in [
+                (2, 128, "NixlConnector", None),
+                (4, 128, "NixlConnector", Some("num_kv_heads")),
+                (2, 64, "NixlConnector", Some("head_size")),
+                (2, 128, "NixlPushConnector", Some("transfer_mode")),
+            ] {
+                assert_eq!(
+                    prefill
+                        .mismatch(&identity(heads, width, compact, connector))
+                        .map(|d| d.0),
+                    expected
+                );
+            }
+        }
+        let model = |count, width| {
+            observe(
+                json!({"runtime_settings":{"model_config":{"use_mla":false,
+            "hf_overrides":{"model_type":"llama","num_key_value_heads":count,"head_dim":width}}}}),
+                "decode",
+            )
+        };
+        assert_eq!(
+            model(4, 128).mismatch(&model(8, 128)).unwrap().0,
+            "num_kv_heads"
+        );
+        assert_eq!(
+            model(4, 128).mismatch(&model(4, 64)).unwrap().0,
+            "head_size"
+        );
+        assert!(model(4, 128).mismatch(&NixlIdentity::default()).is_none());
+    }
+
+    #[test]
+    fn effective_model_geometry_depends_on_the_recorded_converter() {
+        let model = |over| {
+            observe(
+                json!({"runtime_settings":{"model_config":{
+            "use_mla":false,"hf_overrides":over}}}),
+                "decode",
+            )
+        };
+        for family in ["falcon", "unknown"] {
+            let first = model(
+                json!({"model_type":family,"n_head_kv":4,"multi_query":true,"new_decoder_architecture":false}),
+            );
+            let second = model(
+                json!({"model_type":family,"n_head_kv":8,"multi_query":true,"new_decoder_architecture":false}),
+            );
+            assert!(first.mismatch(&second).is_none());
+        }
+        let partial = |n| model(json!({"model_type":"qwen2","num_attention_groups":n}));
+        assert!(partial(4).mismatch(&partial(8)).is_none());
+        let layers = |n| model(json!({"model_type":"nemotron_h","num_hidden_layers":n}));
+        assert_eq!(
+            layers(3).mismatch(&layers(4)).unwrap().0,
+            "num_hidden_layers"
+        );
+        assert!(layers(3).mismatch(&model(json!({}))).is_none());
+    }
+
+    #[test]
+    fn selected_groups_preserve_observed_geometry_and_allow_unmeasured_transfer_bytes() {
+        let group =
+            json!({"kind":"attention","num_layers":1,"block_size_tokens":64,"page_size_bytes":256});
+        let mut id = NixlIdentity::default();
+        id.normalized_groups(&json!([group])).unwrap();
+        let mut selected = group.clone();
+        selected["transfer_bytes_per_block"] = json!(128);
+        id.selected_groups(&json!([selected])).unwrap();
+        let cache = json!({"groups":[{"kind":"attention","block_size_tokens":64,"layer_names":["a"],
+            "spec_page_size_bytes":128}],"allocated_cache_bytes":1024,"num_blocks":4});
+        let mut raw = NixlIdentity::default();
+        raw.worker_groups(&cache).unwrap();
+        raw.selected_groups(&json!([selected])).unwrap();
+        for (field, value) in [
+            ("block_size_tokens", 128),
+            ("num_layers", 2),
+            ("page_size_bytes", 512),
+            ("sliding_window", 32),
+        ] {
+            let mut changed = selected.clone();
+            changed[field] = json!(value);
+            assert!(raw.selected_groups(&json!([changed])).is_err());
+            assert!(
+                id.selected_groups(&json!([changed]))
+                    .unwrap_err()
+                    .to_string()
+                    .contains(field)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_push_requires_a_common_layout_across_peers() {
+        let worker = |connector, layout, permute, role| {
+            observe(
+                json!({"artifacts":[{"evidence":{
+                    "kind":"worker","phase":role,"tp_rank":0,"dp_rank":0,"raw_cache_config":{"kv_cache_layout":layout},
+                    "resolved_config":{"model_config":{"use_mla":false},"kv_transfer_config":{
+                        "kv_connector":connector,"enable_permute_local_kv":permute,"kv_buffer_device":"cuda"}}
+                }}]}),
+                role,
+            )
+        };
+        for (connector, can_permute) in [
+            ("NixlConnector", true),
+            ("NixlPullConnector", true),
+            ("NixlPushConnector", false),
+        ] {
+            let p = worker(connector, "LBHNC", false, "prefill");
+            assert!(
+                p.mismatch(&worker(connector, "LBHNC", false, "decode"))
+                    .is_none()
+            );
+            assert_eq!(
+                p.mismatch(&worker(connector, "LBNHC", true, "decode"))
+                    .is_none(),
+                can_permute
+            );
         }
     }
 

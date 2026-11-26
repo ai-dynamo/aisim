@@ -2290,6 +2290,91 @@ def test_direct_grouped_pd_prefix_policy_checks_each_role(grouped_case, pinned, 
         assert candidates("prefill") == candidates("decode") == [rank]
 
 
+@pytest.mark.parametrize("modes", [["agg", "disagg"], ["disagg", "agg"]])
+@pytest.mark.parametrize("warm", ["agg", "prefill"])
+def test_warm_exhaustion_leaves_feasible_modes(grouped_case, modes, warm):
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.search_space import enumerate_branches
+
+    source, root = grouped_case
+    profile = _with_transfer_markers(source)
+    _write_timings(root, profile, version="0.31.0")
+    search = {
+        **_pd_search(profile, root),
+        "deployment_mode": modes,
+        "agg_enable_prefix_caching": warm == "agg",
+        "agg_max_num_batched_tokens": [128],
+        "agg_max_num_seqs": [4],
+        "prefill_enable_prefix_caching": warm == "prefill",
+    }
+    smart = SmartSearchConfig(
+        search_space=search,
+        workload=Workload(isl=128, osl=2, concurrency=1, request_count=2),
+    )
+    with pytest.warns(UserWarning, match=f"{warm}_enable_prefix_caching=false"):
+        branches = enumerate_branches(smart, max_seq_len=128)
+    assert [branch.deployment_mode for branch in branches] == ["agg" if warm == "prefill" else "disagg"]
+
+
+def test_warm_pd_search_checks_transfer_evidence_before_warm_filter(grouped_case):
+    from aisim.sweeper.config import SearchSpace
+
+    source, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(source))
+    cold = profile["deployments"][0]["resources"]
+    del cold["runtime_memory"]["hash_block_size_tokens"]
+    cold["runtime_memory"].update(enable_prefix_caching=False, mamba_cache_mode="none")
+    del cold["cache_groups"][0]["transfer_bytes_per_block"]
+    search = {**_pd_search(profile, root), "prefill_enable_prefix_caching": True}
+    with pytest.raises(ValueError, match="transfer_bytes_per_block"):
+        SearchSpace.model_validate(search)
+    pin = {"tp": 1, "attention_dp": 2, "moe_ep": 2}
+    SearchSpace.model_validate(
+        {
+            **search,
+            "parallel_configs_by_mode": {"disagg": [{"prefill": pin, "decode": pin}]},
+        }
+    )
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_single_role_checks_only_reachable_replica_counts(grouped_case, role):
+    source, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(source, version="0.32.0"), version="0.32.0")
+    row = profile["deployments"][0]
+    row["tp"] = row["moe_tp"] = 4
+    row["resources"]["runtime_memory"]["provenance"] = json.dumps({"runtime": {"version": "0.32.0+cu130"}})
+    _write_timings(root, profile, version="0.32.0")
+
+    def search(budget):
+        return parallel_configs_for(
+            profile["model"],
+            "h200_sxm",
+            deployment_mode="agg",
+            worker_type=role,
+            backend="vllm",
+            backend_version="0.32.0",
+            gpu_budget=budget,
+            min_gpu_budget=budget,
+            max_seq_len=128,
+            max_num_tokens=128,
+            max_batch_size=4,
+            fpm_profile=profile,
+            systems_paths=[str(root)],
+            **{f"{role}_enable_prefix_caching": True},
+        )
+
+    (allowed,) = search(6)
+    assert (allowed.shape.tp, allowed.shape.dp, allowed.replicas) == (1, 2, 3)
+    with pytest.raises(ValueError, match="cu130"):
+        search(4)
+    del row["resources"]["cache_groups"][0]["transfer_bytes_per_block"]
+    row["resources"]["runtime_memory"]["provenance"] = "operator capture"
+    with pytest.raises(ValueError, match="transfer_bytes_per_block"):
+        search(4)
+    assert search(6) == [allowed]
+
+
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 @pytest.mark.parametrize(
     "runtime_version,hash_block",
@@ -3930,6 +4015,43 @@ def test_convolution_with_larger_checkpointed_state_plans_and_runs_cold(grouped_
         worker = yaml.safe_load((plan / path).read_text())["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
     assert json.loads((output / "validation.json").read_text())["status"] == "covered"
+
+
+@pytest.mark.parametrize("case", ["unequal_pages", "noncacheable_convolution", "nonaligned_mamba"])
+def test_saved_pilots_cannot_be_changed_to_warm_for_historically_cold_geometry(grouped_case, tmp_path, capsys, case):
+    from aisim.support.plan import check_plan
+
+    source = grouped_case[0]
+    profile = _with_prefix_evidence(
+        _with_state_group(source) if case == "nonaligned_mamba" else source,
+        version="0.32.0",
+    )
+    for deployment in profile["deployments"]:
+        resources = deployment["resources"]
+        if case == "unequal_pages":
+            resources["cache_groups"][0]["page_size_bytes"] *= 2
+        elif case == "noncacheable_convolution":
+            resources["cache_groups"][0] = {
+                **_CONVOLUTION_GROUP,
+                "prefix_cacheable": False,
+            }
+        else:
+            resources["runtime_memory"]["mamba_cache_mode"] = "none"
+    _onboarding_plan(profile, tmp_path, capsys, "0.32.0")
+    saved = tmp_path / "collection"
+    assert _prefix_caching_of(saved) == [False, False]
+    request = SupportRequest.from_yaml(saved / "request.yaml")
+    check_plan(request, saved)
+    manifest_file = saved / "support-plan.json"
+    manifest = json.loads(manifest_file.read_text())
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        pilot = saved / name
+        changed = pilot.read_bytes().replace(b"prefix_caching: false", b"prefix_caching: true")
+        pilot.write_bytes(changed)
+        manifest["generated_files_sha256"][name] = hashlib.sha256(changed).hexdigest()
+    manifest_file.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="generated plan input .* modified"):
+        check_plan(request, saved)
 
 
 @reads_saved_config

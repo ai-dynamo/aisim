@@ -576,6 +576,17 @@ def _ordered_runtime_evidence(value: Any) -> Any:
     return result
 
 
+def _has_indexed_cell(manifest: dict[str, Any]) -> bool:
+    for cell in manifest.get("cell_observations", []):
+        try:
+            evidence = json.loads(cell["runtime_memory"]["provenance"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if isinstance(evidence, dict) and evidence.get("source") == "runtime_observations":
+            return True
+    return False
+
+
 def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     """Revalidate source files and the exact runtime binding of an imported draft."""
     manifest = runtime_probe_manifest(request)
@@ -590,8 +601,10 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
 
         finalized = finalization_manifest(request)
         quality = verify_finalized_quality(finalized) if finalized is not None else None
-        if finalized is not None and "runtime_compatibility" in finalized:
-            compatible = finalized["runtime_compatibility"]
+        if finalized is not None and (
+            "runtime_compatibility" in finalized or "runtime_probe" in finalized or _has_indexed_cell(finalized)
+        ):
+            compatible = finalized.get("runtime_compatibility")
             index = compatible.get("source_observations_index") if isinstance(compatible, dict) else None
             probe = _probe_provenance(json.dumps(finalized.get("runtime_probe")))
             if not index or probe is None or probe["observations_index"] != index:

@@ -236,8 +236,9 @@ def _parse_parallel_entry(entry: dict[str, Any], deployment_mode: str):
     )
 
 
-def _fpm_parallel_configs(search_space, deployment_mode: str):
+def _fpm_parallel_configs(search_space, deployment_mode: str, *, validate_grouped_role=None):
     """Apply declared topology domains before grouped compatibility or resource checks."""
+    from aisim.config.engine import KvTransferConfig
     from aisim.fpm_profile import load_fpm_profile
 
     profile = load_fpm_profile(search_space.fpm_profile)
@@ -290,8 +291,21 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
         candidate_configs=[_parse_parallel_entry(entry, deployment_mode) for entry in raw_pinned]
         if raw_pinned
         else None,
-        # The search validates transfer evidence after applying its role and topology domains.
-        validate_transfer=False,
+        require_pinned_pairs=bool(raw_pinned),
+        filter_warm_aggregate=(
+            deployment_mode == "agg"
+            and search_space.agg_enable_prefix_caching
+            and len(set(search_space.deployment_mode)) > 1
+            and not (raw_pinned or custom)
+        ),
+        validate_grouped_role=validate_grouped_role,
+        # SearchSpace validates every in-domain pair before warm filtering. Its later enumeration reuses that check.
+        validate_transfer=validate_grouped_role is not None,
+        kv_transfer=(
+            KvTransferConfig.model_construct(bytes_per_token=search_space.kv_transfer_bytes_per_token)
+            if search_space.kv_transfer_bytes_per_token is not None
+            else None
+        ),
         replica_counts=replica_counts if custom or domains or bounds else None,
     )
     return configs

@@ -90,7 +90,12 @@ def finalization_manifest(request: SupportRequest) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     if value.get("schema_version") != _SCHEMA:
-        if "runtime_compatibility" in value and "source_request_id" in value:
+        schema = value.get("schema_version")
+        if (isinstance(schema, str) and schema.startswith("aisimulate-onboarding-finalization/")) or (
+            isinstance(value.get("source_request_id"), str)
+            and isinstance(value.get("source_collection_plan_sha256"), str)
+            and isinstance(value.get("cell_observations"), list)
+        ):
             raise ValueError("invalid indexed finalization schema")
         return None
     if "observation_provenance" in value and value["observation_provenance"] not in (

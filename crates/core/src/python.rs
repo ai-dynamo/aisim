@@ -4908,7 +4908,7 @@ impl GroupedPdObservation {
             )?;
             if let Some(groups) = groups {
                 identity
-                    .measured_groups(&serde_json::from_str(groups).map_err(|error| {
+                    .selected_groups(&serde_json::from_str(groups).map_err(|error| {
                         crate::AicError::InvalidEngineConfig(error.to_string())
                     })?)?;
             }

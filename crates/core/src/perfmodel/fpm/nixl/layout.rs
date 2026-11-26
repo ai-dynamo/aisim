@@ -4,7 +4,7 @@
 
 //! Modified from vLLM's `v1/kv_cache_layout.py`, pinned in THIRD_PARTY_NOTICES.md.
 
-use super::{Worker, conflict};
+use super::{HeadGeometry, UNIFORM_SPEC, Worker, conflict, known};
 use crate::AicError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -99,10 +99,10 @@ pub(super) fn routable(
     prefill: &[&Worker],
     decode: &[&Worker],
     version: Option<&str>,
-    hybrid_hma: bool,
+    no_repack: bool,
 ) -> bool {
     let allowed = |w: &Worker| {
-        let choices = std::array::from_fn(|gpu| transfer(w, gpu, version, hybrid_hma));
+        let choices = std::array::from_fn(|gpu| transfer(w, gpu, version, no_repack));
         receive_options(&choices, ALL)
     };
     let senders = prefill
@@ -124,7 +124,7 @@ fn mask(layout: Option<&Layouts>) -> u8 {
 /// For each announced layout, the set of remote layouts one decoder configuration can accept.
 /// The host buffer changes LBNHC to LBHNC only for an ordinary attention worker with permutation enabled.
 /// Older receipts retain only the announced layout, so either registration device can explain those observations.
-fn transfer(worker: &Worker, gpu: usize, version: Option<&str>, hybrid_hma: bool) -> [u8; 6] {
+fn transfer(worker: &Worker, gpu: usize, version: Option<&str>, no_repack: bool) -> [u8; 6] {
     let mut allowed = [0; 6];
     let effective = mask(worker.kv_cache_layout.as_ref());
     if mask(worker.gpu_cache_layout.as_ref()) & (1 << gpu) == 0 {
@@ -152,7 +152,7 @@ fn transfer(worker: &Worker, gpu: usize, version: Option<&str>, hybrid_hma: bool
                 }
                 let can_repack = permute
                     && !worker.requires_hma
-                    && !hybrid_hma
+                    && !no_repack
                     && (local == LBNHC || version.is_none_or(|v| v == "0.31.0"));
                 allowed[local] |= if mla {
                     ALL
@@ -245,7 +245,7 @@ pub(super) fn engines_routable(
     prefill: &Deployment,
     decode: &Deployment,
     version: Option<&str>,
-    hybrid_hma: bool,
+    no_repack: bool,
 ) -> bool {
     let observed = |w: &Worker| w.kv_cache_layout.is_some() || w.gpu_cache_layout.is_some();
     if ![prefill, decode].iter().any(|r| {
@@ -285,7 +285,7 @@ pub(super) fn engines_routable(
                 .iter()
                 .map(|e| {
                     let worker = e.workers.get(&rank).unwrap_or(&unknown_worker);
-                    std::array::from_fn(|gpu| transfer(worker, gpu, version, hybrid_hma))
+                    std::array::from_fn(|gpu| transfer(worker, gpu, version, no_repack))
                 })
                 .collect()
         })
@@ -364,13 +364,36 @@ fn view_dimensions(
     if shape.len() != 4 || strides.len() != 4 || view["block_axis"] != 0 {
         return None;
     }
-    let mut dims = [(layers as u64, allocation["layer_stride"].as_u64()?); 5];
-    for (i, (size, stride)) in shape.iter().zip(strides).enumerate() {
-        dims[i + 1] = (size.as_u64()?, stride.as_u64()?);
+    // A negative stride on a non-singleton axis cannot describe these GPU views.
+    let stride = |v: &Value| v.as_u64().or_else(|| v.as_i64().map(|_| 0));
+    let layer_stride = stride(&allocation["layer_stride"]).or((layers == 1).then_some(0))?;
+    let mut dims = [(layers as u64, layer_stride); 5];
+    for (i, (size, step)) in shape.iter().zip(strides).enumerate() {
+        let size = size.as_u64()?;
+        dims[i + 1] = (size, stride(step).or((size == 1).then_some(0))?);
     }
-    dims.iter()
-        .all(|&(size, stride)| size > 0 && (size == 1 || stride > 0))
-        .then_some(dims)
+    Some(dims)
+}
+
+fn shared_spec(group: &Value) -> Option<&str> {
+    group["spec_type"]
+        .as_str()
+        .filter(|name| known(name) && *name != UNIFORM_SPEC)
+}
+
+pub(super) fn check_layer_specs(group: &Value) -> Result<(), AicError> {
+    if let Some(shared) = shared_spec(group)
+        && group["layer_specs"].as_object().is_some_and(|layers| {
+            layers.values().any(|layer| {
+                layer["spec_type"]
+                    .as_str()
+                    .is_some_and(|specific| known(specific) && specific != shared)
+            })
+        })
+    {
+        return Err(conflict("cache group spec_type"));
+    }
+    Ok(())
 }
 
 /// UniformTypeKVCacheSpecs records each layer's spec. Older probes can record a shared
@@ -391,10 +414,12 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
                 .flat_map(|layers| layers.keys().map(String::as_str)),
         )
         .map(move |name| {
-            let spec = group["layer_specs"][name]["spec_type"]
-                .as_str()
-                .or_else(|| group["spec_type"].as_str());
-            let ordinary = match spec {
+            let inner = group["layer_specs"][name]["spec_type"].as_str().filter(|name| known(name));
+            let spec = shared_spec(group).or(inner).or_else(|| group["spec_type"].as_str());
+            let ordinary = if group["kind"] == "convolution" {
+                spec == Some("vllm.v1.kv_cache_interface.SlidingWindowSpec")
+                    && group["layer_classes"][name] == "vllm.models.inkling.nvidia.sconv_swa_attn.InklingConvState"
+            } else { match spec {
                 Some(spec) => matches!(
                     spec,
                     "vllm.v1.kv_cache_interface.FullAttentionSpec"
@@ -409,36 +434,75 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
                             | "vllm.model_executor.layers.attention.prefill_prefix_lm_attention.PrefillPrefixLMAttention"
                     )
                 ),
-            };
+            }};
             (name, ordinary)
         })
 }
 
-pub(super) fn from_strides(rank: &Value) -> Result<Option<Layouts>, AicError> {
+pub(super) fn from_strides(
+    rank: &Value,
+    heads: &mut BTreeMap<String, HeadGeometry>,
+) -> Result<Option<Layouts>, AicError> {
     if rank["schema_version"] != "aisimulate-runtime-observation/v1" {
         return Ok(None);
     }
-    // v0.33 records every block-first view of a layer. Its backing storage identifies the device.
+    // The 0.31 and 0.33 writers save lists of block-first views. 0.32 saves a single backend view.
     let block_first = rank
         .pointer("/runtime/version")
         .and_then(Value::as_str)
-        .is_some_and(|v| v.split('+').next() == Some("0.33.0"));
+        .is_some_and(|v| matches!(v.split('+').next(), Some("0.31.0" | "0.33.0")));
     let cache = &rank["cache"];
+    // A separate state allocation can have four axes with different meanings.
+    let attention_layers = cache["groups"].as_array().map(|groups| {
+        groups
+            .iter()
+            .filter(|g| matches!(g["kind"].as_str(), Some("attention" | "convolution")))
+            .flat_map(|g| {
+                decoder_layers(g)
+                    .filter(|(_, ordinary)| *ordinary)
+                    .map(move |(name, _)| (name, g["kind"] == "attention"))
+            })
+            .collect::<BTreeMap<_, _>>()
+    });
+    // Only a decoder cache spec supplies logical KV geometry. An Inkling window or an MLA
+    // indexer may carry similarly named dimensions for different data.
+    for group in rank["raw_cache_config"]["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        check_layer_specs(group)?;
+        for (name, ordinary) in decoder_layers(group) {
+            if !ordinary
+                || attention_layers
+                    .as_ref()
+                    .and_then(|layers| layers.get(name))
+                    != Some(&true)
+            {
+                continue;
+            }
+            for spec in shared_spec(group)
+                .map(|_| group)
+                .into_iter()
+                .chain(group["layer_specs"].get(name))
+            {
+                let saved = HeadGeometry {
+                    num_kv_heads: spec["num_kv_heads"].as_u64().filter(|v| *v > 0),
+                    head_size: spec["head_size"].as_u64().filter(|v| *v > 0),
+                    ..Default::default()
+                };
+                if !saved.is_empty() {
+                    heads.entry(name.to_owned()).or_default().merge(&saved)?;
+                }
+            }
+        }
+    }
     let (Some(allocations), Some(tensors)) = (
         cache["tensor_allocations"].as_array(),
         cache["layer_tensors"].as_object(),
     ) else {
         return Ok(None);
     };
-    // A separate state allocation can have four axes with different meanings.
-    let attention_layers = cache["groups"].as_array().map(|groups| {
-        groups
-            .iter()
-            .filter(|g| g["kind"] == "attention")
-            .flat_map(decoder_layers)
-            .filter_map(|(name, ordinary)| ordinary.then_some(name))
-            .collect::<BTreeSet<_>>()
-    });
     let mut candidates = LAYOUTS.to_vec();
     let mut measured = false;
     for allocation in allocations {
@@ -450,7 +514,7 @@ pub(super) fn from_strides(rank: &Value) -> Result<Option<Layouts>, AicError> {
             let name = name.as_str().unwrap_or_default();
             if attention_layers
                 .as_ref()
-                .is_some_and(|names| !names.contains(name))
+                .is_some_and(|names| !names.contains_key(name))
             {
                 continue;
             }
@@ -467,15 +531,31 @@ pub(super) fn from_strides(rank: &Value) -> Result<Option<Layouts>, AicError> {
                     continue;
                 };
                 measured = true;
+                // Inkling packs several streams into C. Only an ordinary attention view describes KV heads.
+                if attention_layers
+                    .as_ref()
+                    .and_then(|layers| layers.get(name))
+                    == Some(&true)
+                {
+                    heads
+                        .entry(name.to_owned())
+                        .or_default()
+                        .merge(&HeadGeometry {
+                            num_kv_heads: Some(dims[2].0),
+                            // C is the packed storage width, which need not equal the logical head size.
+                            content_size: (views.len() == 1).then_some(dims[4].0),
+                            ..Default::default()
+                        })?;
+                }
                 candidates.retain(|(_, order)| {
-                    let mut previous = None;
-                    for &axis in order {
+                    let mut span = u128::from(view["element_size_bytes"].as_u64().unwrap_or(1));
+                    for &axis in order.iter().rev() {
                         let (size, stride) = dims[axis];
+                        if size == 0 || (size > 1 && u128::from(stride) < span) {
+                            return false;
+                        }
                         if size > 1 {
-                            if previous.is_some_and(|p| p <= stride) {
-                                return false;
-                            }
-                            previous = Some(stride);
+                            span += u128::from(size - 1) * u128::from(stride);
                         }
                     }
                     true
@@ -511,7 +591,7 @@ mod tests {
                 "layer_tensors":{"a":view,"b":view}
             }})
         };
-        let inferred = |rank: &Value| from_strides(rank).unwrap();
+        let inferred = |rank: &Value| from_strides(rank, &mut BTreeMap::new()).unwrap();
         let shape = [100, 2, 16, 4];
         let compact = capture(shape, [256, 128, 8, 2], 25600);
         assert_eq!(inferred(&compact), Layouts::named("LBHNC"));
@@ -523,7 +603,10 @@ mod tests {
             inferred(&capture(shape, [512, 8, 16, 2], 256)),
             Layouts::named("BLNHC")
         );
-        let one_head = capture([100, 1, 16, 4], [128, 128, 8, 2], 12800);
+        for invalid in [[256, 0, 8, 2], [256, 8, 8, 2], [256, 64, 8, 2]] {
+            assert!(from_strides(&capture(shape, invalid, 25600), &mut BTreeMap::new()).is_err());
+        }
+        let one_head = capture([100, 1, 16, 4], [128, 0, 8, 2], 12800);
         assert_eq!(
             inferred(&one_head).unwrap().names(),
             ["LBHNC", "LBNHC", "LHBNC"]
@@ -540,10 +623,13 @@ mod tests {
             view["storage_id"] = json!("s0");
             *view = json!([view]);
         }
-        assert_eq!(
-            inferred(&block_first).unwrap().names(),
-            ["BHLNC", "BLHNC", "BLNHC"]
-        );
+        for version in ["0.31.0", "0.33.0"] {
+            block_first["runtime"]["version"] = json!(version);
+            assert_eq!(
+                inferred(&block_first).unwrap().names(),
+                ["BHLNC", "BLHNC", "BLNHC"]
+            );
+        }
         block_first["cache"]["storages"][0]["device"] = json!("cpu");
         assert_eq!(inferred(&block_first), None);
         let mut empty = compact.clone();
@@ -584,7 +670,7 @@ mod tests {
                         "layer_tensors":{"a":view(a),"b":view(b),"s":view(&token_first)}
                     }
                 });
-                let physical = from_strides(&rank);
+                let physical = from_strides(&rank, &mut BTreeMap::new());
                 if layout == Some("conflict") {
                     assert!(
                         physical

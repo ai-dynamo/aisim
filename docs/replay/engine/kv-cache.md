@@ -1540,8 +1540,19 @@ sub-block matching without an explicit full-state scratch count.
   Replay also compares the initialized model path and literal cache dtype when
   both runtimes recorded them. For example, `fp8` and `fp8_e4m3` can use the same
   FPM table label and still yield different handshake hashes.
-  vLLM hashes the model ID, cache dtype and resolved attention backend during
-  the NIXL handshake. See [v0.31.0](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L182-L199),
+  Replay compares recorded KV head counts and dimensions for ordinary attention.
+  At equal tensor parallelism, an initialized layer's cache spec or GPU view can
+  establish incompatible per-rank dimensions even when its page bytes match.
+  An Inkling convolution window also constrains the physical GPU layout.
+  When serving evidence identifies the NIXL connector, both roles must use the
+  same transfer mode. `NixlConnector` is the pull alias. An explicit push
+  uses the prefill-side handshake and requires a common physical GPU layout
+  across participating workers. Pull can use the decode-side permutation.
+  Replay compares a recorded effective hidden-layer count, including layers
+  without a KV cache. It reads checkpoint overrides when their model converter
+  establishes the effective value. A sparse record can omit these dimensions.
+  vLLM hashes the model ID, KV head geometry, hidden-layer count, cache dtype,
+  resolved attention backend and transfer mode during the NIXL handshake. See [v0.31.0](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L182-L199),
   [v0.32.0](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L185-L202)
   and [v0.33.0](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py#L186-L203).
   `engine.backend_version` must be `0.31.0`, `0.32.0` or `0.33.0`. On
