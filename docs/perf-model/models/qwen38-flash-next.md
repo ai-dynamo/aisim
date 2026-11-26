@@ -60,7 +60,10 @@ The FP8 release quantizes **routed experts only**. Its
 indexer therefore run in BF16 under both artifacts. The SDK keeps KV and FMHA
 quantization in BF16 for this architecture even though the checkpoint reports
 the model-wide `fp8_block` mode; an explicit `kv_cache_quant_algo` or
-`kvcache_quant_mode` still wins and fails loudly when the data are missing.
+`kvcache_quant_mode` still wins and fails loudly when the data are missing. The
+same applies to `gemm_quant_mode`: when it is set explicitly it prices every
+GEMM family at that mode, hyper-connections, PLE and the MTP FC pair included;
+without one, `modules_to_not_convert` keeps those families in BF16.
 Consequently the QSA module rows carry exactly one precision triple
 (`compute`, `kv_cache`, `gemm` = BF16) and serve both artifacts.
 

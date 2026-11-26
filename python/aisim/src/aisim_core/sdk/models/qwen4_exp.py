@@ -161,8 +161,12 @@ class Qwen4ExpModel(Qwen35Model):
     ) -> None:
         # Qwen35Model.__init__ builds the op graphs, so the raw config the extra
         # quant families resolve against must be reachable before ``super()``.
-        # Nothing later in the chain resets it.
+        # Nothing later in the chain resets it. The split permission is stored
+        # alongside it: the parent resolves its own families before dispatching
+        # to the overridden builders, which resolve the extra ones through
+        # ``_extra_gemm_mode``.
         self._raw_config = raw_config or {}
+        self._allow_checkpoint_split = allow_checkpoint_split
         # Qwen35Model.__init__ validates the shared GDN contract, resolves the
         # SSM state dtype, the projection/shared-expert/FFN quant modes and the
         # vision tower, then dispatches to the overridden builders below.
@@ -186,10 +190,22 @@ class Qwen4ExpModel(Qwen35Model):
         Resolution is deferred to first use because ``self.config`` only exists
         once ``BaseModel.__init__`` has run, while the op graphs are built later
         in the same constructor.
+
+        ``allow_checkpoint_split`` gates the exclusion lookup exactly as
+        ``_qwen35_mixed_precision_gemm_modes`` does for the families the parent
+        owns: an explicit ``gemm_quant_mode`` is the caller's decision for every
+        GEMM, so the checkpoint's ``modules_to_not_convert`` must not keep the
+        hyper-connection, PLE or MTP FC families at BF16. The n-gram table is
+        unaffected either way — it is not excluded, so it already resolves to
+        the configured mode.
         """
         cache = self.__dict__.setdefault("_extra_mode_cache", {})
         if markers not in cache:
-            cache[markers] = _excluded_gemm_mode(self._raw_config, markers, self.config.gemm_quant_mode)
+            cache[markers] = (
+                _excluded_gemm_mode(self._raw_config, markers, self.config.gemm_quant_mode)
+                if self._allow_checkpoint_split
+                else self.config.gemm_quant_mode
+            )
         return cache[markers]
 
     @property

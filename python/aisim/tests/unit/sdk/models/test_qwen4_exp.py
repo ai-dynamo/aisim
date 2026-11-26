@@ -34,8 +34,14 @@ FP8 = "Qwen/Qwen3.8-Flash-Next-FP8"
 REPO_BYTES = {BF16: 360.0e9, FP8: 185.5e9}
 
 
-def _model_config(tp_size=8, *, nextn=1):
-    return config.ModelConfig(tp_size=tp_size, moe_tp_size=1, moe_ep_size=tp_size, nextn=nextn)
+def _model_config(tp_size=8, *, nextn=1, gemm_quant_mode=None):
+    return config.ModelConfig(
+        tp_size=tp_size,
+        moe_tp_size=1,
+        moe_ep_size=tp_size,
+        nextn=nextn,
+        gemm_quant_mode=gemm_quant_mode,
+    )
 
 
 def _build(model_path=BF16, **kwargs):
@@ -277,6 +283,27 @@ def test_quant_modes_follow_checkpoint_exclusions(model_path, moe_mode):
     assert model._hc_gemm_quant_mode == common.GEMMQuantMode.bfloat16
     assert model._ple_gemm_quant_mode == common.GEMMQuantMode.bfloat16
     assert model._mtp_fc_gemm_quant_mode == common.GEMMQuantMode.bfloat16
+
+
+def test_explicit_gemm_mode_reaches_the_families_the_checkpoint_excludes():
+    """An explicit ``gemm_quant_mode`` must price every GEMM at that mode.
+
+    ``create`` passes ``allow_checkpoint_split=False`` when the caller set the
+    mode, and the parent then keeps its projection / dense-FFN / shared-expert /
+    GDN ``in_proj_ba`` families there. The Qwen4-Exp additions resolve through
+    ``_extra_gemm_mode``, which used to consult ``modules_to_not_convert``
+    unconditionally, so the hyper-connection, PLE and MTP FC families stayed
+    BF16 and the override was applied non-uniformly.
+    """
+    explicit = common.GEMMQuantMode.fp8_block
+    model = _build(FP8, gemm_quant_mode=explicit)
+
+    assert model._allow_checkpoint_split is False
+    assert model._projection_gemm_quant_mode == explicit
+    assert model._shared_expert_gemm_quant_mode == explicit
+    assert model._hc_gemm_quant_mode == explicit
+    assert model._ple_gemm_quant_mode == explicit
+    assert model._mtp_fc_gemm_quant_mode == explicit
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang"])
