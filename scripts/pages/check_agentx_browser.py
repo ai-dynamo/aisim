@@ -195,8 +195,8 @@ def fixtures(site, weka=False):
             },
         }
         run["cpu_overhead"] = {
-            "tokenization": {"workers": 1, "base_ms": 0.0, "per_input_token_ms": 0.001217},
-            "extra_cpu_overhead": {"base_ms": 12.6, "per_input_token_ms": 0.000342},
+            "tokenization": {"workers": 1, "base_ms": 0.2871126396889849, "per_input_token_ms": 0.001217},
+            "extra_cpu_overhead": {"base_ms": 12.578254436262315, "per_input_token_ms": 0.000342},
         }
         run["measured_backend_version"] = "0.31.0" if run["backend"] == "vllm" else "0.5.20"
         run["prediction_backend_version"] = "0.31.0" if run["backend"] == "vllm" else "0.5.21"
@@ -372,7 +372,7 @@ async def check():
                 await expect(hardware.nth(2)).to_contain_text("B300 · vllm 0.31.0")
                 cpu = models.nth(0).locator(".agentx-cpu")
                 await expect(cpu).to_have_text(
-                    ["Tokenizer (queued, 1 worker): 1.217 µs/token", "Unqueued: 12.6 ms + 0.342 µs/token"]
+                    ["Tokenizer (queued, 1 worker): 0.29 ms + 1.217 µs/token", "Unqueued: 12.58 ms + 0.342 µs/token"]
                 )
                 # Steps pool exactly over the six points; requests average the runs.
                 metrics = models.nth(1).locator("td.agentx-metric")

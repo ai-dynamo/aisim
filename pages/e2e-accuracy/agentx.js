@@ -41,10 +41,10 @@ window.AgentX = (() => {
   const REQUEST_METRICS=[["tpot_ms","e2e"],["ttft_ms","e2e"],["tpot_ms","quantile"],["ttft_ms","quantile"]];
   function cpuOverhead(run){
     const c=run.cpu_overhead;if(!c)return "—";
-    const us=v=>finite(v)?String(Math.round(v*1e6)/1e3):"?";
+    const us=v=>finite(v)?String(Math.round(v*1e6)/1e3):"?", ms=v=>finite(v)?String(Math.round(v*100)/100):"?";
     const t=c.tokenization,x=c.extra_cpu_overhead;
-    const tok=t?`Tokenizer (queued, ${t.workers} worker${t.workers===1?"":"s"}): ${t.base_ms?t.base_ms+" ms + ":""}${us(t.per_input_token_ms)} µs/token`:"Tokenizer (queued): none";
-    const ext=x?`Unqueued: ${x.base_ms} ms + ${us(x.per_input_token_ms)} µs/token`:"Unqueued: none measured";
+    const tok=t?`Tokenizer (queued, ${t.workers} worker${t.workers===1?"":"s"}): ${t.base_ms?ms(t.base_ms)+" ms + ":""}${us(t.per_input_token_ms)} µs/token`:"Tokenizer (queued): none";
+    const ext=x?`Unqueued: ${ms(x.base_ms)} ms + ${us(x.per_input_token_ms)} µs/token`:"Unqueued: none measured";
     return `<span class="agentx-cpu">${esc(tok)}</span><span class="agentx-cpu">${esc(ext)}</span>`;
   }
   function specDec(run){
