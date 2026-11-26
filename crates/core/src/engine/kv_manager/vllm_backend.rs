@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified Rust simulation of the vLLM v0.29.0
 // (98dff2a81d747d1dba01a47f939f48c3526d4206) align-mode state cache and of
-// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules.
+// the v0.31.0 (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules.
 // Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 // Modified persistent speculative-capacity semantics derived from vLLM:
@@ -25,6 +26,7 @@ use super::AllocationRequirement;
 use super::grouped::{GroupedBlockPool, GroupedKvPool, GroupedLease};
 use super::grouped_prefix::{
     AdmissionLimits, GroupedHit, GroupedPrefixCoordinator, GroupedPrefixRules, StoredGroupedHit,
+    destination_admission_bytes, remaining_bytes,
 };
 use super::grouped_transfer::GroupedTransferRules;
 use super::state_cache_manager::{StateAlignRules, StateCacheManager, StateRequest, StateRestore};
@@ -34,7 +36,8 @@ use crate::engine::cache::vllm_block_pool::{
 };
 pub(crate) use crate::engine::cache::vllm_block_pool::{SourceReleaseOrder, SourceReuseDependency};
 use crate::engine::common::hashing::{
-    BlockHash, SequenceHash, block_hashes, compute_next_sequence_hash,
+    BlockHash, SequenceHash, XXH3_SEED, block_hashes, compute_block_hash_for_tokens,
+    compute_next_sequence_hash,
 };
 use crate::engine::common::kv_cache_trace;
 use crate::engine::common::protocols::{KvEventPublishers, PrefillCost, SchedulingPolicy};
@@ -223,6 +226,22 @@ impl PrefixHashMemo {
     }
 }
 
+/// The last scheduled step of a request on a grouped pool or a state cache,
+/// for the processed token count of its next allocation. Only a grouped pool
+/// reads that count: its allocation frees held blocks on it, and the
+/// scheduler checks a grouped forward against it. A state cache records the
+/// step but does not read the count: an allocation of the request releases
+/// the copies that an earlier step held, with one batch and with two.
+#[derive(Debug, Clone, Copy)]
+struct ScheduledStep {
+    /// [`VllmKvManager`]'s step counter at the step.
+    step: u64,
+    /// The computed count before the step.
+    computed_before: usize,
+    /// The processed count of the step's allocation.
+    processed: usize,
+}
+
 /// Move-only native-G1 ownership token attached to one scheduler request.
 #[derive(Debug)]
 #[must_use = "a native block lease must be finished, aborted, retracted, or moved into a hold"]
@@ -233,7 +252,14 @@ pub(crate) struct BlockRequestLease {
     /// Anonymous request-owned slots, retained across draft rejection.
     opaque_copies: Vec<BlockCopyId>,
     prefix_hashes: Option<(usize, Vec<SequenceHash>)>,
-    /// The prompt length behind `prefix_hashes`.
+    /// The tokens after the last hash boundary, fewer than the hash unit, on
+    /// a rank with a grouped prefix cache. Each output token joins them, and
+    /// a full unit becomes the next prefix hash, as vLLM extends the block
+    /// hashes of a request with every output token that it appends (v0.31,
+    /// v0.32 and v0.33 `vllm/v1/request.py:272-288`). `None` on every other
+    /// rank, where the prefix hashes cover the prompt only.
+    hash_tail: Option<Vec<u32>>,
+    /// The length of the prompt that `configure_prefix_hashes` hashed.
     prompt_tokens: usize,
     /// Present only while newly acquired capacity awaits a scheduler-installed
     /// write fence. The default path does not allocate this state.
@@ -258,6 +284,8 @@ pub(crate) struct BlockRequestLease {
     junction: Option<usize>,
     /// See [`VllmKvManager::get_waiting_lease_prefill_cost`].
     state_miss: Option<StateMiss>,
+    /// See [`VllmKvManager::processed_tokens`]. Cleared by preemption.
+    scheduled_step: Option<ScheduledStep>,
     pub(crate) session_id: Option<String>,
 }
 
@@ -276,6 +304,7 @@ impl BlockRequestLease {
             allocated_tokens: 0,
             opaque_copies: Vec::new(),
             prefix_hashes: None,
+            hash_tail: None,
             prompt_tokens: 0,
             pending_capacity_writes: None,
             grouped: None,
@@ -285,6 +314,7 @@ impl BlockRequestLease {
             prefill_checkpoint: None,
             junction: None,
             state_miss: None,
+            scheduled_step: None,
             session_id: None,
         }
     }
@@ -353,6 +383,36 @@ impl BlockRequestLease {
         }
     }
 
+    /// Hash the output tokens of the request too, for a grouped prefix cache.
+    /// `tokens` is the prompt of `configure_prefix_hashes`: its tokens after
+    /// the last hash boundary start the next hash unit.
+    pub(crate) fn hash_output_tokens(&mut self, tokens: &[u32]) {
+        let (unit, _) = self
+            .prefix_hashes
+            .as_ref()
+            .expect("the prefix hashes are configured first");
+        self.hash_tail = Some(tokens[tokens.len() - tokens.len() % unit..].to_vec());
+    }
+
+    /// Add one output token to the hashed tokens. A full hash unit gets the
+    /// hash that `configure_prefix_hashes` gives a prompt with the same
+    /// tokens.
+    pub(crate) fn push_output_token(&mut self, token: u32) {
+        let (Some(tail), Some((unit, hashes))) = (&mut self.hash_tail, &mut self.prefix_hashes)
+        else {
+            return;
+        };
+        tail.push(token);
+        if tail.len() == *unit {
+            let local = compute_block_hash_for_tokens(tail, XXH3_SEED);
+            let hash = hashes
+                .last()
+                .map_or(local, |&parent| compute_next_sequence_hash(parent, local));
+            hashes.push(hash);
+            tail.clear();
+        }
+    }
+
     fn state_hash(&self, tokens: usize, block_size: usize) -> Option<SequenceHash> {
         if self.prefix_hashes.is_some() {
             return self.prefix_hash_at(tokens);
@@ -365,8 +425,8 @@ impl BlockRequestLease {
     }
 
     /// The chained hash of the first `tokens` tokens, for a positive multiple
-    /// of the prefix hash unit. `None` otherwise, and without configured
-    /// prefix hashes.
+    /// of the prefix hash unit. `None` otherwise, past the hashed tokens, and
+    /// without configured prefix hashes.
     pub(crate) fn prefix_hash_at(&self, tokens: usize) -> Option<SequenceHash> {
         let (unit, hashes) = self.prefix_hashes.as_ref()?;
         if !tokens.is_multiple_of(*unit) {
@@ -390,6 +450,11 @@ impl BlockRequestLease {
             .as_ref()
             .map(StoredGroupedHit::hit)
             .map_or(0, |hit| hit.tokens + hit.junction_tokens)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grouped_hit(&self) -> Option<&GroupedHit> {
+        self.grouped_hit.as_ref().map(StoredGroupedHit::hit)
     }
 
     #[cfg(test)]
@@ -515,7 +580,24 @@ pub(crate) struct DestinationReservation {
     block_count: usize,
     /// Fresh blocks for the transferred recurrent state; not prompt tokens.
     state_blocks: usize,
+    /// Empty for a grouped cache, whose blocks `grouped` holds.
     pool: BlockReservation,
+    // Boxed to keep the reservation small for the request states that embed it.
+    grouped: Option<Box<GroupedDestinationBlocks>>,
+}
+
+/// The blocks that a grouped cache charges a destination for its loaded
+/// tokens.
+struct GroupedDestinationBlocks {
+    /// Every group's blocks. In block mode its `block_lease` holds the pinned
+    /// attention hit and the fresh blocks.
+    lease: GroupedLease,
+    /// The hit behind a block-mode reservation, stored on the request lease
+    /// at activation for its first allocation.
+    hit: Option<GroupedHit>,
+    /// The full-attention blocks that the transfer moves, the unit of its
+    /// handoff timing.
+    transfer_units: usize,
 }
 
 impl DestinationReservation {
@@ -523,7 +605,12 @@ impl DestinationReservation {
         self.pool.fresh_source_reads()
     }
 
+    /// The transferable prompt of a linear cache in tokens, or the missing
+    /// full-attention blocks of a grouped cache, as its timing counts blocks.
     pub(crate) fn transferable_prompt_tokens(&self, block_size: usize) -> usize {
+        if let Some(grouped) = &self.grouped {
+            return grouped.transfer_units;
+        }
         self.pool
             .fresh_len()
             .saturating_sub(self.state_blocks)
@@ -531,7 +618,25 @@ impl DestinationReservation {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.pool.len()
+        match &self.grouped {
+            Some(grouped) => grouped.lease.blocks(),
+            None => self.pool.len(),
+        }
+    }
+
+    fn linear(
+        request_id: Uuid,
+        block_count: usize,
+        state_blocks: usize,
+        pool: BlockReservation,
+    ) -> Self {
+        Self {
+            request_id,
+            block_count,
+            state_blocks,
+            pool,
+            grouped: None,
+        }
     }
 }
 
@@ -634,13 +739,39 @@ pub(crate) struct VllmKvManager {
     grouped_prefix: Option<GroupedPrefixCoordinator>,
     /// The P/D transfer rules of a grouped cache on a prefill or decode rank.
     grouped_transfer: Option<GroupedTransferRules>,
+    /// The limits of the sliding-window admission cap, set for every grouped
+    /// rank. Byte mode counts the whole sequence of a waiting request, the
+    /// whole prompt of a destination reservation and the need of a load with
+    /// them.
+    grouped_limits: Option<AdmissionLimits>,
     state_cache: Option<StateCacheManager>,
     prefix_match_unit: Option<usize>,
     /// Present while a host tier takes recurrent-state stores.
     state_handoffs: Option<StateHandoffQueue>,
-    /// Scheduler steps begun, for the one-step block lifetimes of the
-    /// grouped coordinator.
+    /// Scheduler steps begun. The grouped coordinator times its one-step
+    /// block lifetimes with it, and the record of a lease's last scheduled
+    /// step holds it, so that [`Self::processed_tokens`] can tell whether
+    /// that step is in flight.
     step: u64,
+    /// Whether the processed token count of this step leaves out the tokens
+    /// of the step in flight, as vLLM's count does. The scheduler sets it
+    /// when the step before this one is still in flight and the rank is a
+    /// grouped prefill or decode rank, or an aggregated rank whose layout
+    /// passes [`GroupedPrefixRules::keeps_in_flight_hold`] or
+    /// has no grouped prefix rules: with async scheduling
+    /// vLLM forms a step before it processes the outputs of the step before
+    /// (v0.33 `vllm/v1/engine/core.py:735`, `:778-793`). On a linear prefill
+    /// or decode rank it stays false, also with a step in flight. Only
+    /// [`Self::processed_tokens`] reads it, and only a grouped pool frees held
+    /// blocks on that count: a linear state cache releases its held copies by
+    /// the step. [`Self::begin_step`] clears it.
+    previous_pass_in_flight: bool,
+    /// The sum of `first_pass_need` over the grouped destination loads in
+    /// flight: reserved, or activated before their first pass. vLLM keeps
+    /// the same blocks free for its in-flight prefills when it admits an
+    /// async load (V32 `sched:1241-1251`, `:3088-3092`, V31
+    /// `sched:1194-1204`, `:3032-3036`).
+    grouped_inflight_need: u64,
 }
 
 impl VllmKvManager {
@@ -665,6 +796,16 @@ impl VllmKvManager {
         self.grouped_prefix = Some(GroupedPrefixCoordinator::new(rules, limits));
     }
 
+    /// Set the limits of the sliding-window admission cap of the grouped
+    /// cache.
+    pub(crate) fn set_grouped_admission_limits(&mut self, limits: AdmissionLimits) {
+        assert!(
+            self.grouped.is_some(),
+            "grouped admission limits need a grouped cache"
+        );
+        self.grouped_limits = Some(limits);
+    }
+
     /// Set the P/D transfer rules of the grouped cache.
     pub(crate) fn set_grouped_transfer_rules(&mut self, rules: GroupedTransferRules) {
         assert!(
@@ -674,8 +815,41 @@ impl VllmKvManager {
         self.grouped_transfer = Some(rules);
     }
 
+    /// The bytes of the whole sequence of `tokens` tokens of a request
+    /// without blocks in a byte-mode pool, as the first test of vLLM's
+    /// `allocate_slots` counts them (v0.33 `mgr:531-548`): the blocks of
+    /// `min(tokens, max_model_len)` tokens with the admission cap of a
+    /// window group (v0.33 `single:214-227`), and the fixed blocks of the
+    /// state groups, which vLLM counts for a request without blocks: a
+    /// Mamba group with prefix caching off (v0.33 `single:1713-1729`) and a
+    /// ring buffer (v0.33 `single:1203-1214`).
+    pub(crate) fn grouped_whole_sequence_bytes(&self, tokens: usize) -> u64 {
+        let grouped = self.grouped.as_ref().expect("a grouped cache");
+        let limits = self
+            .grouped_limits
+            .expect("the limits are set for every grouped rank");
+        remaining_bytes(
+            grouped.groups(),
+            0,
+            tokens.min(limits.max_model_len),
+            limits,
+        )
+        .saturating_add(grouped.fixed_request_bytes())
+    }
+
     pub(crate) fn grouped(&self) -> Option<&GroupedKvPool> {
         self.grouped.as_ref()
+    }
+
+    pub(crate) fn grouped_inflight_need(&self) -> u64 {
+        self.grouped_inflight_need
+    }
+
+    /// The grouped prefix coordinator's published epoch, or 0 without one.
+    pub(crate) fn grouped_published_epoch(&self) -> u64 {
+        self.grouped_prefix
+            .as_ref()
+            .map_or(0, GroupedPrefixCoordinator::published_epoch)
     }
 
     pub(crate) fn grouped_prefix_rules(&self) -> Option<&GroupedPrefixRules> {
@@ -719,10 +893,13 @@ impl VllmKvManager {
             grouped: None,
             grouped_prefix: None,
             grouped_transfer: None,
+            grouped_limits: None,
             state_cache: None,
             prefix_match_unit: None,
             state_handoffs: None,
             step: 0,
+            previous_pass_in_flight: false,
+            grouped_inflight_need: 0,
         }
     }
 
@@ -942,10 +1119,54 @@ impl VllmKvManager {
             coordinator.begin_step();
         }
         self.step = self.step.checked_add(1).expect("scheduler step overflow");
+        self.previous_pass_in_flight = false;
     }
 
-    /// Release the copy sources that the grouped prefix hits inside a block
-    /// of this scheduling pass hold.
+    /// Tell the manager if the processed token count of this step leaves out
+    /// the tokens of the step in flight: the step before this one is still in
+    /// flight, and the rank is a grouped prefill or decode rank or an
+    /// aggregated rank whose layout keeps the hold (see the scheduler).
+    /// Call it after [`Self::begin_step`].
+    pub(crate) fn set_previous_pass_in_flight(&mut self, in_flight: bool) {
+        self.previous_pass_in_flight = in_flight;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn previous_pass_in_flight(&self) -> bool {
+        self.previous_pass_in_flight
+    }
+
+    /// The processed token count of the request's allocation in this step:
+    /// vLLM's `max(0, total_computed_tokens - request.num_in_flight_tokens)`
+    /// (v0.33 `vllm/v1/core/kv_cache_manager.py:561-568`). A scheduled step
+    /// adds its tokens to the in-flight count (v0.33
+    /// `vllm/v1/core/sched/scheduler.py:1859`), and processing its outputs
+    /// takes them off (v0.33 `scheduler.py:2318`). Only the step before can
+    /// be in flight, so processed is the computed count before that step when
+    /// the flag of this step is set and that step ran the request, and
+    /// `computed_before` otherwise. The scheduler sets the flag only on an
+    /// aggregated rank and on a grouped prefill or decode rank, so a linear
+    /// prefill or decode rank gets `computed_before` also with a step in
+    /// flight. After the finalize of a step it is the
+    /// count of that step's allocation, whatever `computed_before` is,
+    /// because the step's own tokens are in flight too.
+    pub(crate) fn processed_tokens(
+        &self,
+        lease: &BlockRequestLease,
+        computed_before: usize,
+    ) -> usize {
+        match lease.scheduled_step {
+            Some(record) if record.step == self.step => record.processed,
+            Some(record) if self.previous_pass_in_flight && record.step + 1 == self.step => {
+                record.computed_before
+            }
+            _ => computed_before,
+        }
+    }
+
+    /// Release the copy sources of this scheduling pass: the blocks that the
+    /// grouped prefix hits inside a block copied, and the state blocks that a
+    /// request wrote past after it published a state in them.
     pub(crate) fn release_grouped_copy_sources(&mut self) {
         if let (Some(grouped), Some(coordinator)) = (&mut self.grouped, &mut self.grouped_prefix)
             && let Some(pool) = grouped.block_pool_mut()
@@ -1033,7 +1254,24 @@ impl VllmKvManager {
         reusable_prefix_blocks: usize,
     ) -> NativeAllocation<usize> {
         lease.debug_assert_owner(owner);
-        if let Some(grouped) = &mut self.grouped {
+        // The processed count of a grouped allocation, read before the
+        // grouped pool is borrowed, with the computed count that it falls
+        // back to. A first allocation in block mode starts from its hit,
+        // every other allocation from the tokens it holds.
+        let counts = self.grouped.is_some().then(|| {
+            let first_with_hit = self.grouped_prefix.is_some()
+                && !lease
+                    .grouped
+                    .as_ref()
+                    .and_then(|grouped| grouped.block_lease.as_ref())
+                    .is_some_and(|block_lease| block_lease.allocated);
+            let fallback = match &lease.grouped_hit {
+                Some(hit) if first_with_hit => hit.hit().tokens,
+                _ => lease.allocated_tokens,
+            };
+            (fallback, self.processed_tokens(lease, fallback))
+        });
+        if let (Some(grouped), Some((fallback, processed))) = (&mut self.grouped, counts) {
             assert!(self.enable_prefix_caching || reusable_prefix_blocks == 0);
             // Most decode steps stay inside the blocks the request holds, so
             // the coordinator has nothing to release or take for them.
@@ -1050,6 +1288,10 @@ impl VllmKvManager {
                 };
             }
             let previous_blocks = lease.resident_block_count();
+            let first_pass_need = lease
+                .grouped
+                .as_ref()
+                .map_or(0, |grouped| grouped.first_pass_need);
             if let Some(coordinator) = &mut self.grouped_prefix {
                 let pool = grouped.block_pool_mut().expect("block mode");
                 let hit = lease
@@ -1101,13 +1343,23 @@ impl VllmKvManager {
                 } else {
                     lease.allocated_tokens
                 };
+                debug_assert_eq!(
+                    fallback, computed_before,
+                    "the count of an allocation without a record is its computed count"
+                );
+                // Held blocks go on the processed count (v0.31
+                // `mgr:549-556`, v0.32 `mgr:552-559`, v0.33 `mgr:561-568`). A
+                // first allocation has no record of a step, so its count is
+                // its hit, the count that vLLM pads null window blocks below
+                // (v0.33 `single:293-312`).
                 if !coordinator.allocate(
                     pool,
                     block_lease,
                     prefill_end,
                     computed_before,
                     cumulative_tokens,
-                    self.step,
+                    processed,
+                    self.grouped_transfer.is_none().then_some(self.step),
                 ) {
                     if first {
                         // Undo the pin, so that the hit blocks return to the
@@ -1116,14 +1368,20 @@ impl VllmKvManager {
                     }
                     return NativeAllocation::CapacityExhausted;
                 }
-            } else if !grouped.allocate(
-                &mut lease.grouped,
-                lease.allocated_tokens,
-                cumulative_tokens,
-            ) {
+            } else if !grouped.allocate(&mut lease.grouped, processed, cumulative_tokens) {
                 return NativeAllocation::CapacityExhausted;
             }
             lease.allocated_tokens = cumulative_tokens;
+            // A destination load leaves the loads in flight once its first
+            // pass has allocated (V32 `sched:1640-1642`, V31 `:1607-1609`).
+            if first_pass_need > 0 {
+                self.grouped_inflight_need -= first_pass_need;
+                lease
+                    .grouped
+                    .as_mut()
+                    .expect("an allocated grouped lease")
+                    .first_pass_need = 0;
+            }
             return NativeAllocation::Ready {
                 value: lease.resident_block_count().saturating_sub(previous_blocks),
                 dependencies: Vec::new(),
@@ -1528,6 +1786,16 @@ impl VllmKvManager {
         computed_before: usize,
         computed_after: usize,
     ) {
+        // The scheduler finalizes every request of a step, also one that
+        // allocates nothing new, so the record follows vLLM's in-flight count.
+        if self.grouped.is_some() || self.state_cache.is_some() {
+            let processed = self.processed_tokens(lease, computed_before);
+            lease.scheduled_step = Some(ScheduledStep {
+                step: self.step,
+                computed_before,
+                processed,
+            });
+        }
         self.finalize_computed_prefix(
             owner,
             sequence,
@@ -1758,6 +2026,10 @@ impl VllmKvManager {
                 });
             }
         }
+        // The record of the step is written, so this is the count of its
+        // allocation.
+        #[cfg(debug_assertions)]
+        let processed = self.processed_tokens(lease, computed_before);
         if let (Some(grouped), Some(coordinator)) = (&mut self.grouped, &mut self.grouped_prefix)
             && publish_state
             && self.enable_prefix_caching
@@ -1795,7 +2067,8 @@ impl VllmKvManager {
                         prefill_end,
                         computed_before,
                         computed_after,
-                        self.step,
+                        processed,
+                        self.grouped_transfer.is_none().then_some(self.step)
                     ));
                     before
                 });
@@ -1806,7 +2079,7 @@ impl VllmKvManager {
                     sequence.num_input_tokens(),
                     computed_after,
                     hit,
-                    self.step,
+                    self.grouped_transfer.is_none().then_some(self.step),
                 );
                 #[cfg(debug_assertions)]
                 if let Some(before) = quiet {
@@ -1834,6 +2107,9 @@ impl VllmKvManager {
         );
     }
 
+    /// `local_prefill_need` is what the local prefills in flight still need,
+    /// as `grouped_remaining_need` counts it. A grouped destination keeps it
+    /// free, and the linear path ignores it.
     pub(crate) fn reserve_destination_lease(
         &mut self,
         owner: Uuid,
@@ -1841,6 +2117,7 @@ impl VllmKvManager {
         lease: &BlockRequestLease,
         mode: super::DestinationReservationMode,
         _eviction_now_ms: Option<f64>,
+        local_prefill_need: u64,
     ) -> VllmAcquire<DestinationReservation> {
         lease.debug_assert_owner(owner);
         assert_eq!(
@@ -1848,6 +2125,15 @@ impl VllmKvManager {
             0,
             "destination request already owns physical blocks"
         );
+        if self.grouped.is_some() {
+            return self.reserve_grouped_destination(
+                owner,
+                sequence,
+                lease,
+                mode,
+                local_prefill_need,
+            );
+        }
         let prompt_blocks = sequence
             .num_input_tokens()
             .div_ceil(self.block_size)
@@ -1871,11 +2157,250 @@ impl VllmKvManager {
             return VllmAcquire::CapacityExhausted;
         };
         self.publish_removed(outcome.removed);
+        VllmAcquire::Ready(DestinationReservation::linear(
+            owner,
+            prompt_blocks,
+            state_blocks,
+            outcome.reservation,
+        ))
+    }
+
+    /// The blocks of every group for the tokens that the transfer loads. The
+    /// decode rank allocates the slots of the loaded tokens in every group
+    /// before the load (V32 `sched:1256-1273`), so the pool is charged now.
+    /// The loaded tokens count as computed, so a window group holds only
+    /// the blocks inside its window. A fresh destination holds no blocks to
+    /// free: vLLM counts only the blocks inside the window (V32
+    /// `vllm/v1/core/single_type_kv_cache_manager.py:245-248`, V31
+    /// `:248-251`) and pads the skipped ones with null blocks (V32
+    /// `:310-311`, V31 `:313-314`).
+    /// Before it allocates, the reservation makes vLLM's two tests of an async
+    /// load (V32 `vllm/v1/core/kv_cache_manager.py:522-539`, `:561-579`, V31
+    /// `:519-536`, `:558-576`). The whole prompt, with the loaded tokens
+    /// computed, must fit the free capacity. The loaded tokens must fit the
+    /// free capacity less what the prefills in flight still need, as vLLM
+    /// counts it. These are the other loads in flight (`first_pass_need`)
+    /// and the local prefills in flight (`local_prefill_need`), such as a
+    /// local prompt or the recompute of a preempted request. Replay adds one
+    /// count that vLLM does not have: the copy of a state that the
+    /// activation publishes inside its block. The second test also subtracts
+    /// that copy for this load, and the need of a load in flight holds it
+    /// from the reservation on. vLLM counts that block only once the load
+    /// has finished and the state is cached (V32 `sched:3155-3157`,
+    /// `single:1732-1739`, V31 `sched:3083-3085`, `single:1770-1777`). So
+    /// vLLM admits a load where replay makes it wait. The count of the
+    /// prefills in flight caps a window group at its admission blocks, so it
+    /// can leave out the window block that a first pass opens (V32
+    /// `vllm/v1/core/single_type_kv_cache_manager.py:213-235`, V31
+    /// `:216-238`). So, as in vLLM, a load admitted past the cap can wait for
+    /// its first pass, and with no request running the rank stops.
+    /// Byte mode charges the projected bytes. Block mode pins the hit blocks
+    /// of the local prefix that vLLM's connector path takes, when the mode
+    /// reuses the resident prefix (`find_destination_hit`). Only the
+    /// full-attention groups have such blocks. Block mode takes fresh blocks
+    /// for the rest. The state groups take fresh running blocks in both
+    /// modes, as the transferred state moves with the blocks. The request's
+    /// prompt is `N` and the loaded tokens end at `T`, so no checkpoint block
+    /// is taken: only a chunk that reaches the prompt does.
+    /// A failed reservation leaves the pool as it was.
+    fn reserve_grouped_destination(
+        &mut self,
+        owner: Uuid,
+        sequence: &RequestSequence,
+        lease: &BlockRequestLease,
+        mode: super::DestinationReservationMode,
+        local_prefill_need: u64,
+    ) -> VllmAcquire<DestinationReservation> {
+        let grouped = self.grouped.as_mut().expect("grouped cache");
+        let rules = self
+            .grouped_transfer
+            .as_ref()
+            .expect("a grouped destination needs the transfer rules of a decode rank");
+        let prompt = sequence.num_input_tokens();
+        let transfer = rules.transfer_tokens(prompt);
+        let full_blocks = rules.full_blocks(transfer);
+        let (lease, hit, transfer_units) = match &mut self.grouped_prefix {
+            Some(coordinator) => {
+                let pool = grouped.block_pool_mut().expect("block mode");
+                let reuse = matches!(mode, super::DestinationReservationMode::ReuseResidentPrefix)
+                    && self.enable_prefix_caching
+                    && sequence.enable_prefix_caching();
+                let hit = if reuse {
+                    coordinator.find_destination_hit(pool, lease, prompt, transfer)
+                } else {
+                    coordinator.empty_hit()
+                };
+                let free = pool.capacity_blocks() - pool.active_blocks();
+                let state_copy = coordinator.destination_state_copy_blocks(lease, prompt, transfer);
+                if coordinator.destination_admission_blocks(pool, &hit, transfer, prompt) > free
+                    || (coordinator.destination_load_blocks(pool, &hit, transfer, prompt) as u64)
+                        .saturating_add(self.grouped_inflight_need)
+                        .saturating_add(local_prefill_need)
+                        .saturating_add(state_copy as u64)
+                        > free as u64
+                {
+                    return VllmAcquire::CapacityExhausted;
+                }
+                let mut block_lease = coordinator.new_lease();
+                if coordinator.pin_hit(pool, &mut block_lease, &hit).is_err() {
+                    return VllmAcquire::CapacityExhausted;
+                }
+                if !coordinator.allocate(
+                    pool,
+                    &mut block_lease,
+                    prompt,
+                    transfer,
+                    transfer,
+                    transfer,
+                    None,
+                ) {
+                    // Undo the pin, so that the hit blocks return to the
+                    // inactive LRU.
+                    coordinator.release_request(pool, &mut block_lease);
+                    return VllmAcquire::CapacityExhausted;
+                }
+                // The decode rank pulls only the full-attention blocks that
+                // it lacks (`nixl/pull_scheduler.py:149-156`). A transfer unit
+                // is one block of every full-attention group, so the transfer
+                // leaves a unit out only where every such group keeps its hit
+                // block. A group that is not prefix-cacheable keeps none,
+                // though a state hit can still give `hit.tokens`.
+                let hit_blocks = rules.unit_block().map_or(0, |block| {
+                    coordinator.kept_full_attention_tokens(&hit) / block
+                });
+                let mut grouped_lease = GroupedLease::default();
+                // What the load still needs for its whole prompt, as vLLM's
+                // `_request_remaining_blocks` counts it (V31
+                // `sched:3003-3017`, V32 `sched:3060-3076`), with the
+                // admission cap of a window group (V31 `single:216-229`, V32
+                // `single:213-226`). Grouped replay has no speculative tokens.
+                // Activation publishes a loaded partial state before the
+                // first pass, which then takes a block for its copy. vLLM
+                // counts that block only once the load has finished (see
+                // the comment of this function). Replay counts it from the
+                // reservation on, a known difference from vLLM. Activation
+                // counts the same need again.
+                grouped_lease.first_pass_need =
+                    (coordinator.remaining_blocks(&block_lease, prompt, transfer, prompt)
+                        + state_copy) as u64;
+                grouped_lease.block_lease = Some(block_lease);
+                (
+                    grouped_lease,
+                    Some(hit),
+                    full_blocks.saturating_sub(hit_blocks),
+                )
+            }
+            None => {
+                let free = grouped.capacity_bytes() - grouped.used_bytes();
+                let limits = self
+                    .grouped_limits
+                    .expect("the limits are set for every grouped rank");
+                let Some(load_bytes) = grouped.required_bytes(transfer, transfer) else {
+                    return VllmAcquire::CapacityExhausted;
+                };
+                let prompt_bytes = destination_admission_bytes(
+                    grouped.groups(),
+                    grouped.fixed_request_bytes(),
+                    transfer,
+                    prompt,
+                    limits,
+                );
+                if prompt_bytes > free
+                    || load_bytes
+                        .saturating_add(self.grouped_inflight_need)
+                        .saturating_add(local_prefill_need)
+                        > free
+                {
+                    return VllmAcquire::CapacityExhausted;
+                }
+                let mut grouped_lease = None;
+                if !grouped.allocate(&mut grouped_lease, transfer, transfer) {
+                    return VllmAcquire::CapacityExhausted;
+                }
+                let mut grouped_lease =
+                    grouped_lease.expect("a successful allocation sets the lease");
+                // The same count in bytes, where a state group holds its
+                // fixed blocks already.
+                grouped_lease.first_pass_need =
+                    remaining_bytes(grouped.groups(), transfer, prompt, limits);
+                (grouped_lease, None, full_blocks)
+            }
+        };
+        self.grouped_inflight_need += lease.first_pass_need;
+        let pool = self
+            .pool
+            .reserve(&[], 0)
+            .expect("an empty reservation always fits")
+            .reservation;
         VllmAcquire::Ready(DestinationReservation {
             request_id: owner,
-            block_count: prompt_blocks,
-            state_blocks,
-            pool: outcome.reservation,
+            block_count: 0,
+            state_blocks: 0,
+            pool,
+            grouped: Some(Box::new(GroupedDestinationBlocks {
+                lease,
+                hit,
+                transfer_units,
+            })),
+        })
+    }
+
+    /// What a request with `lease` still needs to hold its `tokens` tokens,
+    /// as vLLM's `_request_remaining_blocks` counts it (V31
+    /// `sched:3003-3017`, V32 `sched:3060-3076`): blocks in block mode, bytes
+    /// in byte mode. A lease without grouped blocks gives 0. Byte mode needs
+    /// the admission limits, which are set for every grouped rank.
+    pub(crate) fn grouped_remaining_need(&self, lease: &BlockRequestLease, tokens: usize) -> u64 {
+        let (Some(grouped), Some(grouped_lease)) = (&self.grouped, &lease.grouped) else {
+            return 0;
+        };
+        match &self.grouped_prefix {
+            Some(coordinator) => grouped_lease.block_lease.as_ref().map_or(0, |block_lease| {
+                coordinator.remaining_blocks(
+                    block_lease,
+                    // vLLM's prefill end (V32 `sched:3075`).
+                    lease.prompt_tokens.max(tokens.saturating_sub(1)),
+                    lease.allocated_tokens,
+                    tokens,
+                ) as u64
+            }),
+            None => {
+                let limits = self
+                    .grouped_limits
+                    .expect("the limits are set for every grouped rank");
+                remaining_bytes(grouped.groups(), lease.allocated_tokens, tokens, limits)
+            }
+        }
+    }
+
+    /// The bytes that a grouped destination of `prompt_tokens` needs, with no
+    /// local hit, for the first forward after its load: from the transferred
+    /// tokens to the whole prompt, without an admission cap. So a window
+    /// group needs the blocks inside the window of the first token that the
+    /// decode rank computes, and a full-attention group every block of the
+    /// prompt. The whole pool must hold that forward, so a destination whose
+    /// count is above the whole pool can never run. vLLM's test of the whole
+    /// prompt with the loaded tokens computed, which the default
+    /// `scheduler_reserve_full_isl` turns on (V32 `vllm/config/scheduler.py:190`,
+    /// V31 `:191`, v0.33 `:190`; V32 `vllm/v1/core/kv_cache_manager.py:522-539`,
+    /// V31 `:519-536`, v0.33 `:531-548`), is the one that
+    /// `reserve_grouped_destination` makes, with its local hit and the
+    /// admission cap of a window group. `None` without a grouped cache.
+    pub(crate) fn grouped_destination_required_bytes(&self, prompt_tokens: usize) -> Option<u64> {
+        let grouped = self.grouped.as_ref()?;
+        let rules = self
+            .grouped_transfer
+            .as_ref()
+            .expect("a grouped destination needs the transfer rules of a decode rank");
+        let transfer = rules.transfer_tokens(prompt_tokens);
+        // A prompt that the pool cannot project never fits.
+        Some(match grouped.block_pool() {
+            Some(pool) => grouped
+                .projected_blocks(transfer, prompt_tokens)
+                .map_or(u64::MAX, |blocks| pool.bytes(blocks)),
+            None => grouped
+                .required_bytes(transfer, prompt_tokens)
+                .unwrap_or(u64::MAX),
         })
     }
 
@@ -1940,18 +2465,22 @@ impl VllmKvManager {
             "external reservation changed the exact tier boundary"
         );
         self.publish_removed(outcome.removed);
-        VllmAcquire::Ready(DestinationReservation {
-            request_id: owner,
+        VllmAcquire::Ready(DestinationReservation::linear(
+            owner,
             block_count,
             state_blocks,
-            pool: outcome.reservation,
-        })
+            outcome.reservation,
+        ))
     }
 
     pub(crate) fn destination_pending_dependencies(
         &self,
         reservation: &DestinationReservation,
     ) -> Vec<SourceReuseDependency> {
+        if reservation.grouped.is_some() {
+            // Grouped blocks have no pending readers.
+            return Vec::new();
+        }
         self.pool
             .reservation_pending_dependencies(&reservation.pool)
     }
@@ -2044,6 +2573,11 @@ impl VllmKvManager {
             "destination request already owns physical blocks"
         );
         assert_eq!(reservation.request_id, owner, "destination owner mismatch");
+        if let Some(grouped) = reservation.grouped.take() {
+            self.activate_grouped_destination(sequence, lease, *grouped);
+            self.pool.cancel(reservation.pool);
+            return;
+        }
         let prompt_blocks = reservation.block_count;
         assert!(
             prompt_blocks
@@ -2113,11 +2647,80 @@ impl VllmKvManager {
         }
     }
 
+    /// The copy sources that the grouped prefix coordinator holds.
+    #[cfg(test)]
+    pub(crate) fn grouped_copy_source_count(&self) -> usize {
+        self.grouped_prefix
+            .as_ref()
+            .map_or(0, |coordinator| coordinator.copy_source_count())
+    }
+
+    /// Move the grouped blocks of the loaded tokens onto the request lease.
+    /// In block mode the hit of the reservation becomes the lease's hit, and
+    /// the loaded blocks are published at once, as vLLM caches them when the
+    /// load completes (V32 `sched:3155-3157`, V31 `:3083-3085`), before the
+    /// first decode step.
+    fn activate_grouped_destination(
+        &mut self,
+        sequence: &RequestSequence,
+        lease: &mut BlockRequestLease,
+        blocks: GroupedDestinationBlocks,
+    ) {
+        let rules = self
+            .grouped_transfer
+            .as_ref()
+            .expect("a grouped destination needs the transfer rules of a decode rank");
+        let prompt = sequence.num_input_tokens();
+        let transfer = rules.transfer_tokens(prompt);
+        lease.grouped = Some(blocks.lease);
+        // The allocation watermark is the tokens that stay computed: the
+        // prompt less the backoff tokens, which the first pass computes (V31
+        // `sched:3095-3096`, V32 `sched:3171-3172`). A prompt that
+        // is not longer than the backoff is loaded whole and computed again,
+        // so its first pass allocates too, and it takes the copy when the
+        // load published a state at its last token.
+        lease.allocated_tokens = prompt - rules.backoff_tokens().min(prompt);
+        if let (Some(grouped), Some(coordinator)) = (&mut self.grouped, &mut self.grouped_prefix) {
+            let hit = blocks
+                .hit
+                .expect("a block-mode reservation carries its hit");
+            let mut block_lease = lease
+                .grouped
+                .as_mut()
+                .and_then(|grouped| grouped.block_lease.take())
+                .expect("a block-mode reservation carries its blocks");
+            // The block lease leaves the request lease for the call, which
+            // reads the request's prefix hashes.
+            coordinator.finalize(
+                grouped.block_pool_mut().expect("block mode"),
+                &mut block_lease,
+                lease,
+                prompt,
+                transfer,
+                &hit,
+                None,
+            );
+            // vLLM counts what the load still needs again at each test, and
+            // a state published here inside its running block adds the block
+            // of its copy (V31 `single:1770-1777`, V32 `single:1732-1739`).
+            let need = coordinator.remaining_blocks(&block_lease, prompt, transfer, prompt) as u64;
+            let grouped_lease = lease.grouped.as_mut().expect("grouped lease present");
+            self.grouped_inflight_need =
+                self.grouped_inflight_need - grouped_lease.first_pass_need + need;
+            grouped_lease.first_pass_need = need;
+            grouped_lease.block_lease = Some(block_lease);
+            // The hit of the reservation comes from no search of the
+            // lookup, so it holds no stamp and is never reused.
+            lease.grouped_hit = Some(StoredGroupedHit::unsearched(hit));
+        }
+    }
+
     pub(crate) fn preempt_lease(&mut self, owner: Uuid, lease: &mut BlockRequestLease) {
         lease.debug_assert_owner(owner);
         lease.prefill_checkpoint = None;
         lease.junction = None;
         lease.state_miss = None;
+        lease.scheduled_step = None;
         if let (Some(manager), Some(state)) = (&mut self.state_cache, &mut lease.state) {
             manager.preempt(&mut self.pool, state);
         }
@@ -2127,17 +2730,25 @@ impl VllmKvManager {
         lease.grouped_hit = None;
     }
 
-    /// Free the grouped blocks of a completed source that a next query of
-    /// its `computed` tokens would skip. vLLM frees them on the processed-token
-    /// basis before it hands the block table to the connector (V32
-    /// `sched:3023-3031`, V31 `:2966-2974`), when it processes the outputs of
-    /// the pass that completed the source. A window group keeps its blocks
-    /// inside the window, a Mamba-type state group the block of the last
-    /// computed token, and full attention and a ring keep every block. The
-    /// release is the one of a pass, with its publish and LRU rules, but it
-    /// takes no fresh block: a state that the source published inside its
-    /// running block gets no copy, as vLLM copies it only at an allocation
-    /// (V32 `single:1855-1900`, V31 `:1891-1936`).
+    /// Free the grouped blocks that a next query of the `computed` tokens
+    /// would skip, for an ending request on a prefill or decode rank, before
+    /// the other blocks of the request. vLLM's `_free_request` runs
+    /// `_connector_finished` before it frees the blocks (V32
+    /// `sched:2714-2723`, V31 `:2650-2658`). `_connector_finished` frees the
+    /// skipped blocks on the processed-token basis before it hands the block
+    /// table to the connector (V32 `sched:3023-3031`, V31 `:2966-2974`). So
+    /// the skipped blocks reach the LRU first. vLLM runs both when it
+    /// processes the outputs of the pass that ended the request, so with
+    /// async scheduling the scheduler calls this in its deferred free, right
+    /// before it frees the other blocks. A held source that leaves first
+    /// calls it before its other blocks too; a later call frees nothing a
+    /// second time. A window group keeps its blocks inside the window, a
+    /// Mamba-type state group the block of the last computed token, and full
+    /// attention and a ring keep every block. The release is the one of a
+    /// pass, with its publish and LRU rules, but it takes no fresh block: a
+    /// state that the request published inside its running block gets no
+    /// copy, as vLLM copies it only at an allocation (V32
+    /// `single:1855-1900`, V31 `:1891-1936`).
     pub(crate) fn release_skipped_blocks(
         &mut self,
         owner: Uuid,
@@ -2150,27 +2761,54 @@ impl VllmKvManager {
         };
         match &mut self.grouped_prefix {
             Some(coordinator) => {
+                // A block lease that never allocated holds no block, and
+                // vLLM frees only the blocks that a request holds (V31
+                // `single:718-725`, V32 `single:703-710`). An allocation here
+                // would take the blocks of a first pass.
                 if let Some(block_lease) = lease
                     .grouped
                     .as_mut()
                     .and_then(|grouped| grouped.block_lease.as_mut())
+                    .filter(|block_lease| block_lease.allocated)
                 {
-                    // A finished request runs no next pass, so the previous
-                    // state block that a pass keeps one more step goes too.
+                    // vLLM frees the skipped blocks of an ending request on
+                    // its processed count (V31 `sched:2968-2971`, V32
+                    // `sched:3025-3028`, v0.33 `sched:3369-3372`). Nothing of
+                    // a finished request is in flight when vLLM processes its
+                    // last step, so every held state block goes here. A
+                    // dropped request can have a step in flight. vLLM then
+                    // frees its held blocks with its other blocks, tail
+                    // first, and replay frees them here first. The blocks are
+                    // the same, and only their order in the free queue can
+                    // differ.
                     let released = coordinator.allocate(
                         grouped.block_pool_mut().expect("block mode"),
                         block_lease,
                         lease.prompt_tokens,
                         computed,
                         computed,
-                        self.step + 1,
+                        computed,
+                        self.grouped_transfer.is_none().then_some(self.step),
                     );
                     debug_assert!(released, "a release takes no fresh block");
                 }
             }
             None if lease.grouped.is_some() => {
+                // `allocate` replaces the lease with one that has no
+                // first-pass need. A load that ends before its first pass
+                // still has that need, and its free takes it off the loads in
+                // flight, so the release keeps it.
+                let first_pass_need = lease
+                    .grouped
+                    .as_ref()
+                    .map_or(0, |grouped| grouped.first_pass_need);
                 let released = grouped.allocate(&mut lease.grouped, computed, computed);
                 debug_assert!(released, "a release takes no fresh bytes");
+                lease
+                    .grouped
+                    .as_mut()
+                    .expect("a release keeps the grouped lease")
+                    .first_pass_need = first_pass_need;
             }
             None => {}
         }
@@ -2184,6 +2822,11 @@ impl VllmKvManager {
 
     fn release_lease_entries(&mut self, lease: &mut BlockRequestLease) {
         if let Some(grouped) = &mut self.grouped {
+            // A load dropped before its first pass leaves the loads in flight.
+            self.grouped_inflight_need -= lease
+                .grouped
+                .as_ref()
+                .map_or(0, |grouped| grouped.first_pass_need);
             if let Some(coordinator) = &self.grouped_prefix {
                 if let Some(block_lease) = lease
                     .grouped
@@ -2752,7 +3395,21 @@ impl VllmKvManager {
         self.pool.cancel(reservation.pool);
     }
 
-    pub(crate) fn cancel_destination(&mut self, reservation: DestinationReservation) {
+    pub(crate) fn cancel_destination(&mut self, mut reservation: DestinationReservation) {
+        if let (Some(grouped), Some(blocks)) = (&mut self.grouped, reservation.grouped.take()) {
+            let mut lease = blocks.lease;
+            self.grouped_inflight_need -= lease.first_pass_need;
+            match &self.grouped_prefix {
+                Some(coordinator) => coordinator.release_request(
+                    grouped.block_pool_mut().expect("block mode"),
+                    lease
+                        .block_lease
+                        .as_mut()
+                        .expect("a block-mode reservation carries its blocks"),
+                ),
+                None => grouped.release(&mut Some(lease)),
+            }
+        }
         self.pool.cancel(reservation.pool);
     }
 

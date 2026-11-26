@@ -1097,9 +1097,10 @@ def test_plan_names_the_cache_geometry_of_an_observed_profile(tmp_path, capsys, 
 
 
 def test_plan_admits_the_imported_glm_draft_at_its_observed_capacity(tmp_path, capsys):
-    # The live GLM probe record leaves 13,696 usable pool blocks of 13,516,800 bytes. A request at its 1,048,576-token
-    # context needs 482 attention blocks of 2,176 tokens and one block in each of the five state groups, the 4-token
-    # tail group too: 487 blocks.
+    # The live GLM probe record leaves 13,696 usable pool blocks of 13,516,800 bytes. vLLM's startup check reserves,
+    # for one request at its 1,048,576-token context, 482 attention blocks of 2,176 tokens, one block of the 4-token
+    # tail ring, and 2 + c = 3 blocks (running, previous, checkpoint) in each of the four KDA groups of align mode,
+    # whose spec has one prefill checkpoint block (v0.33.0 kv_cache_interface.py:1135-1141): 482 + 1 + 12 = 495.
     _, _, _, files = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
     root = tmp_path / "collection"
     assert cli.main(["onboard", "plan", "--config", files["request"], "--output-dir", str(root)]) == 0
@@ -1108,7 +1109,7 @@ def test_plan_admits_the_imported_glm_draft_at_its_observed_capacity(tmp_path, c
     assert plan["prerequisites"][0]["detail"] == (
         "Observed cache capacity and grouped geometry are bound to this deployment and runtime envelope."
     )
-    assert plan["resources"]["request_peak_cache_bytes"] == 487 * 13_516_800
+    assert plan["resources"]["request_peak_cache_bytes"] == 495 * 13_516_800
     assert plan["resources"]["total_kv_size_bytes"] == 13_696 * 13_516_800
 
 
@@ -1312,6 +1313,46 @@ def test_grouped_capacity_override_keeps_its_whole_block_plan_check(tmp_path, ca
         "observed FPM resources leave insufficient rank-local bytes for grouped cache peak allocation"
         in capsys.readouterr().err
     )
+
+
+@pytest.mark.parametrize("blocks", [490, 495], ids=["between_refused", "startup_count_admitted"])
+def test_plan_admits_a_glm_capacity_only_from_the_startup_count(tmp_path, capsys, blocks):
+    # One request at the 1,048,576-token context holds 482 attention blocks, one tail block and one block in each of
+    # the four KDA groups between block boundaries: 487 blocks. vLLM's startup check reserves 2 + c = 3 blocks in each
+    # KDA group of align mode (v0.33.0 kv_cache_interface.py:1135-1141): 495 blocks. A pool of 490 blocks lies between
+    # the two counts, and the plan refuses it.
+    checkpoint, _, request, _ = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    changed = _capacity_override(checkpoint, request, blocks * 13_516_800)
+    command = _plan_override(tmp_path, changed)
+    if blocks == 490:
+        with pytest.raises(SystemExit) as error:
+            cli.main(command)
+        assert error.value.code == 2
+        assert (
+            "observed FPM resources leave insufficient rank-local bytes for grouped cache peak allocation"
+            in capsys.readouterr().err
+        )
+    else:
+        assert cli.main(command) == 0
+        plan = json.loads((tmp_path / "collection" / "support-plan.json").read_text())
+        assert plan["resources"]["request_peak_cache_bytes"] == 495 * 13_516_800
+        assert plan["resources"]["total_kv_size_bytes"] == 495 * 13_516_800
+
+
+def test_glm_plan_saved_with_the_earlier_peak_bound_still_verifies(tmp_path, capsys):
+    from aisim.support.plan import check_plan
+
+    # The planner before the bound counted vLLM's startup blocks stored, for a request at the 1,048,576-token context,
+    # 482 attention blocks of 2,176 tokens and the blocks_per_request of each state group: 1 block of the 4-token tail
+    # ring (not one per 4 tokens of the context) and 1 block of each of the four KDA groups: 487 blocks.
+    _, _, _, files = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    root = tmp_path / "collection"
+    assert cli.main(["onboard", "plan", "--config", files["request"], "--output-dir", str(root)]) == 0
+    path = root / "support-plan.json"
+    saved = json.loads(path.read_text())
+    saved["resources"]["request_peak_cache_bytes"] = 487 * 13_516_800
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    check_plan(SupportRequest.from_yaml(root / "request.yaml"), root)
 
 
 def test_profile_edit_preserves_measured_values_and_requires_fresh_probe_for_settings(tmp_path, capsys):

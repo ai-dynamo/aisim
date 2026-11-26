@@ -1246,6 +1246,251 @@ mod tests {
         }
     }
 
+    /// The KV handoff command `kind` for `handoff_id`, with a request of
+    /// `request_id` where the command carries one.
+    fn handoff_command(kind: &str, handoff_id: HandoffId, request_id: Uuid) -> SchedulerCommand {
+        match kind {
+            "SubmitHandoffPrefill" => SchedulerCommand::SubmitHandoffPrefill {
+                handoff_id,
+                request: request(request_id, (0..8).collect()),
+            },
+            "ReleaseSource" => SchedulerCommand::ReleaseSource { handoff_id },
+            "CancelSource" => SchedulerCommand::CancelSource { handoff_id },
+            "ReserveDestination" => SchedulerCommand::ReserveDestination {
+                handoff_id,
+                request: request(request_id, (0..8).collect()),
+            },
+            "ActivateDestination" => SchedulerCommand::ActivateDestination { handoff_id },
+            "CancelDestination" => SchedulerCommand::CancelDestination { handoff_id },
+            _ => unreachable!("{kind} is no KV handoff command"),
+        }
+    }
+
+    /// Step `source` until it holds the prefill of its one handoff request.
+    fn hold_source(source: &mut EngineCore) {
+        let mut now_ms = 0.0;
+        for _ in 0..8 {
+            now_ms = source.execute_hidden_pass(now_ms).end_ms;
+            if source.is_empty() {
+                break;
+            }
+        }
+        assert!(source.is_empty());
+        assert!(!source.is_drained());
+    }
+
+    /// Step `rank` until it drains, starting at `now_ms`, and describe each
+    /// pass by its end, admissions, outputs, events and metrics.
+    fn passes_to_the_end(rank: &mut EngineCore, mut now_ms: f64) -> Vec<String> {
+        let mut passes = Vec::new();
+        for _ in 0..32 {
+            if rank.is_drained() {
+                return passes;
+            }
+            let pass = rank.execute_hidden_pass(now_ms);
+            now_ms = pass.end_ms;
+            passes.push(format!(
+                "{} {:?} {:?} {:?} {:?} {:?} {:?}",
+                pass.end_ms,
+                pass.committed_requests,
+                pass.admissions,
+                pass.output_signals,
+                pass.lifecycle_events,
+                pass.kv_events,
+                pass.mocker_metrics,
+            ));
+        }
+        panic!("the rank did not drain in 32 passes");
+    }
+
+    #[test]
+    fn rank_refuses_kv_handoff_commands_of_the_opposite_role() {
+        let cases = [
+            (WorkerType::Decode, "SubmitHandoffPrefill"),
+            (WorkerType::Decode, "ReleaseSource"),
+            (WorkerType::Decode, "CancelSource"),
+            (WorkerType::Prefill, "ReserveDestination"),
+            (WorkerType::Prefill, "ActivateDestination"),
+            (WorkerType::Prefill, "CancelDestination"),
+        ];
+        for (engine, engine_type) in [EngineType::Vllm, EngineType::Trtllm, EngineType::Sglang]
+            .into_iter()
+            .enumerate()
+        {
+            for (case, (opposite, kind)) in cases.into_iter().enumerate() {
+                let id = 50_000 + 100 * engine as u128 + 10 * case as u128;
+                let handoff_id = HandoffId::from(Uuid::from_u128(id));
+                let request_id = Uuid::from_u128(id + 1);
+                let (refusal, taker) = if opposite == WorkerType::Decode {
+                    (
+                        format!(
+                            "a decode rank holds no KV handoff source, so it refuses {kind}; a prefill rank takes it"
+                        ),
+                        WorkerType::Prefill,
+                    )
+                } else {
+                    (
+                        format!(
+                            "a prefill rank loads no KV handoff destination, so it refuses {kind}; a decode rank takes it"
+                        ),
+                        WorkerType::Decode,
+                    )
+                };
+                let refused = |rank: &mut EngineCore| {
+                    rank.apply_command_effects(handoff_command(kind, handoff_id, request_id), true)
+                        .unwrap_err()
+                        .to_string()
+                };
+
+                // The rank of the opposite role refuses the command and keeps
+                // nothing of it.
+                let mut rank = core(engine_type, opposite, 16);
+                assert_eq!(refused(&mut rank), refusal, "{engine_type:?}");
+                assert_eq!(rank.num_requests(), 0, "{engine_type:?} {kind}");
+                assert!(rank.is_empty(), "{engine_type:?} {kind}");
+                assert!(rank.is_drained(), "{engine_type:?} {kind}");
+                assert!(
+                    rank.retry_pending_destinations().is_empty(),
+                    "{engine_type:?} {kind}"
+                );
+                assert!(rank.drain_kv_events().is_empty(), "{engine_type:?} {kind}");
+                let pass = rank.execute_hidden_pass(0.0);
+                assert!(pass.lifecycle_events.is_empty(), "{engine_type:?} {kind}");
+                assert!(pass.admissions.is_empty(), "{engine_type:?} {kind}");
+                // The request ID is still free.
+                assert_eq!(
+                    rank.apply_command(SchedulerCommand::Submit(request(
+                        request_id,
+                        (0..8).collect()
+                    )))
+                    .unwrap(),
+                    SchedulerCommandResult::Submitted(request_id),
+                    "{engine_type:?} {kind}"
+                );
+                // The role comes before the request ID, which is now active.
+                assert_eq!(refused(&mut rank), refusal, "{engine_type:?}");
+                assert_eq!(rank.num_requests(), 1, "{engine_type:?} {kind}");
+                // The request then runs to its end as on a rank that never
+                // got the refused command.
+                let mut untouched = core(engine_type, opposite, 16);
+                untouched.execute_hidden_pass(0.0);
+                untouched
+                    .apply_command(SchedulerCommand::Submit(request(
+                        request_id,
+                        (0..8).collect(),
+                    )))
+                    .unwrap();
+                assert_eq!(
+                    passes_to_the_end(&mut rank, pass.end_ms),
+                    passes_to_the_end(&mut untouched, pass.end_ms),
+                    "{engine_type:?} {kind}"
+                );
+
+                // A rank of the other role takes the same command with the
+                // same IDs.
+                let mut rank = core(engine_type, taker, 16);
+                let apply = |rank: &mut EngineCore, kind: &str| {
+                    rank.apply_command(handoff_command(kind, handoff_id, request_id))
+                        .unwrap()
+                };
+                let taken = match kind {
+                    "ReleaseSource" => {
+                        apply(&mut rank, "SubmitHandoffPrefill");
+                        hold_source(&mut rank);
+                        apply(&mut rank, kind)
+                    }
+                    "CancelSource" => {
+                        apply(&mut rank, "SubmitHandoffPrefill");
+                        apply(&mut rank, kind)
+                    }
+                    "ActivateDestination" | "CancelDestination" => {
+                        apply(&mut rank, "ReserveDestination");
+                        apply(&mut rank, kind)
+                    }
+                    _ => apply(&mut rank, kind),
+                };
+                let expected = match kind {
+                    "SubmitHandoffPrefill" => SchedulerCommandResult::Submitted(request_id),
+                    "ReserveDestination" => {
+                        SchedulerCommandResult::DestinationAccepted { request_id }
+                    }
+                    _ => SchedulerCommandResult::Applied,
+                };
+                assert_eq!(taken, expected, "{engine_type:?} {kind}");
+            }
+
+            // A request cancel is no KV handoff command: a rank of either
+            // role takes it.
+            for worker_type in [WorkerType::Prefill, WorkerType::Decode] {
+                let request_id = Uuid::from_u128(50_090 + 100 * engine as u128);
+                let mut rank = core(engine_type, worker_type, 16);
+                rank.apply_command(SchedulerCommand::Submit(request(
+                    request_id,
+                    (0..8).collect(),
+                )))
+                .unwrap();
+                assert_eq!(
+                    rank.apply_command(SchedulerCommand::CancelRequest { request_id })
+                        .unwrap(),
+                    SchedulerCommandResult::Applied,
+                    "{engine_type:?} {worker_type:?}"
+                );
+                assert!(rank.is_drained(), "{engine_type:?} {worker_type:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn linear_aggregated_rank_takes_both_sides_of_a_kv_handoff() {
+        for (engine, engine_type) in [EngineType::Vllm, EngineType::Trtllm, EngineType::Sglang]
+            .into_iter()
+            .enumerate()
+        {
+            let id = 60_000 + 100 * engine as u128;
+            let request_id = |handoff: u128| Uuid::from_u128(id + 10 + handoff);
+            // A source that is held and released, a source that is canceled,
+            // and a destination that is activated and canceled: the six KV
+            // handoff commands, each with the number of its handoff.
+            let steps = [
+                (
+                    "SubmitHandoffPrefill",
+                    0,
+                    SchedulerCommandResult::Submitted(request_id(0)),
+                ),
+                ("ReleaseSource", 0, SchedulerCommandResult::Applied),
+                (
+                    "SubmitHandoffPrefill",
+                    1,
+                    SchedulerCommandResult::Submitted(request_id(1)),
+                ),
+                ("CancelSource", 1, SchedulerCommandResult::Applied),
+                (
+                    "ReserveDestination",
+                    2,
+                    SchedulerCommandResult::DestinationAccepted {
+                        request_id: request_id(2),
+                    },
+                ),
+                ("ActivateDestination", 2, SchedulerCommandResult::Applied),
+                ("CancelDestination", 2, SchedulerCommandResult::Applied),
+            ];
+            let mut rank = core(engine_type, WorkerType::Aggregated, 16);
+            for (kind, handoff, expected) in steps {
+                if kind == "ReleaseSource" {
+                    hold_source(&mut rank);
+                }
+                let handoff_id = HandoffId::from(Uuid::from_u128(id + handoff));
+                assert_eq!(
+                    rank.apply_command(handoff_command(kind, handoff_id, request_id(handoff)))
+                        .unwrap(),
+                    expected,
+                    "{engine_type:?} {kind}"
+                );
+            }
+            assert!(rank.is_drained(), "{engine_type:?}");
+        }
+    }
+
     #[test]
     fn admission_invariant_distinguishes_materialized_and_pending_requests() {
         assert_eq!(

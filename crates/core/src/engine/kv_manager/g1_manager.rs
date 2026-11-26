@@ -96,6 +96,14 @@ impl G1Manager {
         self.inner.grouped()
     }
 
+    pub(crate) fn grouped_inflight_need(&self) -> u64 {
+        self.inner.grouped_inflight_need()
+    }
+
+    pub(crate) fn grouped_published_epoch(&self) -> u64 {
+        self.inner.grouped_published_epoch()
+    }
+
     pub(crate) fn set_grouped_prefix_rules(
         &mut self,
         rules: GroupedPrefixRules,
@@ -109,8 +117,18 @@ impl G1Manager {
         self.inner.grouped_prefix_rules()
     }
 
+    pub(crate) fn set_grouped_admission_limits(&mut self, limits: AdmissionLimits) {
+        self.inner.set_grouped_admission_limits(limits);
+    }
+
     pub(crate) fn set_grouped_transfer_rules(&mut self, rules: GroupedTransferRules) {
         self.inner.set_grouped_transfer_rules(rules);
+    }
+
+    /// The bytes of the whole sequence of `tokens` tokens in a byte-mode
+    /// pool, admission cap and state blocks included.
+    pub(crate) fn grouped_whole_sequence_bytes(&self, tokens: usize) -> u64 {
+        self.inner.grouped_whole_sequence_bytes(tokens)
     }
 
     /// The transfer rules of a grouped cache on a prefill or decode rank.
@@ -121,6 +139,12 @@ impl G1Manager {
     /// The whole-prompt blocks of `known_tokens` without a prefix hit.
     pub(crate) fn grouped_cold_admission_blocks(&self, known_tokens: usize) -> usize {
         self.inner.grouped_cold_admission_blocks(known_tokens)
+    }
+
+    /// The bytes that a grouped destination of `prompt_tokens` needs for its
+    /// loaded tokens. `None` without a grouped cache.
+    pub(crate) fn grouped_destination_required_bytes(&self, prompt_tokens: usize) -> Option<u64> {
+        self.inner.grouped_destination_required_bytes(prompt_tokens)
     }
 
     pub(crate) fn set_belady_oracle(&mut self, oracle: BeladyOracle) {
@@ -189,8 +213,30 @@ impl G1Manager {
         self.inner.begin_step();
     }
 
+    pub(crate) fn set_previous_pass_in_flight(&mut self, in_flight: bool) {
+        self.inner.set_previous_pass_in_flight(in_flight);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn previous_pass_in_flight(&self) -> bool {
+        self.inner.previous_pass_in_flight()
+    }
+
+    pub(crate) fn processed_tokens(
+        &self,
+        lease: &BlockRequestLease,
+        computed_before: usize,
+    ) -> usize {
+        self.inner.processed_tokens(lease, computed_before)
+    }
+
     pub(crate) fn release_grouped_copy_sources(&mut self) {
         self.inner.release_grouped_copy_sources();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grouped_copy_source_count(&self) -> usize {
+        self.inner.grouped_copy_source_count()
     }
 
     pub(crate) fn accepts_sequence_length(&self, tokens: usize) -> bool {
@@ -348,7 +394,8 @@ impl G1Manager {
         self.inner.preempt_lease(owner, lease);
     }
 
-    /// Free the grouped blocks that a completed source no longer needs.
+    /// Free the grouped blocks that an ending request of a prefill or decode
+    /// rank no longer needs, before its other blocks.
     pub(crate) fn release_skipped_blocks(
         &mut self,
         owner: Uuid,
@@ -390,6 +437,14 @@ impl G1Manager {
         self.inner.get_waiting_lease_prefill_cost(sequence, lease)
     }
 
+    /// What a request with `lease` still needs to hold its `tokens` tokens:
+    /// blocks in block mode, bytes in byte mode. 0 without grouped blocks.
+    pub(crate) fn grouped_remaining_need(&self, lease: &BlockRequestLease, tokens: usize) -> u64 {
+        self.inner.grouped_remaining_need(lease, tokens)
+    }
+
+    /// `local_prefill_need` is what the local prefills in flight still need.
+    /// A grouped destination keeps it free, and a linear one ignores it.
     pub(crate) fn reserve_native_destination_at(
         &mut self,
         owner: Uuid,
@@ -397,6 +452,7 @@ impl G1Manager {
         lease: &BlockRequestLease,
         mode: DestinationReservationMode,
         eviction_now_ms: Option<f64>,
+        local_prefill_need: u64,
     ) -> G1Acquire<DestinationReservation> {
         into_g1_acquire(self.inner.reserve_destination_lease(
             owner,
@@ -404,6 +460,7 @@ impl G1Manager {
             lease,
             mode,
             eviction_now_ms,
+            local_prefill_need,
         ))
         .map(|inner| DestinationReservation { inner })
     }

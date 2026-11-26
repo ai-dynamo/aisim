@@ -98,27 +98,38 @@ pub struct Request {
 }
 
 /// Commands supported by the standalone scheduler.
+///
+/// A KV handoff has a source on the rank that prefills and a destination on
+/// the rank that decodes. A prefill rank refuses the destination commands and
+/// a decode rank refuses the source commands. An aggregated rank takes both,
+/// except with `kv_cache_groups`, where it refuses all six.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Submit one request.
     Submit(Request),
     /// Submit a request whose completed prefill KV must remain source-held.
+    /// A source command, for a prefill rank.
     SubmitHandoffPrefill {
         handoff_id: HandoffId,
         request: Request,
     },
     /// Accept a decode request and reserve its destination KV footprint.
+    /// A destination command, for a decode rank.
     ReserveDestination {
         handoff_id: HandoffId,
         request: Request,
     },
     /// Make a reserved destination runnable after transfer completion.
+    /// A destination command, for a decode rank.
     ActivateDestination { handoff_id: HandoffId },
     /// Release a successfully transferred source hold.
+    /// A source command, for a prefill rank.
     ReleaseSource { handoff_id: HandoffId },
     /// Cancel pending or held source ownership.
+    /// A source command, for a prefill rank.
     CancelSource { handoff_id: HandoffId },
     /// Cancel pending, reserved, or active destination ownership.
+    /// A destination command, for a decode rank.
     CancelDestination { handoff_id: HandoffId },
     /// Cancel one request.
     ///
@@ -304,7 +315,10 @@ pub struct CacheTierAttribution {
 pub struct Admission {
     /// Admitted request.
     pub request_id: Uuid,
-    /// Prompt tokens reused from all KV-cache tiers.
+    /// Prompt tokens reused from all KV-cache tiers. For a readmission on a
+    /// rank with KV cache groups, the tokens of the request that the
+    /// admission served from the cache, which can include its own output
+    /// tokens.
     pub reused_input_tokens: usize,
     /// Tier provenance captured before a host-loaded prefix becomes G1.
     pub cache_tier_attribution: Option<CacheTierAttribution>,

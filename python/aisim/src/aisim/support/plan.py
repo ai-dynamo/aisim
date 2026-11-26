@@ -38,6 +38,10 @@ MEMORY_OBSERVATION_VERSIONS = ("0.27.0", "0.32.0", "0.33.0")
 SOURCE_MANIFEST_RELEASES = ("0.32.0", "0.33.0")
 
 
+class _PoolRefusal(ValueError):
+    """The planner's refusal of a pool that cannot hold the grouped cache peak of one request."""
+
+
 def audited_memory_release(version: str | None) -> str | None:
     """Return the audited release whose source a version stands for, or None."""
     if not isinstance(version, str):
@@ -184,6 +188,7 @@ def _configs(
                     architecture=request.fpm_profile.architecture,
                     prefix_match_unit=None,
                     max_batched_tokens=worker["scheduler"]["max_batched_tokens"],
+                    pd_rank=request.worker_type in {"prefill", "decode"},
                 )
                 prefix_caching = (
                     not grouped_cold and _evidence_version(request, deployment) == deployment.backend_version
@@ -345,7 +350,12 @@ def _commands(
 
 
 def _plan_documents(
-    request: SupportRequest, root: Path, *, legacy_cli: bool = False, grouped_cold: bool = False
+    request: SupportRequest,
+    root: Path,
+    *,
+    legacy_cli: bool = False,
+    grouped_cold: bool = False,
+    earlier_peak: bool = False,
 ) -> tuple[dict[str, Any], dict[Path, bytes]]:
     package_spec = find_spec("aisim_core")
     if package_spec is None:
@@ -481,9 +491,24 @@ def _plan_documents(
                 else "Native timing collection policy; runtime memory observation is unavailable for this vLLM version."
             )
         elif deployment.resources.cache_layout == "grouped":
+            if earlier_peak:
+                # The peak bound of the planner before it counted vLLM's startup blocks: each state group counts its
+                # blocks_per_request pages, a window group its window and one chunk, any other group the context.
+                context, chunk = request.search.context_length, scheduler["max_batched_tokens"]
+                peak = 0
+                for group in estimate["cache_groups"]:
+                    block, window = group["block_size_tokens"], group.get("sliding_window")
+                    if group["kind"] == "state":
+                        pages = group["blocks_per_request"]
+                    elif window is not None:
+                        pages = min(-(-context // block), -(-(window - 1 + chunk + block - 1) // block))
+                    else:
+                        pages = -(-context // block)
+                    peak += pages * group["page_size_bytes"]
+                estimate["request_peak_cache_bytes"] = peak
             if estimate["request_peak_cache_bytes"] > estimate["total_kv_size_bytes"]:
                 source = "observed" if deployment.resources.memory_source == "runtime" else "declared"
-                raise ValueError(
+                raise _PoolRefusal(
                     f"{source} FPM resources leave insufficient rank-local bytes for grouped cache peak allocation"
                 )
         elif deployment.resources.memory_source == "runtime":
@@ -749,17 +774,43 @@ def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = Fal
         raise ValueError(f"saved request in {root} was modified or cannot be read") from exc
     if request_id(saved) != prior["request_id"] or validation_id(saved) != prior.get("validation_id"):
         raise ValueError(f"saved request identity in {root} was modified or differs from the requested plan")
-    expected, documents = _plan_documents(saved, root)
+    try:
+        expected, documents = _plan_documents(saved, root)
+        refusal, completed = None, True
+    except _PoolRefusal as exc:
+        expected, refusal, completed = None, exc, False
     if prior != expected:
         # Validate the entire original presentation, including its generated-file
         # hashes. Do not rewrite saved commands/evidence or ignore differing fields.
         # A plan saved before replay modeled grouped prefix caching keeps its
         # grouped replay cold until `onboard plan --overwrite` writes it again.
-        for legacy_cli, grouped_cold in ((True, False), (False, True), (True, True)):
-            expected, documents = _plan_documents(saved, root, legacy_cli=legacy_cli, grouped_cold=grouped_cold)
+        # A plan saved before the peak bound counted vLLM's startup blocks keeps
+        # its value until `onboard plan --overwrite` writes it again. When its
+        # pool is too small for the plan of this checkout, it keeps its value,
+        # because the planner refuses to write it again. Only the pool refusal of
+        # a rendering is caught; every other error of a rendering is raised.
+        for legacy_cli, grouped_cold, earlier_peak in (
+            (True, False, False),
+            (False, True, False),
+            (True, True, False),
+            (False, False, True),
+            (True, False, True),
+            (False, True, True),
+            (True, True, True),
+        ):
+            try:
+                expected, documents = _plan_documents(
+                    saved, root, legacy_cli=legacy_cli, grouped_cold=grouped_cold, earlier_peak=earlier_peak
+                )
+            except _PoolRefusal:
+                continue
+            completed = True
             if prior == expected:
                 break
         else:
+            # The pool refusal stands only when every rendering refused the pool.
+            if not completed:
+                raise refusal
             raise ValueError(
                 f"generated plan input {root / 'support-plan.json'} was modified; choose a new output directory"
             )

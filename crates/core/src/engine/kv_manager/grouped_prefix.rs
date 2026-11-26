@@ -118,15 +118,24 @@ pub(crate) struct GroupedPrefixRules {
     specs: Vec<SpecGroup>,
     hash_block: usize,
     /// The hit alignment `A` (`coord:687-735`): the hash block with
-    /// fine-grained hits, else the scheduler block, the LCM of every group
-    /// block (`coord:87-92`).
+    /// fine-grained hits, else the scheduler block.
     alignment: usize,
+    /// The scheduler block, the LCM of every group block (V31
+    /// `kv_cache_utils.py:770`, V32 `:851`, v0.33 `:863`).
+    scheduler_block: usize,
     /// The smallest cacheable group block, vLLM's `cache_config.block_size`
     /// (`core:336-350`).
     cacheable_block: usize,
     version: VllmRuleVersion,
     checkpoint: Option<CheckpointRule>,
+    /// Whether an aggregated rank holds the blocks of a step in flight. See
+    /// [`Self::keeps_in_flight_hold`].
+    keeps_in_flight_hold: bool,
 }
+
+/// The most groups of one grouped prefix cache: `CacheKey::Grouped` names a
+/// group by its position among all groups of the rank, in a `u16`.
+const MAX_CACHE_GROUPS: usize = 1 << u16::BITS;
 
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
@@ -146,6 +155,14 @@ impl GroupedPrefixRules {
         version: VllmRuleVersion,
     ) -> anyhow::Result<Self> {
         ensure!(hash_block > 0, "prefix_match_unit must be positive");
+        // The bound counts every group, also one that opts out of prefix
+        // caching: that group still takes a position, and a caching group
+        // after it must stay at a position that a key can name. Byte mode
+        // has no cache key, so it takes any group count.
+        ensure!(
+            groups.len() <= MAX_CACHE_GROUPS,
+            "kv_cache_groups with enable_prefix_caching=true support at most {MAX_CACHE_GROUPS} groups; use fewer groups, or turn prefix caching off to replay them cold"
+        );
         let mut rules = Vec::with_capacity(groups.len());
         let mut checkpoints = Vec::new();
         for group in groups {
@@ -187,7 +204,7 @@ impl GroupedPrefixRules {
                         GroupRuleKind::Ring
                     }
                 }
-                FpmCacheKind::Attention => match group.sliding_window {
+                FpmCacheKind::Attention | FpmCacheKind::Convolution => match group.sliding_window {
                     Some(window) => {
                         // The window specs that opt out of prefix caching are
                         // a ring of one block per request (v0.31
@@ -199,20 +216,31 @@ impl GroupedPrefixRules {
                         // in vLLM (v0.31 `coord:743-749`, v0.32
                         // `coord:713-720`).
                         ensure!(
-                            cacheable,
+                            cacheable || group.kind == FpmCacheKind::Convolution,
                             "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not model"
+                        );
+                        // A convolution group is vLLM's plain
+                        // `SlidingWindowSpec`, with the kernel size as its
+                        // block and its window (v0.31.0, v0.32.0 and v0.33.0
+                        // `vllm/models/inkling/nvidia/sconv_swa_attn.py:158-159`,
+                        // `:185-193`), and that spec takes part in prefix
+                        // caching. The profile keeps its kind, so it forms
+                        // its own spec group.
+                        ensure!(
+                            cacheable,
+                            "kv_cache_groups with enable_prefix_caching=true do not model a convolution group with prefix_cacheable=false; turn prefix caching off to replay it cold"
                         );
                         GroupRuleKind::SlidingWindow {
                             window: window as usize,
                         }
                     }
+                    // `EngineConfig::validate` refuses this group with the
+                    // same text before it reaches the rule table.
+                    None if group.kind == FpmCacheKind::Convolution => {
+                        bail!("convolution cache groups require a sliding_window")
+                    }
                     None => GroupRuleKind::FullAttention,
                 },
-                // The table has no rule for a convolution group, so the
-                // group fails here and does not lose its window.
-                FpmCacheKind::Convolution => bail!(
-                    "grouped prefix caching does not support convolution cache groups; turn prefix caching off to replay them cold"
-                ),
             };
             cacheable &= kind != GroupRuleKind::Ring;
             if cacheable {
@@ -349,15 +377,37 @@ impl GroupedPrefixRules {
             }
         }
         specs.sort_by_key(|spec| spec.kind != GroupRuleKind::FullAttention);
+        let has_state = rules.iter().any(|rule| rule.kind == GroupRuleKind::State);
+        let has_full_attention = rules
+            .iter()
+            .any(|rule| rule.kind == GroupRuleKind::FullAttention && rule.cacheable);
+        let keeps_in_flight_hold = !has_state
+            || (has_full_attention
+                && rules
+                    .iter()
+                    .filter(|rule| rule.cacheable)
+                    .all(|rule| rule.block == scheduler_block));
         Ok(Self {
             groups: rules,
             specs,
             hash_block,
             alignment,
+            scheduler_block,
             cacheable_block,
             version,
             checkpoint,
+            keeps_in_flight_hold,
         })
+    }
+
+    /// Whether the aggregate window and forward-admission checks account for
+    /// a step in flight. vLLM frees skipped pages on the processed count
+    /// (v0.31 mgr:549-556, v0.32 mgr:552-559, v0.33 mgr:561-568).
+    /// For grouped aggregate layouts with state, replay applies that window
+    /// hold only when every cacheable block equals the scheduler block and
+    /// full attention participates. Aggregate state itself retires by step.
+    pub(crate) fn keeps_in_flight_hold(&self) -> bool {
+        self.keeps_in_flight_hold
     }
 
     /// The pool blocks that vLLM's startup check reserves for one request of
@@ -402,13 +452,19 @@ impl GroupedPrefixRules {
     /// the pool as they are. 0 when the next step can change them.
     ///
     /// `settled` is the larger of the prompt and the junction. Every position
-    /// that `finalize` publishes at (replay boundary, partial tail, prompt
-    /// checkpoint and junction) lies at or below it, so past it `finalize`
-    /// only counts the blocks that a step completes. `allocate` takes a
-    /// block when the target leaves the blocks that the request holds,
-    /// retires a window block every `block` tokens, and releases the blocks
-    /// that a state group holds beside a private running block. A checkpoint
-    /// block needs a chunk that spans two state blocks.
+    /// that `finalize` publishes a state, a window run or a key inside a
+    /// block at (replay boundary, partial tail, prompt checkpoint and
+    /// junction) lies at or below it, so past it `finalize` publishes only
+    /// the full-attention blocks that a step completes. That holds for the
+    /// full-attention keys that wait for a multiple of the scheduler block
+    /// too, the partial tail among them: such a multiple is a block end of
+    /// every group. `allocate` takes a block when the target leaves the
+    /// blocks that the request holds, retires a window block every `block`
+    /// tokens, and releases the blocks that a state group holds beside a
+    /// private running block. A window block retires on the processed count,
+    /// which is at or below the count that the allocation starts from, so
+    /// the bound holds with a step in flight. A checkpoint block needs a
+    /// chunk that spans two state blocks.
     fn quiet_until(
         &self,
         lease: &GroupedBlockLease,
@@ -492,6 +548,18 @@ pub(crate) enum GroupHitBlocks {
     /// run.
     Attention(Vec<Option<CacheKey>>),
     State(Option<CacheKey>),
+    /// The own hit of a state group on a decode rank that loads a KV handoff:
+    /// the cached block keyed at `tokens`, below the loaded tokens. vLLM
+    /// counts it in both admission tests: its `cdiv(tokens, B)` blocks count
+    /// as computed, and the cached one counts again when no request holds it
+    /// (V31 `single:1762-1816`, V32 `single:1724-1778`). Then the decode rank
+    /// drops the block without holding it, as a Mamba group skips all but the
+    /// last computed token (V31 `single:298-303`, `:1990-1995`, V32
+    /// `single:295-300`, `:1954-1959`).
+    DroppedState {
+        key: CacheKey,
+        tokens: usize,
+    },
     None,
 }
 
@@ -576,7 +644,9 @@ pub(crate) struct AdmissionLimits {
 
 /// `SlidingWindowSpec.max_admission_blocks_per_request` (v0.31
 /// `iface:859-866`, v0.32 `iface:878-885`), without multi-module speculative
-/// decoding.
+/// decoding. Without `max_model_len` and a step budget, both limits are
+/// `usize::MAX`. The cap is then at least `usize::MAX / B`, so it does not
+/// bind.
 fn window_admission_blocks(
     window: usize,
     block: usize,
@@ -588,6 +658,91 @@ fn window_admission_blocks(
         .min(max_model_len)
         .div_ceil(block)
         .saturating_add(1)
+}
+
+/// `GroupedPrefixCoordinator::remaining_blocks` in byte mode, which keeps no
+/// blocks: the bytes that a request still needs to hold its `tokens` tokens
+/// after `computed` tokens, as vLLM's `_request_remaining_blocks` counts them
+/// (V31 `sched:3003-3017`, V32 `sched:3060-3076`). Each group that is not a
+/// state group holds `cdiv(computed, B)` blocks, null blocks included, and
+/// counts `page_size_bytes` for each block up to `cdiv(tokens, B)` (V31
+/// `single:232-238`, V32 `single:229-235`). A group with a sliding window
+/// counts up to the admission cap (V31 `single:216-229`, V32
+/// `single:213-226`). That is a sliding-window attention group, or a
+/// convolution group, which always has a window. Byte-mode P/D accepts such
+/// a group, and `FpmCacheGroup::block_range` counts it as a window. A state
+/// group counts 0, as it holds its fixed blocks for the whole request.
+pub(crate) fn remaining_bytes(
+    groups: &[FpmCacheGroup],
+    computed: usize,
+    tokens: usize,
+    limits: AdmissionLimits,
+) -> u64 {
+    groups
+        .iter()
+        .filter(|group| group.kind != FpmCacheKind::State)
+        .map(|group| {
+            let block = group.block_size_tokens as usize;
+            let mut required = tokens.div_ceil(block);
+            if let Some(window) = group.sliding_window {
+                required = required.min(window_admission_blocks(
+                    window as usize,
+                    block,
+                    limits.max_in_flight_tokens,
+                    limits.max_model_len,
+                ));
+            }
+            (required.saturating_sub(computed.div_ceil(block)) as u64)
+                .saturating_mul(group.page_size_bytes)
+        })
+        .fold(0, u64::saturating_add)
+}
+
+/// `GroupedPrefixCoordinator::destination_admission_blocks` in byte mode,
+/// which keeps no blocks and finds no local hit: the bytes of vLLM's
+/// whole-prompt test for a decode rank that loads `loaded` of the `tokens`
+/// prompt tokens of a request without blocks (V31 `mgr:519-536`, V32
+/// `mgr:522-539`, v0.33 `mgr:531-548`). Each group that is not a state group
+/// counts `page_size_bytes` for each block up to `cdiv(tokens, B)`. A group
+/// with a sliding window counts up to the admission cap and leaves out the
+/// whole blocks below the window of the loaded tokens, so it can count 0
+/// (V31 `single:216-251`, `:1185-1188`, V32 `single:213-248`, `:1167-1170`,
+/// v0.33 `single:214-249`, `:1180-1183`). As in `remaining_bytes`, that is a
+/// sliding-window attention group or a convolution group. The state groups
+/// count `state_bytes`, their fixed blocks, for a request with tokens.
+/// vLLM's test counts `min(tokens, max_model_len)` tokens. The scheduler
+/// refuses a destination prompt of `max_model_len` tokens or more before it
+/// reserves one, so `tokens` is below that bound here.
+pub(crate) fn destination_admission_bytes(
+    groups: &[FpmCacheGroup],
+    state_bytes: u64,
+    loaded: usize,
+    tokens: usize,
+    limits: AdmissionLimits,
+) -> u64 {
+    groups
+        .iter()
+        .filter(|group| group.kind != FpmCacheKind::State)
+        .map(|group| {
+            let block = group.block_size_tokens as usize;
+            let mut required = tokens.div_ceil(block);
+            let mut skipped = 0;
+            if let Some(window) = group.sliding_window {
+                let window = window as usize;
+                required = required.min(window_admission_blocks(
+                    window,
+                    block,
+                    limits.max_in_flight_tokens,
+                    limits.max_model_len,
+                ));
+                skipped = loaded.saturating_sub(window - 1) / block;
+            }
+            (required.saturating_sub(skipped) as u64).saturating_mul(group.page_size_bytes)
+        })
+        .fold(
+            if tokens == 0 { 0 } else { state_bytes },
+            u64::saturating_add,
+        )
 }
 
 /// The first end, a multiple of `step` at most `max`, with `needed`
@@ -618,12 +773,17 @@ fn window_run(
     (0, 0)
 }
 
+/// The position of a group as a cache key holds it.
+fn key_group(group: usize) -> u16 {
+    u16::try_from(group).expect("GroupedPrefixRules::new allows at most 65,536 groups")
+}
+
 fn grouped_key(
     group: usize,
     hash: Option<crate::engine::common::hashing::SequenceHash>,
 ) -> Option<CacheKey> {
     hash.map(|hash| CacheKey::Grouped {
-        group: group as u16,
+        group: key_group(group),
         hash,
     })
 }
@@ -676,6 +836,12 @@ impl GroupedPrefixCoordinator {
         }
     }
 
+    /// Raised when the keys published in this step gain a key or are cleared
+    /// while not empty: a step start that makes such keys hits moves it.
+    pub(crate) fn published_epoch(&self) -> u64 {
+        self.state.visibility_epoch()
+    }
+
     pub(crate) fn rules(&self) -> &GroupedPrefixRules {
         &self.rules
     }
@@ -703,9 +869,10 @@ impl GroupedPrefixCoordinator {
 
     /// Every input of [`Self::find_longest_hit`] that can change while a
     /// request waits: the pool, its resident keys, the keys published in
-    /// this step and the request's token count. The other inputs, the rules
-    /// and the request's prefix hashes, are fixed once the lease has its
-    /// prefix hashes. The search reads the pool only through
+    /// this step and the request's token count. The other inputs are the
+    /// rules, which are fixed, and the request's prefix hashes. A request
+    /// only appends tokens, so its token count fixes the hashes once the
+    /// lease has its prefix hashes. The search reads the pool only through
     /// `key_hit(..).is_some()` and `keys_in_block`, which only narrows where
     /// it looks. So two searches of one lease with equal stamps give equal
     /// hits.
@@ -844,6 +1011,193 @@ impl GroupedPrefixCoordinator {
         hit
     }
 
+    /// The local prefix of a decode rank that loads a P/D handoff. The NIXL
+    /// connector supports divergent hits (V31 `nixl/connector.py:80-82`, V32
+    /// and v0.33 `nixl/connector.py:83-85`), so the scheduler takes the local
+    /// prefix from `get_computed_blocks_for_connector` (V31 `sched:529-539`,
+    /// V32 `sched:558-568`, v0.33 `sched:664-676`; V31 and V32
+    /// `mgr:323-369`, v0.33 `mgr:330-378`). Its rules, in order:
+    ///
+    /// 1. Without Mamba layers or without a full-attention group, the local
+    ///    prefix is the hit that every group agrees on, which
+    ///    `find_longest_hit` finds (V31 and V32 `mgr:346-351`, v0.33
+    ///    `mgr:353-358`). The Mamba layers are the prefix-cacheable state
+    ///    groups (`has_mamba_layers`, V31 `iface:1568-1574`, V32
+    ///    `iface:1563-1569`, v0.33 `iface:1629-1635`). The full-attention
+    ///    group is the first spec group (V31 `coord:781-788`, V32
+    ///    `coord:752-759`, v0.33 `coord:762-769`).
+    /// 2. Otherwise each spec group is looked up alone, capped at
+    ///    `num_tokens - 1` (V31 and V32 `mgr:356-359`, v0.33 `mgr:363-368`;
+    ///    V31 `coord:979-1011`, V32 `coord:933-977`, v0.33
+    ///    `coord:943-987`).
+    /// 3. If another group hits deeper than the full-attention group, the
+    ///    local prefix is again the hit that every group agrees on (V31 and
+    ///    V32 `mgr:360-364`, v0.33 `mgr:369-373`).
+    /// 4. Otherwise the local prefix is the full-attention hit, with a
+    ///    junction of 0, and each group keeps its own hit blocks (V31 and V32
+    ///    `mgr:366-369`, v0.33 `mgr:375-378`).
+    /// 5. The scheduler floors the local prefix to the scheduler block before
+    ///    it asks the connector (V31 `sched:941-952`, V32 `sched:971-982`,
+    ///    v0.33 `sched:1131-1142`). A load that reaches past the local prefix
+    ///    truncates the hit blocks of every group to the floor (V31
+    ///    `sched:974-985`, V32 `sched:1007-1018`, v0.33 `sched:1167-1178`).
+    ///    Otherwise the scheduler keeps the sub-block tail and loads nothing
+    ///    (V31 `sched:986-992`, V32 `sched:1019-1025`, v0.33
+    ///    `sched:1179-1185`). A Mamba list keeps `min(floor / B, len)` blocks
+    ///    (V31 `mgr:852-853`, V32 `mgr:826-827`, v0.33 `mgr:835-836`).
+    ///
+    /// This finder always floors, so the decode rank loads the sub-block tail
+    /// of a fine-grained hit again, also where vLLM keeps it. With a hash
+    /// block smaller than the scheduler block, vLLM keeps it when the first
+    /// `num_tokens - 1` tokens end on a hash block boundary and are all
+    /// cached, and loads nothing, while replay moves the full-attention
+    /// blocks above the floor and the fixed bytes. A nonzero junction keeps
+    /// its position.
+    ///
+    /// Only the full-attention groups get hit blocks to pin. On a decode rank
+    /// vLLM drops each group's hit blocks below its skipped tokens before it
+    /// touches them (V31 `single:295-316`, V32 `single:292-313`, v0.33
+    /// `single:293-314`). A Mamba group skips all but the last computed token
+    /// (V31 `single:1990-1995`, V32 `single:1954-1959`, v0.33
+    /// `single:1971-1976`), so vLLM never holds a lagging state hit block,
+    /// though its two admission tests count it. So each state group with an
+    /// own hit gets `GroupHitBlocks::DroppedState`, which the tests count and
+    /// `pin_hit` skips. A state hit above the floor gets none, as the
+    /// truncation cuts its cached block. A local prefix that reaches
+    /// `loaded_tokens` leaves every state group without a hit, as vLLM then
+    /// loads nothing (`nixl/pull_scheduler.py:59-65`) and replay still moves
+    /// the state. A window group keeps its hit blocks inside the window, where
+    /// this finder takes new blocks.
+    pub(crate) fn find_destination_hit(
+        &self,
+        pool: &GroupedBlockPool,
+        lease: &BlockRequestLease,
+        num_tokens: usize,
+        loaded_tokens: usize,
+    ) -> GroupedHit {
+        let rules = &self.rules;
+        if num_tokens == 0 {
+            return self.empty_hit();
+        }
+        let max = (num_tokens - 1) / rules.alignment * rules.alignment;
+        let full = rules
+            .specs
+            .iter()
+            .find(|spec| spec.kind == GroupRuleKind::FullAttention);
+        let mamba = rules
+            .groups
+            .iter()
+            .any(|rule| rule.kind == GroupRuleKind::State);
+        // Rules 2 to 4: the per-group path of a model with Mamba layers.
+        let local = full.filter(|_| mamba).and_then(|spec| {
+            let (ends, tokens) = self.full_attention_hit(pool, lease, spec, max);
+            let deeper = rules
+                .specs
+                .iter()
+                .any(|other| self.own_hit(pool, lease, other, max) > tokens);
+            (!deeper).then_some((spec, ends, tokens))
+        });
+        let mut hit = match local {
+            // The keys of every group of `spec`, the own hit of each state
+            // group and no junction.
+            Some((spec, ends, tokens)) => {
+                let mut hit = self.empty_hit();
+                for &g in &spec.groups {
+                    hit.per_group[g] = GroupHitBlocks::Attention(
+                        ends.iter()
+                            .map(|&end| grouped_key(g, lease.prefix_hash_at(end)))
+                            .collect(),
+                    );
+                }
+                for state in rules
+                    .specs
+                    .iter()
+                    .filter(|spec| spec.kind == GroupRuleKind::State)
+                {
+                    let own = self.own_hit(pool, lease, state, max);
+                    for &g in &state.groups {
+                        if let Some(key) = (own > 0)
+                            .then(|| grouped_key(g, lease.prefix_hash_at(own)))
+                            .flatten()
+                        {
+                            hit.per_group[g] = GroupHitBlocks::DroppedState { key, tokens: own };
+                        }
+                    }
+                }
+                hit.tokens = tokens;
+                hit
+            }
+            // Rules 1 and 3: the fixed point, with no hit block outside full
+            // attention. A state group keeps the agreed hit as its own.
+            None => {
+                let mut hit = self.find_longest_hit(pool, lease, num_tokens);
+                let tokens = hit.tokens;
+                for (blocks, rule) in hit.per_group.iter_mut().zip(&rules.groups) {
+                    if rule.kind != GroupRuleKind::FullAttention {
+                        *blocks = match *blocks {
+                            GroupHitBlocks::State(Some(key)) => {
+                                GroupHitBlocks::DroppedState { key, tokens }
+                            }
+                            _ => GroupHitBlocks::None,
+                        };
+                    }
+                }
+                hit
+            }
+        };
+        // Rule 5, floored to the scheduler block: the attention keys are
+        // full-attention keys here, and each group keeps the keys below the
+        // floor.
+        let floor = hit.tokens / rules.scheduler_block * rules.scheduler_block;
+        if hit.junction_tokens > 0 {
+            hit.junction_tokens += hit.tokens - floor;
+        }
+        hit.tokens = floor;
+        for (blocks, rule) in hit.per_group.iter_mut().zip(&rules.groups) {
+            if let GroupHitBlocks::Attention(keys) = blocks {
+                keys.truncate(floor / rule.block);
+            }
+        }
+        // The truncation keeps `min(floor / B, len)` blocks of a Mamba list,
+        // so a state hit above the floor loses its cached block. A local
+        // prefix that reaches the loaded tokens loads nothing in vLLM, while
+        // replay still moves the state.
+        let tokens = hit.tokens;
+        for (blocks, rule) in hit.per_group.iter_mut().zip(&rules.groups) {
+            if let GroupHitBlocks::DroppedState { tokens: own, .. } = *blocks
+                && (own.div_ceil(rule.block) > tokens / rule.block || tokens >= loaded_tokens)
+            {
+                *blocks = GroupHitBlocks::None;
+            }
+        }
+        hit
+    }
+
+    /// The hit of `spec` looked up alone at `max`, as vLLM's per-group lookup
+    /// finds it (V31 `coord:979-1011`, V32 `coord:933-977`).
+    fn own_hit(
+        &self,
+        pool: &GroupedBlockPool,
+        lease: &BlockRequestLease,
+        spec: &SpecGroup,
+        max: usize,
+    ) -> usize {
+        match spec.kind {
+            GroupRuleKind::FullAttention => self.full_attention_hit(pool, lease, spec, max).1,
+            GroupRuleKind::SlidingWindow { window } => {
+                self.window_hit(pool, lease, spec, window, max).0
+            }
+            GroupRuleKind::State => self.state.grouped_hit(
+                pool,
+                lease,
+                self.state.group(spec.groups[0]),
+                &spec.groups,
+                max,
+            ),
+            GroupRuleKind::Ring => 0,
+        }
+    }
+
     /// Whether every group of `spec` holds a block keyed at `tokens`, as
     /// vLLM's `get_cached_block` asks for a spec group (`pool:198-224`).
     fn spec_resident(
@@ -855,7 +1209,7 @@ impl GroupedPrefixCoordinator {
         lease.prefix_hash_at(tokens).is_some_and(|hash| {
             spec.groups
                 .iter()
-                .all(|&g| pool.key_hit(g as u16, hash).is_some())
+                .all(|&g| pool.key_hit(key_group(g), hash).is_some())
         })
     }
 
@@ -944,6 +1298,24 @@ impl GroupedPrefixCoordinator {
             })
     }
 
+    /// The tokens of the hit blocks that `hit` keeps in every full-attention
+    /// group. A group that is not prefix-cacheable keeps none, so the count
+    /// is 0 with such a group, even when a state hit gives `hit.tokens`. It
+    /// is also 0 without a full-attention group.
+    pub(crate) fn kept_full_attention_tokens(&self, hit: &GroupedHit) -> usize {
+        self.rules
+            .groups
+            .iter()
+            .zip(&hit.per_group)
+            .filter(|(rule, _)| rule.kind == GroupRuleKind::FullAttention)
+            .map(|(rule, blocks)| match blocks {
+                GroupHitBlocks::Attention(keys) => keys.iter().flatten().count() * rule.block,
+                _ => 0,
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
     /// The blocks a new request needs for the whole prompt, counting inactive
     /// hit blocks again (`single:216-268`, `single:1716-1816`, `mgr:519-536`).
     /// This is vLLM's whole-prompt test of a waiting request (v0.32
@@ -956,7 +1328,74 @@ impl GroupedPrefixCoordinator {
         hit: &GroupedHit,
         prompt_tokens: usize,
     ) -> usize {
-        self.blocks_to_allocate(pool, hit, prompt_tokens, prompt_tokens, true)
+        self.blocks_to_allocate(pool, hit, hit.tokens, prompt_tokens, prompt_tokens, true)
+    }
+
+    /// `admission_blocks` of a decode rank that loads a P/D handoff on top of
+    /// the local `hit`: the loaded tokens count as computed too, as the
+    /// `total_computed_tokens` of vLLM's whole-prompt check (`mgr:519-536`).
+    /// A state group counts its own hit, which the decode rank then drops
+    /// without holding it (`GroupHitBlocks::DroppedState`).
+    pub(crate) fn destination_admission_blocks(
+        &self,
+        pool: &GroupedBlockPool,
+        hit: &GroupedHit,
+        loaded_tokens: usize,
+        prompt_tokens: usize,
+    ) -> usize {
+        self.blocks_to_allocate(pool, hit, loaded_tokens, prompt_tokens, prompt_tokens, true)
+    }
+
+    /// The blocks of vLLM's second test in `allocate_slots` for the tokens of
+    /// a P/D handoff on top of the local `hit`, for an async load with no new
+    /// tokens (`mgr:558-576`, `sched:1064-1067`). A state group counts its
+    /// own hit here too, though the decode rank never holds it
+    /// (`GroupHitBlocks::DroppedState`). So the count can exceed the blocks
+    /// that the load takes.
+    pub(crate) fn destination_load_blocks(
+        &self,
+        pool: &GroupedBlockPool,
+        hit: &GroupedHit,
+        loaded_tokens: usize,
+        prompt_tokens: usize,
+    ) -> usize {
+        self.blocks_to_allocate(
+            pool,
+            hit,
+            loaded_tokens,
+            loaded_tokens,
+            prompt_tokens,
+            false,
+        )
+    }
+
+    /// The extra first-pass blocks for states that activation will publish
+    /// inside their fresh running blocks. Other retained state positions are
+    /// block-aligned and cannot add a producer copy. Count without publishing
+    /// keys or copying the lease, so reservation remains atomic.
+    pub(crate) fn destination_state_copy_blocks(
+        &self,
+        request: &BlockRequestLease,
+        prompt: usize,
+        loaded_tokens: usize,
+    ) -> usize {
+        // Keep the modeled one-token load behavior: it transfers the whole
+        // prompt and only counts the copy once activation publishes it.
+        if loaded_tokens >= prompt || request.prefix_hash_at(loaded_tokens).is_none() {
+            return 0;
+        }
+        self.rules
+            .groups
+            .iter()
+            .filter(|rule| {
+                rule.cacheable
+                    && rule.kind == GroupRuleKind::State
+                    && self
+                        .rules
+                        .align_rules()
+                        .retains_partial(prompt, loaded_tokens, rule.block)
+            })
+            .count()
     }
 
     /// The blocks that the first allocation of a request takes for its tokens
@@ -970,16 +1409,19 @@ impl GroupedPrefixCoordinator {
         prefill_end: usize,
         target: usize,
     ) -> usize {
-        self.blocks_to_allocate(pool, hit, target, prefill_end, false)
+        self.blocks_to_allocate(pool, hit, hit.tokens, target, prefill_end, false)
     }
 
     /// vLLM's `get_num_blocks_to_allocate` for the first `tokens` tokens of a
-    /// request without blocks. Only a chunk that reaches the prefill end
-    /// `prefill_end` takes a checkpoint block (v0.32 `single:1643-1674`).
+    /// request without blocks. `computed` is its `total_computed_tokens`: the
+    /// hit, and on a decode rank the loaded tokens. Only a chunk that reaches
+    /// the prefill end `prefill_end` takes a checkpoint block (v0.32
+    /// `single:1643-1674`).
     fn blocks_to_allocate(
         &self,
         pool: &GroupedBlockPool,
         hit: &GroupedHit,
+        computed: usize,
         tokens: usize,
         prefill_end: usize,
         admission_cap: bool,
@@ -1014,7 +1456,7 @@ impl GroupedPrefixCoordinator {
                                 self.limits.max_model_len,
                             ));
                         }
-                        skipped_blocks = hit.tokens.saturating_sub(window - 1) / block;
+                        skipped_blocks = computed.saturating_sub(window - 1) / block;
                     }
                     let new = required.saturating_sub(skipped_blocks.max(keys.len()));
                     let inactive = keys[skipped_blocks.min(keys.len())..]
@@ -1028,14 +1470,18 @@ impl GroupedPrefixCoordinator {
                     new + inactive + copy
                 }
                 GroupRuleKind::State => {
-                    let key = match hit.per_group[g] {
-                        GroupHitBlocks::State(key) => key,
-                        _ => None,
+                    // The group's own hit: the hit itself, or on a decode rank
+                    // the hit that the load drops.
+                    let (key, own) = match hit.per_group[g] {
+                        GroupHitBlocks::State(key) => (key, hit.tokens),
+                        GroupHitBlocks::DroppedState { key, tokens: own } => (Some(key), own),
+                        _ => (None, 0),
                     };
                     self.state.group(g).first_allocation_blocks(
                         &pool.pool,
-                        key,
+                        key.map(|key| (key, own)),
                         hit.tokens,
+                        computed,
                         tokens,
                         prefill_end,
                     )
@@ -1061,7 +1507,8 @@ impl GroupedPrefixCoordinator {
             .flat_map(|blocks| match blocks {
                 GroupHitBlocks::Attention(keys) => keys.iter().flatten().copied().collect(),
                 GroupHitBlocks::State(key) => key.iter().copied().collect(),
-                GroupHitBlocks::None => Vec::new(),
+                // A decode rank drops this block without holding it.
+                GroupHitBlocks::DroppedState { .. } | GroupHitBlocks::None => Vec::new(),
             })
             .collect();
         if keys.is_empty() {
@@ -1121,7 +1568,15 @@ impl GroupedPrefixCoordinator {
     /// references until the end of `schedule()` (v0.31 `single:307`,
     /// `:387-397`, `:454-474`, `:1935-1937`, v0.32 `single:304`, `:387-397`,
     /// `:454-474`, `:1899-1901`, v0.33 `single:305`, `:388-398`, `:455-475`,
-    /// `:1916-1918`).
+    /// `:1916-1918`). So does the running block of a state group that the
+    /// request published a state in and now writes past without a crossing:
+    /// the request takes a fresh running block, and the published block is
+    /// the copy of that pass. `processed` is vLLM's processed token count,
+    /// `computed - num_in_flight_tokens`, on which the held state blocks and
+    /// the window blocks go (v0.31 `mgr:549-556`, v0.32 `mgr:552-559`, v0.33
+    /// `mgr:561-568`). An aggregate worker supplies its scheduler step for
+    /// state retention. P/D workers retire state on the processed count.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn allocate(
         &mut self,
         pool: &mut GroupedBlockPool,
@@ -1129,71 +1584,24 @@ impl GroupedPrefixCoordinator {
         prefill_end: usize,
         computed_before: usize,
         target: usize,
-        step: u64,
+        processed: usize,
+        aggregate_step: Option<u64>,
     ) -> bool {
-        let rules = &self.rules;
-        let first = !lease.allocated;
         // The blocks can change here, so the step's `finalize` has to run.
         lease.quiet_until = 0;
-        let mut fresh = 0;
-        let releases = &mut self.releases;
-        releases.clear();
-        // Per group: new blocks, a copy block to take, and for states the
-        // running block, the copy block and the checkpoint position.
-        let plan = &mut self.plan;
-        plan.clear();
-        for (g, rule) in rules.groups.iter().enumerate() {
-            let block = rule.block;
-            let item = match (rule.kind, &mut lease.groups[g]) {
-                (
-                    GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. },
-                    GroupLease::Attention {
-                        copies, first_live, ..
-                    },
-                ) => {
-                    if let GroupRuleKind::SlidingWindow { window } = rule.kind {
-                        let skipped =
-                            (computed_before.saturating_sub(window - 1) / block).min(copies.len());
-                        // Tail first, as `_remove_blocks_in_range` frees the
-                        // range (v0.31 `single:660-685`, v0.32 `:645-670`).
-                        for copy in copies[*first_live..skipped.max(*first_live)]
-                            .iter_mut()
-                            .rev()
-                        {
-                            releases.extend(copy.take());
-                        }
-                        *first_live = (*first_live).max(skipped);
-                    }
-                    let new = target.div_ceil(block).saturating_sub(copies.len());
-                    let copy = first
-                        && !computed_before.is_multiple_of(block)
-                        && copies.len() == computed_before.div_ceil(block)
-                        && copies.last().is_some_and(Option::is_some);
-                    fresh += new + usize::from(copy);
-                    Plan::Attention { new, copy }
-                }
-                (GroupRuleKind::State, GroupLease::State(state)) => {
-                    let group = self.state.group(g);
-                    group.release_before_allocation(state, first, computed_before, step, releases);
-                    let state_plan = group.plan(state, first, computed_before, target, prefill_end);
-                    fresh += state_plan.fresh_states();
-                    Plan::State(state_plan)
-                }
-                (GroupRuleKind::Ring, GroupLease::Ring { copy }) => {
-                    fresh += usize::from(copy.is_none());
-                    Plan::Ring {
-                        take: copy.is_none(),
-                    }
-                }
-                (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
-            };
-            plan.push(item);
-        }
-        pool.release_all(releases.drain(..));
+        let fresh = self.plan_allocation(
+            lease,
+            prefill_end,
+            computed_before,
+            target,
+            processed,
+            aggregate_step,
+        );
+        pool.release_all(self.releases.drain(..));
         let Some(mut reservation) = pool.reserve(&[], fresh) else {
             return false;
         };
-        for (g, (item, group)) in plan.drain(..).zip(lease.groups.iter_mut()).enumerate() {
+        for (g, (item, group)) in self.plan.drain(..).zip(lease.groups.iter_mut()).enumerate() {
             match (item, group) {
                 (Plan::Attention { new, copy }, GroupLease::Attention { copies, .. }) => {
                     if copy {
@@ -1207,8 +1615,15 @@ impl GroupedPrefixCoordinator {
                     copies.extend((0..new).map(|_| Some(pool.take_private(&mut reservation))));
                 }
                 (Plan::State(plan), GroupLease::State(state)) => {
-                    self.state
-                        .apply_group(&mut pool.pool, g, state, plan, step, &mut reservation);
+                    self.state.apply_group(
+                        &mut pool.pool,
+                        self.state.group(g),
+                        state,
+                        plan,
+                        computed_before,
+                        aggregate_step,
+                        &mut reservation,
+                    );
                 }
                 (Plan::Ring { take }, GroupLease::Ring { copy }) => {
                     if take {
@@ -1223,9 +1638,181 @@ impl GroupedPrefixCoordinator {
         true
     }
 
-    /// Publish the blocks that `computed_after` completes and apply the
-    /// default retention (`single:476-560`, `single:864-880`,
-    /// `single:1614-1622`, `single:1658-1675`, v0.32 `single:2017-2066`).
+    /// The plan of `allocate`: what each group takes into `plan`, the blocks
+    /// that vLLM frees before it allocates into `releases`, and the fresh
+    /// blocks in all as the result. The plan changes the lease but not the
+    /// pool.
+    fn plan_allocation(
+        &mut self,
+        lease: &mut GroupedBlockLease,
+        prefill_end: usize,
+        computed_before: usize,
+        target: usize,
+        processed: usize,
+        aggregate_step: Option<u64>,
+    ) -> usize {
+        let first = !lease.allocated;
+        let mut fresh = 0;
+        let releases = &mut self.releases;
+        releases.clear();
+        // Per group: new blocks, a copy block to take, and for states the
+        // running block, the copy block and the checkpoint position.
+        self.plan.clear();
+        for (g, rule) in self.rules.groups.iter().enumerate() {
+            let block = rule.block;
+            let item = match (rule.kind, &mut lease.groups[g]) {
+                (
+                    GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. },
+                    GroupLease::Attention {
+                        copies, first_live, ..
+                    },
+                ) => {
+                    if let GroupRuleKind::SlidingWindow { window } = rule.kind {
+                        // vLLM retires the blocks below the window of the
+                        // processed count (v0.31 `mgr:549-556`, v0.32
+                        // `mgr:552-559`, v0.33 `mgr:561-568`): a step in
+                        // flight still reads the window of its own start
+                        // (v0.33 `single:1148-1183`). vLLM also keeps
+                        // `extra_retained_tokens` tokens below the window.
+                        // That count is above 0 only with multi-module
+                        // speculative decoding, which a rank with cache
+                        // groups refuses, so it is 0 here.
+                        let skipped = processed.saturating_sub(window - 1) / block;
+                        // Tail first, as `_remove_blocks_in_range` frees the
+                        // range (v0.31 `single:660-685`, v0.32 `:645-670`).
+                        let held = skipped.min(copies.len());
+                        for copy in copies[*first_live..held.max(*first_live)].iter_mut().rev() {
+                            releases.extend(copy.take());
+                        }
+                        // A request that computed its tokens elsewhere, as a
+                        // P/D destination did, holds null blocks below the
+                        // window (v0.31 `single:314`, v0.32 `:311`).
+                        if copies.len() < skipped {
+                            copies.resize(skipped, None);
+                        }
+                        *first_live = (*first_live).max(skipped);
+                    }
+                    let new = target.div_ceil(block).saturating_sub(copies.len());
+                    let copy = first
+                        && !computed_before.is_multiple_of(block)
+                        && copies.len() == computed_before.div_ceil(block)
+                        && copies.last().is_some_and(Option::is_some);
+                    fresh += new + usize::from(copy);
+                    Plan::Attention { new, copy }
+                }
+                (GroupRuleKind::State, GroupLease::State(state)) => {
+                    let group = self.state.group(g);
+                    group.release_before_allocation(
+                        state,
+                        first,
+                        computed_before,
+                        processed,
+                        aggregate_step,
+                        releases,
+                    );
+                    let state_plan = group.plan(state, first, computed_before, target, prefill_end);
+                    fresh += state_plan.fresh_states();
+                    Plan::State(state_plan)
+                }
+                (GroupRuleKind::Ring, GroupLease::Ring { copy }) => {
+                    fresh += usize::from(copy.is_none());
+                    Plan::Ring {
+                        take: copy.is_none(),
+                    }
+                }
+                (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
+            };
+            self.plan.push(item);
+        }
+        fresh
+    }
+
+    /// vLLM's `_request_remaining_blocks`: the blocks that a request with
+    /// `lease` still needs to hold its `tokens` tokens after `computed` tokens
+    /// (V31 `sched:3003-3017`, V32 `sched:3060-3076`). When vLLM admits an
+    /// async load, it keeps the sum over its prefills in flight free (V31
+    /// `sched:1194-1204`, `:3032-3036`, `mgr:570-576`, V32 `sched:1241-1251`,
+    /// `:3088-3092`, `mgr:573-579`). vLLM counts at most `max_model_len`
+    /// tokens, and no replay request has more. Grouped replay has no
+    /// speculative tokens, so the speculative terms are 0 (V31 `sched:3017`,
+    /// V32 `sched:3064-3065`). Per group, with `len` the blocks that the
+    /// request holds, null blocks included:
+    ///
+    /// - Full attention: `max(cdiv(tokens, B) - len, 0)` (V31
+    ///   `single:232-238`, V32 `single:229-235`).
+    /// - Sliding window: the same, with `cdiv(tokens, B)` capped at the
+    ///   admission blocks (V31 `single:216-229`, V32 `single:213-226`).
+    /// - State: `len` is `cdiv(computed, B)`. With `n = cdiv(tokens, B) -
+    ///   len`, the count is 0 for `n = 0`, 1 for `n = 1`, and 1 plus a valid
+    ///   checkpoint block for `n >= 2` (V31 `single:1762-1811`, V32
+    ///   `single:1724-1773`). `prompt` is the prefill end, which the query
+    ///   must reach for a checkpoint (V32 `single:1643-1674`). vLLM adds one
+    ///   block while a partial state block waits for its copy (V31
+    ///   `single:1770-1777`, V32 `single:1732-1739`). After the first
+    ///   allocation, such a block is by default a state cached at the
+    ///   prompt's partial tail, with a hash block below the state block (V31
+    ///   `single:2094-2138`, V32 `single:2067-2103`). Replay takes that copy
+    ///   at the request's next allocation, so this count adds one block while
+    ///   the lease holds the key of a state published inside its running
+    ///   block.
+    /// - Ring: 0 while the request holds its block, else 1 (V31
+    ///   `single:1214-1225`, V32 `single:1190-1201`).
+    pub(crate) fn remaining_blocks(
+        &self,
+        lease: &GroupedBlockLease,
+        prompt: usize,
+        computed: usize,
+        tokens: usize,
+    ) -> usize {
+        let rules = &self.rules;
+        rules
+            .groups
+            .iter()
+            .zip(&lease.groups)
+            .enumerate()
+            .map(|(rule_index, (rule, group))| {
+                let block = rule.block;
+                match (rule.kind, group) {
+                    (
+                        GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. },
+                        GroupLease::Attention { copies, .. },
+                    ) => {
+                        let mut required = tokens.div_ceil(block);
+                        if let GroupRuleKind::SlidingWindow { window } = rule.kind {
+                            required = required.min(window_admission_blocks(
+                                window,
+                                block,
+                                self.limits.max_in_flight_tokens,
+                                self.limits.max_model_len,
+                            ));
+                        }
+                        required.saturating_sub(copies.len())
+                    }
+                    (GroupRuleKind::State, GroupLease::State(state)) => self
+                        .state
+                        .group(rule_index)
+                        .remaining_blocks(state, computed, tokens, prompt),
+                    (GroupRuleKind::Ring, GroupLease::Ring { copy }) => usize::from(copy.is_none()),
+                    (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
+                }
+            })
+            .sum()
+    }
+
+    /// Run the cache step of `computed_after` computed tokens: publish the
+    /// blocks that vLLM caches at that count and apply the default retention
+    /// (`single:476-560`, `single:864-880`, `single:1614-1622`,
+    /// `single:1658-1675`, v0.32 `single:2017-2066`). With two batches vLLM
+    /// caches a block that a sampled token fills one step later: in the
+    /// request's next `allocate_slots` call if that call succeeds (v0.31
+    /// `mgr:574-576` and `mgr:608-612`, v0.32 `mgr:577-579` and
+    /// `mgr:612-616`, v0.33 `mgr:586-588` and `mgr:621-625`), or when vLLM
+    /// processes the outputs of the filling step, if the request runs at that
+    /// time (v0.31 and v0.32 `async_scheduler.py:73-77`, v0.33
+    /// `sched:2407-2415`, where vLLM also skips the outputs of a step that
+    /// was in flight when it preempted the request). Replay publishes that
+    /// block in the pass that fills it, and keeps it for a request that is
+    /// preempted in the next pass, where vLLM frees it without its key.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize(
         &mut self,
@@ -1235,7 +1822,7 @@ impl GroupedPrefixCoordinator {
         prompt: usize,
         computed_after: usize,
         hit: &GroupedHit,
-        step: u64,
+        aggregate_step: Option<u64>,
     ) {
         let rules = &self.rules;
         let junction = (hit.junction_tokens > 0).then_some(hit.tokens + hit.junction_tokens);
@@ -1253,32 +1840,70 @@ impl GroupedPrefixCoordinator {
                         copies, finalized, ..
                     },
                 ) => {
-                    // Only the blocks that this step completes, as
-                    // `num_cached_block` limits vLLM (`single:500-533`).
-                    // Earlier ones are cached, or have no key.
-                    let full = (computed_after / block).min(copies.len());
+                    // With several cache groups vLLM caches the computed
+                    // tokens only up to the last multiple of the scheduler
+                    // block, unless hits land inside a block (v0.31.0
+                    // `coord:796-806`, `:808-840`, v0.32.0 `coord:767-794`,
+                    // v0.33.0 `coord:777-804`). The hit alignment is the
+                    // scheduler block, or with hits inside a block the hash
+                    // block, which divides the block of every
+                    // prefix-cacheable group and the partial tail, so
+                    // rounding to it changes nothing there. One cache
+                    // group has vLLM's coordinator of one group, which
+                    // caches the computed tokens as they are (v0.31.0
+                    // `coord:340-364`, `:1043-1044`, v0.32.0 `coord:346-377`,
+                    // `:1009-1010`, v0.33.0 `coord:350-381`, `:1021-1022`).
+                    let cacheable = if rules.groups.len() > 1 {
+                        computed_after / rules.alignment * rules.alignment
+                    } else {
+                        computed_after
+                    };
+                    // Only the blocks that the cached count covers for the
+                    // first time, as `num_cached_block` limits vLLM
+                    // (`single:500-533`). Earlier ones are cached, or have
+                    // no key.
+                    let full = (cacheable / block).min(copies.len());
                     for (i, copy) in copies.iter().enumerate().take(full).skip(*finalized) {
                         if let Some(id) = copy
-                            && pool.is_private(*id)
                             && let Some(key) = key_at((i + 1) * block)
                         {
-                            pool.cache(*id, key);
+                            if pool.is_private(*id) {
+                                pool.cache(*id, key);
+                            } else {
+                                // A cached block that the step completes
+                                // holds the key of the prompt's partial tail,
+                                // and vLLM gives it its full key too (v0.31.0
+                                // `vllm/v1/core/block_pool.py:286-299`,
+                                // v0.32.0 `:286-299`, v0.33.0 `:290-303`). For
+                                // a hit block, which holds this key, the call
+                                // changes nothing.
+                                pool.cache_alias(*id, key, None);
+                            }
                         }
                     }
                     *finalized = (*finalized).max(full);
                     // The prompt's partial-tail entry, so that a later prompt
                     // can hit up to the tail, inside the last block
-                    // (`single:864-880`, v0.32 `single:860-868`).
+                    // (`single:864-880`, v0.32 `single:860-868`, v0.33
+                    // `single:870-881`). vLLM adds it at every cache step,
+                    // also to a block that has its full key (v0.31.0
+                    // `single:845-892`, `vllm/v1/core/block_pool.py:505-526`,
+                    // `:629-649`, v0.32.0 `single:830-884`,
+                    // `block_pool.py:502-523`, `:626-646`, v0.33.0
+                    // `single:840-897`, `block_pool.py:539-560`, `:666-686`).
                     let tail = rules.align_rules().partial_tail(prompt);
                     if rules.hash_block < block
                         && tail > 0
                         && !tail.is_multiple_of(block)
-                        && tail <= computed_after
+                        && tail <= cacheable
                         && let Some(Some(id)) = copies.get(tail / block)
-                        && pool.is_private(*id)
                         && let Some(key) = key_at(tail)
                     {
-                        pool.cache_at(*id, key, in_block(tail));
+                        if pool.is_private(*id) {
+                            pool.cache_at(*id, key, in_block(tail));
+                        } else {
+                            pool.cache_alias(*id, key, in_block(tail));
+                        }
                     }
                 }
                 (
@@ -1321,7 +1946,7 @@ impl GroupedPrefixCoordinator {
                         prompt,
                         computed_after,
                         junction,
-                        step,
+                        aggregate_step,
                         |pos| key_at(pos).map(|key| (key, in_block(pos))),
                     );
                 }

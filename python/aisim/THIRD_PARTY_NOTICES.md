@@ -658,6 +658,13 @@ its step. Its align module adapts the prefill split and retention boundaries,
 including the checkpoint branch of v0.32.0 and the checkpoint position and
 validity tests in `kv_cache_interface.py`. The grouped coordinator adapts the
 admission cap of a sliding-window group from that same interface.
+From `kv_cache_manager.py`, `kv_cache_coordinator.py` and `sched/scheduler.py`,
+the grouped coordinator also adapts the local prefix that a decode rank takes for a KV load: the
+full-attention hit of a model with Mamba layers unless another group hits
+deeper, and otherwise the hit that every group agrees on.
+From `single_type_kv_cache_manager.py`, the state cache manager also adapts the count of a state
+group's own hit in both admission tests of a KV load. The decode rank then
+drops that hit block without holding it.
 From `block_pool.py`, it adapts the lookup of one spec group and the free order
 of cached blocks. From `kv_cache_utils.py`, it adapts the rule that the hash
 block divides the block of every prefix-cacheable group. From `engine/core.py`,
@@ -665,11 +672,20 @@ it adapts the block of the align split, which is the smallest block of the
 prefix-cacheable groups. From `config/vllm.py`, it adapts the bound on in-flight
 tokens that the admission cap uses. The test module ports cases from the
 upstream tests listed below.
-From v0.31.0 and v0.32.0, `crates/core/src/engine/kv_manager/vllm_backend.rs`
+From `block_pool.py` of v0.31.0, v0.32.0 and v0.33.0,
+`crates/core/src/engine/cache/vllm_block_pool.rs` adapts the later keys that one
+cached block of a grouped pool holds beside its first key, and their removal
+with the block when it is evicted. With the full-attention manager of
+`single_type_kv_cache_manager.py`, which registers the prompt's tail entry
+again in the cache step that gives a block its full key, it adapts the order
+of the blocks of a key: such a block becomes the last block of its tail key.
+From v0.31.0, v0.32.0 and v0.33.0, `crates/core/src/engine/kv_manager/vllm_backend.rs`
 adapts, from `kv_cache_manager.py`, the whole-prompt admission cost of
 `allocate_slots`, its test of the first chunk before the hit blocks are
 pinned and the prefill end of a request that resumes after a preemption, and
-`grouped_prefix.rs` counts the blocks of that first chunk.
+`grouped_prefix.rs` counts the blocks of that first chunk. From `request.py`,
+`vllm_backend.rs` adapts the block hashes that each output token of a request
+extends.
 `crates/core/src/engine/scheduler/vllm/policy.rs` adapts the whole-prompt test
 of `allocate_slots` and, from `sched/scheduler.py`, the token budget of a prompt
 without chunked prefill and the stop of the waiting loop at a request that does
@@ -683,7 +699,13 @@ tests of these rules.
 check of `kv_cache_utils.py` that the pool holds one request of `max_model_len`
 tokens, with the size of each group from `kv_cache_interface.py`, summed per
 group.
-In v0.33.0 that check is in `kv_cache_planning.py`. `config.rs` also refuses
+In v0.33.0 that check is in `kv_cache_planning.py`.
+`crates/core/src/perfmodel/fpm/resources.rs` adapts, from
+`kv_cache_interface.py`, the startup size of a `MambaSpec` in align mode and the
+startup size of a `SlidingWindowSpec`, which is its admission cap, and, from
+`config/vllm.py`, the bound on in-flight tokens that the cap uses, with two
+concurrent batches, for the peak cache bound of planning.
+`config.rs` also refuses
 `prefill_schedule_interval` above 1 on the v0.33.0 row, because
 `sched/scheduler.py` of v0.33.0 applies that interval without data parallelism
 and the simulation does not.
@@ -691,7 +713,16 @@ From `sched/scheduler.py` and `kv_cache_interface.py`, `grouped_prefix.rs` also
 adapts the rule that only a rank with a Mamba layer in align mode splits its
 prefill.
 `crates/core/src/engine/scheduler/vllm/core.rs` and `vllm_backend.rs` adapt the
-release of the skipped blocks of a completed source.
+release of the skipped blocks of an ending request on a prefill or decode rank,
+before the release of its other blocks.
+`vllm_backend.rs` also adapts the two admission tests of an async KV load and
+the reservation of the blocks that the loads in flight still need, which
+`grouped_prefix.rs` counts by `_request_remaining_blocks` of
+`sched/scheduler.py` with the admission cap of a sliding-window group.
+`core.rs` also adapts the set of prefills in flight of `sched/scheduler.py`,
+so that a decode rank keeps free what its local prefills still need. `core.rs`
+also adapts the queue order that serves the requests that hold KV blocks first.
+`crates/core/tests/runtime_contract.rs` holds replay tests of these rules.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_coordinator.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
@@ -702,6 +733,7 @@ release of the skipped blocks of a completed source.
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/block_pool.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/core.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/vllm.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/request.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_coordinator.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
@@ -712,6 +744,7 @@ release of the skipped blocks of a completed source.
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/request.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/test_mamba_align_chunk_split.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_coordinator.py
@@ -724,6 +757,7 @@ release of the skipped blocks of a completed source.
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/vllm.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/request.py
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
@@ -740,14 +774,15 @@ file is vendored.
 The repository-root file `crates/core/src/engine/kv_manager/grouped_transfer.rs`
 adapts the P/D transfer rules of vLLM's NIXL connector and KV cache manager
 from vLLM v0.31.0, immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`,
-and from vLLM v0.32.0, immutable commit
-`5df63a7203cdb9328d824a27b682e77c7b9928be`: the block clip of each cache
+from vLLM v0.32.0, immutable commit
+`5df63a7203cdb9328d824a27b682e77c7b9928be`, and from vLLM v0.33.0, immutable
+commit `4ba787ec9959e566d3b587a796dff07673324da5`: the block clip of each cache
 group, the whole-block reads of a full-attention group, the in-window block
 count of a decode rank for a sliding-window group, the prefill backoff and
 truncation, the blocks that a decode rank pulls, the state pairing and the
-copy on each TP rank. The rules count the same blocks in both versions and
-take the bytes that the connector reads for one block of each group from the
-profile, so one set of rules covers both.
+copy on each TP rank. The rules count the same blocks in the three versions
+and take the bytes that the connector reads for one block of each group from
+the profile, so one set of rules covers them.
 `crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
 tests of these rules.
 
@@ -766,10 +801,19 @@ tests of these rules.
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/utils.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
 https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
 
 This is a modified Rust simulation adaptation, restricted to no speculative
 decoding, no HiSparse, no bounded replay window and no `all` Mamba cache mode.

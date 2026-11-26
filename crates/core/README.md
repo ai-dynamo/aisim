@@ -62,8 +62,14 @@ The replay engine models vLLM's attention-DP prefill cadence through
 
 `EngineConfig::async_scheduling` models vLLM's async-scheduling batch queue,
 which delays requests that arrive at a busy engine. It also frees a finished
-request's blocks for the pass after next and, with a CPU tier, does not preempt
-a request that the pass in flight runs; see
+request's blocks for the pass after next. On an aggregated rank with cache
+groups it frees the blocks that a running request no longer needs one pass
+later, on vLLM's processed token count, except, with prefix caching on,
+in the layouts that the known differences of
+[KV cache](../../docs/replay/engine/kv-cache.md#other-cache-modes) name. A
+prefill or decode rank with cache groups frees them one pass later in every
+layout. With a CPU tier, or on a prefill or decode rank with cache groups,
+it does not preempt a request that the pass in flight runs; see
 [vLLM async scheduling](../../docs/replay/engine/workers.md#vllm-async-scheduling).
 `EngineConfig::launch` adds the engine loop's launch costs. A rank then holds
 each pass's outputs until the driver releases them through

@@ -106,6 +106,12 @@ cells = ["limited", "not_supported", "not_supported"]
 note = "Kimi K3 and DeepSeek V4 state in G1, aggregated and P/D; prefix reuse resumes from state snapshots. G2 keeps states too: a recurrent state on a local pool that follows a vLLM 0.32 connector, a sliding-window state (DeepSeek V4) under either offloading connector, with vLLM 0.32's rules on a local pool. No G3 or recommend."
 
 [[sections.rows]]
+name = "Grouped FPM cache"
+doc = "replay/engine/kv-cache.md#other-cache-modes"
+cells = ["limited", "not_supported", "not_supported"]
+note = "Aggregated or P/D, HBM only, PP1/CP1, no speculation. P/D supports vLLM 0.31.0, 0.32.0 and 0.33.0 with equal TP, identical groups and per-group connector bytes."
+
+[[sections.rows]]
 name = "Frontend tokenization cost"
 doc = "replay/engine/README.md#request-tokenization"
 cells = ["supported", "supported", "supported"]

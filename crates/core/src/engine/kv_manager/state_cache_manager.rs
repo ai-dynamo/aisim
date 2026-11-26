@@ -79,9 +79,15 @@ impl StateSlots for Vec<BlockCopyId> {
 pub(super) struct StateLease<S> {
     pub(super) working: S,
     pub(super) working_cached: bool,
-    pub(super) previous: S,
-    pub(super) previous_step: u64,
+    pub(super) previous: Vec<(BlockCopyId, PreviousRelease)>,
     pub(super) checkpoint: S,
+}
+
+/// The last scheduler step or processed token position that still reads the block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreviousRelease {
+    AfterStep(u64),
+    Above(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,13 +142,13 @@ impl<S: StateSlots> StateLease<S> {
         pool: &mut VllmBlockPool,
         reservation: &mut BlockReservation,
         width: usize,
-        step: u64,
+        until: Option<PreviousRelease>,
     ) {
-        if !self.working.blocks().is_empty() {
-            for id in self.working.drain_blocks() {
-                self.previous.push_block(id);
-            }
-            self.previous_step = step;
+        if let Some(until) = until {
+            self.previous
+                .extend(self.working.drain_blocks().map(|id| (id, until)));
+        } else {
+            debug_assert!(self.working.blocks().is_empty());
         }
         for _ in 0..width {
             self.working.push_block(pool.allocate_private(reservation));
@@ -164,14 +170,18 @@ impl<S: StateSlots> StateLease<S> {
     }
 
     fn hold_previous(&mut self, id: BlockCopyId, step: u64) {
-        self.previous.push_block(id);
-        self.previous_step = step;
+        self.previous.push((id, PreviousRelease::AfterStep(step)));
     }
 
     fn release_previous(&mut self, step: u64, mut release: impl FnMut(BlockCopyId)) {
-        if self.previous_step < step {
-            self.previous.drain_blocks().for_each(&mut release);
-        }
+        self.previous.retain(|&(id, until)| {
+            if matches!(until, PreviousRelease::AfterStep(held) if held < step) {
+                release(id);
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -536,9 +546,12 @@ impl StateCacheManager {
         target: usize,
     ) {
         debug_assert!(state.blocks.working.is_empty());
-        state
-            .blocks
-            .rotate(pool, reservation, self.blocks_per_state, self.step);
+        state.blocks.rotate(
+            pool,
+            reservation,
+            self.blocks_per_state,
+            Some(PreviousRelease::AfterStep(self.step)),
+        );
         state
             .speculative
             .extend((0..self.speculative_blocks).map(|_| pool.allocate_private(reservation)));
@@ -597,11 +610,12 @@ impl StateCacheManager {
     /// Sources from this pass cannot be reclaimed to satisfy sampled-token
     /// headroom. Earlier previous-state refs are released by the next allocation.
     pub(crate) fn current_source_blocks(&self, state: &StateRequest) -> usize {
-        let previous = if state.blocks.previous_step == self.step {
-            state.blocks.previous.len()
-        } else {
-            0
-        };
+        let previous = state
+            .blocks
+            .previous
+            .iter()
+            .filter(|(_, until)| *until == PreviousRelease::AfterStep(self.step))
+            .count();
         let copies = if state.copy_step == self.step {
             state.copy_holds.len()
         } else {
@@ -753,9 +767,12 @@ impl StateCacheManager {
             StateWrite::Keep => {}
             StateWrite::Start => self.start(pool, state, reservation, computed, target),
             StateWrite::Rotate => {
-                state
-                    .blocks
-                    .rotate(pool, reservation, self.blocks_per_state, self.step);
+                state.blocks.rotate(
+                    pool,
+                    reservation,
+                    self.blocks_per_state,
+                    Some(PreviousRelease::AfterStep(self.step)),
+                );
                 state.working_slot = self.working_slot(target);
             }
             StateWrite::Preserve => self.preserve_working(pool, state, reservation),
@@ -870,7 +887,7 @@ impl StateCacheManager {
     }
 
     pub(crate) fn release(&mut self, pool: &mut VllmBlockPool, state: &mut StateRequest) {
-        for id in state.blocks.previous.drain(..) {
+        for (id, _) in state.blocks.previous.drain(..) {
             pool.release(id);
         }
         if state.copy_step == self.step {

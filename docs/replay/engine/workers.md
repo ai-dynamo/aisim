@@ -326,9 +326,13 @@ keeps decode steps balanced across DP ranks. It has an effect only when
 data parallelism, and it gives a dense DP rank its own cadence; see vLLM
 v0.33.0 [`scheduler.py:396-425`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L396-L425)
 and [`:780-791`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py#L780-L791).
-Replay does not model that. A grouped FPM cache with prefix caching on vLLM
-0.33.0 refuses an interval above 1. Where replay accepts the interval, it
-applies it only for `attention_data` above 1.
+Replay does not model that. A grouped FPM cache on vLLM 0.33.0 refuses an
+interval above 1 with prefix caching. A grouped prefill or decode rank on vLLM
+0.33.0 refuses it with prefix caching on or off. Both refusals also apply with
+`attention_data` above 1, where vLLM 0.33.0 leaves the cadence of a MoE model
+to its DP engine core, as replay models it. The validation of a rank does not
+see the attention DP size. Where replay accepts the interval, it applies it
+only for `attention_data` above 1.
 
 ```yaml
 engine:
@@ -416,16 +420,37 @@ which requests can be preempted:
   no forward-pass snapshot, as Dynamo's vLLM recorder skips empty batches. The
   engine protocol still reports an all-zero `forward_pass_metrics` for it, which
   a consumer that mirrors that recorder skips.
+- vLLM frees the blocks that a running request no longer needs, such as a
+  previous state block or the blocks below a sliding window, on the processed
+  token count, which leaves out the tokens of the pass in flight. A block that
+  a request stops needing in pass k is therefore freed when pass k+2 is
+  formed, if the request runs in it, and not when pass k+1 is formed. See
+  [KV cache](kv-cache.md#other-cache-modes). Replay does this on an aggregated
+  worker with a grouped cache, except, with prefix caching on, in the
+  layouts that the known differences in
+  [KV cache](kv-cache.md#other-cache-modes) name: there it
+  frees such a block when pass k+1 is formed, one pass earlier than vLLM. A
+  prefill or decode worker with a grouped cache frees such a block when pass
+  k+2 is formed, as vLLM does, in every layout. A
+  [state cache](kv-cache.md#state-cache) frees a previous state copy when pass
+  k+1 is formed on every worker.
 - With a CPU tier (`kv_cache.host_offload`), vLLM does not free the blocks of a
   request that the pass in flight runs until that pass ends, so it does not
   preempt that request. A running request that needs its blocks waits for the
   next pass instead.
 
 vLLM defers the same frees for a P/D connector that consumes KV (`kv_role`
-`kv_consumer` or `kv_both`). Replay does not model a P/D connector's role, so
-it applies the second rule only with a CPU tier. These rules follow `Scheduler`
-in vLLM
-[v0.30.0](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/sched/scheduler.py),
+`kv_consumer` or `kv_both`). Replay does not model a P/D connector's role. It
+applies the third rule with a CPU tier. On a prefill or decode worker with a
+grouped cache it also does not preempt a request that the pass in flight
+runs, whatever the role of the connector, so also where vLLM runs a prefill
+worker as `kv_producer` and has no such rule (see
+[KV cache](kv-cache.md#other-cache-modes)). A prefill or decode worker with a
+linear cache and no CPU tier can preempt such a request. These rules follow
+`Scheduler` and
+`KVCacheManager.allocate_slots` in vLLM
+[v0.30.0](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/sched/scheduler.py)
+([`kv_cache_manager.py`](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/v1/core/kv_cache_manager.py)),
 the first release that stops the allocation instead of preempting such a
 request.
 
