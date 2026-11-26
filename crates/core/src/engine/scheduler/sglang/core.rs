@@ -602,7 +602,7 @@ impl SglangCore {
                     .prompt_len()
                     .saturating_add(
                         request
-                            .max_output_tokens
+                            .budget_max_output_tokens
                             .min(self.config.clip_max_new_tokens),
                     )
                     .saturating_sub(retractable_tokens)
@@ -635,7 +635,7 @@ impl SglangCore {
                     .saturating_sub(prefix_tokens)
                     .saturating_add(
                         request
-                            .max_output_tokens
+                            .budget_max_output_tokens
                             .min(self.config.clip_max_new_tokens),
                     )
                     .saturating_sub(retractable_tokens),
@@ -783,14 +783,18 @@ impl SglangCore {
 
     fn build_request(&self, request: DirectRequest) -> SglangRequest {
         let prompt_len = request.tokens.len();
-        let max_output_tokens = request
-            .effective_max_output_tokens()
-            .min(self.config.max_request_len().saturating_sub(prompt_len + 1))
+        let limit = self
+            .config
+            .max_request_len()
+            .saturating_sub(prompt_len + 1)
             .min(self.config.total_kv_tokens.saturating_sub(
                 super::config::ceil_to_block(prompt_len, self.config.block_size)
                     + self.config.block_size
                     + 1,
             ));
+        let max_output_tokens = request.effective_max_output_tokens().min(limit);
+        // With an exact output plan, `max_output_tokens` on the request is the requested maximum.
+        let budget_max_output_tokens = request.max_output_tokens.min(limit).max(max_output_tokens);
         let output_storage_hint = self.config.output_storage_hint(
             request.tokens.len(),
             max_output_tokens,
@@ -799,6 +803,7 @@ impl SglangCore {
         let mut request = SglangRequest::new(request, self.config.block_size, output_storage_hint);
         // Admission, retraction and speculative decode all consume this budget.
         request.max_output_tokens = max_output_tokens;
+        request.budget_max_output_tokens = budget_max_output_tokens;
         request
     }
 

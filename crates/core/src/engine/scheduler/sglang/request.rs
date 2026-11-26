@@ -26,6 +26,11 @@ pub(super) struct SglangRequest {
     pub(super) sequence_tokens: Vec<u32>,
     pub(super) prompt_len: usize,
     pub(super) max_output_tokens: usize,
+    /// The request's requested maximum (SGLang `sampling_params.max_new_tokens`), at least
+    /// `max_output_tokens`. SGLang budgets admission, the running requests' reservation, the
+    /// retraction estimate and decode preallocation from it; generation stops at
+    /// `max_output_tokens`, which is a replay plan's length when one is given.
+    pub(super) budget_max_output_tokens: usize,
     pub(super) planned_output_ids: Option<Vec<u32>>,
     pub(super) kv_lease: RadixRequestLease,
     pub(super) materialized_tokens: usize,
@@ -62,6 +67,7 @@ impl SglangRequest {
             sequence_tokens,
             prompt_len,
             max_output_tokens,
+            budget_max_output_tokens: max_output_tokens,
             planned_output_ids: req.output_token_ids,
             kv_lease,
             materialized_tokens: 0,
@@ -85,6 +91,12 @@ impl SglangRequest {
 
     pub(super) fn remaining_output_tokens(&self) -> usize {
         self.max_output_tokens.saturating_sub(self.output_len())
+    }
+
+    /// What is left of the requested maximum: SGLang's `max_new_tokens - len(output_ids)`.
+    pub(super) fn remaining_budget_tokens(&self) -> usize {
+        self.budget_max_output_tokens
+            .saturating_sub(self.output_len())
     }
 
     #[cfg(debug_assertions)]
