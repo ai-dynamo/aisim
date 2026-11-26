@@ -40,10 +40,11 @@ def test_frozen_trtllm_plan_binds_observer_and_points(tmp_path):
         build_plan(MODEL, SYSTEM, replace(plan.options, benchmark_points_json=None), frozen, "revision", IMAGE_SHA256)
 
 
-def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch):
+@pytest.mark.parametrize("baseline_power", [200.5, None])
+def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline_power):
     plan = _plan()
     arms = []
-    receipt = {"gpu_watts": {"GPU-0": 200, "GPU-1": 201}, "mean_w_per_gpu": 200.5, "serving_frames_s": 100}
+    receipt = {"gpu_uuids": ["GPU-0", "GPU-1"], "mean_w_per_gpu": 200.5, "serving_frames_s": 100}
     for cell in plan.cells:
         with monkeypatch.context() as patch:
             out = tmp_path / cell.workload_kind
@@ -51,14 +52,15 @@ def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch):
             ctx = _cell_context(plan, cell, cell.cell_id, "1")
             patch.setattr(simulated, "context", lambda _: ctx)
             simulated.run(raw, patch, phase=cell.workload_kind)
-            arms.append((cell, cell.cell_id, out, receipt, receipt))
+            arms.append((cell, cell.cell_id, out, receipt | {"mean_w_per_gpu": baseline_power}, receipt))
             assert _validate_clock(raw, {"GPU-0", "GPU-1"})[0] is None
 
     parquet, rows, summary = publish_campaign(plan, arms, tmp_path / "systems")
     assert parquet.is_file()
     assert {row["workload_kind"] for row in rows} == {"prefill", "decode"}
-    assert all(row["power_w"] == pytest.approx(620 / 2.1) for row in rows)
+    expected = pytest.approx(620 / 2.1) if baseline_power is not None else None
+    assert all(row["power_w"] == expected for row in rows)
     assert all(entry["serving_rate_change_pct"] == 0 for entry in summary.values())
     # Use the compiled profile query on the same schema-8 file just published.
     query = query_published_profile(plan, parquet, rows)
-    assert all(point["power_w"] == pytest.approx(620 / 2.1) for point in query.values())
+    assert all(point["power_w"] == expected for point in query.values())

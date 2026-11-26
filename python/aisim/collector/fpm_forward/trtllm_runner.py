@@ -126,31 +126,51 @@ def _drive(url, model, phase):
 def _energy_counter(uuids):
     import pynvml
 
-    pynvml.nvmlInit()
+    initialized = False
     try:
+        pynvml.nvmlInit()
+        initialized = True
         handles = {uuid: pynvml.nvmlDeviceGetHandleByUUID(uuid) for uuid in uuids}
+    except pynvml.NVMLError:
+        handles = {}
 
-        def read():
+    def read():
+        try:
             return {
                 uuid: (time.monotonic(), pynvml.nvmlDeviceGetTotalEnergyConsumption(handle))
                 for uuid, handle in handles.items()
             }
+        except pynvml.NVMLError:
+            return {}
 
+    try:
         yield read
     finally:
-        pynvml.nvmlShutdown()
+        if initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except pynvml.NVMLError:
+                pass
 
 
-def _rates(start, end, replies):
+def _rates(gpus, start, end, replies):
     duration = max(reply["last_s"] for reply in replies) - min(reply["submitted_s"] for reply in replies)
-    watts = {uuid: (end[uuid][1] - mj) / (1000 * (end[uuid][0] - stamp)) for uuid, (stamp, mj) in start.items()}
-    if duration <= 0 or not all(math.isfinite(v) and v > 0 for v in watts.values()):
-        raise ValueError("pilot baseline has invalid elapsed time or GPU energy delta")
+    if duration <= 0:
+        raise ValueError("pilot baseline has invalid elapsed time")
+    watts = {}
+    if set(start) == set(end) == set(gpus):
+        for uuid, (stamp, mj) in start.items():
+            elapsed, delta = end[uuid][0] - stamp, end[uuid][1] - mj
+            if elapsed <= 0 or delta <= 0:
+                watts.clear()
+                break
+            watts[uuid] = delta / (1000 * elapsed)
     return {
         "wall_s": duration,
         "serving_frames_s": sum(reply["frames"] for reply in replies) / duration,
-        "mean_w_per_gpu": sum(watts.values()) / len(watts),
+        "mean_w_per_gpu": sum(watts.values()) / len(watts) if watts else None,
         "gpu_watts": watts,
+        "gpu_uuids": gpus,
         "energy_start": start,
         "energy_end": end,
         "replies": replies,
@@ -281,15 +301,22 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
             start = read()
             replies = _drive(url, model, cell.workload_kind)
             end = read()
-        receipt = _rates(start, end, replies)
+        receipt = _rates(gpus, start, end, replies)
         _save(raw / "throughput-energy.json", receipt)
         if enabled:
-            _wait(
-                lambda: (raw / "benchmark.json").is_file() and (raw / "collector-provenance.json").is_file(),
-                processes,
-                "TRT-LLM observer artifact",
-                timeout=12,
-            )
+            try:
+                _wait(
+                    lambda: (raw / "benchmark.json").is_file() and (raw / "collector-provenance.json").is_file(),
+                    processes,
+                    "TRT-LLM observer artifact",
+                    timeout=12,
+                )
+            except TimeoutError:
+                # The observer also seals a valid latency sample on shutdown
+                # when the work ended before the power window could close.
+                pass
+    if enabled and not ((raw / "benchmark.json").is_file() and (raw / "collector-provenance.json").is_file()):
+        raise RuntimeError("TRT-LLM observer finished without a latency artifact; see rank records and engine log")
     return receipt
 
 
@@ -345,24 +372,28 @@ def publish_campaign(plan, arms, systems_root):
     summaries = {}
     matched_uuids = None
     for cell, attempt, observed, off, on in arms:
-        if set(off["gpu_watts"]) != set(on["gpu_watts"]):
+        if set(off["gpu_uuids"]) != set(on["gpu_uuids"]):
             raise ValueError(f"{cell.cell_id} baseline and observer used different GPUs")
-        gpus = set(on["gpu_watts"])
+        gpus = set(on["gpu_uuids"])
         if len(gpus) != 2 or (matched_uuids is not None and matched_uuids != gpus):
             raise ValueError("TRT-LLM pilot must use the same two H200s throughout")
         matched_uuids = gpus
         measured = aggregate_cell(plan, cell, observed, expected_attempt_id=attempt)
         _validate_coordinates(cell, measured)
         reason, details = (None, None)
+        off_power, on_power = off["mean_w_per_gpu"], on["mean_w_per_gpu"]
+        paired_power = off_power is not None and on_power is not None
         if measured[0]["power_w"] is not None:
             reason, details = _validate_clock(observed / "raw" / "node-0", gpus)
+            if not paired_power and reason is None:
+                reason = "matched_power_unavailable"
             if reason:
                 measured[0]["power_w"] = None
         summaries[cell.workload_kind] = {
             "serving_rate_change_pct": 100 * (on["serving_frames_s"] / off["serving_frames_s"] - 1),
-            "mean_power_change_pct": 100 * (on["mean_w_per_gpu"] / off["mean_w_per_gpu"] - 1),
+            "mean_power_change_pct": 100 * (on_power / off_power - 1) if paired_power else None,
             "clock_evidence": details,
-            "clock_unavailable_reason": reason,
+            "power_unavailable_reason": reason,
             "power_w": measured[0]["power_w"],
         }
         rows.extend(measured)
