@@ -47,7 +47,7 @@ jobs:
 
       - name: Install AIC and test dependencies
         run: |
-          python -m pip install uv
+          python -m pip install uv==0.13.10
           uv sync --extra dev
 
       - name: Check collector data (fail-closed)
