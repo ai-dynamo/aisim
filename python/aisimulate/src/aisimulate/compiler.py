@@ -332,14 +332,15 @@ def _afd_deployment(
 ) -> BackendDeploymentSpec:
     afd = engine.afd
     assert afd is not None
-    facts = resolve_model_hardware(engine.model, engine.hardware, backend=engine.backend)
     topology_fields = afd.model_dump(mode="python")
     profile_path = topology_fields.pop("fastafd_profile_path")
     profile_backend = topology_fields.pop("fastafd_moe_backend")
+    systems_kwargs = {}
     if profile_path is not None:
         from .sweeper.forward_pass_estimator import resolve_systems_paths
 
         systems_paths = resolve_systems_paths(engine.systems_paths)
+        systems_kwargs["systems_paths"] = list(systems_paths)
         # The configured provider keeps measuring the attention side; the
         # adapter obtains the complete MoE stage from the canonical Rust
         # best_available estimator, including exact selection and normalization.
@@ -350,13 +351,16 @@ def _afd_deployment(
             moe_precision=engine.moe_quant_mode,
             systems_paths=systems_paths,
         )
+    facts = resolve_model_hardware(engine.model, engine.hardware, backend=engine.backend, **systems_kwargs)
     topology = AFDTopology(
         **topology_fields,
         gpus_per_node=facts.gpus_per_node,
         is_moe=facts.is_moe,
         num_experts=facts.num_experts,
     )
-    backend_version = engine.backend_version or resolve_backend_version(engine.hardware, engine.backend)
+    backend_version = engine.backend_version or resolve_backend_version(
+        engine.hardware, engine.backend, **systems_kwargs
+    )
     if profile_path is not None and backend_version in {"current", "previous", "next"}:
         from aisimulate_core.sdk.perf_database import resolve_query_version
 

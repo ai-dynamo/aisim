@@ -660,12 +660,14 @@ def _afd_topology(deployment) -> AFDTopology:
 
 def _validate_saved_fastafd_decode_trace(measurement: AFDLayerTimes, index: int) -> None:
     attention = measurement.provenance.get("attention")
-    if (
-        measurement.provenance.get("provider") != "fastafd"
-        or not isinstance(attention, Mapping)
-        or "decode_samples" not in attention
-    ):
+    if measurement.provenance.get("provider") != "fastafd":
         # Custom providers with neither trace describe constant attention.
+        return
+    if not isinstance(attention, Mapping) or "decode_samples" not in attention:
+        if measurement.decode_attention_samples:
+            raise ValueError(
+                f"AFD measurement {index} decode_attention_samples require provenance.attention.decode_samples"
+            )
         return
     raw_samples = attention["decode_samples"]
     typed_samples = measurement.decode_attention_samples

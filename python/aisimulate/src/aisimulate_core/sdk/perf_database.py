@@ -389,8 +389,15 @@ def is_blackwell_system(
     """True for Blackwell-class systems (SM >= 100, e.g. b200_sxm / gb200 / b300 / gb300)."""
     if not system_name:
         return False
-    spec = load_system_spec(system_name, systems_paths=systems_paths)
-    return int(spec.get("gpu", {}).get("sm_version", -1)) >= 100
+    roots = _normalize_systems_paths(systems_paths if systems_paths is not None else get_systems_paths())
+    spec = load_system_spec(system_name, systems_paths=roots)
+    if not spec and not any(os.path.exists(os.path.join(root, f"{system_name}.yaml")) for root in roots):
+        return False
+    try:
+        sm_version = int(spec["gpu"]["sm_version"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"system {system_name!r} requires gpu.sm_version in its selected hardware spec") from exc
+    return sm_version >= 100
 
 
 def is_hopper_system(system_name: str | None) -> bool:

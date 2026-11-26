@@ -59,6 +59,7 @@ def build_profile(
         raise ValueError(f"no benchmark results in {results_dir}")
     summary: Counter[str] = Counter()
     source: dict[str, Any] | None = None
+    system: str | None = None
     entries: list[dict[str, Any]] = []
     seen: dict[tuple[Any, ...], str] = {}
     for path in files:
@@ -80,6 +81,14 @@ def build_profile(
             source = current
         elif current != source:
             raise ValueError(f"{path.name}: mixed benchmark, commit, or boundary in {results_dir}")
+        if system is None:
+            system = payload["system_label"]
+        elif payload["system_label"] != system:
+            raise ValueError(f"{path.name}: mixed systems in {results_dir}")
+        backend_field = "primary_backend" if stage == "agg" else "moe_backend"
+        backend = payload.get(backend_field)
+        if not isinstance(backend, str) or backend not in _BACKENDS:
+            raise ValueError(f"{path.name}: unsupported {backend_field}: {backend!r}")
         workload = payload["workload"]
         if not isinstance(payload["stable"], bool):
             raise ValueError(f"{path.name}: stable must be a boolean")
@@ -182,6 +191,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     output = Path(args.output)
+    if output.suffix not in {".json", ".parquet"}:
+        raise ValueError("FastAFD output suffix must be .json or .parquet")
     if output.is_symlink():
         raise ValueError("FastAFD output must not be a symlink")
     profile, summary = build_profile(

@@ -189,9 +189,8 @@ def test_canonical_estimator_rejects_latency_underflow(tmp_path, suffix):
         profile = FastAFDMoEStageProfile.load(path)
         path = path.with_suffix(".parquet")
         profile.write_parquet(path)
-    model = RustForwardPassPerfModel.best_available(_canonical_config(path))
     with pytest.raises(ValueError, match="normalized per-unit latency must be finite and positive"):
-        model.estimate_fastafd_stage(48)
+        RustForwardPassPerfModel.best_available(_canonical_config(path))
 
 
 def test_canonical_estimator_rejects_unused_fpm_attention_selector(tmp_path):
@@ -568,6 +567,7 @@ def test_parquet_metadata_requires_utf8_for_inspection_and_native_loading(tmp_pa
     import pyarrow.parquet as pq
 
     from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisimulate_core.sdk.errors import PerfDataNotAvailableError
 
     profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
     path = tmp_path / "profile.parquet"
@@ -578,7 +578,7 @@ def test_parquet_metadata_requires_utf8_for_inspection_and_native_loading(tmp_pa
     if encoding == "binary":
         with pytest.raises(ValueError, match=rf"{column}.*UTF-8"):
             FastAFDMoEStageProfile.load(path)
-        with pytest.raises(ValueError, match="(?i)string|str"):
+        with pytest.raises(PerfDataNotAvailableError, match="UTF-8"):
             RustForwardPassPerfModel.best_available(_canonical_config(path))
     else:
         assert FastAFDMoEStageProfile.load(path).entries == profile.entries
@@ -736,3 +736,180 @@ def test_inspection_rejects_unverified_or_incompatible_boundary(tmp_path, compon
     payload["source"]["boundary_components"] = components
     with pytest.raises(ValueError, match="boundary_components"):
         FastAFDMoEStageProfile.load(_write(tmp_path, payload))
+
+
+@pytest.mark.parametrize("correctness", [False, True, None])
+def test_writer_validates_direct_measurements_before_replacing_output(tmp_path, correctness):
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    path = tmp_path / "profile.parquet"
+    profile.write_parquet(path)
+    original = path.read_bytes()
+    changed = FastAFDMoEStageProfile(
+        (replace(profile.entries[0], correctness=correctness),),
+        source=profile.source,
+        path=profile.path,
+        profile_sha256=profile.profile_sha256,
+    )
+    if correctness is False:
+        with pytest.raises(ValueError, match="not a qualified measurement"):
+            changed.write_parquet(path)
+        assert path.read_bytes() == original
+    else:
+        changed.write_parquet(path)
+        assert FastAFDMoEStageProfile.load(path).entries[0].correctness is correctness
+
+
+@pytest.mark.parametrize("text", ["\ud800", "\udfff"])
+def test_rejects_invalid_unicode_during_inspection_and_conversion(tmp_path, text):
+    from aisimulate_core.sdk.fastafd_profile import _native_profile_snapshot
+
+    payload = _payload()
+    payload["source"]["boundary"] = text
+    path = _write(tmp_path, payload)
+    for load in (FastAFDMoEStageProfile.load, _native_profile_snapshot):
+        with pytest.raises(ValueError, match=r"source.boundary must be valid UTF-8"):
+            load(path)
+
+
+def test_non_bmp_provenance_reaches_native_estimation(tmp_path):
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload()
+    payload["source"]["boundary"] = "complete stage 🚀"
+    path = _write(tmp_path, payload)
+    assert FastAFDMoEStageProfile.load(path).source.boundary == payload["source"]["boundary"]
+    estimate = RustForwardPassPerfModel.best_available(_canonical_config(path)).estimate_fastafd_stage(48)
+    assert estimate["stage"]["boundary"] == payload["source"]["boundary"]
+
+
+@pytest.mark.parametrize("record", ["source", "capture", "validation", "measurement"])
+def test_parquet_metadata_records_require_objects_for_both_readers(tmp_path, record):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    path = tmp_path / "stage.parquet"
+    profile.write_parquet(path)
+    table = pq.read_table(path)
+    column = "source_json" if record == "source" else "capture_json"
+    value = json.loads(table[column][0].as_py())
+    field_order = {
+        "source": (
+            "repository",
+            "commit",
+            "benchmark",
+            "boundary",
+            "boundary_components",
+            "timed_span",
+            "microbatch_split",
+        ),
+        "capture": ("model_profile", "measurement", "validation"),
+        "validation": ("stable", "correctness"),
+        "measurement": (
+            "scope",
+            "method",
+            "method_version",
+            "statistic",
+            "sample_count",
+            "cv_percent",
+            "routing",
+            "source_tree_sha256",
+            "raw_artifact",
+            "raw_sha256",
+        ),
+    }
+    target = value if record in {"source", "capture"} else value[record]
+    positional = [target[name] for name in field_order[record]]
+    if record in {"source", "capture"}:
+        value = positional
+    else:
+        value[record] = positional
+    table = table.set_column(table.schema.get_field_index(column), column, pa.array([json.dumps(value)]))
+    pq.write_table(table, path)
+    with pytest.raises(ValueError, match="must contain exactly"):
+        FastAFDMoEStageProfile.load(path)
+    with pytest.raises(ValueError, match="expected a JSON object"):
+        RustForwardPassPerfModel.best_available(_canonical_config(path))
+
+
+@pytest.mark.parametrize("encoding", ["int64", "duration"])
+def test_parquet_count_descriptors_override_arrow_schema_hints(tmp_path, encoding):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    payload = _payload()
+    payload["entries"][0].update(latency_ms=12.0)
+    payload["entries"][0]["key"]["moe_layers"] = 3
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, payload))
+    path = tmp_path / "stage.parquet"
+    profile.write_parquet(path)
+    table = pq.read_table(path)
+    column = "logical_batch_per_source_rank"
+    if encoding == "duration":
+        table = table.set_column(table.schema.get_field_index(column), column, table[column].cast(pa.duration("ns")))
+    pq.write_table(table, path)
+    assert b"ARROW:schema" in pq.read_metadata(path).metadata
+    assert FastAFDMoEStageProfile.load(path).entries[0].key.logical_batch_per_source_rank == 48
+    assert (
+        RustForwardPassPerfModel.best_available(_canonical_config(path, moe_layers=3)).estimate_fastafd_stage(48)[
+            "ffn_ms"
+        ]
+        == 2.0
+    )
+
+
+def test_fastafd_rejects_nondefault_database_mode_before_attention_setup(tmp_path, monkeypatch):
+    from aisimulate.sdk import inference_session
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    def unexpected_attention(*args, **kwargs):
+        pytest.fail("unsupported database mode must fail before attention measurement")
+
+    monkeypatch.setattr(inference_session, "_measure_fastafd_attention", unexpected_attention)
+    config = _canonical_config(_write(tmp_path, _payload())).to_dict()
+    config["database_mode"] = "EMPIRICAL"
+    with pytest.raises(ValueError, match="no unrelated estimator/graph controls"):
+        RustForwardPassPerfModel.best_available(config).estimate_fastafd_attention(isl=128, osl=2)
+
+
+@pytest.mark.parametrize("annotation", ["STRING", "ENUM"])
+def test_identity_requires_string_parquet_descriptor_for_both_readers(tmp_path, annotation):
+    import pyarrow.parquet as pq
+
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+    from aisimulate_core.sdk.errors import PerfDataNotAvailableError
+
+    profile = FastAFDMoEStageProfile.load(_write(tmp_path, _payload()))
+    path = tmp_path / "stage.parquet"
+    profile.write_parquet(path)
+    # Self-authored profile. Disable the Arrow hint and change only system's
+    # Thrift compact SchemaElement: converted UTF8(0) -> ENUM(4), and the
+    # LogicalType union STRING(field 1) -> ENUM(field 4). Both are BYTE_ARRAY;
+    # data pages and footer size stay unchanged. PyArrow cannot write ENUM.
+    pq.write_table(pq.read_table(path), path, store_schema=False)
+    if annotation == "ENUM":
+        raw = path.read_bytes()
+        footer_size = int.from_bytes(raw[-8:-4], "little")
+        footer = raw[-8 - footer_size : -8]
+        string_descriptor = b"\x18\x06system\x25\x00\x4c\x1c\x00\x00"
+        enum_descriptor = b"\x18\x06system\x25\x08\x4c\x4c\x00\x00"
+        assert footer.count(string_descriptor) == 1
+        footer = footer.replace(string_descriptor, enum_descriptor)
+        path.write_bytes(raw[: -8 - footer_size] + footer + raw[-8:])
+    schema = pq.read_metadata(path).schema
+    column = next(schema.column(i) for i in range(len(schema)) if schema.column(i).name == "system")
+    assert column.logical_type.type == annotation
+    if annotation == "ENUM":
+        with pytest.raises(ValueError, match="system.*UTF-8"):
+            FastAFDMoEStageProfile.load(path)
+        with pytest.raises(PerfDataNotAvailableError, match="system.*UTF-8"):
+            RustForwardPassPerfModel.best_available(_canonical_config(path))
+    else:
+        assert FastAFDMoEStageProfile.load(path).entries == profile.entries
+        assert RustForwardPassPerfModel.best_available(_canonical_config(path)).estimate_fastafd_stage(48)[
+            "ffn_ms"
+        ] == pytest.approx(16.7 / 86)

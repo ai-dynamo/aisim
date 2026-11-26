@@ -80,3 +80,23 @@ def test_nvfp4_wo_memory_matches_nvfp4():
 def test_nvfp4_wo_compute_matches_bfloat16():
     assert common.GEMMQuantMode.nvfp4_wo.value.compute == common.GEMMQuantMode.bfloat16.value.compute
     assert common.MoEQuantMode.nvfp4_wo.value.compute == common.MoEQuantMode.bfloat16.value.compute
+
+
+@pytest.mark.parametrize("spec", ["gpu: {}", "{}", "gpu: null", "gpu:\n  sm_version: null"])
+def test_selected_system_requires_architecture_before_nvfp4_remapping(tmp_path, spec):
+    from aisimulate_core.sdk import perf_database
+
+    (tmp_path / "custom_sku.yaml").write_text(spec)
+    mc = _model_config(gemm_quant_mode=common.GEMMQuantMode.nvfp4, moe_quant_mode=common.MoEQuantMode.nvfp4)
+    with pytest.raises(ValueError, match=r"custom_sku.*gpu.sm_version"):
+        resolve_nvfp4_for_system(mc, "custom_sku", systems_paths=[tmp_path])
+    assert mc.gemm_quant_mode is common.GEMMQuantMode.nvfp4
+    assert mc.moe_quant_mode is common.MoEQuantMode.nvfp4
+    assert perf_database.is_blackwell_system("absent_sku", systems_paths=[tmp_path]) is False
+
+
+def test_non_fp4_modes_do_not_require_cuda_architecture_on_b60():
+    mc = _model_config(gemm_quant_mode=common.GEMMQuantMode.bfloat16, moe_quant_mode=common.MoEQuantMode.fp8)
+    resolve_nvfp4_for_system(mc, "b60")
+    assert mc.gemm_quant_mode is common.GEMMQuantMode.bfloat16
+    assert mc.moe_quant_mode is common.MoEQuantMode.fp8

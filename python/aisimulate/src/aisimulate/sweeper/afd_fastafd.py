@@ -182,7 +182,6 @@ class FastAFDMoEStagePerformanceModel:
             raise _infeasible("the attention provider decode_samples must be a non-empty sequence")
         samples = []
         total_repeat = 0
-        compute_sum = combine_sum = router_sum = 0.0
         typed = attention.decode_attention_samples
         if typed and len(typed) != len(raw):
             raise _infeasible("typed decode_attention_samples must match provenance decode_samples")
@@ -217,12 +216,10 @@ class FastAFDMoEStagePerformanceModel:
                 raise _infeasible("typed decode_attention_samples must match provenance decode_samples")
             samples.append((compute + components["a_router_ms"], repeat))
             total_repeat += repeat
-            compute_sum += compute * repeat
-            combine_sum += combine * repeat
-            router_sum += components["a_router_ms"] * repeat
         averaged = FastAFDMoEStagePerformanceModel._components(attention)
-        for name, total in zip(_ATTENTION_COMPONENTS, (compute_sum, combine_sum, router_sum), strict=True):
-            if not math.isclose(total / total_repeat, averaged[name], rel_tol=1e-9, abs_tol=1e-12):
+        for name in _ATTENTION_COMPONENTS:
+            mean = math.fsum(sample["components"][name] * (sample["repeat"] / total_repeat) for sample in raw)
+            if not math.isclose(mean, averaged[name], rel_tol=1e-9, abs_tol=1e-12):
                 raise _infeasible(f"decode sample {name} does not reconcile with its averaged component")
         return tuple(samples)
 

@@ -153,6 +153,34 @@ def test_builds_split_profile_through_the_command_line(tmp_path, suffix):
     assert profile.require(key).latency_ms == pytest.approx(11.4)
     assert profile.require(key).method_version == "torch 2.10.0+cu130; cuda 13.0"
     assert profile.source.benchmark == "fastafd.moe-m2n-model-benchmark.v2"
+    from aisimulate_core.sdk import RustForwardPassPerfModel
+
+    model = RustForwardPassPerfModel.best_available(
+        {
+            "model": key.model_path,
+            "system": key.system,
+            "backend": "sglang",
+            "backend_version": "0.5.14",
+            "worker_type": "decode",
+            "estimation_mode": "fastafd_stage",
+            "moe_backend": key.moe_backend,
+            "nextn": key.mtp_nextn,
+            "afd": {
+                "logical_batch_per_source_rank": 64,
+                "attention_gpus": 16,
+                "ffn_gpus": 8,
+                "f_moe_ep_size": 8,
+                "microbatches": 2,
+                "moe_layers": 94,
+                "routed_topk": 8,
+                "boundary_on_attn": True,
+            },
+            "estimator_config": {"fastafd_stage": {"profile_path": str(output)}},
+        }
+    )
+    estimate = model.estimate_fastafd_stage(64)
+    assert estimate["ffn_ms"] == pytest.approx(11.4 / 188)
+    assert estimate["stage"]["benchmark"] == profile.source.benchmark
 
 
 def test_rejects_mixed_directories_and_repeated_measurements(tmp_path):
@@ -381,3 +409,37 @@ def test_builder_rejects_unverified_capture_contract_without_publication(tmp_pat
     with pytest.raises(ValueError, match=field):
         main(args)
     assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize("routing,stable", [("balanced", True), ("hotset", True), ("balanced", False)])
+def test_builder_rejects_mixed_systems_before_filtering(tmp_path, routing, stable):
+    _write(tmp_path, "a.json", _colocated(48))
+    other = {**_colocated(96, routing=routing, stable=stable), "system_label": "h200"}
+    _write(tmp_path, "b.json", other)
+    with pytest.raises(ValueError, match="mixed systems"):
+        build_profile(tmp_path, repository=_REPOSITORY)
+
+
+@pytest.mark.parametrize("capture,field", [(_colocated, "primary_backend"), (_split, "moe_backend")])
+@pytest.mark.parametrize("backend", ["unsupported", None, []])
+def test_builder_rejects_unsupported_backend_before_routing_filter(tmp_path, capture, field, backend):
+    _write(tmp_path, "a.json", capture(48))
+    hotset = capture(96)
+    hotset["workload"]["routing"] = "hotset"
+    hotset[field] = backend
+    _write(tmp_path, "b.json", hotset)
+    with pytest.raises(ValueError, match=f"unsupported {field}"):
+        build_profile(tmp_path, repository=_REPOSITORY)
+    hotset[field] = "mega"
+    _write(tmp_path, "b.json", hotset)
+    _, summary = build_profile(tmp_path, repository=_REPOSITORY)
+    assert summary == {"accepted": 1, "skipped_routing": 1}
+
+
+@pytest.mark.parametrize("suffix", [".PARQUET", ".csv", ""])
+def test_cli_rejects_output_format_before_discovery_or_publication(tmp_path, suffix):
+    output = tmp_path / f"stage{suffix}"
+    output.write_bytes(b"existing output")
+    with pytest.raises(ValueError, match="output suffix must be .json or .parquet"):
+        main([str(tmp_path / "missing"), "--repository", _REPOSITORY, "--output", str(output)])
+    assert output.read_bytes() == b"existing output"

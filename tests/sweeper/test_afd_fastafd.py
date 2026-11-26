@@ -1062,9 +1062,12 @@ def test_prediction_pins_fastafd_alias_for_attention_and_companion(tmp_path, mon
 
 
 @pytest.mark.parametrize("root_source", ["environment", "sdk"])
-@pytest.mark.parametrize("alias,version", [("current", "0.5.99"), ("previous", "0.5.98")])
+@pytest.mark.parametrize("gpus_per_node", [4, 8])
+@pytest.mark.parametrize(
+    "alias,version", [(None, "0.5.99"), ("current", "0.5.99"), ("previous", "0.5.98"), ("0.5.99", "0.5.99")]
+)
 def test_prediction_resolves_fastafd_alias_from_attention_roots(
-    tmp_path, monkeypatch, fastafd_attention_sol, root_source, alias, version
+    tmp_path, monkeypatch, fastafd_attention_sol, root_source, alias, version, gpus_per_node
 ):
     from aisimulate_core.sdk import RustForwardPassPerfModel, perf_database
 
@@ -1074,6 +1077,7 @@ def test_prediction_resolves_fastafd_alias_from_attention_roots(
     system = yaml.safe_load((packaged / f"{SYSTEM}.yaml").read_text())
     system["data_dir"] = str(packaged / system["data_dir"])
     system["gpu"]["mem_bw"] /= 2
+    system["node"]["num_gpus_per_node"] = gpus_per_node
     (root / f"{SYSTEM}.yaml").write_text(yaml.safe_dump(system))
     (root / "query_versions.yaml").write_text(
         yaml.safe_dump({"overrides": {SYSTEM: {"sglang": {"current": "0.5.99", "previous": "0.5.98"}}}})
@@ -1082,8 +1086,9 @@ def test_prediction_resolves_fastafd_alias_from_attention_roots(
     # supported when SDK roots are default; explicit SDK roots take precedence.
     monkeypatch.setattr(perf_database, "_SYSTEMS_PATHS", [str(packaged if root_source == "environment" else root)])
     monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(root if root_source == "environment" else packaged))
-    raw = _prediction(_profile(tmp_path))
+    raw = _prediction(_profile(tmp_path, [_entry(topology=f"{16 * gpus_per_node}A{2 * gpus_per_node}F")]))
     raw["engine"].update(backend_version=alias, context_length=2048)
+    raw["engine"]["afd"]["f_moe_ep_size"] = 2 * gpus_per_node
     raw["engine"]["workers"]["prefill"]["timing"] = {"type": "default"}
 
     deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw)).backend_deployment
@@ -1095,6 +1100,8 @@ def test_prediction_resolves_fastafd_alias_from_attention_roots(
     saved = json.loads(json.dumps(measurement["provenance"]["config"]))
     assert saved["backend_version"] == version
     assert saved["systems_paths"] == [str(root)]
+    assert saved["afd"]["attention_gpus"] == 16 * gpus_per_node
+    assert saved["afd"]["ffn_gpus"] == 2 * gpus_per_node
     assert measurement["provenance"]["attention"]["config"] == saved
     assert measurement["attention_ms"] > 0
     assert measurement["ffn_ms"] == pytest.approx(STAGE_MS / (LAYERS * 2))
@@ -1294,7 +1301,8 @@ def test_fastafd_crossing_trace_survives_replay_serialization(tmp_path, pipeline
     # JSON round trip exercises the serialized lists used in saved replay specs.
     deployment = spec.backend_deployment
     metadata = json.loads(json.dumps(deployment.performance_model_metadata))
-    (measurement,) = _afd_layer_measurements(replace(deployment, performance_model_metadata=metadata))
+    restored_deployment = replace(deployment, performance_model_metadata=metadata)
+    (measurement,) = _afd_layer_measurements(restored_deployment)
     assert measurement.decode_attention_samples == ((0.05, 32), (0.15, 32))
     planned = AFDForegroundEngine(request.topology, (measurement,)).execute_pass(
         phase="decode", now_ms=0.0, input_length=1024, output_length=65
@@ -1306,7 +1314,7 @@ def test_fastafd_crossing_trace_survives_replay_serialization(tmp_path, pipeline
     assert planned.evaluation.step_latency_ms == pytest.approx(
         _decode_reference(request.topology, measurement.decode_attention_samples, 0.1, 65)
     )
-    report = EngineReplayRunnerFactory().create(0).run(spec)
+    report = EngineReplayRunnerFactory().create(0).run(replace(spec, backend_deployment=restored_deployment))
     assert report.metrics["mean_tpot_ms"] == pytest.approx(expected)
     assert report.metrics["completed_requests"] == 1
 
@@ -1341,7 +1349,10 @@ def _saved_fastafd_decode_spec(tmp_path, *, pipeline_model="optimistic", with_tr
     return replace(spec, backend_deployment=replace(deployment, performance_model_metadata=saved))
 
 
-@pytest.mark.parametrize("corruption", ["missing", "empty", "same_mean", "reordered", "split_repeat", "boundary"])
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing", "empty", "same_mean", "reordered", "split_repeat", "boundary", "missing_raw", "missing_attention"],
+)
 def test_saved_fastafd_rejects_missing_or_inconsistent_typed_trace(tmp_path, corruption):
     spec = _saved_fastafd_decode_spec(tmp_path)
     (saved,) = spec.backend_deployment.performance_model_metadata["afd"]["measurements"]
@@ -1356,6 +1367,10 @@ def test_saved_fastafd_rejects_missing_or_inconsistent_typed_trace(tmp_path, cor
         saved["decode_attention_samples"].reverse()
     elif corruption == "split_repeat":
         saved["decode_attention_samples"] = [[0.05, 16], [0.05, 16], [0.15, 32]]
+    elif corruption == "missing_raw":
+        del saved["provenance"]["attention"]["decode_samples"]
+    elif corruption == "missing_attention":
+        del saved["provenance"]["attention"]
     else:
         saved["provenance"]["attention"]["decode_samples"][0]["components"] = None
 
@@ -1791,3 +1806,49 @@ def test_canonical_stage_pins_batch_and_resolved_precision(tmp_path):
     (smaller,) = _provider(tmp_path, profile_path=path).measure(_request(_topology(a_batch_size=64)))
     assert smaller.provenance["config"]["moe_quant_mode"] == "fp8"
     assert smaller.ffn_ms == 2 * measurement.ffn_ms
+
+
+@pytest.mark.parametrize("pipeline_model", ["optimistic", "conservative"])
+def test_fastafd_normalizes_repeat_weights_before_accumulation(tmp_path, monkeypatch, pipeline_model):
+    # Synthetic one-layer checkpoint keeps the complete phase finite while
+    # compute * repeat would overflow during adapter preparation.
+    monkeypatch.setattr(afd_fastafd, "get_model_config_from_model_path", lambda _: {"layers": 1, "topk": 8})
+    topology = _topology(pipeline_model=pipeline_model)
+    request = replace(_request(topology), output_length=33)
+    components = {**COMPONENTS, "attention_compute_ms": 1e307, "a_combine_ms": 0.0}
+    (attention,) = _Attention(num_layers=1).measure(request)
+    attention = replace(
+        attention,
+        attention_ms=1e307,
+        provenance={
+            "components": components,
+            "decode_samples": [{"repeat": 32, "components": components}],
+        },
+    )
+    (measurement,) = _provider(
+        tmp_path,
+        SimpleNamespace(measure=lambda _: (attention,)),
+        profile_path=_profile(tmp_path, [_entry(moe_layers=1)]),
+    ).measure(request)
+    assert measurement.decode_attention_samples == ((1e307, 32),)
+    result = evaluate_afd_phase(topology, measurement, input_length=1024, output_length=33)
+    # Two pipeline units, each dominated by A=1e307 ms.
+    assert result.step_latency_ms == pytest.approx(2e307)
+    assert result.tokens_per_second == pytest.approx(topology.total_batch_size / 2e304, abs=0.0)
+
+
+@pytest.mark.parametrize("node_width", [4, 8])
+def test_ffn_memory_resolves_independent_f_communication_topology(node_width):
+    from aisimulate_core.sdk import models
+    from aisimulate_core.sdk.config_builders import build_model_config
+
+    a_config = build_model_config(1, 1, 1, 1, 1)
+    a_model = models.get_model(MODEL, a_config, "sglang")
+    assert a_model._gpus_per_node == 0
+    f_config = build_model_config(16, 1, 1, 1, 16)
+    f_config.moe_comm_backend = {"generation": "deepep_ll"}
+    f_config.num_gpus_per_node = node_width
+    f_model = a_model._afd_ffn_memory_model(f_config)
+    assert f_model.config.num_gpus_per_node == node_width
+    assert f_model.get_resident_weights_bytes() > 0
+    assert a_model.config.moe_comm_backend is None

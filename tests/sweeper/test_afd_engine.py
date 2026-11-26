@@ -142,8 +142,9 @@ def test_sampled_cadence_stays_finite_before_repeat_normalization(
         num_layers=1,
         decode_attention_samples=samples,
     )
+    topology = _topology(num_microbatches=2, pipeline_model=pipeline_model)
     result = evaluate_afd_phase(
-        _topology(num_microbatches=2, pipeline_model=pipeline_model),
+        topology,
         times,
         input_length=128,
         output_length=33,
@@ -151,7 +152,7 @@ def test_sampled_cadence_stays_finite_before_repeat_normalization(
     # Two pipeline units: fill=A+F, then one weighted max(A,F) cycle.
     assert math.isfinite(result.cycle_ms)
     assert result.step_latency_ms == pytest.approx(expected_step)
-    assert result.tokens_per_second > 0.0
+    assert result.tokens_per_second == pytest.approx(topology.total_batch_size / (expected_step / 1000.0), abs=0.0)
 
 
 def test_foreground_pass_expands_every_stage_and_matches_formula_boundary():

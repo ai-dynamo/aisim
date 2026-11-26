@@ -21,6 +21,33 @@ fn invalid(message: impl Into<String>) -> AicError {
     AicError::InvalidEngineConfig(message.into())
 }
 
+// Derived struct visitors also accept positional arrays. Profile metadata is
+// a JSON object contract; preserve the struct visitor's duplicate-field checks.
+fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+        type Value = T;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M) -> Result<T, M::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
+}
+
+fn object_from_str<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let value = deserialize_object(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
 /// Immutable identity of one measured split-stage configuration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,7 +257,9 @@ struct Entry {
 #[serde(deny_unknown_fields)]
 struct ParquetCapture {
     model_profile: String,
+    #[serde(deserialize_with = "deserialize_object")]
     measurement: Capture,
+    #[serde(deserialize_with = "deserialize_object")]
     validation: Validation,
 }
 
@@ -377,8 +406,14 @@ impl Document {
 }
 
 #[derive(Clone, Debug)]
+struct PreparedEntry {
+    entry: Entry,
+    ffn_ms: f64,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct FastAfdTable {
-    entries: BTreeMap<u32, Vec<Entry>>,
+    entries: BTreeMap<u32, Vec<PreparedEntry>>,
     source: Source,
     path: PathBuf,
     sha256: String,
@@ -448,9 +483,14 @@ impl FastAfdTable {
             for &column in &columns[4..=8] {
                 reader.require_signed_int64(column)?;
             }
+            for &column in columns[..4].iter().chain(&columns[9..]) {
+                reader.require_utf8(column)?;
+            }
             let latency = reader.col("latency_ms")?;
             let metadata = reader.col("capture_json")?;
             let source = reader.col("source_json")?;
+            reader.require_utf8(metadata)?;
+            reader.require_utf8(source)?;
             let mut entries = Vec::new();
             let mut origin = None;
             for row in reader.rows()? {
@@ -471,7 +511,7 @@ impl FastAfdTable {
                         },
                     );
                 }
-                let capture: ParquetCapture = serde_json::from_str(&row.str_owned(metadata)?)
+                let capture: ParquetCapture = object_from_str(&row.str_owned(metadata)?)
                     .map_err(|e| invalid(e.to_string()))?;
                 entries.push(Entry {
                     key: serde_json::from_value(Value::Object(key))
@@ -485,7 +525,7 @@ impl FastAfdTable {
             Document {
                 schema: "aisimulate.fastafd-moe-stage.v1".into(),
                 lookup_policy: "exact-only".into(),
-                source: serde_json::from_str(
+                source: object_from_str(
                     &origin.ok_or_else(|| invalid("empty FastAFD parquet table"))?,
                 )
                 .map_err(|e| invalid(e.to_string()))?,
@@ -496,7 +536,7 @@ impl FastAfdTable {
         document.validate()?;
         let id = config.afd.as_ref().unwrap();
         let shape = format!("{}A{}F", id.attention_gpus, id.ffn_gpus);
-        let mut entries: BTreeMap<u32, Vec<Entry>> = BTreeMap::new();
+        let mut entries: BTreeMap<u32, Vec<PreparedEntry>> = BTreeMap::new();
         for entry in document.entries {
             let k = &entry.key;
             if k.model_path == config.model
@@ -514,10 +554,17 @@ impl FastAfdTable {
                     .as_ref()
                     .is_none_or(|q| q == &k.moe_precision)
             {
+                let ffn_ms =
+                    entry.latency_ms / (f64::from(k.moe_layers) * f64::from(k.microbatches));
+                if !ffn_ms.is_finite() || ffn_ms <= 0.0 {
+                    return Err(invalid(
+                        "FastAFD normalized per-unit latency must be finite and positive",
+                    ));
+                }
                 entries
                     .entry(k.logical_batch_per_source_rank)
                     .or_default()
-                    .push(entry);
+                    .push(PreparedEntry { entry, ffn_ms });
             }
         }
         if entries.is_empty() {
@@ -541,6 +588,7 @@ impl FastAfdTable {
     pub(crate) fn precision(&self) -> &str {
         // Construction retains exactly one batch and one qualified capture.
         &self.entries.first_key_value().unwrap().1[0]
+            .entry
             .key
             .moe_precision
     }
@@ -555,17 +603,11 @@ impl FastAfdTable {
                 "several FastAFD split MoE stage measurements match; set engine.moe_quant_mode to pick the profile precision",
             ));
         }
-        let e = &matches[0];
+        let e = &matches[0].entry;
         let c = &e.measurement;
         let s = &self.source;
-        let ffn_ms = e.latency_ms / (f64::from(e.key.moe_layers) * f64::from(e.key.microbatches));
-        if !ffn_ms.is_finite() || ffn_ms <= 0.0 {
-            return Err(invalid(
-                "FastAFD normalized per-unit latency must be finite and positive",
-            ));
-        }
         Ok(FastAfdStageEstimate {
-            ffn_ms,
+            ffn_ms: matches[0].ffn_ms,
             num_layers: e.key.moe_layers,
             stage: json!({"profile_path":self.path,"profile_sha256":self.sha256,"key":e.key,"latency_ms":e.latency_ms,
                 "provider":"fastafd","schema":"aisimulate.fastafd-moe-stage.v1","repository":s.repository,"source_commit":s.commit,"benchmark":s.benchmark,"boundary":s.boundary,"boundary_components":s.boundary_components,"timed_span":s.timed_span,"microbatch_split":s.microbatch_split,
@@ -676,8 +718,9 @@ mod tests {
         let mut document = fixture_document();
         document["entries"][0]["latency_ms"] = json!(f64::from_bits(1));
         std::fs::write(file.path(), parquet_snapshot(&document)).unwrap();
-        let model = ForwardPassPerfModel::best_available(config).unwrap();
-        let error = model.estimate_fastafd_stage(128).unwrap_err().to_string();
+        let error = ForwardPassPerfModel::best_available(config)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("normalized per-unit latency"), "{error}");
     }
 
@@ -805,14 +848,14 @@ mod tests {
         float: bool,
         duplicate_latency: bool,
     ) -> bytes::Bytes {
-        parquet_snapshot_with_count_annotation(document, float, duplicate_latency, None)
+        parquet_snapshot_with_annotation(document, float, duplicate_latency, None)
     }
 
-    fn parquet_snapshot_with_count_annotation(
+    fn parquet_snapshot_with_annotation(
         document: &Value,
         float: bool,
         duplicate_latency: bool,
-        count_annotation: Option<(&str, &str)>,
+        column_annotation: Option<(&str, &str)>,
     ) -> bytes::Bytes {
         use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, FloatType, Int64Type};
         use parquet::file::properties::WriterProperties;
@@ -852,7 +895,7 @@ mod tests {
                 } else {
                     "BINARY"
                 };
-                let logical_type = if let Some((column, annotation)) = count_annotation
+                let logical_type = if let Some((column, annotation)) = column_annotation
                     && name == column
                 {
                     annotation
@@ -923,7 +966,7 @@ mod tests {
             ] {
                 std::fs::write(
                     file.path(),
-                    parquet_snapshot_with_count_annotation(
+                    parquet_snapshot_with_annotation(
                         &fixture_document(),
                         false,
                         false,
@@ -937,6 +980,46 @@ mod tests {
                     assert!(error.contains(column), "{error}");
                     assert!(error.contains("must be signed INT64"), "{error}");
                     assert!(error.contains(file.path().to_str().unwrap()), "{error}");
+                } else {
+                    // Synthetic 12 ms / (three layers * two microbatches).
+                    assert_eq!(
+                        model.unwrap().estimate_fastafd_stage(128).unwrap().ffn_ms,
+                        2.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_stage_requires_utf8_descriptors() {
+        let (file, config) = fixture();
+        for column in [
+            "model_path",
+            "system",
+            "stage",
+            "topology",
+            "moe_backend",
+            "moe_precision",
+            "capture_json",
+            "source_json",
+        ] {
+            for annotation in ["", " (ENUM)", " (UTF8)", " (STRING)"] {
+                std::fs::write(
+                    file.path(),
+                    parquet_snapshot_with_annotation(
+                        &fixture_document(),
+                        false,
+                        false,
+                        Some((column, annotation)),
+                    ),
+                )
+                .unwrap();
+                let model = ForwardPassPerfModel::best_available(config.clone());
+                if annotation.is_empty() || annotation.contains("ENUM") {
+                    let error = model.unwrap_err().to_string();
+                    assert!(error.contains(column), "{error}");
+                    assert!(error.contains("must be UTF-8 text"), "{error}");
                 } else {
                     // Synthetic 12 ms / (three layers * two microbatches).
                     assert_eq!(

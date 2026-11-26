@@ -177,6 +177,33 @@ impl<R: ChunkReader + 'static> PerfReader<R> {
         Ok(())
     }
 
+    /// ENUM and JSON byte arrays can also surface as strings in the record
+    /// reader. FastAFD identity and metadata columns require UTF8 descriptors.
+    pub(crate) fn require_utf8(&self, column: usize) -> Result<(), AicError> {
+        let descriptor = self
+            .file_reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .column(column);
+        let utf8 = match descriptor.logical_type_ref() {
+            Some(LogicalType::String) => matches!(
+                descriptor.converted_type(),
+                ConvertedType::NONE | ConvertedType::UTF8
+            ),
+            None => descriptor.converted_type() == ConvertedType::UTF8,
+            _ => false,
+        };
+        if descriptor.physical_type() != PhysicalType::BYTE_ARRAY || !utf8 {
+            return Err(AicError::PerfDatabase(format!(
+                "FastAFD metadata or identity column {:?} must be UTF-8 text at {}",
+                descriptor.name(),
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Iterate over every row. Errors are surfaced per-row so loaders can
     /// distinguish a single corrupt row from a wholesale file failure.
     pub fn rows(&self) -> Result<impl Iterator<Item = Result<PerfRow, AicError>> + '_, AicError> {

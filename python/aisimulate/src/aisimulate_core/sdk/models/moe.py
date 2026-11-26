@@ -390,7 +390,7 @@ class MOEModel(BaseModel):
             backend_name=self._backend_name,
             inference_phase="generation",
             model_family=self.model_family,
-            gpus_per_node=self._gpus_per_node,
+            gpus_per_node=None,
         )
         model.context_ops = block_ops
         model.generation_ops = block_ops

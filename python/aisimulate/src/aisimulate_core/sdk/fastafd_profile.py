@@ -168,15 +168,33 @@ class FastAFDMoEStageProfile:
                     codec = row_group.column(column).compression
                     if codec not in _PARQUET_CODECS:
                         raise ValueError(f"unsupported FastAFD Parquet codec: {codec}")
-            table = pq.read_table(pa.BufferReader(raw))
-            for name in ("capture_json", "source_json"):
-                if table.schema.field(name).type not in (pa.string(), pa.large_string()):
-                    raise ValueError(f"FastAFD metadata column {name!r} must be UTF-8 text")
-            for name in sorted(_COUNT_FIELDS):
-                if table.schema.field(name).type != pa.int64():
-                    raise ValueError(f"FastAFD count column {name!r} must be signed INT64")
-            if table.schema.field("latency_ms").type not in (pa.float32(), pa.float64()):
-                raise ValueError("FastAFD latency_ms column must be FLOAT or DOUBLE")
+            # Parquet descriptors are authoritative for both readers. Arrow's
+            # optional schema hint must not reinterpret integer counts as e.g.
+            # durations that the native Parquet reader does not observe.
+            columns = {metadata.schema.column(i).name: metadata.schema.column(i) for i in range(metadata.num_columns)}
+            if len(columns) != metadata.num_columns:
+                raise ValueError("duplicate parquet column")
+            fields = []
+            for name in sorted(_KEY_FIELDS | {"latency_ms", "capture_json", "source_json"}):
+                column = columns[name]
+                if name in _COUNT_FIELDS:
+                    if (
+                        column.physical_type != "INT64"
+                        or column.converted_type not in {"NONE", "INT_64"}
+                        or column.logical_type.type not in {"NONE", "INT"}
+                    ):
+                        raise ValueError(f"FastAFD count column {name!r} must be signed INT64")
+                    data_type = pa.int64()
+                elif name == "latency_ms":
+                    if column.physical_type not in {"FLOAT", "DOUBLE"}:
+                        raise ValueError("FastAFD latency_ms column must be FLOAT or DOUBLE")
+                    data_type = pa.float32() if column.physical_type == "FLOAT" else pa.float64()
+                else:
+                    if column.physical_type != "BYTE_ARRAY" or column.logical_type.type != "STRING":
+                        raise ValueError(f"FastAFD metadata or identity column {name!r} must be UTF-8 text")
+                    data_type = pa.string()
+                fields.append(pa.field(name, data_type))
+            table = pq.read_table(pa.BufferReader(raw), schema=pa.schema(fields))
             rows = table.to_pylist()
             if not rows:
                 raise ValueError("FastAFD profile entries must be a non-empty list")
@@ -253,6 +271,9 @@ class FastAFDMoEStageProfile:
         if any(entry.source != self.source for entry in self.entries):
             raise ValueError("mixed FastAFD source provenance")
         rows = []
+        entries = []
+        source = asdict(self.source)
+        source["boundary_components"] = list(source["boundary_components"])
         for entry in self.entries:
             capture = {
                 "model_profile": entry.model_profile,
@@ -260,6 +281,7 @@ class FastAFDMoEStageProfile:
                 "validation": {"stable": True, "correctness": entry.correctness},
             }
             capture["measurement"]["scope"] = "complete_moe_stage"
+            entries.append({**capture, "key": asdict(entry.key), "latency_ms": entry.latency_ms})
             rows.append(
                 {
                     **asdict(entry.key),
@@ -268,6 +290,9 @@ class FastAFDMoEStageProfile:
                     "source_json": json.dumps(asdict(self.source), sort_keys=True),
                 }
             )
+        self._validate_document(
+            {"schema": FASTAFD_PROFILE_SCHEMA, "lookup_policy": "exact-only", "source": source, "entries": entries}
+        )
         schema = pa.schema(
             [
                 ("model_path", pa.string()),
@@ -346,6 +371,10 @@ def _object(value: Any, fields: set[str], name: str) -> dict[str, Any]:
 def _text(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{name} must be valid UTF-8 text") from exc
     return value.strip()
 
 

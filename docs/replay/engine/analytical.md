@@ -48,7 +48,7 @@ engine:
 | `engine.afd.pipeline_model` | `optimistic` | `{choices: [optimistic, conservative]}` | `optimistic`, `conservative` or `serial`. |
 | `engine.afd.comm_overhead_factor` | `1.0` | fixed | Positive factor on A/F communication. Must be `1.0` with `fastafd_profile_path`. |
 | `engine.afd.boundary_on_attn` | `true` | fixed | A/F boundary convention. |
-| `engine.afd.fastafd_profile_path` | `null` | Prediction only | Measured FastAFD split MoE stage; see [below](#measured-fastafd-moe-stage). Requires `phase: decode`, `tp_a: 1`, `f_moe_ep_size` equal to the F GPU count, and `boundary_on_attn: true`. Backend version aliases are pinned before measurement. |
+| `engine.afd.fastafd_profile_path` | `null` | Prediction only | Measured FastAFD split MoE stage; see [below](#measured-fastafd-moe-stage). Requires `phase: decode`, `tp_a: 1`, `f_moe_ep_size` equal to the F GPU count, and `boundary_on_attn: true`. Hardware facts, default versions and version aliases use the attention data roots. |
 | `engine.afd.fastafd_moe_backend` | `null` | Prediction only | Required with `fastafd_profile_path`; `megamoe` or `deepep_deepgemm`. |
 | `engine.moe_quant_mode` | `null` | FastAFD prediction only | Exact profile `moe_precision` selector; required when otherwise matching entries differ in precision. Also qualifies F memory at the selected precision. Does not override attention or companion-worker timing. Unsupported for AFD without a FastAFD profile. |
 | `engine.afd.max_af_ratio`, `max_candidates` | `4.0`, `10000` | Recommend only | Bounds on the generated topology space. |
@@ -99,6 +99,8 @@ both prediction configuration validation and the direct provider API.
 Public `engine.backend_version` slot aliases (`current`, `previous`, `next`)
 are resolved to a literal version before FastAFD stage construction. The A-side
 model and companion worker use that same pinned version; unavailable slots fail.
+An omitted version and the hardware node width are resolved from the same data
+roots as attention, including environment and SDK root overrides.
 A keeps the attention provider's
 A-side compute without its own combine term and adds the router, which FastAFD
 runs on the A side outside the measured stage. The attention provider must report
@@ -152,8 +154,11 @@ with the provider's attention total (relative tolerance `1e-9`, absolute toleran
 differ only in `moe_precision`, set `engine.moe_quant_mode` to the exact profile
 precision, for example `fp8`; an unset selector is ambiguous, and an unmeasured
 precision is infeasible. In FastAFD prediction this selects only the measured
-stage, leaving attention and companion-worker timing unchanged. Other engine
-model controls remain unsupported for AFD. The profile entry, its producer and
+stage, leaving attention and companion-worker timing unchanged.
+Native `nvfp4` hardware classification requires `gpu.sm_version` in the selected
+system specification; missing architecture data is an error before remapping
+precision. Ordinary BF16/FP8 runs on non-CUDA systems do not require an SM version.
+Other engine model controls remain unsupported for AFD. The profile entry, its producer and
 the attention composition are recorded in the measurement provenance. FastAFD
 is not a runtime dependency.
 

@@ -1216,6 +1216,11 @@ class Task:
         # runtimes dequantize to BF16 before the MMA. The transfer ladder models
         # the Marlin-class memory savings via the (0.5625, 1) util-level entry.
         for role in roles:
+            if (
+                self._role_attr(role, "gemm_quant_mode") != common.GEMMQuantMode.nvfp4
+                and self._role_attr(role, "moe_quant_mode") != common.MoEQuantMode.nvfp4
+            ):
+                continue
             system = self._role_attr(role, "system_name")
             if not is_blackwell_system(system):
                 if self._role_attr(role, "gemm_quant_mode") == common.GEMMQuantMode.nvfp4:

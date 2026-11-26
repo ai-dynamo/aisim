@@ -973,9 +973,6 @@ def resolve_nvfp4_for_system(
     """
     from aisimulate_core.sdk.perf_database import is_blackwell_system
 
-    if is_blackwell_system(system_name, systems_paths=systems_paths):
-        return  # native FP4 TC — nvfp4 stays as-is
-
     gemm_q = model_config.gemm_quant_mode
     moe_q = model_config.moe_quant_mode
     if (gemm_q is None or moe_q is None) and model_path:
@@ -989,6 +986,13 @@ def resolve_nvfp4_for_system(
             gemm_q = inferred.get("gemm_quant_mode")
         if moe_q is None:
             moe_q = resolve_vllm_moe_execution_mode(inferred.get("moe_quant_mode"), backend_name, architecture)
+
+    # Only native FP4 needs a CUDA architecture decision. Non-CUDA systems
+    # such as B60 have no SM version and still support ordinary BF16/FP8 runs.
+    if gemm_q != common.GEMMQuantMode.nvfp4 and moe_q != common.MoEQuantMode.nvfp4:
+        return
+    if is_blackwell_system(system_name, systems_paths=systems_paths):
+        return  # native FP4 TC — nvfp4 stays as-is
 
     if gemm_q == common.GEMMQuantMode.nvfp4:
         model_config.gemm_quant_mode = common.GEMMQuantMode.nvfp4_wo

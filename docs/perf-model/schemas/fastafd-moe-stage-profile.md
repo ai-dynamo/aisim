@@ -23,6 +23,13 @@ capture metadata; selection and latency normalization run in Rust through the
 Both Python inspection and native loading reject other count encodings, including
 INT32 and UINT32. Counts must fit in an unsigned 32-bit value; only `mtp_nextn`
 may be zero.
+The Parquet column descriptors are authoritative: optional `ARROW:schema`
+metadata cannot reinterpret signed INT64 counts. For example, an Arrow duration
+hint on an unannotated INT64 column is read as the same integer count by both
+entrypoints. Timestamp-annotated columns are rejected. Identity and metadata
+text columns require STRING/UTF8 descriptors; ENUM byte arrays are rejected.
+The JSON metadata records must be objects, not positional arrays, and text must
+be valid UTF-8.
 Topology components in `ep<N>` and `<A>A<F>F` must also be positive u32 values.
 Both loaders trim leading and trailing whitespace from key text using Python's
 `str.strip()` rule: Unicode White_Space plus ASCII separators U+001C–U+001F.
