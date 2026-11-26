@@ -1812,8 +1812,10 @@ def _run_prefill_point(
     point_clock.mark("metadata")
     # MSA-only: the helper writes M3's fused KV+index history through
     # MiniMaxSparseAttnBackend's pool writer and reads `.attn`/`.num_kv_heads`/
-    # `.idx_head_dim`, which a QSA layer does not have. QSA keeps the zero fill
-    # its accepted C3.3 rows were measured with (see the module docstring).
+    # `.idx_head_dim`, which a QSA layer does not have. A prefixed QSA point
+    # therefore reads its prefix from recycled pages (see the module docstring's
+    # measurement deviation); that is the condition the accepted C3.3 rows were
+    # measured under.
     if attention_type != "qsa":
         _initialize_msa_history(model_runner, attention_module, forward_batch, prefix_len)
     point_clock.mark("history")
@@ -1963,7 +1965,8 @@ def _run_decode_point(
     # QSA route labels its own kernel source from the backend it routed to.
     max_seqlen_k = int(sparse._max_seqlen_k) if sparse is not None else 0
     point_clock.mark("metadata")
-    # MSA-only, same reason as the context path.
+    # MSA-only, same reason as the context path: a QSA decode point starts on
+    # the pages the allocator hands it, not on a seeded history.
     if attention_type != "qsa":
         _initialize_msa_history(model_runner, attention_module, forward_batch, kv_len)
     point_clock.mark("history")
