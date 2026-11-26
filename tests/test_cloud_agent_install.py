@@ -55,7 +55,7 @@ rustup() {
 }
 curl() {
   printf 'curl %s\n' "$*" >> "$COMMAND_LOG"
-  [[ "$*" == '-LsSf https://astral.sh/uv/0.13.10/install.sh' ]] || return 6
+  [[ "$*" == '-LsSf https://astral.sh/uv/install.sh' ]] || return 6
   printf 'touch "$BOOTSTRAP_STATE/uv-ready"\n'
 }
 sudo() {
@@ -88,7 +88,7 @@ def _bootstrap(tmp_path, *, uv="compatible", rust="1.96.1", toolchain=None, dire
 @pytest.mark.parametrize("uv", ["legacy", "missing", "project-only", "extra-only"])
 def test_bootstrap_replaces_incompatible_uv_and_is_repeatable(tmp_path, uv):
     commands = _bootstrap(tmp_path, uv=uv)
-    assert commands.count("curl -LsSf https://astral.sh/uv/0.13.10/install.sh") == 1
+    assert commands.count("curl -LsSf https://astral.sh/uv/install.sh") == 1
     assert commands.count(f"sudo ln -sf {Path.home()}/.local/bin/uv /usr/local/bin/uv") == 1
     assert len([line for line in commands if line.startswith("sync ")]) == 2
 

@@ -53,6 +53,9 @@ runs:
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
         version: "0.13.10"
+        # setup-uv v8.2.0 has checksums only up to uv 0.11.18. This is the sha256 of
+        # uv-aarch64-apple-darwin.tar.gz for the version above; change both together.
+        checksum: "e419bf07533bdbf48795fc793601c834dd79db57a8c49ce8e25cfe3a8639958d"
         enable-cache: false
 
     - name: Create isolated macOS Python environment
