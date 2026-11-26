@@ -541,6 +541,15 @@ pub(super) fn check_layer_specs(group: &Value) -> Result<(), AicError> {
 
 /// UniformTypeKVCacheSpecs records each layer's spec. Older probes can record a shared
 /// attention spec only on the group, or name a stock decoder class without its spec.
+fn ordinary_spec(spec: &str) -> bool {
+    matches!(
+        spec,
+        "vllm.v1.kv_cache_interface.FullAttentionSpec"
+            | "vllm.v1.kv_cache_interface.SlidingWindowSpec"
+            | "vllm.v1.kv_cache_interface.SinkFullAttentionSpec"
+    )
+}
+
 pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)> {
     let names = group["layer_names"].as_array();
     let legacy = group["layer_classes"]
@@ -563,12 +572,7 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
                 spec == Some("vllm.v1.kv_cache_interface.SlidingWindowSpec")
                     && group["layer_classes"][name] == "vllm.models.inkling.nvidia.sconv_swa_attn.InklingConvState"
             } else { match spec {
-                Some(spec) => matches!(
-                    spec,
-                    "vllm.v1.kv_cache_interface.FullAttentionSpec"
-                        | "vllm.v1.kv_cache_interface.SlidingWindowSpec"
-                        | "vllm.v1.kv_cache_interface.SinkFullAttentionSpec"
-                ),
+                Some(spec) => ordinary_spec(spec),
                 None => matches!(
                     group["layer_classes"][name].as_str(),
                     Some(
@@ -583,12 +587,12 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-pub(super) struct StateRegions {
+pub(super) struct LayerRegions {
     possible: BTreeSet<usize>,
     required: BTreeSet<usize>,
 }
 
-impl StateRegions {
+impl LayerRegions {
     pub(super) fn new(possible: BTreeSet<usize>, first_attention: Option<usize>) -> Self {
         // NIXL visits the native mixers in layer order and keeps the first name at each address.
         let required = possible
@@ -598,6 +602,17 @@ impl StateRegions {
             .into_iter()
             .collect();
         Self { possible, required }
+    }
+
+    pub(super) fn first_possible(&self) -> Option<usize> {
+        self.possible.first().copied()
+    }
+
+    pub(super) fn exact(names: BTreeSet<usize>) -> Self {
+        Self {
+            required: names.clone(),
+            possible: names,
+        }
     }
 
     pub(super) fn merge(&mut self, other: &Self) {
@@ -610,13 +625,28 @@ impl StateRegions {
     }
 }
 
+pub(super) fn nemotron_owners(names: &BTreeSet<String>, suffix: &str) -> Option<LayerRegions> {
+    let mut indices = BTreeSet::new();
+    for name in names {
+        let (index, mixer) = name.strip_prefix("model.layers.")?.split_once('.')?;
+        if !matches!(mixer, "mixer" | "mixer.attn") {
+            return None;
+        }
+        if mixer == suffix {
+            indices.insert(index.parse().ok()?);
+        }
+    }
+    Some(LayerRegions::exact(indices))
+}
+
 /// A Mamba position is a possible region name. An aliased state can never replace an
 /// earlier mixer at its address. The GPU probe retains the starts of its state views.
 pub(super) fn nemotron_state_regions(
     rank: &Value,
     groups: &[Value],
     host: bool,
-) -> Option<StateRegions> {
+    owners: Option<&BTreeSet<String>>,
+) -> Option<LayerRegions> {
     let mut names = BTreeMap::new();
     let mut first_attention = None;
     for g in groups {
@@ -646,7 +676,10 @@ pub(super) fn nemotron_state_regions(
     if names.is_empty() {
         return None;
     }
-    let mut regions = StateRegions::new(names.keys().copied().collect(), first_attention);
+    if let Some(exact) = owners.and_then(|n| nemotron_owners(n, "mixer")) {
+        return Some(exact);
+    }
+    let mut regions = LayerRegions::new(names.keys().copied().collect(), first_attention);
     if host {
         return Some(regions);
     }
@@ -715,9 +748,160 @@ fn contiguous_page(
         .then_some(u128::from(bytes))
 }
 
-/// Disjoint ordinary cache pages register each layer under its own name. Two
-/// pages may occupy separate spans within the same strided allocation.
+/// The tagged NIXL connector retains the first layer name at each registered
+/// address. Numeric substrings sort as integers, including double-digit layers.
+fn layer_order(left: &str, right: &str) -> std::cmp::Ordering {
+    fn parts(name: &str) -> impl Iterator<Item = (bool, usize, &[u8])> {
+        name.as_bytes()
+            .chunk_by(|a, b| a.is_ascii_digit() == b.is_ascii_digit())
+            .map(|part| {
+                if part[0].is_ascii_digit() {
+                    let digits = &part[part.iter().take_while(|&&b| b == b'0').count()..];
+                    (false, digits.len(), digits)
+                } else {
+                    (true, 0, part)
+                }
+            })
+    }
+    parts(left).cmp(parts(right))
+}
+
+fn attention_address(
+    group: &Value,
+    name: &str,
+    view: &Value,
+    bytes: u64,
+    blocks: u64,
+) -> Option<u64> {
+    let start = view["storage_offset_bytes"].as_u64()?;
+    let shape = view["shape"].as_array()?;
+    let steps = view["stride_bytes"].as_array()?;
+    let item = view["element_size_bytes"].as_u64().filter(|&b| b > 0)?;
+    if view["block_axis"] != 0 || shape.len() <= 1 || shape.len() != steps.len() {
+        return None;
+    }
+    let dims = shape
+        .iter()
+        .zip(steps)
+        .map(|(d, s)| Some((d.as_u64()?, s.as_u64()?)))
+        .collect::<Option<Vec<_>>>()?;
+    if u128::from(start).checked_add(view_span(&dims, item)?)? > u128::from(bytes) {
+        return None;
+    }
+    let (num, stride) = dims[0];
+    let kernel = view["kernel_block_size_tokens"]
+        .as_u64()
+        .filter(|&n| n > 0)?;
+    let pool = group["block_size_tokens"].as_u64()?;
+    if stride == 0 || !pool.is_multiple_of(kernel) || blocks.checked_mul(pool / kernel)? != num {
+        return None;
+    }
+    let page = group["layer_specs"][name]["page_size_bytes"]
+        .as_u64()
+        .or_else(|| shared_spec(group).and(group["spec_page_size_bytes"].as_u64()))?;
+    if page == 0 || pool == 0 || !page.is_multiple_of(pool / kernel) {
+        return None;
+    }
+    let segment = num.checked_mul(stride)?;
+    let block_major = bytes.checked_sub(segment).is_some_and(|tail| tail < stride);
+    Some(if block_major {
+        if contiguous_page(group, name, view, &dims[1..], item).is_some() {
+            start
+        } else {
+            0
+        }
+    } else {
+        // The connector can split a plane-major cache into several regions.
+        // A single observed segment determines its sole registration address.
+        if dims.iter().try_fold(item, |n, (d, _)| n.checked_mul(*d))? != segment {
+            return None;
+        }
+        start
+    })
+}
+
+fn gpu_region_owners(rank: &Value) -> Option<BTreeSet<String>> {
+    let cache = &rank["cache"];
+    let block_first = block_first_probe(rank);
+    let blocks = cache["num_blocks"].as_u64().filter(|&n| n > 0)?;
+    let mut groups = BTreeMap::new();
+    for group in cache["groups"].as_array()? {
+        for name in group["layer_names"].as_array()? {
+            if groups.insert(name.as_str()?, group).is_some() {
+                return None;
+            }
+        }
+    }
+    if groups.is_empty() || groups.len() != cache["layer_tensors"].as_object()?.len() {
+        return None;
+    }
+    let count = groups.len();
+    let has_state = groups.values().any(|g| g["kind"] == "state");
+    let mut owners: BTreeMap<(&str, u64), &str> = BTreeMap::new();
+    for allocation in cache["tensor_allocations"].as_array()? {
+        let storage_id = allocation["storage_id"].as_str()?;
+        let bytes = cache["storages"]
+            .as_array()?
+            .iter()
+            .find(|s| s["storage_id"] == storage_id)?["size_bytes"]
+            .as_u64()?;
+        for layer in allocation["layers"].as_array()? {
+            let name = layer.as_str()?;
+            let group = groups.remove(name)?;
+            let views = layer_views(&cache["layer_tensors"][name], block_first);
+            let first = views.first()?;
+            if first["storage_id"] != storage_id || !on_gpu(cache, allocation, first, block_first) {
+                return None;
+            }
+            let start = first["storage_offset_bytes"].as_u64()?;
+            let address = match group["kind"].as_str()? {
+                "state"
+                    if concrete_spec(group, name)? == "vllm.v1.kv_cache_interface.MambaSpec" =>
+                {
+                    // The observer retains the typed state views of the same raw cache.
+                    if !views.iter().all(|v| {
+                        v["storage_id"] == storage_id
+                            && v["storage_offset_bytes"]
+                                .as_u64()
+                                .is_some_and(|n| n >= start && n < bytes)
+                    }) {
+                        return None;
+                    }
+                    start
+                }
+                "attention" if views.len() == 1 && ordinary_spec(concrete_spec(group, name)?) => {
+                    attention_address(group, name, first, bytes, blocks)?
+                }
+                _ => return None,
+            };
+            let owner = owners.entry((storage_id, address)).or_insert(name);
+            match layer_order(name, owner) {
+                std::cmp::Ordering::Less => *owner = name,
+                std::cmp::Ordering::Equal if name != *owner => return None,
+                _ => {}
+            }
+        }
+    }
+    (groups.is_empty() && (has_state || owners.len() < count))
+        .then(|| owners.into_values().map(str::to_owned).collect())
+}
+
 pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
+    disjoint_layers(rank).or_else(|| {
+        if rank
+            .pointer("/resolved_config/kv_transfer_config/kv_buffer_device")
+            .and_then(Value::as_str)
+            == Some("cpu")
+        {
+            return None;
+        }
+        gpu_region_owners(rank)
+    })
+}
+
+/// Disjoint ordinary cache pages register each layer under its own name. Older
+/// probes can establish this even when the full shaped view is unavailable.
+fn disjoint_layers(rank: &Value) -> Option<BTreeSet<String>> {
     let cache = &rank["cache"];
     let block_first = block_first_probe(rank);
     let groups = cache["groups"].as_array()?;
@@ -1075,12 +1259,17 @@ mod tests {
                 };
                 tensor["storage_offset_bytes"] = json!(16_384);
                 tensor["stride_bytes"] = json!([32_768, 512, 1024, 2]);
-                assert!(
-                    registered_layers(&interleaved).is_none(),
-                    "non-contiguous rows alias the backing"
+                assert_eq!(
+                    registered_layers(&interleaved),
+                    Some(BTreeSet::from(["a".to_owned()])),
+                    "the shared row keeps its first registration"
                 );
                 rank["cache"]["layer_tensors"]["b"] = view(0);
-                assert!(registered_layers(&rank).is_none(), "aliased {version}");
+                assert_eq!(
+                    registered_layers(&rank),
+                    Some(BTreeSet::from(["a".to_owned()])),
+                    "aliased {version}"
+                );
                 rank["cache"]["layer_tensors"]["b"] = view(layer_bytes);
                 let first = &mut rank["cache"]["layer_tensors"]["a"];
                 let first = if version == "0.32.0" {
@@ -1095,6 +1284,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn shared_attention_and_mamba_buffers_keep_the_first_name_at_each_address() {
+        let attention = "model.layers.0.mixer.attn";
+        let earlier = "model.layers.3.mixer";
+        let later = "model.layers.11.mixer";
+        let alias = "model.layers.4.mixer.attn";
+        let state = |start| {
+            json!([{"storage_id":"s", "storage_offset_bytes":start},
+                                   {"storage_id":"s", "storage_offset_bytes":start + 4}])
+        };
+        let page = |start| {
+            json!([{"storage_id":"s", "storage_offset_bytes":start,
+            "shape":[4,1,1,8], "stride_bytes":[16,16,16,2], "block_axis":0,
+            "element_size_bytes":2, "kernel_block_size_tokens":1}])
+        };
+        let mut rank = json!({"runtime":{"version":"0.33.0"}, "cache":{"num_blocks":4,
+            "groups":[{"kind":"attention", "layer_names":[attention,alias], "block_size_tokens":1,
+                "spec_type":"vllm.v1.kv_cache_interface.FullAttentionSpec", "spec_page_size_bytes":16},
+                {"kind":"state", "layer_names":[earlier,later],
+                "spec_type":"vllm.v1.kv_cache_interface.MambaSpec"}],
+            "storages":[{"storage_id":"s", "size_bytes":128, "device":"cuda:0"}],
+            "tensor_allocations":[{"layers":[later,alias,attention,earlier], "storage_id":"s"}],
+            "layer_tensors":{(attention):page(0),(earlier):state(64),(later):state(64),(alias):page(64)}}});
+        assert_eq!(
+            registered_layers(&rank),
+            Some(BTreeSet::from([attention.to_owned(), earlier.to_owned()]))
+        );
+        rank["cache"]["layer_tensors"][earlier] = state(0);
+        assert_eq!(
+            registered_layers(&rank),
+            Some(BTreeSet::from([attention.to_owned(), alias.to_owned()]))
+        );
+        rank["cache"]["layer_tensors"][later][1]["storage_id"] = json!("unobserved");
+        assert!(registered_layers(&rank).is_none());
     }
 
     #[test]

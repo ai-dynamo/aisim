@@ -167,6 +167,23 @@ fn record_memory_fraction(expected: &mut Value, entry: &Value) -> Result<(), Aic
     Ok(())
 }
 
+fn record_limits(expected: &mut Value, resources: &Value, entry: &Value) -> Result<(), AicError> {
+    record_memory_field(expected, &resources["runtime_memory"], "max_model_len")?;
+    for key in ["max_num_tokens", "max_batch_size"] {
+        record_memory_field(expected, resources, key)?;
+    }
+    for settings in [&entry["runtime_settings"], &entry["resolved_config"]] {
+        record_memory_field(expected, &settings["model_config"], "max_model_len")?;
+        for (key, serving) in [
+            ("max_num_tokens", "max_num_batched_tokens"),
+            ("max_batch_size", "max_num_seqs"),
+        ] {
+            record_field(expected, key, &settings["scheduler_config"][serving])?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn record_cell_memory(
     cell: &Value,
     entry: &Value,
@@ -191,19 +208,7 @@ pub(super) fn record_cell_memory(
         return Err(super::conflict("kv_cache_bytes"));
     }
     record_memory_settings(expected, memory)?;
-    record_memory_field(expected, memory, "max_model_len")?;
-    for key in ["max_num_tokens", "max_batch_size"] {
-        record_memory_field(expected, cell, key)?;
-    }
-    for settings in [&entry["runtime_settings"], &entry["resolved_config"]] {
-        record_memory_field(expected, &settings["model_config"], "max_model_len")?;
-        for (key, serving) in [
-            ("max_num_tokens", "max_num_batched_tokens"),
-            ("max_batch_size", "max_num_seqs"),
-        ] {
-            record_field(expected, key, &settings["scheduler_config"][serving])?;
-        }
-    }
+    record_limits(expected, cell, entry)?;
     record_memory_fraction(expected, entry)?;
     if let Some(phase) = first_phase_settings(entry) {
         record_memory_settings(expected, phase)?;
@@ -219,8 +224,10 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
         evidence["schema_version"].as_str(),
         Some("aisimulate-onboarding-runtime-probe/v1" | "aisimulate-onboarding-runtime-probe/v2")
     ) {
-        let memory = &evidence["observed_resources"]["runtime_memory"];
+        let resources = &evidence["observed_resources"];
+        let memory = &resources["runtime_memory"];
         record_memory_settings(&mut expected, memory)?;
+        record_limits(&mut expected, resources, &evidence["nixl_observation"])?;
         let recorded = memory["kv_cache_bytes"].as_u64();
         if let Some(change) = evidence["user_overrides"].get("runtime_memory.kv_cache_bytes") {
             if change["observed"].as_u64() != recorded
@@ -238,6 +245,7 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
             recorded
         }
     } else if identified_source(evidence) {
+        record_limits(&mut expected, &Value::Null, evidence)?;
         record_memory_fraction(&mut expected, evidence)?;
         if let Some(phase) = first_phase_settings(evidence) {
             record_memory_settings(&mut expected, phase)?;
@@ -934,6 +942,21 @@ mod tests {
         let mut edited = cell.clone();
         edited["max_num_tokens"] = json!(512);
         assert!(record_cell_memory(&edited, &entry, &Value::Null, &mut json!({})).is_err());
+    }
+
+    #[test]
+    fn selected_memory_retains_the_measured_limits_in_raw_and_draft_records() {
+        let settings = json!({"model_config":{"max_model_len":4096},"scheduler_config":{"max_num_batched_tokens":1024,"max_num_seqs":64}});
+        let limits = json!({"max_model_len":4096,"max_num_tokens":1024,"max_batch_size":64});
+        let raw = json!({"source":"runtime_observations","observation_schema":"aisimulate-runtime-observation/v1","runtime_settings":settings});
+        let draft = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v2","observed_resources":{
+            "max_num_tokens":1024,"max_batch_size":64,"runtime_memory":{"max_model_len":4096}}});
+        assert_eq!(selected_memory(&raw).unwrap(), limits);
+        assert_eq!(selected_memory(&draft).unwrap(), limits);
+        assert_eq!(
+            selected_memory(&json!({"source":"runtime_observations"})).unwrap(),
+            json!({})
+        );
     }
 
     #[test]

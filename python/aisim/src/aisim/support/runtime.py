@@ -394,12 +394,21 @@ def _worker_attention_backends(evidence: dict[str, Any]) -> list:
     ]
 
 
-def _worker_observations(evidence: dict[str, Any], architecture: str | None = None) -> list:
+def _worker_observations(
+    evidence: dict[str, Any], architecture: str | None = None, *, checkpoint: Path | None = None
+) -> list:
     from aisim import _runtime
 
-    records = [
-        item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] in ("worker", "scheduler")
-    ]
+    records = []
+    for item in evidence["artifacts"]:
+        record = item["evidence"]
+        if record["kind"] not in ("worker", "scheduler"):
+            continue
+        if checkpoint is not None and (reference := record.get("launch", {}).get("model_config")):
+            # Preserve the observer's digest. Rust verifies the staged content against it.
+            launch = {**record["launch"], "model_config": {**reference, "path": str(checkpoint)}}
+            record = {**record, "launch": launch}
+        records.append(record)
     return json.loads(_runtime.nixl_worker_observations(json.dumps(records), architecture))
 
 
@@ -463,7 +472,10 @@ def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str, invent
         snapshot["worker_attention_backends"] = _worker_attention_backends(evidence)
     else:
         architecture = inventory.get("model_metadata", {}).get("architecture")
-        snapshot["worker_observations"] = _worker_observations(evidence, architecture)
+        staged = Path(inventory["observations_index"]).with_name("model-config.json")
+        snapshot["worker_observations"] = _worker_observations(
+            evidence, architecture, checkpoint=staged if staged.is_file() else None
+        )
         if version := evidence.get("runtime", {}).get("version"):
             snapshot["runtime"] = {"version": version}
         snapshot["worker_observations_sha256"] = _worker_observation_digest(snapshot, evidence, inventory, draft=True)

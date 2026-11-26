@@ -11,6 +11,7 @@
 
 mod heads;
 mod layout;
+mod registry;
 mod roster;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,16 +119,10 @@ pub(crate) struct TransferMetadata {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     hybrid_attention_positions: BTreeSet<Vec<usize>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    nemotron_state_regions: Option<layout::StateRegions>,
+    nemotron_state_regions: Option<layout::LayerRegions>,
 }
 
 impl TransferMetadata {
-    fn hybrid_pattern(config: &Value) -> Option<&str> {
-        config["hybrid_override_pattern"]
-            .as_str()
-            .filter(|p| !p.is_empty() && p.bytes().all(|c| matches!(c, b'*' | b'M' | b'-' | b'E')))
-    }
-
     fn configured(
         config: &Value,
         use_mla: Option<bool>,
@@ -137,12 +132,41 @@ impl TransferMetadata {
         let model = &config["model_config"];
         let resolved = &model["model_arch_config"];
         let checkpoint = heads::checkpoint(model, source);
-        let (top, text) = heads::HfConfig::observed(
+        let top = heads::HfConfig::observed(model, checkpoint.as_ref());
+        let names = resolved
+            .get("architectures")
+            .or_else(|| top.fields.get("architectures"));
+        let release = source
+            .pointer("/runtime/version")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                (source["source"] == "vllm_initialized_cache")
+                    .then(|| source["backend_version"].as_str())
+                    .flatten()
+            });
+        let model_impl = model["model_impl"].as_str().unwrap_or("auto");
+        let native = matches!(model_impl, "auto" | "vllm");
+        let registered = names
+            .filter(|_| native)
+            .and_then(Value::as_array)
+            .and_then(|names| {
+                registry::select(
+                    names.iter().map(Value::as_str),
+                    release,
+                    model_impl == "vllm",
+                    top.has_stock_model_lookup(),
+                )
+            });
+        let decoder = if native && names.is_none_or(Value::is_null) {
+            Decoder::inferred(top.fields, architecture)
+        } else {
+            registered.and_then(registry::Registration::decoder)
+        };
+        let text = top.text_config(
             model,
-            checkpoint.as_ref(),
             source["launch"]["model_config"].is_object(),
+            registered,
         );
-        let decoder = Decoder::observed(top.fields, architecture);
         let family = resolved["model_type"]
             .as_str()
             .or_else(|| top.fields["model_type"].as_str())
@@ -155,7 +179,7 @@ impl TransferMetadata {
                 .as_u64()
                 .or(configured_layers)
                 .or_else(|| {
-                    let pattern = Self::hybrid_pattern(top.fields)?;
+                    let pattern = heads::hybrid_pattern(top.fields)?;
                     (family.is_none()
                         && architecture.is_none()
                         && top.fields["num_hidden_layers"].as_u64() == Some(pattern.len() as u64))
@@ -174,27 +198,27 @@ impl TransferMetadata {
             ..Self::default()
         };
         if use_mla != Some(true) {
-            let ordered = top.fields["architectures"].is_array();
+            let ordered = names.is_some_and(Value::is_array);
             facts.uniform_attention = decoder.and_then(|d| d.physical_heads(top, text, ordered));
         }
         // NemotronHModel constructs its layers from the top-level HF pattern. A nested text
         // config and the separate hidden-layer count do not select its attention mixers.
         let top = top.fields;
         let top_family = top["model_type"].as_str();
-        let architectures = top.get("architectures");
-        if top_family.is_none_or(|name| name == "nemotron_h")
-            && architectures.is_none_or(|_| decoder == Some(Decoder::NemotronH))
-            && let Some(pattern) = Self::hybrid_pattern(top)
+        if native
+            && top_family.is_none_or(|name| name == "nemotron_h")
+            && (decoder == Some(Decoder::NemotronH) || (names.is_none() && decoder.is_none()))
+            && let Some(pattern) = heads::hybrid_pattern(top)
         {
             let positions = pattern
                 .match_indices('*')
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
-            facts.nemotron_state_regions = Some(layout::StateRegions::new(
+            facts.nemotron_state_regions = Some(layout::LayerRegions::new(
                 pattern.match_indices('M').map(|(i, _)| i).collect(),
                 positions.first().copied(),
             ));
-            if top_family == Some("nemotron_h") || architectures.is_some() {
+            if top_family == Some("nemotron_h") || names.is_some() {
                 facts.nemotron_attention_layers = Some(positions);
             } else {
                 facts.hybrid_attention_positions.insert(positions);
@@ -366,13 +390,16 @@ impl Worker {
             });
         let single_head_mla = mla_groups && use_mla == Some(true);
         let mut metadata = TransferMetadata::configured(config, use_mla, architecture, rank);
-        if let Some(regions) = groups.and_then(|g| layout::nemotron_state_regions(rank, g, host)) {
+        metadata.registered_layers = layout::registered_layers(rank);
+        if let Some(regions) = groups.and_then(|g| {
+            layout::nemotron_state_regions(rank, g, host, metadata.registered_layers.as_ref())
+        }) {
             metadata
                 .nemotron_state_regions
                 .get_or_insert_with(|| regions.clone())
                 .merge(&regions);
         }
-        metadata.registered_layers = layout::registered_layers(rank);
+
         let physical = if groups.is_some() {
             layout::from_strides(rank, &mut metadata.layer_heads)?
         } else {
@@ -779,7 +806,8 @@ impl NixlIdentity {
                 }
             }
             let common = Worker::observed(
-                &serde_json::json!({"resolved_config":config,"launch":entry["launch"]}),
+                &serde_json::json!({"resolved_config":config,"launch":entry["launch"],
+                    "runtime":entry["runtime"], "source": entry["source"], "backend_version":entry["backend_version"]}),
                 self.architecture.as_deref(),
             )?;
             if common.gpu_cache_layout.is_some()
@@ -1469,6 +1497,27 @@ impl NixlIdentity {
         Ok(identity)
     }
 
+    fn nemotron_attention_regions(&self) -> Option<layout::LayerRegions> {
+        if let Some(exact) = self
+            .metadata
+            .registered_layers
+            .as_ref()
+            .and_then(|names| layout::nemotron_owners(names, "mixer.attn"))
+        {
+            return Some(exact);
+        }
+        let logical = self.metadata.nemotron_attention_layers.as_ref()?;
+        let first_state = self
+            .metadata
+            .nemotron_state_regions
+            .as_ref()
+            .and_then(|r| r.first_possible());
+        Some(layout::LayerRegions::new(
+            logical.iter().copied().collect(),
+            first_state,
+        ))
+    }
+
     fn nemotron_decoder(&self) -> bool {
         self.metadata
             .uniform_attention
@@ -1521,22 +1570,7 @@ impl NixlIdentity {
             {
                 return Err(conflict("Mamba layer positions"));
             }
-            let mut positions = std::mem::take(&mut self.metadata.hybrid_attention_positions);
-            // The tagged NemotronH decoder registers each attention mixer under this name.
-            if let Some(names) = &self.metadata.registered_layers
-                && let Some(mut observed) = names
-                    .iter()
-                    .map(|name| {
-                        name.strip_prefix("model.layers.")?
-                            .strip_suffix(".mixer.attn")?
-                            .parse::<usize>()
-                            .ok()
-                    })
-                    .collect::<Option<Vec<_>>>()
-            {
-                observed.sort_unstable();
-                positions.insert(observed);
-            }
+            let positions = std::mem::take(&mut self.metadata.hybrid_attention_positions);
             for layers in positions {
                 if self
                     .metadata
@@ -1682,36 +1716,37 @@ impl NixlIdentity {
         {
             return Some(("cache region names", format!("{a:?}"), format!("{b:?}")));
         }
-        if self.nemotron_decoder()
-            && decode.nemotron_decoder()
-            && let (Some(a), Some(b)) = (
-                &self.metadata.nemotron_attention_layers,
-                &decode.metadata.nemotron_attention_layers,
-            )
-            && a != b
-        {
-            return Some((
-                "attention layer positions",
-                format!("{a:?}"),
-                format!("{b:?}"),
-            ));
-        }
-        if self.nemotron_decoder()
-            && decode.nemotron_decoder()
-            && let (Some(a), Some(b)) = (
-                &self.metadata.nemotron_state_regions,
-                &decode.metadata.nemotron_state_regions,
-            )
-        {
-            for (local, peer, transpose) in [(a, b, false), (b, a, true)] {
-                if let Some(i) = local.missing(peer) {
-                    let name = format!("model.layers.{i}.mixer");
-                    let missing = "absent".to_string();
-                    return Some(if transpose {
-                        ("Mamba layer positions", missing, name)
-                    } else {
-                        ("Mamba layer positions", name, missing)
-                    });
+        if self.nemotron_decoder() && decode.nemotron_decoder() {
+            let attention = (
+                self.nemotron_attention_regions(),
+                decode.nemotron_attention_regions(),
+            );
+            for (field, suffix, local, remote) in [
+                (
+                    "attention layer positions",
+                    "mixer.attn",
+                    attention.0.as_ref(),
+                    attention.1.as_ref(),
+                ),
+                (
+                    "Mamba layer positions",
+                    "mixer",
+                    self.metadata.nemotron_state_regions.as_ref(),
+                    decode.metadata.nemotron_state_regions.as_ref(),
+                ),
+            ] {
+                if let (Some(a), Some(b)) = (local, remote) {
+                    for (required, possible, transpose) in [(a, b, false), (b, a, true)] {
+                        if let Some(i) = required.missing(possible) {
+                            let name = format!("model.layers.{i}.{suffix}");
+                            let absent = "absent".to_owned();
+                            return Some(if transpose {
+                                (field, absent, name)
+                            } else {
+                                (field, name, absent)
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -2698,8 +2733,17 @@ mod tests {
             );
         }
         let layers = |n| model(json!({"model_type":"nemotron_h","num_hidden_layers":n}));
+        // NemotronH's setter ignores this scalar. A converter result records the actual count.
+        assert!(layers(3).mismatch(&layers(4)).is_none());
+        let converted = |n| {
+            observe(
+                json!({"runtime_settings":{"model_config":{"model_arch_config":{
+                    "model_type":"nemotron_h","total_num_hidden_layers":n}}}}),
+                "decode",
+            )
+        };
         assert_eq!(
-            layers(3).mismatch(&layers(4)).unwrap().0,
+            converted(3).mismatch(&converted(4)).unwrap().0,
             "num_hidden_layers"
         );
         assert!(layers(3).mismatch(&model(json!({}))).is_none());
@@ -2850,7 +2894,10 @@ mod tests {
         let settings = |overrides| json!({"model_config":{"hf_overrides":overrides}});
         let arch = Some("Qwen2ForCausalLM");
         let project = |v| TransferMetadata::configured(&settings(v), Some(false), arch, &source);
-        assert_eq!(project(json!({"head_dim":128})).model_heads.head_size, None);
+        assert_eq!(
+            project(json!({"head_dim":96})).model_heads.head_size,
+            Some(128)
+        );
         assert_eq!(
             project(json!({"text_config":{"head_dim":128}}))
                 .model_heads
@@ -2908,6 +2955,177 @@ mod tests {
                 .head_size,
             Some(64)
         );
+    }
+
+    #[test]
+    fn qwen_vl_initializes_the_text_model_before_serving_overrides() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (family, architecture) in [
+            ("qwen2_vl", "Qwen2VLForConditionalGeneration"),
+            ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
+        ] {
+            // A sparse draft can retain the ordered names and an outer scalar alone.
+            let sparse = |names: &[&str]| {
+                let settings =
+                    json!({"model_config":{"hf_overrides":{"architectures":names,"head_dim":96}}});
+                TransferMetadata::configured(
+                    &settings,
+                    Some(false),
+                    Some(architecture),
+                    &Value::Null,
+                )
+                .model_heads
+                .head_size
+            };
+            assert_eq!(sparse(&["UnregisteredModel", architecture]), None);
+            assert_eq!(sparse(&["Qwen2ForCausalLM", architecture]), Some(96));
+            let flat = json!({"model_type":family,"architectures":[architecture],
+                "hidden_size":1536,"num_attention_heads":12,"num_key_value_heads":2,
+                "num_hidden_layers":28,"head_dim":192,"n_head_kv":1});
+            let nested = json!({"hidden_size":512,"num_attention_heads":8,"num_key_value_heads":8});
+            let mut typed = nested.clone();
+            typed["model_type"] = json!(format!("{family}_text"));
+            for (text, kv_heads, width) in
+                [(None, 2, 128), (Some(nested), 8, 64), (Some(typed), 8, 64)]
+            {
+                let mut checkpoint = flat.clone();
+                if let Some(text) = text {
+                    checkpoint["text_config"] = text;
+                }
+                let data = serde_json::to_vec(&checkpoint).unwrap();
+                std::fs::write(&path, &data).unwrap();
+                let source = json!({"launch":{"model_config":{"path":path,"sha256":format!("{:x}",Sha256::digest(&data))}}});
+                let facts = |overrides| {
+                    TransferMetadata::configured(
+                        &json!({"model_config":{"hf_overrides":overrides}}),
+                        Some(false),
+                        Some(architecture),
+                        &source,
+                    )
+                };
+                let observed = |overrides, hash_heads, hash_size| {
+                    let projected = facts(overrides);
+                    assert_eq!(projected.model_heads.num_kv_heads, Some(hash_heads));
+                    assert_eq!(projected.model_heads.head_size, Some(hash_size));
+                    let rank = projected
+                        .uniform_attention
+                        .unwrap()
+                        .rank_heads(2, Some(architecture))
+                        .unwrap();
+                    assert_eq!(
+                        (rank.num_kv_heads, rank.head_size),
+                        (Some(kv_heads / 2), Some(width))
+                    );
+                };
+                observed(json!({}), kv_heads, width);
+                observed(
+                    json!({"head_dim":256,"num_key_value_heads":16}),
+                    kv_heads,
+                    width,
+                );
+                observed(json!({"text_config":{"head_dim":96,"n_head_kv":4}}), 4, 96);
+                observed(
+                    json!({"text_config":{"head_dim":null,"hidden_size_per_head":112}}),
+                    kv_heads,
+                    112,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verified_nemotron_layers_drive_both_positions_and_count() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let data = br#"{"model_type":"nemotron_h","architectures":["NemotronHForCausalLM"],"hybrid_override_pattern":"**--","num_hidden_layers":4}"#;
+        std::fs::write(&path, data).unwrap();
+        let source = json!({"launch":{"model_config":{"path":path,"sha256":format!("{:x}",Sha256::digest(data))}}});
+        let project = |overrides| {
+            TransferMetadata::configured(
+                &json!({"model_config":{"hf_overrides":overrides}}),
+                None,
+                Some("NemotronHForCausalLM"),
+                &source,
+            )
+        };
+        let baseline = project(json!({"num_hidden_layers":5}));
+        assert_eq!(
+            (
+                baseline.nemotron_attention_layers,
+                baseline.num_hidden_layers
+            ),
+            (Some(vec![0, 1]), Some(4))
+        );
+        for alias in ["layer_types", "layers_block_type"] {
+            let changed = project(json!({alias:["mlp","mlp","full_attention","full_attention"]}));
+            assert_eq!(
+                (changed.nemotron_attention_layers, changed.num_hidden_layers),
+                (Some(vec![2, 3]), Some(4))
+            );
+        }
+    }
+
+    #[test]
+    fn nemotron_regions_require_the_first_registered_generation_class() {
+        let nemotron = "NemotronHForCausalLM";
+        let foreign = "Qwen2MoeForCausalLM";
+        let regions = |version, names: &[&str], model_impl| {
+            let model = json!({"hf_overrides":{"model_type":"nemotron_h","architectures":names,
+                "hybrid_override_pattern":"**--"}, "model_impl":model_impl});
+            TransferMetadata::configured(
+                &json!({"model_config":model}),
+                None,
+                Some(nemotron),
+                &json!({"runtime":{"version":version}}),
+            )
+            .nemotron_attention_layers
+        };
+        for version in ["0.31.0", "0.32.0", "0.33.0"] {
+            for names in [
+                vec!["NemotronHModel", nemotron],
+                vec!["UnknownModel", nemotron],
+                vec![nemotron, foreign],
+                vec!["NemotronHPuzzleForCausalLM", foreign],
+                vec![nemotron, nemotron],
+            ] {
+                assert_eq!(regions(version, &names, "auto"), Some(vec![0, 1]));
+            }
+            assert_eq!(regions(version, &[foreign, nemotron], "auto"), None);
+            assert_eq!(regions(version, &[nemotron], "transformers"), None);
+            assert_eq!(
+                regions(
+                    version,
+                    &["NemotronHForConditionalGeneration", foreign],
+                    "auto"
+                ),
+                Some(vec![0, 1])
+            );
+            assert_eq!(
+                regions(version, &["NemotronHForConditionalGeneration"], "vllm"),
+                Some(vec![0, 1])
+            );
+        }
+        let normalized = |auto_map: Value| {
+            let model = json!({"hf_config":{"model_type":"qwen2","architectures":["Qwen2LMHeadModel"],
+                "auto_map":auto_map,"num_attention_heads":8,"num_key_value_heads":4,"hidden_size":512}});
+            TransferMetadata::configured(
+                &json!({"model_config":model}),
+                Some(false),
+                None,
+                &Value::Null,
+            )
+            .uniform_attention
+        };
+        assert!(normalized(Value::Null).is_some());
+        assert!(normalized(json!({"AutoModel":"custom.Model"})).is_none());
+        let names = ["DomynEdgeForCausalLM", nemotron];
+        assert_eq!(regions("0.31.0", &names, "auto"), Some(vec![0, 1]));
+        assert_eq!(regions("0.32.0", &names, "auto"), Some(vec![0, 1]));
+        assert_eq!(regions("0.33.0", &names, "auto"), None);
+        assert_eq!(regions("", &names, "auto"), None);
     }
 
     #[test]

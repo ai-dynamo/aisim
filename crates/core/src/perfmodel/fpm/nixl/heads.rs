@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// SPDX-FileCopyrightText: Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 //! NIXL hashes the model converter's global geometry. Registered caches use the
 //! attention constructor's rank-local geometry. See THIRD_PARTY_NOTICES.md for sources.
 
 use std::{
+    borrow::Cow,
     fs,
     io::{BufReader, Seek},
     path::Path,
@@ -17,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{AicError, known, merge_observed, positive};
+use super::{AicError, known, merge_observed, positive, registry};
 
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub(super) struct HeadGeometry {
@@ -74,6 +78,9 @@ fn geometry_config(config: &Value) -> serde_json::Map<String, Value> {
     for key in [
         "model_type",
         "architectures",
+        "auto_map",
+        "layers_block_type",
+        "layer_types",
         "n_head_kv",
         "num_kv_heads",
         "num_key_value_heads",
@@ -114,6 +121,77 @@ fn text_field(config: &Value) -> Option<&'static str> {
     ["text_config", "decoder", "generator", "text_encoder"]
         .into_iter()
         .find(|&key| config[key].is_object())
+}
+
+fn qwen2_vl_text_type(config: &Value) -> Option<&'static str> {
+    if config["auto_map"].get("AutoConfig").is_some() {
+        return None;
+    }
+    match config["model_type"].as_str() {
+        Some("qwen2_vl") => Some("qwen2_vl_text"),
+        Some("qwen2_5_vl") => Some("qwen2_5_vl_text"),
+        _ => None,
+    }
+}
+
+pub(super) fn hybrid_pattern(config: &Value) -> Option<Cow<'_, str>> {
+    if let Some(layers) = config
+        .get("layers_block_type")
+        .or_else(|| config.get("layer_types"))
+        .and_then(Value::as_array)
+    {
+        let pattern = layers
+            .iter()
+            .map(|layer| {
+                Some(match layer.as_str()? {
+                    "linear_attention" | "mamba" => 'M',
+                    "full_attention" | "attention" => '*',
+                    "moe" => 'E',
+                    "mlp" => '-',
+                    _ => return None,
+                })
+            })
+            .collect::<Option<String>>()?;
+        return (!pattern.is_empty()).then_some(Cow::Owned(pattern));
+    }
+    config["hybrid_override_pattern"]
+        .as_str()
+        .filter(|p| !p.is_empty() && p.bytes().all(|c| matches!(c, b'*' | b'M' | b'-' | b'E')))
+        .map(Cow::Borrowed)
+}
+
+/// Project the authenticated HF checkpoint before vLLM applies its serving overrides.
+fn checkpoint_geometry(config: &Value) -> Value {
+    let mut top = geometry_config(config);
+    if let Some(family) = qwen2_vl_text_type(config) {
+        // Both Qwen2 VL constructors consume these flat kwargs, even when an
+        // explicit text_config supplies the actual values. Other flat attributes
+        // (including head_dim and n_head_kv) stay on the enclosing config.
+        let declared = config["text_config"].is_object();
+        let mut text = geometry_config(&config["text_config"]);
+        for (key, default) in [
+            ("hidden_size", 8192),
+            ("num_hidden_layers", 80),
+            ("num_attention_heads", 64),
+            ("num_key_value_heads", 8),
+        ] {
+            let flat = top.remove(key);
+            text.entry(key)
+                .or_insert_with(|| flat.filter(|_| !declared).unwrap_or(Value::from(default)));
+        }
+        if text["num_key_value_heads"].is_null() {
+            text.insert(
+                "num_key_value_heads".into(),
+                text["num_attention_heads"].clone(),
+            );
+        }
+        text.entry("model_type")
+            .or_insert_with(|| Value::from(family));
+        top.insert("text_config".into(), Value::Object(text));
+    } else if let Some(key) = text_field(config) {
+        top.insert(key.into(), Value::Object(geometry_config(&config[key])));
+    }
+    Value::Object(top)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -194,13 +272,9 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Value> {
             if CheckpointKey::new(path, digest, &file.metadata()?).as_ref() != Some(&key) {
                 return Ok(None);
             }
-            Ok(config.filter(Value::is_object).map(|config| {
-                let mut fields = Value::Object(geometry_config(&config));
-                if let Some(key) = text_field(&config) {
-                    fields[key] = Value::Object(geometry_config(&config[key]));
-                }
-                std::sync::Arc::new(fields)
-            }))
+            Ok(config
+                .filter(Value::is_object)
+                .map(|config| std::sync::Arc::new(checkpoint_geometry(&config))))
         })
         .ok()
         .flatten()?;
@@ -212,43 +286,63 @@ pub(super) fn checkpoint(model: &Value, source: &Value) -> Option<Value> {
         apply_geometry(&mut effective[key], &overrides[key]);
     }
     apply_geometry(&mut effective, overrides);
+    if saved["model_type"] == "nemotron_h" && saved["auto_map"].get("AutoConfig").is_none() {
+        // Stock NemotronHConfig computes both properties from the same list. Its
+        // compatibility setter for num_hidden_layers ignores scalar updates.
+        let pattern = hybrid_pattern(overrides)
+            .or_else(|| hybrid_pattern(&saved))
+            .unwrap_or(Cow::Borrowed("ME*-"));
+        let fields = effective.as_object_mut()?;
+        fields.remove("layers_block_type");
+        fields.remove("layer_types");
+        fields.insert("num_hidden_layers".into(), Value::from(pattern.len()));
+        fields.insert(
+            "hybrid_override_pattern".into(),
+            Value::from(pattern.as_ref()),
+        );
+    }
     Some(effective)
 }
 
 impl<'a> HfConfig<'a> {
-    pub(super) fn observed(
-        model: &'a Value,
-        checkpoint: Option<&'a Value>,
-        referenced: bool,
-    ) -> (Self, Self) {
+    pub(super) fn observed(model: &'a Value, checkpoint: Option<&'a Value>) -> Self {
         let saved = model.get("hf_config").filter(|v| v.is_object());
-        let top = Self {
+        Self {
             fields: saved.or(checkpoint).unwrap_or(&model["hf_overrides"]),
             complete: saved.is_some(),
             verified: checkpoint.is_some(),
-        };
-        let nested = text_field(top.fields).or_else(|| {
-            // Qwen2-VL creates its text sub-config even for older flat checkpoint files.
-            (top.fields["model_type"] == "qwen2_vl"
-                || top.fields["architectures"][0] == "Qwen2VLForConditionalGeneration")
-                .then_some("text_config")
-        });
-        let text = if let Some(fields) = model.get("hf_text_config").filter(|v| v.is_object()) {
-            Self {
+        }
+    }
+
+    pub(super) fn text_config(
+        self,
+        model: &'a Value,
+        referenced: bool,
+        registered: Option<registry::Registration>,
+    ) -> Self {
+        if let Some(fields) = model.get("hf_text_config").filter(|v| v.is_object()) {
+            return Self {
                 fields,
                 complete: true,
                 verified: false,
-            }
-        } else if let Some(key) = nested {
+            };
+        }
+        let qwen_vl = qwen2_vl_text_type(self.fields).is_some();
+        let nested = text_field(self.fields).or_else(|| {
+            // A recorded wrapper can establish that its outer override is not a text field.
+            (qwen_vl || registered == Some(registry::Registration::Qwen2Vl))
+                .then_some("text_config")
+        });
+        if let Some(key) = nested {
             Self {
-                fields: &top.fields[key],
-                complete: top.complete,
-                verified: top.verified,
+                fields: &self.fields[key],
+                complete: self.complete || (self.verified && qwen_vl),
+                verified: self.verified,
             }
         } else if referenced
-            && saved.is_none()
-            && checkpoint.is_none()
-            && top.fields["model_type"].as_str().is_none()
+            && !self.complete
+            && !self.verified
+            && self.fields["model_type"].as_str().is_none()
         {
             // A missing archive cannot identify whether an outer override reaches the text model.
             Self {
@@ -257,9 +351,17 @@ impl<'a> HfConfig<'a> {
                 verified: false,
             }
         } else {
-            top
-        };
-        (top, text)
+            self
+        }
+    }
+
+    pub(super) fn has_stock_model_lookup(self) -> bool {
+        (self.complete || self.verified || self.fields.get("auto_map").is_some())
+            && (self.fields["auto_map"].is_null()
+                || self.fields["auto_map"].as_object().is_some_and(|m| {
+                    !m.keys()
+                        .any(|k| k == "AutoConfig" || k.starts_with("AutoModel"))
+                }))
     }
 
     fn divided_head_size(self) -> Option<u64> {
@@ -357,9 +459,18 @@ impl<'a> HfConfig<'a> {
         {
             return (heads, None);
         }
-        let layers = (family != "longcat_flash")
-            .then(|| positive(&self.fields["num_hidden_layers"]))
-            .flatten();
+        let stored_layers = positive(&self.fields["num_hidden_layers"]);
+        let layers = match family {
+            "longcat_flash" => None,
+            "nemotron_h" if std::ptr::eq(self.fields, top.fields) => hybrid_pattern(self.fields)
+                .map(|p| p.len() as u64)
+                .or_else(|| {
+                    (self.complete || self.verified)
+                        .then_some(stored_layers)
+                        .flatten()
+                }),
+            _ => stored_layers,
+        };
         heads.num_kv_heads = match family {
             "falcon" | "RefinedWeb" | "RefinedWebModel" => {
                 match (
@@ -393,37 +504,39 @@ impl<'a> HfConfig<'a> {
                 if self.complete && self.fields.get("model_type").is_none() {
                     return true; // The tagged converter checks for this attribute before testing MLA.
                 }
-                text_family.filter(|s| known(s)).is_some_and(|name| {
-                    !matches!(
-                        name,
-                        "axk1"
-                            | "deepseek_v2"
-                            | "deepseek_v3"
-                            | "deepseek_v32"
-                            | "deepseek_v4"
-                            | "deepseek_v41"
-                            | "dots3_note"
-                            | "deepseek_mtp"
-                            | "k3_dspark"
-                            | "glm5_next"
-                            | "glm5_next_text"
-                            | "glm_moe_dsa"
-                            | "glm4_moe_lite"
-                            | "glm4_moe_lite_mtp"
-                            | "kimi_k2"
-                            | "kimi_linear"
-                            | "longcat_flash"
-                            | "longcat_flash_ngram"
-                            | "pangu_ultra_moe"
-                            | "pangu_ultra_moe_mtp"
-                            | "bailing_hybrid"
-                            | "bailing_hybrid_mtp"
-                            | "bailing_hybrid_v3_mtp"
-                            | "hy_v4"
-                            | "hy_v4_mtp"
-                            | "eagle"
-                    )
-                })
+                text_family
+                    .filter(|s| self.complete || known(s))
+                    .is_some_and(|name| {
+                        !matches!(
+                            name,
+                            "axk1"
+                                | "deepseek_v2"
+                                | "deepseek_v3"
+                                | "deepseek_v32"
+                                | "deepseek_v4"
+                                | "deepseek_v41"
+                                | "dots3_note"
+                                | "deepseek_mtp"
+                                | "k3_dspark"
+                                | "glm5_next"
+                                | "glm5_next_text"
+                                | "glm_moe_dsa"
+                                | "glm4_moe_lite"
+                                | "glm4_moe_lite_mtp"
+                                | "kimi_k2"
+                                | "kimi_linear"
+                                | "longcat_flash"
+                                | "longcat_flash_ngram"
+                                | "pangu_ultra_moe"
+                                | "pangu_ultra_moe_mtp"
+                                | "bailing_hybrid"
+                                | "bailing_hybrid_mtp"
+                                | "bailing_hybrid_v3_mtp"
+                                | "hy_v4"
+                                | "hy_v4_mtp"
+                                | "eagle"
+                        )
+                    })
             });
         heads.head_size = match family {
             "zamba2" => positive(&self.fields["attention_head_dim"]),
@@ -447,23 +560,14 @@ pub(super) enum Decoder {
 
 impl Decoder {
     pub(super) fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "LlamaForCausalLM" => Self::Llama,
-            "MistralForCausalLM" => Self::Mistral,
-            // Qwen2-VL pins this native language model in init_vllm_registered_model.
-            "Qwen2ForCausalLM" | "Qwen2Model" | "Qwen2VLForConditionalGeneration" => Self::Qwen2,
-            "Qwen3ForCausalLM" => Self::Qwen3,
-            "NemotronHForCausalLM" | "NemotronHPuzzleForCausalLM" => Self::NemotronH,
-            "FalconForCausalLM" => Self::Falcon,
-            _ => return None,
-        })
+        registry::at_release(None, |minor| registry::lookup(name, minor)).and_then(|r| r.decoder())
     }
 
     fn from_family(family: &str) -> Option<Self> {
         Some(match family {
             "llama" => Self::Llama,
             "mistral" => Self::Mistral,
-            "qwen2" | "qwen2_vl" => Self::Qwen2,
+            "qwen2" | "qwen2_vl" | "qwen2_5_vl" => Self::Qwen2,
             "qwen3" => Self::Qwen3,
             "nemotron_h" => Self::NemotronH,
             "falcon" | "RefinedWeb" | "RefinedWebModel" => Self::Falcon,
@@ -493,12 +597,7 @@ impl Decoder {
         }
     }
 
-    pub(super) fn observed(top: &Value, selected: Option<&str>) -> Option<Self> {
-        if let Some(names) = top.get("architectures").filter(|v| !v.is_null()) {
-            // Native dispatch tries registered classes in order. A checkpoint's
-            // advertised architecture can be a fallback behind a different loaded class.
-            return Self::from_name(names.as_array()?.first()?.as_str()?);
-        }
+    pub(super) fn inferred(top: &Value, selected: Option<&str>) -> Option<Self> {
         let selected = match selected {
             Some(s) => Some(Self::from_name(s)?),
             None => None,

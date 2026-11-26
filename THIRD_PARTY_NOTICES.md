@@ -794,8 +794,9 @@ version, KV head geometry, transfer mode, attention backend and cache dtype chec
 of the NIXL handshake. GPU layout resolution in the engine core applies to its TP workers, while the NIXL
 worker selects the registered GPU or host buffer layout. The ordinary per-layer head dimensions and TP partition follow
 `vllm/model_executor/models/{falcon,llama,mistral,nemotron_h,qwen2,qwen3}.py` at the same three
-revisions. The Qwen2-VL wrapper selects its Qwen2 language model in
-`vllm/model_executor/models/qwen2_vl.py`. Architecture selection and model-level fields follow
+revisions. The Qwen2-VL and Qwen2.5-VL wrappers select their Qwen2 language model in
+`vllm/model_executor/models/{qwen2_vl,qwen2_5_vl}.py`. The stock class names and their release-specific registrations in
+`crates/core/src/perfmodel/fpm/nixl/registry.rs` derive from the three model registries. Architecture selection and model-level fields follow
 `vllm/model_executor/models/registry.py`, `vllm/config/model.py` and
 `vllm/transformers_utils/{config,model_arch_config_convertor}.py`. The NemotronH
 attention and Mamba mixer names follow `vllm/model_executor/models/nemotron_h.py`.
@@ -808,6 +809,9 @@ GPU page registration and shared addresses follow `register_kv_caches` in
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/model_executor/models/registry.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/model_executor/models/qwen2_vl.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/model_executor/models/qwen2_5_vl.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/model_arch_config_convertor.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/models/inkling/nvidia/sconv_swa_attn.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_layout.py
@@ -825,6 +829,9 @@ GPU page registration and shared addresses follow `register_kv_caches` in
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/registry.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/qwen2_vl.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/qwen2_5_vl.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/transformers_utils/model_arch_config_convertor.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/models/inkling/nvidia/sconv_swa_attn.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_layout.py
@@ -843,6 +850,9 @@ GPU page registration and shared addresses follow `register_kv_caches` in
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/models/registry.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/models/qwen2_vl.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/models/qwen2_5_vl.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/transformers_utils/model_arch_config_convertor.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/transformers_utils/config.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/models/inkling/nvidia/sconv_swa_attn.py
@@ -868,6 +878,18 @@ decoding, no HiSparse, no bounded replay window and no `all` Mamba cache mode.
 No upstream method body is copied. The identified upstream revisions have no
 root NOTICE file. The repository's Apache-2.0 LICENSE supplies the license
 text, and no upstream source file is vendored.
+
+The checkpoint projection in `crates/core/src/perfmodel/fpm/nixl/heads.rs` is a modified Rust adaptation of the Qwen2-VL and Qwen2.5-VL text configuration constructors. Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved. Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved. Both upstream configuration files use Apache-2.0. Neither Transformers revision has a root NOTICE file.
+
+The NemotronH model layer list and its computed layer count follow the stock Transformers configuration. Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved. The loader fallback uses the public model names of the same Transformers versions.
+
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/nemotron_h/configuration_nemotron_h.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/nemotron_h/configuration_nemotron_h.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen2_vl/configuration_qwen2_vl.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen2_5_vl/configuration_qwen2_5_vl.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/qwen2_vl/configuration_qwen2_vl.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/qwen2_5_vl/configuration_qwen2_5_vl.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/LICENSE
 
 
 The inference-mode scope and MSA query-position metadata integration in

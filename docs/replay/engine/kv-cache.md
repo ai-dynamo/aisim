@@ -1559,18 +1559,26 @@ sub-block matching without an explicit full-state scratch count.
   divided by its attention-head count. Its NIXL model hash uses the converter's
   head width, which can come from an explicit `head_dim`. Two Qwen2 roles can
   therefore have identical cache tensors and incompatible connector hashes.
-  Native dispatch uses the first loadable architecture in the recorded list.
+  Native dispatch uses the recorded architecture order and the class registry
+  for the profiled vLLM release.
   A scalar override on an enclosing model applies to that model. A saved
   effective configuration takes precedence. A matching checkpoint reference
-  supplies the original fields, and the recorded overrides apply to the outer
-  model or its nested text configuration. Fields from an unavailable checkpoint
+  supplies the original fields, and a verified draft uses its staged copy after
+  the original launch path moves. Recorded overrides apply to the outer
+  model or its nested text configuration. Qwen2-VL and Qwen2.5-VL first
+  construct their text configuration, including when a checkpoint stores the
+  text dimensions at the top level. A later outer `head_dim` therefore leaves
+  the language model unchanged, while a text override reaches its converter.
+  Fields from an unavailable checkpoint
   remain unknown. An override establishes the model-wide KV-head count when
   the runtime's higher-priority checkpoint aliases are known. When the probe
   records disjoint GPU pages for each ordinary attention layer, replay compares the
   registered names, including layers interleaved within each block. One pool
-  block can span several kernel blocks. A saved NemotronH pattern identifies
-  attention positions and possible Mamba region names. The first cache at each
-  address owns its registered name, so moving an aliased state can preserve it.
+  block can span several kernel blocks. A noncontiguous block-major row can
+  register once under the first layer that uses its backing allocation.
+  NemotronH derives its attention and Mamba positions and its layer count from
+  the effective layer list. The first cache at each address owns its registered
+  name, so moving a later aliased attention or state layer can preserve it.
   An Inkling convolution window also constrains the physical GPU layout.
   When serving evidence identifies the NIXL connector, both roles must use the
   same transfer mode. `NixlConnector` is the pull alias. An explicit push
