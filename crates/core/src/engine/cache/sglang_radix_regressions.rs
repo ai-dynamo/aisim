@@ -4390,6 +4390,7 @@ fn repair_swa_suffix_insert_applies_controller_barriers_without_prefix_rows() {
     let mut tree = Core::new(
         CacheInitParams {
             enable_hicache: true,
+            write_through_threshold: 1,
             has_swa_host_pool: true,
             swa_sliding_window_size: Some(1),
             ..Default::default()
