@@ -51,6 +51,7 @@ following local corrections to this pinned revision:
   actions before resuming so terminal backups observe rebuilt SWA rows. Reject
   unsafe single-shot calls before mutation; Full-only inserts, entirely
   tombstoned SWA inputs, and empty continuations retain their single-shot path.
+  Resumable suffix entrypoints retain the prefix without requiring its KV rows.
 - Bind SWA backup targets to the anchor's ordered backup window before adopting
   any Full or auxiliary rows. Compare window handles without copying pool rows.
 - Reject empty SWA load-back batches before committing any component, preserving

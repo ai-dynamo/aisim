@@ -4384,3 +4384,84 @@ fn repair_empty_swa_load_back_batch_is_rejected_before_mutation() {
         .unwrap();
     tree.try_sanity_check(&[], &[]).unwrap();
 }
+
+#[test]
+fn repair_swa_suffix_insert_applies_controller_barriers_without_prefix_rows() {
+    let mut tree = Core::new(
+        CacheInitParams {
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            swa_sliding_window_size: Some(1),
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let anchor = insert(&mut tree, vec![10], &[1]);
+    tree.commit_backup(anchor, PageValue::from_vec(vec![101]), HashMap::new())
+        .unwrap();
+    let pending = tree
+        .mark_write_through_pending(vec![anchor], anchor)
+        .unwrap();
+    tree.finish_write_through(pending, anchor).unwrap();
+    let key = vec![10, 20];
+    let mut p = params(&key, &[2]);
+    p.prev_prefix_len = 1;
+    p.swa_evicted_seqlen = 1;
+    let nodes = tree.inspect_get_all_node_ids();
+    assert!(matches!(
+        tree.try_insert_suffix_from_node(anchor, 1, &p),
+        Err(TreeCoreRuntimeError::InsertRequiresController)
+    ));
+    assert_eq!(tree.inspect_get_all_node_ids(), nodes);
+    let mut step = tree
+        .try_begin_insert_suffix_from_node(anchor, 1, &p)
+        .unwrap();
+    let mut observed = Vec::new();
+    let result = loop {
+        for action in step.actions {
+            match action {
+                CacheAction::SwaRebuild {
+                    node_id,
+                    source_value,
+                } => {
+                    assert_ne!(node_id, anchor);
+                    assert_eq!(source_value.as_slice(), &[2]);
+                    tree.set_component_device_value(node_id, SWA, PageValue::from_vec(vec![12]))
+                        .unwrap();
+                    observed.push("rebuild");
+                }
+                CacheAction::BackupKV(backup) => {
+                    assert_eq!(backup.node_ids.len(), 1);
+                    let leaf = backup.node_ids[0];
+                    assert_ne!(leaf, anchor);
+                    let (full, mut aux) = tree.build_backup_spec(leaf).unwrap();
+                    assert_eq!(full.as_slice(), &[2]);
+                    aux.get_mut(&SWA).unwrap()[0].host_indices =
+                        Some(PageValue::from_vec(vec![202]));
+                    tree.commit_backup(leaf, PageValue::from_vec(vec![102]), aux)
+                        .unwrap();
+                    let pending = tree.mark_write_through_pending(vec![leaf], leaf).unwrap();
+                    tree.finish_write_through(pending, leaf).unwrap();
+                    observed.push("backup");
+                }
+                _ => panic!("unexpected suffix controller action"),
+            }
+        }
+        if let Some(result) = step.result {
+            break result;
+        }
+        step = tree.try_resume_insert().unwrap();
+    };
+    assert_eq!(observed, ["rebuild", "backup"]);
+    assert_eq!(result.total_len, 2);
+    assert_eq!(result.prefix_len, 1);
+    assert_eq!(
+        tree.arena
+            .node(tree.arena.resolve(anchor).unwrap())
+            .device_value(FULL)
+            .as_slice(),
+        &[1]
+    );
+    assert_eq!(tree.full_kv_prefix_len(&key, Default::default()), 2);
+    tree.try_sanity_check(&[], &[]).unwrap();
+}

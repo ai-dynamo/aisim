@@ -1858,6 +1858,30 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         self.try_insert_at_(prefix_node_idx, prefix_len, params)
     }
 
+    /// Start a suffix-only insert at a retained prefix, stopping at each
+    /// controller barrier just like `begin_insert`. Apply its actions before
+    /// calling `resume_insert`; retained prefix KV is not required again.
+    pub fn begin_insert_suffix_from_node(
+        &mut self,
+        prefix_node_id: NodeId,
+        prefix_len: usize,
+        params: &InsertParams<'_, K, V>,
+    ) -> InsertStepResult<V> {
+        self.try_begin_insert_suffix_from_node(prefix_node_id, prefix_len, params)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`Self::begin_insert_suffix_from_node`].
+    pub fn try_begin_insert_suffix_from_node(
+        &mut self,
+        prefix_node_id: NodeId,
+        prefix_len: usize,
+        params: &InsertParams<'_, K, V>,
+    ) -> Result<InsertStepResult<V>, TreeCoreRuntimeError> {
+        let prefix_node_idx = self.arena.resolve(prefix_node_id)?;
+        self.try_begin_insert_at_(prefix_node_idx, prefix_len, params, false)
+    }
+
     fn validate_insert_anchor_(
         &self,
         prefix_node_idx: NodeIdx_,
