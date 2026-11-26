@@ -1915,6 +1915,7 @@ def grouped_pd_pair_requirement(prefill_deployment, decode_deployment) -> str | 
                 evidence(decode_deployment),
                 row(prefill_deployment),
                 row(decode_deployment),
+                prefill_deployment.tp,
             )
         except ValueError as error:
             raise GroupedObservationError(str(error)) from error

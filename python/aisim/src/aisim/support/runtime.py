@@ -37,7 +37,8 @@ from .schema import (
 )
 
 LEGACY_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v1"
-PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v2"
+RANK_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v2"
+PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v3"
 _PRECISION = (
     "gemm_quant_mode",
     "moe_quant_mode",
@@ -340,13 +341,21 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
         value = json.loads(provenance)
     except (TypeError, ValueError):
         return None
-    if not isinstance(value, dict) or value.get("schema_version") not in (LEGACY_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA):
+    if not isinstance(value, dict) or value.get("schema_version") not in (
+        LEGACY_PROVENANCE_SCHEMA,
+        RANK_PROVENANCE_SCHEMA,
+        PROVENANCE_SCHEMA,
+    ):
         return None
     snapshot = value.get("nixl_observation")
-    if value["schema_version"] == PROVENANCE_SCHEMA and (
+    if value["schema_version"] != LEGACY_PROVENANCE_SCHEMA and (
         not isinstance(snapshot, dict)
         or not isinstance(snapshot.get("runtime_settings"), dict)
         or not isinstance(snapshot.get("worker_observations"), list)
+        or (
+            value["schema_version"] == PROVENANCE_SCHEMA
+            and not isinstance(snapshot.get("worker_observations_sha256"), str)
+        )
     ):
         raise ValueError("onboarding runtime probe is missing its NIXL observation")
     if (
@@ -375,18 +384,38 @@ def _worker_attention_backends(evidence: dict[str, Any]) -> list:
     ]
 
 
-def _worker_observations(evidence: dict[str, Any]) -> list:
+def _worker_observations(evidence: dict[str, Any], *, current_format: bool) -> list:
     from aisim import _runtime
 
     workers = [item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] == "worker"]
-    return json.loads(_runtime.nixl_worker_observations(json.dumps(workers)))
+    return json.loads(_runtime.nixl_worker_observations(json.dumps(workers), current_format))
 
 
-def _observed_transfer_settings(evidence: dict[str, Any], *, legacy: bool = False) -> dict[str, Any]:
+def _worker_observation_digest(snapshot: dict[str, Any], evidence: dict[str, Any]) -> str:
+    from aisim import _runtime
+
+    fields = {
+        key: snapshot[key]
+        for key in ("runtime", "runtime_settings", "worker_observations", "rank_capacities")
+        if key in snapshot
+    }
+    if evidence.get("source") == "vllm_initialized_cache":
+        fields.update(
+            source=evidence["source"],
+            backend_version=evidence["backend_version"],
+            artifacts=[{"sha256": item["sha256"]} for item in evidence["artifacts"]],
+        )
+        source = evidence["plan_sha256"]
+    else:
+        source = evidence["observations_index"]["sha256"]
+    return _runtime.nixl_observation_digest(json.dumps(fields), source)
+
+
+def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str = PROVENANCE_SCHEMA) -> dict[str, Any]:
     """Retain the initialized NIXL fields when an import replaces raw rank records with source hashes."""
     settings = evidence["runtime_settings"]
     sections = {"model_config": ("model", "dtype"), "cache_config": ("cache_dtype",)}
-    if not legacy:
+    if schema != LEGACY_PROVENANCE_SCHEMA:
         sections["scheduler_config"] = ("disable_hybrid_kv_cache_manager",)
     snapshot = {
         "runtime_settings": {
@@ -395,12 +424,14 @@ def _observed_transfer_settings(evidence: dict[str, Any], *, legacy: bool = Fals
             if section in settings
         }
     }
-    if legacy:
+    if schema == LEGACY_PROVENANCE_SCHEMA:
         snapshot["worker_attention_backends"] = _worker_attention_backends(evidence)
     else:
-        snapshot["worker_observations"] = _worker_observations(evidence)
+        snapshot["worker_observations"] = _worker_observations(evidence, current_format=schema == PROVENANCE_SCHEMA)
         if version := evidence.get("runtime", {}).get("version"):
             snapshot["runtime"] = {"version": version}
+        if schema == PROVENANCE_SCHEMA:
+            snapshot["worker_observations_sha256"] = _worker_observation_digest(snapshot, evidence)
     return snapshot
 
 
@@ -558,10 +589,14 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     if _request_launch(request, launch) != launch:
         raise ValueError("runtime-affecting draft edits require a compatible fresh probe")
     expected = as_saved_resources(manifest["observed_resources"], _resource_values(result["resources"]))
-    if "nixl_observation" in manifest and manifest["nixl_observation"] != _observed_transfer_settings(
-        result["provenance"], legacy=manifest["schema_version"] == LEGACY_PROVENANCE_SCHEMA
-    ):
-        raise ValueError("saved NIXL settings differ from immutable runtime evidence")
+    if "nixl_observation" in manifest:
+        saved = deepcopy(manifest["nixl_observation"])
+        fresh = _observed_transfer_settings(result["provenance"], schema=manifest["schema_version"])
+        if "worker_observations" in saved and "worker_observations" in fresh:
+            for sample in (saved, fresh):
+                sample["worker_observations"].sort(key=_json)
+        if saved != fresh:
+            raise ValueError("saved NIXL settings differ from immutable runtime evidence")
     if manifest["observed_resources"] != expected:
         raise ValueError("saved observed resources differ from immutable runtime evidence")
     selected = request.profile_deployment()

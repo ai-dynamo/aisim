@@ -247,7 +247,7 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
     bounds = search_space.parallel_independent_log_ranges_by_mode.get(deployment_mode, {})
     role_choices = {role: {_replica_from_dict(entry) for entry in entries} for role, entries in custom.items()}
 
-    def replica_counts(role, shape, maximum):
+    def replica_counts(role, shape, maximum, pinned):
         prefix = "" if role == "agg" else f"{role}_"
         role_domains = {k.removeprefix(prefix): v for k, v in domains.items() if k.startswith(prefix)}
         role_bounds = {k.removeprefix(prefix): v for k, v in bounds.items() if k.startswith(prefix)}
@@ -258,13 +258,23 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
         lower, upper = role_bounds.pop("replicas", (1, maximum))
         if not matches_parallel_domains(ReplicaParallelConfig(shape, 1), role_domains, role_bounds):
             return ()
+        lower, upper = max(1, lower), min(maximum, upper)
+        if pinned is not None:
+            allowed = (
+                lower <= pinned <= upper
+                and (counts is None or pinned in counts)
+                and (role not in role_choices or ReplicaParallelConfig(shape, pinned) in role_choices[role])
+            )
+            return (pinned,) if allowed else ()
         if role in role_choices:
-            choices = (r.replicas for r in role_choices[role] if r.shape == shape)
+            choices = {r.replicas for r in role_choices[role] if r.shape == shape}
+            if counts is not None:
+                choices.intersection_update(counts)
+        elif counts is not None:
+            choices = set(counts)
         else:
-            choices = counts if counts is not None else range(max(1, lower), min(maximum, upper) + 1)
-        return tuple(
-            sorted({n for n in choices if lower <= n <= min(upper, maximum) and (counts is None or n in counts)})
-        )
+            return range(lower, upper + 1)
+        return sorted(n for n in choices if lower <= n <= upper)
 
     configs = _profile_parallel_configs(
         profile,

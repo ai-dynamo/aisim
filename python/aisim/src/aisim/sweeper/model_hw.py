@@ -361,7 +361,7 @@ def _profile_parallel_configs(
     worker_type: str = "aggregated",
     candidate_configs: list[ReplicaParallelConfig] | list[DisaggParallelConfig] | None = None,
     validate_transfer: bool = True,
-    replica_counts: Callable[[str, ParallelShape, int], Sequence[int]] | None = None,
+    replica_counts: Callable[[str, ParallelShape, int, int | None], Sequence[int]] | None = None,
 ):
     """Enumerate only declared deployment shapes; replicas do not change a cell."""
     from aisim.config.engine import (
@@ -392,9 +392,9 @@ def _profile_parallel_configs(
         )
 
     @cache
-    def allowed_counts(role, shape):
+    def allowed_counts(role, shape, pinned=None):
         maximum = gpu_budget // shape.gpus_per_worker
-        return replica_counts(role, shape, maximum) if replica_counts is not None else range(1, maximum + 1)
+        return replica_counts(role, shape, maximum, pinned) if replica_counts is not None else range(1, maximum + 1)
 
     if candidate_configs is not None:
         candidate_configs = [
@@ -402,13 +402,13 @@ def _profile_parallel_configs(
         ]
         if replica_counts is not None:
             if deployment_mode == "agg":
-                candidate_configs = [c for c in candidate_configs if c.replicas in allowed_counts("agg", c.shape)]
+                candidate_configs = [c for c in candidate_configs if allowed_counts("agg", c.shape, c.replicas)]
             else:
                 candidate_configs = [
                     c
                     for c in candidate_configs
-                    if c.prefill.replicas in allowed_counts("prefill", c.prefill.shape)
-                    and c.decode.replicas in allowed_counts("decode", c.decode.shape)
+                    if allowed_counts("prefill", c.prefill.shape, c.prefill.replicas)
+                    and allowed_counts("decode", c.decode.shape, c.decode.replicas)
                 ]
     if deployment_mode == "agg":
         shapes = shapes_for(hardware_sku, worker_type)

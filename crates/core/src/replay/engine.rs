@@ -234,7 +234,7 @@ impl ReplayRoleConfig {
             if let Some(version) = version.filter(known)
                 && let Some(rank_version) = &self.rank.vllm_version
                 && (if field == "runtime_memory.runtime_framework_version" {
-                    version.split('+').next().unwrap_or(version)
+                    FpmRuntimeMemoryConfig::modeled_release(version)
                 } else {
                     version
                 }) != rank_version
@@ -277,6 +277,7 @@ impl ReplayRoleConfig {
                 .and_then(|m| m["provenance"].as_str())
                 .unwrap_or_default(),
             Some(u64::from(self.tensor_parallel_size) * u64::from(self.dp_size)),
+            Some(u64::from(self.tensor_parallel_size)),
         )?;
         let backend = source(
             "attention_backend",

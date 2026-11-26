@@ -415,6 +415,13 @@ pub struct FpmRuntimeMemoryConfig {
 }
 
 impl FpmRuntimeMemoryConfig {
+    /// FPM tables name the release. The NIXL handshake also compares the installed local build suffix.
+    pub(crate) fn modeled_release(installed: &str) -> &str {
+        installed
+            .split_once('+')
+            .map_or(installed, |(release, _)| release)
+    }
+
     pub(crate) fn normalize_model_dtype(dtype: &str) -> Option<String> {
         let lower = dtype.trim().to_ascii_lowercase();
         Some(

@@ -1407,6 +1407,60 @@ def test_grouped_pd_refuses_roles_whose_evidence_records_two_vllm_versions(group
         SearchSpace.model_validate(search)
 
 
+def test_grouped_pd_materializes_a_matching_local_vllm_build(grouped_case):
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper.config import SearchSpace
+    from aisim.sweeper.search_space import _fpm_parallel_configs
+
+    original, root = grouped_case
+    version = "0.33.0"
+    profile = _with_transfer_markers(_with_prefix_evidence(original, version=version), version=version)
+    shared = profile["deployments"][0]
+    profile["deployments"] = [shared]
+    _write_timings(root, profile, version=version)
+    profile["deployments"] = [{**deepcopy(shared), "worker_type": role} for role in ("prefill", "decode")]
+    for measured in profile["deployments"]:
+        measured["resources"]["runtime_memory"]["runtime_framework_version"] = version + "+cu130"
+
+    raw = _pd_prediction(profile, root)
+    raw["engine"]["context_length"] = 1024
+    raw["traffic"]["source"]["input_tokens"] = 128
+    search = _pd_search(profile, root)
+    assert _fpm_parallel_configs(SearchSpace.model_validate(search), "disagg")
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 2
+
+    profile["deployments"][1]["resources"]["runtime_memory"]["runtime_framework_version"] = version + "+cu131"
+    with pytest.raises(ValueError, match="matching vllm_version"):
+        CorePredictionConfig.model_validate(raw)
+
+
+def test_grouped_pd_reports_the_supported_versions_for_a_row_without_one(grouped_case):
+    from aisim.sweeper.config import SearchSpace
+
+    original, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(original))
+    search = _pd_search(profile, root)
+    del search["backend_version"]
+    for row in profile["deployments"]:
+        del row["backend_version"]
+    with pytest.raises(ValueError, match=re.escape(_PD_VERSION)):
+        SearchSpace.model_validate(search)
+    with pytest.raises(ValueError, match=re.escape(_PD_VERSION)):
+        parallel_configs_for(
+            profile["model"],
+            "h200_sxm",
+            gpu_budget=4,
+            deployment_mode="disagg",
+            backend="vllm",
+            systems_paths=[str(root)],
+            max_seq_len=1024,
+            max_num_tokens=128,
+            max_batch_size=4,
+            fpm_profile=profile,
+        )
+
+
 @pytest.mark.parametrize(("case", "error"), [("non_cacheable_window", _PD_REPLAY_WINDOW), ("vllm_0300", _PD_VERSION)])
 def test_grouped_pd_with_prefix_caching_gives_the_texts_whose_remedies_hold_on_a_pd_rank(grouped_case, case, error):
     # With prefix caching on, the prefix-caching rule runs before the P/D rule. A bounded replay window and a version
@@ -2312,6 +2366,17 @@ def test_grouped_pd_surfaces_conflicting_evidence_only_for_reachable_shapes(grou
     assert {(c.prefill.replicas, c.decode.replicas) for c in configs} == {
         (p, d) for p in range(1, 5) for d in range(1, 5) if p + d <= 6
     }
+
+    # A pinned shape only needs a membership lookup in its independent replica domain.
+    class PinnedChoices(list):
+        def __iter__(self):
+            pytest.fail("expanded the pinned replica domain")
+
+    pinned = SearchSpace.model_validate(
+        {**constrained, "parallel_configs_by_mode": {"disagg": [{"prefill": good_pin, "decode": good_pin}]}}
+    )
+    pinned.parallel_independent_by_mode["disagg"]["prefill_replicas"] = PinnedChoices(range(1, 8193))
+    assert _fpm_parallel_configs(pinned, "disagg") == [candidate]
 
 
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):

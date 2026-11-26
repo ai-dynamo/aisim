@@ -9,6 +9,11 @@
 //! <https://github.com/vllm-project/vllm/tree/4ba787ec9959e566d3b587a796dff07673324da5>
 //! See THIRD_PARTY_NOTICES.md for upstream paths and the Apache-2.0 license.
 
+mod layout;
+mod roster;
+
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -40,6 +45,8 @@ fn record(slot: &mut Option<String>, value: Option<&str>, field: &str) -> Result
 #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub(crate) struct Worker {
     tp_rank: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dp_rank: Option<u64>,
     phase: Option<String>,
     backends: Vec<String>,
     kv_cache_layout: Option<String>,
@@ -68,7 +75,7 @@ impl Worker {
         names
     }
 
-    fn observed(rank: &Value) -> Self {
+    fn observed(rank: &Value, physical_strides: bool) -> Self {
         let config = &rank["resolved_config"];
         let groups = rank.pointer("/cache/groups").and_then(Value::as_array);
         // Older probes record the concrete per-layer classes. Only recognize an ordinary attention
@@ -109,12 +116,20 @@ impl Worker {
             .or_else(|| {
                 rank.pointer("/raw_cache_config/kv_cache_layout")
                     .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                if physical_strides && ordinary == Some(true) && !mamba {
+                    layout::from_strides(rank)
+                } else {
+                    None
+                }
             });
         if host && layout == Some("LBNHC") {
             layout = permute.map(|enabled| if enabled { "LBHNC" } else { "LBNHC" });
         }
         Self {
             tp_rank: rank["tp_rank"].as_u64(),
+            dp_rank: rank["dp_rank"].as_u64(),
             phase: rank["phase"].as_str().map(str::to_owned),
             backends: Self::names(&rank["attention_backend"]),
             kv_cache_layout: layout
@@ -139,6 +154,52 @@ impl Worker {
                         .and_then(Value::as_bool)
                         == Some(false)),
         }
+    }
+
+    fn coordinate(&self, single_dp: bool) -> Option<(bool, u64, u64)> {
+        let decode = match self.phase.as_deref()? {
+            "prefill" => false,
+            "decode" => true,
+            _ => return None,
+        };
+        Some((
+            decode,
+            self.dp_rank.or(single_dp.then_some(0))?,
+            self.tp_rank?,
+        ))
+    }
+
+    fn combine(&mut self, other: &Self) -> Result<(), AicError> {
+        if self.backends.is_empty() {
+            self.backends.clone_from(&other.backends);
+        } else if !other.backends.is_empty() {
+            self.backends.retain(|name| other.backends.contains(name));
+            if self.backends.is_empty() {
+                return Err(conflict("attention_backend"));
+            }
+        }
+        record(
+            &mut self.kv_cache_layout,
+            other.kv_cache_layout.as_deref(),
+            "kv_cache_layout",
+        )?;
+        for (field, old, new) in [
+            ("use_mla", &mut self.use_mla, other.use_mla),
+            (
+                "enable_permute_local_kv",
+                &mut self.permit_permute,
+                other.permit_permute,
+            ),
+        ] {
+            if let Some(value) = new {
+                if old.is_some_and(|v| v != value) {
+                    return Err(conflict(field));
+                }
+                *old = Some(value);
+            }
+        }
+        self.requires_hma |= other.requires_hma;
+        Ok(())
     }
 
     fn excludes_backend(&self, peer: &Self) -> bool {
@@ -178,11 +239,30 @@ pub(crate) struct NixlIdentity {
     pub(crate) modeled_version: Option<String>,
     pub(crate) disable_hma: Option<String>,
     pub(crate) workers: Vec<Worker>,
+    pub(crate) rosters: Vec<Vec<Worker>>,
+    pub(crate) phase_width: Option<u64>,
+    pub(crate) tp_size: Option<u64>,
 }
 
 impl NixlIdentity {
-    pub(crate) fn compact_workers(records: &[Value]) -> Value {
-        serde_json::json!(records.iter().map(Worker::observed).collect::<Vec<_>>())
+    /// Reproducing an older snapshot preserves its omitted DP coordinate and named-only layout.
+    pub(crate) fn compact_workers(records: &[Value], current_format: bool) -> Value {
+        serde_json::json!(
+            records
+                .iter()
+                .map(|row| {
+                    let mut worker = Worker::observed(row, current_format);
+                    if !current_format {
+                        worker.dp_rank = None;
+                    }
+                    worker
+                })
+                .collect::<Vec<_>>()
+        )
+    }
+
+    pub(crate) fn observation_digest(entry: &Value, source: &str) -> Result<String, AicError> {
+        roster::digest(entry, Some(source))
     }
 
     fn settings(&mut self, config: &Value) -> Result<(), AicError> {
@@ -231,6 +311,7 @@ impl NixlIdentity {
         &mut self,
         entry: &Value,
         v1_phase_width: Option<u64>,
+        verified_roster: bool,
     ) -> Result<bool, AicError> {
         self.settings(&entry["runtime_settings"])?;
         record(
@@ -238,7 +319,15 @@ impl NixlIdentity {
             entry.pointer("/runtime/version").and_then(Value::as_str),
             "vllm_version",
         )?;
+        if entry["source"] == "vllm_initialized_cache" {
+            record(
+                &mut self.version,
+                entry["backend_version"].as_str(),
+                "vllm_version",
+            )?;
+        }
         let start = self.workers.len();
+        let mut complete = verified_roster;
         if let Some(workers) = entry["worker_observations"].as_array() {
             for worker in workers {
                 // New snapshots spell unavailable optional fields as null or an empty name list.
@@ -278,6 +367,7 @@ impl NixlIdentity {
                         .all(|r| matches!(r["phase"].as_str(), Some("prefill" | "decode")))
             });
             if let Some(rows) = capacities {
+                complete = true;
                 self.workers
                     .extend(names.iter().zip(rows).map(|(name, row)| Worker {
                         phase: row["phase"].as_str().map(str::to_owned),
@@ -288,6 +378,7 @@ impl NixlIdentity {
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|&n| n > 0 && (names.len() == n || names.len().checked_sub(n) == Some(n)))
             {
+                complete = true;
                 // A v1 import verifies every TP × DP worker before retaining its slot, including
                 // nulls. A combined import writes one complete prefill block, then one decode block.
                 // The rank order inside each phase is lost.
@@ -325,16 +416,32 @@ impl NixlIdentity {
                 let rank = &artifact["evidence"];
                 if rank["kind"].as_str() == Some("worker") {
                     self.settings(&rank["resolved_config"])?;
+                    if entry["source"] == "vllm_initialized_cache" {
+                        record(
+                            &mut self.version,
+                            rank["backend_version"].as_str(),
+                            "vllm_version",
+                        )?;
+                    }
                     record(
                         &mut self.version,
                         rank.pointer("/runtime/version").and_then(Value::as_str),
                         "vllm_version",
                     )?;
-                    self.workers.push(Worker::observed(rank));
+                    self.workers.push(Worker::observed(rank, true));
                 }
             }
         }
         let count = self.workers.len() - start;
+        if count > 0
+            && (complete
+                || (entry["source"] == "runtime_observations"
+                    && entry["rank_capacities"]
+                        .as_array()
+                        .is_some_and(|r| r.len() == count)))
+        {
+            self.rosters.push(self.workers[start..].to_vec());
+        }
         if entry["rank_capacities"]
             .as_array()
             .is_some_and(|ranks| ranks.len() > count)
@@ -345,15 +452,19 @@ impl NixlIdentity {
         Ok(self.workers.len() != start)
     }
 
-    fn collection(&mut self, entry: &Value) -> Result<bool, AicError> {
-        let mut found = self.observation(entry, None)?;
+    fn collection(&mut self, entry: &Value, verified_roster: bool) -> Result<bool, AicError> {
+        let mut found = self.observation(entry, None, verified_roster)?;
         if let Some(phases) = entry["phases"].as_object() {
             for (phase, snapshot) in phases {
                 let before = self.workers.len();
-                if !self.observation(snapshot, None)? {
+                let rosters_before = self.rosters.len();
+                if !self.observation(snapshot, None, false)? {
                     self.workers.push(Worker::default());
                 }
-                for rank in &mut self.workers[before..] {
+                for rank in self.workers[before..]
+                    .iter_mut()
+                    .chain(self.rosters[rosters_before..].iter_mut().flatten())
+                {
                     rank.phase.get_or_insert_with(|| phase.clone());
                 }
                 found = true;
@@ -362,9 +473,11 @@ impl NixlIdentity {
         Ok(found)
     }
 
-    fn probe(&mut self, entry: &Value, phase_width: Option<u64>) -> Result<(), AicError> {
-        self.collection(entry)?;
-        if entry["schema_version"] == "aisimulate-onboarding-runtime-probe/v2" {
+    fn probe(&mut self, entry: &Value) -> Result<(), AicError> {
+        self.collection(entry, false)?;
+        let version = entry["schema_version"].as_str();
+        let bound = version == Some("aisimulate-onboarding-runtime-probe/v3");
+        if bound || version == Some("aisimulate-onboarding-runtime-probe/v2") {
             let snapshot = &entry["nixl_observation"];
             let recorded = [
                 "/runtime_settings/model_config/model",
@@ -385,19 +498,38 @@ impl NixlIdentity {
                     "onboarding runtime probe is missing its NIXL observation".into(),
                 ));
             }
+            roster::validate(snapshot, self.phase_width, self.tp_size, None, bound)?;
+            if bound {
+                let source = entry["source_artifacts"]
+                    .as_array()
+                    .and_then(|refs| {
+                        refs.iter()
+                            .find(|r| r["path"] == entry["observations_index"])
+                    })
+                    .and_then(|r| r["sha256"].as_str());
+                if snapshot["worker_observations_sha256"] != roster::digest(snapshot, source)? {
+                    return Err(roster::invalid());
+                }
+            }
         }
-        match entry["schema_version"].as_str() {
+        match version {
             Some(
-                "aisimulate-onboarding-runtime-probe/v1" | "aisimulate-onboarding-runtime-probe/v2",
+                "aisimulate-onboarding-runtime-probe/v1"
+                | "aisimulate-onboarding-runtime-probe/v2"
+                | "aisimulate-onboarding-runtime-probe/v3",
             ) => {
                 let memory = &entry["observed_resources"]["runtime_memory"];
                 self.memory(memory)?;
                 let legacy = entry["schema_version"] == "aisimulate-onboarding-runtime-probe/v1";
-                self.observation(&entry["nixl_observation"], phase_width.filter(|_| legacy))?;
+                self.observation(
+                    &entry["nixl_observation"],
+                    self.phase_width.filter(|_| legacy),
+                    !legacy,
+                )?;
                 if let Some(nested) = memory["provenance"].as_str()
                     && let Ok(direct) = serde_json::from_str(nested)
                 {
-                    self.collection(&direct)?;
+                    self.collection(&direct, false)?;
                 }
             }
             _ => {}
@@ -409,26 +541,35 @@ impl NixlIdentity {
         recorded_dtype: Option<&str>,
         provenance: &str,
         phase_width: Option<u64>,
+        tp_size: Option<u64>,
     ) -> Result<Self, AicError> {
         let mut identity = Self {
+            phase_width,
+            tp_size,
             model_dtype: recorded_dtype.and_then(FpmRuntimeMemoryConfig::normalize_model_dtype),
             ..Self::default()
         };
         let Ok(evidence) = serde_json::from_str::<Value>(provenance) else {
             return Ok(identity);
         };
-        identity.probe(&evidence, phase_width)?;
+        identity.probe(&evidence)?;
         if let Some(probe) = evidence.get("runtime_probe")
             && matches!(
                 probe["schema_version"].as_str(),
                 Some(
                     "aisimulate-onboarding-runtime-probe/v1"
                         | "aisimulate-onboarding-runtime-probe/v2"
+                        | "aisimulate-onboarding-runtime-probe/v3"
                 )
             )
         {
-            identity.probe(probe, phase_width)?;
+            identity.probe(probe)?;
         }
+        let format = evidence["observation_provenance"].as_str();
+        let bound = format == Some("source_references_v4");
+        let compact = bound || format == Some("source_references_v3");
+        let mut any_workers = false;
+        let mut digests = Vec::new();
         if let Some(cells) = evidence["cell_observations"].as_array() {
             for cell in cells {
                 let memory = &cell["runtime_memory"];
@@ -436,9 +577,61 @@ impl NixlIdentity {
                 let nested = memory["provenance"]
                     .as_str()
                     .and_then(|s| serde_json::from_str(s).ok());
-                if !identity.collection(&nested.unwrap_or_default())? {
+                let nested: Value = nested.unwrap_or_default();
+                if compact && nested.get("worker_observations").is_some() {
+                    let capacities = nested["rank_capacities"]
+                        .as_array()
+                        .ok_or_else(roster::invalid)?;
+                    roster::validate(&nested, phase_width, tp_size, Some(capacities), bound)?;
+                    any_workers = true;
+                }
+                if bound {
+                    digests.push(roster::digest(&nested, roster::cell_source(&nested))?);
+                }
+                if !identity.collection(&nested, compact)? {
                     identity.workers.push(Worker::default());
                 }
+            }
+        }
+        if compact && !any_workers {
+            return Err(roster::invalid());
+        }
+        if bound {
+            let mut expected = evidence["worker_observation_digests"]
+                .as_array()
+                .ok_or_else(roster::invalid)?
+                .iter()
+                .map(|v| v.as_str().ok_or_else(roster::invalid))
+                .collect::<Result<Vec<_>, _>>()?;
+            expected.sort_unstable();
+            digests.sort_unstable();
+            if expected != digests {
+                return Err(roster::invalid());
+            }
+        }
+        // Only repeated observations of the same measured worker constrain one another. A
+        // historical record without DP coordinates can identify its worker on a DP=1 row.
+        let single_dp = phase_width.is_some() && phase_width == tp_size;
+        let mut by_rank = BTreeMap::new();
+        for worker in &identity.workers {
+            if let Some(key) = worker.coordinate(single_dp) {
+                match by_rank.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(worker.clone());
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        slot.get_mut().combine(worker)?
+                    }
+                }
+            }
+        }
+        for worker in identity
+            .workers
+            .iter_mut()
+            .chain(identity.rosters.iter_mut().flatten())
+        {
+            if let Some(matched) = worker.coordinate(single_dp).and_then(|k| by_rank.get(&k)) {
+                worker.clone_from(matched);
             }
         }
         Ok(identity)
@@ -457,9 +650,14 @@ impl NixlIdentity {
             .iter()
             .any(|w| w.phase.as_deref() == Some(phase))
         {
-            self.workers
-                .retain(|w| w.phase.as_deref().is_none_or(|p| p == phase));
+            let selected = |w: &Worker| w.phase.as_deref().is_none_or(|p| p == phase);
+            self.workers.retain(selected);
+            for roster in &mut self.rosters {
+                roster.retain(selected);
+            }
         }
+        self.rosters
+            .retain(|r| !r.is_empty() && self.phase_width.is_some_and(|n| r.len() as u64 == n));
         self.workers.sort_unstable();
         self.workers.dedup();
         if let Some(name) = backend.filter(|s| known(s) && !s.eq_ignore_ascii_case("auto")) {
@@ -478,7 +676,7 @@ impl NixlIdentity {
         if let (Some(actual), Some(modeled)) = (
             self.version.as_deref(),
             modeled_version.filter(|s| known(s)),
-        ) && actual.split('+').next() != Some(modeled)
+        ) && FpmRuntimeMemoryConfig::modeled_release(actual) != modeled
         {
             let field = if recorded_version.is_some() {
                 "runtime_memory.runtime_framework_version"
@@ -594,13 +792,36 @@ impl NixlIdentity {
             .version
             .as_deref()
             .or(decode.modeled_version.as_deref())
-            .and_then(|s| s.split('+').next());
+            .map(FpmRuntimeMemoryConfig::modeled_release);
         if incompatible(&|p, d| p.excludes_layout(d, version)) {
             return Some((
                 "kv_cache_layout",
                 "prefill workers".into(),
                 "decode workers".into(),
             ));
+        }
+        for p in &self.rosters {
+            for d in &decode.rosters {
+                // With unequal DP populations there is no one-to-one mapping of the full worker
+                // sets. Exact TP coordinates have already been checked above.
+                if p.len() != d.len() || p.iter().chain(d).all(|w| w.tp_rank.is_some()) {
+                    continue;
+                }
+                let compatible = |a: &Worker, b: &Worker| {
+                    (a.tp_rank.is_none() || b.tp_rank.is_none() || a.tp_rank == b.tp_rank)
+                        && !a.excludes_backend(b)
+                };
+                if !roster::can_pair(p, d, |a, b| {
+                    compatible(a, b) && !a.excludes_layout(b, version)
+                }) {
+                    let field = if roster::can_pair(p, d, compatible) {
+                        "kv_cache_layout"
+                    } else {
+                        "attention_backend"
+                    };
+                    return Some((field, "prefill workers".into(), "decode workers".into()));
+                }
+            }
         }
         None
     }
@@ -612,7 +833,7 @@ mod tests {
     use serde_json::json;
 
     fn observe(evidence: Value, phase: &str) -> NixlIdentity {
-        let mut identity = NixlIdentity::observed(None, &evidence.to_string(), None).unwrap();
+        let mut identity = NixlIdentity::observed(None, &evidence.to_string(), None, None).unwrap();
         identity.select(phase, None, None, None, None).unwrap();
         identity
     }
@@ -710,16 +931,98 @@ mod tests {
     }
 
     #[test]
+    fn only_formal_collector_versions_are_installed_versions() {
+        let mut evidence = json!({"backend_version":"0.32.0+cu130", "audited_backend_version":"0.32.0",
+            "artifacts":[{"evidence":{"kind":"worker","backend_version":"0.32.0+cu130"}}]});
+        assert!(observe(evidence.clone(), "prefill").version.is_none());
+        evidence["source"] = json!("vllm_initialized_cache");
+        let mut measured = observe(evidence.clone(), "prefill");
+        assert_eq!(measured.version.as_deref(), Some("0.32.0+cu130"));
+        measured
+            .select("prefill", None, None, Some("0.32.0"), None)
+            .unwrap();
+        assert!(
+            measured
+                .select("prefill", None, None, Some("0.33.0"), None)
+                .is_err()
+        );
+        evidence["artifacts"][0]["evidence"]["backend_version"] = json!("0.33.0");
+        assert!(NixlIdentity::observed(None, &evidence.to_string(), None, None).is_err());
+    }
+
+    #[test]
+    fn repeated_rank_observations_must_admit_the_same_backend() {
+        let cell = |phase, dp, names: Value| {
+            let rank = json!({"kind":"worker","phase":phase,"dp_rank":dp,"tp_rank":0,"attention_backend":names});
+            json!({"runtime_memory":{"provenance":json!({"artifacts":[{"evidence":rank}]}).to_string()}})
+        };
+        let read = |cells: Vec<Value>| {
+            NixlIdentity::observed(
+                None,
+                &json!({"cell_observations":cells}).to_string(),
+                Some(4),
+                Some(2),
+            )
+        };
+        let first = cell("prefill", 0, json!(["a", "b"]));
+        let second = cell("prefill", 0, json!(["b", "c"]));
+        let narrowed = read(vec![first.clone(), second.clone()]).unwrap();
+        assert!(narrowed.workers.iter().all(|w| w.backends == ["b"]));
+        assert!(
+            read(vec![
+                first.clone(),
+                second,
+                cell("prefill", 0, json!(["a", "c"]))
+            ])
+            .is_err()
+        );
+        assert!(read(vec![first.clone(), cell("prefill", 1, json!("c"))]).is_ok());
+        assert!(read(vec![first, cell("decode", 0, json!("c"))]).is_ok());
+    }
+
+    #[test]
     fn legacy_draft_retains_complete_phase_blocks_without_assigning_tp_ranks() {
         let draft = |names: Value, phase, width| {
             let saved = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v1",
                 "nixl_observation":{"worker_attention_backends":names}});
-            let mut identity = NixlIdentity::observed(None, &saved.to_string(), width).unwrap();
+            let mut identity =
+                NixlIdentity::observed(None, &saved.to_string(), width, None).unwrap();
             identity.select(phase, None, None, None, None).unwrap();
             identity
         };
         let a = json!("FLASH_ATTN");
         let b = json!("FLASHINFER");
+        let three_a = draft(json!([a, a, a, b]), "prefill", Some(4));
+        let three_b = draft(json!([b, a, b, b]), "decode", Some(4));
+        assert!(three_a.mismatch(&three_b).is_some());
+        assert!(three_b.mismatch(&three_a).is_some());
+        // A manually recorded list of unrelated observations has no complete worker roster.
+        let unscoped = |names: &[Value], phase| {
+            let raw = names
+                .iter()
+                .map(|n| json!({"attention_backend":n}))
+                .collect::<Vec<_>>();
+            let saved = json!({"worker_observations": NixlIdentity::compact_workers(&raw, false)});
+            let mut id =
+                NixlIdentity::observed(None, &saved.to_string(), Some(4), Some(4)).unwrap();
+            id.select(phase, None, None, None, None).unwrap();
+            id
+        };
+        assert!(
+            unscoped(&[a.clone(), a.clone(), a.clone(), b.clone()], "prefill")
+                .mismatch(&unscoped(
+                    &[a.clone(), b.clone(), b.clone(), b.clone()],
+                    "decode"
+                ))
+                .is_none()
+        );
+        for possible in [json!([b, a, a, a]), json!([b, null, a, null])] {
+            assert!(
+                three_a
+                    .mismatch(&draft(possible, "decode", Some(4)))
+                    .is_none()
+            );
+        }
         let uniform = draft(json!([a, a]), "prefill", Some(2));
         let two_phases = json!([a, a, b, null]);
         assert!(
@@ -781,7 +1084,7 @@ mod tests {
         ] {
             let mut corrupt = raw.clone();
             corrupt["artifacts"][0]["evidence"]["resolved_config"][section][key] = json!(value);
-            assert!(NixlIdentity::observed(None, &corrupt.to_string(), None).is_err());
+            assert!(NixlIdentity::observed(None, &corrupt.to_string(), None, None).is_err());
         }
     }
 
@@ -789,8 +1092,8 @@ mod tests {
     fn imported_snapshot_requires_recorded_fields_but_accepts_sparse_workers() {
         let mut probe = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v2", "nixl_observation":{
             "runtime":{"version":"0.33.0"},"runtime_settings":{"model_config":{"model":"/M","dtype":"torch.bfloat16"},
-            "cache_config":{"cache_dtype":"auto"}},"worker_observations":NixlIdentity::compact_workers(&[json!({"tp_rank":0,"phase":"prefill"})])}});
-        assert!(NixlIdentity::observed(None, &probe.to_string(), None).is_ok());
+            "cache_config":{"cache_dtype":"auto"}},"worker_observations":NixlIdentity::compact_workers(&[json!({"tp_rank":0,"phase":"prefill"})], false)}});
+        assert!(NixlIdentity::observed(None, &probe.to_string(), None, None).is_ok());
         for (parent, key) in [
             ("/nixl_observation/runtime_settings/model_config", "model"),
             ("/nixl_observation/runtime_settings/model_config", "dtype"),
@@ -810,14 +1113,47 @@ mod tests {
                 .unwrap()
                 .remove(key);
             assert!(
-                NixlIdentity::observed(None, &damaged.to_string(), None).is_err(),
+                NixlIdentity::observed(None, &damaged.to_string(), None, None).is_err(),
                 "{parent}/{key}"
             );
         }
         probe.as_object_mut().unwrap().remove("nixl_observation");
-        assert!(NixlIdentity::observed(None, &probe.to_string(), None).is_err());
+        assert!(NixlIdentity::observed(None, &probe.to_string(), None, None).is_err());
         probe["schema_version"] = json!("aisimulate-onboarding-runtime-probe/v1");
-        assert!(NixlIdentity::observed(None, &probe.to_string(), None).is_ok());
+        assert!(NixlIdentity::observed(None, &probe.to_string(), None, None).is_ok());
+    }
+
+    #[test]
+    fn preceding_compact_formats_validate_every_phase_before_selection() {
+        let raw = [
+            json!({"phase":"prefill", "tp_rank":1}),
+            json!({"phase":"prefill", "tp_rank":0}),
+        ];
+        let old = NixlIdentity::compact_workers(&raw, false);
+        let snapshot = |rows: Value| {
+            json!({"schema_version":"aisimulate-onboarding-runtime-probe/v2",
+            "nixl_observation":{"runtime":{"version":"0.33.0"},"runtime_settings":{"model_config":{"model":"M","dtype":"half"},
+                "cache_config":{"cache_dtype":"auto"}},"worker_observations":rows}})
+        };
+        let capacities = json!([{"phase":"prefill","tp_rank":0,"dp_rank":0}, {"phase":"prefill","tp_rank":1,"dp_rank":0}]);
+        let cell = |data: Value| json!({"runtime_memory":{"provenance":data.to_string()}});
+        let finalized = |rows: Value| {
+            json!({"observation_provenance":"source_references_v3", "cell_observations":[
+            cell(json!({"rank_capacities":capacities})), cell(json!({"rank_capacities":capacities,"worker_observations":rows}))]})
+        };
+        let parse = |data: Value| NixlIdentity::observed(None, &data.to_string(), Some(2), Some(2));
+        assert!(parse(snapshot(old.clone())).is_ok());
+        assert!(parse(snapshot(json!([old[0], old[0]]))).is_err());
+        assert!(parse(snapshot(json!([old[0]]))).is_err());
+        assert!(parse(finalized(old.clone())).is_ok());
+        assert!(parse(finalized(json!([old[0], old[0]]))).is_err());
+        let mut foreign = old.clone();
+        foreign[0]["phase"] = json!("decode");
+        assert!(parse(snapshot(foreign.clone())).is_err());
+        assert!(parse(finalized(foreign)).is_err());
+        let mut missing = finalized(old);
+        missing["cell_observations"][1] = cell(json!({"rank_capacities":capacities}));
+        assert!(parse(missing).is_err());
     }
 
     #[test]

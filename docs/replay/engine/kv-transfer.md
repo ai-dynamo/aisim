@@ -100,9 +100,19 @@ For a measured deployment, the literal `ModelConfig.model` and
 the full installed version strings, including any local build suffix.
 The probe records backend names per TP rank. It sorts mixed layers, so the
 first registered backend is unknown. Two disjoint sets cannot match through
-either the first backend or the packed transfer's joined names. Older compact
-profiles can have only anonymous worker lists or source references.
+either the first backend or the packed transfer's joined names. A complete
+anonymous phase needs a distinct compatible peer for every worker. A missing
+backend can match any backend the other transfer settings permit.
+
+Current runtime drafts and compact finalizations record a SHA-256 digest of
+the worker observations, initialized settings and source references. The references
+identify the observation index or the formal collection plan and individual files.
+Replay checks the saved fields and rank coverage offline, including after workers
+are reordered. Older archives support the structural checks their recorded coordinates
+and counts permit. Onboarding verification also rehashes the original sources.
 For known non-MLA GPU caches, the decode worker checks the physical KV layout.
+When a probe omits the layout name, recorded layer and tensor byte strides can
+identify it if exactly one physical axis order fits its non-unit dimensions.
 Permuting a remote LBHNC cache into a local LBNHC cache requires the decoder's
 permute option and a layout that permits postprocessing. A memory probe without
 a connector leaves that serving option open.
