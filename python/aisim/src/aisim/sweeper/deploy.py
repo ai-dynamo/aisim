@@ -274,12 +274,17 @@ def gemma4_window_geometry(
     if sample["backend"] != "vllm" or not _is_gemma4(model):
         return None
     runtime = None
+    kv_quant_mode = sample.get("kvcache_quant_mode") or None
     if fpm_profile is not None:
-        resources = _profile_deployment(sample, role, backend_version, model=model, fpm_profile=fpm_profile).resources
+        deployment = _profile_deployment(sample, role, backend_version, model=model, fpm_profile=fpm_profile)
+        resources = deployment.resources
         # A grouped profile models the window groups itself; one without runtime memory has no pool to divide.
         if resources is None or resources.cache_layout == "grouped" or resources.runtime_memory is None:
             return None
         runtime = resources.runtime_memory
+        # The window is sized at the precision the profile was measured at; an override must match it.
+        deployment.validate_overrides(kvcache_quant_mode=kv_quant_mode)
+        kv_quant_mode = deployment.kv_cache_dtype
     prefix = _role_prefix(role)
     state = estimate_state_cache(
         model,
@@ -287,7 +292,7 @@ def gemma4_window_geometry(
         tp_size=int(sample[f"{prefix}tp"]),
         pp_size=int(sample[f"{prefix}pp"]),
         block_size=int(block_size),
-        kvcache_quant_mode=sample.get("kvcache_quant_mode") or None,
+        kvcache_quant_mode=kv_quant_mode,
     )
     return {**state, "runtime_memory": runtime}
 

@@ -13,6 +13,7 @@ from .config.engine import (
     WorkerPredictionConfig,
     _require_block_drop_off,
     _validate_hybrid_host_offload,
+    fpm_profile_deployment,
     recorded_state_pool,
 )
 
@@ -42,7 +43,7 @@ def resolve_state_size(engine: EnginePredictionConfig, worker: WorkerPredictionC
             pp_size=worker.parallelism.pipeline,
             block_size=cache.block_size,
             kv_bytes_per_token=None if cache.bytes_per_token == "auto" else cache.bytes_per_token,
-            kvcache_quant_mode=worker.timing.kvcache_quant_mode or engine.kvcache_quant_mode,
+            kvcache_quant_mode=_kv_quant_mode(engine, worker, role),
             mamba_cache_dtype=sizing.mamba_cache_dtype,
             indexer_cache_dtype=sizing.indexer_cache_dtype,
             num_speculative_tokens=engine.speculation.num_speculative_tokens if engine.speculation else engine.nextn,
@@ -88,6 +89,17 @@ def resolve_state_size(engine: EnginePredictionConfig, worker: WorkerPredictionC
     if capacity is not None and capacity < blocks + 1:
         raise ValueError("state_cache capacity must fit one token block and one request state")
     return {**result, "state_blocks": blocks, "allocated_bytes_per_request": blocks * block_bytes}
+
+
+def _kv_quant_mode(engine: EnginePredictionConfig, worker: WorkerPredictionConfig, role: str) -> str | None:
+    """KV precision for state sizing: an explicit override, then the FPM profile's, then ``None`` (the checkpoint's)."""
+    explicit = worker.timing.kvcache_quant_mode or engine.kvcache_quant_mode
+    if engine.fpm_profile is None:
+        return explicit
+    # The profile's timing and recorded pool were measured at this precision.
+    deployment = fpm_profile_deployment(engine, worker, role)
+    deployment.validate_overrides(kvcache_quant_mode=explicit)
+    return deployment.kv_cache_dtype
 
 
 def runtime_memory_blocks(

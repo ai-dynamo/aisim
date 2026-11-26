@@ -272,7 +272,7 @@ def test_fp8_kv_checkpoint_sizes_the_state_in_fp8():
     )
 
 
-def _grouped_profile(layout):
+def _grouped_profile(layout, kv_cache_dtype="bfloat16"):
     groups = [
         {
             "name": "full",
@@ -298,6 +298,9 @@ def _grouped_profile(layout):
     }
     if layout == "grouped":
         resources["cache_groups"] = groups
+    else:
+        # The global group's rate at TP1 FP8: one 1,310,720 B block per 128 tokens.
+        resources["kv_bytes_per_token"] = 10240
     resources["runtime_memory"] = {
         "kv_cache_bytes": 60 * 10**9,
         "gpu_memory_utilization": 0.9,
@@ -318,7 +321,7 @@ def _grouped_profile(layout):
         "moe_quant_mode": "bfloat16",
         "fmha_quant_mode": "bfloat16",
         "comm_quant_mode": "half",
-        "kv_cache_dtype": "bfloat16",
+        "kv_cache_dtype": kv_cache_dtype,
         "worker_type": "aggregated",
         "resources": resources,
     }
@@ -342,3 +345,51 @@ def test_a_grouped_fpm_profile_keeps_its_own_window_model():
     engine["workers"]["aggregated"].pop("parallelism")
     _, args = _args(payload)
     assert "state_cache" not in args
+
+
+def _linear_profile_payload(**engine):
+    payload = _payload(timing={"type": "default"}, capacity={"type": "default"}, prefix_caching=False)
+    payload["engine"].update(hardware="h200_sxm", backend_version="0.32.0", context_length=8192, **engine)
+    payload["engine"]["fpm_profile"] = _grouped_profile("linear", kv_cache_dtype="fp8")
+    payload["engine"]["workers"]["aggregated"].pop("parallelism")
+    return payload
+
+
+def test_a_linear_fpm_profile_sizes_the_window_at_its_kv_dtype():
+    # The checkpoint is BF16, but the profile was measured with FP8 KV. TP1 FP8 halves
+    # the TP1 BF16 page: 64 x 4096 B per layer, five layers per 1,310,720 B block.
+    _, args = _args(_linear_profile_payload())
+    assert (args["block_size"], args["kv_cache_bytes_per_token"]) == (128, 10240)
+    assert args["state_cache"]["bytes_per_request"] == 85 * 1310720
+    # The recorded 60 GB pool, in FP8 blocks.
+    assert args["num_gpu_blocks"] == 60 * 10**9 // 1310720
+
+
+def test_a_kv_dtype_override_that_contradicts_the_profile_is_rejected():
+    with pytest.raises(ValueError, match="FPM profile identity conflict"):
+        _args(_linear_profile_payload(kvcache_quant_mode="bfloat16"))
+
+
+def _sweeper_sample(**extra):
+    """A TP1 aggregated vLLM Gemma 4 candidate, as the sweeper unrolls it."""
+    shape = dict.fromkeys(("tp", "pp", "attention_dp", "moe_tp", "moe_ep"), 1)
+    return {"backend": "vllm", "model_name": GEMMA4, "hardware_sku": "h200_sxm", **shape, **extra}
+
+
+def test_the_sweeper_sizes_the_window_at_the_profile_kv_dtype():
+    from aisim.sweeper.deploy import gemma4_window_geometry
+
+    sample = _sweeper_sample()
+    profile = _grouped_profile("linear", kv_cache_dtype="fp8")
+    state = gemma4_window_geometry(sample, "agg", 64, backend_version="0.32.0", fpm_profile=profile)
+    assert (state["kv_bytes_per_token"], state["bytes_per_block"]) == (10240, 1310720)
+    assert state["runtime_memory"].kv_cache_bytes == 60 * 10**9
+
+
+def test_the_sweeper_rejects_a_kv_dtype_that_contradicts_the_profile():
+    from aisim.sweeper.deploy import gemma4_window_geometry
+
+    sample = _sweeper_sample(kvcache_quant_mode="bfloat16")
+    profile = _grouped_profile("linear", kv_cache_dtype="fp8")
+    with pytest.raises(ValueError, match="FPM profile identity conflict"):
+        gemma4_window_geometry(sample, "agg", 64, backend_version="0.32.0", fpm_profile=profile)
