@@ -1035,7 +1035,7 @@ def test_sparse_formal_finalization_still_binds_its_installed_version_and_rank_r
 
     cell = _evidence(tmp_path, monkeypatch, version="0.32.0", initialized=_initialized_layer_strided)
     resources = _resolve(cell, tmp_path, expected_backend_version="0.32.0")
-    for version in ("source_references_v4", "source_references_v5"):
+    for version in ("source_references_v4", "source_references_v5", "source_references_v6"):
         saved = {}
         _merge_resources([resources], saved, source_references=True, observation_format=version)
         assert saved["observation_provenance"] == version
@@ -1045,7 +1045,7 @@ def test_sparse_formal_finalization_still_binds_its_installed_version_and_rank_r
         assert all(
             not row["backends"] and row["kv_cache_layout"] is None for row in portable.get("worker_observations", [])
         )
-        assert bool(portable.get("worker_observations")) == (version == "source_references_v5")
+        assert bool(portable.get("worker_observations")) == (version != "source_references_v4")
         captured = (json.dumps(saved), None, "auto")
         recorded = ("bfloat16", "0.32.0", None, 4)
         assert _runtime.grouped_observation_requirement(captured, captured, recorded, recorded, 2) is None

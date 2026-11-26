@@ -422,6 +422,19 @@ impl FpmRuntimeMemoryConfig {
             .map_or(installed, |(release, _)| release)
     }
 
+    pub(crate) fn matches_grouped_version(
+        installed: &str,
+        modeled: &str,
+        prefix_caching: bool,
+    ) -> bool {
+        let version = if prefix_caching {
+            installed
+        } else {
+            Self::modeled_release(installed)
+        };
+        version == modeled
+    }
+
     pub(crate) fn normalize_model_dtype(dtype: &str) -> Option<String> {
         let lower = dtype.trim().to_ascii_lowercase();
         Some(

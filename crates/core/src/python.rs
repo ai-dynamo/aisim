@@ -2811,11 +2811,11 @@ fn materialize_aic_capacity(
             && let Some(version) = &config.backend_version
         {
             ensure!(
-                if role.rank.enable_prefix_caching {
-                    observed
-                } else {
-                    crate::perfmodel::fpm::FpmRuntimeMemoryConfig::modeled_release(observed)
-                } == version,
+                crate::perfmodel::fpm::FpmRuntimeMemoryConfig::matches_grouped_version(
+                    observed,
+                    version,
+                    role.rank.enable_prefix_caching
+                ),
                 "grouped FPM cache P/D requires runtime_memory.runtime_framework_version ({observed}) to equal the deployment's backend_version ({version})"
             );
         }
@@ -4839,11 +4839,12 @@ fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult
 
 /// Compact initialized worker fields for a hash-bound onboarding observation.
 #[pyfunction]
-#[pyo3(signature = (records, current_format=false, keep_layout_choices=true))]
+#[pyo3(signature = (records, current_format=false, keep_layout_choices=true, engine_layout=false))]
 fn nixl_worker_observations(
     records: &str,
     current_format: bool,
     keep_layout_choices: bool,
+    engine_layout: bool,
 ) -> PyResult<String> {
     let parsed: Vec<serde_json::Value> = serde_json::from_str(records)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -4851,17 +4852,23 @@ fn nixl_worker_observations(
         &parsed,
         current_format,
         keep_layout_choices,
+        engine_layout,
     )
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
     .to_string())
 }
 
 #[pyfunction]
-fn nixl_observation_digest(entry: &str, source_sha256: &str) -> PyResult<String> {
+#[pyo3(signature = (entry, source_sha256, bind_references=false))]
+fn nixl_observation_digest(
+    entry: &str,
+    source_sha256: &str,
+    bind_references: bool,
+) -> PyResult<String> {
     let entry = serde_json::from_str(entry).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid worker observation: {e}"))
     })?;
-    crate::perfmodel::fpm::NixlIdentity::observation_digest(&entry, source_sha256)
+    crate::perfmodel::fpm::NixlIdentity::observation_digest(&entry, source_sha256, bind_references)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
@@ -4890,6 +4897,7 @@ fn grouped_observation_requirement(
             row.map(|r| r.0),
             row.and_then(|r| r.1),
             row.and_then(|r| r.2),
+            false,
         )?;
         Ok::<_, crate::AicError>(value)
     };

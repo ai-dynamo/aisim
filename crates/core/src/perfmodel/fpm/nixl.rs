@@ -53,6 +53,10 @@ pub(crate) struct Worker {
     phase: Option<String>,
     backends: Vec<String>,
     kv_cache_layout: Option<Layouts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_cache_layout: Option<Layouts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_buffer: Option<bool>,
     use_mla: Option<bool>,
     permit_permute: Option<bool>,
     requires_hma: bool,
@@ -82,6 +86,7 @@ impl Worker {
         rank: &Value,
         physical_strides: bool,
         keep_choices: bool,
+        engine_layout: bool,
     ) -> Result<Self, AicError> {
         let config = &rank["resolved_config"];
         let groups = rank.pointer("/cache/groups").and_then(Value::as_array);
@@ -92,7 +97,8 @@ impl Worker {
         let mut mamba = false;
         if let Some(groups) = groups {
             for group in groups {
-                mamba |= group["spec_type"] == "vllm.v1.kv_cache_interface.MambaSpec";
+                mamba |= group["spec_type"] == "vllm.v1.kv_cache_interface.MambaSpec"
+                    || (engine_layout && Self::contains_mamba(group));
                 hybrid |= group["kind"] == "state" || group["sliding_window"].as_u64().is_some();
                 if group["kind"] == "attention" {
                     let standard = group["layer_classes"].as_object().is_some_and(|classes| {
@@ -121,38 +127,29 @@ impl Worker {
             .pointer("/model_config/use_mla")
             .and_then(Value::as_bool)
             .or_else(|| (ordinary == Some(true)).then_some(false));
-        let gpu_attention = ordinary == Some(true) && !mamba && use_mla == Some(false);
+        let gpu_attention = if engine_layout {
+            // The stride reader checks each layer's class and excludes state views.
+            use_mla == Some(false) && groups.is_some()
+        } else {
+            ordinary == Some(true) && !mamba && use_mla == Some(false)
+        };
         let physical = if gpu_attention {
-            layout::from_strides(rank, true)?
+            layout::from_strides(rank, true, engine_layout)?
         } else {
             None
         };
-        let mut named = None;
-        for path in [
-            "/cache/kv_cache_layout",
-            "/raw_cache_config/kv_cache_layout",
-        ] {
-            if let Some(name) = rank
-                .pointer(path)
-                .and_then(Value::as_str)
-                .and_then(Layouts::named)
-            {
-                if named.as_ref().is_some_and(|seen| seen != &name)
-                    || physical
-                        .as_ref()
-                        .is_some_and(|possible| !possible.names().contains(&name.names()[0]))
-                {
-                    return Err(conflict("kv_cache_layout"));
-                }
-                named = Some(name);
-            }
+        let named = Self::named_layout(rank, engine_layout)?;
+        if let (Some(name), Some(possible)) = (&named, &physical)
+            && !possible.names().contains(&name.names()[0])
+        {
+            return Err(conflict("kv_cache_layout"));
         }
         let layout = if named.is_some() || !physical_strides {
             named
         } else if keep_choices {
             physical
         } else if gpu_attention {
-            layout::from_strides(rank, false)?.filter(|v| matches!(v, Layouts::Named(_)))
+            layout::from_strides(rank, false, false)?.filter(|v| matches!(v, Layouts::Named(_)))
         } else {
             None
         };
@@ -161,8 +158,18 @@ impl Worker {
             dp_rank: rank["dp_rank"].as_u64(),
             phase: rank["phase"].as_str().map(str::to_owned),
             backends: Self::names(&rank["attention_backend"]),
-            kv_cache_layout: if host {
-                layout.and_then(|v| v.host(permute, keep_choices))
+            gpu_cache_layout: if engine_layout { layout.clone() } else { None },
+            host_buffer: engine_layout.then_some(host),
+            kv_cache_layout: if host && (!engine_layout || use_mla != Some(true)) {
+                layout.and_then(|v| {
+                    // Unknown MLA status also permits the unchanged GPU layout.
+                    let permute = if engine_layout && use_mla.is_none() && permute == Some(true) {
+                        None
+                    } else {
+                        permute
+                    };
+                    v.host(permute, keep_choices)
+                })
             } else {
                 layout
             },
@@ -170,13 +177,47 @@ impl Worker {
             permit_permute: permute,
             // Standard full attention and Mamba cannot be promoted to one cache spec when
             // HMA is disabled. Their separate initialized groups also establish this for old probes.
-            requires_hma: (mamba && ordinary == Some(true))
+            requires_hma: (mamba && (engine_layout || ordinary == Some(true)))
                 || (hybrid
                     && config
                         .pointer("/scheduler_config/disable_hybrid_kv_cache_manager")
                         .and_then(Value::as_bool)
                         == Some(false)),
         })
+    }
+
+    fn named_layout(rank: &Value, engine_layout: bool) -> Result<Option<Layouts>, AicError> {
+        let mut named = None;
+        let paths = [
+            "/cache/kv_cache_layout",
+            "/raw_cache_config/kv_cache_layout",
+        ];
+        for path in paths
+            .into_iter()
+            .chain(engine_layout.then_some("/resolved_config/cache_config/kv_cache_layout"))
+        {
+            if let Some(name) = rank
+                .pointer(path)
+                .and_then(Value::as_str)
+                .and_then(Layouts::named)
+            {
+                if named.as_ref().is_some_and(|other| other != &name) {
+                    return Err(conflict("kv_cache_layout"));
+                }
+                named = Some(name);
+            }
+        }
+        Ok(named)
+    }
+
+    fn contains_mamba(spec: &Value) -> bool {
+        match spec["spec_type"].as_str() {
+            Some("vllm.v1.kv_cache_interface.MambaSpec") => true,
+            Some("vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs") => spec["layer_specs"]
+                .as_object()
+                .is_some_and(|layers| layers.values().any(Self::contains_mamba)),
+            _ => false,
+        }
     }
 
     fn coordinate(&self, single_dp: bool) -> Option<(bool, u64, u64)> {
@@ -201,20 +242,26 @@ impl Worker {
                 return Err(conflict("attention_backend"));
             }
         }
-        if let Some(other) = &other.kv_cache_layout {
-            self.kv_cache_layout = Some(match &self.kv_cache_layout {
-                None => other.clone(),
-                Some(ours) => Layouts::from_names(
-                    ours.names()
-                        .iter()
-                        .filter(|n| other.names().contains(n))
-                        .cloned()
-                        .collect(),
-                )
-                .ok_or_else(|| conflict("kv_cache_layout"))?,
-            });
+        for (ours, theirs) in [
+            (&mut self.kv_cache_layout, &other.kv_cache_layout),
+            (&mut self.gpu_cache_layout, &other.gpu_cache_layout),
+        ] {
+            if let Some(theirs) = theirs {
+                *ours = Some(match ours {
+                    None => theirs.clone(),
+                    Some(ours) => Layouts::from_names(
+                        ours.names()
+                            .iter()
+                            .filter(|n| theirs.names().contains(n))
+                            .cloned()
+                            .collect(),
+                    )
+                    .ok_or_else(|| conflict("kv_cache_layout"))?,
+                });
+            }
         }
         for (field, old, new) in [
+            ("kv_buffer_device", &mut self.host_buffer, other.host_buffer),
             ("use_mla", &mut self.use_mla, other.use_mla),
             (
                 "enable_permute_local_kv",
@@ -272,7 +319,19 @@ impl Worker {
 enum Capture {
     Full,
     References,
+    TensorRank,
     Ranked,
+    LayoutChoices,
+    EngineLayout,
+}
+
+impl Capture {
+    fn ranked(self) -> bool {
+        matches!(
+            self,
+            Self::TensorRank | Self::Ranked | Self::LayoutChoices | Self::EngineLayout
+        )
+    }
 }
 
 #[derive(Default)]
@@ -285,6 +344,7 @@ pub(crate) struct NixlIdentity {
     pub(crate) modeled_version: Option<String>,
     pub(crate) disable_hma: Option<String>,
     pub(crate) workers: Vec<Worker>,
+    pub(crate) engines: layout::Deployment,
     pub(crate) rosters: Vec<Vec<Worker>>,
     pub(crate) phase_width: Option<u64>,
     pub(crate) tp_size: Option<u64>,
@@ -296,20 +356,65 @@ impl NixlIdentity {
         records: &[Value],
         ranked: bool,
         keep_choices: bool,
+        engine_layout: bool,
     ) -> Result<Value, AicError> {
-        let mut workers = Vec::with_capacity(records.len());
-        for row in records {
-            let mut worker = Worker::observed(row, ranked, ranked && keep_choices)?;
-            if !ranked {
-                worker.dp_rank = None;
-            }
-            workers.push(worker);
-        }
-        Ok(serde_json::json!(workers))
+        Ok(serde_json::json!(Self::project_workers(
+            records.iter(),
+            ranked,
+            keep_choices,
+            engine_layout
+        )?))
     }
 
-    pub(crate) fn observation_digest(entry: &Value, source: &str) -> Result<String, AicError> {
-        roster::digest(entry, Some(source))
+    fn project_workers<'a>(
+        records: impl Iterator<Item = &'a Value> + Clone,
+        ranked: bool,
+        keep_choices: bool,
+        engine_layout: bool,
+    ) -> Result<Vec<Worker>, AicError> {
+        let mut schedulers = BTreeMap::new();
+        if engine_layout {
+            for row in records.clone().filter(|r| r["kind"] == "scheduler") {
+                if let Some(layout) = Worker::named_layout(row, true)? {
+                    let pool = (row["phase"].as_str(), row["dp_rank"].as_u64());
+                    if schedulers
+                        .insert(pool, layout.clone())
+                        .is_some_and(|old| old != layout)
+                    {
+                        return Err(conflict("kv_cache_layout"));
+                    }
+                }
+            }
+        }
+        records
+            .filter(|r| r["kind"] != "scheduler")
+            .map(|row| {
+                let mut worker =
+                    Worker::observed(row, ranked, ranked && keep_choices, engine_layout)?;
+                if let Some(layout) = schedulers.get(&(row["phase"].as_str(), worker.dp_rank)) {
+                    if worker
+                        .gpu_cache_layout
+                        .as_ref()
+                        .is_some_and(|gpu| !gpu.names().contains(&layout.names()[0]))
+                    {
+                        return Err(conflict("kv_cache_layout"));
+                    }
+                    worker.gpu_cache_layout = Some(layout.clone());
+                }
+                if !ranked {
+                    worker.dp_rank = None;
+                }
+                Ok(worker)
+            })
+            .collect()
+    }
+
+    pub(crate) fn observation_digest(
+        entry: &Value,
+        source: &str,
+        bind_references: bool,
+    ) -> Result<String, AicError> {
+        roster::digest(entry, Some(source), bind_references)
     }
 
     fn settings(&mut self, config: &Value) -> Result<(), AicError> {
@@ -360,6 +465,21 @@ impl NixlIdentity {
         v1_phase_width: Option<u64>,
         capture: Capture,
     ) -> Result<bool, AicError> {
+        if capture == Capture::References
+            && (entry.get("worker_observations").is_some()
+                || entry.get("worker_observations_sha256").is_some()
+                || entry.get("worker_attention_backends").is_some_and(|v| {
+                    v.as_array().is_none_or(|names| {
+                        names.iter().any(|n| {
+                            !(n.is_null()
+                                || n.is_string()
+                                || n.as_array().is_some_and(|a| a.iter().all(Value::is_string)))
+                        })
+                    })
+                }))
+        {
+            return Err(roster::invalid());
+        }
         self.settings(&entry["runtime_settings"])?;
         record(
             &mut self.version,
@@ -374,7 +494,7 @@ impl NixlIdentity {
             )?;
         }
         let mut complete = roster::validate_source(entry, capture, self.phase_width, self.tp_size)?
-            || capture == Capture::Ranked;
+            || capture.ranked();
         let start = self.workers.len();
         if let Some(workers) = entry["worker_observations"].as_array() {
             for worker in workers {
@@ -395,6 +515,30 @@ impl NixlIdentity {
                     return Err(AicError::InvalidEngineConfig(
                         "incomplete grouped worker observation".into(),
                     ));
+                }
+                if capture == Capture::TensorRank && worker.get("dp_rank").is_some()
+                    || capture != Capture::EngineLayout
+                        && (worker.get("host_buffer").is_some()
+                            || worker.get("gpu_cache_layout").is_some())
+                    || capture == Capture::EngineLayout && !worker["host_buffer"].is_boolean()
+                {
+                    return Err(roster::invalid());
+                }
+                for field in ["kv_cache_layout", "gpu_cache_layout"] {
+                    match &worker[field] {
+                        Value::Null => {}
+                        Value::String(s) if Layouts::named(s).is_some() => {}
+                        Value::Array(names)
+                            if matches!(
+                                capture,
+                                Capture::LayoutChoices | Capture::EngineLayout
+                            ) && names.len() > 1
+                                && names
+                                    .iter()
+                                    .all(|n| n.as_str().and_then(Layouts::named).is_some())
+                                && names.windows(2).all(|n| n[0].as_str() < n[1].as_str()) => {}
+                        _ => return Err(roster::invalid()),
+                    }
                 }
                 self.workers
                     .push(serde_json::from_value(worker.clone()).map_err(|e| {
@@ -479,9 +623,17 @@ impl NixlIdentity {
                         rank.pointer("/runtime/version").and_then(Value::as_str),
                         "vllm_version",
                     )?;
-                    self.workers.push(Worker::observed(rank, true, true)?);
                 }
             }
+            self.workers.extend(Self::project_workers(
+                artifacts
+                    .iter()
+                    .map(|a| &a["evidence"])
+                    .filter(|r| matches!(r["kind"].as_str(), Some("worker" | "scheduler"))),
+                true,
+                true,
+                true,
+            )?);
         }
         let count = self.workers.len() - start;
         if count > 0
@@ -527,14 +679,21 @@ impl NixlIdentity {
     fn probe(&mut self, entry: &Value) -> Result<(), AicError> {
         self.collection(entry, Capture::Full)?;
         let version = entry["schema_version"].as_str();
+        let engines = version == Some("aisimulate-onboarding-runtime-probe/v5");
+        let choices = engines || version == Some("aisimulate-onboarding-runtime-probe/v4");
         let bound = matches!(
             version,
             Some(
-                "aisimulate-onboarding-runtime-probe/v3" | "aisimulate-onboarding-runtime-probe/v4"
+                "aisimulate-onboarding-runtime-probe/v3"
+                    | "aisimulate-onboarding-runtime-probe/v4"
+                    | "aisimulate-onboarding-runtime-probe/v5"
             )
         );
         if bound || version == Some("aisimulate-onboarding-runtime-probe/v2") {
             let snapshot = &entry["nixl_observation"];
+            if !bound && snapshot.get("worker_observations_sha256").is_some() {
+                return Err(roster::invalid());
+            }
             let recorded = [
                 "/runtime_settings/model_config/model",
                 "/runtime_settings/model_config/dtype",
@@ -572,7 +731,9 @@ impl NixlIdentity {
                             .find(|r| r["path"] == entry["observations_index"])
                     })
                     .and_then(|r| r["sha256"].as_str());
-                if snapshot["worker_observations_sha256"] != roster::digest(snapshot, source)? {
+                if snapshot["worker_observations_sha256"]
+                    != roster::digest(snapshot, source, false)?
+                {
                     return Err(roster::invalid());
                 }
             }
@@ -582,18 +743,29 @@ impl NixlIdentity {
                 "aisimulate-onboarding-runtime-probe/v1"
                 | "aisimulate-onboarding-runtime-probe/v2"
                 | "aisimulate-onboarding-runtime-probe/v3"
-                | "aisimulate-onboarding-runtime-probe/v4",
+                | "aisimulate-onboarding-runtime-probe/v4"
+                | "aisimulate-onboarding-runtime-probe/v5",
             ) => {
                 let memory = &entry["observed_resources"]["runtime_memory"];
                 self.memory(memory)?;
                 let legacy = entry["schema_version"] == "aisimulate-onboarding-runtime-probe/v1";
+                let snapshot = &entry["nixl_observation"];
+                if legacy && !snapshot.is_null() && !snapshot.is_object() {
+                    return Err(roster::invalid());
+                }
                 self.observation(
-                    &entry["nixl_observation"],
+                    snapshot,
                     self.phase_width.filter(|_| legacy),
                     if legacy {
                         Capture::References
-                    } else {
+                    } else if engines {
+                        Capture::EngineLayout
+                    } else if choices {
+                        Capture::LayoutChoices
+                    } else if bound {
                         Capture::Ranked
+                    } else {
+                        Capture::TensorRank
                     },
                 )?;
                 if let Some(nested) = memory["provenance"].as_str()
@@ -644,17 +816,28 @@ impl NixlIdentity {
                         | "source_references_v3"
                         | "source_references_v4"
                         | "source_references_v5"
+                        | "source_references_v6"
                 )
         }) {
             return Err(AicError::InvalidEngineConfig(
                 "unsupported finalized observation provenance format".into(),
             ));
         }
-        let current = format == Some("source_references_v5");
+        let engines = format == Some("source_references_v6");
+        let current = engines || format == Some("source_references_v5");
         let bound = current || format == Some("source_references_v4");
         let compact = bound || format == Some("source_references_v3");
-        let capture = if compact {
+        if format.is_some() && !bound && evidence.get("worker_observation_digests").is_some() {
+            return Err(roster::invalid());
+        }
+        let capture = if engines {
+            Capture::EngineLayout
+        } else if current {
+            Capture::LayoutChoices
+        } else if bound {
             Capture::Ranked
+        } else if compact {
+            Capture::TensorRank
         } else if matches!(format, Some("source_references" | "source_references_v2")) {
             Capture::References
         } else {
@@ -687,7 +870,11 @@ impl NixlIdentity {
                     any_workers = true;
                 }
                 if bound {
-                    digests.push(roster::digest(&nested, roster::cell_source(&nested))?);
+                    digests.push(roster::digest(
+                        &nested,
+                        roster::cell_source(&nested),
+                        engines,
+                    )?);
                 }
                 if nested["schema_version"]
                     .as_str()
@@ -750,6 +937,7 @@ impl NixlIdentity {
         precision: Option<&str>,
         modeled_version: Option<&str>,
         recorded_version: Option<&str>,
+        prefix_caching: bool,
     ) -> Result<(), AicError> {
         if self
             .workers
@@ -780,7 +968,23 @@ impl NixlIdentity {
             }) {
                 return Err(conflict("attention_backend"));
             }
+            if rosters.iter().flat_map(|r| r.iter()).any(|w| {
+                w.kv_cache_layout.is_some()
+                    || w.gpu_cache_layout.is_some()
+                    || w.use_mla.is_some()
+                    || w.permit_permute.is_some()
+                    || w.host_buffer.is_some()
+            }) && !roster::workers_fit(&rosters)
+            {
+                return Err(conflict("kv_cache_layout or worker settings"));
+            }
         }
+        self.engines = layout::Deployment::from_workers(
+            &self.workers,
+            &self.rosters,
+            self.phase_width,
+            self.tp_size,
+        )?;
         self.workers.sort_unstable();
         self.workers.dedup();
         if let Some(name) = backend.filter(|s| known(s) && !s.eq_ignore_ascii_case("auto")) {
@@ -799,7 +1003,7 @@ impl NixlIdentity {
         if let (Some(actual), Some(modeled)) = (
             self.version.as_deref(),
             modeled_version.filter(|s| known(s)),
-        ) && FpmRuntimeMemoryConfig::modeled_release(actual) != modeled
+        ) && !FpmRuntimeMemoryConfig::matches_grouped_version(actual, modeled, prefix_caching)
         {
             let field = if recorded_version.is_some() {
                 "runtime_memory.runtime_framework_version"
@@ -923,11 +1127,17 @@ impl NixlIdentity {
                 "decode workers".into(),
             ));
         }
-        if let Some(tp) = self
+        let tp = self
             .tp_size
-            .filter(|t| Some(*t) == decode.tp_size && *t > 0)
-            && !(self.rosters.is_empty() && decode.rosters.is_empty())
-        {
+            .filter(|t| Some(*t) == decode.tp_size && *t > 0);
+        if tp.is_some() && !layout::engines_routable(&self.engines, &decode.engines, version) {
+            return Some((
+                "kv_cache_layout",
+                "prefill engines".into(),
+                "decode engines".into(),
+            ));
+        }
+        if let Some(tp) = tp.filter(|_| !(self.rosters.is_empty() && decode.rosters.is_empty())) {
             for slot in 0..tp {
                 let at_slot =
                     |w: &&Worker| w.tp_rank == Some(slot) || (tp == 1 && w.tp_rank.is_none());
@@ -993,7 +1203,9 @@ mod tests {
 
     fn observe(evidence: Value, phase: &str) -> NixlIdentity {
         let mut identity = NixlIdentity::observed(None, &evidence.to_string(), None, None).unwrap();
-        identity.select(phase, None, None, None, None).unwrap();
+        identity
+            .select(phase, None, None, None, None, false)
+            .unwrap();
         identity
     }
 
@@ -1081,11 +1293,11 @@ mod tests {
         let mut identity = observe(artifacts(&[mixed, n], "prefill"), "prefill");
         assert!(
             identity
-                .select("prefill", Some("FLASH_ATTN"), None, None, None)
+                .select("prefill", Some("FLASH_ATTN"), None, None, None, false)
                 .is_err()
         );
         identity
-            .select("prefill", Some("flashinfer"), None, None, None)
+            .select("prefill", Some("flashinfer"), None, None, None, false)
             .unwrap();
     }
 
@@ -1098,11 +1310,11 @@ mod tests {
         let mut measured = observe(evidence.clone(), "prefill");
         assert_eq!(measured.version.as_deref(), Some("0.32.0+cu130"));
         measured
-            .select("prefill", None, None, Some("0.32.0"), None)
+            .select("prefill", None, None, Some("0.32.0"), None, false)
             .unwrap();
         assert!(
             measured
-                .select("prefill", None, None, Some("0.33.0"), None)
+                .select("prefill", None, None, Some("0.33.0"), None, false)
                 .is_err()
         );
         evidence["artifacts"][0]["evidence"]["backend_version"] = json!("0.33.0");
@@ -1146,7 +1358,9 @@ mod tests {
                 "nixl_observation":{"worker_attention_backends":names}});
             let mut identity =
                 NixlIdentity::observed(None, &saved.to_string(), width, None).unwrap();
-            identity.select(phase, None, None, None, None).unwrap();
+            identity
+                .select(phase, None, None, None, None, false)
+                .unwrap();
             identity
         };
         let a = json!("FLASH_ATTN");
@@ -1161,10 +1375,10 @@ mod tests {
                 .iter()
                 .map(|n| json!({"attention_backend":n}))
                 .collect::<Vec<_>>();
-            let saved = json!({"worker_observations": NixlIdentity::compact_workers(&raw, false, false).unwrap()});
+            let saved = json!({"worker_observations": NixlIdentity::compact_workers(&raw, false, false, false).unwrap()});
             let mut id =
                 NixlIdentity::observed(None, &saved.to_string(), Some(4), Some(4)).unwrap();
-            id.select(phase, None, None, None, None).unwrap();
+            id.select(phase, None, None, None, None, false).unwrap();
             id
         };
         assert!(
@@ -1222,11 +1436,21 @@ mod tests {
         let raw = json!({"runtime":{"version":"0.32.0+build"},"runtime_settings":settings,
             "artifacts":[{"evidence":{"kind":"worker","resolved_config":settings}}]});
         let mut p = observe(raw.clone(), "prefill");
-        p.select("prefill", None, Some("bfloat16"), Some("0.32.0"), None)
-            .unwrap();
-        assert!(p.select("prefill", None, Some("fp8"), None, None).is_err());
+        p.select(
+            "prefill",
+            None,
+            Some("bfloat16"),
+            Some("0.32.0"),
+            None,
+            false,
+        )
+        .unwrap();
         assert!(
-            p.select("prefill", None, None, Some("0.33.0"), None)
+            p.select("prefill", None, Some("fp8"), None, None, false)
+                .is_err()
+        );
+        assert!(
+            p.select("prefill", None, None, Some("0.33.0"), None, false)
                 .is_err()
         );
         let mut diff = raw.clone();
@@ -1250,7 +1474,7 @@ mod tests {
     fn imported_snapshot_requires_recorded_fields_but_accepts_sparse_workers() {
         let mut probe = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v2", "nixl_observation":{
             "runtime":{"version":"0.33.0"},"runtime_settings":{"model_config":{"model":"/M","dtype":"torch.bfloat16"},
-            "cache_config":{"cache_dtype":"auto"}},"worker_observations":NixlIdentity::compact_workers(&[json!({"tp_rank":0,"phase":"prefill"})], false, false).unwrap()}});
+            "cache_config":{"cache_dtype":"auto"}},"worker_observations":NixlIdentity::compact_workers(&[json!({"tp_rank":0,"phase":"prefill"})], false, false, false).unwrap()}});
         assert!(NixlIdentity::observed(None, &probe.to_string(), None, None).is_ok());
         for (parent, key) in [
             ("/nixl_observation/runtime_settings/model_config", "model"),
@@ -1287,7 +1511,7 @@ mod tests {
             json!({"phase":"prefill", "tp_rank":1}),
             json!({"phase":"prefill", "tp_rank":0}),
         ];
-        let old = NixlIdentity::compact_workers(&raw, false, false).unwrap();
+        let old = NixlIdentity::compact_workers(&raw, false, false, false).unwrap();
         let snapshot = |rows: Value| {
             json!({"schema_version":"aisimulate-onboarding-runtime-probe/v2",
             "nixl_observation":{"runtime":{"version":"0.33.0"},"runtime_settings":{"model_config":{"model":"M","dtype":"half"},
@@ -1322,11 +1546,13 @@ mod tests {
                 "nixl_observation":{"worker_attention_backends":names}});
             let mut id =
                 NixlIdentity::observed(None, &probe.to_string(), Some(width), Some(tp)).unwrap();
-            id.select(phase, None, None, None, None).unwrap();
+            id.select(phase, None, None, None, None, false).unwrap();
             id
         }
         let mut missing = NixlIdentity::observed(None, "", Some(2), Some(1)).unwrap();
-        missing.select("prefill", None, None, None, None).unwrap();
+        missing
+            .select("prefill", None, None, None, None, false)
+            .unwrap();
         let mixed = imported(json!(["a", "b"]), 1, "decode");
         assert!(missing.mismatch(&mixed).is_some());
         assert!(mixed.mismatch(&missing).is_some());
@@ -1366,7 +1592,7 @@ mod tests {
                 json!({"observation_provenance":"source_references_v2","cell_observations":cells});
             let mut id =
                 NixlIdentity::observed(None, &profile.to_string(), Some(2), Some(2)).unwrap();
-            id.select("prefill", None, None, None, None)
+            id.select("prefill", None, None, None, None, false)
         };
         assert!(select(vec![cell(json!(["a", "b"])), cell(json!(["b", "a"]))]).is_ok());
         assert!(select(vec![cell(json!(["a", null])), cell(json!(["b", null]))]).is_ok());
@@ -1394,6 +1620,194 @@ mod tests {
             NixlIdentity::observed(None, r#"{"schema_version":"unrelated/v99"}"#, None, None)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn gpu_layout_is_common_to_one_engine_and_registration_is_local_to_a_worker() {
+        let identity = |phase: &str,
+                        layouts: &[(u64, u64, Option<&str>, bool)],
+                        scheduler: Option<&str>| {
+            let mut records = layouts.iter().map(|(dp,tp,layout,host)| json!({"kind":"worker","phase":phase,
+                "dp_rank":dp,"tp_rank":tp,"raw_cache_config":{"kv_cache_layout":layout},
+                "resolved_config":{"model_config":{"use_mla": false},"kv_transfer_config":{
+                    "kv_buffer_device": if *host { "cpu" } else { "cuda" }, "enable_permute_local_kv":true}}})).collect::<Vec<_>>();
+            records.push(json!({"kind":"scheduler","phase":phase,"dp_rank":0,"raw_cache_config":{"kv_cache_layout":scheduler}}));
+            let artifacts = records
+                .iter()
+                .map(|r| json!({"evidence":r}))
+                .collect::<Vec<_>>();
+            let mut id = NixlIdentity::observed(
+                None,
+                &json!({"artifacts":artifacts}).to_string(),
+                Some(layouts.len() as u64),
+                Some(2),
+            )?;
+            id.select(phase, None, None, Some("0.33.0"), None, false)?;
+            Ok::<_, AicError>(id)
+        };
+        let p = identity(
+            "prefill",
+            &[(0, 0, Some("BLHNC"), false), (0, 1, None, false)],
+            None,
+        )
+        .unwrap();
+        let d = identity(
+            "decode",
+            &[(0, 0, None, false), (0, 1, Some("BLNHC"), false)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.mismatch(&d).unwrap().0, "kv_cache_layout");
+        let none = [(0, 0, None, false), (0, 1, None, false)];
+        assert!(
+            p.mismatch(&identity("decode", &none, Some("BLNHC")).unwrap())
+                .is_some()
+        );
+        assert!(
+            p.mismatch(&identity("decode", &none, Some("BLHNC")).unwrap())
+                .is_none()
+        );
+        assert!(
+            identity(
+                "prefill",
+                &[(0, 0, Some("BLNHC"), false), (0, 1, None, false)],
+                Some("BLHNC")
+            )
+            .is_err()
+        );
+        let host = [(0, 0, Some("LBNHC"), true), (0, 1, Some("LBNHC"), false)];
+        let a = identity("prefill", &host, None).unwrap();
+        assert!(
+            a.mismatch(&identity("decode", &host, None).unwrap())
+                .is_none()
+        );
+        assert!(
+            identity(
+                "prefill",
+                &[
+                    host[0],
+                    host[1],
+                    (1, 0, Some("BLHNC"), false),
+                    (1, 1, None, false)
+                ],
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn hybrid_attention_views_and_wrapped_state_specs_constrain_the_handoff() {
+        let view = json!({"shape":[10,2,16,4],"stride_bytes":[4096,128,8,2],"block_axis":0});
+        let standard = "vllm.model_executor.layers.attention.Attention";
+        let wrapped = json!({"kind":"state","spec_type":"vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs",
+            "layer_specs":{"s":{"spec_type":"vllm.v1.kv_cache_interface.MambaSpec"}}});
+        let mut row = json!({"schema_version":"aisimulate-runtime-observation/v1","runtime":{"version":"0.33.0"},
+            "cache":{"groups":[{"kind":"attention","layer_classes":{"a":standard,"b":standard}},wrapped],
+            "tensor_allocations":[{"layers":["a","b"],"host_resident":false,"layer_stride":1024}],
+            "layer_tensors":{"a":[view],"b":[view]}}});
+        let w = Worker::observed(&row, true, true, true).unwrap();
+        assert_eq!(w.gpu_cache_layout, Layouts::named("BLHNC"));
+        assert!(w.requires_hma);
+        row["raw_cache_config"] = json!({"kv_cache_layout":"LBNHC"});
+        assert!(Worker::observed(&row, true, true, true).is_err());
+        row["cache"]["layer_tensors"] = json!({});
+        let w = Worker::observed(&row, true, true, true).unwrap();
+        assert!(!w.accepts_layout("LBHNC", "LBNHC", Some("0.33.0")));
+        row["resolved_config"] = json!({"model_config":{"use_mla":true},"kv_transfer_config":{
+            "kv_buffer_device":"cpu","enable_permute_local_kv":true}});
+        assert_eq!(
+            Worker::observed(&row, true, true, true)
+                .unwrap()
+                .kv_cache_layout,
+            Layouts::named("LBNHC")
+        );
+    }
+
+    #[test]
+    fn anonymous_dp_coordinates_preserve_common_gpu_layouts_and_their_counts() {
+        let archive = |phase: &str, ranks: &[&[Option<&str>]]| {
+            let mut workers = Vec::new();
+            let mut capacities = Vec::new();
+            for (tp, engines) in ranks.iter().enumerate() {
+                for (dp, name) in engines.iter().enumerate() {
+                    workers.push(json!({"phase":phase,"tp_rank":tp,"dp_rank":dp,
+                        "raw_cache_config":{"kv_cache_layout":name},"resolved_config":{"model_config":{"use_mla":false}}}));
+                    capacities.push(json!({"phase":phase,"tp_rank":tp,"dp_rank":dp}));
+                }
+            }
+            let projected = NixlIdentity::compact_workers(&workers, false, false, false)?;
+            let cell = json!({"source":"runtime_observations","worker_observations":projected,"rank_capacities":capacities});
+            let portable = json!({"observation_provenance":"source_references_v3","cell_observations":[{"runtime_memory":{"provenance":cell.to_string()}}]});
+            let mut id = NixlIdentity::observed(
+                None,
+                &portable.to_string(),
+                Some(workers.len() as u64),
+                Some(ranks.len() as u64),
+            )?;
+            id.select(phase, None, None, Some("0.33.0"), None, false)?;
+            Ok::<_, AicError>(id)
+        };
+        let a = Some("BLHNC");
+        let b = Some("BLNHC");
+        let p = archive("prefill", &[&[a, a], &[None, None]]).unwrap();
+        assert!(
+            p.mismatch(&archive("decode", &[&[None, None], &[b, b]]).unwrap())
+                .is_some()
+        );
+        assert!(
+            p.mismatch(&archive("decode", &[&[None, None], &[a, a]]).unwrap())
+                .is_none()
+        );
+        assert!(archive("prefill", &[&[a, b, a], &[b, a, a]]).is_ok());
+        assert!(archive("prefill", &[&[a, b, a], &[b, a, b]]).is_err());
+    }
+
+    #[test]
+    fn archive_writer_controls_the_observation_schema() {
+        for snapshot in [
+            json!({"worker_observations":[]}),
+            json!({"worker_observations_sha256":"hash"}),
+            json!({"worker_attention_backends":"FLASH_ATTN"}),
+            json!({"worker_attention_backends":[[null]]}),
+        ] {
+            let probe = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v1","nixl_observation":snapshot});
+            assert!(NixlIdentity::observed(None, &probe.to_string(), Some(1), Some(1)).is_err());
+        }
+        let row = json!({"tp_rank":0,"dp_rank":0,"phase":"prefill"});
+        let mut worker =
+            NixlIdentity::compact_workers(std::slice::from_ref(&row), false, false, false).unwrap();
+        worker[0]["kv_cache_layout"] = json!(["LBHNC", "LBNHC"]);
+        let entry = json!({"rank_capacities":[row],"worker_observations":worker});
+        let archive = |format, entry: &Value| {
+            json!({"observation_provenance":format,
+            "cell_observations":[{"runtime_memory":{"provenance":entry.to_string()}}]})
+        };
+        assert!(
+            NixlIdentity::observed(
+                None,
+                &archive("source_references_v3", &entry).to_string(),
+                Some(1),
+                Some(1)
+            )
+            .is_err()
+        );
+        let mut entry = json!({"source":"runtime_observations","launch":{"topology":{"tp":1,"dp":1}},
+            "launch_artifacts":[{}],"worker_attention_backends":["FLASH_ATTN"]});
+        for missing in [None, Some(json!("missing"))] {
+            if let Some(value) = missing {
+                entry["rank_capacities"] = value;
+            }
+            assert!(
+                NixlIdentity::observed(
+                    None,
+                    &archive("source_references_v2", &entry).to_string(),
+                    Some(1),
+                    Some(1)
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

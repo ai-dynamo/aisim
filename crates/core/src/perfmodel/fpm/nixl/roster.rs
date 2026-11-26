@@ -25,7 +25,11 @@ pub(super) fn cell_source(entry: &Value) -> Option<&str> {
 
 /// Bind the portable projection to its recorded sources, independently of worker order.
 /// The onboarding verifier separately rehashes the original files.
-pub(crate) fn digest(entry: &Value, source: Option<&str>) -> Result<String, AicError> {
+pub(crate) fn digest(
+    entry: &Value,
+    source: Option<&str>,
+    bind_references: bool,
+) -> Result<String, AicError> {
     let formal = entry["source"] == "vllm_initialized_cache";
     let sha256 = |s: &str| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit());
     let source = source
@@ -71,6 +75,37 @@ pub(crate) fn digest(entry: &Value, source: Option<&str>) -> Result<String, AicE
     // Compact finalizations retain the measured roster even for a cell with no observed names or layout.
     if let Some(capacities) = sorted_rows("rank_capacities") {
         contents.push(serde_json::json!(capacities));
+    }
+    if bind_references && !formal {
+        // The verified index is the source of truth. A portable cell also retains copies
+        // of its paths and hashes; bind those copies without having to reopen the index.
+        contents.push(entry["observations_index"].clone());
+        for key in ["artifacts", "runtime_artifacts", "launch_artifacts"] {
+            let Some(value) = entry.get(key) else {
+                if key == "artifacts" {
+                    return Err(invalid());
+                }
+                contents.push(Value::Null);
+                continue;
+            };
+            let mut files = Vec::new();
+            for file in value.as_array().ok_or_else(invalid)? {
+                let path = file["path"]
+                    .as_str()
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(invalid)?;
+                let hash = file["sha256"]
+                    .as_str()
+                    .filter(|s| sha256(s))
+                    .ok_or_else(invalid)?;
+                files.push((path, hash));
+            }
+            if key == "artifacts" && files.is_empty() {
+                return Err(invalid());
+            }
+            files.sort_unstable();
+            contents.push(serde_json::json!(files));
+        }
     }
     Ok(format!(
         "{:x}",
@@ -120,6 +155,14 @@ pub(super) fn validate_source(
     let width = width.or(selected_width);
     let capacities = entry["rank_capacities"].as_array();
     if capture != Capture::Full {
+        if probe
+            && entry.get("worker_attention_backends").is_some()
+            && entry.pointer("/launch/topology").is_some()
+            && entry.get("launch_artifacts").is_some()
+            && capacities.is_none()
+        {
+            return Err(invalid());
+        }
         if let Some(capacities) = capacities
             && entry.get("worker_observations").is_none()
         {
@@ -150,30 +193,37 @@ pub(super) fn validate_source(
         capacities.map(Vec::as_slice),
         true,
     )?;
-    if probe {
-        fn pool(row: &Value) -> Result<(&str, u64), AicError> {
-            Ok((
-                row["phase"].as_str().ok_or_else(invalid)?,
-                row["dp_rank"].as_u64().ok_or_else(invalid)?,
-            ))
-        }
-        let worker_pools: BTreeSet<_> =
-            workers.iter().map(|r| pool(r)).collect::<Result<_, _>>()?;
-        let mut schedulers = BTreeSet::new();
-        for file in files
-            .iter()
-            .map(|f| &f["evidence"])
-            .filter(|r| r["kind"] == "scheduler")
-        {
-            if !schedulers.insert(pool(file)?) {
-                return Err(invalid());
-            }
-        }
-        if schedulers != worker_pools {
+    let pool = |row: &Value| -> Result<_, AicError> {
+        Ok((
+            phase(entry, &row["phase"])?,
+            row["dp_rank"].as_u64().ok_or_else(invalid)?,
+        ))
+    };
+    let worker_pools: BTreeSet<_> = workers.iter().map(|r| pool(r)).collect::<Result<_, _>>()?;
+    let mut schedulers = BTreeSet::new();
+    for row in files
+        .iter()
+        .map(|f| &f["evidence"])
+        .filter(|r| r["kind"] == "scheduler")
+    {
+        if !schedulers.insert(pool(row)?) {
             return Err(invalid());
         }
     }
+    if schedulers != worker_pools {
+        return Err(invalid());
+    }
     Ok(true)
+}
+
+// The original formal memory collector measured one cell and omitted its phase name.
+fn phase(entry: &Value, value: &Value) -> Result<&'static str, AicError> {
+    match value.as_str() {
+        Some("prefill") => Ok("prefill"),
+        Some("decode") => Ok("decode"),
+        None if value.is_null() && entry["source"] == "vllm_initialized_cache" => Ok(""),
+        _ => Err(invalid()),
+    }
 }
 
 /// The older compact projection retained TP and phase but omitted DP coordinates. Its per-TP
@@ -186,18 +236,11 @@ pub(super) fn validate<'a>(
     capacities: Option<&[Value]>,
     require_dp: bool,
 ) -> Result<(), AicError> {
-    // The original formal memory collector measured one cell and omitted its phase name.
-    let phase = |v: &Value| match v.as_str() {
-        Some("prefill") => Ok("prefill"),
-        Some("decode") => Ok("decode"),
-        None if v.is_null() && entry["source"] == "vllm_initialized_cache" => Ok(""),
-        _ => Err(invalid()),
-    };
     let mut slots = BTreeMap::new();
     let mut full_slots = BTreeSet::new();
     let mut sizes = BTreeMap::new();
     for worker in workers {
-        let phase = phase(&worker["phase"])?;
+        let phase = phase(entry, &worker["phase"])?;
         let rank = worker["tp_rank"].as_u64().ok_or_else(invalid)?;
         if tp.is_some_and(|t| rank >= t) {
             return Err(invalid());
@@ -240,7 +283,7 @@ pub(super) fn validate<'a>(
         let mut expected = BTreeMap::new();
         let mut coordinates = BTreeSet::new();
         for row in capacities {
-            let phase = phase(&row["phase"])?;
+            let phase = phase(entry, &row["phase"])?;
             let rank = row["tp_rank"].as_u64().ok_or_else(invalid)?;
             let dp = row["dp_rank"].as_u64().ok_or_else(invalid)?;
             *expected.entry((phase, rank)).or_insert(0_u64) += 1;
@@ -292,6 +335,99 @@ pub(super) fn can_pair<L, R>(
         }
     }
     true
+}
+
+/// Assign one worker from each complete cell to each physical slot, retaining all their
+/// common settings. The optional physical-layout constraint can depend on the slot's DP rank.
+pub(super) fn assign_workers(
+    slots: &mut [Worker],
+    cells: &[Vec<Worker>],
+    allowed: &impl Fn(&Worker) -> bool,
+) -> bool {
+    fn join(a: &Worker, b: &Worker, allowed: &impl Fn(&Worker) -> bool) -> Option<Worker> {
+        if a.tp_rank.zip(b.tp_rank).is_some_and(|(x, y)| x != y)
+            || a.dp_rank.zip(b.dp_rank).is_some_and(|(x, y)| x != y)
+        {
+            return None;
+        }
+        let mut worker = a.clone();
+        worker.combine(b).ok()?;
+        worker.tp_rank = a.tp_rank.or(b.tp_rank);
+        worker.dp_rank = a.dp_rank.or(b.dp_rank);
+        allowed(&worker).then_some(worker)
+    }
+    fn assign(
+        slots: &mut [Worker],
+        cells: &[Vec<Worker>],
+        used: &mut [bool],
+        i: usize,
+        allowed: &impl Fn(&Worker) -> bool,
+    ) -> bool {
+        let Some((cell, later)) = cells.split_first() else {
+            return true;
+        };
+        if cell.len() != slots.len() {
+            return false;
+        }
+        if i == 0 {
+            if !can_pair(slots, cell, |a, b| join(a, b, allowed).is_some()) {
+                return false;
+            }
+            if later.is_empty() {
+                return true;
+            }
+        }
+        let Some(worker) = cell.get(i) else {
+            return assign(slots, later, &mut vec![false; slots.len()], 0, allowed);
+        };
+        let mut tried = BTreeSet::new();
+        for j in 0..slots.len() {
+            if used[j] || !tried.insert(slots[j].clone()) {
+                continue;
+            }
+            if let Some(merged) = join(&slots[j], worker, allowed) {
+                let old = std::mem::replace(&mut slots[j], merged);
+                used[j] = true;
+                if assign(slots, cells, used, i + 1, allowed) {
+                    return true;
+                }
+                slots[j] = old;
+                used[j] = false;
+            }
+        }
+        false
+    }
+    assign(slots, cells, &mut vec![false; slots.len()], 0, allowed)
+}
+
+pub(super) fn workers_fit(rosters: &[&[Worker]]) -> bool {
+    fn fit(mut cells: Vec<Vec<Worker>>) -> bool {
+        for cell in &mut cells {
+            cell.sort_unstable();
+        }
+        cells.sort_unstable();
+        cells.dedup();
+        let Some(mut first) = cells.pop() else {
+            return true;
+        };
+        assign_workers(&mut first, &cells, &|w| super::layout::possible_gpu(w) != 0)
+    }
+
+    if rosters
+        .iter()
+        .flat_map(|r| r.iter())
+        .all(|w| w.tp_rank.is_some())
+    {
+        let ranks: BTreeSet<_> = rosters[0].iter().map(|w| w.tp_rank).collect();
+        ranks.into_iter().all(|rank| {
+            fit(rosters
+                .iter()
+                .map(|r| r.iter().filter(|w| w.tp_rank == rank).cloned().collect())
+                .collect())
+        })
+    } else {
+        fit(rosters.iter().map(|r| r.to_vec()).collect())
+    }
 }
 
 /// Each slot needs one possible initialized backend. On one deployment a slot is a physical
@@ -529,15 +665,49 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_cells_need_one_assignment_of_backend_and_layout_together() {
+        let w = |backend: &str, layout: &str| Worker {
+            tp_rank: Some(0),
+            backends: vec![backend.to_string()],
+            kv_cache_layout: super::super::Layouts::named(layout),
+            ..Default::default()
+        };
+        let a = vec![w("a", "BLHNC"), w("b", "BLNHC")];
+        let mut b = a.clone();
+        b.reverse();
+        assert!(workers_fit(&[&a, &b]));
+        let c = vec![w("a", "BLNHC"), w("b", "BLHNC")];
+        assert!(!workers_fit(&[&a, &c]));
+        b[0].kv_cache_layout = None;
+        assert!(workers_fit(&[&a, &b]));
+        b[0].kv_cache_layout = super::super::Layouts::named("BLHNC");
+        assert!(!workers_fit(&[&a, &b]));
+    }
+
+    #[test]
+    fn formal_memory_requires_each_dp_scheduler_once_without_a_phase_label() {
+        let worker =
+            |dp| serde_json::json!({"evidence":{"kind":"worker","tp_rank":0,"dp_rank":dp}});
+        let scheduler = |dp| serde_json::json!({"evidence":{"kind":"scheduler","dp_rank":dp}});
+        let mut entry = serde_json::json!({"source":"vllm_initialized_cache","plan_sha256":"plan",
+            "artifacts":[worker(0),worker(1),scheduler(0),scheduler(1)]});
+        assert!(validate_source(&entry, Capture::Full, Some(2), Some(1)).unwrap());
+        entry["artifacts"][3] = scheduler(0);
+        assert!(validate_source(&entry, Capture::Full, Some(2), Some(1)).is_err());
+        entry["artifacts"].as_array_mut().unwrap().pop();
+        assert!(validate_source(&entry, Capture::Full, Some(2), Some(1)).is_err());
+    }
+
+    #[test]
     fn a_compact_cell_with_no_worker_identity_still_binds_its_rank_capacities() {
         let source = "a".repeat(64);
         let first = json!({"phase":"decode","tp_rank":0,"dp_rank":0,"kv_cache_bytes":256});
         let second = json!({"phase":"decode","tp_rank":1,"dp_rank":0,"kv_cache_bytes":128});
         let mut cell = json!({"rank_capacities":[first,second]});
-        let original = digest(&cell, Some(&source)).unwrap();
+        let original = digest(&cell, Some(&source), false).unwrap();
         cell["rank_capacities"].as_array_mut().unwrap().reverse();
-        assert_eq!(digest(&cell, Some(&source)).unwrap(), original);
+        assert_eq!(digest(&cell, Some(&source), false).unwrap(), original);
         cell["rank_capacities"][0]["phase"] = json!("prefill");
-        assert_ne!(digest(&cell, Some(&source)).unwrap(), original);
+        assert_ne!(digest(&cell, Some(&source), false).unwrap(), original);
     }
 }

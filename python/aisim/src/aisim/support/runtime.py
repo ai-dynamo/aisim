@@ -39,7 +39,8 @@ from .schema import (
 LEGACY_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v1"
 RANK_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v2"
 BOUND_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v3"
-PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v4"
+LAYOUT_PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v4"
+PROVENANCE_SCHEMA = "aisimulate-onboarding-runtime-probe/v5"
 _PRECISION = (
     "gemm_quant_mode",
     "moe_quant_mode",
@@ -343,17 +344,34 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     schema = value.get("schema_version") if isinstance(value, dict) else None
-    if schema not in (LEGACY_PROVENANCE_SCHEMA, RANK_PROVENANCE_SCHEMA, BOUND_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA):
+    if schema not in (
+        LEGACY_PROVENANCE_SCHEMA,
+        RANK_PROVENANCE_SCHEMA,
+        BOUND_PROVENANCE_SCHEMA,
+        LAYOUT_PROVENANCE_SCHEMA,
+        PROVENANCE_SCHEMA,
+    ):
         if isinstance(schema, str) and schema.startswith("aisimulate-onboarding-runtime-probe/"):
             raise ValueError(f"unsupported onboarding runtime probe version: {schema}")
         return None
     snapshot = value.get("nixl_observation")
+    if (
+        schema == LEGACY_PROVENANCE_SCHEMA
+        and snapshot is not None
+        and (
+            not isinstance(snapshot, dict)
+            or "worker_observations" in snapshot
+            or "worker_observations_sha256" in snapshot
+            or ("worker_attention_backends" in snapshot and not isinstance(snapshot["worker_attention_backends"], list))
+        )
+    ):
+        raise ValueError("invalid legacy NIXL observation")
     if value["schema_version"] != LEGACY_PROVENANCE_SCHEMA and (
         not isinstance(snapshot, dict)
         or not isinstance(snapshot.get("runtime_settings"), dict)
         or not isinstance(snapshot.get("worker_observations"), list)
         or (
-            value["schema_version"] in (BOUND_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA)
+            value["schema_version"] in (BOUND_PROVENANCE_SCHEMA, LAYOUT_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA)
             and not isinstance(snapshot.get("worker_observations_sha256"), str)
         )
     ):
@@ -384,14 +402,20 @@ def _worker_attention_backends(evidence: dict[str, Any]) -> list:
     ]
 
 
-def _worker_observations(evidence: dict[str, Any], *, ranked: bool, layout_choices: bool) -> list:
+def _worker_observations(
+    evidence: dict[str, Any], *, ranked: bool, layout_choices: bool, engine_layout: bool = False
+) -> list:
     from aisim import _runtime
 
-    workers = [item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] == "worker"]
-    return json.loads(_runtime.nixl_worker_observations(json.dumps(workers), ranked, layout_choices))
+    records = [
+        item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] in ("worker", "scheduler")
+    ]
+    return json.loads(_runtime.nixl_worker_observations(json.dumps(records), ranked, layout_choices, engine_layout))
 
 
-def _worker_observation_digest(snapshot: dict[str, Any], evidence: dict[str, Any]) -> str:
+def _worker_observation_digest(
+    snapshot: dict[str, Any], evidence: dict[str, Any], *, bind_references: bool = False
+) -> str:
     from aisim import _runtime
 
     fields = {
@@ -408,7 +432,12 @@ def _worker_observation_digest(snapshot: dict[str, Any], evidence: dict[str, Any
         source = evidence["plan_sha256"]
     else:
         source = evidence["observations_index"]["sha256"]
-    return _runtime.nixl_observation_digest(json.dumps(fields), source)
+        if bind_references:
+            fields["observations_index"] = evidence["observations_index"]
+            for key in ("artifacts", "runtime_artifacts", "launch_artifacts"):
+                if key in evidence:
+                    fields[key] = [{"path": ref["path"], "sha256": ref["sha256"]} for ref in evidence[key]]
+    return _runtime.nixl_observation_digest(json.dumps(fields), source, bind_references)
 
 
 def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str = PROVENANCE_SCHEMA) -> dict[str, Any]:
@@ -427,9 +456,12 @@ def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str = PROVE
     if schema == LEGACY_PROVENANCE_SCHEMA:
         snapshot["worker_attention_backends"] = _worker_attention_backends(evidence)
     else:
-        bound = schema in (BOUND_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA)
+        bound = schema in (BOUND_PROVENANCE_SCHEMA, LAYOUT_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA)
         snapshot["worker_observations"] = _worker_observations(
-            evidence, ranked=bound, layout_choices=schema == PROVENANCE_SCHEMA
+            evidence,
+            ranked=bound,
+            layout_choices=schema in (LAYOUT_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA),
+            engine_layout=schema == PROVENANCE_SCHEMA,
         )
         if version := evidence.get("runtime", {}).get("version"):
             snapshot["runtime"] = {"version": version}

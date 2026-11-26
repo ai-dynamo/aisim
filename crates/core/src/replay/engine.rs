@@ -146,11 +146,20 @@ impl ReplayRoleConfig {
         use crate::perfmodel::{ForwardPassPerfModelConfig, FpmCacheGroup, FpmRuntimeMemoryConfig};
         use anyhow::{Context, bail, ensure};
 
+        let empty = || {
+            let identity = || NixlIdentity {
+                phase_width: Some(u64::from(self.tensor_parallel_size) * u64::from(self.dp_size)),
+                tp_size: Some(u64::from(self.tensor_parallel_size)),
+                modeled_version: self.rank.vllm_version.clone(),
+                ..Default::default()
+            };
+            Ok([identity(), identity()])
+        };
         let TimingModelConfig::External { provider, config } = &self.rank.timing_model else {
-            return Ok(Default::default());
+            return empty();
         };
         if !matches!(provider.as_str(), "aic" | "ais") {
-            return Ok(Default::default());
+            return empty();
         }
         // Duration may be supplied by the caller, bypassing the ordinary timing descriptor reader.
         for (name, legacy) in [
@@ -233,11 +242,11 @@ impl ReplayRoleConfig {
         ] {
             if let Some(version) = version.filter(known)
                 && let Some(rank_version) = &self.rank.vllm_version
-                && (if field == "runtime_memory.runtime_framework_version" {
-                    FpmRuntimeMemoryConfig::modeled_release(version)
-                } else {
-                    version
-                }) != rank_version
+                && !FpmRuntimeMemoryConfig::matches_grouped_version(
+                    version,
+                    rank_version,
+                    self.rank.enable_prefix_caching || field == "timing backend_version",
+                )
             {
                 bail!("grouped rank vllm_version ({rank_version}) must match {field} ({version})");
             }
@@ -308,6 +317,7 @@ impl ReplayRoleConfig {
             labels.kv_cache_dtype.as_deref(),
             self.rank.vllm_version.as_deref(),
             memory.and_then(|m| m["runtime_framework_version"].as_str()),
+            self.rank.enable_prefix_caching,
         )?;
         Ok([labels, observed])
     }

@@ -111,17 +111,27 @@ side has no measured backend identity.
 Current runtime drafts and compact finalizations record a SHA-256 digest of
 the worker observations, initialized settings and source references. The references
 identify the observation index or the formal collection plan and individual files.
+Finalization v6 also binds the path and hash of each retained indexed worker,
+scheduler, runtime and launch artifact. Earlier indexed receipts bind the index
+hash. Source-backed onboarding verifies the files listed by that index.
 Replay checks the saved fields and rank coverage offline, including cells whose
 workers have no recorded backend or layout. Reordering the workers preserves
 their receipt. Older archives support the structural checks their recorded
-coordinates and counts permit. Onboarding verification also rehashes the original sources.
+coordinates and counts permit.
 For known non-MLA GPU caches, the decode worker checks the physical KV layout.
 When a probe omits the layout name, recorded layer and tensor byte strides narrow
 the possible layouts. The ordinary attention views that identify their axes must
 agree with one another and with any measured layout name. A raw byte view
-can leave the layout unknown for that layer. Each worker must have one feasible
-layout for all its routable peers, including when a unit dimension leaves several
-possible orders.
+can leave the layout unknown for that layer. The scheduler and every TP worker
+within one DP engine share a resolved GPU layout. Attention views in hybrid
+caches constrain that layout too. A worker using a CPU transfer buffer can
+announce a different layout when it permutes ordinary attention into LBHNC.
+Each worker must use one feasible registration for all its routable DP peers.
+Runtime probe v5 and finalization v6 record the GPU and transfer-buffer evidence
+separately. Earlier projections retain their observed registration layouts.
+When a complete cell omits DP coordinates, the workers at each TP rank can be
+reordered across DP engines. The same engines must still explain every TP rank
+and every cell.
 With the decoder's permute option enabled and postprocessing available, vLLM
 0.32.0 and 0.33.0 can convert a remote LBHNC cache to a local LBNHC cache.
 The 0.31.0 conversion checks the remote LBHNC layout alone. A memory probe
