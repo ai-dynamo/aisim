@@ -396,10 +396,17 @@ def test_the_sweeper_rejects_a_kv_dtype_that_contradicts_the_profile():
         gemma4_window_geometry(sample, "agg", 64, backend_version="0.32.0", fpm_profile=profile)
 
 
-def _gemma4_snapshot(backend="vllm", tp=1):
+def _gemma4_snapshot(backend="vllm", tp=1, kv_block_size=64):
     from aisim.sweeper.state_snapshot import SnapshotRole
 
-    identity = {"model": GEMMA4, "backend": backend, "system": "h200_sxm", "kv_block_size": 64, "tp": tp, "pp": 1}
+    identity = {
+        "model": GEMMA4,
+        "backend": backend,
+        "system": "h200_sxm",
+        "kv_block_size": kv_block_size,
+        "tp": tp,
+        "pp": 1,
+    }
     summary = {"identity": identity, "selected_estimation_mode": "fpm_regression", "kind": "regression"}
     return SnapshotRole(role="agg", path="/snapshots/gemma4", summary=summary, config={})
 
@@ -414,15 +421,24 @@ def test_recommend_rejects_a_gemma4_vllm_snapshot_whose_block_grows(monkeypatch)
         "deployment_mode": ["agg"],
         "role_estimator_controls": {"agg": {"estimator_config": {"state_snapshot": {"path": "/snapshots/gemma4"}}}},
     }
-    # At TP1 the deployed 64-token block gives the window-state pool 128-token global blocks.
-    with pytest.raises(ValueError, match="kv_block_size=64 gives the window-state pool a 128-token block"):
+    # At TP1 a deployment's 64-token block gives the window-state pool 128-token global blocks.
+    with pytest.raises(ValueError, match="at tp=1 .* kv_block_size=64 does not record which"):
         state_snapshot.derive_snapshot_roles(value)
+
+
+def test_a_snapshot_saved_from_a_compiled_gemma4_model_is_rejected_for_the_same_reason():
+    from aisim.sweeper.state_snapshot import _reject_window_state_snapshot
+
+    # An AISim-compiled TP2 model saves the pool block (128), which a deployment launched with
+    # --block-size 128 (pool block 256) would also record; the value cannot tell them apart.
+    with pytest.raises(ValueError, match="at tp=2 .* kv_block_size=128 does not record which"):
+        _reject_window_state_snapshot(_gemma4_snapshot(tp=2, kv_block_size=128))
 
 
 def test_a_gemma4_snapshot_with_an_unknown_tensor_width_is_rejected():
     from aisim.sweeper.state_snapshot import UNKNOWN, _reject_window_state_snapshot
 
-    with pytest.raises(ValueError, match="an unknown block"):
+    with pytest.raises(ValueError, match="tensor width or kv_block_size is unknown"):
         _reject_window_state_snapshot(_gemma4_snapshot(tp=UNKNOWN))
 
 

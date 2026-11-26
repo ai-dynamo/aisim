@@ -472,11 +472,13 @@ def _check_role_identity(value: dict[str, Any], snapshot: SnapshotRole) -> None:
 
 
 def _reject_window_state_snapshot(snapshot: SnapshotRole) -> None:
-    """Reject a Gemma 4 vLLM snapshot whose deployed KV block is not the window-state pool's block.
+    """Reject a Gemma 4 vLLM snapshot whose role would run two different KV block sizes.
 
-    The snapshot records the deployed block size (vLLM's --block-size). The engine pool, and so the
-    estimator's kv_block_size, uses the global group's block, which vLLM grows to match the sliding
-    layers' page (64 to 128 at TP1 and TP2; unchanged at TP4). Only an unchanged block can be restored.
+    vLLM grows the global group's block to match the sliding layers' page (64 to 128 at TP1 and
+    TP2; unchanged at TP4 and above). The window-state pool, and so the estimator's kv_block_size,
+    uses that grown block, while vLLM is launched with the smaller one. A snapshot records a single
+    kv_block_size: an AISim-compiled model saves the pool block, a deployment saves vLLM's requested
+    block, and the value does not say which. Restoring is only safe where the two coincide.
     """
     from aisim_core.sdk.memory import estimate_state_cache
 
@@ -487,19 +489,19 @@ def _reject_window_state_snapshot(snapshot: SnapshotRole) -> None:
         return
     saved = identity["kv_block_size"]
     shape = (identity.get("tp") or 1, identity.get("pp") or 1)
-    resolved = None
     if UNKNOWN not in (saved, *shape):
         state = estimate_state_cache(
             str(identity["model"]), backend="vllm", tp_size=int(shape[0]), pp_size=int(shape[1]), block_size=int(saved)
         )
-        resolved = state["block_size"]
-        if resolved == int(saved):
+        if state["block_size"] == int(saved):
             return
-    found = "an unknown block" if resolved is None else f"a {resolved}-token block"
-    raise ValueError(
-        f"{snapshot.describe()} cannot time a Gemma 4 vLLM role: its deployed kv_block_size={saved} gives the "
-        f"window-state pool {found}, so the saved identity cannot be restored"
-    )
+        reason = (
+            f"at tp={shape[0]} the window-state pool's KV block differs from vLLM's requested block, and the "
+            f"snapshot's kv_block_size={saved} does not record which of the two it is"
+        )
+    else:
+        reason = "its tensor width or kv_block_size is unknown, so the window-state pool's KV block cannot be checked"
+    raise ValueError(f"{snapshot.describe()} cannot time a Gemma 4 vLLM role: {reason}")
 
 
 def _pin_block_size(value: dict[str, Any], snapshot: SnapshotRole) -> None:

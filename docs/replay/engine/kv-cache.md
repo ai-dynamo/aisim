@@ -974,10 +974,11 @@ its window snapshot, so a Gemma 4 vLLM worker rejects it:
 `recommend` sizes Gemma 4 vLLM candidates the same way, so a saved candidate and
 `predict` agree. A role timed by a
 [state snapshot](../../perf-model/configuration.md#recommending-with-a-calibrated-snapshot)
-is rejected when the snapshot's deployed `kv_block_size` differs from the
-pool's global block (TP1 and TP2: 64 becomes 128), because the saved identity
-could not be restored; at TP4 and above the block is unchanged and the snapshot
-is accepted.
+is rejected at TP1 and TP2, where the pool's global block differs from vLLM's
+requested block (64 becomes 128) and the snapshot's single `kv_block_size`
+does not record which of the two it is; at TP4 and above the blocks are equal
+and the snapshot is accepted. See
+[snapshot block sizes](../../perf-model/configuration.md#recommending-with-a-calibrated-snapshot).
 
 DeepSeek V4 and Kimi K3 still have this bug. Their state cache is opt-in
 (`state_cache: {}`), so a worker without it, and every `recommend` candidate
