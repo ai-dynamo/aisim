@@ -3229,10 +3229,10 @@ _PROBE_FIXTURE = (
 
 
 def test_grouped_pd_prediction_replays_measured_bytes_with_the_vllm_0330_probe_geometry(grouped_case, tmp_path):
-    # The tracked probe supplies the six GLM-5.3-Flash cache groups in runtime order. The connector measurement
-    # supplies each group's bytes on one TP rank.
-    # A P/D prediction on vLLM 0.33.0 takes them as they are. The pool of 64 pages is hand-made, as in
-    # _glm_shaped_profile. The fixture leaves out the staged model configuration, which equals the bundled one.
+    # The tracked probe supplies the GLM-5.3-Flash cache geometry and group order. Supply the six rank-local
+    # byte counts from the independent November 17 NIXL group log for vLLM 0.33.0, checkpoint 04c4e9e, TP 4
+    # and DS convolution state layout. The probe fixture does not record that layout.
+    # The 64-page pool is hand-sized. The staged model configuration in the probe equals the bundled one.
     import shutil
 
     from collector.fpm_forward.runtime_observations import validate_observation_phase
