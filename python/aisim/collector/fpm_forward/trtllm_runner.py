@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Launch the pinned OpenEngine pilot inside an existing exclusive Slurm job."""
+"""Launch the pinned OpenEngine pilot inside an existing two-GPU Slurm job."""
 
 from __future__ import annotations
 
@@ -239,7 +239,7 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
         "srun",
         "--nodes=1",
         "--ntasks=1",
-        "--gpus=2",
+        "--gpus=h200:2",
         f"--container-image={image}",
         "--container-mounts=" + ",".join(f"{path}:{path}" for path in dict.fromkeys(mounts)),
         "--no-container-mount-home",
@@ -465,16 +465,18 @@ def _require_allocation():
     job = os.environ.get("SLURM_JOB_ID")
     node_list = os.environ.get("SLURM_JOB_NODELIST")
     if not job or not node_list or os.environ.get("SLURM_JOB_NUM_NODES") != "1":
-        raise ValueError("run TRT-LLM FPM pilot inside an exclusive one-node Slurm allocation")
+        raise ValueError("run TRT-LLM FPM pilot inside a one-node Slurm allocation with two H200s")
     nodes = subprocess.check_output(["scontrol", "show", "hostnames", node_list], text=True).split()
     if nodes != [socket.gethostname().split(".")[0]]:
         raise ValueError("the pilot must run on the allocated Slurm node")
-    jobs = subprocess.check_output(
-        ["squeue", "-h", "-t", "RUNNING,COMPLETING", "-w", nodes[0], "-o", "%A"], text=True
-    ).split()
-    if jobs != [job]:
-        raise ValueError(f"the pinned node is not dedicated to pilot job {job}")
-    return {"job_id": job, "node": nodes[0]}
+    jobs = subprocess.run(
+        ["squeue", "-h", "-t", "RUNNING,COMPLETING", "-w", nodes[0], "-o", "%A"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    other_jobs = len(set(jobs.stdout.split()) - {job}) if jobs.returncode == 0 else None
+    return {"job_id": job, "node": nodes[0], "other_jobs_at_start": other_jobs}
 
 
 def run_cli(args, parser):

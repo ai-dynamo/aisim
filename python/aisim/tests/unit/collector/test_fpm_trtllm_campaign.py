@@ -64,3 +64,19 @@ def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline
     # Use the compiled profile query on the same schema-8 file just published.
     query = query_published_profile(plan, parquet, rows)
     assert all(point["power_w"] == expected for point in query.values())
+
+
+def test_shared_node_allocation_is_allowed(monkeypatch):
+    from types import SimpleNamespace
+
+    from collector.fpm_forward import trtllm_runner
+
+    monkeypatch.setenv("SLURM_JOB_ID", "646")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "pilot-node")
+    monkeypatch.setenv("SLURM_JOB_NUM_NODES", "1")
+    monkeypatch.setattr(trtllm_runner.socket, "gethostname", lambda: "pilot-node")
+    monkeypatch.setattr(trtllm_runner.subprocess, "check_output", lambda *a, **kw: "pilot-node\n")
+    monkeypatch.setattr(
+        trtllm_runner.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0, stdout="646\n647\n")
+    )
+    assert trtllm_runner._require_allocation() == {"job_id": "646", "node": "pilot-node", "other_jobs_at_start": 1}

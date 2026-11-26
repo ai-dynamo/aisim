@@ -53,7 +53,7 @@ qualification are tracked separately in AISIM-2520 PR 3.
 
 ## Run the collector pilot
 
-From a one-node exclusive Slurm job with two assigned H200 SXM GPUs, use the
+From a one-node Slurm job with two assigned H200 SXM GPUs, use the
 collector environment with the built AISim Rust extension, PyArrow and pynvml.
 The stock OpenEngine bindings and Dynamo sidecar interpreter must be available
 on the node. Use the following point file:
@@ -79,7 +79,7 @@ python -m collector.fpm_forward --backend trtllm --gpu h200_sxm \
 Add `--plan-only` to print the fixed two-point plan without a Slurm allocation.
 Each phase serves identical seeded traffic with the observer off and on.
 The collector requires the same two GPU UUIDs across both phases, stores the
-observed decode coordinate, and publishes a schema-8 pair through the shared
+observed decode coordinate, records the number of other jobs on the node at startup, and publishes a schema-8 pair through the shared
 finalizer. `acceptance.json` reports the serving-frame rate and mean power
 deltas. `profile-query.json` contains the native FPM query for both points.
 The command exits unsuccessfully when either point lacks qualified power.
