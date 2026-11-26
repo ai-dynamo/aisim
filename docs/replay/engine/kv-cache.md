@@ -1543,25 +1543,31 @@ sub-block matching without an explicit full-state scratch count.
   An indexed import of both phases keeps prefill's cache groups and prefix
   settings. Mamba's block size can differ in a cold decode phase. Replay checks
   each phase's ranks against one another and checks the selected profile against
-  the retained geometry, prefix settings and usable capacity. A finalized
-  profile uses the minimum measured capacity across compatible cells. A draft
-  can record an explicit capacity override.
+  the retained geometry, prefix settings and usable capacity. A warm rank uses
+  the selected hash block size. A finalized profile uses the minimum measured
+  capacity across compatible cells at their recorded GPU memory utilization.
+  A draft can record an explicit capacity override.
 
   Replay compares recorded KV head counts and dimensions for ordinary attention.
   At equal tensor parallelism, an initialized layer's cache spec or GPU view can
   establish incompatible per-rank dimensions even when its page bytes match.
   For an identified ordinary decoder, its recorded constructor settings can
   establish the corresponding dimensions in a compact profile. Qwen2 takes
-  its layer width from the hidden size divided by the attention-head count.
+  its layer width from the hidden size divided by the attention-head count,
+  including when both roles use compact profiles.
   An override only establishes the model-wide KV-head count when the runtime's
-  higher-priority checkpoint aliases are known. Complete, disjoint cache
-  buffers also identify the set of registered layer names on each role.
+  higher-priority checkpoint aliases are known. When the probe records a
+  disjoint GPU byte range for each cache in an ordinary attention model, replay
+  compares the registered layer names. One pool block can span
+  several kernel blocks. For NemotronH, a saved top-level layer pattern also
+  identifies the attention positions when the compact profile omits the views.
   An Inkling convolution window also constrains the physical GPU layout.
   When serving evidence identifies the NIXL connector, both roles must use the
   same transfer mode. `NixlConnector` is the pull alias. An explicit push
   uses the prefill-side handshake and requires a common physical GPU layout
   across participating workers. A cache made entirely of single-head MLA
   latents has the same byte order when only the position of the head axis changes.
+  The measured MLA cache specs and their head counts can identify that case.
   Pull can use the decode-side permutation.
   Replay compares a recorded effective hidden-layer count, including layers
   without a KV cache. It reads checkpoint overrides when their model converter

@@ -264,9 +264,18 @@ pub(crate) struct TransferMetadata {
     registered_layers: Option<BTreeSet<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nemotron_attention_layers: Option<Vec<usize>>,
+    // A compact writer can retain the top-level override without the checkpoint architecture.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    hybrid_attention_positions: BTreeSet<Vec<usize>>,
 }
 
 impl TransferMetadata {
+    fn hybrid_pattern(config: &Value) -> Option<&str> {
+        config["hybrid_override_pattern"]
+            .as_str()
+            .filter(|p| !p.is_empty() && p.bytes().all(|c| matches!(c, b'*' | b'M' | b'-' | b'E')))
+    }
+
     fn configured(config: &Value, use_mla: Option<bool>) -> Self {
         let model = &config["model_config"];
         let resolved = &model["model_arch_config"];
@@ -287,19 +296,14 @@ impl TransferMetadata {
             family,
             Some("llama" | "mistral" | "qwen2" | "qwen3" | "nemotron_h")
         );
-        let hybrid_pattern = text["hybrid_override_pattern"].as_str().is_some_and(|p| {
-            !p.is_empty()
-                && text["num_hidden_layers"].as_u64() == Some(p.len() as u64)
-                && p.bytes().all(|c| matches!(c, b'*' | b'M' | b'-' | b'E'))
-        });
-        let known_layers =
-            standard || family == Some("falcon") || (family.is_none() && hybrid_pattern);
+        let known_layers = standard
+            || family == Some("falcon")
+            || (family.is_none()
+                && Self::hybrid_pattern(text).is_some_and(|pattern| {
+                    text["num_hidden_layers"].as_u64() == Some(pattern.len() as u64)
+                }));
         let mut facts = Self {
             transfer_mode: TransferMode::configured(config),
-            nemotron_attention_layers: text["hybrid_override_pattern"]
-                .as_str()
-                .filter(|_| family == Some("nemotron_h") && hybrid_pattern)
-                .map(|pattern| pattern.match_indices('*').map(|(index, _)| index).collect()),
             num_hidden_layers: resolved["total_num_hidden_layers"].as_u64().or_else(|| {
                 known_layers
                     .then(|| positive(&text["num_hidden_layers"]))
@@ -313,6 +317,28 @@ impl TransferMetadata {
             },
             ..Self::default()
         };
+        // NemotronHModel constructs its layers from the top-level HF pattern. A nested text
+        // config and the separate hidden-layer count do not select its attention mixers.
+        let top = model
+            .get("hf_config")
+            .filter(|v| v.is_object())
+            .unwrap_or(overrides);
+        let top_family = top["model_type"].as_str();
+        let architectures = top.get("architectures");
+        if top_family.is_none_or(|name| name == "nemotron_h")
+            && architectures.is_none_or(|v| {
+                v.as_array()
+                    .is_some_and(|a| a.len() == 1 && a[0] == "NemotronHForCausalLM")
+            })
+            && let Some(pattern) = Self::hybrid_pattern(top)
+        {
+            let positions = pattern.match_indices('*').map(|(index, _)| index).collect();
+            if top_family == Some("nemotron_h") || architectures.is_some() {
+                facts.nemotron_attention_layers = Some(positions);
+            } else {
+                facts.hybrid_attention_positions.insert(positions);
+            }
+        }
         if use_mla != Some(true) {
             facts.uniform_attention = UniformAttention::configured(text, effective.is_some());
         }
@@ -382,6 +408,8 @@ impl TransferMetadata {
                 return Err(conflict("cache region names"));
             }
         }
+        self.hybrid_attention_positions
+            .extend(other.hybrid_attention_positions.iter().cloned());
         if let Some(layers) = &other.nemotron_attention_layers
             && self
                 .nemotron_attention_layers
@@ -469,22 +497,30 @@ impl Worker {
             .pointer("/kv_transfer_config/kv_buffer_device")
             .and_then(Value::as_str)
             == Some("cpu");
+        let raw_groups = rank["raw_cache_config"]["groups"].as_array();
+        let mla_groups = groups.is_some_and(|groups| {
+            !groups.is_empty()
+                && groups
+                    .iter()
+                    .all(|g| g["kind"] == "attention" && layout::single_head_mla(g))
+        }) && raw_groups
+            .is_none_or(|groups| !groups.is_empty() && groups.iter().all(layout::single_head_mla));
         let use_mla = config
             .pointer("/model_config/use_mla")
             .and_then(Value::as_bool)
-            .or_else(|| (ordinary == Some(true)).then_some(false));
-        let single_head_mla = use_mla == Some(true)
-            && groups.is_some_and(|groups| {
-                !groups.is_empty()
-                    && groups
-                        .iter()
-                        .all(|g| g["kind"] == "attention" && layout::single_head_mla(g))
-            })
-            && rank["raw_cache_config"]["groups"]
-                .as_array()
-                .is_none_or(|groups| {
-                    !groups.is_empty() && groups.iter().all(layout::single_head_mla)
-                });
+            .or_else(|| (ordinary == Some(true)).then_some(false))
+            .or_else(|| {
+                (mla_groups
+                    && groups.is_some_and(|groups| {
+                        groups.iter().all(layout::records_one_head)
+                            || raw_groups.is_some_and(|raw| {
+                                raw.len() == groups.len()
+                                    && raw.iter().all(layout::records_one_head)
+                            })
+                    }))
+                .then_some(true)
+            });
+        let single_head_mla = mla_groups && use_mla == Some(true);
         let mut metadata = TransferMetadata::configured(config, use_mla);
         metadata.registered_layers = layout::registered_layers(rank);
         let physical = if groups.is_some() {
@@ -1172,7 +1208,7 @@ impl NixlIdentity {
     pub(crate) fn selected_memory(&self, selected: &Value) -> Result<(), AicError> {
         if let Some(fields) = self.recorded_memory.as_object() {
             for (field, value) in fields {
-                if selected[field] != *value {
+                if !roster::same_memory_setting(field, &selected[field], value) {
                     return Err(conflict(field));
                 }
             }
@@ -1582,29 +1618,33 @@ impl NixlIdentity {
         for worker in &self.workers {
             self.metadata.merge(&worker.metadata)?;
         }
-        // The tagged NemotronH decoder registers each attention mixer under this exact layer name.
-        if self.architecture.as_deref() == Some("NemotronHForCausalLM")
-            && let Some(names) = &self.metadata.registered_layers
-            && let Some(mut positions) = names
-                .iter()
-                .map(|name| {
-                    name.strip_prefix("model.layers.")?
-                        .strip_suffix(".mixer.attn")?
-                        .parse::<usize>()
-                        .ok()
-                })
-                .collect::<Option<Vec<_>>>()
-        {
-            positions.sort_unstable();
-            if self
-                .metadata
-                .nemotron_attention_layers
-                .as_ref()
-                .is_some_and(|saved| *saved != positions)
+        if self.architecture.as_deref() == Some("NemotronHForCausalLM") {
+            let mut positions = std::mem::take(&mut self.metadata.hybrid_attention_positions);
+            // The tagged NemotronH decoder registers each attention mixer under this name.
+            if let Some(names) = &self.metadata.registered_layers
+                && let Some(mut observed) = names
+                    .iter()
+                    .map(|name| {
+                        name.strip_prefix("model.layers.")?
+                            .strip_suffix(".mixer.attn")?
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .collect::<Option<Vec<_>>>()
             {
-                return Err(conflict("attention layer positions"));
+                observed.sort_unstable();
+                positions.insert(observed);
             }
-            self.metadata.nemotron_attention_layers = Some(positions);
+            for layers in positions {
+                if self
+                    .metadata
+                    .nemotron_attention_layers
+                    .get_or_insert_with(|| layers.clone())
+                    != &layers
+                {
+                    return Err(conflict("attention layer positions"));
+                }
+            }
         }
         if matches!(phase, "prefill" | "decode") && self.metadata.speculative == Some(true) {
             return Err(AicError::InvalidEngineConfig(
@@ -1755,10 +1795,25 @@ impl NixlIdentity {
             ));
         }
         if let Some(tp) = self.tp_size.filter(|size| Some(*size) == decode.tp_size) {
-            for (rank, peer, transpose) in [(self, decode, false), (decode, self, true)] {
-                if let Some(attention) = &rank.metadata.uniform_attention
-                    && let Some(expected) = attention.rank_heads(tp, rank.architecture.as_deref())
-                {
+            let configured = |rank: &Self| {
+                rank.metadata
+                    .uniform_attention
+                    .as_ref()?
+                    .rank_heads(tp, rank.architecture.as_deref())
+            };
+            let prefill_heads = configured(self);
+            let decode_heads = configured(decode);
+            if let Some(difference) = prefill_heads
+                .as_ref()
+                .zip(decode_heads.as_ref())
+                .and_then(|(a, b)| a.mismatch(b))
+            {
+                return Some(difference);
+            }
+            for (expected, peer, transpose) in
+                [(prefill_heads, decode, false), (decode_heads, self, true)]
+            {
+                if let Some(expected) = expected {
                     for observed in peer.metadata.layer_heads.values() {
                         if let Some((field, a, b)) = expected.mismatch(observed) {
                             return Some(if transpose {
@@ -2251,6 +2306,36 @@ mod tests {
     }
 
     #[test]
+    fn selected_nemotron_interprets_the_saved_top_level_layer_pattern() {
+        let selected = |model: Value, arch: &str| {
+            let mut id = observe(json!({"runtime_settings":{"model_config":model}}), "decode");
+            id.architecture = Some(arch.into());
+            id.select("decode", None, None, None, None, false).unwrap();
+            id.metadata.nemotron_attention_layers
+        };
+        let arch = "NemotronHForCausalLM";
+        let compact = json!({"hf_overrides":{"hybrid_override_pattern":"--**"}});
+        assert_eq!(selected(compact.clone(), arch), Some(vec![2, 3]));
+        assert!(selected(compact, "LlamaForCausalLM").is_none());
+        assert!(selected(json!({"hf_overrides":{}}), arch).is_none());
+        assert!(
+            selected(
+                json!({"hf_overrides":{"text_config":{"hybrid_override_pattern":"**--"}}}),
+                arch
+            )
+            .is_none()
+        );
+        assert_eq!(
+            selected(
+                json!({"hf_config":{"hybrid_override_pattern":"**--"},
+            "hf_overrides":{"hybrid_override_pattern":"--**"}}),
+                arch
+            ),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
     fn initialized_settings_agree_with_workers_and_selected_row() {
         let settings = json!({"model_config":{"model":"/p/M","dtype":"torch.bfloat16"},"cache_config":{"cache_dtype":"auto"}});
         let raw = json!({"runtime":{"version":"0.32.0+build"},"runtime_settings":settings,
@@ -2681,6 +2766,14 @@ mod tests {
             let mut compact = observe(json!({"runtime_settings":config(family,64)}), "prefill");
             compact.architecture = Some(arch.to_owned());
             compact.tp_size = Some(8);
+            let mut other = config(family, 32);
+            other["model_config"]["hf_overrides"]["hidden_size"] = json!(512);
+            let mut peer = observe(json!({"runtime_settings":other}), "decode");
+            peer.architecture = Some(arch.to_owned());
+            peer.tp_size = Some(8);
+            assert_eq!(compact.mismatch(&peer).unwrap().0, "head_size");
+            assert_eq!(peer.mismatch(&compact).unwrap().0, "head_size");
+            assert!(compact.mismatch(&compact).is_none());
             let mut measured = NixlIdentity {
                 tp_size: Some(8),
                 ..Default::default()
@@ -2770,11 +2863,11 @@ mod tests {
 
     #[test]
     fn mla_push_compares_physical_orders_after_removing_the_singleton_head() {
-        let worker = |name, compact| {
+        let worker = |name, compact, flag: Option<bool>, heads: Option<u64>| {
             let row = json!({"kind":"worker","phase":"decode","tp_rank":0,"dp_rank":0,
                 "raw_cache_config":{"kv_cache_layout":name},
-                "cache":{"groups":[{"kind":"attention","layer_names":["a"],"spec_type":"vllm.v1.kv_cache_interface.MLAAttentionSpec"}]},
-                "resolved_config":{"model_config":{"use_mla":true},"kv_transfer_config":{"kv_connector":"NixlPushConnector"}}});
+                "cache":{"groups":[{"kind":"attention","layer_names":["a"],"spec_type":"vllm.v1.kv_cache_interface.MLAAttentionSpec","num_kv_heads":heads}]},
+                "resolved_config":{"model_config":{"use_mla":flag},"kv_transfer_config":{"kv_connector":"NixlPushConnector"}}});
             let evidence = if compact {
                 json!({"worker_observations":NixlIdentity::compact_workers(&[row]).unwrap()})
             } else {
@@ -2783,13 +2876,25 @@ mod tests {
             observe(evidence, "decode")
         };
         for compact in [false, true] {
-            let a = worker("LBHNC", compact);
-            let b = worker("LBNHC", !compact);
-            assert!(a.mismatch(&b).is_none() && b.mismatch(&a).is_none());
-            assert_eq!(
-                a.mismatch(&worker("BLHNC", !compact)).unwrap().0,
-                "kv_cache_layout"
-            );
+            let a = worker("LBHNC", compact, Some(true), None);
+            for (flag, heads) in [(Some(true), None), (None, Some(1))] {
+                let b = worker("LBNHC", !compact, flag, heads);
+                assert!(a.mismatch(&b).is_none() && b.mismatch(&a).is_none());
+                assert_eq!(
+                    a.mismatch(&worker("BLHNC", !compact, flag, heads))
+                        .unwrap()
+                        .0,
+                    "kv_cache_layout"
+                );
+            }
+            for heads in [None, Some(2)] {
+                assert_eq!(
+                    a.mismatch(&worker("LBNHC", !compact, None, heads))
+                        .unwrap()
+                        .0,
+                    "kv_cache_layout"
+                );
+            }
         }
     }
 

@@ -351,6 +351,44 @@ pub(super) fn engines_routable(
     fits(&first) || choose(&mut domains, &fits)
 }
 
+// The 0.31 and 0.33 probes record a list of block-first views for each layer.
+fn block_first_probe(rank: &Value) -> bool {
+    rank.pointer("/runtime/version")
+        .and_then(Value::as_str)
+        .is_some_and(|v| matches!(v.split('+').next(), Some("0.31.0" | "0.33.0")))
+}
+
+fn layer_views(saved: &Value, block_first: bool) -> &[Value] {
+    match saved.as_array() {
+        Some(views) if block_first => views,
+        _ => std::slice::from_ref(saved),
+    }
+}
+
+fn on_gpu(cache: &Value, allocation: &Value, view: &Value, block_first: bool) -> bool {
+    match allocation.get("host_resident") {
+        Some(Value::Bool(host)) => !host,
+        None if block_first => view["storage_id"].as_str().is_some_and(|id| {
+            cache["storages"].as_array().is_some_and(|storages| {
+                storages.iter().any(|s| {
+                    s["storage_id"] == id
+                        && s["device"]
+                            .as_str()
+                            .is_some_and(|d| d == "cuda" || d.starts_with("cuda:"))
+                })
+            })
+        }),
+        _ => false,
+    }
+}
+
+fn view_span(dims: &[(u64, u64)], item_bytes: u64) -> Option<u128> {
+    dims.iter()
+        .try_fold(u128::from(item_bytes), |span, &(count, stride)| {
+            span.checked_add(u128::from(count.checked_sub(1)?) * u128::from(stride))
+        })
+}
+
 fn view_dimensions(
     cache: &Value,
     allocation: &Value,
@@ -358,20 +396,8 @@ fn view_dimensions(
     view: &Value,
     block_first: bool,
 ) -> Option<Result<[(u64, u64); 5], AicError>> {
-    match allocation.get("host_resident") {
-        Some(Value::Bool(false)) => {}
-        None if block_first => {
-            let storage = view["storage_id"].as_str()?;
-            if !cache["storages"].as_array()?.iter().any(|r| {
-                r["storage_id"] == storage
-                    && r["device"]
-                        .as_str()
-                        .is_some_and(|v| v == "cuda" || v.starts_with("cuda:"))
-            }) {
-                return None;
-            }
-        }
-        _ => return None,
+    if !on_gpu(cache, allocation, view, block_first) {
+        return None;
     }
     let shape = view["shape"].as_array()?;
     let strides = view["stride_bytes"].as_array()?;
@@ -424,6 +450,17 @@ pub(super) fn prefix_cacheable(group: &Value) -> Option<bool> {
         }
     }
     Some(cacheable)
+}
+
+pub(super) fn records_one_head(group: &Value) -> bool {
+    group["num_kv_heads"] == 1
+        || group["layer_names"].as_array().is_some_and(|names| {
+            !names.is_empty()
+                && names.iter().all(|n| {
+                    n.as_str()
+                        .is_some_and(|n| group["layer_specs"][n]["num_kv_heads"] == 1)
+                })
+        })
 }
 
 pub(super) fn single_head_mla(group: &Value) -> bool {
@@ -514,6 +551,7 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
 /// Packed rows, shared views and incomplete captures do not establish that region set.
 pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
     let cache = &rank["cache"];
+    let block_first = block_first_probe(rank);
     let groups = cache["groups"].as_array()?;
     let mut names = BTreeSet::new();
     for group in groups {
@@ -539,24 +577,51 @@ pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
     for allocation in cache["tensor_allocations"].as_array()? {
         let layers = allocation["layers"].as_array()?;
         let block_stride = allocation["block_stride"].as_u64().filter(|&n| n > 0)?;
-        if allocation["host_resident"] != false || layers.is_empty() {
+        if layers.is_empty() {
             return None;
         }
         for layer in layers {
             let name = layer.as_str()?;
-            let view = &cache["layer_tensors"][name];
-            let start = view["storage_offset_bytes"].as_u64()?;
+            let [view] = layer_views(&cache["layer_tensors"][name], block_first) else {
+                return None;
+            };
+            let storage = allocation["storage_id"].as_str()?;
             if view["block_axis"] != 0
-                || allocation["storage_id"].as_str()? != view["storage_id"].as_str()?
-                || view["stride_bytes"][0] != block_stride
+                || view["storage_id"] != storage
+                || !on_gpu(cache, allocation, view, block_first)
                 || !placed.insert(name.to_owned())
             {
                 return None;
             }
+            let start = view["storage_offset_bytes"].as_u64()?;
+            let stride = view["stride_bytes"][0].as_u64().filter(|&n| n > 0)?;
+            let mut span = u128::from(blocks) * u128::from(block_stride);
+            if let Some(shape) = view["shape"].as_array() {
+                let steps = view["stride_bytes"].as_array()?;
+                let dims = shape
+                    .iter()
+                    .zip(steps)
+                    .map(|(n, step)| Some((n.as_u64()?, step.as_u64()?)))
+                    .collect::<Option<Vec<_>>>()?;
+                let physical = u128::from(dims.first()?.0);
+                // The probe records a whole pool-block stride on the allocation and kernel-block
+                // strides on the view. The final logical block can have unused trailing slots.
+                if shape.len() != steps.len()
+                    || !block_stride.is_multiple_of(stride)
+                    || physical * u128::from(stride) > span
+                    || physical * u128::from(stride) <= span - u128::from(block_stride)
+                {
+                    return None;
+                }
+                // Head- or plane-major views can extend beyond the first run of blocks.
+                span = span.max(view_span(&dims, view["element_size_bytes"].as_u64()?)?);
+            } else if block_first || stride != block_stride {
+                return None;
+            }
             ranges.push((
-                view["storage_id"].as_str()?,
-                start,
-                start.checked_add(blocks.checked_mul(block_stride)?)?,
+                storage,
+                u128::from(start),
+                u128::from(start).checked_add(span)?,
             ));
         }
     }
@@ -577,11 +642,7 @@ pub(super) fn from_strides(
     if rank["schema_version"] != "aisimulate-runtime-observation/v1" {
         return Ok(None);
     }
-    // The 0.31 and 0.33 writers save lists of block-first views. 0.32 saves a single backend view.
-    let block_first = rank
-        .pointer("/runtime/version")
-        .and_then(Value::as_str)
-        .is_some_and(|v| matches!(v.split('+').next(), Some("0.31.0" | "0.33.0")));
+    let block_first = block_first_probe(rank);
     let cache = &rank["cache"];
     // A separate state allocation can have four axes with different meanings.
     let attention_layers = cache["groups"].as_array().map(|groups| {
@@ -674,10 +735,7 @@ pub(super) fn from_strides(
                 continue;
             }
             let saved = tensors.get(name).unwrap_or(&Value::Null);
-            let views = match saved.as_array() {
-                Some(views) if block_first => views.as_slice(),
-                _ => std::slice::from_ref(saved),
-            };
+            let views = layer_views(saved, block_first);
             for view in views {
                 let Some(dims) =
                     view_dimensions(cache, allocation, layers.len(), view, block_first)
@@ -693,12 +751,8 @@ pub(super) fn from_strides(
                     view["storage_offset_bytes"].as_u64(),
                     view["element_size_bytes"].as_u64(),
                 ) {
-                    let end = dims[1..].iter().try_fold(
-                        u128::from(start) + u128::from(item),
-                        |end, &(count, stride)| {
-                            end.checked_add(u128::from(count - 1) * u128::from(stride))
-                        },
-                    );
+                    let end = view_span(&dims[1..], item)
+                        .and_then(|span| u128::from(start).checked_add(span));
                     if end.is_none_or(|end| end > u128::from(*size)) {
                         return Err(conflict("kv_cache_layout tensor storage bounds"));
                     }
@@ -768,6 +822,58 @@ mod tests {
         assert!(registered_layers(&row).is_none());
         row["cache"]["tensor_allocations"][0]["layers"] = json!(["a"]);
         assert!(registered_layers(&row).is_none());
+    }
+
+    #[test]
+    fn registered_layers_follow_the_cuda_views_of_each_probe() {
+        let names = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+        for version in ["0.31.0", "0.32.0", "0.33.0"] {
+            for per_block in [1, 4] {
+                let pool_stride = 16_384 * per_block;
+                let layer_bytes = 40 * pool_stride;
+                let view = |start| {
+                    let tensor = json!({"storage_id":"s0", "storage_offset_bytes":start, "block_axis":0,
+                        "shape":[40 * per_block, 2, 16, 256],
+                        "stride_bytes":[16_384, 8192, 512, 2],
+                        "element_size_bytes":2, "kernel_block_size_tokens":16});
+                    if version == "0.32.0" {
+                        tensor
+                    } else {
+                        json!([tensor])
+                    }
+                };
+                let mut rank = json!({"schema_version":"aisimulate-runtime-observation/v1",
+                    "runtime":{"version":version}, "cache":{"num_blocks":40,
+                        "groups":[{"kind":"attention", "layer_names":["a","b"], "block_size_tokens":16 * per_block,
+                                   "spec_type":"vllm.v1.kv_cache_interface.FullAttentionSpec"}],
+                        "storages":[{"storage_id":"s0", "size_bytes":2 * layer_bytes, "device":"cuda:0"}],
+                        "tensor_allocations":[{"storage_id":"s0", "layers":["a","b"],
+                            "offset":0, "size":2 * layer_bytes, "layer_stride":layer_bytes, "block_stride":pool_stride}],
+                        "layer_tensors":{"a":view(0),"b":view(layer_bytes)}}});
+                if version == "0.32.0" {
+                    rank["cache"]["tensor_allocations"][0]["host_resident"] = json!(false);
+                }
+                assert_eq!(
+                    registered_layers(&rank).as_ref(),
+                    Some(&names),
+                    "{version} {per_block}"
+                );
+                rank["cache"]["layer_tensors"]["b"] = view(0);
+                assert!(registered_layers(&rank).is_none(), "aliased {version}");
+                rank["cache"]["layer_tensors"]["b"] = view(layer_bytes);
+                let first = &mut rank["cache"]["layer_tensors"]["a"];
+                let first = if version == "0.32.0" {
+                    first
+                } else {
+                    &mut first[0]
+                };
+                first["stride_bytes"][1] = json!(layer_bytes);
+                assert!(
+                    registered_layers(&rank).is_none(),
+                    "overlapping planes {version}"
+                );
+            }
+        }
     }
 
     #[test]

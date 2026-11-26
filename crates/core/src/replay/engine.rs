@@ -293,6 +293,18 @@ impl ReplayRoleConfig {
             .map(str::to_owned);
         if let Some(memory) = memory {
             observed.selected_memory(memory)?;
+            if self.rank.enable_prefix_caching {
+                ensure!(
+                    memory["enable_prefix_caching"] != false,
+                    "warm grouped rank requires prefix caching in the selected runtime memory"
+                );
+                if let Some(unit) = memory["hash_block_size_tokens"].as_u64() {
+                    ensure!(
+                        self.rank.prefix_match_unit.map(|n| n as u64) == Some(unit),
+                        "grouped rank prefix_match_unit must match the selected hash_block_size_tokens ({unit})"
+                    );
+                }
+            }
         }
         if let Some(groups) = deployment.and_then(|d| d.pointer("/resources/cache_groups")) {
             observed.selected_groups(groups)?;
@@ -1145,6 +1157,32 @@ mod disaggregated_tests {
             role.as_mut().unwrap().rank.kv_cache_groups.clear();
         }
         config.validate_topology(&topology).unwrap();
+    }
+
+    #[test]
+    fn warm_native_rank_uses_the_selected_hash_block_size() {
+        let mut role = ReplayRoleConfig::default();
+        role.rank.worker_type = WorkerType::Prefill;
+        role.rank.enable_prefix_caching = true;
+        role.rank.prefix_match_unit = Some(64);
+        role.rank.timing_model = TimingModelConfig::External {
+            provider: "ais".into(),
+            config: serde_json::json!({"model":"model","system":"gpu","worker_type":"prefill",
+                "backend":"vllm","backend_version":"0.33.0","fpm_profile":{"model":"model","deployments":[{
+                    "system":"gpu","worker_type":"prefill","backend":"vllm","backend_version":"0.33.0",
+                    "tp":1,"pp":1,"dp":1,"moe_tp":1,"moe_ep":1,
+                    "resources":{"cache_layout":"grouped","runtime_memory":{
+                        "enable_prefix_caching":true,"hash_block_size_tokens":64}}}]}}),
+        };
+        role.grouped_transfer_identity().map(|_| ()).unwrap();
+        role.rank.prefix_match_unit = Some(32);
+        assert!(
+            role.grouped_transfer_identity()
+                .is_err_and(|error| error.to_string().contains("hash_block_size_tokens"))
+        );
+        role.rank.enable_prefix_caching = false;
+        role.rank.prefix_match_unit = None;
+        role.grouped_transfer_identity().map(|_| ()).unwrap();
     }
 
     #[test]

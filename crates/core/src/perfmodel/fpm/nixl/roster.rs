@@ -42,11 +42,10 @@ pub(super) fn validate_formal_index(cell: &Value, manifest: &Value) -> Result<()
         ("observations_index", "path"),
         ("observations_sha256", "sha256"),
     ] {
-        if compatibility
-            .get(field)
-            .is_some_and(|value| *value != index[key])
-        {
-            return Err(invalid_index());
+        match compatibility.get(field) {
+            Some(value) if *value == index[key] => {}
+            None if manifest.get("source_artifacts").is_none() => {}
+            _ => return Err(invalid_index()),
         }
     }
     if let Some(inventory) = manifest.get("source_artifacts") {
@@ -122,20 +121,44 @@ fn first_phase_settings(entry: &Value) -> Option<&Value> {
     phases.get("prefill").or_else(|| phases.get("decode"))
 }
 
-const PREFIX_FIELDS: [&str; 3] = [
-    "enable_prefix_caching",
-    "hash_block_size_tokens",
-    "mamba_cache_mode",
-];
+pub(super) fn same_memory_setting(key: &str, lhs: &Value, rhs: &Value) -> bool {
+    lhs == rhs
+        || key == "gpu_memory_utilization"
+            && lhs.as_f64().zip(rhs.as_f64()).is_some_and(|(a, b)| a == b)
+}
 
-fn record_prefix(expected: &mut Value, memory: &Value) -> Result<(), AicError> {
-    for key in PREFIX_FIELDS {
-        if let Some(value) = memory.get(key).filter(|v| !v.is_null()) {
-            if expected.get(key).is_some_and(|old| old != value) {
-                return Err(super::conflict(key));
-            }
-            expected[key] = value.clone();
+fn record_memory_field(expected: &mut Value, memory: &Value, key: &str) -> Result<(), AicError> {
+    if let Some(value) = memory.get(key).filter(|v| !v.is_null()) {
+        if expected
+            .get(key)
+            .is_some_and(|old| !same_memory_setting(key, old, value))
+        {
+            return Err(super::conflict(key));
         }
+        expected[key] = value.clone();
+    }
+    Ok(())
+}
+
+fn record_memory_settings(expected: &mut Value, memory: &Value) -> Result<(), AicError> {
+    for key in [
+        "enable_prefix_caching",
+        "hash_block_size_tokens",
+        "mamba_cache_mode",
+        "gpu_memory_utilization",
+    ] {
+        record_memory_field(expected, memory, key)?;
+    }
+    Ok(())
+}
+
+fn record_memory_fraction(expected: &mut Value, entry: &Value) -> Result<(), AicError> {
+    for settings in [&entry["runtime_settings"], &entry["resolved_config"]] {
+        record_memory_field(
+            expected,
+            &settings["cache_config"],
+            "gpu_memory_utilization",
+        )?;
     }
     Ok(())
 }
@@ -163,9 +186,10 @@ pub(super) fn record_cell_memory(
     {
         return Err(super::conflict("kv_cache_bytes"));
     }
-    record_prefix(expected, memory)?;
+    record_memory_settings(expected, memory)?;
+    record_memory_fraction(expected, entry)?;
     if let Some(phase) = first_phase_settings(entry) {
-        record_prefix(expected, phase)?;
+        record_memory_settings(expected, phase)?;
     }
     Ok(observed.or(saved).or(formal))
 }
@@ -179,7 +203,7 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
         Some("aisimulate-onboarding-runtime-probe/v1" | "aisimulate-onboarding-runtime-probe/v2")
     ) {
         let memory = &evidence["observed_resources"]["runtime_memory"];
-        record_prefix(&mut expected, memory)?;
+        record_memory_settings(&mut expected, memory)?;
         let recorded = memory["kv_cache_bytes"].as_u64();
         if let Some(change) = evidence["user_overrides"].get("runtime_memory.kv_cache_bytes") {
             if change["observed"].as_u64() != recorded
@@ -197,8 +221,9 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
             recorded
         }
     } else if identified_source(evidence) {
+        record_memory_fraction(&mut expected, evidence)?;
         if let Some(phase) = first_phase_settings(evidence) {
-            record_prefix(&mut expected, phase)?;
+            record_memory_settings(&mut expected, phase)?;
         }
         rank_capacity(evidence)
     } else {
@@ -859,6 +884,47 @@ pub(super) fn backends_fit(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn measured_pool_retains_its_gpu_memory_fraction() {
+        let mut expected = json!({});
+        let cell = json!({"runtime_memory":{"kv_cache_bytes":1024,"gpu_memory_utilization":0.9}});
+        let mut source =
+            json!({"runtime_settings":{"cache_config":{"gpu_memory_utilization":0.9}}});
+        assert_eq!(
+            record_cell_memory(&cell, &source, &Value::Null, &mut expected).unwrap(),
+            Some(1024)
+        );
+        assert_eq!(expected["gpu_memory_utilization"], 0.9);
+        source["runtime_settings"]["cache_config"]["gpu_memory_utilization"] = json!(0.5);
+        assert!(record_cell_memory(&cell, &source, &Value::Null, &mut expected).is_err());
+        let mut full = json!({"gpu_memory_utilization":1});
+        record_memory_field(
+            &mut full,
+            &json!({"gpu_memory_utilization":1.0}),
+            "gpu_memory_utilization",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn inventoried_formal_index_requires_the_recorded_path_and_digest() {
+        let index = json!({"path":"index","sha256":"0".repeat(64)});
+        let cell = json!({"observations_index":index});
+        let mut manifest = json!({"source_artifacts":[index],"runtime_compatibility":{
+            "observations_index":"index","observations_sha256":"0".repeat(64)}});
+        assert!(validate_formal_index(&cell, &manifest).is_ok());
+        for key in ["observations_index", "observations_sha256"] {
+            let saved = manifest["runtime_compatibility"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key)
+                .unwrap();
+            assert!(validate_formal_index(&cell, &manifest).is_err());
+            manifest["runtime_compatibility"][key] = saved;
+        }
+        assert!(validate_formal_index(&cell, &json!({})).is_ok());
+    }
 
     #[test]
     fn large_anonymous_rosters_keep_multiplicity_of_disjoint_backend_classes() {
