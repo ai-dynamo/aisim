@@ -899,6 +899,33 @@ fn grouped_prefill_source_rejects_an_empty_prompt_before_registering_the_hold() 
 }
 
 #[test]
+fn grouped_pd_local_submit_rejects_an_empty_prompt_before_registering_it() {
+    for role in [WorkerType::Prefill, WorkerType::Decode] {
+        let mut core = pd_core(
+            glm_transfer_groups("0.32.0", false),
+            128 * GLM_PAGE,
+            8192,
+            role,
+            None,
+        );
+        let error = core
+            .apply_command(SchedulerCommand::Submit(pd_request(1, 0, 1)))
+            .unwrap_err();
+        assert!(error.to_string().contains("nonempty prompt"));
+        assert!(core.is_drained());
+        core.apply_command(SchedulerCommand::Submit(pd_request(1, 4, 2)))
+            .unwrap();
+        let mut forwards = 0;
+        for step in 0..2 {
+            let pass = core.execute_pass(&mut TraceCollector::default(), step as f64);
+            forwards += pass.decode_acceptance.forwards;
+        }
+        assert_eq!(forwards, if role == WorkerType::Decode { 2 } else { 0 });
+        assert!(core.is_drained());
+    }
+}
+
+#[test]
 fn grouped_decode_rank_refuses_source_commands() {
     // A decode rank has transfer rules but holds no source: only a prefill
     // rank frees the skipped blocks of a source that it holds.
@@ -2077,6 +2104,13 @@ fn grouped_hybrid_destination_recomputes_the_last_prompt_token() {
         let pass = core.execute_pass(&mut trace, step as f64);
         step += 1;
         assert_eq!(pass.output_signals.len(), 1, "N {prompt}");
+        assert_eq!(
+            (
+                pass.decode_acceptance.accepted_tokens,
+                pass.decode_acceptance.forwards
+            ),
+            (1, 1)
+        );
         assert_eq!(pass.output_signals[0].uuid, id);
         // The admission reports no reused tokens, as a linear handoff does.
         assert_eq!(
@@ -2106,6 +2140,42 @@ fn grouped_hybrid_destination_recomputes_the_last_prompt_token() {
         assert_eq!(grouped_pool(&core).used_bytes(), 0);
         assert!(core.is_drained(), "N {prompt}");
     }
+}
+
+#[test]
+fn fully_loaded_grouped_prompts_each_consume_one_decode_token() {
+    let mut full = group("full", 4, 64, None);
+    full.prefix_cacheable = Some(true);
+    full.transfer_bytes_per_block = Some(64);
+    let mut core = pd_core(vec![full], 4096, 1, WorkerType::Decode, None);
+    for id in [1, 2] {
+        let handoff = HandoffId::new(Uuid::from_u128(id + 10));
+        assert_eq!(
+            reserve_grouped(&mut core, handoff, pd_request(id, 4, 1)),
+            Some(1)
+        );
+        activate(&mut core, handoff);
+        let request = &core.state.requests[&Uuid::from_u128(id)];
+        assert_eq!(
+            (
+                request.num_computed_tokens,
+                request.sequence.num_allocated_tokens()
+            ),
+            (3, 3)
+        );
+    }
+    for pass_id in 0..2 {
+        let pass = core.execute_pass(&mut TraceCollector::default(), f64::from(pass_id));
+        assert_eq!(pass.output_signals.len(), 1);
+        assert_eq!(
+            (
+                pass.decode_acceptance.accepted_tokens,
+                pass.decode_acceptance.forwards
+            ),
+            (1, 1)
+        );
+    }
+    assert!(core.is_drained());
 }
 
 #[test]
@@ -2543,9 +2613,9 @@ fn grouped_prefill_rank_in_block_mode_readmits_a_held_request_when_a_held_source
 }
 
 #[test]
-fn grouped_destination_without_state_layers_activates_prebuilt() {
-    // Without a Mamba state the backoff is 0: the decode rank loads all 130
-    // tokens, three 64-token blocks, and recomputes none.
+fn grouped_destination_without_state_layers_loads_all_tokens_and_recomputes_the_last() {
+    // Without a Mamba state the source sends all 130 tokens, three 64-token
+    // blocks. Decode schedules the last token to sample its first output.
     let mut full = group("full", 64, 100, None);
     full.prefix_cacheable = Some(true);
     full.transfer_bytes_per_block = Some(100);
@@ -2558,8 +2628,8 @@ fn grouped_destination_without_state_layers_activates_prebuilt() {
     assert_eq!(core.mocker_metrics().kv_cache_used_bytes, Some(300));
     activate(&mut core, handoff_id);
     let request = &core.state.requests[&Uuid::from_u128(1611)];
-    assert_eq!(request.num_computed_tokens, 130);
-    assert_eq!(request.recompute_tokens, 0);
+    assert_eq!(request.num_computed_tokens, 129);
+    assert_eq!(request.recompute_tokens, 1);
     let mut trace = TraceCollector::default();
     let mut step = 0;
     assert_eq!(step_pd(&mut core, &mut trace, &mut step), 1);
@@ -4391,6 +4461,27 @@ fn grouped_destination_waits_for_the_cached_block_of_a_lagging_state_hit() {
         ..pd_request(1774, 0, 2)
     };
     assert_eq!(reserve_grouped(&mut core, c, request), None);
+    let lookup = crate::engine::PrefixCacheLookupCounts {
+        query_count: 1,
+        queried_tokens: 65,
+        matched_tokens: 48,
+    };
+    assert_eq!(core.destination_lookup.take(), Some(lookup));
+    assert!(core.retry_pending_destinations().is_empty());
+    assert!(core.destination_lookup.is_none());
+    // Cancelling another pending load wakes the queue and retries its head.
+    let other = HandoffId::new(Uuid::from_u128(1777));
+    assert_eq!(
+        reserve_grouped(&mut core, other, pd_request(1776, 33, 1)),
+        None
+    );
+    assert!(core.destination_lookup.is_none());
+    core.apply_command_effects(
+        SchedulerCommand::CancelDestination { handoff_id: other },
+        true,
+    )
+    .unwrap();
+    assert_eq!(core.destination_lookup.take(), Some(lookup));
 }
 
 #[test]

@@ -451,16 +451,16 @@ impl G1Manager {
         sequence: &RequestSequence,
         lease: &BlockRequestLease,
         mode: DestinationReservationMode,
-        eviction_now_ms: Option<f64>,
         local_prefill_need: u64,
+        lookup: &mut Option<crate::engine::PrefixCacheLookupCounts>,
     ) -> G1Acquire<DestinationReservation> {
         into_g1_acquire(self.inner.reserve_destination_lease(
             owner,
             sequence,
             lease,
             mode,
-            eviction_now_ms,
             local_prefill_need,
+            lookup,
         ))
         .map(|inner| DestinationReservation { inner })
     }

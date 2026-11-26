@@ -1891,6 +1891,15 @@ def grouped_pd_requirements(prefill_deployment, decode_deployment, *, backend_ve
     """
     if requirement := grouped_pd_pair_requirement(prefill_deployment, decode_deployment):
         raise ValueError(f"grouped FPM cache P/D requires prefill and decode deployments with {requirement}")
+    grouped_pd_transfer_requirements(
+        prefill_deployment, decode_deployment, backend_version=backend_version, kv_transfer=kv_transfer
+    )
+
+
+def grouped_pd_transfer_requirements(
+    prefill_deployment, decode_deployment, *, backend_version: str | None, kv_transfer
+) -> None:
+    """Check the transfer evidence for a pair with compatible grouped cache layouts."""
     # The versions come first, as in the Rust gate and the prefix-caching rule: no marker makes P/D of another
     # version run.
     if backend_version not in GROUPED_PD_VERSIONS:

@@ -416,6 +416,9 @@ pub struct Metrics {
     pub running_requests: u64,
     pub waiting_requests: u64,
     pub preemptions_total: u64,
+    /// G1 lookup performed by a grouped destination at this command or pass
+    /// completion. A blocked reservation still contributes its lookup.
+    pub g1_destination_lookup: Option<PrefixCacheLookupCounts>,
     /// SGLang radix-cache tokens reused by the most recently completed pass.
     ///
     /// Backends without an equivalent pass-local metric report zero.
@@ -464,7 +467,7 @@ pub struct CommandEffects {
     pub suppressed_pending_output: bool,
 }
 
-/// G1 prefix-cache lookup observations at scheduler pass start.
+/// G1 prefix-cache lookup observations during scheduling or destination reservation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PrefixCacheLookupCounts {
     pub query_count: u64,

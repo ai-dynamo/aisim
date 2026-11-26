@@ -241,6 +241,7 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
     from aisim.fpm_profile import load_fpm_profile
 
     profile = load_fpm_profile(search_space.fpm_profile)
+    raw_pinned = search_space.parallel_configs_by_mode.get(deployment_mode, search_space.parallel_configs)
     configs = _profile_parallel_configs(
         profile,
         hardware_sku=search_space.hardware_sku_for("agg" if deployment_mode == "agg" else "prefill"),
@@ -250,11 +251,12 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
         gpu_budget=search_space.gpu_budget,
         min_gpu_budget=search_space.min_gpu_budget,
         deployment_mode=deployment_mode,
+        candidate_configs=[_parse_parallel_entry(entry, deployment_mode) for entry in raw_pinned]
+        if raw_pinned
+        else None,
+        # The search validates transfer evidence after applying its role and topology domains.
+        validate_transfer=False,
     )
-    raw_pinned = search_space.parallel_configs_by_mode.get(deployment_mode, search_space.parallel_configs)
-    if raw_pinned:
-        pinned = {_parse_parallel_entry(entry, deployment_mode) for entry in raw_pinned}
-        configs = [config for config in configs if config in pinned]
     for role, entries in search_space.parallel_custom_configs_by_mode.get(deployment_mode, {}).items():
         choices = {_replica_from_dict(entry) for entry in entries}
         configs = [config for config in configs if _parallel_role(config, role) in choices]
@@ -432,18 +434,23 @@ def _heterogeneous_disagg_configs(
             raise type(exc)(f"{role} hardware_sku={hardware!r}: {exc}") from exc
         per_role[role] = configs
 
-    # The roles pair again only as the candidates do: a profile drops grouped pairs that cannot hand off.
-    candidates = set(candidate_configs) if candidate_configs is not None else None
-    configs = [
-        DisaggParallelConfig(prefill=prefill, decode=decode)
-        for prefill in per_role["prefill"]
-        for decode in per_role["decode"]
-        if prefill.total_gpus + decode.total_gpus <= search_space.gpu_budget
-        and (
-            search_space.min_gpu_budget is None or prefill.total_gpus + decode.total_gpus >= search_space.min_gpu_budget
-        )
-        and (candidates is None or DisaggParallelConfig(prefill=prefill, decode=decode) in candidates)
-    ]
+    minimum = search_space.min_gpu_budget or 0
+    if candidate_configs is not None:
+        prefill, decode = set(per_role["prefill"]), set(per_role["decode"])
+        configs = [
+            config
+            for config in candidate_configs
+            if config.prefill in prefill
+            and config.decode in decode
+            and minimum <= config.total_gpus <= search_space.gpu_budget
+        ]
+    else:
+        configs = [
+            DisaggParallelConfig(prefill=prefill, decode=decode)
+            for prefill in per_role["prefill"]
+            for decode in per_role["decode"]
+            if minimum <= prefill.total_gpus + decode.total_gpus <= search_space.gpu_budget
+        ]
     if not configs:
         raise NoViableParallelConfig(
             f"heterogeneous P/D roles have no legal pair within gpu_budget={search_space.gpu_budget}"

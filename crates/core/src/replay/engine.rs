@@ -289,6 +289,13 @@ impl ReplayEngineConfig {
                     ));
                 }
                 if !prefill.kv_cache_groups.is_empty() {
+                    if prefill_role.prefill_context_parallel_size != 1
+                        || decode_role.prefill_context_parallel_size != 1
+                    {
+                        return Err(ReplayError::InvalidSpec(
+                            "grouped prefill and decode roles require prefill_context_parallel_size=1".into(),
+                        ));
+                    }
                     // The handoff moves one TP rank's cache with one vLLM rule set.
                     if prefill_role.tensor_parallel_size != decode_role.tensor_parallel_size {
                         return Err(ReplayError::InvalidSpec(

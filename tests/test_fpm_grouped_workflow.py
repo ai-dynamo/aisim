@@ -2015,6 +2015,83 @@ def test_grouped_search_checks_incompatible_deployments_before_creating_replica_
         )
 
 
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize(
+    "case, error",
+    [
+        ("valid", None),
+        ("tp", "equal tensor parallelism and identical cache groups"),
+        ("dtype", "matching kv_cache_dtype"),
+        ("backend", "matching attention_backend"),
+        ("markers", "transfer_bytes_per_block"),
+        ("version", "vLLM 0.31.0"),
+        ("runtime_version", "runtime_memory.runtime_framework_version"),
+        ("ring", "blocks_per_request=1"),
+        ("window", "sliding-window attention group"),
+        ("full", "one block_size_tokens"),
+    ],
+)
+def test_direct_grouped_pd_parallel_configs(grouped_case, pinned, case, error):
+    from aisim.sweeper.parallel_enum import (
+        DisaggParallelConfig,
+        ParallelShape,
+        ReplicaParallelConfig,
+    )
+
+    profile, root = grouped_case
+    version = "0.34.0" if case == "version" else "0.32.0"
+    if case == "runtime_version":
+        profile = _with_prefix_evidence(profile, version=version)
+    profile = _with_transfer_markers(profile, version=version)
+    tensor, dep = profile["deployments"]
+    prefill = {**tensor, "worker_type": "prefill", "attention_backend": "flashinfer"}
+    decode = {**deepcopy(dep if case == "tp" else prefill), "worker_type": "decode"}
+    if case == "dtype":
+        decode["kv_cache_dtype"] = "int8"
+    if case == "backend":
+        decode["attention_backend"] = "fa3"
+    if case == "runtime_version":
+        decode["resources"]["runtime_memory"]["runtime_framework_version"] = "0.33.0"
+    profile["deployments"] = [prefill, decode]
+    for deployment in profile["deployments"]:
+        groups = deployment["resources"]["cache_groups"]
+        if case == "markers":
+            del groups[0]["transfer_bytes_per_block"]
+        elif case == "ring":
+            groups.append(
+                {
+                    **_STATE_GROUP,
+                    "prefix_cacheable": False,
+                    "blocks_per_request": 4,
+                    "transfer_bytes_per_block": 64,
+                }
+            )
+        elif case == "window":
+            groups[1]["prefix_cacheable"] = False
+        elif case == "full":
+            groups.append({**groups[0], "name": "other_full", "block_size_tokens": 16})
+    tensor_rank = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), 1)
+    dep_rank = ReplicaParallelConfig(ParallelShape(tp=1, dp=2, moe_tp=1, moe_ep=2), 1)
+    pair = DisaggParallelConfig(tensor_rank, dep_rank if case == "tp" else tensor_rank)
+    kwargs = dict(
+        gpu_budget=4,
+        deployment_mode="disagg",
+        backend="vllm",
+        backend_version=version,
+        fpm_profile=profile,
+        systems_paths=[str(root)],
+        max_seq_len=128,
+        max_num_tokens=128,
+        max_batch_size=4,
+        candidate_configs=[pair] if pinned else None,
+    )
+    if error is None:
+        assert parallel_configs_for(profile["model"], "h200_sxm", **kwargs) == [pair]
+    else:
+        with pytest.raises(ValueError, match=error):
+            parallel_configs_for(profile["model"], "h200_sxm", **kwargs)
+
+
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):
     from aisim.sweeper.config import SmartSearchConfig
     from aisim.sweeper.search_space import enumerate_branches
@@ -2031,6 +2108,65 @@ def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):
         (shape, shape) for shape in {candidate.prefill.shape for candidate in branch.parallel_configs}
     }
     assert {candidate.prefill.shape.tp for candidate in branch.parallel_configs} == {1, 2}
+
+
+def test_direct_pd_checks_transfer_only_for_deployment_pairs_in_the_gpu_range(grouped_case):
+    profile, root = grouped_case
+    profile = _mixed_profile(profile)
+    for deployment in profile["deployments"]:
+        deployment["backend_version"] = "0.32.0"
+    # Linear ranks use one GPU. The grouped ranks lack transfer markers and
+    # use two GPUs each, so no grouped pair can use exactly five GPUs.
+    profile["deployments"][0].update(tp=1, dp=1, moe_tp=1, moe_ep=1)
+    configs = parallel_configs_for(
+        profile["model"],
+        "h200_sxm",
+        gpu_budget=5,
+        min_gpu_budget=5,
+        deployment_mode="disagg",
+        backend="vllm",
+        backend_version="0.32.0",
+        fpm_profile=profile,
+        systems_paths=[str(root)],
+        max_seq_len=128,
+        max_num_tokens=128,
+        max_batch_size=4,
+    )
+    assert [(c.prefill.replicas, c.decode.replicas) for c in configs] == [(1, 4), (2, 3), (3, 2), (4, 1)]
+
+
+def test_grouped_heterogeneous_pins_validate_one_deployment_pair_before_replica_filtering(grouped_case, monkeypatch):
+    from aisim.config import engine
+    from aisim.sweeper import model_hw
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.search_space import enumerate_branches
+
+    profile, root = grouped_case
+    tensor = _with_transfer_markers(profile)["deployments"][0]
+    profile["deployments"] = [tensor, {**deepcopy(tensor), "system": "h100_sxm"}]
+    (root / "h100_sxm.yaml").write_bytes((root / "h200_sxm.yaml").read_bytes())
+    ranks = [{"tp": 2, "moe_tp": 2, "replicas": i} for i in range(256, 0, -1)]
+    raw = {
+        **_pd_search(profile, root),
+        "gpu_budget": 1024,
+        "decode_hardware_sku": "h100_sxm",
+        "parallel_configs_by_mode": {"disagg": [{"prefill": rank, "decode": rank} for rank in ranks]},
+    }
+    checks = []
+    check_transfer = engine.grouped_pd_transfer_requirements
+
+    def checked(prefill, decode, **kwargs):
+        checks.append((prefill.system, decode.system))
+        check_transfer(prefill, decode, **kwargs)
+
+    monkeypatch.setattr(engine, "grouped_pd_transfer_requirements", checked)
+    monkeypatch.setattr(model_hw, "DisaggParallelConfig", lambda **kw: pytest.fail("expanded an authored replica pair"))
+    config = SmartSearchConfig(search_space=raw, workload=Workload(isl=1152, osl=4, concurrency=1, request_count=2))
+    (branch,) = enumerate_branches(config, max_seq_len=2048)
+    assert checks == [("h200_sxm", "h100_sxm")]
+    assert [(c.prefill.replicas, c.decode.replicas) for c in branch.parallel_configs] == [
+        (i, i) for i in range(256, 0, -1)
+    ]
 
 
 @pytest.mark.parametrize(

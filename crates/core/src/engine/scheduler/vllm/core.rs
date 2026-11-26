@@ -89,9 +89,8 @@ pub(crate) struct VllmRequestState {
     arrival_ms: f64,
     is_decode_handoff: bool,
     pub(crate) num_computed_tokens: usize,
-    /// Prompt tokens that a decode handoff computes after its load: the
-    /// backoff tokens that the prefill rank left out. The prompt counts as
-    /// prebuilt with them, and the first pass computes them.
+    /// Prompt tokens that a decode handoff computes after its load. The
+    /// final token supplies logits even when its page was transferred.
     pub(crate) recompute_tokens: usize,
     /// Cleared on preemption: recomputation has no draft IDs to verify.
     drafts_ready: bool,
@@ -135,7 +134,7 @@ impl VllmRequestState {
     }
 
     /// Whether the prompt needs no prefill: a decode handoff holds its loaded
-    /// tokens and computes only the backoff tokens in its first pass.
+    /// pages and computes the remaining prompt work in its first decode pass.
     fn prompt_is_prebuilt(&self) -> bool {
         let prompt = self.sequence.num_input_tokens();
         self.num_computed_tokens + self.recompute_tokens >= prompt
@@ -752,6 +751,8 @@ pub(crate) struct VllmCore {
     lifecycle_events: Vec<SchedulerLifecycleEvent>,
     pressure_events: Vec<PressureEvent>,
     g1_prefix_cache_lookup: Option<crate::engine::PrefixCacheLookupCounts>,
+    /// The queue head's G1 lookup at this command or pass completion boundary.
+    pub(crate) destination_lookup: Option<crate::engine::PrefixCacheLookupCounts>,
     retain_local_hashes: bool,
     emit_token_ids: bool,
     /// The `prefix_match_unit` hashes of the prompt spans this engine has
@@ -962,16 +963,12 @@ impl ReservedVllmDecode {
             &mut request.sequence.lease,
             kv,
         );
-        // A grouped decode rank loads N - backoff tokens of a prompt longer
-        // than the backoff, and else the whole prompt. Its first pass computes
-        // the backoff tokens (V31 `sched:3052-3096`). The linear path has no
-        // backoff.
-        let backoff = kv_manager
+        // A grouped decode rank needs the final prompt token's logits even
+        // when it loaded the whole prompt.
+        request.num_computed_tokens = kv_manager
             .grouped_transfer()
-            .map_or(0, |rules| rules.backoff_tokens())
-            .min(prompt_len);
-        request.num_computed_tokens = prompt_len - backoff;
-        request.recompute_tokens = backoff;
+            .map_or(prompt_len, |rules| rules.computed_after_load(prompt_len));
+        request.recompute_tokens = prompt_len - request.num_computed_tokens;
         request.status = RequestStatus::Waiting;
         request.is_decode_handoff = true;
         request
@@ -1265,6 +1262,7 @@ impl VllmCore {
             lifecycle_events: Vec::new(),
             pressure_events: Vec::new(),
             g1_prefix_cache_lookup: None,
+            destination_lookup: None,
             retain_local_hashes,
             emit_token_ids,
             prefix_hash_memo,
@@ -1476,6 +1474,10 @@ impl VllmCore {
         let mutation_now_ms = command_now_ms.filter(|_| allow_destination_admission);
         match command {
             SchedulerCommand::Submit(mut request) => {
+                anyhow::ensure!(
+                    self.kv_manager.grouped_transfer().is_none() || !request.tokens.is_empty(),
+                    "grouped KV prefill and decode workers require a nonempty prompt"
+                );
                 let uuid = request.uuid.unwrap_or_else(Uuid::new_v4);
                 request.uuid = Some(uuid);
                 self.validate_request_id(uuid)?;
@@ -1639,7 +1641,7 @@ impl VllmCore {
                 if allow_destination_admission {
                     effects
                         .lifecycle_events
-                        .extend(self.retry_pending_destinations_at(mutation_now_ms));
+                        .extend(self.retry_pending_destinations());
                 }
                 Ok(effects)
             }
@@ -1707,19 +1709,12 @@ impl VllmCore {
             }
             effects
                 .lifecycle_events
-                .extend(self.retry_pending_destinations_at(mutation_now_ms));
+                .extend(self.retry_pending_destinations());
         }
         effects
     }
 
     pub(crate) fn retry_pending_destinations(&mut self) -> Vec<SchedulerLifecycleEvent> {
-        self.retry_pending_destinations_at(None)
-    }
-
-    pub(super) fn retry_pending_destinations_at(
-        &mut self,
-        mutation_now_ms: Option<f64>,
-    ) -> Vec<SchedulerLifecycleEvent> {
         // A grouped pool frees blocks inside a pass, publishes the blocks of
         // an activation and evicts keys without a generation bump. Each can
         // let the head reserve, so a change since the last retry makes it due.
@@ -1765,7 +1760,7 @@ impl VllmCore {
         {
             self.bump_capacity_generation();
         }
-        let events = self.retry_front_destination(mutation_now_ms, local_prefill_need);
+        let events = self.retry_front_destination(local_prefill_need);
         // The changes of the attempt itself do not make the next retry due.
         // The attempt leaves the local prefills as they were.
         self.grouped_retry_epoch = self.kv_manager.grouped().map(GroupedKvPool::retry_epoch);
@@ -1794,11 +1789,7 @@ impl VllmCore {
             .fold(0, u64::saturating_add)
     }
 
-    fn retry_front_destination(
-        &mut self,
-        mutation_now_ms: Option<f64>,
-        local_prefill_need: u64,
-    ) -> Vec<SchedulerLifecycleEvent> {
+    fn retry_front_destination(&mut self, local_prefill_need: u64) -> Vec<SchedulerLifecycleEvent> {
         self.destination_retry_ready = false;
         let generation = self.capacity_generation;
         let max_num_running = self.args.max_num_seqs.unwrap_or(usize::MAX);
@@ -1850,8 +1841,8 @@ impl VllmCore {
             &request.sequence.sequence,
             &request.sequence.lease,
             reservation_mode,
-            mutation_now_ms,
             local_prefill_need,
+            &mut self.destination_lookup,
         );
         let kv = match reservation {
             // Never receive handoff KV into capacity whose previous contents
@@ -5155,9 +5146,12 @@ impl VllmCore {
                 continue;
             };
             if self.args.worker_type != WorkerType::Prefill
-                && scheduled
-                    .get(&uuid)
-                    .is_some_and(|work| work.prompt_tokens == 0 && !work.terminal_after_schedule)
+                && scheduled.get(&uuid).is_some_and(|work| {
+                    // A grouped decode worker prices the first sampled
+                    // output as decode, even when it computes prompt tokens.
+                    (work.prompt_tokens == 0 || self.kv_manager.grouped_transfer().is_some())
+                        && !work.terminal_after_schedule
+                })
             {
                 decode_acceptance.accepted_tokens += 1;
                 decode_acceptance.forwards += 1;

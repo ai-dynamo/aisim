@@ -168,19 +168,16 @@ def parallel_configs_for(
         seq_len = max_seq_len if max_seq_len is not None else profile.context_length
         if seq_len > profile.context_length:
             raise ValueError("max_seq_len exceeds FPM profile context_length")
-        configs = (
-            candidate_configs
-            if candidate_configs is not None
-            else _profile_parallel_configs(
-                profile,
-                hardware_sku=hardware_sku,
-                backend=backend,
-                backend_version=backend_version,
-                gpu_budget=gpu_budget,
-                min_gpu_budget=min_gpu_budget,
-                deployment_mode=deployment_mode,
-                worker_type=worker_type,
-            )
+        configs = _profile_parallel_configs(
+            profile,
+            hardware_sku=hardware_sku,
+            backend=backend,
+            backend_version=backend_version,
+            gpu_budget=gpu_budget,
+            min_gpu_budget=min_gpu_budget,
+            deployment_mode=deployment_mode,
+            worker_type=worker_type,
+            candidate_configs=candidate_configs,
         )
     else:
         mh = resolve_model_hardware(model_name, hardware_sku, backend=backend, systems_paths=systems_paths)
@@ -359,28 +356,27 @@ def _profile_parallel_configs(
     deployment_mode: str,
     decode_hardware_sku: str | None = None,
     worker_type: str = "aggregated",
+    candidate_configs: list[ReplicaParallelConfig] | list[DisaggParallelConfig] | None = None,
+    validate_transfer: bool = True,
 ):
     """Enumerate only declared deployment shapes; replicas do not change a cell."""
-    from aisim.config.engine import grouped_pd_pair_requirement
+    from aisim.config.engine import grouped_pd_pair_requirement, grouped_pd_transfer_requirements
 
     def shapes_for(system, role):
-        return [
-            (
-                deployment,
-                ParallelShape(
-                    tp=deployment.tp,
-                    pp=deployment.pp,
-                    dp=deployment.dp,
-                    moe_tp=deployment.moe_tp,
-                    moe_ep=deployment.moe_ep,
-                ),
-            )
+        return {
+            ParallelShape(
+                tp=deployment.tp,
+                pp=deployment.pp,
+                dp=deployment.dp,
+                moe_tp=deployment.moe_tp,
+                moe_ep=deployment.moe_ep,
+            ): deployment
             for deployment in profile.deployments
             if deployment.system == system
             and deployment.backend == backend
             and deployment.backend_version == backend_version
             and deployment.worker_type in (None, role)
-        ]
+        }
 
     def replicas(shape, budget):
         return (
@@ -388,33 +384,65 @@ def _profile_parallel_configs(
             for count in range(1, budget // shape.gpus_per_worker + 1)
         )
 
-    if deployment_mode == "agg":
-        configs = [
-            replica for _, shape in shapes_for(hardware_sku, worker_type) for replica in replicas(shape, gpu_budget)
+    if candidate_configs is not None:
+        candidate_configs = [
+            config for config in candidate_configs if (min_gpu_budget or 0) <= config.total_gpus <= gpu_budget
         ]
+    if deployment_mode == "agg":
+        shapes = shapes_for(hardware_sku, worker_type)
+        if candidate_configs is not None:
+            return [config for config in candidate_configs if config.shape in shapes]
+        configs = [replica for shape in shapes for replica in replicas(shape, gpu_budget)]
     elif deployment_mode == "disagg":
-        configs = []
-        requirements = {}
+        prefill_shapes = shapes_for(hardware_sku, "prefill")
         decode_shapes = shapes_for(decode_hardware_sku or hardware_sku, "decode")
-        for prefill, shape in shapes_for(hardware_sku, "prefill"):
-            compatible = []
-            for decode, decode_shape in decode_shapes:
-                if shape.gpus_per_worker + decode_shape.gpus_per_worker > gpu_budget:
+        requirements = {}
+
+        def compatible(prefill_shape, decode_shape):
+            prefill, decode = prefill_shapes[prefill_shape], decode_shapes[decode_shape]
+            if requirement := grouped_pd_pair_requirement(prefill, decode):
+                requirements[requirement] = None
+                return False
+            if validate_transfer and prefill.resources.cache_layout == "grouped":
+                grouped_pd_transfer_requirements(prefill, decode, backend_version=backend_version, kv_transfer=None)
+            return True
+
+        if candidate_configs is not None:
+            # Replica counts do not change a deployment's transfer geometry.
+            pairs = dict.fromkeys((config.prefill.shape, config.decode.shape) for config in candidate_configs)
+            allowed = {
+                (prefill, decode)
+                for prefill, decode in pairs
+                if prefill in prefill_shapes and decode in decode_shapes and compatible(prefill, decode)
+            }
+            configs = [config for config in candidate_configs if (config.prefill.shape, config.decode.shape) in allowed]
+        else:
+            configs = []
+
+            def fits_budget(prefill, decode):
+                p, d = prefill.gpus_per_worker, decode.gpus_per_worker
+                if min_gpu_budget is None:
+                    return p + d <= gpu_budget
+                # At a fixed prefill count, fill the remaining GPUs with decode ranks.
+                # The unused remainder repeats after at most d prefill counts.
+                counts = range(1, min(d, (gpu_budget - d) // p) + 1)
+                return any(gpu_budget - (gpu_budget - count * p) % d >= min_gpu_budget for count in counts)
+
+            for shape in prefill_shapes:
+                destinations = [dest for dest in decode_shapes if fits_budget(shape, dest) and compatible(shape, dest)]
+                if not destinations:
                     continue
-                if requirement := grouped_pd_pair_requirement(prefill, decode):
-                    requirements[requirement] = None
-                else:
-                    compatible.append(decode_shape)
-            if compatible:
                 for replica in replicas(shape, gpu_budget):
                     available = gpu_budget - replica.total_gpus
                     configs.extend(
                         DisaggParallelConfig(prefill=replica, decode=destination)
-                        for decode_shape in compatible
+                        for decode_shape in destinations
                         for destination in replicas(decode_shape, available)
                     )
         if requirements and not configs:
             raise NoViableParallelConfig(f"no prefill/decode deployment pair with {' and '.join(requirements)}")
     else:
         raise ValueError("FPM profiles support only agg or disagg deployment modes")
-    return [config for config in configs if min_gpu_budget is None or config.total_gpus >= min_gpu_budget]
+    if candidate_configs is not None or min_gpu_budget is None:
+        return configs
+    return [config for config in configs if config.total_gpus >= min_gpu_budget]

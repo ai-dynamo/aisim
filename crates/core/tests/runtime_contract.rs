@@ -1280,6 +1280,80 @@ fn grouped_pd_rejects_unequal_tensor_parallel_sizes() {
 }
 
 #[test]
+fn grouped_pd_reports_destination_lookups_and_first_decode_forwards() {
+    for (mode, cache) in [
+        ("destination_missing", true),
+        ("full_prompt", true),
+        ("destination_missing", false),
+    ] {
+        let requests = [("cold", 0.0), ("warm", 100.0)].map(|(id, at)| {
+            let mut req = request(id, at, 9, 1);
+            req.input_token_ids = Some((0..9).collect());
+            req
+        });
+        let mut spec = small_grouped_pd_spec(requests.to_vec(), 32, Some(64));
+        let rank = &mut spec.engine["rank"];
+        rank["kv_transfer_timing_mode"] = mode.into();
+        rank["enable_prefix_caching"] = cache.into();
+        rank["prefix_match_unit"] = if cache {
+            4.into()
+        } else {
+            serde_json::Value::Null
+        };
+        rank["kv_cache_groups"] = serde_json::json!([{
+            "name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":4,
+            "page_size_bytes":100, "transfer_bytes_per_block":100, "prefix_cacheable":true
+        }]);
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .with_telemetry_observer(
+                1_000.0,
+                Box::new(RecordingTelemetryObserver {
+                    samples: Arc::clone(&samples),
+                }),
+            )
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 2);
+        let samples = samples.lock().unwrap();
+        let final_sample = samples.last().unwrap();
+        let counts = final_sample.decode_interval_metrics.g1_prefix_cache_lookup;
+        assert_eq!(
+            counts.map(|c| (c.query_count, c.queried_tokens, c.matched_tokens)),
+            cache.then_some((2, 18, 8)),
+            "{mode}"
+        );
+        assert_eq!(
+            final_sample.traffic.accept_length_forward_count, 2,
+            "{mode}"
+        );
+        assert_eq!(final_sample.traffic.avg_accept_length, Some(1.0), "{mode}");
+    }
+}
+
+#[test]
+fn grouped_pd_requires_context_parallel_size_one_on_each_role() {
+    for role in ["prefill", "decode"] {
+        let mut spec = disaggregated_grouped_spec(vec![request("cp-override", 0.0, 1000, 1)]);
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "prefill_context_parallel_size": 4
+        });
+        let error = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prefill_context_parallel_size=1"),
+            "{role}: {error}"
+        );
+    }
+}
+
+#[test]
 fn grouped_pd_accepts_equal_tensor_parallel_sizes() {
     for prefill_override in [false, true] {
         for decode_override in [false, true] {

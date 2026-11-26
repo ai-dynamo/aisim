@@ -1565,8 +1565,8 @@ sub-block matching without an explicit full-state scratch count.
   replay checks that the prefill and decode
   roles have identical `kv_cache_groups` and the same `vllm_version`, and
   it runs the gate of each rank. Native replay checks equal `tensor_parallel_size`
-  and compares the model ID, KV cache dtype and attention backend when both
-  timing models identify them. Each rank's `vllm_version` must match its known
+  and `prefill_context_parallel_size=1` on both roles. It compares the model
+  ID, KV cache dtype and attention backend when both timing models identify them. Each rank's `vllm_version` must match its known
   timing `backend_version`, including the observed runtime version when the
   selected FPM deployment records it. P/D
   moves whole blocks of full-attention groups, the last blocks of window groups
@@ -1583,6 +1583,9 @@ sub-block matching without an explicit full-state scratch count.
   short, and the decode worker recomputes that token. The prefill
   of a one-token prompt computes that token, and the decode worker computes
   it again. A `state` group with `prefix_cacheable: true` marks such layers.
+  Without these layers, prefill transfers the whole prompt. Decode keeps
+  those pages and schedules the last prompt token again to sample its first
+  output, consuming one token of its scheduler budget.
   [KV transfer](kv-transfer.md) gives the transferred bytes.
 
   As in vLLM, a decode worker makes two tests to reserve a transferred

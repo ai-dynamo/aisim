@@ -240,11 +240,19 @@ impl GroupedTransferRules {
     /// loads. Only a prompt longer than the backoff loses the backoff tokens
     /// (V31 `nixl/base_scheduler.py:400-407`, `:424`, V32 `:396-403`, `:420`).
     pub(crate) fn transfer_tokens(&self, prompt_tokens: usize) -> usize {
-        if prompt_tokens > self.backoff_tokens {
-            prompt_tokens - self.backoff_tokens
+        if prompt_tokens > self.backoff_tokens() {
+            prompt_tokens - self.backoff_tokens()
         } else {
             prompt_tokens
         }
+    }
+
+    /// After publishing the loaded blocks, a full load rolls the computed
+    /// count back one token to sample the first output (V31 `sched:3092-3096`,
+    /// V32 `sched:3168-3172`, v0.33 `sched:3512-3516`).
+    pub(crate) fn computed_after_load(&self, prompt_tokens: usize) -> usize {
+        self.transfer_tokens(prompt_tokens)
+            .min(prompt_tokens.saturating_sub(1))
     }
 
     /// The full-attention blocks of `transfer_tokens` tokens, a partly filled

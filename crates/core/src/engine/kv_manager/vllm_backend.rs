@@ -2116,8 +2116,8 @@ impl VllmKvManager {
         sequence: &RequestSequence,
         lease: &BlockRequestLease,
         mode: super::DestinationReservationMode,
-        _eviction_now_ms: Option<f64>,
         local_prefill_need: u64,
+        lookup: &mut Option<crate::engine::PrefixCacheLookupCounts>,
     ) -> VllmAcquire<DestinationReservation> {
         lease.debug_assert_owner(owner);
         assert_eq!(
@@ -2132,6 +2132,7 @@ impl VllmKvManager {
                 lease,
                 mode,
                 local_prefill_need,
+                lookup,
             );
         }
         let prompt_blocks = sequence
@@ -2210,6 +2211,7 @@ impl VllmKvManager {
         lease: &BlockRequestLease,
         mode: super::DestinationReservationMode,
         local_prefill_need: u64,
+        lookup: &mut Option<crate::engine::PrefixCacheLookupCounts>,
     ) -> VllmAcquire<DestinationReservation> {
         let grouped = self.grouped.as_mut().expect("grouped cache");
         let rules = self
@@ -2226,7 +2228,14 @@ impl VllmKvManager {
                     && self.enable_prefix_caching
                     && sequence.enable_prefix_caching();
                 let hit = if reuse {
-                    coordinator.find_destination_hit(pool, lease, prompt, transfer)
+                    let (hit, matched) =
+                        coordinator.lookup_destination(pool, lease, prompt, transfer);
+                    *lookup = Some(crate::engine::PrefixCacheLookupCounts {
+                        query_count: 1,
+                        queried_tokens: prompt as u64,
+                        matched_tokens: matched as u64,
+                    });
+                    hit
                 } else {
                     coordinator.empty_hit()
                 };
@@ -2673,13 +2682,9 @@ impl VllmKvManager {
         let prompt = sequence.num_input_tokens();
         let transfer = rules.transfer_tokens(prompt);
         lease.grouped = Some(blocks.lease);
-        // The allocation watermark is the tokens that stay computed: the
-        // prompt less the backoff tokens, which the first pass computes (V31
-        // `sched:3095-3096`, V32 `sched:3171-3172`). A prompt that
-        // is not longer than the backoff is loaded whole and computed again,
-        // so its first pass allocates too, and it takes the copy when the
-        // load published a state at its last token.
-        lease.allocated_tokens = prompt - rules.backoff_tokens().min(prompt);
+        // Keep the loaded pages, including the last one of a full load. The
+        // decode pass still schedules from the computed watermark.
+        lease.allocated_tokens = rules.computed_after_load(prompt);
         if let (Some(grouped), Some(coordinator)) = (&mut self.grouped, &mut self.grouped_prefix) {
             let hit = blocks
                 .hit

@@ -21,6 +21,19 @@ use crate::engine::kv_manager::vllm_backend::BlockRequestLease;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
 use uuid::Uuid;
 
+impl GroupedPrefixCoordinator {
+    fn find_destination_hit(
+        &self,
+        pool: &GroupedBlockPool,
+        lease: &BlockRequestLease,
+        num_tokens: usize,
+        loaded_tokens: usize,
+    ) -> GroupedHit {
+        self.lookup_destination(pool, lease, num_tokens, loaded_tokens)
+            .0
+    }
+}
+
 const BUDGET: usize = 8192;
 const GLM_BLOCK: u32 = 2176;
 
@@ -945,6 +958,35 @@ fn grouped_destination_reuses_the_full_attention_lookup_when_state_hits_deeper()
 }
 
 #[test]
+fn warm_destination_window_looks_up_only_the_common_hit() {
+    let groups = [attention("window", 4, Some(4))];
+    let coordinator = with_limits(rules(&groups, 4));
+    let mut kv = kv_pool(&groups, 3);
+    let pool = kv.block_pool_mut().unwrap();
+    let end = 1_048_576;
+    let request = lease(end + 1, 4);
+    let last = grouped_key(0, request.prefix_hash_at(end)).unwrap();
+    seed(pool, last);
+
+    pool.key_probes.set(0);
+    let destination = coordinator.find_destination_hit(pool, &request, end + 1, end);
+    assert_eq!((destination.tokens, destination.junction_tokens), (end, 0));
+    assert_eq!(destination.per_group, [GroupHitBlocks::None]);
+    // One resident page establishes the window hit. A destination takes a
+    // new window page instead of building the source's logical block list.
+    assert_eq!(pool.key_probes.get(), 1);
+
+    let source = coordinator.find_longest_hit(pool, &request, end + 1);
+    assert_eq!((source.tokens, source.junction_tokens), (end, 0));
+    let GroupHitBlocks::Attention(keys) = &source.per_group[0] else {
+        panic!("expected the source's window hit blocks");
+    };
+    assert_eq!(keys.len(), end / 4);
+    assert_eq!(keys.last(), Some(&Some(last)));
+    assert!(keys[..keys.len() - 1].iter().all(Option::is_none));
+}
+
+#[test]
 fn grouped_destination_window_stores_only_its_live_suffix() {
     let groups = [attention("window", 4, Some(4))];
     let mut coordinator = with_limits(rules(&groups, 4));
@@ -997,8 +1039,8 @@ fn decode_side_hit_of_a_state_model_is_its_full_attention_hit_floored_to_its_blo
     let (ends, tokens) =
         coordinator.full_attention_hit(pool, &request, &coordinator.rules.specs[0], 60);
     assert_eq!((ends, tokens), (vec![16, 32, 36], 36));
-    let hit = coordinator.find_destination_hit(pool, &request, 64, 63);
-    assert_eq!(hit.tokens, 32);
+    let (hit, matched) = coordinator.lookup_destination(pool, &request, 64, 63);
+    assert_eq!((matched, hit.tokens), (36, 32));
     assert_eq!(hit.junction_tokens, 0);
     assert!(matches!(&hit.per_group[0], GroupHitBlocks::Attention(keys) if keys.len() == 2));
     assert_eq!(hit.per_group[1], GroupHitBlocks::None);

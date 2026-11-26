@@ -927,7 +927,7 @@ impl GroupedPrefixCoordinator {
         lease: &BlockRequestLease,
         num_tokens: usize,
     ) -> GroupedHit {
-        self.common_hit(pool, lease, num_tokens, None)
+        self.common_hit(pool, lease, num_tokens, None, true)
     }
 
     fn common_hit(
@@ -936,6 +936,7 @@ impl GroupedPrefixCoordinator {
         lease: &BlockRequestLease,
         num_tokens: usize,
         first_full: Option<(Vec<usize>, usize)>,
+        keep_window_blocks: bool,
     ) -> GroupedHit {
         let rules = &self.rules;
         let mut hit = GroupedHit {
@@ -997,6 +998,9 @@ impl GroupedPrefixCoordinator {
                         .map(Some)
                         .collect()
                 }
+                // A handoff destination takes new window pages. Its window
+                // constrains the common hit above, but supplies no keys to pin.
+                GroupRuleKind::SlidingWindow { .. } if !keep_window_blocks => continue,
                 GroupRuleKind::SlidingWindow { window } => {
                     let (tokens, run) = self.window_hit(pool, lease, spec, window, candidate);
                     debug_assert_eq!(tokens, candidate);
@@ -1081,16 +1085,17 @@ impl GroupedPrefixCoordinator {
     /// loads nothing (`nixl/pull_scheduler.py:59-65`) and replay still moves
     /// the state. A window group keeps its hit blocks inside the window, where
     /// this finder takes new blocks.
-    pub(crate) fn find_destination_hit(
+    /// The second result is the local G1 match before connector alignment.
+    pub(crate) fn lookup_destination(
         &self,
         pool: &GroupedBlockPool,
         lease: &BlockRequestLease,
         num_tokens: usize,
         loaded_tokens: usize,
-    ) -> GroupedHit {
+    ) -> (GroupedHit, usize) {
         let rules = &self.rules;
         if num_tokens == 0 {
-            return self.empty_hit();
+            return (self.empty_hit(), 0);
         }
         let max = (num_tokens - 1) / rules.alignment * rules.alignment;
         // Full attention sorts first in the spec groups. If no other spec
@@ -1135,7 +1140,7 @@ impl GroupedPrefixCoordinator {
             // Rules 1 and 3: the fixed point, with no hit block outside full
             // attention. A state group keeps the agreed hit as its own.
             None => {
-                let mut hit = self.common_hit(pool, lease, num_tokens, first_full);
+                let mut hit = self.common_hit(pool, lease, num_tokens, first_full, false);
                 let tokens = hit.tokens;
                 for (blocks, rule) in hit.per_group.iter_mut().zip(&rules.groups) {
                     if rule.kind != GroupRuleKind::FullAttention {
@@ -1153,7 +1158,8 @@ impl GroupedPrefixCoordinator {
         // Rule 5, floored to the scheduler block: the attention keys are
         // full-attention keys here, and each group keeps the keys below the
         // floor.
-        let floor = hit.tokens / rules.scheduler_block * rules.scheduler_block;
+        let matched_tokens = hit.tokens;
+        let floor = matched_tokens / rules.scheduler_block * rules.scheduler_block;
         if hit.junction_tokens > 0 {
             hit.junction_tokens += hit.tokens - floor;
         }
@@ -1175,7 +1181,7 @@ impl GroupedPrefixCoordinator {
                 *blocks = GroupHitBlocks::None;
             }
         }
-        hit
+        (hit, matched_tokens)
     }
 
     /// The hit of `spec` looked up alone at `max`, as vLLM's per-group lookup

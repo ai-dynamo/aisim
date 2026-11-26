@@ -1265,16 +1265,12 @@ class SearchSpace(BaseModel):
                 moe_ep_size=shape.moe_ep,
             )
 
-        def pinned_pairs():
+        def pinned_shapes():
             # A pin names its pair, so a pinned pair that fails the rule is a configuration error. The enumeration
             # drops only the pairs that it builds, and it refuses a pin without a deployment.
             for entry in self.parallel_configs_by_mode.get("disagg", self.parallel_configs):
                 pin = _parse_parallel_entry(entry, "disagg")
-                try:
-                    pair = select("prefill", pin.prefill.shape), select("decode", pin.decode.shape)
-                except ValueError:
-                    continue
-                yield pair
+                yield pin.prefill.shape, pin.decode.shape
 
         for mode in self.deployment_mode:
             try:
@@ -1317,9 +1313,12 @@ class SearchSpace(BaseModel):
                 )
                 # The enumeration keeps only compatible deployment pairs. The other checks hold for
                 # every pair of the search.
-                shapes = dict.fromkeys((c.prefill.shape, c.decode.shape) for c in configs)
-                enumerated_pairs = ((select("prefill", p), select("decode", d)) for p, d in shapes)
-                for prefill, decode in chain(pinned_pairs(), enumerated_pairs):
+                enumerated_shapes = ((c.prefill.shape, c.decode.shape) for c in configs)
+                for prefill_shape, decode_shape in dict.fromkeys(chain(pinned_shapes(), enumerated_shapes)):
+                    try:
+                        prefill, decode = select("prefill", prefill_shape), select("decode", decode_shape)
+                    except ValueError:
+                        continue
                     if "grouped" in (prefill.resources.cache_layout, decode.resources.cache_layout):
                         grouped_pd_requirements(prefill, decode, backend_version=backend_version, kv_transfer=transfer)
         return self
