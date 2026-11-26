@@ -243,11 +243,16 @@ fn mem_op_sol_ms(spec: &SystemSpec, mem_bytes: f64) -> f64 {
     mem_bytes / spec.gpu.mem_bw * 1000.0
 }
 
-/// embedding.py:49-62: `x = -(-x // seq_split)`, `d2d_bytes = x * hidden * 2`
-/// (hard-coded bf16 bytes), one SOL mem-op.
+/// embedding.py:49-62: `x = -(-x // seq_split)`, `d2d_bytes = x * hidden *
+/// dtype_bytes`, one SOL mem-op. The table dtype is the op's own mode, which
+/// a checkpoint that quantizes the table (an FP8 n-gram table) sets; the
+/// default is BF16.
 fn embedding_sol(op: &EmbeddingOp, spec: &SystemSpec, x: f64) -> f64 {
     let tokens = ceil_div(x, op.seq_split.max(1) as f64);
-    mem_op_sol_ms(spec, tokens * op.hidden_size as f64 * 2.0) * op.scale_factor
+    mem_op_sol_ms(
+        spec,
+        tokens * op.hidden_size as f64 * op.quant_mode.mapping().memory,
+    ) * op.scale_factor
 }
 
 /// elementwise.py:49-66 over the folded `bytes_per_token` wire form (see the
@@ -859,6 +864,16 @@ mod tests {
         approx(
             embedding_sol(&emb, &s, 10.5),
             11.0 * 6144.0 * 2.0 / s.gpu.mem_bw * 1000.0,
+        );
+        // A table stored at 1 byte per element (an FP8 n-gram table) reads half
+        // the bytes of the BF16 default: 11 * 6144 * 1 / mem_bw * 1000 ms.
+        let emb_fp8 = EmbeddingOp {
+            quant_mode: GemmQuantMode::Fp8Block,
+            ..emb.clone()
+        };
+        approx(
+            embedding_sol(&emb_fp8, &s, 10.5),
+            11.0 * 6144.0 * 1.0 / s.gpu.mem_bw * 1000.0,
         );
         let ew = ElementwiseOp {
             name: "add_norm".into(),

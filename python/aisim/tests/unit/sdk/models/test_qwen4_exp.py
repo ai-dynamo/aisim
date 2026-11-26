@@ -16,6 +16,7 @@ from the published safetensors headers rather than against the Python builder:
 
 import dataclasses
 import json
+import pickle
 import types
 
 import pytest
@@ -194,6 +195,21 @@ def test_ple_branch_is_priced_once_with_the_checkpoint_dtype():
     assert model._ple_table_gemm_quant_mode == common.GEMMQuantMode.fp8_block
     assert _build(BF16)._ple_table_gemm_quant_mode == common.GEMMQuantMode.bfloat16
 
+    # The dtype reaches the op, not just the resolver property: the table's
+    # residency and its per-token lookup both read one byte per element on the
+    # FP8 artifact. The op is built once, so the inventory counts the table
+    # once at that width (a separate `table_delta` would double-count it).
+    elements = (20_000_000 // 8) * 2560
+    assert table._quant_mode == common.GEMMQuantMode.bfloat16
+    assert table.get_weights() == elements * 2
+    fp8_table = _by_name(_build(FP8).context_ops)["context_ple_ngram_embedding"]
+    assert fp8_table._quant_mode == common.GEMMQuantMode.fp8_block
+    assert fp8_table.get_weights() == elements * 1
+    # Op graphs cross worker boundaries pickled, so the dtype has to survive
+    # reconstruct: `__getnewargs_ex__` carries it.
+    assert pickle.loads(pickle.dumps(fp8_table))._quant_mode == common.GEMMQuantMode.fp8_block
+    assert pickle.loads(pickle.dumps(table))._quant_mode == common.GEMMQuantMode.bfloat16
+
 
 @pytest.mark.parametrize("model_path", [BF16, FP8])
 def test_resident_weights_match_the_published_checkpoint(model_path):
@@ -246,17 +262,19 @@ def test_ple_branch_prices_every_checkpoint_module():
 
 def test_kv_cache_prices_both_qsa_index_key_buffers():
     model = _build()
-    # 12 QSA layers x (2 kv heads ceil-sharded to 1 x 256 dims x 2) = 6144.
-    # Each layer's index state is TWO key arrays at one 128-dim key per 4-token
-    # block (raw ring + compressed) plus three int64 MRoPE axes quoted as 12
-    # BF16 words: 2 x 32 + 12 = 76 per layer, 912 across the model.
-    assert model.get_kvcache_elements_per_token() == 6144 + 912 == 7056
+    # 13 QSA layers own KV here: the 12 decoder layers plus the MTP draft layer
+    # the default ``nextn=1`` builds (see test_mtp_draft_layer_owns_a_kv_slot).
+    # Each layer is 2 kv heads ceil-sharded to 1 x 256 dims x 2 = 512 elements,
+    # and its index state is TWO key arrays at one 128-dim key per 4-token block
+    # (raw ring + compressed) plus three int64 MRoPE axes quoted as 12 BF16
+    # words: 2 x 32 + 12 = 76. 13 x 512 = 6656 and 13 x 76 = 988.
+    assert model.get_kvcache_elements_per_token() == 6656 + 988 == 7644
     # The side buffers are BF16/int64 whatever the main pool stores, so the
-    # byte figure is not elements x pool width: 6144 x 2 + 12 x (2 x 32 x 2 + 24)
-    # = 12,288 + 1,824 = 14,112 at BF16. The constant GDN state the parent adds
+    # byte figure is not elements x pool width: 6656 x 2 + 13 x (2 x 32 x 2 + 24)
+    # = 13,312 + 1,976 = 15,288 at BF16. The constant GDN state the parent adds
     # is held out by differencing two lengths.
-    assert model.get_kvcache_bytes_per_sequence(1) - model.get_kvcache_bytes_per_sequence(0) == 14112
-    assert model.get_kvcache_bytes_per_sequence(10) - model.get_kvcache_bytes_per_sequence(0) == 141120
+    assert model.get_kvcache_bytes_per_sequence(1) - model.get_kvcache_bytes_per_sequence(0) == 15288
+    assert model.get_kvcache_bytes_per_sequence(10) - model.get_kvcache_bytes_per_sequence(0) == 152880
     # An fp8 main pool halves only the main K/V; the side buffers do not move.
     model_fp8 = models.get_model(
         FP8,
@@ -265,7 +283,7 @@ def test_kv_cache_prices_both_qsa_index_key_buffers():
     )
     assert model_fp8.config.kvcache_quant_mode == common.KVCacheQuantMode.fp8
     fp8_token_bytes = model_fp8.get_kvcache_bytes_per_sequence(1) - model_fp8.get_kvcache_bytes_per_sequence(0)
-    assert fp8_token_bytes == 6144 + 1824 == 7968
+    assert fp8_token_bytes == 6656 + 1976 == 8632
     # Capacity is the exact inverse of that curve at both pool widths: the
     # largest admitted length fits the token-linear budget, one more does not.
     budget = 1 << 30
@@ -275,6 +293,33 @@ def test_kv_cache_prices_both_qsa_index_key_buffers():
         per_token = candidate.get_kvcache_bytes_per_sequence(1) - candidate.get_kvcache_bytes_per_sequence(0)
         assert tokens == int((budget - gdn) // per_token)
         assert (tokens + 1) * per_token > budget - gdn
+
+
+def test_mtp_draft_layer_owns_a_kv_slot():
+    """``nextn`` draft QSA layers add their own token-linear KV and index state.
+
+    vLLM names the draft layers ``layers.{num_hidden_layers + idx}``, which only
+    means something if they take a slot of their own in the paged pool. Counting
+    only the decoder's 12 QSA layers would admit 1/13 more tokens than the
+    budget holds whenever MTP is on.
+    """
+    plain, draft = _build(nextn=0), _build(nextn=1)
+    assert plain._qsa_cache_layers() == 12
+    assert draft._qsa_cache_layers() == 13
+
+    # One extra layer: 2 kv heads ceil-sharded to 1 x 256 dims x 2 = 512
+    # elements, plus 2 x 32 + 12 = 76 of index state.
+    assert draft.get_kvcache_elements_per_token() - plain.get_kvcache_elements_per_token() == 588
+    draft_bytes = draft.get_kvcache_bytes_per_sequence(1) - draft.get_kvcache_bytes_per_sequence(0)
+    plain_bytes = plain.get_kvcache_bytes_per_sequence(1) - plain.get_kvcache_bytes_per_sequence(0)
+    assert draft_bytes - plain_bytes == 512 * 2 + (2 * 32 * 2 + 24) == 1176
+
+    # Capacity is priced from the same curve, and no draft KV is added when MTP
+    # is off.
+    budget = 1 << 30
+    gdn = draft._gdn_state_bytes_per_request()
+    assert draft.get_kvcache_max_tokens(budget) == int((budget - gdn) // draft_bytes)
+    assert plain.get_kvcache_max_tokens(budget) > draft.get_kvcache_max_tokens(budget)
 
 
 @pytest.mark.parametrize(
@@ -350,6 +395,7 @@ def test_fp8_qsa_module_keys_on_the_bf16_kernels_the_runtime_runs(backend):
         (None, common.KVCacheQuantMode.bfloat16, common.FMHAQuantMode.bfloat16),
         ("fp8", common.KVCacheQuantMode.fp8, common.FMHAQuantMode.fp8),
         ("none", common.KVCacheQuantMode.bfloat16, common.FMHAQuantMode.bfloat16),
+        ("bfloat16", common.KVCacheQuantMode.bfloat16, common.FMHAQuantMode.bfloat16),
     ],
 )
 def test_checkpoint_exclusions_only_default_the_kv_pool(explicit_kv, expected_kv, expected_fmha):
@@ -359,7 +405,8 @@ def test_checkpoint_exclusions_only_default_the_kv_pool(explicit_kv, expected_kv
     ``ModelConfig`` directly, so it never reaches
     ``_infer_quant_modes_from_raw_config`` where the guard lives. This walks
     the raw config path instead: an absent key gets the BF16 default, while an
-    explicit ``fp8`` (or an explicit unquantized value) keeps the caller's pool.
+    explicit ``fp8`` (or either spelling of an explicit unquantized pool) keeps
+    the caller's pool.
     """
     from aisim_core.sdk import utils
     from aisim_core.sdk.models import helpers

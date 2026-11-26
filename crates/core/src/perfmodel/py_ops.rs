@@ -493,7 +493,10 @@ impl PyGemm {
 
 /// Embedding lookup. `empirical_bw_scaling_factor` is accepted for calling-
 /// shape compatibility and dropped (its math retired with the Python query
-/// stack); the engine types the quant as bfloat16 (memory-only op).
+/// stack). `quant_mode` defaults to BF16, which is what every table stored at
+/// the model-wide dtype is; a checkpoint that quantizes the table itself (an
+/// FP8 n-gram table) passes its own mode so the lookup prices the dtype the
+/// runtime reads.
 #[pyclass(extends = PyOperation, subclass, name = "Embedding", module = "aisim_core._native")]
 pub struct PyEmbedding;
 
@@ -508,7 +511,7 @@ impl PyEmbedding {
     const _ENGINE_QUERY_SHAPE: &'static str = "tokens";
 
     #[new]
-    #[pyo3(signature = (name, scale_factor, row_size, column_size, empirical_bw_scaling_factor=0.3, *, seq_split=1))]
+    #[pyo3(signature = (name, scale_factor, row_size, column_size, empirical_bw_scaling_factor=0.3, *, seq_split=1, quant_mode=None))]
     fn new(
         name: String,
         scale_factor: f64,
@@ -516,6 +519,7 @@ impl PyEmbedding {
         column_size: u32,
         empirical_bw_scaling_factor: f64,
         seq_split: u32,
+        quant_mode: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyClassInitializer<Self>> {
         let _ = empirical_bw_scaling_factor;
         let inner = Op::Embedding(EmbeddingOp {
@@ -523,7 +527,10 @@ impl PyEmbedding {
             scale_factor,
             vocab_size: row_size,
             hidden_size: column_size,
-            quant_mode: GemmQuantMode::Bfloat16,
+            quant_mode: match quant_mode {
+                Some(mode) => gemm_quant(mode)?,
+                None => GemmQuantMode::Bfloat16,
+            },
             seq_split,
         });
         Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyEmbedding))
@@ -538,7 +545,17 @@ impl PyEmbedding {
             (o.name.clone(), o.scale_factor, o.vocab_size, o.hidden_size).into_pyobject(py)?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("seq_split", o.seq_split)?;
+        kwargs.set_item("quant_mode", enum_token(&o.quant_mode))?;
         Ok((args, kwargs))
+    }
+
+    #[getter(_quant_mode)]
+    fn quant_mode<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        py_enum_member(
+            py,
+            "GEMMQuantMode",
+            &enum_token(&slf.as_super().embedding()?.quant_mode),
+        )
     }
 
     #[getter(_row_size)]

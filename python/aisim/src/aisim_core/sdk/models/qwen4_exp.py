@@ -98,6 +98,7 @@ from aisim_core.sdk import common
 from aisim_core.sdk.models.base import BaseModel, register_model
 from aisim_core.sdk.models.helpers import quant_exclude_patterns
 from aisim_core.sdk.models.qwen35 import Qwen35Model
+from aisim_core.sdk.speculation.mtp import MTPScheme
 
 # Substrings that identify a module family in the checkpoint's exclusion globs.
 _HC_EXCLUSION_MARKER = "hyper_connection"
@@ -229,6 +230,10 @@ class Qwen4ExpModel(Qwen35Model):
         are listed, and the FP8 repository stores it as F8_E4M3 (172 GB of FP8
         weights = 120.8 GB routed experts + 51.2 GB table). Pricing it BF16
         over-reports resident weights by 51 GB per model.
+
+        The same mode is the table's lookup width: a lookup reads only the rows
+        it touches, so each token costs ``ple_embed_dim`` bytes here — 1 on FP8,
+        2 on BF16.
         """
         return self._extra_gemm_mode((_PLE_TABLE_QUANT_MARKER,))
 
@@ -258,22 +263,38 @@ class Qwen4ExpModel(Qwen35Model):
     # ------------------------------------------------------------------
 
     def get_resident_weights_bytes(self) -> float:
-        """Phase inventory plus the MTP draft layer and the dtype-correct table.
+        """Phase inventory plus the MTP draft layer.
 
         The QSA draft layer shares no weights with the GDN decoder stack, so the
         context-op inventory cannot imply it. Draft ops are ``draft_``-prefixed
         and therefore excluded from the base sum; they are added back here at
         their own (nextn-scaled) weight.
 
-        The generic ``Embedding`` op prices every table at BF16, but the n-gram
-        table follows the checkpoint dtype (FP8 releases store it as F8_E4M3),
-        so its share is re-priced here.
+        The n-gram table is priced by its op at the checkpoint dtype (FP8
+        releases store it as F8_E4M3), so the base inventory already counts it
+        once, correctly: ``_ple_ops`` passes ``_ple_table_gemm_quant_mode`` to
+        the ``Embedding``.
+        """
+        draft = sum(op.get_weights() for op in self.generation_ops if op._name.startswith(_DRAFT_PREFIX))
+        return float(super().get_resident_weights_bytes() + draft)
+
+    def _qsa_cache_layers(self) -> int:
+        """QSA layers that own a KV slot: the decoder's plus any MTP draft's.
+
+        vLLM builds the draft stack as ``Qwen4ExpMTP`` with one
+        ``Qwen4ExpDecoderLayer(layer_type="qwen_sparse_attention")`` per MTP
+        layer and names them ``layers.{num_hidden_layers + idx}``
+        (``vllm/models/qwen4_exp/nvidia/mtp.py`` @0.32.0). The offset only means
+        something when the draft layers take their own slot in the same paged
+        pool, and each one runs the full QSA attention with its own indexer, so
+        their per-token K/V and index side buffers are additional layers, not
+        shares of the decoder's. Gated on the MTP scheme because scheme-based
+        speculation rewrites ``_nextn`` to a verify width post-construction.
         """
         cfg: common.Qwen4ExpConfig = self.extra_params
-        elements = len(cfg.ple_layer_indices) * (cfg.ngram_vocab_size_base // self.config.tp_size) * cfg.ple_embed_dim
-        table_delta = elements * (self._ple_table_gemm_quant_mode.value.memory - 2.0)
-        draft = sum(op.get_weights() for op in self.generation_ops if op._name.startswith(_DRAFT_PREFIX))
-        return float(super().get_resident_weights_bytes() + draft + table_delta)
+        return cfg.layer_types.count("full_attention") + (
+            self.spec_scheme.depth if isinstance(self.spec_scheme, MTPScheme) else 0
+        )
 
     def get_kvcache_elements_per_token(self) -> int:
         """Full-attention KV plus both indexer side buffers, in BF16-equivalent
@@ -295,22 +316,19 @@ class Qwen4ExpModel(Qwen35Model):
         filter prices that shape separately, because the shared capacity
         estimator has no request count.
         """
-        cfg: common.Qwen4ExpConfig = self.extra_params
-        n_qsa = cfg.layer_types.count("full_attention")
         n_kv_per_tp = (self._num_kv_heads + self.config.tp_size - 1) // self.config.tp_size
         per_token = 2 * n_kv_per_tp * self._head_size
-        return n_qsa * per_token + self._qsa_side_elements_per_token()
+        return self._qsa_cache_layers() * per_token + self._qsa_side_elements_per_token()
 
     def _qsa_side_elements_per_token(self) -> int:
         """The index side buffers of one token, in BF16 elements (all layers)."""
         cfg: common.Qwen4ExpConfig = self.extra_params
-        n_qsa = cfg.layer_types.count("full_attention")
         block_size = max(1, cfg.indexer_compress_ratio)
         keys = cfg.indexer_kv_heads * cfg.indexer_head_dim
         keys_per_token = (keys + block_size - 1) // block_size
         # Two key arrays (raw ring + compressed) and three int64 MRoPE axes,
         # which are 4 BF16 words each.
-        return n_qsa * (2 * keys_per_token + 12)
+        return self._qsa_cache_layers() * (2 * keys_per_token + 12)
 
     def _qsa_side_bytes_per_token(self) -> float:
         """True bytes/token of the index side buffers (all layers).
@@ -320,11 +338,10 @@ class Qwen4ExpModel(Qwen35Model):
         the element count by the pool's element size.
         """
         cfg: common.Qwen4ExpConfig = self.extra_params
-        n_qsa = cfg.layer_types.count("full_attention")
         block_size = max(1, cfg.indexer_compress_ratio)
         keys = cfg.indexer_kv_heads * cfg.indexer_head_dim
         keys_per_token = (keys + block_size - 1) // block_size
-        return n_qsa * (2 * keys_per_token * 2 + 3 * 8)
+        return self._qsa_cache_layers() * (2 * keys_per_token * 2 + 3 * 8)
 
     def get_kvcache_bytes_per_sequence(self, seq_len: int) -> float:
         """Token-linear KV bytes, with the side buffers at their real widths."""
@@ -448,7 +465,8 @@ class Qwen4ExpModel(Qwen35Model):
         * the table is ``VocabParallelEmbedding`` over the ETP group, so each
           rank holds ``vocab // tp`` rows (``etp_size`` is TP, and TP x DP only
           when ``EngramConfig.embedding_across_dp`` is on, which it is not by
-          default);
+          default); the checkpoint dtype of those rows is the op's
+          ``quant_mode``, so residency and lookup both read it;
         * ``kv_proj``, the three grouped norms and ``conv1d`` are all replicated
           (``MergedColumnParallelLinear(disable_tp=True)`` and plain ``nn``
           modules), so their widths do not divide by TP.
@@ -469,6 +487,7 @@ class Qwen4ExpModel(Qwen35Model):
                 cfg.ngram_vocab_size_base // self.config.tp_size,
                 cfg.ple_embed_dim,
                 0.3,
+                quant_mode=self._ple_table_gemm_quant_mode,
             ),
             # Merged kv_proj, first half: 2560 -> hc_count * hidden.
             ops.GEMM(f"{prefix}_key_proj_gemm", count, hc_w, cfg.ple_embed_dim, self._ple_gemm_quant_mode),

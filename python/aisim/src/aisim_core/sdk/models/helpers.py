@@ -1003,14 +1003,13 @@ def _infer_quant_modes_from_raw_config(raw_config: dict, architecture: str | Non
     # runtimes run the QSA module at the checkpoint dtype over a BF16 KV pool.
     # The weight-precision rule above would otherwise infer an FP8 pool, which
     # describes a serving state this checkpoint never enters and demands an MSA
-    # row keyed on a quantization the kernel cannot produce. This guard only
-    # fires when kv_cache_quant_algo is absent, so an explicit ``fp8`` still
-    # resolves to an FP8 pool and an explicit unquantized value to BF16. (An
-    # explicit ``bfloat16`` is still rewritten to FP8 by the weight-precision
-    # rule above; that is a pre-existing precedence quirk, tracked separately.)
+    # row keyed on a quantization the kernel cannot produce. This guard fires
+    # when the checkpoint names no pool or names an unquantized one, so an
+    # explicit ``bf16``/``none`` declaration is preserved and an explicit ``fp8``
+    # still resolves to an FP8 pool.
     if (
         architecture == "Qwen4ExpForConditionalGeneration"
-        and kv_cache_algo is None
+        and kv_cache_algo in (None, "bfloat16", "none")
         and any("self_attn" in str(pattern).lower() for pattern in quant_exclude_patterns(raw_config))
     ):
         overrides["kvcache_quant_mode"] = common.KVCacheQuantMode.bfloat16
