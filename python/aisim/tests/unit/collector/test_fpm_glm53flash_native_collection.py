@@ -15,8 +15,10 @@ import hashlib
 import json
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +32,8 @@ from collector.fpm_forward.native_artifact import (
     select_native_measurements,
     validate_native_collection,
 )
-from collector.fpm_forward.planner import FPMCell
+from collector.fpm_forward.planner import FPMCell, GlmProducerDigests
+from collector.fpm_forward.runtime_memory import cell_from_dict
 
 from aisim.fpm_contract import fpm_benchmark_result_name
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, execution_identity
@@ -87,7 +90,11 @@ def glm_identity() -> tuple[str, ...]:
 
 def glm_cell(phase: str, *, dp: int = 1) -> FPMCell:
     """A pure-TP cell that carries the real GLM-5.3-Flash execution identity."""
-    return replace(_cell(phase=phase, dp=dp, strategy="pure_tp"), execution_identity=glm_identity())
+    return replace(
+        _cell(phase=phase, dp=dp, strategy="pure_tp"),
+        execution_identity=glm_identity(),
+        glm_producer_digests=GlmProducerDigests.from_runtime(PRODUCER_DIR),
+    )
 
 
 def glm_native_payload(phase: str, *, points: list[dict], rank: int = 0, dp: int = 1) -> dict:
@@ -226,14 +233,36 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
     ``benchmark_dp<rank>.json`` with a sidecar of the same stem, as the engine names them.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    lines = [
-        json.dumps(
-            {"benchmark_id": row["point"]["benchmark_id"], "point_type": row["point"]["point_type"]},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        for row in payload["results"]
-    ]
+    lines = []
+    for row in payload["results"]:
+        point = row["point"]
+        fpm = row["fpms"][0]
+        raw = fpm.get("benchmark_measurement", {}).get("raw_fpms")
+        repetitions = []
+        forward = -1
+        for index in range(15):
+            observed = raw[index - 5] if isinstance(raw, list) and 5 <= index < 5 + len(raw) else None
+            observed = observed if isinstance(observed, dict) else {}
+            sample = observed.get("benchmark_sample")
+            forward = sample.get("forward_index", forward + 1) if isinstance(sample, dict) else forward + 1
+            repetitions.append(
+                {
+                    "attempt": index,
+                    "repetition": index,
+                    "role": "warmup" if index < 5 else "measurement",
+                    "fpms": [
+                        {
+                            "counter_id": point["benchmark_id"],
+                            "dp_rank": payload["dp"]["rank"],
+                            "scheduled_requests": _expected_scheduled(point),
+                            "wall_time": observed.get("wall_time", fpm["wall_time"]),
+                            "benchmark_sample": {"forward_index": forward},
+                        }
+                    ],
+                }
+            )
+        record = {"benchmark_id": point["benchmark_id"], "point_type": point["point_type"], "repetitions": repetitions}
+        lines.append(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
     for row, line in zip(payload["results"], lines, strict=True):
         row["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
     sidecar = b"".join(line + b"\n" for line in lines)
@@ -294,6 +323,7 @@ def _glm_producer_shape(tmp_path, breakage=None):
             walls = [fpm["wall_time"] * (1 + 0.01 * (index - 4)) for index in range(10)]
             tokens = row["point"]["total_prefill_tokens"] or row["point"]["batch_size"]
             samples = []
+            forward += 10 if phase == "decode" else 5
             for index, wall in enumerate(walls):
                 sample = copy.deepcopy(templates[phase])
                 start = 100.0 * position + index
@@ -548,6 +578,50 @@ def _rewrite_sidecar(payload: dict, sidecar: Path, lines: list[bytes]) -> None:
     sidecar.write_bytes(raw)
     manifest = payload["input_provenance"]["repetition_evidence_manifest"]
     manifest.update(sha256=hashlib.sha256(raw).hexdigest(), records=len(lines))
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (lambda record: record.pop("repetitions"), "5 warmups and 10 measurements"),
+        (lambda record: record["repetitions"].pop(4), "5 warmups and 10 measurements"),
+        (lambda record: record["repetitions"][4].update(role="measurement"), "invalid accepted warmup"),
+        (lambda record: record["repetitions"][5].update(repetition=4), "invalid accepted measurement"),
+        (lambda record: record["repetitions"][5].update(attempt=4), "invalid accepted measurement"),
+        (
+            lambda record: record["repetitions"][4].update(rejection_reason="missing dispatch"),
+            "invalid accepted warmup",
+        ),
+        (lambda record: record["repetitions"][4].update(fpms=[]), "invalid forward for warmup"),
+        (
+            lambda record: record["repetitions"][4]["fpms"][-1]["scheduled_requests"].update(sum_prefill_tokens=0),
+            "invalid forward for warmup",
+        ),
+        (
+            lambda record: record["repetitions"][4]["fpms"][-1]["benchmark_sample"].update(forward_index=3),
+            "repeated or unordered forward",
+        ),
+        (
+            lambda record: record["repetitions"][5]["fpms"][-1].update(wall_time=9.0),
+            "differs from its saved raw sample",
+        ),
+        (lambda record: record.update(point_type="decode"), "5 warmups and 10 measurements"),
+    ],
+)
+def test_glm_publication_checks_the_contents_of_each_repetition(tmp_path, change, expected):
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD])
+    _glm_producer_shape(tmp_path)("prefill", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    sidecar = artifact.with_suffix(".repetitions.jsonl")
+    record = json.loads(sidecar.read_bytes())
+    change(record)
+    line = json.dumps(record).encode()
+    _rewrite_sidecar(payload, sidecar, [line])
+    payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
+    artifact.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match=expected):
+        database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
 
 
 def _swap_the_row_digests(payload: dict, _sidecar: Path) -> None:
@@ -1324,22 +1398,7 @@ def test_glm_producer_vocabulary_range_follows_the_generator_cap(tmp_path, high,
             _validate(tmp_path, cell)
 
 
-def _change_the_sidecar(payload: dict, sidecar: Path) -> None:
-    line = b'{"benchmark_id":1,"point_type":"prefill","note":"another rank"}'
-    raw = line + b"\n"
-    sidecar.write_bytes(raw)
-    payload["input_provenance"]["repetition_evidence_manifest"]["sha256"] = hashlib.sha256(raw).hexdigest()
-    payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
-
-
-@pytest.mark.parametrize(
-    "tamper",
-    [
-        pytest.param(lambda p, _: _evidence(p).update(checkpoint_dir="/another/checkpoint"), id="input"),
-        pytest.param(_change_the_sidecar, id="sidecar-digest"),
-    ],
-)
-def test_glm_producer_dp_ranks_must_agree_on_input_provenance(tmp_path, tamper):
+def test_glm_producer_dp_ranks_must_agree_on_input_provenance(tmp_path):
     cell = glm_cell("prefill", dp=2)
     pod = _pod(tmp_path, cell)
     payloads = [glm_native_payload("prefill", points=[PREFILL_COLD], rank=rank, dp=2) for rank in range(2)]
@@ -1347,7 +1406,11 @@ def test_glm_producer_dp_ranks_must_agree_on_input_provenance(tmp_path, tamper):
     # Each rank names its own sidecar, and the names alone are no disagreement.
     assert [artifact.name for artifact in artifacts] == ["benchmark.json", "benchmark_dp1.json"]
     assert len(_validate(tmp_path, cell).points) == 1
-    tamper(payloads[1], artifacts[1].with_suffix(".repetitions.jsonl"))
+    assert (
+        _evidence(payloads[0])["repetition_evidence_manifest"]["sha256"]
+        != _evidence(payloads[1])["repetition_evidence_manifest"]["sha256"]
+    )
+    _evidence(payloads[1]).update(checkpoint_dir="/another/checkpoint")
     artifacts[1].write_text(json.dumps(payloads[1]))
     with pytest.raises(ValueError, match="native DP ranks disagree on input provenance"):
         _validate(tmp_path, cell)
@@ -2228,7 +2291,7 @@ def _receipt(cell_dir: Path, cell: FPMCell, **changes) -> Path:
 
 def _cell_of_another_producer_revision(tmp_path: Path) -> FPMCell:
     """A prefill cell whose artifact names the producer digests "a" * 64 and "b" * 64, not those of this checkout."""
-    cell = glm_cell("prefill")
+    cell = replace(glm_cell("prefill"), glm_producer_digests=GlmProducerDigests("a" * 64, "b" * 64))
     payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
     payload["producer"].update(runtime_source_manifest_sha256="a" * 64, overlay_sha256="b" * 64)
     write_glm_rank(_pod(tmp_path, cell), payload)
@@ -2399,8 +2462,57 @@ def test_malformed_receipt_is_refused(tmp_path, write, rule):
     assert str(refusal.value) == f"invalid producer receipt: {rule}: {path}"
 
 
-def test_receipt_leaves_the_other_producer_fields_to_the_reader(tmp_path):
+@pytest.mark.parametrize("legacy_plan", [False, True])
+def test_matching_receipt_and_artifact_cannot_replace_the_frozen_producer(tmp_path, legacy_plan):
+    cell = _cell_of_another_producer_revision(tmp_path)
+    cell = replace(cell, glm_producer_digests=None if legacy_plan else GlmProducerDigests.from_runtime(PRODUCER_DIR))
+    cell = cell_from_dict(cell.to_dict())
+    _receipt(tmp_path, cell)
+    with pytest.raises(ValueError, match="producer digests differ from the producer expected for this collection plan"):
+        _validate(tmp_path, cell)
+
+
+def test_concurrent_receipt_writers_use_their_own_file(tmp_path, monkeypatch):
     cell = glm_cell("prefill")
+    replace_file = native_artifact.os.replace
+    barrier = Barrier(4)
+    files = []
+
+    def finish(source, destination):
+        files.append(source)
+        barrier.wait(timeout=10)
+        replace_file(source, destination)
+
+    monkeypatch.setattr(native_artifact.os, "replace", finish)
+
+    def write(_):
+        return native_artifact.write_producer_receipt(cell, tmp_path, plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        paths = list(pool.map(write, range(4)))
+    assert len(set(files)) == 4
+    assert all(path.parent == tmp_path for path in files)
+    assert set(paths) == set(tmp_path.iterdir()) == {tmp_path / native_artifact.PRODUCER_RECEIPT_FILENAME}
+    assert json.loads(paths[0].read_text())["producer"] == cell.glm_producer_digests._asdict()
+
+
+def test_failed_receipt_replace_preserves_the_last_receipt_and_cleans_up(tmp_path, monkeypatch):
+    cell = glm_cell("prefill")
+    receipt = native_artifact.write_producer_receipt(cell, tmp_path, plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID)
+    previous = receipt.read_bytes()
+
+    def fail(_src, _dst):
+        raise OSError("replacement interrupted")
+
+    monkeypatch.setattr(native_artifact.os, "replace", fail)
+    with pytest.raises(OSError, match="replacement interrupted"):
+        native_artifact.write_producer_receipt(cell, tmp_path, plan_sha256=PLAN_SHA256, attempt_id="another")
+    assert list(tmp_path.iterdir()) == [receipt]
+    assert receipt.read_bytes() == previous
+
+
+def test_receipt_leaves_the_other_producer_fields_to_the_reader(tmp_path):
+    cell = replace(glm_cell("prefill"), glm_producer_digests=GlmProducerDigests("a" * 64, "b" * 64))
     payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
     payload["producer"].update(runtime_source_manifest_sha256="a" * 64, overlay_sha256="b" * 64, warmup_repeats=6)
     write_glm_rank(_pod(tmp_path / "warmup", cell), payload)

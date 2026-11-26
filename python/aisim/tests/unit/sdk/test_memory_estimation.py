@@ -1019,6 +1019,13 @@ def test_wrapped_deepseek_v4_uses_the_decoders_compressed_cache(tmp_path):
     wrapped = _write_config(tmp_path, wrapper)
     assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == 3_915
     assert estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=1) == 3_915
+    # The packed Flash pool uses 26 fixed rows of 1,002,240 bytes for one request and one row per 256 tokens.
+    state = 26 * 1_002_240
+    for raw in (config, wrapper):
+        estimator = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=1, pp_size=1)
+        assert [estimator.get_kvcache_max_tokens(budget) for budget in (3_915, state, state + 1_002_239)] == [0, 0, 0]
+        assert estimator.get_kvcache_max_tokens(state + 1_002_240) == 256
+        assert estimator.get_kvcache_max_tokens(state + 2 * 1_002_240) == 512
     with pytest.raises(ValueError, match="DeepSeek V4 stores fp8_ds_mla KV"):
         estimate_kv_bytes_per_token(wrapped, tp_size=1, pp_size=1, kvcache_quant_mode="bfloat16")
 

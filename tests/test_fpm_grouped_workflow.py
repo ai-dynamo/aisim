@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 from copy import deepcopy
 from decimal import Decimal
@@ -2791,6 +2792,25 @@ def test_nixl_transfer_evidence_of_vllm_0330_holds_the_region_table_of_the_live_
     assert sum(lengths) == measured["attention"]
     assert sum(lengths[index] for index in table["scratch_region_indices"]) == measured["ring"]
     assert len(table["ssm_region_indices"]) * sum(table["mamba_ssm_size"]) == measured["kda_group_0"]
+
+
+def test_nixl_prompt_seeds_reproduce_each_recorded_token_prefix():
+    captures = _EVIDENCE / _EVIDENCE_0330 / "captures"
+    expected = {
+        (arm, request["label"], request["usage_prompt_tokens"])
+        for arm in "ABC"
+        for request in map(json.loads, (captures / f"requests-{arm.lower()}.jsonl").read_text().splitlines())
+    }
+    with (captures / "prompt-plans.csv").open() as stream:
+        for row in csv.DictReader(stream):
+            kind, length, repetition = row["request"].split("-")
+            assert int(length) == int(row["prompt_tokens"])
+            expected.remove((row["arm"], row["request"], int(length)))
+            assert (row["seed"], int(row["token_lo"]), int(row["token_hi"])) == ("18h", 1000, 150000)
+            seed = f"18h-hit-{length}" if kind == "hit" else f"18h-fresh-{length}-{int(repetition) - 1}"
+            rng = random.Random(seed)
+            assert [rng.randrange(1000, 150000) for _ in range(8)] == list(map(int, row["first_ids"].split()))
+    assert not expected
 
 
 def test_nixl_captures_reproduce_the_28_request_deltas_and_allocated_gpu_seconds():

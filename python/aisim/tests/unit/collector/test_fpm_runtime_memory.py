@@ -2336,6 +2336,18 @@ def _glm_plan(
     )
 
 
+def test_glm_plan_binds_the_producer_files_before_launch(tmp_path):
+    plan = _glm_plan(tmp_path)
+    manifest = plan.to_dict()
+    expected = planner.GlmProducerDigests.from_runtime()
+    assert all(cell["glm_producer_digests"] == expected._asdict() for cell in manifest["cells"])
+    runtime_memory.validate_saved_plan(manifest)
+    assert runtime_memory.cell_from_dict(manifest["cells"][0]).glm_producer_digests == expected
+    manifest["cells"][0]["glm_producer_digests"]["overlay_sha256"] = "d" * 64
+    with pytest.raises(ValueError, match="SHA-256 does not match its immutable inputs"):
+        runtime_memory.validate_saved_plan(manifest)
+
+
 def test_glm_collection_plan_freezes_the_generated_point_list(tmp_path):
     from collector.fpm_forward.glm53flash_points import glm_point_manifest
 

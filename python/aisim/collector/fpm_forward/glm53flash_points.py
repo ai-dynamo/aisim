@@ -141,6 +141,29 @@ def glm_points(
     state_groups: Sequence[tuple[int, int]],
     checkpoint_alignment: int | None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, int]]]:
+    """Generate points for the supplied state layouts sharing one pool capacity."""
+    usable = kv_cache_bytes // page_size_bytes
+    return _glm_points_for_pools(
+        hash_block_size=hash_block_size,
+        token_budget=token_budget,
+        prefill_batch_limit=prefill_batch_limit,
+        decode_batch_limit=decode_batch_limit,
+        measured_context=measured_context,
+        pools=[(usable, rings, mamba) for rings, mamba in state_groups],
+        checkpoint_alignment=checkpoint_alignment,
+    )
+
+
+def _glm_points_for_pools(
+    *,
+    hash_block_size: int,
+    token_budget: int,
+    prefill_batch_limit: int,
+    decode_batch_limit: int,
+    measured_context: int,
+    pools: Sequence[tuple[int, int, int]],
+    checkpoint_alignment: int | None,
+) -> tuple[dict[str, Any], dict[str, dict[str, int]]]:
     """Return the point list and, for each phase, its candidates and the number of them that each rule dropped.
 
     Every point meets the producer's rules. Prefixes are whole hash blocks. New-token and prefix lengths are multiples
@@ -163,17 +186,19 @@ def glm_points(
     prefill_budget = min(token_budget, MAX_NEW)
     measured = min(measured_context, MAX_CONTEXT)
     unit = hash_block_size
-    usable = kv_cache_bytes // page_size_bytes
 
     def fits(workload_kind: str, point: dict[str, int]) -> bool:
-        blocks = glm_point_blocks(
-            workload_kind,
-            point,
-            hash_block_size=unit,
-            state_groups=state_groups,
-            checkpoint_alignment=checkpoint_alignment,
+        return all(
+            glm_point_blocks(
+                workload_kind,
+                point,
+                hash_block_size=unit,
+                state_groups=[(rings, mamba)],
+                checkpoint_alignment=checkpoint_alignment,
+            )
+            <= usable
+            for usable, rings, mamba in pools
         )
-        return blocks <= usable
 
     def batch_sizes(limit: int) -> list[int]:
         return sorted({*_powers_of_two_up_to(limit), limit})
@@ -257,7 +282,7 @@ def glm_points(
         prefill_candidates - split,
         dropped["decode"]["cache_capacity"],
         decode_candidates - over_budget,
-        usable,
+        min(usable for usable, _, _ in pools),
     )
     # A phase without a point leaves its cells nothing to measure, so the plan is refused before any GPU work.
     if not prefill or not decode:
@@ -283,8 +308,7 @@ def glm_plan_manifest(
     checkpoint alignment. For the same reason a phase that the plan collects is refused when it has no batch limit and
     the deployments hold different ``max_batch_size`` values: one list would leave out the larger points of one of them.
     A phase that the plan does not collect is never measured, and its points take the smallest value. The capacity rule
-    takes the smallest capacity and the largest page among the deployments, and each point takes the most blocks that
-    the groups of one deployment give it.
+    compares each deployment's own block requirement with its usable pool capacity.
     """
     memories = [deployment.resources.runtime_memory for deployment in deployments]
     hash_blocks = {None if memory is None else memory.hash_block_size_tokens for memory in memories}
@@ -295,14 +319,15 @@ def glm_plan_manifest(
     # state group, so a deployment whose groups do not all hold a block takes no internal checkpoint.
     # The plan's one point list serves every cell, so a deployment without an internal checkpoint cannot share it with
     # one that has it.
-    alignments, state_groups = set(), []
+    alignments, pools = set(), []
     for deployment in deployments:
         groups = deployment.resources.cache_groups
         mamba = [group for group in groups if group.prefill_checkpoint_blocks is not None]
         holding = [group for group in mamba if group.prefill_checkpoint_blocks == 1]
         # The tail ring is a state group without the prefill checkpoint field.
         rings = sum(group.kind == "state" and group.prefill_checkpoint_blocks is None for group in groups)
-        state_groups.append((rings, len(mamba)))
+        page = max(group.page_size_bytes for group in groups)
+        pools.append((deployment.resources.runtime_memory.kv_cache_bytes // page, rings, len(mamba)))
         if mamba and len(holding) == len(mamba):
             alignments.update(group.prefill_checkpoint_alignment for group in holding)
         else:
@@ -345,17 +370,13 @@ def glm_plan_manifest(
             limit = min(sizes)
         batch_limits[phase] = limit
     _require_mamba_hash_block(deployments)
-    payload, dropped = glm_points(
+    payload, dropped = _glm_points_for_pools(
         hash_block_size=hash_blocks.pop(),
         token_budget=options.max_prefill_isl,
         prefill_batch_limit=batch_limits["prefill"],
         decode_batch_limit=batch_limits["decode"],
         measured_context=glm_measured_context(options),
-        kv_cache_bytes=min(memory.kv_cache_bytes for memory in memories),
-        page_size_bytes=max(
-            group.page_size_bytes for deployment in deployments for group in deployment.resources.cache_groups
-        ),
-        state_groups=state_groups,
+        pools=pools,
         checkpoint_alignment=alignments.pop(),
     )
     _, canonical, digest = _manifest(payload)

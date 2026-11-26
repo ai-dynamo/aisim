@@ -25,6 +25,7 @@
   "files_sha256": {
     "connector-ranks.txt": "c865eed4c0c10070483d987799e2312b68f09303ead156f3dd88e4c92513e11a",
     "counter-samples.csv": "02fcf90e7ab209e06b75a97fc4833c121920db91fa8fe652adc31fb6927870c8",
+    "prompt-plans.csv": "9e47044badae1b3c4641bae75ee46c734e1222ecfda78b6f31a697f97e1379a0",
     "requests-a.jsonl": "bc1f53e646cebe1d9de2002b3a2f3258e3d3c0f3185175681f026aa310f54a24",
     "requests-b.jsonl": "abebb24ea5c2fa224a45a6f32ec3f935586a1a61a90aa0797234ea36aa75cfce",
     "requests-c.jsonl": "aead4e88f167eaa0fd3680eb8d9374189ddf9ff51cd3c1228ca06e95b2d99af1",
@@ -49,7 +50,10 @@
     "arm-B/logs/decode-server.log": "3a1139d31e28d5804993ca87e5b590531e8fd49473dc7ebba10afba7e26fd5f8",
     "arm-C/logs/prefill-server.log": "ee1fe0ffac9692393401265bc435e97d0eb49b2ee3ffddf3f339911904f4ee76",
     "arm-C/logs/decode-server.log": "bd52236646edc74562bd72e9db6c5be7e5165e669b4ff672c4a1f5132e7cd7bf",
-    "sacct.txt": "cf657ab5c346c4a39bd648e75dfe408af76fe5567d4e4ba3a59f5222df4bd0ab"
+    "sacct.txt": "cf657ab5c346c4a39bd648e75dfe408af76fe5567d4e4ba3a59f5222df4bd0ab",
+    "arm-A/measure/plan.json": "a9b7fceabcce194c287ba99f053f808a0e15719ece159caf216020c1f19faf31",
+    "arm-B/measure/plan.json": "db8810878b5529a5f0a8c47c8f5f2159e6f1ac6affefd1bf92a41024b26d093b",
+    "arm-C/measure/plan.json": "e0857635bae61b3e2f9046da5fef27ec9ffc64ad34443dc2609f2ed0d24878c3"
   },
   "gpu_accounting": {
     "gpu_type": "NVIDIA GB300",

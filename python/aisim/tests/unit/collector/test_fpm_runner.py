@@ -1995,7 +1995,7 @@ def test_recovered_glm_cell_gets_a_producer_receipt(monkeypatch, tmp_path):
         assert receipt == _expected_producer_receipt(plan, cell, attempt_id)
 
 
-def _glm_cell_to_recover(tmp_path: Path, *, status: str, attempt_id: str = "attempt-1"):
+def _glm_cell_to_recover(tmp_path: Path, *, status: str, attempt_id: str = "attempt-1", legacy_plan: bool = False):
     """A smoke campaign with one complete GLM-5.3-Flash prefill cell that the checkpoint does not list as passed.
 
     The rank artifact is in the shape that the producer writes and names the producer digests of this checkout, and the
@@ -2005,6 +2005,8 @@ def _glm_cell_to_recover(tmp_path: Path, *, status: str, attempt_id: str = "atte
     from . import test_fpm_glm53flash_native_collection as nc
 
     cell = nc.glm_cell("prefill")
+    if legacy_plan:
+        cell = dataclasses.replace(cell, glm_producer_digests=None)
     plan = _plan(cell)
     artifact_root = tmp_path / "artifacts"
     cell_dir = artifact_root / plan.sha256[:16] / "smoke" / "cells" / cell.cell_id
@@ -2065,13 +2067,16 @@ def _later_producer_revision(tmp_path: Path, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("status", ["interrupted", "failed", "running"])
-def test_recovery_keeps_the_receipt_that_its_validation_read(tmp_path, monkeypatch, status):
+@pytest.mark.parametrize("legacy_plan", [False, True])
+def test_recovery_keeps_the_receipt_that_its_validation_read(tmp_path, monkeypatch, status, legacy_plan):
     from collector.fpm_forward import database, native_artifact
     from collector.fpm_forward.native_artifact import validate_native_collection
 
     from . import test_fpm_glm53flash_native_collection as nc
 
-    plan, cell, cell_dir, artifact_root, checkpoint_dir = _glm_cell_to_recover(tmp_path, status=status)
+    plan, cell, cell_dir, artifact_root, checkpoint_dir = _glm_cell_to_recover(
+        tmp_path, status=status, legacy_plan=legacy_plan
+    )
     if status == "running":
         # Recovery of a running entry first verifies the teardown of the abandoned workload.
         (cell_dir / "k8s_deploy.yaml").write_text("apiVersion: v1\nkind: Pod\nmetadata:\n  name: cell\n")
@@ -2137,13 +2142,27 @@ def _receipt_of_another_plan(cell_dir: Path, _plan, cell) -> str:
     return "producer receipt names another plan"
 
 
+def _unverified_producer(cell_dir: Path, plan, cell) -> str:
+    from collector.fpm_forward import native_artifact
+
+    receipt = native_artifact.write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id="attempt-1")
+    artifact = cell_dir / "raw" / "node0000" / "benchmark.json"
+    for path in (receipt, artifact):
+        record = json.loads(path.read_bytes())
+        record["producer"]["overlay_sha256"] = "d" * 64
+        path.write_text(json.dumps(record))
+    return "invalid producer receipt: producer digests differ from the producer expected for this collection plan"
+
+
 def _broken_receipt(cell_dir: Path, _plan, _cell) -> str:
     (cell_dir / "producer-receipt.json").write_text("{")
     return "invalid producer receipt"
 
 
 @pytest.mark.parametrize(
-    "plant", [_receipt_of_another_attempt, _receipt_of_another_plan, _broken_receipt], ids=["attempt", "plan", "broken"]
+    "plant",
+    [_receipt_of_another_attempt, _receipt_of_another_plan, _broken_receipt, _unverified_producer],
+    ids=["attempt", "plan", "broken", "unverified-producer"],
 )
 def test_recovery_leaves_a_cell_with_a_refused_receipt_unrecovered(tmp_path, monkeypatch, caplog, plant):
     plan, cell, cell_dir, artifact_root, checkpoint_dir = _glm_cell_to_recover(tmp_path, status="failed")

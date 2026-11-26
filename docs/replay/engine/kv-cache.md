@@ -906,7 +906,9 @@ widest group. A request holds one row per 256 tokens of compressed KV and
 indexer keys (`block_size` 256, `bytes_per_token` one row per 256 tokens), plus
 a 26-row state for its sliding-window groups (SWA KV and compressor states). For
 DeepSeek-V4-Flash, 1,002,240-byte rows give 3915 bytes per token and a
-26,058,240-byte state on every TP rank.
+26,058,240-byte state on every TP rank. The SDK's configuration-based capacity
+estimate reserves this state for one request, then counts whole 256-token
+blocks in the remaining budget.
 Leave `block_size` and `bytes_per_token` unset. Speculative decoding (`nextn`
 or `speculation`) widens each sliding window by the draft tokens, so one draft
 token gives 30 rows. These are modeling assumptions: 26 rows is vLLM's decode

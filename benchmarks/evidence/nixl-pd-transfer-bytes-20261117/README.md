@@ -46,8 +46,15 @@ that splits the descriptors of each transfer by cache group.
 A small proxy sends each request to the prefill server with `max_tokens` 1.
 Then it sends the request to the decode server with the transfer parameters
 that the prefill returns. It sends one request at a time. Each prompt is a list of new random
-token IDs, except the repeated prompt of 5,000 tokens. The three arms used the
-same token IDs for the same prompt. For each request the run reads three
+token IDs, except the repeated prompt of 5,000 tokens. Each arm recorded the
+same base seed, `18h`, and range, 1,000 inclusive to 150,000 exclusive. For
+fresh prompt `fresh-N-K`, seed Python's `random.Random` with the string
+`f"18h-fresh-{N}-{K-1}"` (K starts at 1). For both repeated prompts use
+`"18h-hit-5000"`. Draw N tokens with `rng.randrange(1000, 150000)`. The original measurement
+plans record the seed, bounds and first eight IDs for all 28 requests.
+[Recorded prompt plans](captures/prompt-plans.csv).
+
+For each request the run reads three
 counters of the decode server before and after:
 `vllm:nixl_bytes_transferred_sum`, `vllm:nixl_bytes_transferred_count` and
 `vllm:nixl_num_descriptors_sum`. The counters give the sum and the count of

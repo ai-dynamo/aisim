@@ -13,6 +13,7 @@ import math
 import os
 import re
 import statistics
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +36,7 @@ from collector import glm53flash_attention_tokens
 from collector.glm53flash_runtime_identity import BASELINE_VERSIONS
 
 from .glm53flash_points import MAX_BATCH, MAX_CONTEXT
-from .planner import FPMCell
+from .planner import FPMCell, GlmProducerDigests
 from .types import KVWARM_STRATEGIES
 
 logger = logging.getLogger(__name__)
@@ -312,10 +313,8 @@ def _glm_producer_record() -> dict[str, Any]:
     reader cannot import its constants. The reader keeps them here, and a test keeps them equal to the record that the
     producer writes. The vLLM version is the exact supported runtime. The two digests are those of the pin manifest and
     of the producer file that this collector ships and that a launch of this collector mounts; the producer computes
-    both the same way. A cell folder with a producer receipt (``write_producer_receipt``) gives the two digests instead:
-    the run that collected or recovered the cell wrote them from its own files after this comparison passed. A cell
-    without a receipt is compared with the files of the reading checkout, so a campaign of another producer revision
-    without receipts is refused.
+    both the same way. A receipt must match the producer files frozen before launch, or the independently pinned
+    pair for receipt-v1 campaigns that predate that plan field.
     """
     return {
         "instrumentation_revision": "54960177085413259859c88bd34ed0734d4c2ea9",
@@ -329,10 +328,7 @@ def _glm_producer_record() -> dict[str, Any]:
         ),
         "vllm_package_version": BASELINE_VERSIONS["vllm"],
         "reviewed_scheduler_api_revision": "4ba787ec9959e566d3b587a796dff07673324da5",
-        "runtime_source_manifest_sha256": hashlib.sha256(
-            (_GLM_RUNTIME / "runtime-source-sha256.json").read_bytes()
-        ).hexdigest(),
-        "overlay_sha256": hashlib.sha256((_GLM_RUNTIME / "glm53flash_prefix_scheduler.py").read_bytes()).hexdigest(),
+        **GlmProducerDigests.from_runtime(_GLM_RUNTIME)._asdict(),
         # Version 1 names the shape of the context_policy record. Its rule is a lower bound: the runtime context is at
         # least the measured context plus the producer's headroom. The reader only requires the number to be 1; nothing
         # chooses a rule by it.
@@ -372,7 +368,12 @@ def _glm_input_record(generator_version: int) -> Mapping[str, Any] | None:
     return MappingProxyType(record)
 
 
-_PRODUCER_DIGEST_FIELDS = ("runtime_source_manifest_sha256", "overlay_sha256")
+_PRODUCER_DIGEST_FIELDS = GlmProducerDigests._fields
+# PR #1005's receipt-v1 producer, before collector plans recorded the producer files.
+_LEGACY_GLM_RECEIPT_DIGESTS = GlmProducerDigests(
+    "8255d36806bfbcd757d0265eb507b2d8e3267a348acaafcba3be0226cfeebb10",
+    "848f0826e4984e573f457cfa4b3fa8277ca38152949f880c951243a97920a9de",
+)
 _PRODUCER_RECEIPT_SCHEMA = "aic_fpm_producer_receipt"
 
 
@@ -389,28 +390,32 @@ def _glm_contract(cell: FPMCell) -> bool:
 def write_producer_receipt(cell: FPMCell, cell_dir: Path, *, plan_sha256: str, attempt_id: str) -> Path | None:
     """Write the producer receipt of a cell whose rank artifacts passed the strict comparison of this checkout.
 
-    The receipt binds the plan, the cell and the Collector attempt to the two digests of ``_glm_producer_record``; they
-    are never copied from an artifact. The runner calls this only after a comparison that read no receipt (a new
-    attempt removes the receipt of the attempt that it replaces, and recovery keeps a receipt that its validation read),
-    so these are the digests that the comparison used. A later read of the cell takes the two digests from the receipt
-    (``_producer_receipt``), so a later change of the producer files keeps the cell readable. A cell without the
-    GLM-5.3-Flash producer contract gets no receipt, and None is returned.
+    A new or recovered attempt without a receipt must match the running producer. Its digests must also match the
+    plan frozen before launch. Older plans used the receipt-v1 producer. Readers can validate both after an upgrade.
     """
     if not _glm_contract(cell):
         return None
     record = _glm_producer_record()
+    digests = {field: record[field] for field in _PRODUCER_DIGEST_FIELDS}
+    if digests != (cell.glm_producer_digests or _LEGACY_GLM_RECEIPT_DIGESTS)._asdict():
+        raise ValueError("GLM producer files differ from the producer expected for this collection plan")
     receipt = {
         "attempt_id": attempt_id,
         "cell_id": cell.cell_id,
         "plan_sha256": plan_sha256,
-        "producer": {field: record[field] for field in _PRODUCER_DIGEST_FIELDS},
+        "producer": digests,
         "schema_name": _PRODUCER_RECEIPT_SCHEMA,
         "schema_version": 1,
     }
     path = cell_dir / PRODUCER_RECEIPT_FILENAME
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    os.replace(temporary, path)
+    descriptor, name = tempfile.mkstemp(dir=cell_dir, prefix=f".{path.name}.")
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 
@@ -457,7 +462,75 @@ def _producer_receipt(cell: FPMCell, raw_root: Path, *, plan_sha256: str, attemp
             raise ValueError(
                 f"producer receipt names another {name}: {key} actual={receipt[key]!r} expected={expected!r}: {path}"
             )
-    return {field: producer[field] for field in _PRODUCER_DIGEST_FIELDS}
+    expected = cell.glm_producer_digests or _LEGACY_GLM_RECEIPT_DIGESTS
+    if producer != expected._asdict():
+        raise invalid("producer digests differ from the producer expected for this collection plan")
+    return expected._asdict()
+
+
+def _validate_glm_repetitions(
+    record: dict[str, Any], row: dict[str, Any], rank: object, producer: dict[str, Any], path: Path
+) -> None:
+    """Verify the accepted forwards and match the measured forwards to the saved rank samples."""
+    point = row["point"]
+    repetitions = record.get("repetitions")
+    warmups, measured = producer["warmup_repeats"], producer["measurement_repeats"]
+    error = f"native GLM-5.3-Flash result lacks valid repetition_evidence for benchmark_id={point['benchmark_id']}"
+    if (
+        record.get("point_type") != point.get("point_type")
+        or not isinstance(repetitions, list)
+        or len(repetitions) != warmups + measured
+    ):
+        raise ValueError(f"{error}: expected {warmups} warmups and {measured} measurements: {path}")
+    retained = row.get("fpms")
+    measurement = (
+        retained[0].get("benchmark_measurement")
+        if isinstance(retained, list) and len(retained) == 1 and isinstance(retained[0], dict)
+        else None
+    )
+    raw = measurement.get("raw_fpms") if isinstance(measurement, dict) else None
+    scheduled = _expected_scheduled(point)
+    previous_attempt = previous_forward = -1
+    for index, repetition in enumerate(repetitions):
+        role = "warmup" if index < warmups else "measurement"
+        if (
+            not isinstance(repetition, dict)
+            or not _same(repetition.get("repetition"), index)
+            or repetition.get("role") != role
+            or type(repetition.get("attempt")) is not int
+            or repetition["attempt"] <= previous_attempt
+            or "rejection_reason" in repetition
+        ):
+            raise ValueError(f"{error}: invalid accepted {role} at repetition {index}: {path}")
+        previous_attempt = repetition["attempt"]
+        fpms = repetition.get("fpms")
+        fpm = fpms[-1] if isinstance(fpms, list) and fpms else None
+        if (
+            not isinstance(fpm, dict)
+            or not _same(fpm.get("dp_rank"), rank)
+            or not _same(fpm.get("counter_id"), point["benchmark_id"])
+            or type(fpm.get("wall_time")) not in {int, float}
+            or not math.isfinite(fpm["wall_time"])
+            or fpm["wall_time"] <= 0
+            or not isinstance(fpm.get("scheduled_requests"), dict)
+            or any(not _same(fpm["scheduled_requests"].get(key), value) for key, value in scheduled.items())
+        ):
+            raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
+        sample = fpm.get("benchmark_sample")
+        forward = sample.get("forward_index") if isinstance(sample, dict) else None
+        if type(forward) is not int or forward <= previous_forward:
+            raise ValueError(f"{error}: missing, repeated or unordered forward at repetition {index}: {path}")
+        previous_forward = forward
+        if index >= warmups and isinstance(raw, list) and len(raw) == measured:
+            observed = raw[index - warmups]
+            if isinstance(observed, dict) and (
+                observed.get("wall_time") != fpm["wall_time"]
+                or (
+                    isinstance(observed.get("benchmark_sample"), dict)
+                    and observed["benchmark_sample"].get("forward_index") != previous_forward
+                )
+            ):
+                raise ValueError(f"{error}: measurement {index - warmups} differs from its saved raw sample: {path}")
 
 
 def _validate_glm_provenance(
@@ -583,6 +656,12 @@ def _validate_glm_provenance(
                 f"native GLM-5.3-Flash result lacks valid producer.{key}: expected {value!r}{source}, "
                 f"found {producer.get(key)!r}: {path}"
             )
+    if (
+        producer_digests is None
+        and cell.glm_producer_digests is not None
+        and any(producer[key] != value for key, value in cell.glm_producer_digests._asdict().items())
+    ):
+        raise lacks("producer digests of the frozen collection plan")
     added = sorted(set(producer) - set(expected_producer))
     if added:
         raise ValueError(
@@ -593,6 +672,11 @@ def _validate_glm_provenance(
     # The producer hashes each sidecar line without its line break and stores the digest in the row of the point with
     # the line's benchmark_id. The lines follow the order in which the points ran. A row whose benchmark_id is no
     # integer is left to the check of the row IDs in validate_native_collection.
+    rows_by_id = {
+        row["point"]["benchmark_id"]: row for row in payload["results"] if type(row["point"].get("benchmark_id")) is int
+    }
+    rank = payload.get("dp")
+    rank = rank.get("rank") if isinstance(rank, dict) else None
     line_digests: dict[int, str] = {}
     for line in raw.splitlines():
         try:
@@ -603,6 +687,9 @@ def _validate_glm_provenance(
         if type(benchmark_id) is not int or benchmark_id in line_digests:
             raise lacks("repetition_evidence")
         line_digests[benchmark_id] = hashlib.sha256(line).hexdigest()
+        row = rows_by_id.get(benchmark_id)
+        if row is not None and row.get("repetition_evidence_sha256") == line_digests[benchmark_id]:
+            _validate_glm_repetitions(record, row, rank, expected_producer, path)
     for row in payload["results"]:
         point = row["point"]
         if not _is_hex(row.get("repetition_evidence_sha256"), 64):
@@ -729,14 +816,21 @@ def _validate_token_streams(payload: dict[str, Any], path: Path) -> None:
 def _without_sidecar_names(evidence: dict[str, Any]) -> dict[str, Any]:
     """Input evidence without the file names of its sidecar manifests, which differ per rank.
 
-    The rest of each manifest, such as its digest and its record count, still has to agree across ranks.
+    Each rank's repetition file contains its own timings. Its digest is checked against its own artifact; the
+    seeded inputs, the record counts and the token-stream digest must agree across ranks.
     """
     sidecar_manifests = ("token_stream_manifest", "repetition_evidence_manifest")
     for key in sidecar_manifests:
         if key in evidence and not isinstance(evidence[key], dict):
             raise ValueError(f"native input provenance {key} must be a mapping, found {evidence[key]!r}")
     return {
-        key: {name: item for name, item in value.items() if name != "file"} if key in sidecar_manifests else value
+        key: {
+            name: item
+            for name, item in value.items()
+            if name != "file" and not (key == "repetition_evidence_manifest" and name == "sha256")
+        }
+        if key in sidecar_manifests
+        else value
         for key, value in evidence.items()
     }
 

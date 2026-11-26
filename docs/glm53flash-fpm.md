@@ -175,11 +175,10 @@ this producer. The cell selects these rules, not the artifact:
   the sources of the real-seed and queued-request ports, vLLM `0.33.0`, the
   reviewed vLLM revision `4ba787ec`, the digests of the two producer files,
   `runtime-source-sha256.json` and `glm53flash_prefix_scheduler.py`, the
-  context policy version and the repetition counts above. The two digests
-  are those of the producer receipt of the cell, the file
-  `producer-receipt.json` that the collector writes when the cell passes. When
-  the cell folder holds no receipt, they are those of the files of the
-  checkout that reads the artifact. A missing, changed or added field is
+  context policy version and the repetition counts above. The collector freezes the
+  two file digests in each GLM cell before launch. The plan hash covers them.
+  A new attempt compares its files with the plan and the rank result. A reader
+  verifies a passed cell's `producer-receipt.json` against the frozen digests. A missing, changed or added field is
   refused.
 - The vLLM version of the record must equal the runtime that the Collector
   provenance of the launch names.
@@ -192,7 +191,11 @@ this producer. The cell selects these rules, not the artifact:
 - The artifact must name the repetition evidence file and state its digest
   and its record count. The count must be an integer and equal the number of
   rows. The `repetition_evidence_sha256` of each row must be the SHA-256 of
-  the line of that file with the `benchmark_id` of the row.
+  the line of that file with the `benchmark_id` of the row. Each line must
+  record five accepted warmups followed by ten measurements of that point.
+  Each repetition has its own index and an increasing attempt number. Its
+  last forward must have the rank and scheduled work of the point and a
+  positive wall time. The ten measured forwards match their saved raw samples.
 - `serving_config` must record prefix caching, synchronous scheduling, the
   Mamba cache mode `align`, an integer `block_size`, a `hash_block_size`
   equal to it, and the block-aligned split of prefill chunks.
@@ -221,15 +224,13 @@ warm-up history, of the timing start and of the CUDA graph dispatch need
 measurement evidence version 2, the default, which publication uses. The
 other checks of the protocol and of the raw samples also run at version 1.
 
-When a GLM-5.3-Flash cell passes, the collector writes a producer receipt,
-`producer-receipt.json`, into the cell folder. The receipt holds the digests
-of the collector's own `runtime-source-sha256.json` and
-`glm53flash_prefix_scheduler.py`, which the artifact has matched, with the
-plan hash, the cell ID and the attempt ID. Every later read of the cell takes
-the two digests from the receipt: readiness, repeatability assessment,
-publication, finalization and serving validation, and each later check of a
-profile that was finalized from the campaign. So a campaign with receipts
-stays readable after a change of either file. The receipt covers the two
+When a GLM-5.3-Flash cell passes, the collector writes `producer-receipt.json`
+in the cell folder with its plan hash, cell ID, attempt ID and the two verified
+file digests. Recovery, readiness, repeatability, publication, finalization and
+serving validation check the receipt against the original plan. Plans from
+the receipt-v1 producer in PR #1005 predate the plan's `glm_producer_digests`
+field. The reader checks their receipts against that revision's two known
+file digests. Both forms remain readable after a producer upgrade. The receipt covers the two
 digests only. The reader compares every other field of the record, the vLLM
 version among them, with its own values.
 
@@ -426,8 +427,8 @@ more block in each Mamba group, the cached block of its prefix beside its
 running block. So does a decode request at a context of at least one hash
 block. In a launch where each Mamba group holds a prefill checkpoint block, a
 prefill of more than one hash block of new tokens also holds that block in
-each Mamba group. With several deployments, a point takes the count of the
-deployment that needs the most blocks. At TP4 with 2,176-token hash blocks,
+each Mamba group. With several deployments, each point must fit each
+deployment’s own block pool with its own state groups. At TP4 with 2,176-token hash blocks,
 8,192 tokens, 256 sequences and a 1,048,576-token context, a FlashKDA
 launch (five state groups, four of them KDA groups with a checkpoint block) has
 496 prefill points and 81 decode points. The align rule drops none of 496

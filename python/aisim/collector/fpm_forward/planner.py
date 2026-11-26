@@ -18,7 +18,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 
 from aisim.fpm_cache_layout import cache_layout_markers
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY, execution_identity
@@ -499,6 +499,18 @@ def _backend_policies(
     )
 
 
+class GlmProducerDigests(NamedTuple):
+    runtime_source_manifest_sha256: str
+    overlay_sha256: str
+
+    @classmethod
+    def from_runtime(cls, directory: Path = Path(__file__).parent / "runtime/glm53flash") -> GlmProducerDigests:
+        return cls(
+            hashlib.sha256((directory / "runtime-source-sha256.json").read_bytes()).hexdigest(),
+            hashlib.sha256((directory / "glm53flash_prefix_scheduler.py").read_bytes()).hexdigest(),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class FPMCell:
     cell_id: str
@@ -515,9 +527,11 @@ class FPMCell:
     fmha_resolution: str | None = None
     execution_identity: tuple[str, ...] = LEGACY_EXECUTION_IDENTITY
     input_text_sha256: str = ""
+    glm_producer_digests: GlmProducerDigests | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
+            **({"glm_producer_digests": self.glm_producer_digests._asdict()} if self.glm_producer_digests else {}),
             "cell_id": self.cell_id,
             "execution_identity": dict(zip(EXECUTION_COLUMNS, self.execution_identity, strict=True)),
             "input_text_sha256": self.input_text_sha256,
@@ -968,8 +982,10 @@ def build_collection_plan(
             system,
             details,
         )
+    glm_producer_digests = GlmProducerDigests.from_runtime() if capability.architecture == GLM_ARCHITECTURE else None
     cells = tuple(
         FPMCell(
+            glm_producer_digests=glm_producer_digests,
             cell_id=_cell_id(
                 backend=backend,
                 model_path=model_path,

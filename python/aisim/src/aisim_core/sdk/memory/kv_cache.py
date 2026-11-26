@@ -893,6 +893,13 @@ class NaiveKVCacheEstimator:
 
     # --------------------------- geometry -> byte sizes --------------------------- #
 
+    def _deepseek_v4_pool(self) -> dict[str, Any]:
+        from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
+
+        if self.pp_size != 1:
+            raise ValueError("DeepSeek V4 cache sizing requires PP=1")
+        return deepseek_v4_state_cache(self.geometry["deepseek_v4"], indexer_cache_dtype="auto")
+
     def kv_bytes_per_token(self) -> float | None:
         """Per-token KV byte size (the ``seq_len=1`` rate), MLA-aware, or ``None``.
 
@@ -908,9 +915,7 @@ class NaiveKVCacheEstimator:
         """
         geom = self.geometry
         if "deepseek_v4" in geom:
-            from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
-
-            return deepseek_v4_state_cache(geom["deepseek_v4"], indexer_cache_dtype="auto")["kv_bytes_per_token"]
+            return self._deepseek_v4_pool()["kv_bytes_per_token"]
         layers = geom.get("layers")
         if not layers:
             return None
@@ -989,8 +994,14 @@ class NaiveKVCacheEstimator:
         is known, else LINEAR); pass it explicitly to force one. HYBRID caps the SWA
         layers at the window while global layers keep growing; LINEAR floor-divides
         the budget by the per-token size. An explicit HYBRID with no usable layout
-        falls back to LINEAR rather than raising.
+        falls back to LINEAR. DeepSeek V4 always reserves one request's state
+        and assigns the remaining budget in whole compressed-KV blocks.
         """
+        if "deepseek_v4" in self.geometry:
+            pool = self._deepseek_v4_pool()
+            # Reserve one request's window and compressor state before assigning whole compressed-KV blocks.
+            blocks = max(0, int(kv_budget_bytes - pool["bytes_per_request"]) // pool["bytes_per_block"])
+            return blocks * pool["block_size"]
         hybrid = self._hybrid_tokens_from_bytes()
         use_hybrid = mode is NaiveKVCacheMode.HYBRID or (mode is None and hybrid is not None)
         if use_hybrid and hybrid is not None:

@@ -907,19 +907,17 @@ def test_plan_manifest_refuses_a_mamba_block_that_is_not_the_hash_block():
     assert str(error.value) == _hash_block_refusal(2176, "mamba_0", 4352)
 
 
-def test_plan_manifest_takes_the_smallest_capacity_the_largest_page_and_the_most_groups():
-    # One deployment has the smaller cache and three KDA groups. The other has the smaller page and four. Together they
-    # give the TP4 limits with 2,239 usable blocks: the TP4 FlashKDA list without the 7 prefill points of 32 requests
-    # after 60 hash blocks (one for each length from 4 to 256 new tokens), whose SHA-256 is pinned below.
-    small = _deployment(*[(1, 16)] * 3, kv_cache_bytes=PAGE * 2239)
-    large = _deployment(*[(1, 16)] * 4, kv_cache_bytes=PAGE * 4000, page_size_bytes=PAGE // 2)
-    canonical, digest, dropped = glm_plan_manifest(_OPTIONS, [small, large])
-    _, expected, expected_digest = glm_point_manifest(**{**_TP4, "kv_cache_bytes": PAGE * 2239})
-    assert (canonical, digest) == (expected, expected_digest)
-    assert digest == "9b1e63994616f901fe748f621f8482122090605c8f62c02f9757120f9fc81370"
-    assert json.loads(dropped)["prefill"]["cache_capacity"] == 7
-    # The larger capacity, the smaller page or the smaller number of groups each give the list without a drop.
-    assert digest != glm_point_manifest(**_TP4)[2]
+@pytest.mark.parametrize("checkpoint", [(1, 16), (0, None)])
+def test_plan_manifest_checks_each_deployment_against_its_own_pool(checkpoint):
+    # After 60 cached blocks, 32 requests prefill 64 new tokens. The small deployment needs
+    # 32 * (61 + 1 + 2 * 3) = 2,176 of 2,239 blocks. The large one needs 2,240 of 8,000.
+    small = _deployment(*[checkpoint] * 3, kv_cache_bytes=PAGE * 2239)
+    large = _deployment(*[checkpoint] * 4, kv_cache_bytes=PAGE * 4000, page_size_bytes=PAGE // 2)
+    point = {"batch_size": 32, "total_prefill_tokens": 32 * 64, "total_kv_read_tokens": 32 * 60 * 2176}
+    for deployments in ([small], [large], [small, large], [large, small]):
+        canonical, _, dropped = glm_plan_manifest(_OPTIONS, deployments)
+        assert point in json.loads(canonical)["prefill"]
+        assert json.loads(dropped)["prefill"]["cache_capacity"] == 0
 
 
 @pytest.mark.parametrize("checkpoint", [(1, 16), (0, None)], ids=["flashkda", "no-checkpoint"])
@@ -929,19 +927,6 @@ def test_plan_manifest_counts_every_mamba_group_of_the_deployment(checkpoint, pa
     # blocks need 32 * (61 + 1 + 4 * 2) = 2,240 blocks either way, and every other point fewer.
     _, _, dropped = glm_plan_manifest(_OPTIONS, [_deployment(*[checkpoint] * 4, kv_cache_bytes=PAGE * pages)])
     assert json.loads(dropped)["prefill"]["cache_capacity"] == dropped_count
-
-
-@pytest.mark.parametrize("order", [1, -1], ids=["four-first", "four-last"])
-def test_plan_manifest_counts_the_most_mamba_groups_of_the_deployments(order):
-    # 2,239 usable blocks. With the four KDA groups of one deployment a request after 60 hash blocks needs
-    # 61 + 1 + 4 * 2 = 70 blocks, so the 7 prefills of 32 requests at that rung drop. With the three of the other one it
-    # would need 61 + 1 + 3 * 2 = 68 and fit.
-    four = _deployment(*[(1, 16)] * 4, kv_cache_bytes=PAGE * 4000)
-    three = _deployment(*[(1, 16)] * 3, kv_cache_bytes=PAGE * 2239)
-    _, _, dropped = glm_plan_manifest(_OPTIONS, [four, three][::order])
-    assert json.loads(dropped)["prefill"]["cache_capacity"] == 7
-    _, alone = glm_points(**{**_TP4, "kv_cache_bytes": PAGE * 2239, "state_groups": ((1, 3),)})
-    assert alone["prefill"]["cache_capacity"] == 0
 
 
 @pytest.mark.parametrize(("pages", "dropped_count"), [(2240, 0), (2239, 7)])

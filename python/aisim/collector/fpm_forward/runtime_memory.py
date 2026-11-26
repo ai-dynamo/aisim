@@ -18,7 +18,7 @@ from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDEN
 
 from .model_capability import ResolvedModelConfig
 from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
-from .planner import BackendPolicy, FPMCell, _canonical_hash
+from .planner import BackendPolicy, FPMCell, GlmProducerDigests, _canonical_hash
 from .runtime.fpm_memory_observer import (
     _LEGACY_SPECS,
     _MAMBA_SPEC,
@@ -88,6 +88,18 @@ def cell_from_dict(payload: dict[str, Any]) -> FPMCell:
         ):
             raise ValueError("saved FPM cell has an invalid execution identity")
         execution = tuple(declared[name] for name in EXECUTION_COLUMNS)
+    digests = None
+    if "glm_producer_digests" in payload:
+        declared = payload["glm_producer_digests"]
+        if (
+            not isinstance(declared, dict)
+            or set(declared) != set(GlmProducerDigests._fields)
+            or any(
+                not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value) for value in declared.values()
+            )
+        ):
+            raise ValueError("saved FPM cell has invalid GLM producer digests")
+        digests = GlmProducerDigests(**declared)
     try:
         topology = ParallelTopology(**payload["topology"])
         for name, value in topology.to_dict().items():
@@ -108,6 +120,7 @@ def cell_from_dict(payload: dict[str, Any]) -> FPMCell:
             comm_quant_mode=dtypes["comm_quant_mode"],
             fmha_resolution=dtypes["fmha_resolution"],
             execution_identity=execution,
+            glm_producer_digests=digests,
             input_text_sha256=input_text_sha256,
         )
     except (KeyError, TypeError) as error:
