@@ -920,6 +920,18 @@ def _write_training_checkpoint(
             raise
 
 
+def _telemetry_count(sched: dict[str, Any], key: str, index: int) -> int | None:
+    """A capture-hook count field: absent, or a non-negative integer (integral floats from JSON allowed)."""
+    value = sched.get(key)
+    if value is None:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"iteration {index}: {key} must be a non-negative integer, got {value!r}")
+    return value
+
+
 def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | None = None) -> int:
     """MTP draft depth of the training steps, recorded as artifact ``metadata.nextn``.
 
@@ -940,16 +952,15 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
             sched = _sched(fpm)
             if not _rank_active(sched):
                 continue
-            steps = sched.get("spec_num_steps")
-            draft_tokens = sched.get("spec_num_draft_tokens")
+            steps = _telemetry_count(sched, "spec_num_steps", index)
+            draft_tokens = _telemetry_count(sched, "spec_num_draft_tokens", index)
             if steps is None:
                 if draft_tokens is None:
                     unrecorded = True
                     continue
                 # Width without depth: a chain draft of depth d verifies d + 1 tokens.
-                steps = max(int(draft_tokens) - 1, 0)
-            steps = int(steps)
-            if steps > 0 and draft_tokens is not None and int(draft_tokens) != steps + 1:
+                steps = max(draft_tokens - 1, 0)
+            if steps > 0 and draft_tokens is not None and draft_tokens != steps + 1:
                 raise ValueError(
                     f"iteration {index}: spec_num_draft_tokens={draft_tokens} != spec_num_steps + 1; "
                     "only chain MTP drafts (verify width nextn + 1) are supported"
