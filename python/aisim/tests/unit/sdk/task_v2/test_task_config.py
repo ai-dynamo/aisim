@@ -1903,8 +1903,8 @@ def test_run_single_agg_calls_predict_agg_worker_with_fixed_point(monkeypatch):
         captured["system_spec"] = system_spec
         return MagicMock(name=f"backend-{name}")
 
-    def fake_get_model(model_path, model_config, backend_name, backend_version):
-        assert backend_version == "1.3.0"
+    def fake_get_model(model_path, model_config, backend_name, database):
+        assert database.version == "1.3.0"
         captured["model_config"] = model_config
         from unittest.mock import MagicMock
 
@@ -2057,7 +2057,7 @@ def test_run_single_agg_raises_on_oom(monkeypatch):
 
         return MagicMock()
 
-    def fake_get_model(model_path, model_config, backend_name, backend_version):
+    def fake_get_model(model_path, model_config, backend_name, database):
         from unittest.mock import MagicMock
 
         return MagicMock()
@@ -2092,10 +2092,10 @@ def test_run_single_disagg_invokes_both_phases_and_rate_matches(monkeypatch):
 
         return MagicMock()
 
-    def fake_get_model(model_path, model_config, backend_name, backend_version):
+    def fake_get_model(model_path, model_config, backend_name, database):
         from unittest.mock import MagicMock
 
-        model_versions.append(backend_version)
+        model_versions.append(database.version)
         return MagicMock()
 
     # Build per-role summary dicts that satisfy _rate_match_dict's schema.

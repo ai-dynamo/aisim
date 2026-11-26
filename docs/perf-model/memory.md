@@ -104,7 +104,10 @@ refusals. So is `engine.kv_transfer.bytes_per_token: auto` of a disaggregated
 engine without an FPM profile and without `state_cache` on its prefill role.
 
 When this fallback selects a nested decoder, it uses the decoder's supported
-`model_type` if the optional `architectures` entry is absent. Automatic sizing
+`model_type` if the optional `architectures` entry is absent. vLLM selects an
+explicit decoder class for LLaVA and InternVL and rejects an explicit empty
+class list. Its Idefics3 model constructs a Llama decoder directly. SGLang's
+LLaVA selects the decoder from its Transformers config class. Automatic sizing
 uses each backend's checkpoint metadata. For example, the ModelOpt sidecar for
 Llama-3.1-70B-Instruct-FP8 selects a 20,480-byte FP8 cache per token at TP8.
 BF16 takes 40,960 bytes. An explicit `kvcache_quant_mode` selects the cache
@@ -154,7 +157,7 @@ For example, FlashMLA stores an extra four FP32 scales in a 512-element FP8
 latent. Shared capacity also needs the runtime indexer allocation. Recurrent and
 other per-layer layouts require their runtime state or group measurements.
 Gemma 4 normalizes its final decoder layer to full attention even when an
-explicit list declares it sliding.
+explicit list declares it sliding. On vLLM 0.28 through 0.31, supported Transformers versions can read different head counts from the same Gemma checkpoint. The SDK checks the collection image in the selected performance database when that changes a rank’s attention geometry. A direct `get_model` call can pass that database with `database=...`.
 
 DeepSeek V4 Flash and Pro expose 3,915 and 5,610 marginal compressed-cache bytes
 per token. Their runtime also reserves compressor state, live sliding and prefill

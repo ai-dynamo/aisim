@@ -764,7 +764,7 @@ def test_sweep_agg_epd_language_only_pin_survives_config_builder(monkeypatch):
     the EPD language-only pin must apply to what the builder produces."""
     captured: dict = {}
 
-    def _fake_get_model(*, model_path, model_config, backend_name, backend_version):
+    def _fake_get_model(*, model_path, model_config, backend_name, database):
         captured["language_only"] = model_config.language_only
         return MagicMock()
 
@@ -855,7 +855,7 @@ def test_sweep_agg_epd_composes_encoder_stage(monkeypatch):
     }
     captured: dict = {}
 
-    def _fake_get_model(*, model_path, model_config, backend_name, backend_version):
+    def _fake_get_model(*, model_path, model_config, backend_name, database):
         captured["language_only"] = model_config.language_only
         return MagicMock()
 

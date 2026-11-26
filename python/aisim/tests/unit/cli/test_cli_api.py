@@ -88,8 +88,8 @@ class TestCLIEstimateUnit:
             }
             model_config.num_gpus_per_node = 4
 
-        def fake_get_model(_model_path, model_config, _backend_name, version):
-            assert version == database.version
+        def fake_get_model(_model_path, model_config, _backend_name, *, database):
+            assert database.version == "1.3.0"
             captured["built_config"] = model_config
             return object()
 

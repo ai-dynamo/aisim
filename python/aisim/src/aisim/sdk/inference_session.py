@@ -349,10 +349,10 @@ class DisaggInferenceSession:
             getattr(self._prefill_database, "system_spec", {}),
         )
         prefill_model = models.get_model(
-            model_path, prefill_model_config, self._prefill_backend.name.value, self._prefill_database.version
+            model_path, prefill_model_config, self._prefill_backend.name.value, database=self._prefill_database
         )
         decode_model = models.get_model(
-            model_path, decode_model_config, self._decode_backend.name.value, self._decode_database.version
+            model_path, decode_model_config, self._decode_backend.name.value, database=self._decode_database
         )
         prefill_sess = InferenceSession(
             model=prefill_model, database=self._prefill_database, backend=self._prefill_backend
@@ -547,7 +547,7 @@ class DisaggInferenceSession:
                     model_path=model_path,
                     model_config=overwritten_model_config,
                     backend_name=backend.name.value,
-                    backend_version=database.version,
+                    database=database,
                 )
                 sess = InferenceSession(model=model, database=database, backend=backend)
 

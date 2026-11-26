@@ -207,7 +207,7 @@ def test_native_zero_per_token_raises():
     ],
 )
 def test_native_capacity_discloses_resolved_kv_precision(monkeypatch, override, resolved, token_capacity):
-    def get_model(_path, config, backend, _version):
+    def get_model(_path, config, backend, *, database):
         # Exercise real default resolution for an FP8 checkpoint with no KV declaration.
         _apply_model_quant_defaults(config, {"quant_algo": "fp8"}, "Qwen3ForCausalLM", backend)
         # K and V, eight layers, two KV heads, head dimension 64.
@@ -257,7 +257,7 @@ def test_native_capacity_defaults_backend_version_to_current(monkeypatch, select
     monkeypatch.setattr(
         memory,
         "get_model",
-        lambda *_args: SimpleNamespace(
+        lambda *_args, database: SimpleNamespace(
             get_kvcache_bytes_per_sequence=lambda length: 128 * length,
             get_kvcache_batch_capacity=lambda budget, _batch: int(budget // 128),
         ),
@@ -299,7 +299,7 @@ def test_breakdown_applies_nextn_to_model_config(monkeypatch):
     # decoding instead of treating the request as nextn=0.
     captured = {}
 
-    def _fake_get_model(model_path, model_config, backend, _version):
+    def _fake_get_model(model_path, model_config, backend, *, database):
         captured["nextn"] = model_config.nextn
         captured["has_nextn_accepted"] = hasattr(model_config, "nextn_accepted")
 
@@ -348,7 +348,7 @@ def test_breakdown_accepts_nextn_without_acceptance_field(monkeypatch):
     # Capacity math consumes only the core-owned draft depth.
     captured = {}
 
-    def _fake_get_model(model_path, model_config, backend, _version):
+    def _fake_get_model(model_path, model_config, backend, *, database):
         captured["nextn"] = model_config.nextn
         captured["has_nextn_accepted"] = hasattr(model_config, "nextn_accepted")
 
@@ -411,7 +411,7 @@ def test_prefill_workspace_respects_backend_kv_pool(monkeypatch, backend, extra_
             self.version = "0.5.12"
             self.system_spec = {"gpu": {"mem_capacity": 100 * _GIB}}
 
-    monkeypatch.setattr(memory, "get_model", lambda *args: Model())
+    monkeypatch.setattr(memory, "get_model", lambda *args, database: Model())
     monkeypatch.setattr(memory, "get_backend", lambda *args: Backend())
     monkeypatch.setattr(memory.perf_database, "get_database", lambda *args, **kwargs: Database())
     budgets = []
@@ -2227,7 +2227,8 @@ def test_registered_gemma4_flat_and_per_layer_release_selection(tmp_path):
     for version, width in (("0.26.0", 225_280), ("0.32.0", 215_040)):
         assert estimate_kv_bytes_per_token(path, tp_size=1, pp_size=1, backend_version=version) == width
         assert get_model(path, config, "vllm", version).get_kvcache_bytes_per_sequence(1) == width
-    assert get_model(path, config, "vllm", "0.28.0rc1").get_kvcache_bytes_per_sequence(1) == 215_040
+    with pytest.raises(ValueError, match="runtime profile"):
+        get_model(path, config, "vllm", "0.28.0rc1")
     with pytest.raises(ValueError, match="runtime profile"):
         estimate_kv_bytes_per_token(path, tp_size=1, pp_size=1, backend_version="0.28.0rc1")
     with pytest.raises(ValueError, match="cannot read global Gemma 4 heads"):
@@ -2276,7 +2277,8 @@ def test_gemma4_ignores_layer_overrides_equal_to_global_attributes(tmp_path, ser
         for version in ("0.28.0", "0.29.0"):
             with pytest.raises(ValueError, match="runtime profile"):
                 estimate_kv_bytes_per_token(path, tp_size=1, pp_size=1, backend_version=version)
-            assert get_model(path, config, "vllm", version).get_kvcache_bytes_per_sequence(1) == 225_280
+            with pytest.raises(ValueError, match="runtime profile"):
+                get_model(path, config, "vllm", version)
     else:
         assert get_model(path, config, "vllm").get_kvcache_bytes_per_sequence(1) == 225_280
         for version in ("0.26.0", "0.28.0", "0.29.0"):
@@ -2356,6 +2358,8 @@ def test_gemma4_per_layer_fields_use_the_initialized_configuration(tmp_path, bac
         "num_labels": 2,
         "label2id": {"LABEL_0": 0, "LABEL_1": 1},
         "allow_global_per_layer_attribute_access": False,
+        "keys_to_ignore_at_inference": ["past_key_values"],
+        "serialize_explicit_per_layer_config": False,
         "name_or_path": text.get("_name_or_path", ""),
     }
     options = dict(tp_size=1, pp_size=1, backend=backend, backend_version=release)
@@ -2371,6 +2375,9 @@ def test_gemma4_per_layer_fields_use_the_initialized_configuration(tmp_path, bac
 
 def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.config import ModelConfig
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.speculation import SpeculationConfig
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
@@ -2400,6 +2407,12 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
     table = {"gemm_perf": {"rows": 1, "status": "complete"}}
     index = runtime["image_digest"]
     manifest = "sha256:d3e9c5f146a8251c7489107e6353cf512fcd1bf14a16cab17148125a62a537c8"
+    database = memory.perf_database.PerfDatabase("test_xpu", "vllm", "0.28.0", systems_root=str(tmp_path))
+    config = ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    with pytest.raises(ValueError, match="Model backend sglang differs from database backend vllm"):
+        get_model(path, config, "sglang", database=database)
+    with pytest.raises(ValueError, match="Model release 0.30.0 differs from database release 0.28.0"):
+        get_model(path, config, "vllm", "0.30.0", database=database)
     for change, stock in (
         ({}, True),
         ({"image": runtime["image"] + "@" + index, "image_digest": manifest}, True),
@@ -2413,15 +2426,28 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
         if not stock:
             with pytest.raises(ValueError, match="runtime profile"):
                 estimate_kv_bytes_per_token(path, tp_size=1, **args)
+            with pytest.raises(ValueError, match="runtime profile"):
+                get_model(path, config, "vllm", database=database)
         else:
             assert estimate_kv_bytes_per_token(path, tp_size=1, **args) == 225_280
             assert estimate_kv_bytes_per_token(path, tp_size=4, **args) == 61_440
+            assert get_model(path, config, "vllm", database=database).get_kvcache_bytes_per_sequence(1) == 225_280
     first = tmp_path / "first-root"
     incomplete = first / directory.relative_to(tmp_path)
     incomplete.mkdir(parents=True)
     (first / "test_xpu.yaml").write_bytes((tmp_path / "test_xpu.yaml").read_bytes())
     (incomplete / "INCOMPLETE.txt").write_text("collection failed")
     metadata.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": table}))
+    draft_config = ModelConfig(
+        tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=1,
+        speculation=SpeculationConfig("draft_model", {"num_speculative_tokens": 2}, draft_model_path=path),
+    )
+    target = "google/gemma-4-26B-A4B"
+    for kwargs in ({"database": database}, {"backend_version": "0.32.0"}):
+        model = get_model(target, draft_config, "vllm", **kwargs)
+        assert model.spec_scheme.draft_kv_bytes_per_sequence(model, 1) == 225_280
     assert (
         estimate_kv_bytes_per_token(path, tp_size=4, **(args | {"systems_paths": [str(first), str(tmp_path)]}))
         == 61_440
@@ -2445,6 +2471,8 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
     (directory / "gemm_perf.txt").unlink()
     with pytest.raises(ValueError, match="runtime profile"):
         estimate_kv_bytes_per_token(path, tp_size=1, **args)
+    with pytest.raises(ValueError, match="runtime profile"):
+        get_model(target, draft_config, "vllm", database=database)
 
 
 def test_gemma4_adapter_compares_each_ranks_cache_without_deployment_evidence(tmp_path):
@@ -2505,12 +2533,27 @@ def test_gemma4_reader_agreement_reaches_native_capacity_and_rank_local_models(t
     model_dir.mkdir()
     path = _write_config(model_dir, doc)
     monkeypatch.setattr(
-        memory.perf_database, "get_database", lambda *a, **kw: SimpleNamespace(version="0.30.0", system_spec={})
+        memory.perf_database,
+        "get_database",
+        lambda *a, **kw: SimpleNamespace(
+            version="0.30.0",
+            backend="vllm",
+            system="custom",
+            systems_root=str(tmp_path),
+            strict_provenance=False,
+            system_spec={},
+        ),
     )
     with pytest.raises(ValueError, match="stock collection or a runtime profile"):
         memory.KVCacheEstimator.from_request(
             path, "custom", "vllm", "0.30.0", systems_path=str(tmp_path), max_num_tokens=2560, max_batch_size=12
         )
+    monkeypatch.setattr(
+        NaiveKVCacheEstimator, "from_model_path", lambda *a, **kw: pytest.fail("selected runtime was already refused")
+    )
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=80 * _GIB)
+    with pytest.raises(ValueError, match="stock collection or a runtime profile"):
+        memory.estimate_num_gpu_blocks(path, "custom", "vllm", "0.30.0", **opts)
 
 
 def test_gemma4_adapter_uses_only_global_fields_read_by_its_serving_release():
@@ -2582,9 +2625,7 @@ def test_gemma4_agreeing_adapter_readers_use_the_saved_geometry_without_a_catalo
         if kind == "full_attention"
     }
     path = _write_config(tmp_path, document)
-    monkeypatch.setattr(
-        memory.perf_database, "_iter_database_version_paths", lambda *args: pytest.fail("catalog lookup")
-    )
+    monkeypatch.setattr(memory.perf_database, "_iter_backend_version_dirs", lambda *args: pytest.fail("catalog lookup"))
     config = ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
     assert get_model(path, config, "vllm").get_kvcache_bytes_per_sequence(1) == 286_720
     for version in ("0.28.0", "0.29.0", "0.30.0", "0.31.0"):
@@ -2694,7 +2735,11 @@ def test_selected_qwen2_uses_its_default_ffn_to_size_an_eight_gib_cache(tmp_path
         assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.23", **opts) == 2522
 
 
-def test_onevision_selects_the_qwen2_constructor_when_sizing_weights(tmp_path):
+@pytest.mark.parametrize(
+    "wrapper_class,model_type",
+    [("LlavaOnevisionForConditionalGeneration", "llava_onevision"), ("InternVLForConditionalGeneration", "internvl")],
+)
+def test_multimodal_default_qwen2_constructor_sizes_weights(tmp_path, wrapper_class, model_type):
     text = dict(
         hidden_size=896,
         num_attention_heads=14,
@@ -2705,8 +2750,8 @@ def test_onevision_selects_the_qwen2_constructor_when_sizing_weights(tmp_path):
         torch_dtype="bfloat16",
     )
     wrapper = {
-        "architectures": ["LlavaOnevisionForConditionalGeneration"],
-        "model_type": "llava_onevision",
+        "architectures": [wrapper_class],
+        "model_type": model_type,
         "torch_dtype": "float16",
         "text_config": text,
     }
@@ -2745,6 +2790,15 @@ def test_qwen2_enabled_sliding_window_uses_its_constructor_default(wrapped):
         assert estimator.kv_bytes_per_token() == 28_672
         assert estimator.geometry["num_swa_layers"] == 28
         assert estimator.geometry["sliding_window"] == 4096
+    text["max_window_layers"] = 14
+    for fields in ({}, {"layer_types": ["full_attention"] * 14 + ["sliding_attention"] * 14}):
+        text.update(fields)
+        with pytest.raises(ValueError, match="vLLM Qwen2 does not support"):
+            NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.32.0")
+        estimator = NaiveKVCacheEstimator.from_hf_config(
+            doc, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20"
+        )
+        assert estimator.geometry["num_swa_layers"] is None and estimator.kv_bytes_per_token() == 28_672
     text["sliding_window"] = 0
     with pytest.raises(ValueError, match="positive sliding window"):
         NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.32.0")
@@ -2801,6 +2855,8 @@ def test_fixed_llama_wrapper_uses_its_decoder_independently_of_the_training_clas
     for arch in ("VLlama3ForCausalLM", "DeepseekV3ForCausalLM"):
         model = _write_config(tmp_path, {"architectures": [wrapper], "text_config": text | {"architectures": [arch]}})
         assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == 23_040
+    model = _write_config(tmp_path, {"architectures": [wrapper], "text_config": text | {"model_type": "mistral"}})
+    assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend_version="0.32.0") == 23_040
     bare = estimate_kv_bytes_per_token(_write_config(tmp_path, text), tp_size=1, pp_size=1)
     for decoder_key in ("text_config", "llm_config"):
         model = _write_config(tmp_path, {"architectures": ["UnknownConditionalGeneration"], decoder_key: text})
@@ -2809,6 +2865,88 @@ def test_fixed_llama_wrapper_uses_its_decoder_independently_of_the_training_clas
     model = _write_config(tmp_path, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": text})
     with pytest.raises(ValueError, match="conflicts with architectures"):
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1)
+    model = _write_config(tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "text_config": text})
+    assert (
+        estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20") == 23_040
+    )
+
+
+def test_config_class_defaults_and_explicit_vllm_decoder_dispatch():
+    def width(document):
+        return NaiveKVCacheEstimator.from_hf_config(
+            document, tp_size=1, pp_size=1, backend_version="0.32.0"
+        ).kv_bytes_per_token()
+
+    qwen = {"model_type": "qwen2", "num_attention_heads": 64, "hidden_size": 8192}
+    assert width(qwen) == width({"text_config": qwen}) == 524_288
+    for key in ("text_config", "llm_config"):
+        assert width({key: qwen | {"architectures": False}}) == 524_288
+    onevision = {"architectures": ["LlavaOnevisionForConditionalGeneration"]}
+    assert width(onevision | {"text_config": {"vocab_size": 152064}}) == 524_288
+    for value in ([], {}, False):
+        with pytest.raises(ValueError, match="architectures"):
+            width(onevision | {"text_config": {"vocab_size": 152064, "architectures": value}})
+
+    parent = {"architectures": ["LlavaNextForConditionalGeneration"]}
+    text = dict(
+        architectures=["MistralForCausalLM"],
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        num_hidden_layers=32,
+        hidden_size=4096,
+        intermediate_size=11008,
+        max_position_embeddings=4096,
+        vocab_size=32064,
+    )
+    assert width(parent | {"text_config": text}) == 131_072
+    text.update(
+        model_type="llama",
+        architectures=["OPTForCausalLM"],
+        do_layer_norm_before=True,
+        layer_norm_elementwise_affine=True,
+        ffn_dim=11008,
+        enable_bias=True,
+        activation_function="relu",
+        word_embed_proj_dim=4096,
+        _remove_final_layer_norm=False,
+    )
+    assert width(parent | {"text_config": text}) == 524_288
+
+    def weights(positions):
+        model = parent | {"text_config": text | {"max_position_embeddings": positions}}
+        return NaiveKVCacheEstimator.from_hf_config(
+            model, tp_size=2, pp_size=1, backend_version="0.32.0"
+        ).weight_bytes()
+
+    assert weights(8192) - weights(4096) == 4096 * 4096 * 2
+    del text["ffn_dim"]
+    with pytest.raises(ValueError, match="OPT decoder"):
+        width(parent | {"text_config": text})
+
+
+def test_gemma_readers_compare_only_the_rank_dimensions_used_by_the_adapter():
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    doc = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = doc["text_config"]
+    text["attention_k_eq_v"] = False
+    assert (
+        NaiveKVCacheEstimator.from_hf_config(doc, tp_size=8, pp_size=1, backend="sglang").kv_bytes_per_token() == 35_840
+    )
+    with pytest.raises(ValueError, match="SGLang release"):
+        NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend="sglang")
+    text.update(
+        head_dim=256, global_head_dim=256, num_key_value_heads=8, num_global_key_value_heads=8, attention_k_eq_v=True
+    )
+    text["per_layer_config"] = {
+        str(i): {"num_key_value_heads": 2} for i, kind in enumerate(text["layer_types"]) if kind == "full_attention"
+    }
+    for changes in ({}, {"0": {"num_key_value_heads": 4}}):
+        text["per_layer_config"].update(changes)
+        estimator = NaiveKVCacheEstimator.from_hf_config(doc, tp_size=8, pp_size=1, backend_version="0.31.0")
+        assert estimator.kv_bytes_per_token() == 30_720
+        with pytest.raises(ValueError, match="cache geometry|runtime profile"):
+            NaiveKVCacheEstimator.from_hf_config(doc, tp_size=1, pp_size=1, backend_version="0.31.0")
 
 
 @pytest.mark.parametrize("dtype_key", ["dtype", "torch_dtype"])

@@ -940,6 +940,8 @@ _GEMMA4_OTHER_DEFAULTS = {
     "is_encoder_decoder": False,
     "problem_type": None,
     "allow_global_per_layer_attribute_access": False,
+    "serialize_explicit_per_layer_config": False,
+    "keys_to_ignore_at_inference": ["past_key_values"],
     "initializer_range": 0.02,
     "use_cache": True,
     "pad_token_id": 0,
@@ -1094,6 +1096,10 @@ def gemma4_cache_shapes(
         and release is None
         and not has_per_layer_config
         and gemma4_cache_requires_release(config, backend)
+        and not same_rank_shape(
+            (layout_integer(config["num_global_key_value_heads"], "num_global_key_value_heads"), base[1]),
+            base,
+        )
     ):
         raise ValueError("Gemma 4 cache geometry requires the SGLang release or a runtime profile")
     flat_sglang = backend == "sglang" and release is not None and release < Version("0.5.22")
@@ -1104,6 +1110,7 @@ def gemma4_cache_shapes(
         flat_vllm and release >= Version("0.27.0rc1") and not config.get("allow_global_per_layer_attribute_access")
     )
     explicit_shapes = None
+    guarded_global_read = not config.get("allow_global_per_layer_attribute_access")
     if (
         has_per_layer_config
         and backend in ("sglang", "vllm")
@@ -1132,6 +1139,12 @@ def gemma4_cache_shapes(
             by_layer[int(key)] = fields
         types = [*types[:-1], "full_attention"]
         _check_gemma4_layer_attributes(config, by_layer, types, backend, release, validate_inherited_attention)
+        if compare_adapter_readers and backend == "vllm":
+            # These adapters read KV heads per layer. A 5.14 config may still
+            # read head_dim globally while validating a heterogeneous configuration.
+            guarded_global_read = guarded_global_read and any(
+                fields.get("head_dim", base[1]) != base[1] for fields in by_layer.values()
+            )
         shapes = {}
         for i, kind in enumerate(types):
             fields = by_layer.get(i, {})
@@ -1145,9 +1158,7 @@ def gemma4_cache_shapes(
             if shape != first:
                 if backend != "vllm" or not same_rank_shape(first, shape):
                     raise ValueError("AISim requires one Gemma 4 cache geometry per attention layer type")
-                if (release is None or compare_adapter_readers) and not config.get(
-                    "allow_global_per_layer_attribute_access"
-                ):
+                if (release is None or compare_adapter_readers) and guarded_global_read:
                     raise ValueError("Gemma 4 per_layer_config requires the vLLM release or a runtime profile")
         if not flat_vllm:
             explicit_shapes = shapes
@@ -1183,7 +1194,7 @@ def gemma4_cache_shapes(
                     continue
                 # The 5.14 constructor may guard even the validation-time global head
                 # read. When global reads are allowed, compare each viable rank-local pool.
-                if config.get("allow_global_per_layer_attribute_access") and same_rank_shape(legacy, layered):
+                if not guarded_global_read and same_rank_shape(legacy, layered):
                     continue
                 name = "SGLang" if backend == "sglang" else "vLLM"
                 raise ValueError(f"Gemma 4 per_layer_config requires the {name} release or a runtime profile")

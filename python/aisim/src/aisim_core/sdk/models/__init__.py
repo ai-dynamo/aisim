@@ -52,6 +52,7 @@ from aisim_core.sdk.models.helpers import (
     resolve_sglang_mla_compute,
     resolve_vllm_moe_execution_mode,
 )
+from aisim_core.sdk.perf_database import PerfDatabase
 
 # Auto-import every other module in this package so ``@register_model``
 # decorators populate ``_MODEL_REGISTRY``. New model files become discoverable
@@ -173,12 +174,15 @@ def get_model(
     model_config: config.ModelConfig,
     backend_name: str,
     backend_version: str | None = None,
+    *,
+    database: PerfDatabase | None = None,
 ) -> BaseModel:
     """Build a model from a HuggingFace model path.
 
     Resolves the model family from the architecture, applies quantization
     defaults, then dispatches to the registered class's ``create()``
-    classmethod. Per-family construction details (MoE prefix args, WideEP
+    classmethod. A selected database supplies its release and runtime evidence.
+    Per-family construction details (MoE prefix args, WideEP
     dispatch, post-construction hooks) live inside each model's
     ``create()``.
 
@@ -209,8 +213,14 @@ def get_model(
     if getattr(model_config, "fpm_fmha_quant_mode", None) is not None and forward_model != "fpm":
         raise InvalidEngineConfigurationError("fpm_fmha_quant_mode requires forward_model='fpm'")
 
+    if database is not None:
+        if database.backend != backend_name:
+            raise ValueError(f"Model backend {backend_name} differs from database backend {database.backend}")
+        if backend_version is not None and backend_version != database.version:
+            raise ValueError(f"Model release {backend_version} differs from database release {database.version}")
+        backend_version = database.version
     # Shallow-copy so mutations below don't poison the @cache'd original.
-    model_info = dict(_get_model_info(model_path), backend_version=backend_version)
+    model_info = dict(_get_model_info(model_path), backend_version=backend_version, database=database)
     raw_config = model_info.get("raw_config", {})
     architecture = model_info["architecture"]
     model_family = _architecture_to_model_family(architecture)
@@ -291,6 +301,7 @@ def get_model(
     # attach it after, and gate unsupported (model, backend) combinations.
     from aisim_core.sdk.config_builders import resolve_speculation
     from aisim_core.sdk.speculation import build_spec_scheme
+    from aisim_core.sdk.speculation.draft_model import DraftModelScheme
     from aisim_core.sdk.speculation.materialize import materialize_spec_scheme
 
     # The materialized graph and its cache identity own the same snapshot.
@@ -312,7 +323,10 @@ def get_model(
     if getattr(model, "_backend_name", None) is None:
         model._backend_name = backend_name
     model.spec_scheme = build_spec_scheme(model_config, spec_config)
-    model.spec_scheme.validate(model, backend_name)
+    if isinstance(model.spec_scheme, DraftModelScheme):
+        model.spec_scheme.validate(model, backend_name, backend_version=backend_version, database=database)
+    else:
+        model.spec_scheme.validate(model, backend_name)
     materialize_spec_scheme(model)
     # Op-level decode CP: rewrite the decode attention (sharded KV stripe +
     # merge collectives) after speculation materialized the draft ops. The

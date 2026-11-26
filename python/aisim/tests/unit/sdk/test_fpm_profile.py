@@ -661,7 +661,7 @@ def test_registered_build_failure_is_not_direct_fallback(profile_dict, monkeypat
     monkeypatch.setattr(engine, "_literal_backend_version", lambda _s, _b, version, *_args: version)
     observed = []
 
-    def broken_model(_path, config, _backend, version):
+    def broken_model(_path, config, _backend, version, *, database):
         observed.append((config.fmha_quant_mode.name, version))
         raise RuntimeError("registered model has an unrelated implementation error")
 
@@ -2235,8 +2235,8 @@ def test_registered_glm_auto_retains_sol_with_explicit_fp8_fmha(profile_dict, mo
     real_get_model = engine.get_model
     built_models = []
 
-    def record_model(*args):
-        model = real_get_model(*args)
+    def record_model(*args, **kwargs):
+        model = real_get_model(*args, **kwargs)
         built_models.append(model)
         return model
 

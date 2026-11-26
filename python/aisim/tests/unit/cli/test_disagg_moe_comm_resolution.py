@@ -103,7 +103,7 @@ def test_disagg_resolves_each_role_moe_comm_before_session_run(monkeypatch):
         comm_quant_mode=None,
         load_database=lambda system: databases[system],
         get_backend=lambda _backend: object(),
-        get_model=lambda *_args: object(),
+        get_model=lambda *_args, database: object(),
     )
 
     assert [call[1]["required_phases"] for call in resolver_calls] == [("context",), ("generation",)]

@@ -110,7 +110,7 @@ def _install(monkeypatch, **backend_kwargs) -> tuple[_FakeBackend, list[dict]]:
     monkeypatch.setattr(afd_memory, "resolve_context_fmha_by_data", lambda *a, **k: None)
     monkeypatch.setattr(afd_memory, "resolve_dsv4_moe_arch", lambda *a, **k: None)
     monkeypatch.setattr(afd_memory, "_resolve_afd_execution_quantization", lambda *a, **k: None)
-    monkeypatch.setattr(afd_memory, "get_model", lambda path, config, backend, version: SimpleNamespace(config=config))
+    monkeypatch.setattr(afd_memory, "get_model", lambda path, config, backend, database: SimpleNamespace(config=config))
 
     # Spy on _pool_memory to see the phase/batch/weight selection of the
     # check loop (the real body still runs against the fake backend).

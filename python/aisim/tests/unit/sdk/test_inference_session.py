@@ -200,8 +200,8 @@ def _patch_get_model(monkeypatch):
 
     versions = []
 
-    def _fake_get_model(model_path, model_config, backend_name, backend_version):
-        versions.append((backend_name, backend_version))
+    def _fake_get_model(model_path, model_config, backend_name, database):
+        versions.append((backend_name, database.version))
         m = MagicMock()
         m._tp = model_config.tp_size
         m._pp = model_config.pp_size

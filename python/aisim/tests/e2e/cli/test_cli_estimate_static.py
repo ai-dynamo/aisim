@@ -428,9 +428,10 @@ def test_agg_estimate_resolves_lightning_nvfp4_for_hopper_before_model_construct
 
     real_get_model = models.get_model
 
-    def get_model_with_resolved_moe(model_path, model_config, backend_name):
+    def get_model_with_resolved_moe(model_path, model_config, backend_name, *, database):
         assert model_config.moe_quant_mode == common.MoEQuantMode.nvfp4_wo
-        model = real_get_model(model_path, model_config, backend_name)
+        assert database.version == "0.24.0"
+        model = real_get_model(model_path, model_config, backend_name, database=database)
         assert model.config.moe_quant_mode == common.MoEQuantMode.nvfp4_wo
         raise ModelConstructionObservedError
 

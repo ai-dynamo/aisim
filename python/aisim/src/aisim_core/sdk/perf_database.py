@@ -160,6 +160,18 @@ def restore_systems_paths(previous: list[str] | None) -> None:
     _drop_systems_caches()
 
 
+def resolve_deployment_systems_paths(systems_path: str | list[str] | None) -> list[str]:
+    """Resolve explicit, process and environment roots in the same order as the worker."""
+    from aisim_core.sdk.rust_engine_step import _resolve_forward_pass_systems_paths
+
+    entries = (
+        [part.strip() for part in systems_path.split(",") if part.strip()]
+        if isinstance(systems_path, str)
+        else systems_path or []
+    )
+    return _resolve_forward_pass_systems_paths(tuple(entries), require_directories=False)
+
+
 def get_systems_paths() -> list[str]:
     global _SYSTEMS_PATHS
     if _SYSTEMS_PATHS is None:

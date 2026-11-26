@@ -160,7 +160,7 @@ def _build_pool(
         moe_tp_size=1,
         moe_ep_size=model_config.tp_size if is_a_pool else 1,
     )
-    model = get_model(model_path, reference, backend.name.value, database.version)
+    model = get_model(model_path, reference, backend.name.value, database=database)
     model.config = dataclasses.replace(
         model.config,
         tp_size=model_config.tp_size,

@@ -47,7 +47,7 @@ graphed-runtime potential.
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from aisim_core.sdk.speculation.base import (
     DraftOpSpec,
@@ -56,6 +56,9 @@ from aisim_core.sdk.speculation.base import (
     positive_integer,
     register_spec_scheme,
 )
+
+if TYPE_CHECKING:
+    from aisim_core.sdk.perf_database import PerfDatabase
 
 _SUPPORTED_BACKENDS = ("vllm",)
 
@@ -103,7 +106,14 @@ class DraftModelScheme(SpecSchemeBase):
     # ------------------------------------------------------------------
     # Draft model construction (through the model registry)
     # ------------------------------------------------------------------
-    def _build_draft(self, model, backend_name: str | None = None):
+    def _build_draft(
+        self,
+        model,
+        backend_name: str | None = None,
+        *,
+        backend_version: str | None = None,
+        database: PerfDatabase | None = None,
+    ):
         if self._draft_model is not None:
             return self._draft_model
         import dataclasses
@@ -126,19 +136,21 @@ class DraftModelScheme(SpecSchemeBase):
             forward_model="op_level",
             overwrite_num_layers=0,
         )
-        self._draft_model = get_model(self.draft_model_path, draft_config, backend)
+        self._draft_model = get_model(self.draft_model_path, draft_config, backend, backend_version, database=database)
         # The independent graph stays unchanged: K forwards reuse weights
         # and must not multiply context cost or mutate shared composite ops.
         self._draft_weights = float(sum(op.get_weights() for op in self._draft_model.generation_ops))
         return self._draft_model
 
-    def validate(self, model, backend_name: str) -> None:
+    def validate(
+        self, model, backend_name: str, *, backend_version: str | None = None, database: PerfDatabase | None = None
+    ) -> None:
         if backend_name not in _SUPPORTED_BACKENDS:
             raise ValueError(f"draft_model modeling supports backends {_SUPPORTED_BACKENDS}, got {backend_name!r}.")
         self._draft_backend = backend_name
         # Build eagerly so an unsupported draft checkpoint fails at
         # get_model(target) time, not mid-prediction.
-        self._build_draft(model, backend_name)
+        self._build_draft(model, backend_name, backend_version=backend_version, database=database)
 
     def verify_width(self) -> int:
         return self.num_speculative_tokens + 1

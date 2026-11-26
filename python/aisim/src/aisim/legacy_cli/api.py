@@ -1595,7 +1595,7 @@ def _run_agg_estimate(
         engine_step_backend=engine_step_backend,
     )
 
-    model = get_model(model_path, model_config, backend_name, database.version)
+    model = get_model(model_path, model_config, backend_name, database=database)
     if ctx_tokens is None:
         ctx_tokens = isl + BaseBackend._visual_context_tokens(model, runtime_config)
     backend = get_backend(backend_name, system_name, system_spec=getattr(database, "system_spec", None))
@@ -1781,7 +1781,7 @@ def _run_static_estimate(
         engine_step_backend=engine_step_backend,
     )
 
-    model = get_model(model_path, model_config, backend_name, database.version)
+    model = get_model(model_path, model_config, backend_name, database=database)
     backend = get_backend(backend_name, system_name, system_spec=getattr(database, "system_spec", None))
     session = InferenceSession(model, database, backend)
     summary = session.run_static(

@@ -46,8 +46,8 @@ def test_direct_context_construction_uses_runtime_precision(monkeypatch, entry, 
     captured = []
     real_get_model = models.get_model
 
-    def capture(model_path, model_config, backend_name, backend_version=None):
-        captured.append(real_get_model(model_path, model_config, backend_name, backend_version))
+    def capture(model_path, model_config, backend_name, database=None):
+        captured.append(real_get_model(model_path, model_config, backend_name, database=database))
         if entry != "run_disagg" or len(captured) == 2:
             raise ModelBuilt
         return captured[-1]
@@ -56,7 +56,7 @@ def test_direct_context_construction_uses_runtime_precision(monkeypatch, entry, 
     monkeypatch.setattr(pareto_analysis, "get_model", capture)
     monkeypatch.setattr(memory, "get_model", capture)
     monkeypatch.setattr(models, "get_model", capture)
-    db = SimpleNamespace(version="0.5.14", system_spec={"gpu": {"sm_version": 90}})
+    db = SimpleNamespace(backend="sglang", version="0.5.14", system_spec={"gpu": {"sm_version": 90}})
     monkeypatch.setattr(memory.perf_database, "get_database", lambda *args, **kwargs: db)
     backend = SimpleNamespace(name=SimpleNamespace(value="sglang"))
     mc = config.ModelConfig(tp_size=8, moe_tp_size=8, fmha_quant_mode=explicit)
@@ -311,12 +311,13 @@ def test_estimate_path_data_fallback_reaches_the_built_context_ops(monkeypatch, 
     captured = []
     real_get_model = models.get_model
 
-    def capture(model_path, model_config, backend_name, backend_version=None):
-        captured.append(real_get_model(model_path, model_config, backend_name, backend_version))
+    def capture(model_path, model_config, backend_name, database=None):
+        captured.append(real_get_model(model_path, model_config, backend_name, database=database))
         raise ModelBuilt
 
     monkeypatch.setattr(models, "get_model", capture)
     db = SimpleNamespace(
+        backend="trtllm",
         version="1.3.0rc29",
         system_spec={"gpu": {"sm_version": 100}},
         supported_quant_mode={"context_mla": ["bfloat16"]},

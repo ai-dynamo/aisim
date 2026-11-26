@@ -3,14 +3,203 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import replace
+from pathlib import Path
+
+from packaging.version import Version
 
 import aisim_core.sdk.operations as ops
-from aisim_core.sdk import common
+from aisim_core.decoder_config import decoder_config_key
+from aisim_core.sdk import common, perf_database
+from aisim_core.sdk.config import validate_parallel_size
 from aisim_core.sdk.models.base import BaseModel, register_model
 from aisim_core.sdk.models.blocks.vit import build_gemma4_vision_encoder_ops
 from aisim_core.sdk.models.helpers import mtp_scale_factor, quant_exclude_patterns
 from aisim_core.sdk.utils import gemma4_cache_shapes
+
+# Official release index (first) and its Linux platform manifest digests for the vLLM
+# adapters that support both the flat and heterogeneous Transformers readers.
+_GEMMA4_ADAPTER_IMAGES = {
+    ("0.28.0", "vllm"): (
+        "sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14",
+        "sha256:2a7cde230b59f3ce6cab33dd245ba6bee41aa87b38c9fe84f966ff24016813ce",
+        "sha256:2286e8533ca8b6bc777594bae30524f1426ba46ca21797524e06df6a94b06635",
+    ),
+    ("0.28.0", "vllm_xpu"): (
+        "sha256:4756b66a077627133cee653b551f6f5eaa1b9a981b5eea13edd33fcd3b0d3ca3",
+        "sha256:d3e9c5f146a8251c7489107e6353cf512fcd1bf14a16cab17148125a62a537c8",
+    ),
+    ("0.29.0", "vllm"): (
+        "sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1",
+        "sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a",
+        "sha256:082ca6f035279109041ffd3fe0695cb568b29bc580b35c4f297a66a08b216c1b",
+    ),
+    ("0.29.0", "vllm_xpu"): (
+        "sha256:96db42e248d48760a4937eb3d04c4878b39d13a9814efea95d510393e097a901",
+        "sha256:1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a",
+    ),
+    ("0.30.0", "vllm"): (
+        "sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
+        "sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
+        "sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40",
+    ),
+    ("0.30.0", "vllm_xpu"): (
+        "sha256:fc0e112afb64e3a06fe8daff34652435822a629412f38efce8f0f67a46636b8d",
+        "sha256:e4446310b1d30015e8fdc1a0a2ef1669ac6bef857cbe772487571ed5c1a926a9",
+    ),
+    ("0.31.0", "vllm"): (
+        "sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3",
+        "sha256:3f7dd5b777d34d1724456ce71f87385dca288c3bb23029ab27dee358f5d2b971",
+        "sha256:a4a4c0437bf7240089da5f08aa370c4aee17ae5290f7a3b468825ee26c4c3a6b",
+    ),
+    ("0.31.0", "vllm_xpu"): (
+        "sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7",
+        "sha256:0229393589110073085ffb558d3da4ce1114b93e985019a8811433b5fc793bac",
+    ),
+}
+
+
+def _gemma4_collection_images(directory: Path, version: str, framework: str) -> Iterator[bool]:
+    """Yield whether each retained measurement of this framework used the pinned official image."""
+    path = directory / perf_database.COLLECTION_META_MARKER
+    digests = _GEMMA4_ADAPTER_IMAGES.get((version, framework))
+    if not digests or not path.is_file():
+        return
+    collection = perf_database._load_collection_meta_yaml(str(path))
+    tables = collection.get("tables")
+    if not isinstance(tables, dict):
+        return
+    files = {
+        item.stem
+        for item in directory.iterdir()
+        if item.suffix in (".parquet", ".txt") and item.is_file() and item.stat().st_size
+    }
+    repository = "vllm/vllm-openai-xpu" if framework == "vllm_xpu" else "vllm/vllm-openai"
+    image = f"{repository}:v{version}"
+    for table in files.intersection(tables):
+        data = tables[table]
+        if not isinstance(data, dict):
+            continue
+        # Schema v1 records one collection per table. In v2 an individual
+        # measurement can override the directory's runtime.
+        for event in data.get("collections", [data]):
+            runtime = event.get("runtime", collection.get("runtime"))
+            if not isinstance(runtime, dict) or type(event.get("rows")) is not int or event["rows"] <= 0:
+                continue
+            if runtime.get("framework") != framework:
+                continue
+            reference = runtime.get("image", "")
+            reference = reference.removeprefix("docker.io/") if isinstance(reference, str) else ""
+            name, _, embedded_digest = reference.partition("@")
+            digest = runtime.get("image_digest", embedded_digest)
+            yield (
+                runtime.get("version") == version
+                and isinstance(digest, str)
+                and digest in digests
+                and name in (repository, image)
+                and (not embedded_digest or embedded_digest == digest or embedded_digest == digests[0])
+            )
+
+
+def _has_stock_gemma4_collection(
+    version: str,
+    database: perf_database.PerfDatabase | None,
+    system: str | None,
+    systems_paths: str | list[str] | None,
+) -> bool:
+    """Use the selected database, or the first usable catalog in the deployment's search order."""
+    if database is not None:
+        recorded_dir = database.system_spec.get("data_dir")
+        if not recorded_dir:
+            return False
+        data_dir = str(Path(database.systems_root) / recorded_dir)
+        paths = (
+            (directory, data_dir)
+            for release, directory in perf_database._iter_backend_version_dirs(data_dir, "vllm")
+            if release == version
+        )
+        catalogs = ((database.systems_root, paths),)
+        strict = database.strict_provenance
+    elif system:
+        roots = perf_database.resolve_deployment_systems_paths(systems_paths)
+        catalogs = ((root, perf_database._iter_database_version_paths(system, "vllm", version, root)) for root in roots)
+        strict = perf_database._strict_provenance_enabled(None)
+    else:
+        return False
+    for root, paths in catalogs:
+        cells = [
+            directory
+            for directory, data_dir in paths
+            if not perf_database._version_dir_unusable_for_request(directory, data_dir, strict=strict)
+        ]
+        if not cells:
+            continue
+        spec = database.system_spec if database is not None else perf_database.load_system_spec(system, [root])
+        if spec.get("gpu"):
+            framework = "vllm_xpu" if perf_database.is_xpu_system_spec(spec) else "vllm"
+            images = {
+                stock for directory in cells for stock in _gemma4_collection_images(Path(directory), version, framework)
+            }
+            return images == {True}
+        break
+    return False
+
+
+class UnverifiedGemmaRuntimeError(ValueError):
+    """The selected native database cannot identify the Gemma attention layout."""
+
+
+def check_gemma4_adapter_runtime(
+    document: dict,
+    version: str | None,
+    tp_size: int,
+    *,
+    database: perf_database.PerfDatabase | None = None,
+    system: str | None = None,
+    systems_paths: str | list[str] | None = None,
+    validate_inherited_attention: bool = True,
+) -> None:
+    """Require an observed image when supported Transformers readers select different Gemma geometry."""
+    release = common.parse_support_matrix_version(version)
+    if release is None or not Version("0.28.0rc1") <= release < Version("0.32.0rc0"):
+        return
+    decoder = document.get(decoder_config_key(document), document)
+    if not isinstance(decoder, dict) or "per_layer_config" not in decoder:
+        return
+    names = document.get("architectures")
+    if decoder.get("model_type") != "gemma4_text" and not (
+        isinstance(names, list) and names[:1] == ["Gemma4ForConditionalGeneration"]
+    ):
+        return
+    # These vLLM adapters accept both flat and per-layer Transformers implementations.
+    tp_size = validate_parallel_size("tp_size", tp_size)
+    try:
+        gemma4_cache_shapes(
+            decoder,
+            "vllm",
+            version,
+            agreement_tp_size=tp_size,
+            compare_adapter_readers=True,
+            validate_inherited_attention=validate_inherited_attention,
+        )
+        return
+    except ValueError:
+        # An invalid per-layer layout still fails even with a known stock runtime.
+        gemma4_cache_shapes(
+            decoder,
+            "vllm",
+            version,
+            agreement_tp_size=tp_size,
+            validate_inherited_attention=validate_inherited_attention,
+        )
+
+    if _has_stock_gemma4_collection(version, database, system, systems_paths):
+        return
+    message = f"vLLM {version} Gemma 4 per_layer_config needs a stock collection or a runtime profile"
+    if database is not None:
+        raise UnverifiedGemmaRuntimeError(message)
+    raise ValueError(message)
 
 
 @register_model("GEMMA4MIX")
@@ -69,10 +258,19 @@ class Gemma4MixModel(BaseModel):
         cfg = model_info["extra_params"]
         raw = model_info["raw_config"]
         text = raw.get("text_config", raw)
+        version = model_info.get("backend_version")
+        if backend_name == "vllm":
+            check_gemma4_adapter_runtime(
+                raw,
+                version,
+                model_config.tp_size,
+                database=model_info.get("database"),
+                validate_inherited_attention=False,
+            )
         (swa_heads, swa_dim), (full_heads, full_dim) = gemma4_cache_shapes(
             text,
             backend_name,
-            model_info.get("backend_version"),
+            version,
             agreement_tp_size=model_config.tp_size,
             # The SDK model parser accepts inherited window/chunk settings. Config-only
             # estimates also validate them against the selected serving constructor.

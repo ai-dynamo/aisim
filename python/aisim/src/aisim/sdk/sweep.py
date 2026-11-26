@@ -598,7 +598,7 @@ def sweep_agg(
                 model_path=model_path,
                 model_config=point_model_config,
                 backend_name=backend_name,
-                backend_version=database.version,
+                database=database,
             )
 
             runtime_configs_to_evaluate: list[config.RuntimeConfig] = []
@@ -774,7 +774,7 @@ def _get_disagg_worker_candidates(
                 model_path=model_path,
                 model_config=point_mc,
                 backend_name=backend_name,
-                backend_version=database.version,
+                database=database,
             )
 
             for b in b_list:

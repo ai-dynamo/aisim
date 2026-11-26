@@ -2856,7 +2856,7 @@ class Task:
         runtime_config = self.build_runtime_config(batch_size=batch_size)
         database = self._load_database(self.system_name, self.backend_name, self.backend_version)
         backend = get_backend(self.backend_name, self.system_name, system_spec=getattr(database, "system_spec", None))
-        model = get_model(self.model_path, model_config, self.backend_name, database.version)
+        model = get_model(self.model_path, model_config, self.backend_name, database=database)
 
         backend_kwargs: dict[str, Any] = {}
         if self.max_seq_len is not None:
@@ -2966,7 +2966,7 @@ class Task:
         p_rt = self.build_runtime_config(batch_size=prefill_batch_size)
         p_db = self._load_database(self.prefill_system_name, self.prefill_backend_name, self.prefill_backend_version)
         p_backend = get_backend(self.prefill_backend_name)
-        p_model = get_model(self.prefill_model_path, p_mc, self.prefill_backend_name, p_db.version)
+        p_model = get_model(self.prefill_model_path, p_mc, self.prefill_backend_name, database=p_db)
 
         worker_kwargs: dict[str, Any] = {}
         if self.free_gpu_memory_fraction is not None:
@@ -3004,7 +3004,7 @@ class Task:
         d_rt = self.build_runtime_config(batch_size=decode_batch_size)
         d_db = self._load_database(self.decode_system_name, self.decode_backend_name, self.decode_backend_version)
         d_backend = get_backend(self.decode_backend_name)
-        d_model = get_model(self.decode_model_path, d_mc, self.decode_backend_name, d_db.version)
+        d_model = get_model(self.decode_model_path, d_mc, self.decode_backend_name, database=d_db)
 
         d_summary = predict_disagg_worker(
             model=d_model,

@@ -91,7 +91,7 @@ def agg_pareto(
                 model_path=model_path,
                 model_config=overwritten_model_config,
                 backend_name=backend_name,
-                backend_version=database.version,
+                database=database,
             )
             backend = get_backend(
                 backend_name,
