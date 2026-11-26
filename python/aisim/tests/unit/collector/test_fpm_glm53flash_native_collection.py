@@ -876,6 +876,56 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
     _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, reason)
 
 
+@pytest.mark.parametrize("fault", [None, "count", "mode", "order", "unavailable-values"])
+def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatch(tmp_path, fault):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[DECODE_POINTS[1]])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+
+    def add_discarded_attempt(record):
+        for accepted in record["repetitions"]:
+            accepted["attempt"] += 1
+        rejected = copy.deepcopy(record["repetitions"][0])
+        rejected.pop("role")
+        rejected.pop("repetition")
+        rejected.update(attempt=0, rejection_reason="recorded 3 native FPMs, expected 2")
+        record["rejected_repetitions"] = [rejected]
+        # One request decodes while the other is still preparing its prompt. The last receipt is absent.
+        first, second = rejected["fpms"]
+        rejected["fpms"].append(copy.deepcopy(second))
+        for fpm in rejected["fpms"]:
+            fpm["scheduled_requests"]["num_decode_requests"] = 1
+
+        def receipt(tokens, mode):
+            return dict(runtime_mode=mode, num_unpadded_tokens=tokens, num_padded_tokens=tokens, num_paddings=0)
+
+        for fpm, mode in zip(rejected["fpms"][:2], ("FULL", "PIECEWISE"), strict=True):
+            fpm["benchmark_sample"]["cudagraph"] = {"status": "observed", **receipt(1, mode)}
+        rejected["fpms"][-1]["benchmark_sample"]["cudagraph"] = {"status": "unavailable"}
+        rejected["prefill_chunks"] = [[[0, 4095]], [[0, 4095]]]
+        rejected["dispatches"] = [
+            receipt(4095, "NONE"),
+            receipt(1, "FULL"),
+            receipt(4096, "NONE"),
+            receipt(1, "PIECEWISE"),
+            None,
+        ]
+        rejected["scheduled_token_counts"] = [4095, 1, 4096, 1, 1]
+        if fault == "count":
+            first["benchmark_sample"]["cudagraph"].update(num_unpadded_tokens=1048576, num_padded_tokens=1048576)
+        elif fault == "mode":
+            first["benchmark_sample"]["cudagraph"]["runtime_mode"] = "NONE"
+        elif fault == "order":
+            rejected["dispatches"][1], rejected["dispatches"][3] = rejected["dispatches"][3], rejected["dispatches"][1]
+        elif fault == "unavailable-values":
+            rejected["fpms"][-1]["benchmark_sample"]["cudagraph"]["num_unpadded_tokens"] = 1
+
+    _check_altered_repetition(
+        tmp_path, cell, payload, artifact, add_discarded_attempt, "contradict|unavailable" if fault else None
+    )
+
+
 @pytest.mark.parametrize("records_counts", [True, False])
 def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_path, records_counts):
     cell = glm_cell("decode")
@@ -1034,8 +1084,11 @@ def _check_altered_repetition(tmp_path, cell, payload, artifact, change, expecte
     _rewrite_sidecar(payload, sidecar, [line])
     payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
     artifact.write_text(json.dumps(payload))
-    with pytest.raises(ValueError, match=expected):
-        database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
+    if expected is None:
+        assert len(database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)) == 1
+    else:
+        with pytest.raises(ValueError, match=expected):
+            database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
 
 
 def _swap_the_row_digests(payload: dict, _sidecar: Path) -> None:

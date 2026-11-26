@@ -473,6 +473,9 @@ def _producer_receipt(cell: FPMCell, raw_root: Path, *, plan_sha256: str, attemp
     return expected._asdict()
 
 
+_DISPATCH_FIELDS = ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
+
+
 def _valid_dispatch(receipt: object) -> bool:
     if not isinstance(receipt, dict) or receipt.get("runtime_mode") not in ("NONE", "PIECEWISE", "FULL"):
         return False
@@ -515,7 +518,7 @@ def _observed_forward(sample: dict, wall_time: float, *, glm: bool, path: Path) 
             "benchmark_sample.cudagraph.status of a GLM-5.3-Flash producer sample must be observed: "
             f"expected 'observed', found {graph['status']!r}: {path}"
         )
-    values = [graph.get(name) for name in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")]
+    values = [graph.get(name) for name in _DISPATCH_FIELDS]
     if graph["status"] == "unavailable":
         if any(value is not None for value in values):
             raise ValueError("unavailable graph observation contains observed values")
@@ -523,6 +526,10 @@ def _observed_forward(sample: dict, wall_time: float, *, glm: bool, path: Path) 
     elif not _valid_dispatch(graph):
         raise ValueError("benchmark_sample has invalid observed graph dispatch or padding")
     return timing["basis"], graph, reasons
+
+
+def _same_glm_dispatch(graph: dict, receipt: dict) -> bool:
+    return all(_same(graph.get(key), receipt.get(key)) for key in _DISPATCH_FIELDS)
 
 
 def _glm_scheduled_counts(stage: dict, path: Path) -> list | None:
@@ -549,7 +556,7 @@ def _glm_scheduled_counts(stage: dict, path: Path) -> list | None:
 
 def _validate_glm_chunks(
     stage: dict, path: Path, point: dict, *, counts: list | None = None, seed: bool = False
-) -> None:
+) -> list[tuple[int, int]] | None:
     chunks = stage.get("prefill_chunks", [])
     if not isinstance(chunks, list) or any(
         not isinstance(step, list)
@@ -631,26 +638,20 @@ def _validate_glm_chunks(
                 raise ValueError(f"GLM prefill forward has an invalid count of decode requests: {path}")
             minimums[pos] = maximums[pos] = total + decodes
 
-    if counts is not None:
-        # A one-token prefill request finishes as soon as its prompt runs. In an accepted
-        # decode attempt every pure decode output is an FPM; the caller removed those two outputs.
-        if point["point_type"] == "prefill" or "repetition" in stage:
-            if len(counts) != len(chunks) or any(
+    bounds = list(zip(minimums, maximums, strict=True))
+    # The caller removed both pure-decode outputs of an accepted decode attempt.
+    if (
+        counts is not None
+        and (point["point_type"] == "prefill" or "repetition" in stage)
+        and (
+            len(counts) != len(chunks)
+            or any(
                 count is not None and not low <= count <= high
-                for count, low, high in zip(counts, minimums, maximums, strict=False)
-            ):
-                raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
-        else:
-            # A discarded decode attempt can interleave extra pure-decode outputs with its chunks.
-            positions = {0}
-            for count in counts:
-                following = set(positions) if count is None or count <= point["batch_size"] else set()
-                for pos in positions:
-                    if pos < len(chunks) and (count is None or minimums[pos] <= count <= maximums[pos]):
-                        following.add(pos + 1)
-                positions = following
-            if len(chunks) not in positions:
-                raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
+                for count, (low, high) in zip(counts, bounds, strict=False)
+            )
+        )
+    ):
+        raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
 
     accepted_decode = point["point_type"] == "decode" and "repetition" in stage
     if accepted_decode or (seed and limits is not None):
@@ -671,6 +672,88 @@ def _validate_glm_chunks(
             )
         ):
             raise ValueError(f"GLM preparation chunks must finish the prompts recorded for this stage: {path}")
+
+    return bounds
+
+
+def _validate_glm_rejected_outputs(
+    stage: dict, path: Path, point: dict, counts: list | None, chunks: list[tuple[int, int]] | None
+) -> None:
+    """Match the producer's ordered FPMs and prefill chunks to the same positive scheduler outputs."""
+    events = None
+    decode = point["point_type"] == "decode"
+    if "fpms" in stage:
+        if not isinstance(stage["fpms"], list):
+            raise ValueError(f"invalid GLM rejected forwards: {path}")
+        events = []
+        for fpm in stage["fpms"]:
+            scheduled = fpm.get("scheduled_requests") if isinstance(fpm, dict) else None
+            if not isinstance(scheduled, dict):
+                raise ValueError(f"GLM rejected forward lacks its scheduled requests: {path}")
+            prefills, decodes, fresh = (
+                scheduled.get(k) for k in ("num_prefill_requests", "num_decode_requests", "sum_prefill_tokens")
+            )
+            if (
+                any(type(n) is not int or n < 0 for n in (prefills, decodes, fresh))
+                or not 0 < prefills + decodes <= point["batch_size"]
+                or (prefills == 0) != decode
+                or (fresh == 0) != decode
+            ):
+                raise ValueError(f"GLM rejected forward contradicts its recorded phase or scheduled requests: {path}")
+            tokens = fresh + decodes
+            sample = fpm.get("benchmark_sample")
+            graph = sample.get("cudagraph") if isinstance(sample, dict) else None
+            if graph is not None and (
+                not isinstance(graph, dict) or graph.get("status") not in ("observed", "unavailable")
+            ):
+                raise ValueError(f"invalid GLM rejected forward graph observation: {path}")
+            observed = graph if graph is not None and graph["status"] == "observed" else None
+            if graph is not None and observed is None and any(graph.get(key) is not None for key in _DISPATCH_FIELDS):
+                raise ValueError(f"GLM unavailable rejected forward dispatch contains observed values: {path}")
+            if observed is not None and (not _valid_dispatch(observed) or observed["num_unpadded_tokens"] != tokens):
+                raise ValueError(f"GLM rejected forward contradicts its dispatch or scheduled token count: {path}")
+            events.append((tokens, observed))
+    if counts is None or (events is None and chunks is None):
+        return
+    receipts = stage.get("dispatches")
+
+    def matches(event: int, output: int) -> bool:
+        if events is None:
+            return counts[output] is None or counts[output] <= point["batch_size"]
+        if event >= len(events):
+            return False
+        tokens, observed = events[event]
+        receipt = receipts[output] if receipts is not None else None
+        return (counts[output] is None or counts[output] == tokens) and (
+            receipt is None or observed is None or _same_glm_dispatch(observed, receipt)
+        )
+
+    if not decode:
+        # A one-token prefill request has one FPM for every positive scheduler output.
+        if events is not None and (len(events) != len(counts) or any(not matches(i, i) for i in range(len(counts)))):
+            raise ValueError(f"GLM rejected prefill forward contradicts its dispatch: {path}")
+        return
+
+    # Each positive output is either a prefill/mixed step (one chunk list), or pure decode
+    # (one FPM). Equal token counts can make the ordering ambiguous, especially with a missing receipt.
+    positions = {0}
+    for output, count in enumerate(counts):
+        following = set()
+        for chunk in positions:
+            if matches(output - chunk, output):
+                following.add(chunk)
+            if chunks is None or (
+                chunk < len(chunks) and (count is None or chunks[chunk][0] <= count <= chunks[chunk][1])
+            ):
+                following.add(chunk + 1)
+        positions = following
+    if not any(
+        (chunks is None or chunk == len(chunks)) and (events is None or len(counts) - chunk == len(events))
+        for chunk in positions
+    ):
+        raise ValueError(
+            f"GLM rejected decode forwards or chunks contradict their dispatches or scheduled token counts: {path}"
+        )
 
 
 def _validate_glm_repetitions(
@@ -715,27 +798,13 @@ def _validate_glm_repetitions(
         raise ValueError(f"{error}: invalid rejected repetitions: {path}")
     rejected_ids = set()
     for attempt in rejected:
-        _validate_glm_chunks(attempt, path, point, counts=_glm_scheduled_counts(attempt, path))
+        counts = _glm_scheduled_counts(attempt, path)
+        chunks = _validate_glm_chunks(attempt, path, point, counts=counts)
+        _validate_glm_rejected_outputs(attempt, path, point, counts, chunks)
         attempt_id = attempt.get("attempt")
         if type(attempt_id) is not int or attempt_id < 0 or attempt_id in rejected_ids:
             raise ValueError(f"{error}: invalid or duplicate rejected attempt ID: {path}")
         rejected_ids.add(attempt_id)
-        if point["point_type"] == "prefill" and "fpms" in attempt and "dispatches" in attempt:
-            fpms, dispatches = attempt["fpms"], attempt["dispatches"]
-            if not isinstance(fpms, list) or len(fpms) != len(dispatches):
-                raise ValueError(f"{error}: rejected prefill forwards and dispatches must align: {path}")
-            for fpm, receipt in zip(fpms, dispatches, strict=True):
-                graph = (fpm.get("benchmark_sample") or {}).get("cudagraph") if isinstance(fpm, dict) else None
-                if (
-                    receipt is not None
-                    and isinstance(graph, dict)
-                    and graph.get("status") == "observed"
-                    and any(
-                        not _same(graph.get(key), receipt[key])
-                        for key in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
-                    )
-                ):
-                    raise ValueError(f"{error}: rejected prefill forward contradicts its dispatch: {path}")
     previous_forward, previous_output = previous
     previous_attempt = -1
     for index, repetition in enumerate(repetitions):
@@ -800,10 +869,7 @@ def _validate_glm_repetitions(
             if (
                 basis != ("schedule_to_output" if step == 0 else "inter_output")
                 or not isinstance(receipt, dict)
-                or any(
-                    not _same(receipt.get(key), graph[key])
-                    for key in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
-                )
+                or not _same_glm_dispatch(graph, receipt)
             ):
                 raise ValueError(f"{error}: invalid timing basis or dispatch receipt for {role} {index}: {path}")
             # Only newly scheduled tokens reach the GPU. The first decode step and the steady step each
