@@ -1855,31 +1855,32 @@ impl AicTimingModel {
     fn operation_part_evidence(
         &self,
         operations: &[crate::perfmodel::engine::diagnostics::StaticOperationDiagnostics],
-        fractions: impl Iterator<Item = f64>,
+        fractions: impl Iterator<Item = f64> + Clone,
     ) -> Result<Option<ValidatedTimingPhase>> {
-        let operations = operations
+        let entries = operations
             .iter()
             .zip(fractions)
-            .filter(|(_, fraction)| *fraction > 0.0)
-            .map(|(entry, fraction)| {
-                let mut operation = TimingOperationEvidence::new(
-                    entry.name.clone(),
-                    entry.latency_ms * fraction,
-                    Some(entry.energy_wms * fraction),
-                    TimingEvidenceSource::from_provider(entry.source.clone()),
-                )?;
-                if self.diagnostic_model.is_some() {
-                    let mut details = entry.details.clone();
-                    if let Some(sol) = &mut details.sol {
-                        sol.latency_ms *= fraction;
-                        sol.math_ms *= fraction;
-                        sol.memory_ms *= fraction;
-                    }
-                    operation.details = Some(details);
+            .filter(|(_, fraction)| *fraction > 0.0);
+        // A rank-memo entry keeps this list: size it once, to what it holds.
+        let mut operations = Vec::with_capacity(entries.clone().count());
+        for (entry, fraction) in entries {
+            let mut operation = TimingOperationEvidence::new(
+                entry.name.clone(),
+                entry.latency_ms * fraction,
+                Some(entry.energy_wms * fraction),
+                TimingEvidenceSource::from_native(&entry.source),
+            )?;
+            if self.diagnostic_model.is_some() {
+                let mut details = entry.details.clone();
+                if let Some(sol) = &mut details.sol {
+                    sol.latency_ms *= fraction;
+                    sol.math_ms *= fraction;
+                    sol.memory_ms *= fraction;
                 }
-                Ok(operation)
-            })
-            .collect::<Result<Vec<_>>>()?;
+                operation.details = Some(details);
+            }
+            operations.push(operation);
+        }
         if operations.is_empty() {
             return Ok(None);
         }
@@ -10728,6 +10729,11 @@ mod tests {
                     .derived(|_| -> Result<RankEvidence> { bail!("the entry keeps no evidence") })
                     .unwrap();
                 assert!(Arc::ptr_eq(&parts[0].0, phase));
+                if capture {
+                    // Named operations are kept in a list of their size.
+                    let operations = &phase.to_phase().operations;
+                    assert_eq!(operations.capacity(), operations.len());
+                }
             }
             kept.push(Arc::clone(&evidence[0].0));
         }

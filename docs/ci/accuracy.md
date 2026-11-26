@@ -104,8 +104,14 @@ No PostgreSQL client or database dump is needed. Artifact upload
 uses the output directory so the runner container hook remaps the full path.
 
 Each branch prepares measurements once and runs four independent prediction
-shards, with two CPU workers per shard and `fail-fast: false`. Results and
-incremental checkpoints are encrypted before upload and retained for seven days.
+shards, with two CPU workers per shard and `fail-fast: false`. For revisions
+with an operation-latency dataset pin, the trusted measurement job reads the pin
+from the evaluated source as data and downloads its public operation tables once.
+Each shard restores that cache from the encrypted measurement artifact and uses
+its installed wheel to verify and assemble the systems directory offline. Both
+predictors reuse that directory within each shard. Older releases use the tables
+in their wheels. Results and incremental checkpoints are encrypted before upload
+and retained for seven days.
 Actions artifacts in a public repository are not private. AES-256-GCM encryption
 uses a key derived from the HF secret and workflow identity; it authenticates each
 relative filename. Source rows and resolved evidence are never uploaded in plaintext.

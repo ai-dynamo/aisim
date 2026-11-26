@@ -88,6 +88,9 @@ parallelism, at most twice. Completed candidates are retained. Workers must be
 reaped before another batch can start. Persistent pressure produces an explicit
 `resource_limited` candidate and the sweep continues with other candidates.
 A sudden jump past the supervisor limit stops the entire execution tree.
+A run that is not ready within `initialization_timeout_seconds` is stopped with
+exit status 124; that deadline restarts after a first-use download of the
+default operation data.
 
 `resource-runtime.json` records observed peak RSS, effective budgets and the
 termination outcome. Fields that could not be observed because resource discovery

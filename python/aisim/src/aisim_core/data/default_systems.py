@@ -10,7 +10,7 @@ Operation tables are no longer packaged. The default systems root is composed on
    makes no network call, a cold one downloads and hash-verifies),
 2. write one ``systems/`` root next to it with :func:`~aisim_core.data.op_tree.load_op_latency_tree`, which
    also copies the packaged specs, profiles and version tables,
-3. return that root; later processes reuse it.
+3. return that root; later processes reuse it without reading the dataset cache again.
 
 Overrides, all explicit and never silently replaced by other data:
 
@@ -31,9 +31,11 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from aisim_core.data.ensure import DEFAULT_MAX_BYTES, DataTooLargeError, MissingDataError
@@ -59,6 +61,8 @@ from aisim_core.data.systems import PACKAGED_SYSTEMS_DIR
 PIN_FILE = Path(__file__).with_name("op_latency_pin.json")
 DATASET_ENV = "AISIM_OP_LATENCY_DATASET"
 LOCAL_ENV = "AISIM_OP_LATENCY_LOCAL"
+# A supervising process names a file here; it exists for as long as a first-use download runs.
+DOWNLOAD_MARKER_ENV = "_AISIM_DOWNLOAD_MARKER"
 MARKER = ".aisim-default-systems.json"
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _LOOKUP_FILES = tuple(f"{DATA_PREFIX}/{name}.parquet" for name in (REUSE_MANIFEST_NAME, QUERY_VERSIONS_NAME))
@@ -135,6 +139,7 @@ def _compose(
     transport: Transport | None,
 ) -> Path:
     cache = Cache(cache_dir)
+    tree: Path | None = None
     if local is not None:
         tree = Path(local)
         index = tree / "catalog" / "dataset.json"
@@ -143,12 +148,16 @@ def _compose(
         name = "local-" + hashlib.sha256(index.read_bytes()).hexdigest()[:16]
         source = {"source": "local", "root": local}
     else:
-        tree, sha = _ensure_tree(repo, revision, cache, offline, max_bytes, transport)
+        sha = revision
+        if not _FULL_SHA.fullmatch(revision):  # a branch or tag: only the dataset knows its commit
+            tree, sha = _ensure_tree(repo, revision, cache, offline, max_bytes, transport)
         name = f"{repo.replace('/', '__')}-{sha}"
         source = {"source": "hf", "repo": repo, "revision": sha}
     destination = cache.root / "systems" / f"{name}-{_specs_fingerprint()}"
     if (destination / MARKER).is_file():
         return destination
+    if tree is None:  # a full commit SHA names its root, so the dataset is fetched and verified only to build it
+        tree, _ = _ensure_tree(repo, revision, cache, offline, max_bytes, transport)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(dir=destination.parent, prefix=".compose-")) / "systems"
     try:
@@ -184,14 +193,31 @@ def _ensure_tree(
         from aisim_core.data.fetch import HfTransport
 
         transport = HfTransport()
+    print(f"aisim: fetching op-latency data {where} into {cache.root}; a first use can take minutes", file=sys.stderr)
     try:
-        return _fetch_all(repo, revision, cache, offline=False, max_bytes=max_bytes, transport=transport)
+        with _download_marker():
+            return _fetch_all(repo, revision, cache, offline=False, max_bytes=max_bytes, transport=transport)
     except BudgetExceededError as exc:
         raise DataTooLargeError(
             exc.plan.uncached_bytes, max_bytes, f"aisim data fetch --category op-latency --repo {repo}"
         ) from exc
     except (DataFetchError, SelectionError, OSError) as exc:
         raise MissingDataError(f"cannot obtain op-latency data {where}: {exc}", source=where) from exc
+
+
+@contextmanager
+def _download_marker() -> Iterator[None]:
+    """Hold the supervisor's marker file, when one is named, while a fetch from the Hub runs."""
+    marker = os.environ.get(DOWNLOAD_MARKER_ENV)
+    if marker:
+        with suppress(OSError):  # a signal to the supervisor only: the download never depends on it
+            Path(marker).touch()
+    try:
+        yield
+    finally:
+        if marker:
+            with suppress(OSError):
+                Path(marker).unlink()
 
 
 def _download(transport: Transport, cache: Cache, repo: str, sha: str, f: PlannedFile) -> None:
