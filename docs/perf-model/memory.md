@@ -313,9 +313,11 @@ read `transfer_bytes_per_block`.
   the order of the allocation plan, and the length of a region is the page of
   its layer. Layers of different groups can share a region, and an MLA layer
   then sets its length.
-  For one block, the MLA attention group reads every region. A ring group
-  reads the regions of its own layers. A Mamba group reads its state bytes
-  without padding in every region of a Mamba layer. See vLLM v0.33.0
+  For one block, the MLA attention group reads every region. Each ring group
+  reads every registered region that contains a ring layer. With multiple
+  ring groups, the connector counts the same regions once per group. A Mamba
+  group reads its state bytes without padding in every region of a Mamba layer.
+  See vLLM v0.33.0
   [`base_worker.py:1744-1766`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1744-L1766),
   [`:1774-1786`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1774-L1786),
   [`:237-278`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L237-L278)
@@ -386,11 +388,11 @@ read `transfer_bytes_per_block`.
   and
   [`:155-208`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L155-L208).
 
-  A live run measured the values of GLM-5.3-Flash at TP 4 with an fp8 KV cache
-  on GB300: 21,978,496 bytes for the attention group, 92,288 for the ring and
-  9,768,960 for each KDA state group. The import of a probe record of the same
-  model, TP size, data type and GPU type gives these values. Its region table
-  equals the table that the connector logged. See
+  A live run of GLM-5.3-Flash at TP 4 with an fp8 KV cache on GB300 measured
+  21,978,496 bytes per block per TP rank for the attention group, 92,288 for
+  the single ring group and 9,768,960 for each KDA state group. The import of
+  a probe record of the same model, TP size, data type and GPU type gives
+  these values. Its region table equals the table that the connector logged. See
   [`nixl-pd-transfer-bytes-20261117`](../../benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md).
   For another TP size or KV cache data type of the same cache shape, the
   import computes the value from that record by the same rule. No run
