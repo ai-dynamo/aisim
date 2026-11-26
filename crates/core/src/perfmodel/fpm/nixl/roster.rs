@@ -27,6 +27,189 @@ pub(super) fn sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
+/// A finalized indexed collection records the formal index separately from the draft probe.
+pub(super) fn validate_formal_index(cell: &Value, manifest: &Value) -> Result<(), AicError> {
+    let Some(index) = cell.get("observations_index") else {
+        return Ok(());
+    };
+    let invalid_index = || {
+        AicError::InvalidEngineConfig(
+            "conflicting formal observations index in grouped worker roster".into(),
+        )
+    };
+    let compatibility = &manifest["runtime_compatibility"];
+    for (field, key) in [
+        ("observations_index", "path"),
+        ("observations_sha256", "sha256"),
+    ] {
+        if compatibility
+            .get(field)
+            .is_some_and(|value| *value != index[key])
+        {
+            return Err(invalid_index());
+        }
+    }
+    if let Some(inventory) = manifest.get("source_artifacts") {
+        let mut matches = inventory
+            .as_array()
+            .ok_or_else(invalid_index)?
+            .iter()
+            .filter(|file| file["path"] == index["path"]);
+        if matches
+            .next()
+            .is_none_or(|file| file["sha256"] != index["sha256"])
+            || matches.next().is_some()
+        {
+            return Err(invalid_index());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_probe(probe: &Value) -> Result<(), AicError> {
+    let index = std::path::Path::new(
+        probe["observations_index"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(invalid)?,
+    );
+    let sources = probe["source_artifacts"].as_array().ok_or_else(invalid)?;
+    let resources = &probe["observed_resources"];
+    if ["checkpoint", "configuration"]
+        .iter()
+        .any(|key| probe[key].as_str().is_none_or(str::is_empty))
+        || ["model_metadata", "user_overrides"]
+            .iter()
+            .any(|key| !probe[key].is_object())
+        || resources["runtime_memory"]["kv_cache_bytes"]
+            .as_u64()
+            .is_none_or(|n| n == 0)
+        || resources["cache_groups"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        || sources.iter().any(|r| {
+            r["path"].as_str().is_none_or(str::is_empty)
+                || !r["sha256"].as_str().is_some_and(sha256)
+        })
+        || ![
+            index.to_path_buf(),
+            index.with_file_name("launch.json"),
+            index.with_file_name("model-config.json"),
+        ]
+        .iter()
+        .all(|path| {
+            sources
+                .iter()
+                .any(|r| r["path"].as_str().map(std::path::Path::new) == Some(path.as_path()))
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn rank_capacity(entry: &Value) -> Option<u64> {
+    let mut minimum = None;
+    for row in entry["rank_capacities"].as_array()? {
+        let value = row["kv_cache_bytes"].as_u64().filter(|&n| n > 0)?;
+        minimum = Some(minimum.map_or(value, |m: u64| m.min(value)));
+    }
+    minimum
+}
+
+fn first_phase_settings(entry: &Value) -> Option<&Value> {
+    let phases = entry["prefix_caching"].as_object()?;
+    phases.get("prefill").or_else(|| phases.get("decode"))
+}
+
+const PREFIX_FIELDS: [&str; 3] = [
+    "enable_prefix_caching",
+    "hash_block_size_tokens",
+    "mamba_cache_mode",
+];
+
+fn record_prefix(expected: &mut Value, memory: &Value) -> Result<(), AicError> {
+    for key in PREFIX_FIELDS {
+        if let Some(value) = memory.get(key).filter(|v| !v.is_null()) {
+            if expected.get(key).is_some_and(|old| old != value) {
+                return Err(super::conflict(key));
+            }
+            expected[key] = value.clone();
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn record_cell_memory(
+    cell: &Value,
+    entry: &Value,
+    compatibility: &Value,
+    expected: &mut Value,
+) -> Result<Option<u64>, AicError> {
+    let memory = &cell["runtime_memory"];
+    let observed = rank_capacity(entry);
+    let saved = memory["kv_cache_bytes"].as_u64();
+    let formal = (entry["source"] == "runtime_observations")
+        .then(|| compatibility["observed_capacity_bytes"].as_u64())
+        .flatten();
+    for (a, b) in [(observed, saved), (formal, observed.or(saved))] {
+        if a.zip(b).is_some_and(|(a, b)| a != b) {
+            return Err(super::conflict("kv_cache_bytes"));
+        }
+    }
+    if formal
+        .zip(compatibility["accepted_capacity_bytes"].as_u64())
+        .is_some_and(|(seen, accepted)| seen < accepted)
+    {
+        return Err(super::conflict("kv_cache_bytes"));
+    }
+    record_prefix(expected, memory)?;
+    if let Some(phase) = first_phase_settings(entry) {
+        record_prefix(expected, phase)?;
+    }
+    Ok(observed.or(saved).or(formal))
+}
+
+/// The importer keeps the first collected phase's settings and the minimum usable rank
+/// capacity. A registered draft can carry a separately labelled capacity override.
+pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
+    let mut expected = serde_json::json!({});
+    let capacity = if matches!(
+        evidence["schema_version"].as_str(),
+        Some("aisimulate-onboarding-runtime-probe/v1" | "aisimulate-onboarding-runtime-probe/v2")
+    ) {
+        let memory = &evidence["observed_resources"]["runtime_memory"];
+        record_prefix(&mut expected, memory)?;
+        let recorded = memory["kv_cache_bytes"].as_u64();
+        if let Some(change) = evidence["user_overrides"].get("runtime_memory.kv_cache_bytes") {
+            if change["observed"].as_u64() != recorded
+                || change["source"] != "user override; assumption, not a runtime measurement"
+            {
+                return Err(super::conflict("kv_cache_bytes"));
+            }
+            Some(
+                change["value"]
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| super::conflict("kv_cache_bytes"))?,
+            )
+        } else {
+            recorded
+        }
+    } else if identified_source(evidence) {
+        if let Some(phase) = first_phase_settings(evidence) {
+            record_prefix(&mut expected, phase)?;
+        }
+        rank_capacity(evidence)
+    } else {
+        None
+    };
+    if let Some(bytes) = capacity {
+        expected["kv_cache_bytes"] = Value::from(bytes);
+    }
+    Ok(expected)
+}
+
 fn file_references(files: &Value, path_key: &str) -> Result<Value, AicError> {
     let mut sorted = BTreeMap::new();
     for file in files.as_array().ok_or_else(invalid)? {
@@ -53,6 +236,7 @@ pub(crate) fn digest(
     source: Option<&str>,
     inventory: &Value,
     draft: bool,
+    cell: Option<&Value>,
 ) -> Result<String, AicError> {
     let formal = entry["source"] == "vllm_initialized_cache";
     let source = source
@@ -107,6 +291,16 @@ pub(crate) fn digest(
         if let Some(refs) = inventory.get(key) {
             files.insert(key.into(), file_references(refs, path_key)?);
         }
+    }
+    if let Some(resources) = cell {
+        let mut resources = resources.as_object().cloned().ok_or_else(invalid)?;
+        resources.remove("provenance");
+        resources
+            .get_mut("runtime_memory")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(invalid)?
+            .remove("provenance");
+        files.insert("resources".into(), Value::Object(resources));
     }
     let mut contents = serde_json::json!([source, observation, files]);
     contents.sort_all_objects();
@@ -764,15 +958,15 @@ mod tests {
         let second = json!({"phase":"decode","tp_rank":1,"dp_rank":0,"kv_cache_bytes":128});
         let mut cell = json!({"rank_capacities":[first,second],"observations_index":{"path":"index","sha256":source},
             "artifacts":[{"path":"worker","kind":"worker","sha256":source}]});
-        let original = digest(&cell, Some(&source), &json!({}), false).unwrap();
+        let original = digest(&cell, Some(&source), &json!({}), false, None).unwrap();
         cell["rank_capacities"].as_array_mut().unwrap().reverse();
         assert_eq!(
-            digest(&cell, Some(&source), &json!({}), false).unwrap(),
+            digest(&cell, Some(&source), &json!({}), false, None).unwrap(),
             original
         );
         cell["rank_capacities"][0]["phase"] = json!("prefill");
         assert_ne!(
-            digest(&cell, Some(&source), &json!({}), false).unwrap(),
+            digest(&cell, Some(&source), &json!({}), false, None).unwrap(),
             original
         );
     }

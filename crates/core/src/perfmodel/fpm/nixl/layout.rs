@@ -188,6 +188,20 @@ pub(super) fn possible_gpu(worker: &Worker) -> u8 {
     })
 }
 
+pub(super) fn push_gpu(worker: &Worker, single_head_mla: bool) -> u8 {
+    let layouts = possible_gpu(worker);
+    if !single_head_mla {
+        return layouts;
+    }
+    // The one latent KV head has no stride effect. Moving H preserves the order of L, B, N and C.
+    const LAYER_FIRST: u8 = 0b000111;
+    const BLOCK_FIRST: u8 = 0b111000;
+    [LAYER_FIRST, BLOCK_FIRST]
+        .into_iter()
+        .filter(|class| class & layouts != 0)
+        .fold(0, |all, class| all | class)
+}
+
 #[derive(Default)]
 struct Engine {
     workers: BTreeMap<u64, Worker>,
@@ -343,7 +357,7 @@ fn view_dimensions(
     layers: usize,
     view: &Value,
     block_first: bool,
-) -> Option<[(u64, u64); 5]> {
+) -> Option<Result<[(u64, u64); 5], AicError>> {
     match allocation.get("host_resident") {
         Some(Value::Bool(false)) => {}
         None if block_first => {
@@ -369,16 +383,73 @@ fn view_dimensions(
     let layer_stride = stride(&allocation["layer_stride"]).or((layers == 1).then_some(0))?;
     let mut dims = [(layers as u64, layer_stride); 5];
     for (i, (size, step)) in shape.iter().zip(strides).enumerate() {
-        let size = size.as_u64()?;
+        let Some(size) = size.as_u64().filter(|&n| n > 0) else {
+            return Some(Err(conflict("kv_cache_layout tensor dimensions")));
+        };
         dims[i + 1] = (size, stride(step).or((size == 1).then_some(0))?);
     }
-    Some(dims)
+    Some(Ok(dims))
 }
 
 fn shared_spec(group: &Value) -> Option<&str> {
     group["spec_type"]
         .as_str()
         .filter(|name| known(name) && *name != UNIFORM_SPEC)
+}
+
+fn concrete_spec<'a>(group: &'a Value, name: &str) -> Option<&'a str> {
+    shared_spec(group).or_else(|| shared_spec(&group["layer_specs"][name]))
+}
+
+/// The hybrid collector records this marker from every concrete layer spec in the group.
+pub(super) fn prefix_cacheable(group: &Value) -> Option<bool> {
+    let specs = group["layer_specs"].as_object()?;
+    let layers = group["layer_names"]
+        .as_array()
+        .filter(|names| !names.is_empty() && names.len() == specs.len())?;
+    let mut cacheable = true;
+    for layer in layers {
+        match specs.get(layer.as_str()?)?["spec_type"]
+            .as_str()?
+            .strip_prefix("vllm.v1.kv_cache_interface.")?
+        {
+            "CircularBufferSpec" => cacheable = false,
+            "FullAttentionSpec"
+            | "MLAAttentionSpec"
+            | "SinkFullAttentionSpec"
+            | "HiddenStateCacheSpec"
+            | "SlidingWindowSpec"
+            | "MambaSpec" => {}
+            _ => return None,
+        }
+    }
+    Some(cacheable)
+}
+
+pub(super) fn single_head_mla(group: &Value) -> bool {
+    let mla = |spec: &Value| {
+        matches!(
+            spec["spec_type"].as_str(),
+            Some(
+                "vllm.v1.kv_cache_interface.MLAAttentionSpec"
+                    | "vllm.v1.kv_cache_interface.SlidingWindowMLASpec"
+            )
+        ) && spec
+            .get("num_kv_heads")
+            .is_none_or(|heads| heads.is_null() || *heads == 1)
+    };
+    if group["spec_type"] == UNIFORM_SPEC {
+        return group["layer_names"].as_array().is_some_and(|names| {
+            !names.is_empty()
+                && names
+                    .iter()
+                    .all(|name| name.as_str().is_some_and(|n| mla(&group["layer_specs"][n])))
+        });
+    }
+    mla(group)
+        && group["layer_specs"]
+            .as_object()
+            .is_none_or(|layers| layers.values().all(mla))
 }
 
 pub(super) fn check_layer_specs(group: &Value) -> Result<(), AicError> {
@@ -439,6 +510,66 @@ pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)
         })
 }
 
+/// Layer-major, disjoint ordinary caches register every layer's buffer under its own name.
+/// Packed rows, shared views and incomplete captures do not establish that region set.
+pub(super) fn registered_layers(rank: &Value) -> Option<BTreeSet<String>> {
+    let cache = &rank["cache"];
+    let groups = cache["groups"].as_array()?;
+    let mut names = BTreeSet::new();
+    for group in groups {
+        let layers = group["layer_names"].as_array()?;
+        if group["kind"] != "attention"
+            || layers.is_empty()
+            || !decoder_layers(group).all(|(_, ordinary)| ordinary)
+        {
+            return None;
+        }
+        for layer in layers {
+            if !names.insert(layer.as_str()?.to_owned()) {
+                return None;
+            }
+        }
+    }
+    if cache["layer_tensors"].as_object()?.len() != names.len() {
+        return None;
+    }
+    let blocks = cache["num_blocks"].as_u64().filter(|&n| n > 0)?;
+    let mut placed = BTreeSet::new();
+    let mut ranges = Vec::new();
+    for allocation in cache["tensor_allocations"].as_array()? {
+        let layers = allocation["layers"].as_array()?;
+        let block_stride = allocation["block_stride"].as_u64().filter(|&n| n > 0)?;
+        if allocation["host_resident"] != false || layers.is_empty() {
+            return None;
+        }
+        for layer in layers {
+            let name = layer.as_str()?;
+            let view = &cache["layer_tensors"][name];
+            let start = view["storage_offset_bytes"].as_u64()?;
+            if view["block_axis"] != 0
+                || allocation["storage_id"].as_str()? != view["storage_id"].as_str()?
+                || view["stride_bytes"][0] != block_stride
+                || !placed.insert(name.to_owned())
+            {
+                return None;
+            }
+            ranges.push((
+                view["storage_id"].as_str()?,
+                start,
+                start.checked_add(blocks.checked_mul(block_stride)?)?,
+            ));
+        }
+    }
+    ranges.sort_unstable();
+    if ranges
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[0].2 > pair[1].1)
+    {
+        return None;
+    }
+    (!names.is_empty() && names == placed).then_some(names)
+}
+
 pub(super) fn from_strides(
     rank: &Value,
     heads: &mut BTreeMap<String, HeadGeometry>,
@@ -464,6 +595,14 @@ pub(super) fn from_strides(
             })
             .collect::<BTreeMap<_, _>>()
     });
+    let recorded_specs: BTreeMap<_, _> = cache["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|g| {
+            decoder_layers(g).filter_map(move |(name, _)| Some((name, concrete_spec(g, name)?)))
+        })
+        .collect();
     // Only a decoder cache spec supplies logical KV geometry. An Inkling window or an MLA
     // indexer may carry similarly named dimensions for different data.
     for group in rank["raw_cache_config"]["groups"]
@@ -473,6 +612,11 @@ pub(super) fn from_strides(
     {
         check_layer_specs(group)?;
         for (name, ordinary) in decoder_layers(group) {
+            if let Some(raw) = concrete_spec(group, name)
+                && recorded_specs.get(name).is_some_and(|saved| *saved != raw)
+            {
+                return Err(conflict("cache group spec_type"));
+            }
             if !ordinary
                 || attention_layers
                     .as_ref()
@@ -503,6 +647,17 @@ pub(super) fn from_strides(
     ) else {
         return Ok(None);
     };
+    let storage_sizes: BTreeMap<_, _> = cache["storages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|storage| {
+            Some((
+                storage["storage_id"].as_str()?,
+                storage["size_bytes"].as_u64()?,
+            ))
+        })
+        .collect();
     let mut candidates = LAYOUTS.to_vec();
     let mut measured = false;
     for allocation in allocations {
@@ -530,6 +685,24 @@ pub(super) fn from_strides(
                     // Opaque views contribute no constraint on the initialized layout.
                     continue;
                 };
+                let dims = dims?;
+                if let (Some(size), Some(start), Some(item)) = (
+                    view["storage_id"]
+                        .as_str()
+                        .and_then(|id| storage_sizes.get(id)),
+                    view["storage_offset_bytes"].as_u64(),
+                    view["element_size_bytes"].as_u64(),
+                ) {
+                    let end = dims[1..].iter().try_fold(
+                        u128::from(start) + u128::from(item),
+                        |end, &(count, stride)| {
+                            end.checked_add(u128::from(count - 1) * u128::from(stride))
+                        },
+                    );
+                    if end.is_none_or(|end| end > u128::from(*size)) {
+                        return Err(conflict("kv_cache_layout tensor storage bounds"));
+                    }
+                }
                 measured = true;
                 // Inkling packs several streams into C. Only an ordinary attention view describes KV heads.
                 if attention_layers
@@ -581,6 +754,46 @@ pub(super) fn from_strides(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn layer_names_require_complete_nonoverlapping_ordinary_buffers() {
+        let view = |start| json!({"storage_id":"s0","storage_offset_bytes":start,"block_axis":0,"stride_bytes":[16]});
+        let mut row = json!({"cache":{"num_blocks":2,
+            "groups":[{"kind":"attention","layer_names":["a","b"],"spec_type":"vllm.v1.kv_cache_interface.FullAttentionSpec"}],
+            "tensor_allocations":[{"storage_id":"s0","layers":["b","a"],"block_stride":16,"host_resident":false}],
+            "layer_tensors":{"a":view(0),"b":view(32)}}});
+        let names = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+        assert_eq!(registered_layers(&row), Some(names));
+        row["cache"]["layer_tensors"]["b"] = view(16);
+        assert!(registered_layers(&row).is_none());
+        row["cache"]["tensor_allocations"][0]["layers"] = json!(["a"]);
+        assert!(registered_layers(&row).is_none());
+    }
+
+    #[test]
+    fn ordinary_spec_and_view_must_agree_with_the_recorded_storage() {
+        let full = "vllm.v1.kv_cache_interface.FullAttentionSpec";
+        let mut rank = json!({"schema_version":"aisimulate-runtime-observation/v1",
+            "raw_cache_config":{"groups":[{"layer_names":["a"],"spec_type":full}]},
+            "cache":{"groups":[{"kind":"attention","layer_names":["a"],"spec_type":full}],
+            "tensor_allocations":[{"layers":["a"],"host_resident":false}],
+            "storages":[{"storage_id":"s","size_bytes":32}],
+            "layer_tensors":{"a":{"storage_id":"s","storage_offset_bytes":8,"element_size_bytes":2,
+                "block_axis":0,"shape":[2,1,2,2],"stride_bytes":[16,8,4,2]}}}});
+        let project = |rank: &Value| from_strides(rank, &mut BTreeMap::new());
+        assert!(project(&rank).is_ok());
+        rank["cache"]["groups"][0]["spec_type"] =
+            json!("vllm.v1.kv_cache_interface.MLAAttentionSpec");
+        assert!(project(&rank).is_err());
+        rank["cache"]["groups"][0]["spec_type"] = json!(full);
+        rank["cache"]["layer_tensors"]["a"]["shape"][2] = json!(-2);
+        assert!(project(&rank).is_err());
+        rank["cache"]["layer_tensors"]["a"]["shape"][2] = json!(2);
+        rank["cache"]["layer_tensors"]["a"]["stride_bytes"][0] = json!(32);
+        assert!(project(&rank).is_err());
+        rank["cache"].as_object_mut().unwrap().remove("storages");
+        assert!(project(&rank).is_ok());
+    }
 
     #[test]
     fn tensor_strides_preserve_every_feasible_physical_order() {

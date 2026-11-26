@@ -271,7 +271,7 @@ def _merge_resources(
                 for artifact in evidence["artifacts"]
             ]
             if current:
-                worker_digests.append(_worker_observation_digest(evidence, evidence, manifest))
+                worker_digests.append(_worker_observation_digest(evidence, evidence, manifest, cell=observation))
             summaries.append(
                 {
                     **observation,

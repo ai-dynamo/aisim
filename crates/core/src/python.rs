@@ -4850,11 +4850,13 @@ fn nixl_worker_observations(records: &str) -> PyResult<String> {
 }
 
 #[pyfunction]
+#[pyo3(signature=(entry, source_sha256, inventory, draft, cell=None))]
 fn nixl_observation_digest(
     entry: &str,
     source_sha256: &str,
     inventory: &str,
     draft: bool,
+    cell: Option<&str>,
 ) -> PyResult<String> {
     let parse = |value: &str| {
         serde_json::from_str(value).map_err(|e| {
@@ -4866,6 +4868,7 @@ fn nixl_observation_digest(
         source_sha256,
         &parse(inventory)?,
         draft,
+        cell.map(parse).transpose()?.as_ref(),
     )
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -4890,42 +4893,50 @@ struct GroupedPdObservation {
 #[pymethods]
 impl GroupedPdObservation {
     #[new]
-    #[pyo3(signature=(role, evidence, row=None, tp_size=None, groups=None))]
+    #[pyo3(signature=(role, evidence, row=None, tp_size=None, groups=None, architecture=None, memory=None))]
     fn new(
         role: &str,
         evidence: (&str, Option<&str>, &str),
         row: Option<ObservationRow<'_>>,
         tp_size: Option<u64>,
         groups: Option<&str>,
+        architecture: Option<&str>,
+        memory: Option<&str>,
     ) -> PyResult<Self> {
         let (provenance, dtype, backend) = evidence;
-        let select = || {
-            let mut identity = crate::perfmodel::fpm::NixlIdentity::observed(
-                dtype,
-                provenance,
-                row.map(|r| r.3),
-                tp_size,
-            )?;
-            if let Some(groups) = groups {
-                identity
-                    .selected_groups(&serde_json::from_str(groups).map_err(|error| {
-                        crate::AicError::InvalidEngineConfig(error.to_string())
-                    })?)?;
-            }
-            identity.select(
-                role,
-                Some(backend),
-                row.map(|r| r.0),
-                row.and_then(|r| r.1),
-                row.and_then(|r| r.2),
-                false,
-            )?;
-            Ok::<_, crate::AicError>(Self {
-                identity,
-                kv_cache_dtype: row.map(|r| r.0.to_owned()),
-                recorded_version: row.and_then(|r| r.2).map(str::to_owned),
-            })
-        };
+        let select =
+            || {
+                let mut identity = crate::perfmodel::fpm::NixlIdentity::observed(
+                    dtype,
+                    provenance,
+                    row.map(|r| r.3),
+                    tp_size,
+                )?;
+                identity.architecture = architecture.map(str::to_owned);
+                if let Some(memory) = memory {
+                    identity.selected_memory(&serde_json::from_str(memory).map_err(
+                        |error| crate::AicError::InvalidEngineConfig(error.to_string()),
+                    )?)?;
+                }
+                if let Some(groups) = groups {
+                    identity.selected_groups(&serde_json::from_str(groups).map_err(
+                        |error| crate::AicError::InvalidEngineConfig(error.to_string()),
+                    )?)?;
+                }
+                identity.select(
+                    role,
+                    Some(backend),
+                    row.map(|r| r.0),
+                    row.and_then(|r| r.1),
+                    row.and_then(|r| r.2),
+                    false,
+                )?;
+                Ok::<_, crate::AicError>(Self {
+                    identity,
+                    kv_cache_dtype: row.map(|r| r.0.to_owned()),
+                    recorded_version: row.and_then(|r| r.2).map(str::to_owned),
+                })
+            };
         select().map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -4951,7 +4962,7 @@ impl GroupedPdObservation {
 
 /// Compare runtime evidence for two selected rows without retaining their identities.
 #[pyfunction]
-#[pyo3(signature = (prefill, decode, prefill_row=None, decode_row=None, tp_size=None, prefix_caching=(false,false)))]
+#[pyo3(signature = (prefill, decode, prefill_row=None, decode_row=None, tp_size=None, prefix_caching=(false,false), architecture=None))]
 fn grouped_observation_requirement(
     prefill: (&str, Option<&str>, &str),
     decode: (&str, Option<&str>, &str),
@@ -4959,9 +4970,26 @@ fn grouped_observation_requirement(
     decode_row: Option<ObservationRow<'_>>,
     tp_size: Option<u64>,
     prefix_caching: (bool, bool),
+    architecture: Option<&str>,
 ) -> PyResult<Option<String>> {
-    let prefill = GroupedPdObservation::new("prefill", prefill, prefill_row, tp_size, None)?;
-    let decode = GroupedPdObservation::new("decode", decode, decode_row, tp_size, None)?;
+    let prefill = GroupedPdObservation::new(
+        "prefill",
+        prefill,
+        prefill_row,
+        tp_size,
+        None,
+        architecture,
+        None,
+    )?;
+    let decode = GroupedPdObservation::new(
+        "decode",
+        decode,
+        decode_row,
+        tp_size,
+        None,
+        architecture,
+        None,
+    )?;
     if let Some(reason) = prefill.requirement(&decode) {
         return Ok(Some(reason));
     }

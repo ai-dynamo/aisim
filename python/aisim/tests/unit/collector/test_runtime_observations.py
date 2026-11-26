@@ -2097,6 +2097,18 @@ def test_aggregated_phases_with_different_prefix_caching_import_the_prefill_valu
         "decode: runtime_group_1 block_size_tokens 4096 != 64",
         "decode: runtime_group_2 block_size_tokens 4096 != 64",
     ]
+    from aisim import _runtime
+
+    resources = result["resources"]
+    memory = resources["runtime_memory"]
+    _runtime.GroupedPdObservation(
+        "prefill",
+        (memory["provenance"], None, "auto"),
+        None,
+        2,
+        json.dumps(resources["cache_groups"]),
+        memory=json.dumps({key: val for key, val in memory.items() if key != "provenance"}),
+    )
     # The mode-dependent settings and the engine-core block size leave the compared runtime settings.
     cache = provenance["runtime_settings"]["cache_config"]
     assert not {

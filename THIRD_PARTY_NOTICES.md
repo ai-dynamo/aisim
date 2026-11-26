@@ -792,7 +792,11 @@ tests of these rules. The native replay pair validation in
 version, KV head geometry, transfer mode, attention backend and cache dtype checks
 of the NIXL handshake. GPU
 layout resolution in the engine core applies to its TP workers, while the NIXL
-worker selects the registered GPU or host buffer layout.
+worker selects the registered GPU or host buffer layout. The ordinary per-layer head dimensions and TP partition follow
+`vllm/model_executor/models/{llama,mistral,qwen2,qwen3}.py` at the same three
+revisions. The NemotronH attention layer positions follow
+`vllm/model_executor/models/nemotron_h.py`. The singleton latent KV head follows
+`vllm/model_executor/layers/attention/mla_attention.py` at those revisions.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py

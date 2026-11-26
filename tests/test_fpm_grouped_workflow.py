@@ -2316,6 +2316,35 @@ def test_warm_exhaustion_leaves_feasible_modes(grouped_case, modes, warm):
     assert [branch.deployment_mode for branch in branches] == ["agg" if warm == "prefill" else "disagg"]
 
 
+@pytest.mark.parametrize("modes", [["agg", "disagg"], ["disagg", "agg"]])
+@pytest.mark.parametrize("window", [False, True])
+def test_aggregate_group_without_warm_support_preserves_cold_pd(grouped_case, modes, window):
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.search_space import enumerate_branches
+
+    source, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(source))
+    row = profile["deployments"][0]
+    profile["deployments"] = [{**deepcopy(row), "worker_type": role} for role in ("aggregated", "prefill", "decode")]
+    agg_group = profile["deployments"][0]["resources"]["cache_groups"][0]
+    if window:
+        agg_group.update(sliding_window=128, prefix_cacheable=False)
+    else:
+        del agg_group["prefix_cacheable"]
+    _write_timings(root, profile, version="0.31.0")
+    search = {
+        **_pd_search(profile, root),
+        "deployment_mode": modes,
+        "agg_enable_prefix_caching": True,
+        "agg_max_num_batched_tokens": [128],
+        "agg_max_num_seqs": [4],
+    }
+    smart = SmartSearchConfig(search_space=search, workload=Workload(isl=128, osl=2, concurrency=1, request_count=2))
+    with pytest.warns(UserWarning, match="agg.*skipped"):
+        branches = enumerate_branches(smart, max_seq_len=128)
+    assert [branch.deployment_mode for branch in branches] == ["disagg"]
+
+
 def test_warm_pd_search_checks_transfer_evidence_before_warm_filter(grouped_case):
     from aisim.sweeper.config import SearchSpace
 
@@ -2582,6 +2611,7 @@ def test_grouped_pd_checks_dtype_when_only_one_role_has_runtime_memory(grouped_c
         ("kv_cache_dtype", "fp8", "fp8_e4m3"),
         ("attention_backend", "FLASH_ATTN", "FLASHINFER"),
         ("attention_backend", ["GDN_ATTN", "FLASHINFER_MLA_SPARSE"], "FLASH_ATTN"),
+        ("head_size", 128, 64),
     ],
 )
 @pytest.mark.parametrize("changed_role", ["prefill", "decode"])
@@ -2595,10 +2625,42 @@ def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, ini
     version = "0.32.0"
     profile = _with_transfer_markers(_with_prefix_evidence(profile, version=version), version=version)
     shared = profile["deployments"][0]
+    if field == "head_size":
+        profile.update(architecture="Qwen2ForCausalLM", num_experts=0)
+        (Path(profile["model"]) / "config.json").write_text(json.dumps({"architectures": [profile["architecture"]]}))
+        shared["resources"]["cache_groups"] = shared["resources"]["cache_groups"][:1]
     _write_timings(root, {**profile, "deployments": [shared]}, version=version)
     profile["deployments"] = [dict(deepcopy(shared), worker_type=role) for role in ("prefill", "decode")]
 
-    def observed(model="/source/M", kv_cache_dtype="fp8", attention_backend="FLASH_ATTN"):
+    def observed(
+        model="/source/M",
+        kv_cache_dtype="fp8",
+        attention_backend="FLASH_ATTN",
+        head_size=None,
+        compact=False,
+    ):
+        if head_size is not None:
+            if compact:
+                model_config = {
+                    "use_mla": False,
+                    "hf_overrides": {
+                        "hidden_size": head_size * 8,
+                        "num_attention_heads": 8,
+                    },
+                }
+                return json.dumps({"runtime_settings": {"model_config": model_config}})
+            group = {
+                "kind": "attention",
+                "spec_type": "vllm.v1.kv_cache_interface.FullAttentionSpec",
+                "layer_names": ["a"],
+            }
+            worker = {
+                "schema_version": "aisimulate-runtime-observation/v1",
+                "kind": "worker",
+                "cache": {"groups": [group]},
+                "raw_cache_config": {"groups": [{**group, "head_size": head_size}]},
+            }
+            return json.dumps({"artifacts": [{"evidence": worker}]})
         return json.dumps(
             {
                 "runtime_settings": {"model_config": {"model": model}, "cache_config": {"cache_dtype": kv_cache_dtype}},
@@ -2607,7 +2669,9 @@ def test_grouped_pd_compares_initialized_handoff_fields(grouped_case, field, ini
         )
 
     for deployment in profile["deployments"]:
-        deployment["resources"]["runtime_memory"]["provenance"] = observed(**{field: initial})
+        deployment["resources"]["runtime_memory"]["provenance"] = observed(
+            **{field: initial}, compact=deployment["worker_type"] != changed_role
+        )
     raw = _pd_prediction(profile, root)
     raw["engine"]["context_length"] = 1024
     raw["traffic"]["source"]["input_tokens"] = 128
@@ -2657,7 +2721,19 @@ def test_grouped_pd_surfaces_conflicting_evidence_only_for_reachable_shapes(grou
         provenance=json.dumps(
             {
                 "schema_version": "aisimulate-onboarding-runtime-probe/v1",
-                "observed_resources": {"runtime_memory": {"model_dtype": "bf16"}},
+                "configuration": "tp1",
+                "checkpoint": "checkpoint",
+                "observations_index": "observations.json",
+                "source_artifacts": [
+                    {"path": name, "sha256": "0" * 64}
+                    for name in ("observations.json", "launch.json", "model-config.json")
+                ],
+                "model_metadata": {},
+                "user_overrides": {},
+                "observed_resources": {
+                    "runtime_memory": {"model_dtype": "bf16", "kv_cache_bytes": memory["kv_cache_bytes"]},
+                    "cache_groups": bad["resources"]["cache_groups"],
+                },
             }
         ),
     )

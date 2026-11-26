@@ -2641,6 +2641,19 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
         saved = {}
         _merge_resources([observation], saved, source_references=True, observation_format=version)
         assert saved["observation_provenance"] == version
+        for field in ("cache_groups", "block_size_tokens"):
+            damaged = json.loads(json.dumps(saved))
+            if field == "cache_groups":
+                del damaged["cell_observations"][0][field]
+            else:
+                del damaged["cell_observations"][0]["cache_groups"][0][field]
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(damaged))
+        if version == "source_references_v2":
+            damaged = json.loads(json.dumps(saved))
+            damaged["cell_observations"][0]["cache_groups"][0]["block_size_tokens"] *= 2
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(damaged))
         memory = saved["cell_observations"][0]["runtime_memory"]
         compact = json.loads(memory["provenance"])
         if version == "source_references":
@@ -2670,7 +2683,13 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
         ]
         assert compact["worker_observations"][-1]["backends"] == ["flash_attn", "flashinfer"]
         assert saved["worker_observation_digests"] == [
-            _runtime.nixl_observation_digest(json.dumps(compact), compact["observations_index"]["sha256"], "{}", False)
+            _runtime.nixl_observation_digest(
+                json.dumps(compact),
+                compact["observations_index"]["sha256"],
+                "{}",
+                False,
+                json.dumps(saved["cell_observations"][0]),
+            )
         ]
         downgraded = {**saved, "observation_provenance": "source_references"}
         del downgraded["worker_observation_digests"]
@@ -2824,6 +2843,45 @@ def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_so
     assert any(event["event"] == "candidate_completed" for event in events)
     verify_runtime_profile(resolved)
     observations, legacy_manifest, _, _ = _verify_collection(original, root)
+    for form in ("source_references", "source_references_v2"):
+        archive = copy.deepcopy(legacy_manifest)
+        _merge_resources(observations, archive, source_references=True, observation_format=form)
+        assert _runtime.observed_model_dtype(json.dumps(archive))
+        inflated = copy.deepcopy(archive)
+        for cell in inflated["cell_observations"]:
+            cell["runtime_memory"]["kv_cache_bytes"] *= 100
+        with pytest.raises(ValueError, match="kv_cache_bytes"):
+            _runtime.observed_model_dtype(json.dumps(inflated))
+        if form == "source_references":
+            selected = resolved.profile_deployment().resources.runtime_memory.model_dump(exclude={"provenance"})
+            for field in ("kv_cache_bytes", "hash_block_size_tokens"):
+                if not selected.get(field):
+                    continue
+                omitted = copy.deepcopy(archive)
+                for cell in omitted["cell_observations"]:
+                    cell["runtime_memory"].pop(field, None)
+                evidence = (json.dumps(omitted), None, "auto")
+                _runtime.GroupedPdObservation("prefill", evidence, memory=json.dumps(selected))
+                with pytest.raises(ValueError, match=field):
+                    _runtime.GroupedPdObservation(
+                        "prefill", evidence, memory=json.dumps({**selected, field: selected[field] * 2})
+                    )
+        unreadable = copy.deepcopy(archive)
+        for key in ("runtime_probe", "runtime_compatibility"):
+            del unreadable[key]
+        unreadable["cell_observations"][0]["runtime_memory"]["provenance"] = "{"
+        saved_request = resolved.model_copy(deep=True)
+        saved_request.profile_deployment().resources.runtime_memory.provenance = json.dumps(unreadable)
+        with pytest.raises(ValueError, match="unreadable finalized runtime cell"):
+            verify_runtime_profile(saved_request)
+        for field, value in (
+            ("observations_index", archive["runtime_probe"]["observations_index"]),
+            ("observations_sha256", "5" * 64),
+        ):
+            edited = copy.deepcopy(archive)
+            edited["runtime_compatibility"][field] = value
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(edited))
     legacy = resolved.model_dump(mode="json")
     legacy["fpm_profile"]["deployments"][0]["resources"] = _merge_resources(observations, legacy_manifest)
     review = tmp_path / "resolved-checkpoint.json"

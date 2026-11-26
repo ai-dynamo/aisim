@@ -411,7 +411,7 @@ def _profile_parallel_configs(
         # Selected model objects live for this enumeration; replicas and peer choices share their identity.
         key = role, id(deployment)
         if key not in observations:
-            observations[key] = grouped_pd_observation(role, deployment)
+            observations[key] = grouped_pd_observation(role, deployment, profile.architecture)
         return observations[key]
 
     first_prefix_error = None

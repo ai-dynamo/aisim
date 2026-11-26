@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from functools import partial
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -1747,6 +1748,7 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
             selected["prefill"],
             selected["decode"],
             backend_version=backend_version,
+            architecture=profile.architecture,
             kv_transfer=engine.kv_transfer,
             prefix_caching=(
                 engine.workers.prefill.kv_cache.prefix_caching,
@@ -1818,7 +1820,7 @@ def grouped_prefix_caching_requirements(
     if backend_version not in GROUPED_PREFIX_CACHING_VERSIONS:
         raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only")
     if any(group.prefix_cacheable is None for group in groups):
-        raise ValueError(
+        raise GroupedPrefixEvidenceError(
             "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
             "set prefix_cacheable (true or false) on each cache group of the profile"
         )
@@ -1835,7 +1837,7 @@ def grouped_prefix_caching_requirements(
         group.kind == "attention" and group.sliding_window is not None and group.prefix_cacheable is False
         for group in groups
     ):
-        raise ValueError(
+        raise GroupedPrefixEvidenceError(
             "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with "
             "prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and "
             "prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not "
@@ -1890,7 +1892,7 @@ class GroupedObservationError(ValueError):
     """A selected deployment contains conflicting observations of its own runtime."""
 
 
-def grouped_pd_observation(role, deployment):
+def grouped_pd_observation(role, deployment, architecture=None):
     from aisim import _runtime
 
     memory = deployment.resources.runtime_memory
@@ -1906,6 +1908,8 @@ def grouped_pd_observation(role, deployment):
             ),
             deployment.tp,
             json.dumps([group.model_dump(exclude_none=True) for group in deployment.resources.cache_groups]),
+            architecture,
+            memory.model_dump_json(exclude={"provenance"}, exclude_none=True) if memory else None,
         )
     except ValueError as error:
         raise GroupedObservationError(str(error)) from error
@@ -1938,7 +1942,13 @@ def grouped_pd_pair_requirement(
 
 
 def grouped_pd_requirements(
-    prefill_deployment, decode_deployment, *, backend_version: str | None, kv_transfer, prefix_caching=(False, False)
+    prefill_deployment,
+    decode_deployment,
+    *,
+    backend_version: str | None,
+    kv_transfer,
+    prefix_caching=(False, False),
+    architecture: str | None = None,
 ) -> None:
     """Check a prefill and a decode FPM deployment with a grouped cache for P/D replay.
 
@@ -1946,7 +1956,12 @@ def grouped_pd_requirements(
     ``grouped_pd_pair_requirement``. ``kv_transfer`` is the prediction's transfer configuration, or None. The Rust
     gate checks the transfer geometry and the version of each rank again.
     """
-    if requirement := grouped_pd_pair_requirement(prefill_deployment, decode_deployment, prefix_caching=prefix_caching):
+    if requirement := grouped_pd_pair_requirement(
+        prefill_deployment,
+        decode_deployment,
+        prefix_caching=prefix_caching,
+        observe=partial(grouped_pd_observation, architecture=architecture),
+    ):
         raise ValueError(f"grouped FPM cache P/D requires prefill and decode deployments with {requirement}")
     grouped_pd_transfer_requirements(
         prefill_deployment, decode_deployment, backend_version=backend_version, kv_transfer=kv_transfer

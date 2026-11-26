@@ -404,7 +404,12 @@ def _worker_observations(evidence: dict[str, Any]) -> list:
 
 
 def _worker_observation_digest(
-    snapshot: dict[str, Any], evidence: dict[str, Any], inventory: dict[str, Any], *, draft: bool = False
+    snapshot: dict[str, Any],
+    evidence: dict[str, Any],
+    inventory: dict[str, Any],
+    *,
+    draft: bool = False,
+    cell: dict[str, Any] | None = None,
 ) -> str:
     from aisim import _runtime
 
@@ -414,7 +419,14 @@ def _worker_observation_digest(
         else evidence["observations_index"]["sha256"]
     )
     references = {k: inventory[k] for k in ("observations_index", "source_artifacts", "formal_data") if k in inventory}
-    return _runtime.nixl_observation_digest(json.dumps(snapshot), source, json.dumps(references), draft)
+    resources = inventory.get("observed_resources") if draft else cell
+    return _runtime.nixl_observation_digest(
+        json.dumps(snapshot),
+        source,
+        json.dumps(references),
+        draft,
+        json.dumps(resources) if resources is not None else None,
+    )
 
 
 def _probe_sources(index: Path, evidence: dict[str, Any], digests: dict[Path, str]) -> list[dict[str, str]]:
@@ -577,14 +589,22 @@ def _ordered_runtime_evidence(value: Any) -> Any:
 
 
 def _has_indexed_cell(manifest: dict[str, Any]) -> bool:
+    indexed = False
+    compact = manifest.get("observation_provenance") in ("source_references", "source_references_v2")
     for cell in manifest.get("cell_observations", []):
         try:
             evidence = json.loads(cell["runtime_memory"]["provenance"])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError) as error:
+            if compact:
+                raise ValueError("unreadable finalized runtime cell provenance") from error
             continue
-        if isinstance(evidence, dict) and evidence.get("source") == "runtime_observations":
-            return True
-    return False
+        if compact and (
+            not isinstance(evidence, dict)
+            or evidence.get("source") not in ("runtime_observations", "vllm_initialized_cache")
+        ):
+            raise ValueError("invalid finalized runtime cell provenance")
+        indexed |= isinstance(evidence, dict) and evidence.get("source") == "runtime_observations"
+    return indexed
 
 
 def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
@@ -602,7 +622,7 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
         finalized = finalization_manifest(request)
         quality = verify_finalized_quality(finalized) if finalized is not None else None
         if finalized is not None and (
-            "runtime_compatibility" in finalized or "runtime_probe" in finalized or _has_indexed_cell(finalized)
+            _has_indexed_cell(finalized) or "runtime_compatibility" in finalized or "runtime_probe" in finalized
         ):
             compatible = finalized.get("runtime_compatibility")
             index = compatible.get("source_observations_index") if isinstance(compatible, dict) else None
@@ -663,6 +683,8 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     if _request_launch(request, launch) != launch:
         raise ValueError("runtime-affecting draft edits require a compatible fresh probe")
     expected = as_saved_resources(manifest["observed_resources"], _resource_values(result["resources"]))
+    if manifest["observed_resources"] != expected:
+        raise ValueError("saved observed resources differ from immutable runtime evidence")
     if "nixl_observation" in manifest:
         saved = deepcopy(manifest["nixl_observation"])
         if manifest["schema_version"] == PROVENANCE_SCHEMA and sorted(
@@ -675,8 +697,6 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
                 sample["worker_observations"].sort(key=_json)
         if saved != fresh:
             raise ValueError("saved NIXL settings differ from immutable runtime evidence")
-    if manifest["observed_resources"] != expected:
-        raise ValueError("saved observed resources differ from immutable runtime evidence")
     selected = request.profile_deployment()
     actual = _resource_values(selected.resources.model_dump(mode="json"))
     observed_capacity = expected["runtime_memory"].pop("kv_cache_bytes")

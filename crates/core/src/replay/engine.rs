@@ -288,6 +288,12 @@ impl ReplayRoleConfig {
             Some(u64::from(self.tensor_parallel_size) * u64::from(self.dp_size)),
             Some(u64::from(self.tensor_parallel_size)),
         )?;
+        observed.architecture = profile
+            .and_then(|p| p["architecture"].as_str())
+            .map(str::to_owned);
+        if let Some(memory) = memory {
+            observed.selected_memory(memory)?;
+        }
         if let Some(groups) = deployment.and_then(|d| d.pointer("/resources/cache_groups")) {
             observed.selected_groups(groups)?;
         }
