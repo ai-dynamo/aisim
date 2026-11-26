@@ -36,12 +36,12 @@ use crate::engine::common::utils::{
 use crate::engine::config::LoadCopyStart;
 use crate::engine::host_offload::{G2Binding, HostTierHandle, TransferId};
 use crate::engine::kv_manager::AllocationRequirement;
+use crate::engine::kv_manager::StateAlignRules;
 use crate::engine::kv_manager::{
     AdmissionLimits, G1Manager, GroupedKvPool, GroupedPrefixRules, GroupedTransferRules,
     PrefixHashMemo, VllmRuleVersion,
 };
 use crate::engine::kv_manager::{DestinationReservation, G1Acquire, NativeAllocation};
-use crate::engine::kv_manager::{mamba_prefill_checkpoint, state_boundaries};
 use crate::engine::scheduler::queue_metrics::{QueueStats, QueuedLength};
 use crate::engine::scheduler::vllm::host_offload::{
     CompletedLoad, HostLookup, HostLookupHit, HostTransferProgress, LoadTiming, StartLoad,
@@ -4164,9 +4164,7 @@ impl VllmCore {
         let Some(unit) = self.args.prefix_match_unit else {
             return (desired, None);
         };
-        let alignment = self.args.block_size;
-        let prefill_end = prompt.max(known.saturating_sub(1));
-        if !self.args.enable_prefix_caching || start >= prefill_end {
+        if !self.args.enable_prefix_caching {
             return (desired, None);
         }
         let native_mtp = self
@@ -4178,60 +4176,15 @@ impl VllmCore {
             .args
             .state_cache
             .is_some_and(|state| state.prefill_checkpoint);
-        let mut end = start + desired;
-        // vLLM decides on the unclipped chunk end.
-        let exports_checkpoint = prefill_checkpoint
-            && mamba_prefill_checkpoint(
+        StateAlignRules::state_cache(self.args.block_size, unit, prefill_checkpoint, native_mtp)
+            .split(
                 start,
-                end,
-                prefill_end,
-                prefill_end,
-                unit,
-                alignment,
-                native_mtp,
+                prompt,
+                known,
+                desired,
+                junction,
+                self.args.max_num_batched_tokens.unwrap_or(usize::MAX),
             )
-            .is_some();
-        if end < prefill_end {
-            let aligned = end / alignment * alignment;
-            // A block larger than the whole step budget must make progress
-            // using private state, then stop at the next reachable boundary.
-            if aligned > start
-                || alignment <= self.args.max_num_batched_tokens.unwrap_or(usize::MAX)
-            {
-                end = aligned;
-            }
-        }
-        // Match the state cache's replay boundary, including prompts that end on a full block.
-        let (last_full, resend_full, tail) = state_boundaries(prompt, alignment, unit, native_mtp);
-        let next = start.checked_add(alignment - start % alignment);
-        let stops = [
-            next.filter(|_| !start.is_multiple_of(alignment)),
-            Some(resend_full),
-            Some(last_full),
-            (last_full < tail && tail < prompt).then_some(tail),
-        ];
-        // A sub-block junction's state is not separately cacheable.
-        let junction = junction
-            .filter(|&junction| start < junction && junction < end)
-            .map(|junction| start + (junction - start) / alignment * alignment);
-        for stop in stops
-            .into_iter()
-            .filter(|_| !exports_checkpoint)
-            .chain([junction])
-            .flatten()
-        {
-            if start < stop && stop < end {
-                end = stop;
-            }
-        }
-        // The pass reserves the checkpoint of the chunk it schedules, keyed on
-        // its end; a junction stop short of the prompt leaves none.
-        let checkpoint = prefill_checkpoint
-            .then(|| {
-                mamba_prefill_checkpoint(start, end, prefill_end, end, unit, alignment, native_mtp)
-            })
-            .flatten();
-        (end.saturating_sub(start), checkpoint)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4346,9 +4299,8 @@ impl VllmCore {
         let junction = request.sequence.lease.junction();
         let (desired_tokens, prefill_checkpoint) = mtp.map_or_else(
             || match self.kv_manager.grouped_prefix_rules() {
-                // The grouped rule table owns the split of its vLLM version. A
-                // grouped rank has no state cache, so no prefill checkpoint of
-                // the state cache.
+                // Grouped allocation plans each state's checkpoint together
+                // with the other groups sharing its rank-local pool.
                 Some(rules) => (
                     rules.align_split(
                         effective_computed_before,

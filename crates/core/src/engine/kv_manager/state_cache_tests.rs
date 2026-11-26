@@ -103,7 +103,7 @@ fn eight_block_budget_fits_two_requests_then_reuses_released_capacity() {
             4
         );
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 128);
-        assert_eq!(lease.state.as_ref().unwrap().working.len(), 2);
+        assert_eq!(lease.state.as_ref().unwrap().blocks.working.len(), 2);
         assert_eq!(manager.num_inactive_blocks(), 0);
         leases.push((owner, lease));
     }
@@ -144,7 +144,7 @@ fn failed_growth_preserves_existing_work_and_checkpoint() {
     allocated(manager.allocate_lease(owner, &mut lease, 4, 0));
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 4);
     manager.begin_step();
-    let before_work = lease.state.as_ref().unwrap().working.clone();
+    let before_work = lease.state.as_ref().unwrap().blocks.working.clone();
     let before_token = lease.entries[0].copy;
     let before_counts = (manager.num_active_blocks(), manager.num_inactive_blocks());
 
@@ -155,7 +155,7 @@ fn failed_growth_preserves_existing_work_and_checkpoint() {
     assert_eq!(lease.allocated_tokens(), 4);
     assert_eq!(lease.resident_block_count(), 1);
     assert_eq!(lease.entries[0].copy, before_token);
-    assert_eq!(lease.state.as_ref().unwrap().working, before_work);
+    assert_eq!(lease.state.as_ref().unwrap().blocks.working, before_work);
     assert_eq!(lease.state.as_ref().unwrap().computed_tokens, 4);
     assert!(checkpoint(&manager, &lease, 1));
     assert_eq!(
@@ -349,14 +349,15 @@ fn restored_requests_have_distinct_work_without_overwriting_shared_checkpoint() 
                 .state
                 .as_ref()
                 .unwrap()
+                .blocks
                 .working
                 .iter()
                 .all(|&id| manager.pool.is_private(id))
         );
         readers.push((owner, sequence, lease));
     }
-    let first_work = readers[0].2.state.as_ref().unwrap().working.clone();
-    let second_work = &readers[1].2.state.as_ref().unwrap().working;
+    let first_work = readers[0].2.state.as_ref().unwrap().blocks.working.clone();
+    let second_work = &readers[1].2.state.as_ref().unwrap().blocks.working;
     assert!(first_work.iter().all(|id| !second_work.contains(id)));
     assert_eq!(readers[0].2.entries[0].copy, readers[1].2.entries[0].copy);
     let (owner, sequence, lease) = &mut readers[0];
@@ -422,7 +423,7 @@ fn long_decode_keeps_one_working_state_and_one_latest_checkpoint() {
     let (mut sequence, mut lease) = request(owner, 4, 4, true, 80);
     allocated(manager.allocate_lease(owner, &mut lease, 4, 0));
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 4);
-    let initial_work = lease.state.as_ref().unwrap().working.clone();
+    let initial_work = lease.state.as_ref().unwrap().blocks.working.clone();
     for before in 4..84 {
         manager.begin_step();
         let (_, opened) = sequence.generate_token();
@@ -437,7 +438,7 @@ fn long_decode_keeps_one_working_state_and_one_latest_checkpoint() {
             before,
             before + 1,
         );
-        assert_eq!(lease.state.as_ref().unwrap().working, initial_work);
+        assert_eq!(lease.state.as_ref().unwrap().blocks.working, initial_work);
         assert_eq!(lease.state.as_ref().unwrap().computed_tokens, before + 1);
         assert_eq!(
             manager.num_active_blocks(),
@@ -465,12 +466,12 @@ fn preemption_and_requeue_release_work_and_restore_saved_state() {
     allocated(manager.allocate_lease(owner, &mut lease, 8, 0));
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 8);
     manager.begin_step(); // The previous pass completed before preemption.
-    let old_work = lease.state.as_ref().unwrap().working.clone();
+    let old_work = lease.state.as_ref().unwrap().blocks.working.clone();
     manager.preempt_lease(owner, &mut lease);
     assert_eq!(manager.num_active_blocks(), 0);
     assert_eq!(lease.allocated_tokens(), 0);
     assert_eq!(lease.resident_block_count(), 0);
-    assert!(lease.state.as_ref().unwrap().working.is_empty());
+    assert!(lease.state.as_ref().unwrap().blocks.working.is_empty());
     assert_eq!(lease.state.as_ref().unwrap().computed_tokens, 0);
     manager.begin_step();
     let cost = manager.get_lease_prefill_cost(&sequence, &lease);
@@ -481,6 +482,7 @@ fn preemption_and_requeue_release_work_and_restore_saved_state() {
             .state
             .as_ref()
             .unwrap()
+            .blocks
             .working
             .iter()
             .all(|id| !old_work.contains(id))
@@ -516,9 +518,9 @@ fn full_pool_publishes_working_state_without_a_second_copy() {
     let owner = Uuid::from_u128(1);
     let (mut sequence, mut lease) = request(owner, 8, 4, true, 0);
     allocated(manager.allocate_lease(owner, &mut lease, 8, 0));
-    let working = lease.state.as_ref().unwrap().working.clone();
+    let working = lease.state.as_ref().unwrap().blocks.working.clone();
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 8);
-    assert_eq!(lease.state.as_ref().unwrap().working, working);
+    assert_eq!(lease.state.as_ref().unwrap().blocks.working, working);
     assert_eq!(manager.num_active_blocks(), 4);
     assert_eq!(manager.num_inactive_blocks(), 0);
     manager.begin_step();
@@ -668,9 +670,10 @@ fn waiting_state_miss_is_bypassed_when_a_host_load_lands_private_state() {
     manager.activate_destination_lease(owner, &query, &mut waiting, reservation);
     let state = waiting.state.as_ref().unwrap();
     assert_eq!(state.computed_tokens, 8);
-    assert!(!state.working.is_empty());
+    assert!(!state.blocks.working.is_empty());
     assert!(
         state
+            .blocks
             .working
             .iter()
             .all(|&copy| manager.pool.is_private(copy))
@@ -949,7 +952,7 @@ fn continued_write_requires_checkpoint_capacity_before_mutating_state() {
         allocated(manager.allocate_lease(owner, &mut lease, 8, 0));
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 8);
         manager.begin_step();
-        let working = lease.state.as_ref().unwrap().working.clone();
+        let working = lease.state.as_ref().unwrap().blocks.working.clone();
         assert!(working.iter().all(|&id| !manager.pool.is_private(id)));
         let (_, opened) = sequence.generate_token();
         assert!(opened);
@@ -961,7 +964,7 @@ fn continued_write_requires_checkpoint_capacity_before_mutating_state() {
             ));
             assert_eq!(lease.allocated_tokens(), 8);
             assert_eq!(lease.state.as_ref().unwrap().computed_tokens, 8);
-            assert_eq!(lease.state.as_ref().unwrap().working, working);
+            assert_eq!(lease.state.as_ref().unwrap().blocks.working, working);
             assert!(working.iter().all(|&id| !manager.pool.is_private(id)));
             assert!(checkpoint(&manager, &lease, 2));
             assert_eq!(manager.num_active_blocks(), 4);
@@ -972,7 +975,7 @@ fn continued_write_requires_checkpoint_capacity_before_mutating_state() {
         allocated(manager.allocate_lease(owner, &mut lease, 9, 0));
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 8, 9);
         assert_eq!(lease.state.as_ref().unwrap().computed_tokens, 9);
-        assert_eq!(lease.state.as_ref().unwrap().working, working);
+        assert_eq!(lease.state.as_ref().unwrap().blocks.working, working);
         assert!(working.iter().all(|&id| manager.pool.is_private(id)));
         assert_eq!(manager.num_active_blocks(), 5);
         assert_eq!(
@@ -1003,7 +1006,7 @@ fn aligned_progress_reserves_transition_peak_before_replacing_checkpoint() {
     allocated(manager.allocate_lease(owner, &mut lease, 8, 0));
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 8);
     manager.begin_step();
-    let working = lease.state.as_ref().unwrap().working.clone();
+    let working = lease.state.as_ref().unwrap().blocks.working.clone();
     assert!(matches!(
         manager.allocate_lease(owner, &mut lease, 12, 0),
         NativeAllocation::CapacityExhausted
@@ -1017,7 +1020,7 @@ fn aligned_progress_reserves_transition_peak_before_replacing_checkpoint() {
     assert_eq!(manager.num_active_blocks(), 7);
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 8, 12);
     manager.begin_step();
-    assert_eq!(lease.state.as_ref().unwrap().working, working);
+    assert_eq!(lease.state.as_ref().unwrap().blocks.working, working);
     assert!(!checkpoint(&manager, &lease, 2));
     assert!(checkpoint(&manager, &lease, 3));
     assert_eq!(manager.num_active_blocks(), 5);
@@ -1209,7 +1212,7 @@ fn kda_physical_pages_retain_and_restore_both_real_checkpoints() {
         assert_eq!(cost.cached_tokens, expected);
         allocated(manager.allocate_lease(owner, &mut reader, length, expected / 128));
         assert_eq!(reader.computed_state_tokens(), Some(expected));
-        assert_eq!(reader.state.as_ref().unwrap().working.len(), 1);
+        assert_eq!(reader.state.as_ref().unwrap().blocks.working.len(), 1);
         assert_eq!(reader.resident_block_count(), length.div_ceil(1536));
         manager.finish_lease(owner, reader);
     }
@@ -1391,10 +1394,10 @@ fn kda_unpublished_turnover_source_survives_until_the_next_request_allocation() 
     let (mut sequence, mut lease) = fine_request(owner, 25, 6, 2, 0);
     allocated(manager.allocate_lease(owner, &mut lease, 6, 0));
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 0, 6);
-    let first = lease.state.as_ref().unwrap().working[0];
+    let first = lease.state.as_ref().unwrap().blocks.working[0];
     manager.begin_step();
     allocated(manager.allocate_lease(owner, &mut lease, 12, 0));
-    let second = lease.state.as_ref().unwrap().working[0];
+    let second = lease.state.as_ref().unwrap().blocks.working[0];
     assert_ne!(first, second);
     assert!(manager.pool.is_private(first));
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 6, 12);
@@ -1408,7 +1411,7 @@ fn kda_unpublished_turnover_source_survives_until_the_next_request_allocation() 
     allocated(manager.allocate_lease(owner, &mut lease, 18, 0));
     assert!(!manager.pool.is_private(first));
     assert!(manager.pool.is_private(second));
-    assert_ne!(second, lease.state.as_ref().unwrap().working[0]);
+    assert_ne!(second, lease.state.as_ref().unwrap().blocks.working[0]);
     manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, 12, 18);
     assert_eq!(manager.num_active_blocks(), 3 + 2);
     manager.preempt_lease(owner, &mut lease);
@@ -1433,13 +1436,13 @@ fn kda_turnover_pressure_does_not_overwrite_current_state_or_invent_a_checkpoint
         "old source is still needed this pass"
     );
     manager.begin_step();
-    let work = lease.state.as_ref().unwrap().working.clone();
+    let work = lease.state.as_ref().unwrap().blocks.working.clone();
     assert!(!manager.can_compute(&lease, 18, 18)); // KV3 + source1 + dest1 > capacity4
     assert!(matches!(
         manager.allocate_lease(owner, &mut lease, 18, 0),
         NativeAllocation::CapacityExhausted
     ));
-    assert_eq!(lease.state.as_ref().unwrap().working, work);
+    assert_eq!(lease.state.as_ref().unwrap().blocks.working, work);
     assert_eq!(lease.computed_state_tokens(), Some(12));
     assert_eq!(lease.allocated_tokens(), 12);
     assert!(fine_checkpoint(&manager, &lease, 12));
@@ -1581,7 +1584,7 @@ fn kda_alignment_does_not_rotate_state_when_prefix_caching_is_disabled() {
     for end in [6, 12, 17] {
         allocated(manager.allocate_lease(owner, &mut lease, end, 0));
         manager.finalize_lease_computed_prefix(owner, &mut sequence, &mut lease, before, end);
-        let id = lease.state.as_ref().unwrap().working[0];
+        let id = lease.state.as_ref().unwrap().blocks.working[0];
         assert_eq!(*working.get_or_insert(id), id);
         assert_eq!(manager.num_active_blocks(), end.div_ceil(6) + 1);
         assert_eq!(manager.num_inactive_blocks(), 0);

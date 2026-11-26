@@ -41,6 +41,7 @@ serde_path_to_error = "0.1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 slotmap = "1"
+smallvec = "1"
 thiserror = { workspace = true }
 tempfile = { workspace = true }
 # Python loads this extension with dlopen, so jemalloc must not use initial-exec TLS.

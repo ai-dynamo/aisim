@@ -243,19 +243,19 @@ fn version_rows_differ_in_the_last_cacheable_stop_and_the_partial_tail() {
     // sched:476-480 with iface:1110-1122 `(n - 1) // B * B`.
     let v31 = rules_glm(VllmRuleVersion::V0_31_0, false);
     let v32 = rules_glm(VllmRuleVersion::V0_32_0, false);
-    assert_eq!(v31.last_cacheable_stop(9000), 8704);
-    assert_eq!(v32.last_cacheable_stop(9000), 8704);
-    assert_eq!(v31.last_cacheable_stop(8704), 8704);
-    assert_eq!(v32.last_cacheable_stop(8704), 6528);
-    assert_eq!(v32.last_cacheable_stop(0), 0);
+    assert_eq!(v31.align_rules().last_cacheable_stop(9000), 8704);
+    assert_eq!(v32.align_rules().last_cacheable_stop(9000), 8704);
+    assert_eq!(v31.align_rules().last_cacheable_stop(8704), 8704);
+    assert_eq!(v32.align_rules().last_cacheable_stop(8704), 6528);
+    assert_eq!(v32.align_rules().last_cacheable_stop(0), 0);
     // v0.31 sched:482-487 `prompt // hash * hash`; v0.32 sched:517-525
     // `(prompt - 1) // hash * hash`.
     let v31 = rules_glm_hash(VllmRuleVersion::V0_31_0, false, 4);
     let v32 = rules_glm_hash(VllmRuleVersion::V0_32_0, false, 4);
-    assert_eq!(v31.partial_tail(9000), 9000);
-    assert_eq!(v32.partial_tail(9000), 8996);
-    assert_eq!(v31.partial_tail(4356), 4356);
-    assert_eq!(v32.partial_tail(4356), 4352);
+    assert_eq!(v31.align_rules().partial_tail(9000), 9000);
+    assert_eq!(v32.align_rules().partial_tail(9000), 8996);
+    assert_eq!(v31.align_rules().partial_tail(4356), 4356);
+    assert_eq!(v32.align_rules().partial_tail(4356), 4352);
     assert_eq!(
         VllmRuleVersion::parse("0.31.0"),
         Some(VllmRuleVersion::V0_31_0)
@@ -283,13 +283,13 @@ fn vllm_0330_row_takes_the_0320_arm_in_every_version_branch() {
     let v32 = rules_glm(VllmRuleVersion::V0_32_0, false);
     let v33 = rules_glm(VllmRuleVersion::V0_33_0, false);
     for (n, stop) in [(9000, 8704), (8704, 6528), (0, 0)] {
-        assert_eq!(v33.last_cacheable_stop(n), stop);
-        assert_eq!(v32.last_cacheable_stop(n), stop);
+        assert_eq!(v33.align_rules().last_cacheable_stop(n), stop);
+        assert_eq!(v32.align_rules().last_cacheable_stop(n), stop);
     }
     // v0.33 sched:622-631: `(prompt - 1) // hash * hash`.
     let fine = rules_glm_hash(VllmRuleVersion::V0_33_0, false, 4);
-    assert_eq!(fine.partial_tail(9000), 8996);
-    assert_eq!(fine.partial_tail(4356), 4352);
+    assert_eq!(fine.align_rules().partial_tail(9000), 8996);
+    assert_eq!(fine.align_rules().partial_tail(4356), 4352);
     // v0.33 sched:437-449: checkpoint mode only when every Mamba group has
     // a positive count.
     assert!(v33.checkpoint.is_none());
@@ -299,8 +299,8 @@ fn vllm_0330_row_takes_the_0320_arm_in_every_version_branch() {
     assert_eq!(split(&v33, 0, 9000, 9000, 8192, 0), 6528);
     assert_eq!(split(&v33, 6528, 9000, 9000, 2472, 0), 2176);
     assert_eq!(split(&v33, 4352, 8704, 8704, 4352, 0), 2176);
-    assert_eq!(ckpt.checkpoint_position(9000), 8704);
-    assert!(ckpt.checkpoint_valid(6528, 9000, 8704));
+    assert_eq!(ckpt.align_rules().checkpoint_position(9000), 8704);
+    assert!(ckpt.align_rules().checkpoint_valid(6528, 9000, 8704));
     assert_eq!(split(&ckpt, 6528, 9000, 9000, 2472, 0), 2472);
     assert_eq!(split(&ckpt, 4352, 8704, 8704, 4352, 0), 4352);
 }
@@ -1090,10 +1090,17 @@ fn shared_first_hash_miss_probes_each_distinct_offset_once() {
 
         if i == 0 || i == 1023 {
             let probes = Cell::new(0);
-            let found = coordinator.hit_in_block(pool, &request, spec, 0, 48, |end| {
-                probes.set(probes.get() + 1);
-                GroupedPrefixCoordinator::spec_resident(pool, &request, spec, end)
-            });
+            let found = pool.hit_in_block(
+                spec.groups[0],
+                request.prefix_hash_at(hash_block),
+                0,
+                48,
+                coordinator.rules.alignment,
+                |end| {
+                    probes.set(probes.get() + 1);
+                    GroupedPrefixCoordinator::spec_resident(pool, &request, spec, end)
+                },
+            );
             assert_eq!(found, None);
             // Debug builds also run the independent linear-scan oracle.
             let oracle_probes = if cfg!(debug_assertions) { 48 / 4 } else { 0 };
@@ -1318,15 +1325,15 @@ fn resumed_state_holds_cached_and_running_blocks_during_the_first_step() {
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
         assert_eq!(state.hit.map(|(_, index)| index), Some(1));
-        assert!(state.running.is_none());
+        assert!(state.running().is_none());
     }
     assert!(coordinator.allocate(pool, &mut block_lease, 9000, 4352, 6000, 1));
     let state_blocks: usize = GLM_STATES
         .iter()
         .map(|&group| {
             let state = state_lease(&block_lease, usize::from(group));
-            assert!(state.hit.is_some() && state.running.is_some());
-            assert!(state.previous.is_none() && state.copy.is_none());
+            assert!(state.hit.is_some() && state.running().is_some());
+            assert!(state.previous().is_none() && state.copy.is_none());
             2
         })
         .sum();
@@ -1337,7 +1344,7 @@ fn resumed_state_holds_cached_and_running_blocks_during_the_first_step() {
     // The hit blocks stay through the first step.
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
-        assert!(state.hit.is_some() && state.running.is_some());
+        assert!(state.hit.is_some() && state.running().is_some());
     }
     assert_eq!(pool.active_blocks(), 12);
     assert_eq!(pool.inactive_cached_blocks(), 0);
@@ -1345,7 +1352,7 @@ fn resumed_state_holds_cached_and_running_blocks_during_the_first_step() {
     assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6000, 6001, 2));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
-        assert!(state.hit.is_none() && state.running.is_some());
+        assert!(state.hit.is_none() && state.running().is_some());
     }
     assert_eq!(pool.active_blocks(), 8);
     assert_eq!(pool.inactive_cached_blocks(), 4);
@@ -1376,11 +1383,11 @@ fn boundary_crossing_keeps_the_previous_running_block_for_one_step() {
                 GroupLease::Attention { .. } => 0,
                 GroupLease::Ring { copy } => usize::from(copy.is_some()),
                 GroupLease::State(s) => [
-                    s.running,
+                    s.running(),
                     s.hit.map(|h| h.0),
-                    s.previous.map(|p| p.0),
+                    s.previous().map(|p| p.0),
                     s.copy,
-                    s.checkpoint.map(|c| c.0),
+                    s.checkpoint().map(|c| c.0),
                 ]
                 .iter()
                 .flatten()
@@ -1390,8 +1397,8 @@ fn boundary_crossing_keeps_the_previous_running_block_for_one_step() {
     };
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
-        assert!(state.running.is_some());
-        assert_eq!(state.previous.map(|(_, step)| step), Some(2));
+        assert!(state.running().is_some());
+        assert_eq!(state.previous().map(|(_, step)| step), Some(2));
     }
     assert_eq!(state_and_ring(&block_lease), 9);
     coordinator.finalize(pool, &mut block_lease, &request, 9000, 4352, &hit, 2);
@@ -1403,7 +1410,7 @@ fn boundary_crossing_keeps_the_previous_running_block_for_one_step() {
     assert_eq!(pool.active_blocks(), before + 1);
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
-        assert_eq!(state.previous.map(|(_, step)| step), Some(3));
+        assert_eq!(state.previous().map(|(_, step)| step), Some(3));
     }
     assert_eq!(state_and_ring(&block_lease), 9);
 }
@@ -1444,13 +1451,13 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
     // scheduling pass ends (sched:1434-1442).
     assert_eq!(attention_copies(&block_lease, 0), 4);
     let state = state_lease(&block_lease, 1);
-    assert!(state.hit.is_none() && state.running.is_some() && state.copy.is_none());
+    assert!(state.hit.is_none() && state.running().is_some() && state.copy.is_none());
     assert_eq!(coordinator.copy_source_count(), 2);
     assert_eq!(pool.active_blocks(), 4 + 1 + 2);
     assert_eq!(pool.inactive_cached_blocks(), 0);
     coordinator.finalize(pool, &mut block_lease, &request, 50, 50, &hit, 1);
     let state = state_lease(&block_lease, 1);
-    assert!(state.hit.is_none() && state.running.is_some());
+    assert!(state.hit.is_none() && state.running().is_some());
     assert_eq!(coordinator.copy_source_count(), 2);
     assert_eq!(pool.active_blocks(), 4 + 1 + 2);
     assert_eq!(pool.inactive_cached_blocks(), 0);
@@ -1478,7 +1485,7 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
     assert!(coordinator.pin_hit(pool, &mut block_lease, &hit).is_ok());
     assert!(coordinator.allocate(pool, &mut block_lease, 70, 36, 70, 1));
     let state = state_lease(&block_lease, 1);
-    assert!(state.hit.is_none() && state.running.is_some() && state.copy.is_some());
+    assert!(state.hit.is_none() && state.running().is_some() && state.copy.is_some());
     assert_eq!(coordinator.copy_source_count(), 2);
     assert_eq!(pool.active_blocks(), 5 + 2 + 2);
     coordinator.finalize(pool, &mut block_lease, &request, 70, 70, &hit, 1);
@@ -1490,7 +1497,7 @@ fn partial_hit_takes_a_copy_block_for_the_shared_block() {
     coordinator.begin_step();
     assert!(coordinator.allocate(pool, &mut block_lease, 70, 70, 71, 2));
     let state = state_lease(&block_lease, 1);
-    assert!(state.copy.is_none() && state.running.is_some());
+    assert!(state.copy.is_none() && state.running().is_some());
     assert_eq!(pool.active_blocks(), 5 + 1);
 }
 
@@ -1664,8 +1671,8 @@ fn producer_partial_state_keeps_separate_capacity_until_eviction() {
         // writable state at 50. The state at 32 is already inactive.
         assert_eq!(pool.active_blocks(), 4, "{version:?}");
         let state = state_lease(&block_lease, 1);
-        assert!(pool.is_private(state.running.unwrap()));
-        assert!(state.previous.is_some());
+        assert!(pool.is_private(state.running().unwrap()));
+        assert!(state.previous().is_some());
         assert_eq!(pool.inactive_cached_blocks(), 1);
         coordinator.release_request(pool, &mut block_lease);
         assert_eq!(pool.active_blocks(), 0);
@@ -1720,7 +1727,7 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
         let case = format!("{version:?}, checkpoint={checkpoint}");
         assert!(hit_exists(pool, 1, 4, 48), "{case}");
         assert_eq!(pool.active_blocks(), 2 + 2, "{case}");
-        assert!(state_lease(&block_lease, 1).previous.is_some(), "{case}");
+        assert!(state_lease(&block_lease, 1).previous().is_some(), "{case}");
         coordinator.release_request(pool, &mut block_lease);
     }
     // With them off, vLLM rounds the cached length down to the scheduler
@@ -1766,7 +1773,7 @@ fn producer_copy_is_taken_only_with_hits_inside_a_block() {
         // first decode token on v0.31, stays on the running state block: two
         // window blocks and one state block.
         assert_eq!(pool.active_blocks(), 2 + 1, "{version:?}");
-        assert!(state_lease(&block_lease, 1).previous.is_none());
+        assert!(state_lease(&block_lease, 1).previous().is_none());
         coordinator.release_request(pool, &mut block_lease);
     }
 }
@@ -1807,7 +1814,7 @@ fn producer_copy_defers_hits_on_its_state_in_the_step_of_the_copy() {
         );
         assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 3));
         assert!(
-            state_lease(&block_lease, 1).previous.is_some(),
+            state_lease(&block_lease, 1).previous().is_some(),
             "{version:?}"
         );
         assert!(
@@ -2013,17 +2020,17 @@ fn align_split_follows_vllm_0320() {
     // > 6527 / 2176 == 2; 6528 + 2176 <= 8704; 6528 < 8704 < 9000;
     // 2176 % 16 == 0.
     let ckpt = rules_glm(VllmRuleVersion::V0_32_0, true);
-    assert_eq!(ckpt.checkpoint_position(9000), 8704);
-    assert!(ckpt.checkpoint_valid(6528, 9000, 8704));
+    assert_eq!(ckpt.align_rules().checkpoint_position(9000), 8704);
+    assert!(ckpt.align_rules().checkpoint_valid(6528, 9000, 8704));
     assert_eq!(split(&ckpt, 6528, 9000, 9000, 2472, 0), 2472);
     // For (4352, 8704, pos 6528): 4352 % 2176 == 0; cdiv(8704, 2176) - 2
     // == 2 > 4351 / 2176 == 1; 4352 + 2176 <= 6528; 4352 < 6528 < 8704;
     // 2176 % 16 == 0.
-    assert_eq!(ckpt.checkpoint_position(8704), 6528);
-    assert!(ckpt.checkpoint_valid(4352, 8704, 6528));
+    assert_eq!(ckpt.align_rules().checkpoint_position(8704), 6528);
+    assert!(ckpt.align_rules().checkpoint_valid(4352, 8704, 6528));
     assert_eq!(split(&ckpt, 4352, 8704, 8704, 4352, 0), 4352);
     // Without a checkpoint rule the check is false.
-    assert!(!r.checkpoint_valid(6528, 9000, 8704));
+    assert!(!r.align_rules().checkpoint_valid(6528, 9000, 8704));
 }
 
 #[test]
@@ -2043,9 +2050,9 @@ fn align_split_with_a_checkpoint_block_ports_vllm_0320() {
     // pass the five conditions (0 % 16 == 0; cdiv(2002, 1600) - 2 == 0 >
     // -1; 0 + 16 <= pos; 0 < pos < 2002; pos % 16 == 0), so both give
     // 2,002.
-    assert_eq!(r.checkpoint_position(2002), 2000);
-    assert!(r.checkpoint_valid(0, 2002, 2000));
-    assert!(r.checkpoint_valid(0, 2002, 1600));
+    assert_eq!(r.align_rules().checkpoint_position(2002), 2000);
+    assert!(r.align_rules().checkpoint_valid(0, 2002, 2000));
+    assert!(r.align_rules().checkpoint_valid(0, 2002, 1600));
     assert_eq!(r.align_split(0, 2002, 2002, 2002, 0, 16384), 2002);
     // The end 2,000 is below the prompt, so the floor to 1,600 applies
     // and no checkpoint is taken.
@@ -2156,8 +2163,8 @@ fn checkpoint_block_is_taken_in_the_final_chunk_and_published_at_the_prompt_chec
     assert!(coordinator.allocate(pool, &mut block_lease, 9000, 0, 6528, 1));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
-        assert!(state.running.is_some());
-        assert!(state.previous.is_none() && state.checkpoint.is_none() && state.hit.is_none());
+        assert!(state.running().is_some());
+        assert!(state.previous().is_none() && state.checkpoint().is_none() && state.hit.is_none());
     }
     coordinator.finalize(pool, &mut block_lease, &request, 9000, 6528, &hit, 1);
     coordinator.begin_step();
@@ -2168,8 +2175,8 @@ fn checkpoint_block_is_taken_in_the_final_chunk_and_published_at_the_prompt_chec
     assert!(coordinator.allocate(pool, &mut block_lease, 9000, 6528, 9000, 2));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
-        assert!(state.running.is_some() && state.previous.is_some());
-        assert_eq!(state.checkpoint.map(|(_, position)| position), Some(8704));
+        assert!(state.running().is_some() && state.previous().is_some());
+        assert_eq!(state.checkpoint().map(|(_, position)| position), Some(8704));
     }
     // G0 5, ring 1, 4 x (running + previous + checkpoint).
     assert_eq!(pool.active_blocks(), 5 + 1 + 12);
@@ -2177,9 +2184,9 @@ fn checkpoint_block_is_taken_in_the_final_chunk_and_published_at_the_prompt_chec
     for group in GLM_STATES {
         assert!(hit_exists(pool, group, hash, 8704), "group {group}");
         let state = state_lease(&block_lease, usize::from(group));
-        let (checkpoint, _) = state.checkpoint.unwrap();
+        let (checkpoint, _) = state.checkpoint().unwrap();
         assert!(!pool.is_private(checkpoint));
-        assert!(pool.is_private(state.running.unwrap()));
+        assert!(pool.is_private(state.running().unwrap()));
     }
     coordinator.begin_step();
     let resend = coordinator.find_longest_hit(pool, &lease(9000, hash), 9000);
@@ -2244,7 +2251,7 @@ fn checkpoint_block_goes_at_the_next_step_and_stays_cached_until_eviction() {
         assert_eq!(pool.active_blocks(), 5 + 1 + 4, "step {step}");
         for group in GLM_STATES {
             let state = state_lease(&block_lease, usize::from(group));
-            assert!(state.checkpoint.is_none() && state.previous.is_none());
+            assert!(state.checkpoint().is_none() && state.previous().is_none());
             let cached = pool.key_hit(group, hash_at(hash, 8704));
             assert!(cached.is_some_and(|hit| !hit.is_active), "group {group}");
         }
@@ -2286,7 +2293,7 @@ fn checkpoint_block_publishes_the_prompt_checkpoint_under_retention_zero() {
         coordinator.begin_step();
         assert!(coordinator.allocate(pool, &mut block_lease, prompt, 0, prompt, 1));
         assert_eq!(
-            state_lease(&block_lease, 1).checkpoint.map(|(_, p)| p),
+            state_lease(&block_lease, 1).checkpoint().map(|(_, p)| p),
             Some(expected)
         );
         coordinator.finalize(pool, &mut block_lease, &request, prompt, prompt, &hit, 1);
@@ -2324,7 +2331,7 @@ fn checkpoint_beyond_the_prompt_checkpoint_is_not_published_under_retention_zero
     coordinator.pin_hit(pool, &mut block_lease, &hit).unwrap();
     assert!(coordinator.allocate(pool, &mut block_lease, 39, 16, 40, 1));
     assert_eq!(
-        state_lease(&block_lease, 1).checkpoint.map(|(_, p)| p),
+        state_lease(&block_lease, 1).checkpoint().map(|(_, p)| p),
         Some(32)
     );
     coordinator.finalize(pool, &mut block_lease, &request, 32, 40, &hit, 1);
@@ -2466,7 +2473,7 @@ fn checkpoint_rule_needs_state_groups_at_the_smallest_cacheable_block() {
     let large_attention = [attention("full", 128, None), state("s", 64, true, true)];
     let r = GroupedPrefixRules::new(&large_attention, 64, VllmRuleVersion::V0_32_0).unwrap();
     assert_eq!((r.alignment, r.cacheable_block), (128, 64));
-    assert_eq!(r.checkpoint_position(300), 256);
+    assert_eq!(r.align_rules().checkpoint_position(300), 256);
 }
 
 #[test]
@@ -2616,8 +2623,8 @@ fn rescan_finds_a_block(
                 (0..computed_after / block).any(|i| publishable(g, copies.get(i), (i + 1) * block))
             }
             GroupRuleKind::SlidingWindow { window } => [
-                Some(rules.replay_boundary(prompt, block)),
-                junction.map(|junction| rules.block_floor(junction, block)),
+                Some(rules.align_rules().replay_boundary(prompt, block)),
+                junction.map(|junction| rules.align_rules().block_floor(junction, block)),
             ]
             .into_iter()
             .flatten()
@@ -2885,7 +2892,7 @@ fn hit_stamp_changes_exactly_when_a_search_input_changes() {
     let no_hit = coordinator.empty_hit();
     coordinator.finalize(pool, &mut block_lease, &request, 9, 8, &no_hit, 1);
     let published = coordinator.hit_stamp(pool, 9);
-    assert!(coordinator.published_this_step.contains(&key(1, 4, 8)));
+    assert!(!coordinator.state.visible(key(1, 4, 8)));
     assert_ne!(published.published_epoch, before.published_epoch);
     coordinator.begin_step();
     let cleared = coordinator.hit_stamp(pool, 9);
@@ -2936,11 +2943,7 @@ fn reused_after_a_duplicate_state_publish(
         &no_hit,
         1,
     );
-    assert!(
-        coordinator
-            .published_this_step
-            .contains(&key(1, hash, seeded))
-    );
+    assert!(!coordinator.state.visible(key(1, hash, seeded)));
     assert_eq!(pool.residency(), residency, "a second copy keeps every key");
     // A state key published in this step is no hit (single:1726-1734).
     let fresh = coordinator.find_longest_hit(pool, &waiting, waiting_tokens);
@@ -3122,7 +3125,7 @@ fn copy_sources_of_a_hit_inside_a_block_stay_pinned_until_the_pass_ends() {
         assert_eq!(attention_copies(&block_lease, 0), 2);
         for group in GLM_STATES {
             let state = state_lease(&block_lease, usize::from(group));
-            assert!(state.hit.is_none() && state.running.is_some() && state.copy.is_none());
+            assert!(state.hit.is_none() && state.running().is_some() && state.copy.is_none());
         }
         for group in [0, 2, 3, 4, 5] {
             assert_eq!(key_state(pool, group, &request, 3264), Some(true));
@@ -3258,7 +3261,7 @@ fn a_hit_on_a_block_boundary_pins_no_copy_source() {
     assert_eq!(pool.active_blocks(), 12);
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
-        assert!(state.hit.is_some() && state.running.is_some() && state.copy.is_none());
+        assert!(state.hit.is_some() && state.running().is_some() && state.copy.is_none());
     }
     coordinator.finalize(pool, &mut block_lease, &request, 4700, 4700, &hit, 1);
     assert_eq!(coordinator.copy_source_count(), 0);
@@ -3269,7 +3272,7 @@ fn a_hit_on_a_block_boundary_pins_no_copy_source() {
     assert!(coordinator.allocate(pool, &mut block_lease, 4700, 4700, 4701, 2));
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
-        assert!(state.hit.is_none() && state.running.is_some());
+        assert!(state.hit.is_none() && state.running().is_some());
     }
     assert_eq!(pool.active_blocks(), 8);
     assert_eq!(pool.inactive_cached_blocks(), 4);
@@ -3568,7 +3571,7 @@ fn admit_with_a_checkpoint_block(
     for group in GLM_STATES {
         let state = state_lease(&block_lease, usize::from(group));
         assert!(
-            state.hit.is_some() && state.checkpoint.is_some(),
+            state.hit.is_some() && state.checkpoint().is_some(),
             "{version:?}"
         );
     }

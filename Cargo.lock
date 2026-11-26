@@ -60,6 +60,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "slotmap",
+ "smallvec",
  "tempfile",
  "thiserror",
  "tikv-jemallocator",
