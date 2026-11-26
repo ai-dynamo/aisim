@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "probe_sha256": "91fa97e06a48727468d8a6b8983f0a2ab3c65677cc03af9fb36d3c9a35c604ef",
+  "probe_revision": "6ddd880fa26f86b1c654bcdd77f3ff7cacd1c444",
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "profile": "test",
+  "features": [],
+  "scope": "Synthetic KV-manager lifecycle and published event hashes; no serving accuracy or performance claim.",
+  "baseline": {
+    "commit": "8288046ac88fccaee124714cd60e62b2ad4e184d",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "radix_completion_ancestor_refresh_matches_recorded_behavior"
+    ],
+    "exit_code": 0,
+    "scenarios": [
+      {
+        "capacity_tokens": 24,
+        "locked_b_eviction_hashes": [
+          4945711292740353085,
+          12583592247330656132
+        ],
+        "page_size": 4,
+        "prompt_b": [
+          20,
+          21,
+          22,
+          23
+        ],
+        "prompt_p": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "prompt_pq": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "prompt_pqx": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "removed_block_hashes": [
+          13603407971999731239
+        ],
+        "repeat_reused_tokens": 4,
+        "scenario": "complete_with_new_page_refreshes_ancestors"
+      }
+    ]
+  },
+  "candidate": {
+    "commit": "6ddd880fa26f86b1c654bcdd77f3ff7cacd1c444",
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "aisimulate-core",
+      "--locked",
+      "--lib",
+      "radix_completion_ancestor_refresh_matches_recorded_behavior"
+    ],
+    "exit_code": 0,
+    "scenarios": [
+      {
+        "capacity_tokens": 24,
+        "locked_b_eviction_hashes": [
+          12583592247330656132,
+          4945711292740353085
+        ],
+        "page_size": 4,
+        "prompt_b": [
+          20,
+          21,
+          22,
+          23
+        ],
+        "prompt_p": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "prompt_pq": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "prompt_pqx": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "removed_block_hashes": [
+          13603407971999731239
+        ],
+        "repeat_reused_tokens": 4,
+        "scenario": "complete_with_new_page_refreshes_ancestors"
+      }
+    ]
+  }
+}

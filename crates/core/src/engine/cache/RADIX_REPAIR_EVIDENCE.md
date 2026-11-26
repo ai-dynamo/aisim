@@ -78,6 +78,76 @@ and disables incremental compilation, including when a caller supplies a shared
 target root. This prevents reuse of binaries containing another snapshot's
 embedded manifest directory.
 
+## Completion that adds a page
+
+`PRRT_kwDOT0t9uc68P73W`: the additional
+[probe](../kv_manager/radix_lifecycle_evidence.rs) explicitly establishes a cached
+P→Q path, admits a lease with a private page X, then caches and locks unrelated B.
+Completion adds X. With B locked, eviction removes Q and X; after releasing B,
+one more page is evicted. The repeat of P uses the scheduler's zero-output
+matching cap, allowing all four input tokens to be reused.
+
+[The comparison](radix-ancestor-completion-comparison.json) records legacy main
+`8288046ac88fccaee124714cd60e62b2ad4e184d` and corrective source
+`6ddd880fa26f86b1c654bcdd77f3ff7cacd1c444`, with the identical probe, Rust 1.91.1,
+test profile, and no optional features. Both runs assert the P→Q parent link
+before completion and drain all 24 token slots afterward.
+
+| Observation | Legacy main | Native adapter |
+| --- | --- | --- |
+| Removal order while B is locked | Q, X | X, Q |
+| Final removed page | B | B |
+| Final `Removed` hash | `13603407971999731239` | `13603407971999731239` |
+| Zero-output repeat of P: reused tokens | 4 | 4 |
+
+The proposed final-victim/reuse difference does not reproduce. Legacy
+`insert_page_hash_suffix` calls `touch_path(start_node, now)` before extending
+the leaf, so completion also refreshes P. Legacy coalesces Q/X and publishes
+their hashes in prefix order; the native tree retains separate edges and removes
+the leaf X before Q. These are synthetic cache lifecycle observations, without
+a serving-accuracy or performance claim.
+
+Reproduce both runs with the recorded immutable probe and separate build targets:
+
+```bash
+completion_work=$(mktemp -d "${TMPDIR:?}/radix-completion.XXXXXXXX")
+completion_probe=6ddd880fa26f86b1c654bcdd77f3ff7cacd1c444
+completion_path=crates/core/src/engine/kv_manager/radix_lifecycle_evidence.rs
+completion_targets="${CARGO_TARGET_DIR:-$completion_work/target}/$(basename "$completion_work")"
+for side in baseline candidate; do
+  case "$side" in
+    baseline) revision=8288046ac88fccaee124714cd60e62b2ad4e184d ;;
+    candidate) revision=$completion_probe ;;
+  esac
+  snapshot="$completion_work/$side"
+  mkdir "$snapshot"
+  git archive "$revision" Cargo.toml Cargo.lock crates/core \
+    python/aisimulate/tests/fixtures | tar -x -C "$snapshot"
+  git show "$completion_probe:$completion_path" > "$snapshot/$completion_path"
+  module="$snapshot/crates/core/src/engine/kv_manager/sglang_backend.rs"
+  if ! rg -q 'mod radix_lifecycle_evidence;' "$module"; then
+    cat >> "$module" <<'RUST'
+
+#[cfg(test)]
+#[path = "radix_lifecycle_evidence.rs"]
+mod radix_lifecycle_evidence;
+RUST
+  fi
+  (
+    cd "$snapshot"
+    CARGO_TARGET_DIR="$completion_targets-$side" CARGO_BUILD_JOBS=2 \
+      CARGO_INCREMENTAL=0 AISIM_EVICTION_EVIDENCE_SIDE="$side" \
+      AISIM_EVICTION_EVIDENCE_OUTPUT="$completion_work/$side.json" \
+      cargo test -p aisimulate-core --locked --lib \
+        radix_completion_ancestor_refresh_matches_recorded_behavior
+  )
+done
+```
+
+Initial probe attempts exposed two incorrect expectations: Q/X removal order
+was assumed identical, and legacy was expected to remove P last. The passing
+runs above assert the observed ordering and identical final B removal/reuse.
+
 ## Growth cost and retained state
 
 The affected operation runs whenever SGLang materializes another complete page
