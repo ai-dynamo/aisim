@@ -9,7 +9,7 @@ from aisim_core.sdk.models.base import BaseModel, register_model
 from aisim_core.sdk.models.blocks.moe import MoEBlockShape, build_moe_block_ops
 from aisim_core.sdk.models.blocks.vit import build_llama4_encoder_ops
 from aisim_core.sdk.models.helpers import mtp_scale_factor
-from aisim_core.sdk.utils import _get_language_quantization_config, _load_model_config_from_model_path
+from aisim_core.sdk.utils import _load_model_config_from_model_path, validate_fp8_moe_shard
 
 
 @register_model("HYBRIDMOE")
@@ -101,16 +101,9 @@ class HybridMoEModel(BaseModel):
         """Validate fp8_block MoE alignment: (moe_inter_size / moe_tp_size) % block_size == 0."""
         if self.config.moe_quant_mode != common.MoEQuantMode.fp8_block:
             return
-        raw_config = _load_model_config_from_model_path(self.model_path)
-        default_size = [128, 128]
-        weight_block_size = _get_language_quantization_config(raw_config).get("weight_block_size", default_size)[0]
-        moe_size_per_gpu = self._moe_inter_size // self.config.moe_tp_size
-        if (moe_size_per_gpu % weight_block_size) != 0:
-            raise ValueError(
-                f"Invalid quantized MoE configuration: "
-                f"(moe_intermediate_size={self._moe_inter_size} / moe_tp_size={self.config.moe_tp_size}) "
-                f"% weight_block_size={weight_block_size} != 0. "
-            )
+        validate_fp8_moe_shard(
+            _load_model_config_from_model_path(self.model_path), self._moe_inter_size, self.config.moe_tp_size
+        )
 
     def set_hybrid_config(self, cfg: common.HybridMoEConfig) -> None:
         """Apply HybridMoEConfig and rebuild context/generation ops.

@@ -1865,6 +1865,20 @@ def _get_language_quantization_config(raw_config: dict) -> dict | None:
     return nested.get("quantization_config", {}) if isinstance(nested, dict) else {}
 
 
+def validate_fp8_moe_shard(raw_config: dict, intermediate_size: int, moe_tp_size: int) -> None:
+    """FP8 block-quantized experts must shard on complete weight blocks."""
+    quantization = _get_language_quantization_config(raw_config) or {}
+    shape = quantization.get("weight_block_size", [128, 128])
+    if not isinstance(shape, (list, tuple)) or not shape or type(shape[0]) is not int or shape[0] <= 0:
+        raise ValueError("weight_block_size must supply a positive integer expert block width")
+    block = shape[0]
+    if (intermediate_size // moe_tp_size) % block:
+        raise ValueError(
+            f"Invalid quantized MoE configuration: (moe_intermediate_size={intermediate_size} / "
+            f"moe_tp_size={moe_tp_size}) % weight_block_size={block} != 0."
+        )
+
+
 def _infer_quantization_fields(raw_config: dict) -> dict[str, object]:
     """Infer quant_method, kv_cache_quant_method, and quant_dynamic from config."""
     quant_cfg = _get_language_quantization_config(raw_config)

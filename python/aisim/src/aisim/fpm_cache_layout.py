@@ -10,19 +10,9 @@ the structure checks of a layout with markers, which intake and the collector ru
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Mapping
 from typing import Any
 
-RECURRENT_STATE_FIELDS = (
-    "ssm_cfg",
-    "mamba_d_state",
-    "linear_conv_kernel_dim",
-    "linear_attn_config",
-    "ssm_state_size",
-    "mamba_num_heads",
-)
-RECURRENT_ARCHITECTURES = ("mamba", "jamba", "rwkv")
 LAYER_COUNT_FIELDS = ("num_hidden_layers", "n_layer", "num_layers")
 
 
@@ -53,12 +43,9 @@ def layer_types(raw: Mapping[str, Any], layers: int | None) -> list[str]:
 
 
 def attn_type_list(raw: Mapping[str, Any], layers: int | None) -> list[int]:
-    values = raw["attn_type_list"]
-    if not isinstance(values, list) or (layers is not None and len(values) != layers):
-        raise ValueError("attn_type_list must have one entry per num_hidden_layers")
-    if any(type(value) is not int for value in values):
-        raise ValueError("attn_type_list entries must be integers")
-    return values
+    from aisim_core import decoder_config
+
+    return decoder_config.attn_type_list(raw, layers)
 
 
 def check_marker_layout_declarations(raw: Mapping[str, Any]) -> int | None:
@@ -77,33 +64,12 @@ def check_marker_layout_declarations(raw: Mapping[str, Any]) -> int | None:
 
 
 def recognized_layer_types(architecture: str | None) -> frozenset[str]:
-    names = {"full_attention", "sliding_attention"}
-    if architecture in {"GlmMoeDsaForCausalLM", "DeepseekV32ForCausalLM"}:
-        names.add("deepseek_sparse_attention")
-    return frozenset(names)
+    from aisim_core import decoder_config
+
+    return decoder_config.recognized_layer_types(architecture)
 
 
 def cache_layout_markers(raw: Mapping[str, Any], architecture: str | None) -> tuple[str, ...]:
-    """Sorted reasons the config declares a cache layout it cannot describe; empty when it declares none.
+    from aisim_core import decoder_config
 
-    Layer types, attention-type lists and recurrent-state markers count independently, so recognized values
-    never hide declared state. ``architecture`` is the decoder architecture the layer types are checked against.
-    Malformed lists are not markers: each caller raises its own structure errors for them.
-    """
-    reasons = []
-    layer_types = raw.get("layer_types")
-    if isinstance(layer_types, list):
-        recognized = recognized_layer_types(architecture)
-        unrecognized = Counter(
-            value for value in layer_types if isinstance(value, str) and value.strip() and value not in recognized
-        )
-        reasons.extend(f"layer_types {name} x{count}" for name, count in unrecognized.items())
-    attn_types = raw.get("attn_type_list")
-    if isinstance(attn_types, list):
-        # 1 is full attention; any other integer is a layer type the config does not describe.
-        other = Counter(value for value in attn_types if type(value) is int and value != 1)
-        reasons.extend(f"attn_type_list {value} x{count}" for value, count in other.items())
-    reasons.extend(f"recurrent-state field {key}" for key in RECURRENT_STATE_FIELDS if raw.get(key) is not None)
-    if any(name in (architecture or "").lower() for name in RECURRENT_ARCHITECTURES):
-        reasons.append(f"recurrent architecture {architecture}")
-    return tuple(sorted(reasons))
+    return decoder_config.cache_layout_markers(raw, architecture)

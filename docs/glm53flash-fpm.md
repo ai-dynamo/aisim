@@ -84,6 +84,10 @@ included, before the scheduler loads.
   point keeps its true context `c`: the prompt has `c - 1` tokens and the
   cached seed `(c - 2) // hash_block * hash_block`, where `hash_block` is the
   hash block size of the engine.
+- Validation checks recorded chunk starts and lengths against the prompt and
+  available scheduler counts, including starts in rejected attempts. Each
+  observed prefix dispatch must report a runtime mode and consistent padded
+  and unpadded token counts. Older records may omit a preparation observation.
 - Each point runs 5 warmups and 10 measurements. The table stores the median
   of measurements 2 to 10, which is Dynamo's `adjacent_upper_median` estimate.
   Measurement 1 is a valid measured repetition that this estimate leaves out.

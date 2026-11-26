@@ -853,6 +853,12 @@ def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_pa
         ("seed-chunk", "aligned starts"),
         ("repetition-chunk", "aligned starts"),
         ("chunk-length", "positive lengths"),
+        ("chunk-outside-prompt", "exceeds the recorded prompt"),
+        ("chunk-count", "contradicts the scheduled token counts"),
+        ("chunk-receipt", "contradicts the scheduled token counts"),
+        ("prep-padding", "preparation dispatch receipt or padding"),
+        ("prep-type", "preparation dispatch receipt or padding"),
+        ("rejected-alignment", "aligned starts"),
         ("clock", "starts before the preceding output"),
     ],
 )
@@ -882,6 +888,19 @@ def test_glm_publication_checks_preparation_and_rank_time(tmp_path, corruption, 
             repetition["prefill_chunks"][1][0][0] = 2177
         elif corruption == "chunk-length":
             repetition["prefill_chunks"][0][0][1] = 0
+        elif corruption == "chunk-outside-prompt":
+            repetition["prefill_chunks"][0][0][1] = 21760
+        elif corruption in {"chunk-count", "chunk-receipt"}:
+            repetition["prefill_chunks"][0][0][1] = 2200
+            if corruption == "chunk-receipt":
+                del repetition["scheduled_token_counts"]
+        elif corruption == "prep-padding":
+            repetition["dispatches"][0]["num_padded_tokens"] = 1
+        elif corruption == "prep-type":
+            del repetition["scheduled_token_counts"]
+            repetition["dispatches"][0] = "unavailable"
+        elif corruption == "rejected-alignment":
+            record["rejected_repetitions"] = [{"rejection_reason": "retry", "prefill_chunks": [[[1, 2176]]]}]
         else:
             for fpm in repetition["fpms"]:
                 interval = fpm["benchmark_sample"]["timing"]

@@ -124,11 +124,26 @@ When the fallback reads an unregistered wrapper’s nested decoder at TP greater
 than one, the scalar request must supply the actual `dcp_size`. At TP1 the
 only legal value is one. The block API passes its DCP setting explicitly.
 
-DeepSeek V4 Flash exposes 3,915 marginal compressed-cache bytes per token.
-Its runtime also reserves compressor state, live sliding and prefill pages, and
-a pool-wide null row. Config-only capacity estimation requires runtime group
-allocations for this layout. Native system estimates and measured FPM cache
-profiles use their respective memory models.
+For vLLM expert parallelism, the estimate prices the rank holding the most
+experts. For example, its three EP ranks hold 43, 43 and 42 of Qwen3-30B-A3B's
+128 experts. A block-quantized expert shard must contain complete weight blocks.
+SGLang prefill context parallelism replicates the dense MLA cache on each rank,
+including Kimi K2.5's DeepSeek language decoder. [vLLM expert placement](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/fused_moe/expert_map_manager.py), [SGLang Kimi K2.5 implementation](https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/models/kimi_k25.py)
+
+A selected sparse MLA decoder stores a latent, BF16 rotary keys, and a scaled
+FP8 index per layer. For GLM-5.3-NVFP4 with BF16 KV, each of 78 layers stores
+512 × 2 + 64 × 2 + 132 bytes, or 100,152 bytes per token across the decoder.
+Shared capacity also needs the runtime indexer allocation. Recurrent and
+other per-layer layouts require their runtime state or group measurements.
+Gemma 4 normalizes its final decoder layer to full attention even when an
+explicit list declares it sliding.
+
+DeepSeek V4 Flash and Pro expose 3,915 and 5,610 marginal compressed-cache bytes
+per token. Their runtime also reserves compressor state, live sliding and prefill
+pages, and a pool-wide null row. Config-only capacity estimation requires runtime
+group allocations for this layout. DeepSeek V4.1 has position-dependent compressed
+cache growth and requires native sequence geometry or a runtime profile. Native
+system estimates and measured FPM cache profiles use their respective memory models.
 
 ### FPM profile cache groups and byte budgets
 

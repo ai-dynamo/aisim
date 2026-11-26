@@ -450,6 +450,15 @@ def indexer_cache_entry_bytes(index_head_dim: int) -> int:
     return index_head_dim + ((index_head_dim + 127) // 128) * 4
 
 
+def dsa_kv_cache_entry_bytes(kv_lora_rank: int, rope_dim: int, index_dim: int, kv_dtype_bytes: float) -> float:
+    """One DSA layer stores its latent, BF16 RoPE and scaled FP8 index key on each rank."""
+    return (
+        kv_lora_rank * kv_dtype_bytes
+        + rope_dim * GEMMQuantMode.bfloat16.value.memory
+        + indexer_cache_entry_bytes(index_dim)
+    )
+
+
 def deepseek_v4_indexer_cache_entry_bytes(index_head_dim: int) -> float:
     """Bytes per compressed token in DeepSeek-V4's FP4 indexer KV cache."""
     return index_head_dim * 0.5

@@ -589,6 +589,7 @@ def _roles_with_afd_deployment(engine, *, workload):
                 else estimate_kv_bytes_per_token(
                     engine.model,
                     tp_size=worker.afd.tp_a,
+                    backend=engine.backend,
                     pp_size=1,
                     moe_tp_size=1,
                     moe_ep_size=1,  # KV belongs to one A replica, independently of F-pool EP.
@@ -1241,12 +1242,12 @@ def _resolve_kv_bytes_per_token(
         pp_size=parallel.pipeline,
         moe_tp_size=parallel.moe_tensor,
         moe_ep_size=parallel.moe_expert,
+        backend=engine.backend,
         **(
             {
                 "fpm_profile": engine.fpm_profile.model_dump(mode="json"),
                 "worker_type": role,
                 "system": worker.hardware or engine.hardware,
-                "backend": engine.backend,
                 "backend_version": engine.backend_version,
                 "attention_dp_size": parallel.attention_data,
             }

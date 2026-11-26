@@ -868,9 +868,7 @@ class DeepSeekV32Model(BaseModel):
         return (
             self._num_layers
             * seq_len
-            * (
-                kv_lora_rank * self.config.kvcache_quant_mode.value.memory
-                + qk_rope_head_dim * common.GEMMQuantMode.bfloat16.value.memory
-                + common.indexer_cache_entry_bytes(index_head_dim)
+            * common.dsa_kv_cache_entry_bytes(
+                kv_lora_rank, qk_rope_head_dim, index_head_dim, self.config.kvcache_quant_mode.value.memory
             )
         )

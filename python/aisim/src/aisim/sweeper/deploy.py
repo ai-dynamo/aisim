@@ -271,7 +271,7 @@ def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any],
 
 def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:
     if sample.get("fpm_profile") is None:
-        return {}
+        return {"backend": sample["backend"]}
     prefix = _role_prefix(role)
     return {
         "fpm_profile": sample["fpm_profile"],
@@ -440,6 +440,7 @@ def _build_afd_roles_deployment(sample, backend_version, estimators, encoder):
         transfer = estimate_kv_bytes_per_token(
             sample["model_name"],
             tp_size=topology["a_tp_size"],
+            backend=sample["backend"],
             pp_size=1,
             moe_tp_size=1,
             moe_ep_size=1,  # Per-request A-replica geometry, not the F-pool width.
