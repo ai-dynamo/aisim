@@ -959,6 +959,7 @@ fn native_replay_retracts_readmits_and_finishes_deterministically() {
             sla: Default::default(),
             requests: (0..3)
                 .map(|i| ReplayRequest {
+                    ignore_eos: false,
                     id: format!("pressure-{i}"),
                     arrival_time_ms: 0.0,
                     input_tokens: 96,

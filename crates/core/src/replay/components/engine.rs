@@ -1451,6 +1451,7 @@ fn native_request(request: DirectRequest, kv_hint: Option<KvHintSource>) -> Resu
         cache_salt: request.cache_salt,
         max_output_tokens: request.max_output_tokens,
         output_token_ids: request.output_token_ids,
+        ignore_eos: request.ignore_eos,
         session_id: request
             .replay_context
             .and_then(|context| context.session_id().map(str::to_owned)),

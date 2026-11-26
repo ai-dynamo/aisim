@@ -5824,6 +5824,9 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
     core = source / "crates/core/Cargo.toml"
     core.parent.mkdir(parents=True)
     core.write_text(f'[package]\nname = "{package}"\nversion = "0.13.0"\n')
+    protocol = core.parent / "src/engine/protocol.rs"
+    protocol.parent.mkdir(parents=True)
+    protocol.write_text("pub struct Request {\n    pub max_output_tokens: usize,\n}\n")
     bindings = dynamo / "lib/bindings/python"
     bindings.mkdir(parents=True)
     output.mkdir()
@@ -5884,6 +5887,47 @@ def test_simulation_dynamo_resolves_then_builds_locked(tmp_path, monkeypatch, wr
             "features": ["ais-forward-pass"],
         }
         assert (output / "dynamo-build.patch").read_bytes() == b"dependency patch\n"
+
+
+@pytest.mark.parametrize(
+    ("declaration", "drift", "error"),
+    [
+        ("", False, None),
+        ("pub ignore_eos: bool,", False, None),
+        ("pub ignore_eos: Option<bool>,", False, "expected a public boolean"),
+        ("pub(crate) ignore_eos: bool,", False, "expected a public boolean"),
+        ("pub ignore_eos: bool,", True, "unexpected pinned Dynamo"),
+    ],
+)
+def test_simulation_dynamo_bridges_pinned_fixed_output(tmp_path, monkeypatch, declaration, drift, error):
+    # Conversion adapted from the Apache-2.0 source pinned in the build script.
+    # https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/mocker/src/grouped_scheduler/compatibility.rs
+    from scripts.performance import build_simulation_dynamo as builder
+
+    core, dynamo = tmp_path / "core", tmp_path / "dynamo"
+    protocol = core / "src/engine/protocol.rs"
+    protocol.parent.mkdir(parents=True)
+    protocol.write_text(f"pub struct Request {{\n    {declaration}\n}}\n")
+    adapter = dynamo / builder._GROUPED_REQUEST_ADAPTER
+    adapter.parent.mkdir(parents=True)
+    fixture = b"        Ok(Request {\n            max_output_tokens: request.max_output_tokens,\n        })\n"
+    monkeypatch.setattr(builder, "_GROUPED_REQUEST_ADAPTER_SHA256", hashlib.sha256(fixture).hexdigest())
+    original = fixture + b"\n" if drift else fixture
+    adapter.write_bytes(original)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            builder.forward_fixed_output_reservation(core, dynamo)
+    else:
+        builder.forward_fixed_output_reservation(core, dynamo)
+
+    if declaration and not error:
+        assert adapter.read_bytes() == fixture.replace(
+            b"        })",
+            b"            // Modified for the local AISim Request API.\n"
+            b"            ignore_eos: request.ignore_eos,\n        })",
+        )
+    else:
+        assert adapter.read_bytes() == original
 
 
 @pytest.mark.parametrize(

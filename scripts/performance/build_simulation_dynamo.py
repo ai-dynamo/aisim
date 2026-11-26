@@ -3,6 +3,7 @@
 """Build the pinned Dynamo replay adapter against one exact AISim checkout."""
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -14,6 +15,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.release.package_identity import core_package
 
 DYNAMO_REVISION = "df666fbc6284e540ea0f5cac613da7f992b1fc7b"
+_GROUPED_REQUEST_ADAPTER = "lib/mocker/src/grouped_scheduler/compatibility.rs"
+# Adapted from the pinned Apache-2.0 source. See THIRD_PARTY_NOTICES.md.
+# https://github.com/ai-dynamo/dynamo/blob/df666fbc6284e540ea0f5cac613da7f992b1fc7b/lib/mocker/src/grouped_scheduler/compatibility.rs
+_GROUPED_REQUEST_ADAPTER_SHA256 = "08c34b2ee709f5b038fa0801f40b3d493b58bd5aec8ae77767fa0bbc8265d84c"
+
+
+def forward_fixed_output_reservation(core: Path, dynamo: Path) -> None:
+    """Bridge the pinned request conversion when building against the new core API."""
+    protocol = (core / "src/engine/protocol.rs").read_text()
+    request = re.search(r"^pub struct Request \{\n(.*?)^\}", protocol, re.MULTILINE | re.DOTALL)
+    if request is None:
+        raise ValueError("could not find the AISim engine Request definition")
+    field = re.search(r"^[ \t]*((?:pub(?:\([^)]*\))?[ \t]+)?ignore_eos[ \t]*:[^\n]+)$", request[1], re.MULTILINE)
+    if field is None:
+        return  # The base side still uses the pre-ignore_eos Request API.
+    if field[1].strip() != "pub ignore_eos: bool,":
+        raise ValueError("expected a public boolean Request.ignore_eos")
+
+    adapter = dynamo / _GROUPED_REQUEST_ADAPTER
+    source = adapter.read_bytes()
+    if hashlib.sha256(source).hexdigest() != _GROUPED_REQUEST_ADAPTER_SHA256:
+        raise ValueError("unexpected pinned Dynamo grouped request adapter contents")
+    anchor = b"            max_output_tokens: request.max_output_tokens,\n"
+    if source.count(anchor) != 1:
+        raise ValueError("could not locate the pinned Dynamo request conversion")
+    adapter.write_bytes(
+        source.replace(
+            anchor,
+            anchor
+            + b"            // Modified for the local AISim Request API.\n"
+            + b"            ignore_eos: request.ignore_eos,\n",
+        )
+    )
 
 
 def locked_pyo3_version(lock: Path) -> str:
@@ -36,6 +70,7 @@ def build(source: Path, dynamo: Path, output: Path) -> None:
     subprocess.run(["git", "-C", str(dynamo), "diff", "--exit-code", "HEAD"], check=True)
     core = source / "crates/core"
     package = core_package(core)
+    forward_fixed_output_reservation(core, dynamo)
     bindings = dynamo / "lib/bindings/python"
     for manifest, options in (
         (dynamo / "Cargo.toml", ""),
