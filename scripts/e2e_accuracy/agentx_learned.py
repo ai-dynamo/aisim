@@ -38,6 +38,14 @@ STEP_CAPTURES = {
         "features": "fpm5",
         "drop_unattributed": False,
     },
+    "nvidia/GLM-5.3-NVFP4": {
+        "repository": "ai-dynamo/aisim-data",
+        "revision": "1faa7906a72a111bcc663592300026a4d09f9396",
+        "root": "data/fpm/nvidia--GLM-5.3-NVFP4/b300-sxm/sglang/0.5.20/native-tp8-mtp3",
+        "layout": "sglang_hook",
+        "features": "sglang18",
+        "drop_unattributed": True,
+    },
 }
 
 
@@ -70,8 +78,8 @@ def windows(spec, seed, cache, *, scoring=False):
     """Yield ``(lanes, records)`` per capture window in record order.
 
     ``dynamo_native``: the published training selection names each trace and its 1-based inclusive
-    line range. ``sglang_hook``: the published shard index lists warm-up and profiling shards per lane;
-    scoring uses profiling shards only.
+    line range. ``sglang_hook``: the published manifest lists one warm-up and one profiling capture per
+    seed and lane count (``step-capture/seed<S>/c<lanes>/<window>.jsonl.gz``); scoring uses profiling only.
     """
     if spec["layout"] == "dynamo_native":
         selection = json.loads(_download(spec, f"training/seed{seed}.selection.json", cache).read_text())
@@ -88,16 +96,19 @@ def windows(spec, seed, cache, *, scoring=False):
                 ]
             yield lanes, [r for r in records if r is not None]
     elif spec["layout"] == "sglang_hook":
-        index = json.loads(_download(spec, spec["index"], cache).read_text())
-        for shard in index["shards"]:
-            if shard["seed"] != seed or (scoring and shard["window"] != "profiling"):
+        manifest = json.loads(_download(spec, "aisim-manifest.json", cache).read_text())
+        for artifact in sorted(manifest["artifacts"], key=lambda a: a["artifact_id"]):
+            match = re.fullmatch(
+                r"step-capture/seed(\d+)/c(\d+)/(warmup|profiling)\.jsonl\.gz", artifact["artifact_id"]
+            )
+            if not match or int(match.group(1)) != seed or (scoring and match.group(3) != "profiling"):
                 continue
-            path = _download(spec, shard["path"], cache)
-            if _sha256(path) != shard["sha256"]:
-                raise ValueError(f"Step capture checksum mismatch: {shard['path']}")
+            path = _download(spec, artifact["artifact_id"], cache)
+            if _sha256(path) != artifact["sha256"]:
+                raise ValueError(f"Step capture checksum mismatch: {artifact['artifact_id']}")
             with gzip.open(path, "rt") as stream:
                 records = [_unwrap(line) for line in stream]
-            yield shard["lanes"], [r for r in records if r is not None]
+            yield int(match.group(2)), [r for r in records if r is not None]
     else:
         raise ValueError(f"Unknown step-capture layout: {spec['layout']}")
 

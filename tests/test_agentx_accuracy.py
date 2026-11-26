@@ -30,6 +30,14 @@ from scripts.e2e_accuracy.run_agentx_accuracy import artifact, normalize_native
 from scripts.pages.agentx_pages import unpack, validate_bundle
 
 
+@pytest.fixture(autouse=True)
+def op_level_only(monkeypatch):
+    """These tests cover op-based publications; learned rows are covered in test_agentx_metrics.py."""
+    import scripts.e2e_accuracy.run_agentx_accuracy as runner
+
+    monkeypatch.setattr(runner, "STEP_CAPTURES", {})
+
+
 def observation(key="a", **values):
     return {
         "key": key,

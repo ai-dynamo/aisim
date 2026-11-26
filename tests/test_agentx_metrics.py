@@ -280,3 +280,30 @@ def test_qualification_requires_every_performance_model(tmp_path, monkeypatch):
 
     files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
     assert len(validate_bundle(files)["runs"]) == 2
+
+
+def test_sglang_hook_windows_follow_the_published_manifest(tmp_path, monkeypatch):
+    shards = {}
+    for seed, lanes, window in ((7, 8, "warmup"), (7, 8, "profiling"), (7, 14, "profiling"), (42, 8, "profiling")):
+        path = tmp_path / f"s{seed}-c{lanes}-{window}.jsonl.gz"
+        with gzip.open(path, "wt") as stream:
+            stream.write(json.dumps({"sequence": 1, "fpm": fpm(decode=lanes)}) + "\n")
+        shards[f"step-capture/seed{seed}/c{lanes}/{window}.jsonl.gz"] = path
+    manifest = tmp_path / "aisim-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "artifacts": [{"artifact_id": key, "sha256": agentx_learned._sha256(p)} for key, p in shards.items()]
+                + [{"artifact_id": "collection/windows.json", "sha256": "0" * 64}]
+            }
+        )
+    )
+    monkeypatch.setattr(
+        agentx_learned,
+        "_download",
+        lambda spec, name, cache: manifest if name == "aisim-manifest.json" else shards[name],
+    )
+    spec = {"layout": "sglang_hook"}
+    assert [lanes for lanes, _ in agentx_learned.windows(spec, 7, tmp_path)] == [14, 8, 8]
+    assert [lanes for lanes, _ in agentx_learned.windows(spec, 7, tmp_path, scoring=True)] == [14, 8]
+    assert [lanes for lanes, _ in agentx_learned.windows(spec, 42, tmp_path)] == [8]
