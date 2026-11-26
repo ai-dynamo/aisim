@@ -14,6 +14,7 @@
 import importlib.resources as pkg_resources
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -1866,7 +1867,12 @@ def _get_language_quantization_config(raw_config: dict) -> dict | None:
 
 
 def validate_fp8_moe_shard(
-    raw_config: dict, intermediate_size: int, moe_tp_size: int, *, sglang_tp_size: int | None = None
+    raw_config: dict,
+    intermediate_size: int,
+    moe_tp_size: int,
+    *,
+    sglang_tp_size: int | None = None,
+    vllm_refine_hidden_size: int | None = None,
 ) -> None:
     """Check the checkpoint blocks partitioned by the gate/up and SGLang down projections."""
     quantization = _get_language_quantization_config(raw_config) or {}
@@ -1875,9 +1881,13 @@ def validate_fp8_moe_shard(
         shape = [1, 32]  # SGLang's MXFP8 reader fixes both axes even when the checkpoint supplies another shape.
     if not isinstance(shape, (list, tuple)) or len(shape) != 2 or any(type(n) is not int or n <= 0 for n in shape):
         raise ValueError("weight_block_size must supply two positive integer expert block dimensions")
-    # The row-parallel down projection also shards its input across SGLang tensor-parallel ranks.
-    for block in shape if sglang_tp_size and sglang_tp_size > 1 else shape[:1]:
-        if (intermediate_size // moe_tp_size) % block:
+    shard = intermediate_size // moe_tp_size
+    if vllm_refine_hidden_size and math.gcd(*shape, shard, vllm_refine_hidden_size) >= 32:
+        return  # vLLM can split serialized block scales losslessly down to this common tile.
+    # The row-parallel down projection also shards its input across tensor-parallel ranks.
+    check_down = (sglang_tp_size or 1) > 1 or (vllm_refine_hidden_size and moe_tp_size > 1)
+    for block in shape if check_down else shape[:1]:
+        if shard % block:
             raise ValueError(
                 f"Invalid quantized MoE configuration: (moe_intermediate_size={intermediate_size} / "
                 f"moe_tp_size={moe_tp_size}) % weight_block_size={block} != 0."

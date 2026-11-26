@@ -275,7 +275,7 @@ def _kv_systems_args(sample: dict[str, Any], role: str) -> dict[str, Any]:
     from .forward_pass_estimator import resolve_systems_paths
 
     paths = sample_systems_paths(sample, role)
-    return {"systems_paths": list(resolve_systems_paths(paths))} if paths else {}
+    return {"systems_paths": list(resolve_systems_paths(paths))}
 
 
 def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:

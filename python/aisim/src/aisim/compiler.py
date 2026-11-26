@@ -1255,11 +1255,7 @@ def _resolve_kv_bytes_per_token(
         backend=engine.backend,
         backend_version=engine.backend_version,
         system=worker.hardware or engine.hardware,
-        **(
-            {"systems_paths": list(resolve_systems_paths(paths))}
-            if paths is not None and engine.fpm_profile is None
-            else {}
-        ),
+        **({"systems_paths": list(resolve_systems_paths(paths))} if engine.fpm_profile is None else {}),
         **(
             {
                 "fpm_profile": engine.fpm_profile.model_dump(mode="json"),

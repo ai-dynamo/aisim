@@ -62,6 +62,8 @@ PREFILL_COLD = {
     "total_kv_read_tokens": 0,
     "sample_reasons": ["explicit"],
 }
+# Synthetic accepted forwards follow room for the ten permitted retries in a producer run.
+_FIRST_ACCEPTED_FORWARD = 32
 PREFILL_CACHED = {
     "batch_size": 1,
     "total_prefill_tokens": 64,
@@ -149,7 +151,10 @@ def glm_native_payload(phase: str, *, points: list[dict], rank: int = 0, dp: int
                         **copy.deepcopy(fpm),
                         "benchmark_sample": {
                             **_glm_forward_sample(
-                                point, fpm["wall_time"], ((benchmark_id - 1) * 15 + i + 6) * steps - 1, steps - 1
+                                point,
+                                fpm["wall_time"],
+                                _FIRST_ACCEPTED_FORWARD + ((benchmark_id - 1) * 15 + i + 6) * steps - 1,
+                                steps - 1,
                             ),
                             "sample_index": i,
                         },
@@ -274,7 +279,7 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
     """
     directory.mkdir(parents=True, exist_ok=True)
     lines = []
-    forward = -1
+    forward = _FIRST_ACCEPTED_FORWARD - 1
     for row in payload["results"]:
         point = row["point"]
         fpm = row["fpms"][0]
@@ -332,6 +337,19 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
                     ],
                 }
             )
+            if steps == 2:
+                # Every seeded prompt has an uncached suffix before the two pure decode outputs.
+                total = point["total_kv_read_tokens"] - point["batch_size"]
+                repetitions[-1]["scheduled_token_counts"].insert(0, total)
+                repetitions[-1]["dispatches"].insert(
+                    0,
+                    {
+                        "runtime_mode": "NONE",
+                        "num_padded_tokens": total,
+                        "num_unpadded_tokens": total,
+                        "num_paddings": 0,
+                    },
+                )
         record = {"benchmark_id": point["benchmark_id"], "point_type": point["point_type"], "repetitions": repetitions}
         lines.append(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
     for row, line in zip(payload["results"], lines, strict=True):
@@ -387,7 +405,7 @@ def _glm_producer_shape(tmp_path, breakage=None):
     def shape(phase, payload):
         payload["measurement_protocol"] = copy.deepcopy(protocol)
         payload["warmup_evidence"] = {"status": "recorded", "records": []}
-        forward = 0
+        forward = _FIRST_ACCEPTED_FORWARD
         for position, (row, group) in enumerate(zip(payload["results"], payload["iteration_groups"], strict=True)):
             fpm = group["rank_results"][0]["fpms"][0]
             assert row["fpms"][0] is fpm
@@ -831,7 +849,13 @@ def test_glm_publication_matches_each_dispatch_to_its_scheduled_tokens(tmp_path,
         ("reused-id", "invalid accepted"),
         ("missing-id", "complete attempt history"),
         ("trailing-reject", "complete attempt history"),
-        ("rejected-dispatch", "contradicts its dispatch"),
+        ("rejected-dispatch", "unavailable rejected forward dispatch"),
+        ("absent-dispatch", "contradicts its dispatch"),
+        ("observed-dispatch", "contradicts its dispatch"),
+        ("discarded-rank", "rank, point or sample"),
+        ("discarded-forward", "repeated or unordered"),
+        ("false-rejection", "do not support the rejection reason"),
+        ("missing-reason", "rejection reason"),
         ("extra-prefill-dispatch", "invalid|missing dispatch"),
     ],
 )
@@ -858,7 +882,10 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
         rejected = copy.deepcopy(warmup)
         rejected.pop("role")
         rejected.pop("repetition")
-        rejected.update(attempt=0, rejection_reason="discarded sample")
+        rejected["fpms"][0]["benchmark_sample"]["forward_index"] = 0
+        rejected["fpms"][0]["benchmark_sample"]["cudagraph"] = {"status": "unavailable"}
+        rejected["dispatches"][0] = None
+        rejected.update(attempt=0, rejection_reason="missing actual graph dispatch receipt")
         record["rejected_repetitions"] = [rejected]
         if fault == "rejected-chunk":
             rejected["prefill_chunks"][0][0][1] = 4
@@ -868,12 +895,69 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
             record["repetitions"][-1]["attempt"] += 1
         elif fault == "trailing-reject":
             rejected["attempt"] = len(record["repetitions"]) + 1
+        elif fault in {"absent-dispatch", "false-rejection"}:
+            rejected["fpms"][0]["benchmark_sample"]["cudagraph"] = warmup["fpms"][0]["benchmark_sample"]["cudagraph"]
+            if fault == "false-rejection":
+                rejected["dispatches"] = warmup["dispatches"]
+        elif fault == "observed-dispatch":
+            rejected["dispatches"] = warmup["dispatches"]
+        elif fault == "discarded-rank":
+            rejected["fpms"][0]["dp_rank"] = 1
+        elif fault == "discarded-forward":
+            rejected["fpms"][0]["benchmark_sample"]["forward_index"] = warmup["fpms"][0]["benchmark_sample"][
+                "forward_index"
+            ]
+        elif fault == "missing-reason":
+            del rejected["rejection_reason"]
         else:
             rejected["fpms"][0]["benchmark_sample"]["cudagraph"].update(
                 num_padded_tokens=1, num_unpadded_tokens=1, num_paddings=0
             )
 
     _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, reason)
+
+
+@pytest.mark.parametrize(
+    ("fault", "error"),
+    [
+        ("seed", "seed prompt specs"),
+        ("endpoint", "per-request lengths"),
+        ("hit", "cached prefix"),
+        ("mixed", "prefill chunk contradicts"),
+        ("no-preparation", "lacks a preparation dispatch"),
+    ],
+)
+def test_glm_published_decode_requires_each_seeded_prompt_and_lockstep(tmp_path, fault, error):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[DECODE_POINTS[1]])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+
+    def mutate(record):
+        record["rows"] = {"context": [4096, 4096], "prompt": [4095, 4095], "measured_decode_step": 2}
+        record["seed"] = {"lengths": [2176, 2176], "specs": [[[0, 2176]], [[131, 2176]]]}
+        stage = record["repetitions"][0]
+        stage["prompt_specs"] = [[[0, 4095]], [[131, 4095]]]
+        stage["prefill_chunks"] = [[[0, 4095]], [[0, 4095]]]
+        counts = [4095, 4095]
+        if fault == "seed":
+            record["seed"]["specs"][0][0][1] = 4
+        elif fault == "endpoint":
+            stage["prompt_specs"] = [[[0, 4092]], [[131, 4098]]]
+        elif fault == "hit":
+            stage["prefill_chunks"] = [[[4092, 3]], [[4092, 3]]]
+            counts = [3, 3]
+        elif fault == "no-preparation":
+            del stage["prefill_chunks"]
+            counts = []
+        else:
+            counts[-1] += 1
+        stage["scheduled_token_counts"][:-2] = counts
+        stage["dispatches"][:-2] = [
+            dict(runtime_mode="NONE", num_padded_tokens=n, num_unpadded_tokens=n, num_paddings=0) for n in counts
+        ]
+
+    _check_altered_repetition(tmp_path, cell, payload, artifact, mutate, error)
 
 
 @pytest.mark.parametrize("fault", [None, "count", "mode", "order", "unavailable-values"])
@@ -894,7 +978,8 @@ def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatc
         # One request decodes while the other is still preparing its prompt. The last receipt is absent.
         first, second = rejected["fpms"]
         rejected["fpms"].append(copy.deepcopy(second))
-        for fpm in rejected["fpms"]:
+        for index, fpm in enumerate(rejected["fpms"]):
+            fpm["benchmark_sample"].update(forward_index=index, sample_index=index)
             fpm["scheduled_requests"]["num_decode_requests"] = 1
 
         def receipt(tokens, mode):
@@ -945,12 +1030,23 @@ def test_glm_final_attempt_respects_the_producer_retry_limit(tmp_path, monkeypat
             rejected["dispatches"][-1] = None
             rejected["fpms"][-1]["benchmark_sample"]["cudagraph"] = {"status": "unavailable"}
             rejected["rejection_reason"] = "missing actual graph dispatch receipt"
-            record["rejected_repetitions"] = [{**rejected, "attempt": index} for index in range(rejected_count)]
+            record["rejected_repetitions"] = []
+            for index in range(rejected_count):
+                attempt = copy.deepcopy(rejected)
+                attempt["attempt"] = index
+                for step, fpm in enumerate(attempt["fpms"]):
+                    fpm["benchmark_sample"]["forward_index"] = 2 * index + step
+                record["rejected_repetitions"].append(attempt)
         else:
             record.pop("rejected_repetitions", None)
 
     _check_altered_repetition(
-        tmp_path, cell, payload, artifact, add_rejections, "producer limit" if over_limit else None
+        tmp_path,
+        cell,
+        payload,
+        artifact,
+        add_rejections,
+        "producer limit" if over_limit else (None if records_rejections else "complete attempt history"),
     )
 
 
@@ -1007,8 +1103,8 @@ def test_glm_publication_checks_preparation_and_rank_time(tmp_path, corruption, 
         repetition = record["repetitions"][0]
         repetition["prefill_chunks"] = [[[0, 2176]], [[2176, 1919]]]
         record["seed"] = {"prefill_chunks": [[[0, 2176]]]}
-        repetition["scheduled_token_counts"][:0] = [2176, 1919]
-        repetition["dispatches"][:0] = [
+        repetition["scheduled_token_counts"][:-2] = [2176, 1919]
+        repetition["dispatches"][:-2] = [
             {"runtime_mode": "NONE", "num_unpadded_tokens": count, "num_padded_tokens": count, "num_paddings": 0}
             for count in (2176, 1919)
         ]
@@ -1066,10 +1162,13 @@ def test_glm_decode_preparation_must_finish_every_prompt_in_the_batched_forward(
         # B=2. A single 1,919-token chunk can finish only one of the two 4,095-token prompts.
         first["prompt_specs"] = [[[0, 4095]], [[128, 4095]]]
         first["prefill_chunks"] = [[[2176, 1919]]]
-        first["scheduled_token_counts"].insert(0, 1919)
-        first["dispatches"].insert(
-            0, {"runtime_mode": "NONE", "num_unpadded_tokens": 1919, "num_padded_tokens": 1919, "num_paddings": 0}
-        )
+        first["scheduled_token_counts"][0] = 1919
+        first["dispatches"][0] = {
+            "runtime_mode": "NONE",
+            "num_unpadded_tokens": 1919,
+            "num_padded_tokens": 1919,
+            "num_paddings": 0,
+        }
 
     _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, "finish the prompts")
 
