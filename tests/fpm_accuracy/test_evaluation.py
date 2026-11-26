@@ -1246,7 +1246,7 @@ def test_op_level_request_selects_uncorrected_op_level_and_rejects_bad_overrides
 
 
 def test_real_op_level_predicts_from_the_packaged_database(tmp_path):
-    pytest.importorskip("aisim_core.sdk")
+    pytest.importorskip("aisim._runtime")
     from scripts.fpm_accuracy.models.fpt_predictor import PredictorContext
 
     case = _build_dataset(tmp_path, protocol_id=None, files=[], tp=8).measurement_case(CONFIGURATION_PATH)

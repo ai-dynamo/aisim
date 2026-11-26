@@ -125,6 +125,7 @@ areas:
       - tests/test_e2e_accuracy_ui.mjs
       - tests/test_e2e_accuracy_nightly.py
       - tests/test_agentx_accuracy.py
+      - tests/test_agentx_metrics.py
       - tests/test_agentx_inputs.py
       - tests/test_simulation_features.py
       - tests/test_agentx_curves.py
@@ -241,6 +242,8 @@ shared:
   - glob: tests/test_e2e_accuracy_nightly.py
     owners: [forward-pass-engine, replay, infra, maintainers]
   - glob: tests/test_agentx_accuracy.py
+    owners: [forward-pass-engine, replay, infra, maintainers]
+  - glob: tests/test_agentx_metrics.py
     owners: [forward-pass-engine, replay, infra, maintainers]
   - glob: tests/test_agentx_inputs.py
     owners: [forward-pass-engine, replay, infra, maintainers]
