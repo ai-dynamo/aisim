@@ -2726,6 +2726,57 @@ fn finalize_publishes_what_a_full_rescan_would() {
 }
 
 #[test]
+fn partial_state_hit_admission_and_first_chunk_match_the_allocation_peak() {
+    let groups = [attention("full", 16, None), state("s", 16, true, true)];
+    // Resume at 8 inside a block of 16. At 16 the state copy is the working
+    // block. At 17 it needs a separate destination. The full prompt also
+    // exports a checkpoint at 40, eight tokens inside the third block.
+    for (target, needed, checkpoint) in [(16, 4, None), (17, 6, None), (41, 8, Some(40))] {
+        let mut coordinator =
+            with_limits(GroupedPrefixRules::new(&groups, 4, VllmRuleVersion::V0_33_0).unwrap());
+        let mut kv = kv_pool(&groups, needed as u64);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(41, 4);
+        seed_inside(pool, &[0, 1], 4, 16, 8);
+        let hit = coordinator.find_longest_hit(pool, &request, 41);
+        assert_eq!(hit.tokens, 8);
+        assert_eq!(coordinator.admission_blocks(pool, &hit, 41), 8);
+        assert_eq!(
+            coordinator.first_allocation_blocks(pool, &hit, 41, target),
+            needed
+        );
+        assert_eq!(
+            (pool.active_blocks(), pool.inactive_cached_blocks()),
+            (0, 2)
+        );
+
+        let mut pressure = pool.reserve(&[], 1).unwrap();
+        let other = pool.take_private(&mut pressure);
+        pool.cancel(pressure);
+        let mut lease = coordinator.new_lease();
+        coordinator.pin_hit(pool, &mut lease, &hit).unwrap();
+        assert!(!coordinator.allocate(pool, &mut lease, 41, 8, target, 1));
+        coordinator.release_request(pool, &mut lease);
+        pool.release(other);
+        assert_eq!(
+            (pool.active_blocks(), pool.inactive_cached_blocks()),
+            (0, 2)
+        );
+
+        pool.reset_peak_active_blocks();
+        coordinator.pin_hit(pool, &mut lease, &hit).unwrap();
+        assert!(coordinator.allocate(pool, &mut lease, 41, 8, target, 1));
+        assert_eq!(pool.peak_active_blocks(), needed);
+        let state = state_lease(&lease, 1);
+        assert_eq!(state.copy.is_some(), target > 16);
+        assert_eq!(state.checkpoint().map(|(_, pos)| pos), checkpoint);
+        coordinator.release_request(pool, &mut lease);
+        coordinator.release_copy_sources(pool);
+        assert_eq!(pool.active_blocks(), 0);
+    }
+}
+
+#[test]
 fn first_allocation_test_counts_the_blocks_that_the_first_allocation_takes() {
     // The test before a first allocation (mgr:558-576) counts the inactive
     // hit blocks and the fresh blocks of the chunk. pin_hit and the first

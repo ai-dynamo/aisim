@@ -253,7 +253,7 @@ impl GroupedBlockPool {
     /// them.
     pub(crate) fn release_all(&mut self, ids: impl IntoIterator<Item = BlockCopyId>) {
         for id in ids {
-            self.pool.release(id);
+            self.release(id);
         }
     }
 
@@ -755,14 +755,14 @@ mod tests {
                     GroupLease::Ring { copy: Some(ids[2]) },
                     GroupLease::State(GroupStateLease {
                         blocks: super::super::state_cache_manager::StateLease {
-                            working: smallvec::smallvec![ids[3]],
-                            previous: smallvec::smallvec![ids[5]],
-                            checkpoint: smallvec::smallvec![ids[7]],
+                            working: Some(ids[3]),
+                            previous: Some(ids[5]),
+                            checkpoint: Some(ids[7]),
                             ..Default::default()
                         },
                         hit: Some((ids[4], 1)),
                         copy: Some(ids[6]),
-                        checkpoint_position: Some(8),
+                        checkpoint_position: 8,
                         ..Default::default()
                     }),
                 ],

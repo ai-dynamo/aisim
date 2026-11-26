@@ -28,7 +28,7 @@ mod align;
 mod grouped;
 
 pub(crate) use align::StateAlignRules;
-pub(crate) use grouped::{GroupStateLease, StateGroup, StatePlan};
+pub(crate) use grouped::{GroupStateLease, StateGroup};
 
 use crate::engine::cache::vllm_block_pool::{
     BlockCopyId, BlockReservation, CacheKey, KeyInBlock, VllmBlockPool,
@@ -36,27 +36,99 @@ use crate::engine::cache::vllm_block_pool::{
 use crate::engine::common::hashing::SequenceHash;
 use crate::engine::config::SlidingWindowStateConfig;
 use rustc_hash::FxHashSet;
-use smallvec::SmallVec;
-
-// A grouped state has one block; Kimi can have several capacity units per
-// state. Keep the single-block lease inline across rotations.
-type StateBlocks = SmallVec<[BlockCopyId; 1]>;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct StateLease {
-    pub(super) working: StateBlocks,
-    pub(super) working_cached: bool,
-    pub(super) previous: StateBlocks,
-    pub(super) previous_step: u64,
-    pub(super) checkpoint: StateBlocks,
+/// Both layouts use the same transitions. Grouped state slots hold exactly
+/// one physical block; a state_cache slot can span several pool blocks.
+pub(super) trait StateSlots {
+    fn blocks(&self) -> &[BlockCopyId];
+    fn push_block(&mut self, id: BlockCopyId);
+    fn drain_blocks(&mut self) -> impl Iterator<Item = BlockCopyId>;
 }
 
-impl StateLease {
-    /// Both layouts need a new destination after a slot crossing or a write
-    /// to an immutable snapshot. The same-slot producer copy differs: Kimi
-    /// copies the cache identity; a grouped state retains the old block.
-    fn needs_write(&self, crosses: bool, advances: bool) -> bool {
-        crosses || advances && self.working_cached
+impl StateSlots for Option<BlockCopyId> {
+    fn blocks(&self) -> &[BlockCopyId] {
+        self.as_slice()
+    }
+
+    fn push_block(&mut self, id: BlockCopyId) {
+        assert!(
+            self.replace(id).is_none(),
+            "grouped state slot already occupied"
+        );
+    }
+
+    fn drain_blocks(&mut self) -> impl Iterator<Item = BlockCopyId> {
+        self.take().into_iter()
+    }
+}
+
+impl StateSlots for Vec<BlockCopyId> {
+    fn blocks(&self) -> &[BlockCopyId] {
+        self
+    }
+
+    fn push_block(&mut self, id: BlockCopyId) {
+        self.push(id);
+    }
+
+    fn drain_blocks(&mut self) -> impl Iterator<Item = BlockCopyId> {
+        self.drain(..)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct StateLease<S> {
+    pub(super) working: S,
+    pub(super) working_cached: bool,
+    pub(super) previous: S,
+    pub(super) previous_step: u64,
+    pub(super) checkpoint: S,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateWrite {
+    Keep,
+    Start,
+    Rotate,
+    Preserve,
+}
+
+/// Physical demand for one state over a proposed chunk. A separate partial
+/// copy and a checkpoint each take a full state. Only a new working state
+/// needs speculative scratch.
+#[derive(Debug)]
+pub(super) struct StatePlan {
+    write: StateWrite,
+    /// Transfer an already pinned grouped hit to the pass as a copy source.
+    copy_pinned_hit: bool,
+    separate_copy: bool,
+    checkpoint: Option<usize>,
+}
+
+impl StatePlan {
+    pub(super) fn fresh_states(&self) -> usize {
+        usize::from(self.write != StateWrite::Keep)
+            + usize::from(self.separate_copy)
+            + usize::from(self.checkpoint.is_some())
+    }
+
+    pub(super) fn starts(&self) -> bool {
+        self.write == StateWrite::Start
+    }
+}
+
+impl<S: StateSlots> StateLease<S> {
+    /// Both layouts preserve an immutable snapshot on a same-slot write.
+    /// The linear layout saves its identity; grouped replay rotates the ID.
+    fn write(&self, crosses: bool, advances: bool) -> StateWrite {
+        if self.working.blocks().is_empty() {
+            StateWrite::Start
+        } else if crosses {
+            StateWrite::Rotate
+        } else if advances && self.working_cached {
+            StateWrite::Preserve
+        } else {
+            StateWrite::Keep
+        }
     }
 
     fn rotate(
@@ -66,12 +138,15 @@ impl StateLease {
         width: usize,
         step: u64,
     ) {
-        if !self.working.is_empty() {
-            self.previous.extend(self.working.drain(..));
+        if !self.working.blocks().is_empty() {
+            for id in self.working.drain_blocks() {
+                self.previous.push_block(id);
+            }
             self.previous_step = step;
         }
-        self.working
-            .extend((0..width).map(|_| pool.allocate_private(reservation)));
+        for _ in 0..width {
+            self.working.push_block(pool.allocate_private(reservation));
+        }
         self.working_cached = false;
     }
 
@@ -81,26 +156,28 @@ impl StateLease {
         reservation: &mut BlockReservation,
         width: usize,
     ) {
-        debug_assert!(self.checkpoint.is_empty());
-        self.checkpoint
-            .extend((0..width).map(|_| pool.allocate_private(reservation)));
+        debug_assert!(self.checkpoint.blocks().is_empty());
+        for _ in 0..width {
+            self.checkpoint
+                .push_block(pool.allocate_private(reservation));
+        }
     }
 
     fn hold_previous(&mut self, id: BlockCopyId, step: u64) {
-        self.previous.push(id);
+        self.previous.push_block(id);
         self.previous_step = step;
     }
 
     fn release_previous(&mut self, step: u64, mut release: impl FnMut(BlockCopyId)) {
         if self.previous_step < step {
-            self.previous.drain(..).for_each(&mut release);
+            self.previous.drain_blocks().for_each(&mut release);
         }
     }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct StateRequest {
-    pub(super) blocks: StateLease,
+    pub(super) blocks: StateLease<Vec<BlockCopyId>>,
     pub(crate) speculative: Vec<BlockCopyId>,
     pub(crate) computed_tokens: usize,
     // Align mode rotates the working allocation when the destination slot
@@ -117,6 +194,14 @@ pub(crate) struct StateRequest {
     // Published internal checkpoint, discarded if this pass is retracted.
     checkpoint_published: Vec<BlockCopyId>,
     checkpoint_step: u64,
+}
+
+/// Joint sources of a state_cache hit. A hit inside a token block also
+/// needs the attention tail as a copy source.
+#[derive(Clone, Copy)]
+pub(super) struct StateRestore {
+    pub(super) prefix: SequenceHash,
+    pub(super) token_tail: Option<CacheKey>,
 }
 
 pub(crate) struct StateCacheManager {
@@ -212,14 +297,14 @@ impl StateCacheManager {
         }
     }
 
-    fn publish_destination(
+    fn publish_destination<S: StateSlots>(
         &mut self,
         pool: &mut VllmBlockPool,
-        lease: &mut StateLease,
+        lease: &mut StateLease<S>,
         keys: impl Iterator<Item = CacheKey>,
         at: Option<KeyInBlock>,
     ) {
-        self.publish(pool, &lease.working, keys, at);
+        self.publish(pool, lease.working.blocks(), keys, at);
         lease.working_cached = true;
     }
 
@@ -300,6 +385,17 @@ impl StateCacheManager {
             self.blocks_per_state
         };
         (0..slots).map(move |slot| CacheKey::State { prefix, slot })
+    }
+
+    pub(super) fn restore_keys(
+        &self,
+        pool: &VllmBlockPool,
+        restore: StateRestore,
+    ) -> impl Iterator<Item = CacheKey> {
+        restore
+            .token_tail
+            .into_iter()
+            .chain(self.snapshot_keys(pool, restore.prefix))
     }
 
     fn groups_windows(&self, pool: &VllmBlockPool) -> bool {
@@ -447,21 +543,7 @@ impl StateCacheManager {
             .speculative
             .extend((0..self.speculative_blocks).map(|_| pool.allocate_private(reservation)));
         state.computed_tokens = computed;
-        state.working_slot = self
-            .align_block_size
-            .map(|block| target.saturating_sub(1) / block);
-    }
-
-    /// Reserve the transient internal-checkpoint copy for this pass.
-    pub(crate) fn allocate_checkpoint(
-        &self,
-        pool: &mut VllmBlockPool,
-        state: &mut StateRequest,
-        reservation: &mut BlockReservation,
-    ) {
-        state
-            .blocks
-            .allocate_checkpoint(pool, reservation, self.blocks_per_state);
+        state.working_slot = self.working_slot(target);
     }
 
     /// Publish this pass's internal checkpoint (vLLM 43b4aaea MambaManager's
@@ -489,7 +571,7 @@ impl StateCacheManager {
         for &id in &copies {
             self.hold_previous(state, id);
         }
-        Some(copies.into_vec())
+        Some(copies)
     }
 
     pub(crate) fn release_previous(&self, pool: &mut VllmBlockPool, state: &mut StateRequest) {
@@ -536,48 +618,161 @@ impl StateCacheManager {
         );
     }
 
-    pub(crate) fn write_blocks(
+    pub(super) fn fresh_blocks(&self, plan: &StatePlan) -> usize {
+        let scratch = if plan.starts() {
+            self.speculative_blocks
+        } else {
+            0
+        };
+        self.blocks_per_state
+            .saturating_mul(plan.fresh_states())
+            .saturating_add(scratch)
+    }
+
+    fn working_slot(&self, target: usize) -> Option<usize> {
+        self.align_block_size
+            .map(|block| target.saturating_sub(1) / block)
+    }
+
+    pub(super) fn plan(
+        &self,
+        pool: &VllmBlockPool,
+        state: Option<&StateRequest>,
+        target: usize,
+        checkpoint: Option<usize>,
+    ) -> StatePlan {
+        let write = state.map_or(StateWrite::Start, |state| {
+            Self::debug_assert_working_cached(pool, state);
+            let advances = target > state.computed_tokens;
+            let crosses = advances
+                && self
+                    .working_slot(target)
+                    .is_some_and(|slot| state.working_slot != Some(slot));
+            state.blocks.write(crosses, advances)
+        });
+        StatePlan {
+            write,
+            copy_pinned_hit: false,
+            // The fresh working state is the restore destination in this layout.
+            separate_copy: false,
+            checkpoint: checkpoint.filter(|_| state.is_none_or(|s| s.blocks.checkpoint.is_empty())),
+        }
+    }
+
+    /// Additional capacity for a whole-prompt state_cache admission, or
+    /// `None` if its token and state blocks cannot fit in the whole pool.
+    /// Test that peak before looking up the inactive restore sources.
+    pub(super) fn admission_blocks(
+        &self,
+        pool: &VllmBlockPool,
+        state: Option<&StateRequest>,
+        cached: usize,
+        known: usize,
+        token_block: usize,
+        restore: impl FnOnce() -> Option<StateRestore>,
+    ) -> Option<usize> {
+        // vLLM's full-ISL gate runs to prefill_end. A live allocation plans
+        // only the checkpoint selected by the scheduler for its actual chunk.
+        let checkpoint = self
+            .align_block_size
+            .filter(|_| self.prefill_checkpoint)
+            .and_then(|block| {
+                StateAlignRules::state_cache(block, block, true, self.speculative_drop())
+                    .checkpoint(cached, known, known, known)
+            });
+        let initial = self.plan(pool, None, known, checkpoint);
+        let fresh = self.fresh_blocks(&initial);
+        let total = fresh
+            .saturating_add(if cached > 0 { self.blocks_per_state } else { 0 })
+            .saturating_add(usize::from(!cached.is_multiple_of(token_block)));
+        if known == 0 || known.div_ceil(token_block).saturating_add(total) > pool.capacity() {
+            return None;
+        }
+        // A window loaded from G2 resumes in its landed working state. Other
+        // G2 loads already hold scratch, but admission still budgets a working state.
+        if self.sliding_window.is_some()
+            && state.is_some_and(|state| {
+                !state.blocks.working.is_empty() && state.computed_tokens == cached
+            })
+        {
+            return Some(usize::from(checkpoint.is_some()) * self.blocks_per_state);
+        }
+        let inactive = restore().map_or(0, |hit| {
+            self.restore_keys(pool, hit)
+                .filter(|&key| pool.key_hit(key).is_some_and(|hit| !hit.is_active))
+                .map(|key| pool.key_blocks(key))
+                .sum()
+        });
+        let held_scratch = state.map_or(0, |state| state.speculative.len());
+        Some(fresh.saturating_sub(held_scratch).saturating_add(inactive))
+    }
+
+    pub(super) fn write_blocks(
         &self,
         pool: &VllmBlockPool,
         state: &StateRequest,
         target: usize,
     ) -> usize {
-        Self::debug_assert_working_cached(pool, state);
-        if target <= state.computed_tokens || state.blocks.working.is_empty() {
+        // Decode only reserves a write for a working state the request owns.
+        if state.blocks.working.is_empty() {
             return 0;
         }
-        // Align mode writes into a new working allocation when the slot changes.
-        let new_slot = self.align_block_size.is_some_and(|block_size| {
-            state.working_slot != Some(target.saturating_sub(1) / block_size)
-        });
-        if state.blocks.needs_write(new_slot, true) {
-            self.blocks_per_state
-        } else {
-            0
-        }
+        self.fresh_blocks(&self.plan(pool, Some(state), target, None))
     }
 
-    pub(crate) fn prepare_write(
+    pub(super) fn prepare_write(
         &mut self,
         pool: &mut VllmBlockPool,
         state: &mut StateRequest,
         target: usize,
         reservation: &mut BlockReservation,
     ) {
-        if self.write_blocks(pool, state, target) == 0 {
-            return;
+        if !state.blocks.working.is_empty() {
+            let plan = self.plan(pool, Some(state), target, None);
+            self.apply(
+                pool,
+                state,
+                plan,
+                state.computed_tokens,
+                target,
+                reservation,
+            );
         }
-        if let Some(block_size) = self.align_block_size {
-            let slot = target.saturating_sub(1) / block_size;
-            if state.working_slot != Some(slot) {
+    }
+
+    pub(super) fn apply(
+        &mut self,
+        pool: &mut VllmBlockPool,
+        state: &mut StateRequest,
+        plan: StatePlan,
+        computed: usize,
+        target: usize,
+        reservation: &mut BlockReservation,
+    ) {
+        match plan.write {
+            StateWrite::Keep => {}
+            StateWrite::Start => self.start(pool, state, reservation, computed, target),
+            StateWrite::Rotate => {
                 state
                     .blocks
                     .rotate(pool, reservation, self.blocks_per_state, self.step);
-                state.working_slot = Some(slot);
-                return;
+                state.working_slot = self.working_slot(target);
             }
+            StateWrite::Preserve => self.preserve_working(pool, state, reservation),
         }
+        if plan.checkpoint.is_some() {
+            state
+                .blocks
+                .allocate_checkpoint(pool, reservation, self.blocks_per_state);
+        }
+    }
 
+    fn preserve_working(
+        &mut self,
+        pool: &mut VllmBlockPool,
+        state: &mut StateRequest,
+        reservation: &mut BlockReservation,
+    ) {
         // The state_cache producer keeps its working IDs and moves the
         // published identity to a saved copy in the same logical slot.
         let hash = state.snapshot_hash.expect("published state has a hash");

@@ -442,6 +442,9 @@ impl GroupedPrefixRules {
                 (GroupRuleKind::Ring, GroupLease::Ring { .. }) => usize::MAX,
                 (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
             };
+            if end == 0 {
+                return 0;
+            }
             until = until.min(end);
         }
         until
@@ -1173,7 +1176,7 @@ impl GroupedPrefixCoordinator {
                     let group = self.state.group(g);
                     group.release_before_allocation(state, first, computed_before, step, releases);
                     let state_plan = group.plan(state, first, computed_before, target, prefill_end);
-                    fresh += state_plan.fresh_blocks();
+                    fresh += state_plan.fresh_states();
                     Plan::State(state_plan)
                 }
                 (GroupRuleKind::Ring, GroupLease::Ring { copy }) => {

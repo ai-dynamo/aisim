@@ -1040,7 +1040,10 @@ fn active_state_source_is_not_charged_twice_during_restore_admission() {
     let (query, mut reader) = request(Uuid::from_u128(2), 12, 4, true, 0);
     let cost = manager.get_lease_prefill_cost(&query, &reader);
     assert_eq!(cost.cached_tokens, 8);
-    assert_eq!(manager.state_restore_overhead(&reader, 8), 2);
+    assert_eq!(
+        manager.admission_requirement(&reader, 12, &cost, 0),
+        AllocationRequirement::Blocks(3)
+    );
     allocated(manager.allocate_lease(reader.owner(), &mut reader, 12, 2));
     assert_eq!(manager.num_active_blocks(), 7);
     manager.finish_lease(reader.owner(), reader);
@@ -1705,6 +1708,59 @@ fn sliding_window_turn_resumes_at_prompt_boundary_after_decode_crosses_a_block()
             );
             manager.finish_lease(next, lease);
         }
+    }
+}
+
+#[test]
+fn whole_prompt_state_admission_and_chunk_allocation_charge_physical_width() {
+    // EAGLE drops the 8-token attention hit to the 4-token state. Its two
+    // inactive state slots, the new working state and one scratch state take
+    // six blocks. Only the final chunk needs two more for the checkpoint.
+    for (target, checkpoint, active) in [(8, None, 8), (13, Some(8), 12)] {
+        let mut manager = manager(12, 4, 2, true);
+        manager.configure_state_cache(
+            Some(crate::engine::StateCacheConfig {
+                bytes_per_request: 8,
+                sliding_window: None,
+                num_speculative_states: Some(1),
+                prefill_checkpoint: true,
+                junction_checkpoints: false,
+            }),
+            Some(1),
+            true,
+        );
+        manager.configure_prefix_match_unit(Some(4));
+        let owner = Uuid::from_u128(801);
+        let (request, mut lease) = fine_request(owner, 13, 4, 4, 0);
+        let prefix = lease.state_hash(4, 4).unwrap();
+        for position in [4, 8] {
+            seed_key(
+                &mut manager,
+                CacheKey::Token(lease.state_hash(position, 4).unwrap()),
+            );
+        }
+        for slot in 0..2 {
+            seed_key(&mut manager, CacheKey::State { prefix, slot });
+        }
+        let cost = manager.get_lease_prefill_cost(&request, &lease);
+        assert_eq!(cost.cached_tokens, 4);
+        assert_eq!(
+            manager.admission_requirement(&lease, 13, &cost, 0),
+            AllocationRequirement::Blocks(12)
+        );
+        assert_eq!(manager.num_active_blocks(), 0);
+
+        lease.set_prefill_checkpoint(checkpoint);
+        allocated(manager.allocate_lease(owner, &mut lease, target, 1));
+        assert_eq!(manager.num_active_blocks(), active);
+        let state = lease.state.as_ref().unwrap();
+        assert_eq!(state.speculative.len(), 2);
+        assert_eq!(
+            state.blocks.checkpoint.len(),
+            if checkpoint.is_some() { 2 } else { 0 }
+        );
+        manager.finish_lease(owner, lease);
+        clear_reclaimable_and_assert_empty(&mut manager);
     }
 }
 
