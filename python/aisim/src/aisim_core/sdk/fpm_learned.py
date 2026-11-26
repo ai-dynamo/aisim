@@ -925,7 +925,8 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
 
     The SGLang step-capture hook records ``spec_num_steps`` (draft depth) and
     ``spec_num_draft_tokens`` (verify width, ``spec_num_steps + 1`` for the
-    chain drafts replay prices) on every step. Steps must agree on one depth.
+    chain drafts replay prices) on every step; a step with only the width
+    records depth ``width - 1``. Steps must agree on one depth.
     ``nextn`` declares the depth for telemetry without these fields and must
     match a recorded depth. Without either, the steps ran without speculative
     decoding (depth 0).
@@ -940,11 +941,14 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
             if not _rank_active(sched):
                 continue
             steps = sched.get("spec_num_steps")
-            if steps is None:
-                unrecorded = True
-                continue
-            steps = int(steps)
             draft_tokens = sched.get("spec_num_draft_tokens")
+            if steps is None:
+                if draft_tokens is None:
+                    unrecorded = True
+                    continue
+                # Width without depth: a chain draft of depth d verifies d + 1 tokens.
+                steps = max(int(draft_tokens) - 1, 0)
+            steps = int(steps)
             if steps > 0 and draft_tokens is not None and int(draft_tokens) != steps + 1:
                 raise ValueError(
                     f"iteration {index}: spec_num_draft_tokens={draft_tokens} != spec_num_steps + 1; "

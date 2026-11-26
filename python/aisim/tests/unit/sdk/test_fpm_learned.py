@@ -709,6 +709,13 @@ def test_training_nextn_reads_the_capture_hook_depth():
     assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]]) == 0
     # Telemetry without the hook fields declares its depth.
     assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]], nextn=2) == 2
+    # A step that records only the verify width carries depth width - 1.
+    width_only = _decode_fpm(2, 100, 0.01)
+    width_only["scheduled_requests"]["spec_num_draft_tokens"] = 4
+    assert fpm_learned.training_nextn([[width_only]]) == 3
+    with pytest.raises(ValueError, match="does not match the steps' recorded spec_num_steps=7"):
+        width_only["scheduled_requests"]["spec_num_draft_tokens"] = 8
+        fpm_learned.training_nextn([[width_only]], nextn=3)
 
 
 @pytest.mark.parametrize(
