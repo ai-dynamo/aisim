@@ -153,6 +153,27 @@ following local corrections to this pinned revision:
 - Assert rejected SWA attachment and locked suffix eviction leave the original
   four-atom edge unsplit before retrying or releasing the lock.
 - Keep borrowed namespace fields private so their cached hash stays consistent.
+- Reject duplicate SWA backup targets, occupied Mamba backup destinations, extra
+  Full backup descriptors, multiple backup descriptors for a component, and
+  disabled component keys before adopting any staged rows. Generic load-back
+  commits are rejected; use `commit_load_back` for validation and source pins.
+- Reject both sharded-to-unsharded and unsharded-to-sharded extensions. Revalidate
+  a suspended insert's remaining path before restoring a host graft; a rotation
+  conflict preserves the walk and returns `InsertRotationMismatch` for cancellation.
+- Backfill parent-first storage hashes when storage is enabled, before later
+  children can be hashed. Reselect empty auxiliary eviction cursors after unlock,
+  and refresh Mamba's saved victim after exact inserts as well as matches.
+- Refresh Full eviction after the final device receipt release in either driver
+  registration order. Defer failed-backup drops whose victim became ineligible.
+  Validate SWA cascade locks before taking rows, both on selection and after a
+  deferred backup; skip blocked candidates and continue the walk.
+- Hold a Full-only lock receipt on consumed prefixes while SWA inserts suspend.
+  This prevents demotion of tombstoned SWA prefixes that normal match load-back
+  cannot restore. Release it on resume or cancellation; Full-only inserts keep
+  their existing demotion/recovery behavior. No lock walk is added to ordinary
+  Full-only simulation, and normal eviction keeps its incremental heap updates.
+- Assert the original compressed edge immediately after unaligned suffix eviction
+  is rejected, as well as after rejection of locked suffix eviction.
 - Describe the bundled module as native-only.
 - Borrow child edge keys during removal and copy visible page slices directly
   into compact shared storage during adoption and splitting, avoiding temporary

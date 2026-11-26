@@ -217,3 +217,52 @@ fn radix_growth_measurement() {
     }
     println!("{output}");
 }
+
+#[test]
+#[ignore = "explicit optimized warm-readmission and checkpoint measurement"]
+fn radix_warm_readmission_measurement() {
+    let mut observations = Vec::new();
+    for growth_pages in [2, 128, 512, 2048] {
+        let capacity = 131072;
+        let repetitions = 100;
+        let mut mgr = SglangKvManager::new(capacity, 32, KvEventPublishers::default(), 0);
+        let mut tokens: Vec<u32> = (0..64).collect();
+        let mut alloc = mgr.allocate_for_request(&tokens).unwrap();
+        mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+        for _ in 0..growth_pages {
+            let start = tokens.len() as u32;
+            tokens.extend(start..start + 32);
+            mgr.extend_allocation(&tokens, &mut alloc.lease).unwrap();
+            mgr.extend_cached_prefix(&tokens, &mut alloc.lease);
+        }
+        mgr.finish(&tokens, alloc.lease);
+        let nodes = mgr.cache().num_nodes();
+        let checkpoint_started = std::time::Instant::now();
+        for _ in 0..repetitions {
+            std::hint::black_box(mgr.cache.admission_checkpoint());
+        }
+        let checkpoint_ns = checkpoint_started.elapsed().as_nanos() as u64;
+        let mut warm_admission_ns = 0;
+        for _ in 0..repetitions {
+            let started = std::time::Instant::now();
+            let admission = mgr.begin_admission();
+            let alloc = mgr.allocate_for_request(&tokens).unwrap();
+            mgr.commit_admission(admission);
+            warm_admission_ns += started.elapsed().as_nanos() as u64;
+            assert_eq!(alloc.prefix_len, tokens.len());
+            mgr.finish(&tokens, alloc.lease);
+        }
+        assert_eq!(mgr.cache().num_nodes(), nodes);
+        mgr.cache().assert_invariants();
+        mgr.evict(capacity);
+        assert_eq!(mgr.cache().available_tokens(), capacity);
+        observations.push(json!({"growth_pages": growth_pages, "page_size": 32,
+            "prompt_tokens": tokens.len(), "nodes": nodes, "repetitions": repetitions,
+            "checkpoint_ns": checkpoint_ns, "warm_admission_ns": warm_admission_ns}));
+    }
+    let output = serde_json::to_string_pretty(&observations).unwrap() + "\n";
+    if let Ok(path) = std::env::var("AISIM_EVICTION_EVIDENCE_OUTPUT") {
+        std::fs::write(path, &output).unwrap();
+    }
+    println!("{output}");
+}

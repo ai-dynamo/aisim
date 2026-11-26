@@ -634,6 +634,10 @@ fn native_suffix_eviction_rejects_locked_or_unaligned_pages_before_mutation() {
         .is_err()
     );
     assert_eq!(tree.evictable_size(), 4);
+    assert_eq!(
+        tree.inspect_get_node_token_ids(leaf).unwrap(),
+        vec![10, 20, 30, 40]
+    );
     let (_, evicted) = tree.evict_full_device_suffix(leaf, 2).unwrap();
     assert_eq!(evicted.device_frees[&FULL][0].as_slice(), &[3, 4]);
     assert_eq!(tree.evictable_size(), 2);

@@ -212,7 +212,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
-        tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
+        self.refresh_lru(tree_core, LRURefreshPhase::MatchEnd, node_id);
         let tick = tree_core.arena.get_and_bump_access_counter();
         tree_core.arena.node_mut(node_id).last_access_counter = tick;
         result.mamba_exist = true;
@@ -388,7 +388,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for MambaComponent {
         let mut cursor = tree_core.component_state(MAMBA).evict_device_cursor;
         // A request may lock the saved cursor between eviction steps without
         // removing it from the LRU. Recheck before taking values or debiting sizes.
-        if cursor.is_some_and(|c| {
+        if cursor.is_none_or(|c| {
             !tree_core.device_lru_list(MAMBA).in_list(Some(c))
                 || tree_core.arena.node(c).device_lock_ref(MAMBA) > 0
         }) {

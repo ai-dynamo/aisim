@@ -777,6 +777,9 @@ pub enum TreeCoreRuntimeError {
         "suspended insert lost device residency at node {node_id}; load it back before resuming"
     )]
     InsertPrefixNotDeviceResident { node_id: NodeId },
+    /// A host graft added a differently sharded child while the walk was suspended.
+    #[error("suspended insert rotation conflicts at node {node_id}")]
+    InsertRotationMismatch { node_id: NodeId },
     /// An arena slot beyond the arena's bounds — never allocated. `size` is the
     /// arena's current slot count, so valid ids are `0..size`.
     #[error("node access out of bounds: id {id} not in [0, {size})")]

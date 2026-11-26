@@ -93,11 +93,75 @@ the scoped exclusive-growth optimization on these workloads.
 - Radix source/comparison tool tests: 10 passed.
 - Rustfmt, repository Python Ruff lint/format, and packaged legal-file checks pass.
 
-Reproduce one growth sample on each revision, using the same probe and isolated
-Cargo targets: `cargo test --release --locked --lib --jobs 1 --
---ignored --exact engine::kv_manager::sglang_backend::radix_lifecycle_evidence::radix_growth_measurement`.
-`AISIM_EVICTION_EVIDENCE_OUTPUT` saves its machine-readable observations. CLI inputs
-and the exact output canonicalization exclusions are in the adjacent JSON.
+The following recipe reproduces this table's probe, rather than the older
+10-repetition probe documented in `RADIX_REPAIR_EVIDENCE.md`. It requires local
+Git objects for both immutable revisions and keeps every artifact outside the
+checkout. Build both arms before collecting timings; repeat the last invocation
+with the paired schedule above for comparable measurements.
+
+```bash
+set -euo pipefail
+growth_work=$(mktemp -d "${TMPDIR:?}/exclusive-growth.XXXXXXXX")
+growth_targets="${CARGO_TARGET_DIR:-$growth_work/target}/$(basename "$growth_work")"
+probe_revision=d4e983e1bae6705dd14f6d64e16d4bf6224e71a8
+probe_path=crates/core/src/engine/kv_manager/radix_lifecycle_evidence.rs
+git show "$probe_revision:$probe_path" > "$growth_work/probe.rs"
+printf '%s  %s\n' \
+  852732a3b202490edb6372ba5331a280b73dc129a16315889d42d266bc97b787 \
+  "$growth_work/probe.rs" | sha256sum --check
+for side in baseline candidate; do
+  revision=57a902aad462ab13b7994956ecdeda905220dc8b
+  if [ "$side" = candidate ]; then revision=$probe_revision; fi
+  snapshot="$growth_work/$side"
+  mkdir "$snapshot"
+  git archive "$revision" Cargo.toml Cargo.lock crates/core python/aisimulate | tar -x -C "$snapshot"
+  cp "$growth_work/probe.rs" "$snapshot/$probe_path"
+  module="$snapshot/crates/core/src/engine/kv_manager/sglang_backend.rs"
+  if ! rg -q '^mod radix_lifecycle_evidence;$' "$module"; then
+    printf '\n#[cfg(test)]\n#[path = "radix_lifecycle_evidence.rs"]\nmod radix_lifecycle_evidence;\n' >> "$module"
+  fi
+  (cd "$snapshot"
+    CARGO_TARGET_DIR="$growth_targets/$side" cargo test --release --locked --lib \
+      radix_growth_measurement --no-run > "$growth_work/$side-build.log" 2>&1)
+done
+for side in baseline candidate; do
+  (cd "$growth_work/$side"
+    CARGO_TARGET_DIR="$growth_targets/$side" \
+      AISIM_EVICTION_EVIDENCE_OUTPUT="$growth_work/$side.json" \
+      cargo test --release --locked --lib radix_growth_measurement -- --ignored --exact \
+      engine::kv_manager::sglang_backend::radix_lifecycle_evidence::radix_growth_measurement)
+done
+```
+
+For the CLI rows, build and install each snapshot's optimized production wheel
+before any timing. Use the same pinned Rust/Python versions and lockfiles when
+comparing binary hashes; otherwise record newly built hashes rather than claiming
+they equal the historical artifacts. `maturin` must be available on `PATH`.
+
+```bash
+for side in baseline candidate; do
+  uv venv "$growth_work/$side-venv"
+  (cd "$growth_work/$side/python/aisimulate"
+    CARGO_TARGET_DIR="$growth_targets/$side-wheel" \
+      maturin build --release --locked --out "$growth_work/$side-dist")
+  uv pip install --python "$growth_work/$side-venv/bin/python" "$growth_work/$side-dist/"*.whl
+  "$growth_work/$side-venv/bin/python" - "$growth_work/$side-dist/"*.whl <<'PYCODE'
+import hashlib, importlib, sys, zipfile
+runtime = importlib.import_module("aisimulate._runtime")
+loaded = hashlib.sha256(open(runtime.__file__, "rb").read()).hexdigest()
+with zipfile.ZipFile(sys.argv[1]) as wheel:
+    entry = next(p for p in wheel.namelist() if p.endswith("/_runtime.abi3.so"))
+    assert loaded == hashlib.sha256(wheel.read(entry)).hexdigest()
+print(runtime.__file__, loaded)
+PYCODE
+done
+```
+
+The adjacent JSON's `model_provenance.generated_model` is the complete synthetic
+model config. Write it to a scratch `tiny-model/config.json` and replace only the
+absolute model path in each `cli_rows[].config` before invoking its recorded CLI
+command. Preserve the traffic, cache, timing and resource settings, and the
+`cli_canonical_exclusions` list. No weights or numerical goldens are required.
 
 Earlier setup/resource failures remain in the scratch logs: the initial wheel
 command selected CFFI instead of the Python project; pytest needed its asyncio

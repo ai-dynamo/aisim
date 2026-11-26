@@ -294,6 +294,8 @@ pub struct InsertWalkState<K: ChildKeyType, V: RadixValue> {
     result: Option<InsertResult<V>>,
     /// Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: Vec<CacheAction<V>>,
+    /// Full-only receipt protecting consumed KV while an SWA insert is suspended.
+    prefix_lock: Option<IncLockRefResult>,
 }
 
 /// Result of a KV-canary walk: parallel per-slot rows over the tree's FULL device slots.
@@ -1237,6 +1239,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         self.assert_receipt_anchor_(node_idx, params);
         self.release_components_(node_idx, params, /* lock_host = */ false, skip_swa);
         self.update_evictable_leaf_sets_(node_idx);
+        if self.evictable_device_leaves.contains(node_idx) {
+            // The last auxiliary release can run after Full in either registration order.
+            self.full_evict_device_heap_dirty = true;
+        }
         // TODO: delta is not aggregated from components; no caller uses it yet.
         Ok(DecLockRefResult::default())
     }
@@ -1987,9 +1993,8 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         }
         self.validate_insert_anchor_(prefix_node_idx, prefix_len, params)?;
         if aligned_key_len > 0
-            && let Some(rotation_base) = params.rotation_base
             && let Some((matched, node_id)) =
-                self.rotation_conflict_(params, aligned_key_len, rotation_base)
+                self.rotation_conflict_(params, aligned_key_len, params.rotation_base)
         {
             let root_id = self.arena.root();
             self.touch_node_(root_id);
@@ -2087,11 +2092,13 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 ..InsertResult::default()
             }),
             pending_actions: Vec::new(),
+            prefix_lock: None,
         });
         if !prefix_actions.is_empty() {
             // A root walk suspends right after the step that emits a write-through
             // trigger; hand the replayed ones to the controller before the suffix
             // walk starts.
+            self.pin_suspended_insert_prefix_();
             return Ok(InsertStepResult {
                 actions: prefix_actions,
                 result: None,
@@ -2155,7 +2162,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         &self,
         params: &InsertParams<'_, K, V>,
         aligned_key_len: usize,
-        rotation_base: i64,
+        rotation_base: Option<i64>,
     ) -> Option<(usize, NodeIdx_)> {
         let mut node_id = self.arena.root();
         let mut matched = 0;
@@ -2168,18 +2175,26 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 break;
             };
             let child = self.arena.node(child_id);
+            // Inserts establish a single rotation per root path, and host grafts
+            // are unsharded. An unsharded root child therefore needs no second
+            // full-key traversal in the usual Full-only simulator.
+            if rotation_base.is_none() && child.rotation_base.is_none() {
+                return None;
+            }
             let prefix_len = params
                 .key
                 .match_len(matched, &child.key, self.page_size)
                 .min(aligned_key_len - matched);
             node_id = child_id;
             matched += prefix_len;
+            if child.rotation_base != rotation_base {
+                return Some((matched, child_id));
+            }
             if prefix_len < child.key.atom_len() {
                 break;
             }
         }
-        let node = self.arena.node(node_id);
-        (!node.is_root() && node.rotation_base != Some(rotation_base)).then_some((matched, node_id))
+        None
     }
 
     /// Continue the suspended insert after its step actions were executed.
@@ -2223,8 +2238,34 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             }
             cursor = node.parent();
         }
+        let mut cursor = node_id;
+        let mut offset = state.total_prefix_length - state.key_offset;
+        while offset < state.key.atom_len() {
+            let Some(child) = self.arena.child_on_page_in_namespace(
+                cursor,
+                state.namespace.as_ref(),
+                state.key.page_at(offset, self.page_size),
+            ) else {
+                break;
+            };
+            let node = self.arena.node(child);
+            if node.rotation_base != state.rotation_base {
+                return Err(TreeCoreRuntimeError::InsertRotationMismatch { node_id: node.id });
+            }
+            let len = state.key.match_len(offset, &node.key, self.page_size);
+            offset += len;
+            if len < node.key.atom_len() {
+                break;
+            }
+            cursor = child;
+        }
         state.node_id = node_id;
         state.target_node_id = target_node_id;
+        let receipt = state.prefix_lock.take();
+        if let Some(receipt) = receipt {
+            let anchor = self.arena.node(target_node_id.unwrap_or(node_id)).id;
+            self.dec_lock_ref(anchor, &receipt.to_dec_params(), false)?;
+        }
         Ok(self.advance_insert_())
     }
 
@@ -2235,10 +2276,35 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
 
     /// Finish the insert (idempotent); returns still-pending actions to drain.
     pub fn end_insert(&mut self) -> Vec<CacheAction<V>> {
-        self.ongoing_insert_walk_state
-            .take()
-            .map(|state| state.pending_actions)
-            .unwrap_or_default()
+        let Some(state) = self.ongoing_insert_walk_state.take() else {
+            return Vec::new();
+        };
+        if let Some(receipt) = state.prefix_lock {
+            self.dec_lock_ref(
+                state.target_node_handle.unwrap_or(state.node_handle),
+                &receipt.to_dec_params(),
+                false,
+            )
+            .expect("suspended insert owns a live Full receipt");
+        }
+        state.pending_actions
+    }
+
+    /// SWA tombstones cannot use normal match load-back. Keep the consumed Full
+    /// prefix resident until resume/end instead, using the ordinary lock ledger.
+    fn pin_suspended_insert_prefix_(&mut self) {
+        if self.components_by_type[SWA.idx()].is_none() {
+            return;
+        }
+        let state = self
+            .ongoing_insert_walk_state
+            .as_ref()
+            .expect("suspended insert");
+        let anchor = state.target_node_handle.unwrap_or(state.node_handle);
+        let receipt = self
+            .inc_lock_ref(anchor, [SWA, MAMBA].into_iter().collect())
+            .expect("insert prefix is live");
+        self.ongoing_insert_walk_state.as_mut().unwrap().prefix_lock = Some(receipt);
     }
 
     /// Run the in-flight insert to its next barrier or to completion.
@@ -2266,6 +2332,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             if !new_actions.is_empty() && !new_actions.iter().all(Self::is_deferrable_action_) {
                 let flushed = std::mem::take(&mut state.pending_actions);
                 self.ongoing_insert_walk_state = Some(state);
+                self.pin_suspended_insert_prefix_();
                 return InsertStepResult {
                     actions: flushed,
                     result: None,
@@ -2997,6 +3064,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             || self.arena.device_lock_ref(node_idx, component_type) > 0
             || (component_type == MAMBA && node.is_load_back_pending())
             || !self.device_lru_list(component_type).in_list(Some(node_idx))
+            || !self.can_cascade_evict_device_(node_idx, component_type)
         {
             return result;
         }
@@ -3095,10 +3163,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         let mut result = EvictionStepResult::default();
         {
             let node = self.arena.node(node_id);
-            assert!(
-                self.is_evictable_device_leaf_(node),
-                "node {node_id} is not a D-leaf"
-            );
+            if !self.is_evictable_device_leaf_(node) {
+                return Ok((false, result));
+            }
             // A failed backup never issues the D->H copy, so the subtree root has
             // no host state and no in-flight DMA reading its device slots.
             assert!(!node.backuped() && node.write_through_pending_id.is_none());
@@ -3467,6 +3534,28 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         self.update_evictable_leaf_sets_(node_id);
     }
 
+    /// Check all cascade lock constraints before taking the trigger's rows.
+    pub(crate) fn can_cascade_evict_device_(
+        &self,
+        node_id: NodeIdx_,
+        trigger: ComponentType,
+    ) -> bool {
+        let is_leaf = self.evictable_device_leaves.contains(node_id);
+        let component = self.component_by_type_(trigger);
+        self.components.iter().all(|other| {
+            self.should_cascade_evict_component_(
+                node_id,
+                trigger,
+                other.as_ref(),
+                EvictLayer::Device,
+                is_leaf,
+                component.eviction_priority(is_leaf),
+                component.eviction_priority(false),
+            )
+            .is_ok()
+        })
+    }
+
     /// Decide whether one component participates in a cascade eviction.
     ///
     /// Lock violations are returned instead of panicking so the inspection
@@ -3719,6 +3808,9 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
 
     /// Whether the storage tier (L3) is wired; storage attaches after tree construction.
     pub fn set_enable_storage(&mut self, value: bool) {
+        if value && !self.enable_storage {
+            self.backfill_missing_hash_values();
+        }
         self.enable_storage = value;
     }
 
@@ -4609,11 +4701,23 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         mut insert_result: Option<&mut InsertResult<V>>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) -> Result<(), TreeCoreRuntimeError> {
+        let anchor_id = node_id;
         let node_id = self.arena.resolve(node_id)?;
+        if phase == CacheTransferPhase::LoadBack {
+            return Err(TreeCoreRuntimeError::InvalidLoadBackSpec { node_id: anchor_id });
+        }
         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
         if phase == CacheTransferPhase::BackupHost {
             for (&component_type, transfers) in &comp_xfers {
                 self.validate_backup_transfers_(node_id, component_type, transfers)?;
+            }
+        }
+        for &component_type in comp_xfers.keys() {
+            if self.components_by_type[component_type.idx()].is_none() {
+                return Err(TreeCoreRuntimeError::InvalidBackupSpec {
+                    node_id: anchor_id,
+                    component_type,
+                });
             }
         }
         if let Some(insert_result) = insert_result.as_deref() {
@@ -4650,6 +4754,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
             node_id: self.arena.node(node_id).id,
             component_type,
         };
+        if self.components_by_type[component_type.idx()].is_none() || transfers.len() > 1 {
+            return Err(invalid());
+        }
+        let mut seen = HashSet::new();
         for transfer in transfers {
             let Some(host_indices) = &transfer.host_indices else {
                 continue;
@@ -4660,7 +4768,7 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                     return Err(invalid());
                 }
             } else if component_type == MAMBA {
-                if host_indices.len() != 1 {
+                if host_indices.len() != 1 || self.arena.node(node_id).has_host_value(MAMBA) {
                     return Err(invalid());
                 }
             } else if component_type == SWA {
@@ -4673,7 +4781,10 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
                 let mut total = 0usize;
                 for &target in targets {
                     let node = self.arena.node(self.arena.resolve(target)?);
-                    if !node.has_device_value(SWA) || node.has_host_value(SWA) {
+                    if !seen.insert(target)
+                        || !node.has_device_value(SWA)
+                        || node.has_host_value(SWA)
+                    {
                         return Err(invalid());
                     }
                     total = total
@@ -4699,6 +4810,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
     ) -> Result<(), TreeCoreRuntimeError> {
         let node_id = self.arena.resolve(node_id)?;
         self.validate_pool_transfer_handles(comp_xfers.values().flatten())?;
+        if comp_xfers.contains_key(&FULL) {
+            return Err(TreeCoreRuntimeError::InvalidBackupSpec {
+                node_id: self.arena.node(node_id).id,
+                component_type: FULL,
+            });
+        }
         let node = self.arena.node(node_id);
         if !host_indices.is_empty()
             && (node.has_host_value(FULL) || host_indices.len() != node.key.atom_len())
@@ -4770,6 +4887,12 @@ impl<K: ChildKeyType, V: RadixValue> UnifiedTreeCore<K, V> {
         // Validate the entire plan before pinning nodes or adopting any rows.
         // A live handle can still name a shorter suffix after a node split.
         let invalid = || TreeCoreRuntimeError::InvalidLoadBackSpec { node_id: anchor_id };
+        if comp_xfers
+            .keys()
+            .any(|ct| *ct == FULL || self.components_by_type[ct.idx()].is_none())
+        {
+            return Err(invalid());
+        }
         let counts = kv_xfer.node_row_counts.as_deref().ok_or_else(invalid)?;
         if counts.len() != loaded_node_indices.len() {
             return Err(invalid());

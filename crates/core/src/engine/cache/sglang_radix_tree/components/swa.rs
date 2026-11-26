@@ -785,7 +785,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
         let mut cursor = tree_core.component_state(SWA).evict_device_cursor;
         // A request may lock the saved cursor between eviction steps without
         // removing it from the LRU. Recheck before taking values or debiting sizes.
-        if cursor.is_some_and(|c| {
+        if cursor.is_none_or(|c| {
             !tree_core.device_lru_list(SWA).in_list(Some(c))
                 || tree_core.arena.node(c).device_lock_ref(SWA) > 0
         }) {
@@ -793,7 +793,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                 .device_lru_list(SWA)
                 .get_lru_no_lock(&tree_core.arena);
         }
-        let next = 'step: {
+        let next = 'step: loop {
             if tracker[&ct] >= tree_core.component_state(SWA).evict_device_request_cnt {
                 break 'step None;
             }
@@ -810,6 +810,9 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
             cursor = tree_core
                 .device_lru_list(SWA)
                 .get_prev_no_lock(x, &tree_core.arena);
+            if !tree_core.can_cascade_evict_device_(x, SWA) {
+                continue;
+            }
             // The SWA LRU filters its own transfer/request locks. A Full load
             // pin can also cover an ancestor outside the loaded SWA window,
             // whose separately restored SWA rows remain independently evictable.
@@ -848,7 +851,7 @@ impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for SwaComponent {
                 Some(tracker),
             );
             tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
-            None
+            break 'step None;
         };
         tree_core.component_state_mut(SWA).evict_device_cursor = cursor;
         next
