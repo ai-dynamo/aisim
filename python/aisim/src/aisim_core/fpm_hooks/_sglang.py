@@ -12,7 +12,7 @@ speculative decoding a decode request's extend is the verify width
 ``spec_num_draft_tokens`` (``1 + k``, the convention of the learned-model
 docs), and the tokens it committed are in ``spec_accept_lengths``.
 
-Step diagnostics (see ``_struct.STEP_FIELDS``) come from three more wrappers:
+Step diagnostics (see ``_request_fields.STEP_FIELDS``) come from three more wrappers:
 
 - ``_init_fpm`` adds a DeviceTimer reporter that sums device time per
   category (``target_verify``, ``eagle_draft``, ``eagle_draft_extend``, ...);

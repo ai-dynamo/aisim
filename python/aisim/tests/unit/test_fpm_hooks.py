@@ -208,8 +208,8 @@ def test_sglang_hook_adds_lists_from_schedule_batch(fake_sglang):
 
 def test_extend_struct_step_fields_default_and_roundtrip():
     fpm = _stock_fpm_module("x.fpm")
-    ext = _struct.extend_struct(fpm.ScheduledRequestMetrics)
-    plain = _struct.with_pairs(ext, fpm.ScheduledRequestMetrics(num_decode_requests=1), [(1, 10)])
+    ext = request_fields.extend_struct(fpm.ScheduledRequestMetrics)
+    plain = request_fields.with_pairs(ext, fpm.ScheduledRequestMetrics(num_decode_requests=1), [(1, 10)])
     assert plain.spec_num_draft_tokens == 0 and plain.spec_accept_lengths == []
     assert plain.device_time_s_by_category == {} and plain.host_emitted_at_s == 0.0
     step = {
@@ -221,14 +221,14 @@ def test_extend_struct_step_fields_default_and_roundtrip():
         "host_emitted_at_s": 10.03,
         "not_a_step_field": 1,
     }
-    out = _struct.with_pairs(ext, fpm.ScheduledRequestMetrics(num_decode_requests=2), [(1, 200), (1, 100)], step)
+    out = request_fields.with_pairs(ext, fpm.ScheduledRequestMetrics(num_decode_requests=2), [(1, 200), (1, 100)], step)
     raw = msgspec.msgpack.decode(fpm.encode(fpm.ForwardPassMetrics(wall_time=0.026, scheduled_requests=out)))
     scheduled = raw["scheduled_requests"]
     assert scheduled["spec_accept_lengths"] == [4, 1] and scheduled["spec_num_draft_tokens"] == 4
     assert scheduled["device_time_s_by_category"] == {"target_verify": 0.02, "eagle_draft": 0.006}
     assert "not_a_step_field" not in scheduled
     # re-wrapping an extended record replaces, not duplicates, the hook fields
-    again = _struct.with_pairs(ext, out, [(1, 5)])
+    again = request_fields.with_pairs(ext, out, [(1, 5)])
     assert again.past_kv_lengths == [5] and again.spec_accept_lengths == []
 
 
@@ -400,8 +400,8 @@ def test_record_frames_keeps_hook_fields_and_reports_gaps():
     from aisim_core.fpm_hooks import _record
 
     fpm = _stock_fpm_module("x.fpm")
-    ext = _struct.extend_struct(fpm.ScheduledRequestMetrics)
-    scheduled = _struct.with_pairs(
+    ext = request_fields.extend_struct(fpm.ScheduledRequestMetrics)
+    scheduled = request_fields.with_pairs(
         ext,
         fpm.ScheduledRequestMetrics(num_decode_requests=1),
         [(4, 700)],
