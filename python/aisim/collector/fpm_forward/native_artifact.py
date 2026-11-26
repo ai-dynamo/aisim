@@ -472,9 +472,63 @@ def _producer_receipt(cell: FPMCell, raw_root: Path, *, plan_sha256: str, attemp
     return expected._asdict()
 
 
+def _observed_forward(sample: dict, wall_time: float, *, glm: bool, path: Path) -> tuple[str, dict, list[str]]:
+    """Validate one process-local timing interval and its recorded graph dispatch."""
+    reasons = []
+    timing, graph = sample.get("timing"), sample.get("cudagraph")
+    if not isinstance(timing, dict) or timing.get("basis") not in {"schedule_to_output", "inter_output"}:
+        raise ValueError("benchmark_sample has invalid timing basis")
+    start, end = timing.get("start_monotonic"), timing.get("end_monotonic")
+    if (
+        type(end) not in {int, float}
+        or not math.isfinite(end)
+        or (
+            start is not None
+            and (
+                type(start) not in {int, float}
+                or not math.isfinite(start)
+                or start > end
+                or not math.isclose(end - start, wall_time, rel_tol=1e-9, abs_tol=1e-9)
+            )
+        )
+    ):
+        raise ValueError("benchmark_sample contradicts its local timing interval")
+    if start is None:
+        if glm:
+            raise ValueError(
+                f"benchmark_sample.timing.start_monotonic of a GLM-5.3-Flash producer sample must be recorded: "
+                f"expected a number, found None: {path}"
+            )
+        reasons.append("sample timing start is unavailable")
+    if not isinstance(graph, dict) or graph.get("status") not in {"observed", "unavailable"}:
+        raise ValueError("benchmark_sample has invalid graph observation status")
+    if glm and graph["status"] != "observed":
+        raise ValueError(
+            "benchmark_sample.cudagraph.status of a GLM-5.3-Flash producer sample must be observed: "
+            f"expected 'observed', found {graph['status']!r}: {path}"
+        )
+    values = [graph.get(name) for name in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")]
+    if graph["status"] == "unavailable":
+        if any(value is not None for value in values):
+            raise ValueError("unavailable graph observation contains observed values")
+        reasons.append("per-sample CUDA graph dispatch is unavailable")
+    elif (
+        values[0] not in {"NONE", "PIECEWISE", "FULL"}
+        or not all(type(value) is int and value >= 0 for value in values[1:])
+        or values[2] - values[1] != values[3]
+    ):
+        raise ValueError("benchmark_sample has invalid observed graph dispatch or padding")
+    return timing["basis"], graph, reasons
+
+
 def _validate_glm_repetitions(
-    record: dict[str, Any], row: dict[str, Any], rank: object, producer: dict[str, Any], path: Path
-) -> None:
+    record: dict[str, Any],
+    row: dict[str, Any],
+    rank: object,
+    producer: dict[str, Any],
+    path: Path,
+    previous_forward: int = -1,
+) -> int:
     """Verify the accepted forwards and match the measured forwards to the saved rank samples."""
     point = row["point"]
     repetitions = record.get("repetitions")
@@ -500,7 +554,7 @@ def _validate_glm_repetitions(
     if point["point_type"] == "decode":
         # The first decode advances every request by one token before the measured step.
         steps.insert(0, {**scheduled, "sum_decode_kv_tokens": scheduled["sum_decode_kv_tokens"] - point["batch_size"]})
-    previous_attempt = previous_forward = -1
+    previous_attempt = -1
     for index, repetition in enumerate(repetitions):
         role = "warmup" if index < warmups else "measurement"
         if (
@@ -516,6 +570,11 @@ def _validate_glm_repetitions(
         fpms = repetition.get("fpms")
         if not isinstance(fpms, list) or len(fpms) != len(steps):
             raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
+        dispatches = repetition.get("dispatches")
+        if not isinstance(dispatches, list) or len(dispatches) < len(steps):
+            raise ValueError(f"{error}: missing dispatch receipt for {role} {index}: {path}")
+        # Earlier dispatches can build the prefix. Only the final ones are the forwards of this repetition.
+        receipts = dispatches[-len(steps) :]
         for step, (fpm, expected) in enumerate(zip(fpms, steps, strict=True)):
             if (
                 not isinstance(fpm, dict)
@@ -532,13 +591,24 @@ def _validate_glm_repetitions(
             forward = sample.get("forward_index") if isinstance(sample, dict) else None
             if type(forward) is not int or forward <= previous_forward or not _same(sample.get("sample_index"), step):
                 raise ValueError(f"{error}: missing, repeated or unordered forward at repetition {index}: {path}")
+            if index >= warmups and step == len(steps) - 1:
+                position = index - warmups
+                expected_raw = {**fpm, "benchmark_sample": {**sample, "sample_index": position}}
+                if json.dumps(raw[position], sort_keys=True) != json.dumps(expected_raw, sort_keys=True):
+                    raise ValueError(f"{error}: measurement {position} differs from its saved raw sample: {path}")
+            basis, graph, _ = _observed_forward(sample, fpm["wall_time"], glm=True, path=path)
+            receipt = receipts[step]
+            if (
+                basis != ("schedule_to_output" if step == 0 else "inter_output")
+                or not isinstance(receipt, dict)
+                or any(
+                    not _same(receipt.get(key), graph[key])
+                    for key in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
+                )
+            ):
+                raise ValueError(f"{error}: invalid timing basis or dispatch receipt for {role} {index}: {path}")
             previous_forward = forward
-        if index >= warmups:
-            position = index - warmups
-            fpm = fpms[-1]
-            expected_raw = {**fpm, "benchmark_sample": {**fpm["benchmark_sample"], "sample_index": position}}
-            if json.dumps(raw[position], sort_keys=True) != json.dumps(expected_raw, sort_keys=True):
-                raise ValueError(f"{error}: measurement {position} differs from its saved raw sample: {path}")
+    return previous_forward
 
 
 def _validate_glm_provenance(
@@ -685,6 +755,7 @@ def _validate_glm_provenance(
     rank = payload.get("dp")
     rank = rank.get("rank") if isinstance(rank, dict) else None
     line_digests: dict[int, str] = {}
+    previous_forward = -1
     for line in raw.splitlines():
         try:
             record = json.loads(line)
@@ -696,7 +767,7 @@ def _validate_glm_provenance(
         line_digests[benchmark_id] = hashlib.sha256(line).hexdigest()
         row = rows_by_id.get(benchmark_id)
         if row is not None and row.get("repetition_evidence_sha256") == line_digests[benchmark_id]:
-            _validate_glm_repetitions(record, row, rank, expected_producer, path)
+            previous_forward = _validate_glm_repetitions(record, row, rank, expected_producer, path, previous_forward)
     for row in payload["results"]:
         point = row["point"]
         if not _is_hex(row.get("repetition_evidence_sha256"), 64):

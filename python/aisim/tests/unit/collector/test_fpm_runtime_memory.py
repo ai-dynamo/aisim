@@ -2487,6 +2487,27 @@ def test_glm_collection_plan_counts_two_blocks_for_each_mamba_group(tmp_path, pa
     assert (dropped["prefill"]["cache_capacity"], dropped["decode"]["cache_capacity"]) == dropped_counts
 
 
+@pytest.mark.parametrize(("pages", "fits"), [(24, False), (27, False), (28, True)])
+def test_glm_plan_charges_every_attention_group_at_its_own_block_size(tmp_path, monkeypatch, pages, fits):
+    from . import test_runtime_observations
+
+    groups = test_runtime_observations.glm_tp4_cache_groups()
+    attention = next(group for group in groups if group["kind"] == "attention")
+    assert attention["num_layers"] == 22
+    attention["num_layers"] = 11
+    groups.append({**attention, "name": "second_attention", "block_size_tokens": 16})
+    monkeypatch.setattr(test_runtime_observations, "glm_tp4_cache_groups", lambda: groups)
+    plan = _glm_plan(tmp_path, kda_checkpoint_alignment=16, kv_cache_bytes=pages * 13_516_800)
+    prefill = json.loads(plan.options.benchmark_points_json)["prefill"]
+    cold = {
+        (point["batch_size"], point["total_prefill_tokens"]) for point in prefill if point["total_kv_read_tokens"] == 0
+    }
+    # Each request with four new tokens needs 2 attention, 4 Mamba and 1 ring block. At 512 new tokens the
+    # second attention group alone needs 32 of its own 16-token blocks, exceeding each of these pool capacities.
+    assert ((4, 16) in cold) == fits
+    assert (1, 512) not in cold
+
+
 def _second_deployment(max_batch_size, **topology):
     """A second deployment with the runtime memory of the TP 4 probe, at TP 8 or at ``topology``."""
     memory = {

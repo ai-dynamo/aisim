@@ -86,7 +86,7 @@ Serialized Rust requests and estimates that omit the field remain compatible
 because deserialization defaults it to zero. See [Rust literal migration](../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals)
 for required source changes to request and memory-breakdown structs.
 
-A naive estimate reads only the model's `config.json`. When the first entry
+A naive estimate reads the model's `config.json`. When the first entry
 of `architectures` is an architecture that AISim supports, the config must
 pass AISim's config parser. If the parser refuses it, the estimate fails
 with `the config parser refuses the HF config of the supported architecture
@@ -102,6 +102,24 @@ zero or empty value, which it reads as no architecture.
 an FPM profile and without `state_cache`, is a naive estimate and has the same
 refusals. So is `engine.kv_transfer.bytes_per_token: auto` of a disaggregated
 engine without an FPM profile and without `state_cache` on its prefill role.
+
+For a sliding-window decoder, the config-only shared pool estimate allows every
+scheduled token to be present in every attention layer. A prefill can occupy the
+retained window and its in-flight tokens at the same time. The runtime's
+concurrent steps and physical cache pages are needed to tighten that bound.
+The direct estimator's single-request retention curve caps each sliding layer
+at its window. For GPT-OSS-20B at TP1 with 96 MiB available, bf16 KV retains
+3,968 tokens after eviction and allows 2,048 tokens for shared scheduling.
+
+For DeepSeek V4, the scheduler fallback models vLLM's packed cache with PP1,
+CP1, DCP1 and no draft tokens. Its offline weight inventory uses the same
+per-operation GEMM and MoE storage formats as the native memory estimator,
+including an adjacent `hf_quant_config.json` when supplied. Explicit modes
+must match the checkpoint. At TP8/EP8, Flash holds 20,364,048,808 bytes of
+resident weights per rank and the NVIDIA NVFP4 variant holds 22,528,309,672.
+The fraction of post-weight memory available for KV remains an estimate.
+Each Flash request reserves 26 fixed 1,002,240-byte rows. Each additional row
+fits 256 tokens and requires a 256-token scheduler block.
 
 ### FPM profile cache groups and byte budgets
 

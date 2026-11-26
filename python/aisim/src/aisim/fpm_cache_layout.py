@@ -14,9 +14,6 @@ from collections import Counter
 from collections.abc import Mapping
 from typing import Any
 
-from aisim_core.decoder_config import WINDOW_FIELDS as WINDOW_FIELDS
-from aisim_core.decoder_config import cache_window, layout_integer
-
 RECURRENT_STATE_FIELDS = (
     "ssm_cfg",
     "mamba_d_state",
@@ -27,6 +24,21 @@ RECURRENT_STATE_FIELDS = (
 )
 RECURRENT_ARCHITECTURES = ("mamba", "jamba", "rwkv")
 LAYER_COUNT_FIELDS = ("num_hidden_layers", "n_layer", "num_layers")
+WINDOW_FIELDS = ("sliding_window", "sliding_window_size")
+
+
+def layout_integer(value: Any, field: str, *, minimum: int = 1, maximum: int | None = None) -> int:
+    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+        bound = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
+        raise ValueError(f"{field} must be an integer {bound}, not a boolean, float or numeric string")
+    return value
+
+
+def cache_window(raw: Mapping[str, Any]) -> int | None:
+    supplied = {key: layout_integer(raw[key], key, minimum=0) for key in WINDOW_FIELDS if raw.get(key) is not None}
+    if len(set(supplied.values())) > 1:
+        raise ValueError(f"conflicting sliding-window fields: {supplied}")
+    return next(iter(supplied.values()), None)
 
 
 def layer_count(raw: Mapping[str, Any]) -> int | None:

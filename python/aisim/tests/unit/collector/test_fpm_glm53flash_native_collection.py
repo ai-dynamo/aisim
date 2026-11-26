@@ -100,6 +100,26 @@ def glm_cell(phase: str, *, dp: int = 1) -> FPMCell:
     )
 
 
+def _glm_forward_sample(point, wall, forward, step):
+    tokens = point["total_prefill_tokens"] or point["batch_size"]
+    return {
+        "sample_index": step,
+        "forward_index": forward,
+        "timing": {
+            "basis": "schedule_to_output" if step == 0 else "inter_output",
+            "start_monotonic": float(forward),
+            "end_monotonic": forward + wall,
+        },
+        "cudagraph": {
+            "status": "observed",
+            "runtime_mode": "FULL",
+            "num_unpadded_tokens": tokens,
+            "num_padded_tokens": tokens,
+            "num_paddings": 0,
+        },
+    }
+
+
 def glm_native_payload(phase: str, *, points: list[dict], rank: int = 0, dp: int = 1) -> dict:
     """The rank artifact that the producer writes for ``points`` of one phase.
 
@@ -126,7 +146,12 @@ def glm_native_payload(phase: str, *, points: list[dict], rank: int = 0, dp: int
                 "raw_fpms": [
                     {
                         **copy.deepcopy(fpm),
-                        "benchmark_sample": {"sample_index": i, "forward_index": (i + 6) * steps - 1},
+                        "benchmark_sample": {
+                            **_glm_forward_sample(
+                                point, fpm["wall_time"], ((benchmark_id - 1) * 15 + i + 6) * steps - 1, steps - 1
+                            ),
+                            "sample_index": i,
+                        },
                     }
                     for i in range(10)
                 ]
@@ -248,12 +273,12 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
     """
     directory.mkdir(parents=True, exist_ok=True)
     lines = []
+    forward = -1
     for row in payload["results"]:
         point = row["point"]
         fpm = row["fpms"][0]
         raw = fpm.get("benchmark_measurement", {}).get("raw_fpms")
         repetitions = []
-        forward = -1
         for index in range(15):
             observed = raw[index - 5] if isinstance(raw, list) and 5 <= index < 5 + len(raw) else None
             steps = 2 if point["point_type"] == "decode" else 1
@@ -261,6 +286,8 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
             sample = observed.get("benchmark_sample")
             sample = sample if isinstance(sample, dict) else {}
             forward = sample.get("forward_index", forward + steps)
+            if not sample:
+                sample = _glm_forward_sample(point, fpm["wall_time"], forward, steps - 1)
             measured = {
                 "counter_id": point["benchmark_id"],
                 "dp_rank": payload["dp"]["rank"],
@@ -276,10 +303,23 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
                     **_expected_scheduled(point),
                     "sum_decode_kv_tokens": point["total_kv_read_tokens"] - point["batch_size"],
                 }
-                first["benchmark_sample"].update(sample_index=0, forward_index=forward - 1)
+                first["benchmark_sample"] = _glm_forward_sample(point, first["wall_time"], forward - 1, 0)
                 fpms.insert(0, first)
             repetitions.append(
-                {"attempt": index, "repetition": index, "role": "warmup" if index < 5 else "measurement", "fpms": fpms}
+                {
+                    "attempt": index,
+                    "repetition": index,
+                    "role": "warmup" if index < 5 else "measurement",
+                    "fpms": fpms,
+                    "dispatches": [
+                        {
+                            key: value
+                            for key, value in item["benchmark_sample"].get("cudagraph", {}).items()
+                            if key != "status"
+                        }
+                        for item in fpms
+                    ],
+                }
             )
         record = {"benchmark_id": point["benchmark_id"], "point_type": point["point_type"], "repetitions": repetitions}
         lines.append(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
@@ -684,6 +724,59 @@ def test_glm_publication_requires_both_decode_steps(tmp_path, change):
     _glm_producer_shape(tmp_path)("decode", payload)
     artifact = write_glm_rank(_pod(tmp_path, cell), payload)
     _check_altered_repetition(tmp_path, cell, payload, artifact, change, "invalid forward for warmup")
+
+
+@pytest.mark.parametrize(
+    ("phase", "step", "change", "expected"),
+    [
+        ("prefill", 0, "wall", "contradicts its local timing interval"),
+        ("prefill", 0, "dispatch", "dispatch receipt"),
+        ("decode", 0, "interval", "contradicts its local timing interval"),
+        ("decode", 0, "dispatch", "dispatch receipt"),
+        ("decode", 1, "basis", "timing basis or dispatch receipt"),
+    ],
+)
+def test_glm_publication_checks_unretained_forward_evidence(tmp_path, phase, step, change, expected):
+    cell = glm_cell(phase)
+    payload = glm_native_payload(phase, points=[PREFILL_COLD if phase == "prefill" else DECODE_POINTS[0]])
+    _glm_producer_shape(tmp_path)(phase, payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+
+    def corrupt(record):
+        # Exercise the prefill warmup, the first decode of a measurement, and the steady decode of a warmup.
+        repetition = record["repetitions"][5 if phase == "decode" and step == 0 else 0]
+        fpm = repetition["fpms"][step]
+        if change == "wall":
+            fpm["wall_time"] = 3600.0
+        elif change == "dispatch":
+            repetition["dispatches"][-len(repetition["fpms"]) + step] = None
+        elif change == "interval":
+            fpm["benchmark_sample"]["timing"]["end_monotonic"] += 90
+        else:
+            fpm["benchmark_sample"]["timing"]["basis"] = "schedule_to_output"
+
+    _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, expected)
+
+
+def test_glm_forward_indices_are_monotonic_across_all_executed_points_of_one_rank(tmp_path):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=DECODE_POINTS)
+    _glm_producer_shape(tmp_path)("decode", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    sidecar = artifact.with_suffix(".repetitions.jsonl")
+    assert len(_validate(tmp_path, cell).points) == 2
+    records = [json.loads(line) for line in _sidecar_lines(sidecar)]
+    first = records[0]["repetitions"][0]["fpms"][0]["benchmark_sample"]["forward_index"]
+    records[1]["repetitions"][0]["fpms"][0]["benchmark_sample"]["forward_index"] = first
+    lines = [json.dumps(record).encode() for record in records]
+    _rewrite_sidecar(payload, sidecar, lines)
+    for row, line in zip(payload["results"], lines, strict=True):
+        row["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
+    artifact.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="repeated or unordered forward"):
+        _validate(tmp_path, cell)
+    with pytest.raises(ValueError, match="repeated or unordered forward"):
+        database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
 
 
 def _check_altered_repetition(tmp_path, cell, payload, artifact, change, expected):
@@ -1424,7 +1517,7 @@ def test_sidecar_lines_in_another_order_than_the_rows_still_validate(tmp_path):
     pod = _pod(tmp_path, cell)
     payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
     artifact = write_glm_rank(pod, payload)
-    _rewrite_sidecar(payload, pod / EVIDENCE_FILE, list(reversed(_sidecar_lines(pod / EVIDENCE_FILE))))
+    payload["results"].reverse()  # storage order can differ from the sidecar's execution order
     artifact.write_text(json.dumps(payload))
     assert len(_validate(tmp_path, cell).points) == 2
 

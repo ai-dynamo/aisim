@@ -934,6 +934,7 @@ def test_supervisor_argument_and_output_setup_do_not_import_runtime():
             """
 import sys
 import aisim.supervision, aisim.cli_args, aisim.output
+aisim.cli_args.build_parser()
 aisim.cli_args._extract_output_configs({'artifact': {}}, ['artifact'], stack='engine')
 
 runtime = ('aisim._runtime', 'aisim.sweeper', 'numpy', 'pandas')

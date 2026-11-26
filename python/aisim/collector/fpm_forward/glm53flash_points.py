@@ -98,6 +98,7 @@ def glm_point_blocks(
     hash_block_size: int,
     state_groups: Sequence[tuple[int, int]],
     checkpoint_alignment: int | None,
+    attention_block_sizes: Sequence[int] | None = None,
 ) -> int:
     """Return the cache blocks that the requests of one point hold, for the deployment that needs the most.
 
@@ -120,12 +121,15 @@ def glm_point_blocks(
     context = point["total_kv_read_tokens"] // batch
     if workload_kind == "prefill":
         new = point["total_prefill_tokens"] // batch
-        attention = -(-(context + new) // unit)
+        tokens = context + new
         mamba = 1 + (context > 0) + (checkpoint_alignment is not None and new > unit)
     else:
         # A decode step at a context of x tokens holds x + 1 tokens: the context and the token that it writes.
-        attention = -(-(context + 1) // unit)
+        tokens = context + 1
         mamba = 1 + (context >= unit)
+    attention = sum(
+        -(-tokens // size) for size in ((unit,) if attention_block_sizes is None else attention_block_sizes)
+    )
     return batch * (attention + max(ring + mamba_groups * mamba for ring, mamba_groups in state_groups))
 
 
@@ -149,7 +153,7 @@ def glm_points(
         prefill_batch_limit=prefill_batch_limit,
         decode_batch_limit=decode_batch_limit,
         measured_context=measured_context,
-        pools=[(usable, rings, mamba) for rings, mamba in state_groups],
+        pools=[(usable, (hash_block_size,), rings, mamba) for rings, mamba in state_groups],
         checkpoint_alignment=checkpoint_alignment,
     )
 
@@ -161,7 +165,7 @@ def _glm_points_for_pools(
     prefill_batch_limit: int,
     decode_batch_limit: int,
     measured_context: int,
-    pools: Sequence[tuple[int, int, int]],
+    pools: Sequence[tuple[int, tuple[int, ...], int, int]],
     checkpoint_alignment: int | None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, int]]]:
     """Return the point list and, for each phase, its candidates and the number of them that each rule dropped.
@@ -194,10 +198,11 @@ def _glm_points_for_pools(
                 point,
                 hash_block_size=unit,
                 state_groups=[(rings, mamba)],
+                attention_block_sizes=attention_blocks,
                 checkpoint_alignment=checkpoint_alignment,
             )
             <= usable
-            for usable, rings, mamba in pools
+            for usable, attention_blocks, rings, mamba in pools
         )
 
     def batch_sizes(limit: int) -> list[int]:
@@ -282,7 +287,7 @@ def _glm_points_for_pools(
         prefill_candidates - split,
         dropped["decode"]["cache_capacity"],
         decode_candidates - over_budget,
-        min(usable for usable, _, _ in pools),
+        min(pool[0] for pool in pools),
     )
     # A phase without a point leaves its cells nothing to measure, so the plan is refused before any GPU work.
     if not prefill or not decode:
@@ -326,7 +331,8 @@ def glm_plan_manifest(
         # The tail ring is a state group without the prefill checkpoint field.
         rings = sum(group.kind == "state" and group.prefill_checkpoint_blocks is None for group in groups)
         page = max(group.page_size_bytes for group in groups)
-        pools.append((deployment.resources.runtime_memory.kv_cache_bytes // page, rings, len(mamba)))
+        attention_blocks = tuple(group.block_size_tokens for group in groups if group.kind != "state")
+        pools.append((deployment.resources.runtime_memory.kv_cache_bytes // page, attention_blocks, rings, len(mamba)))
         if mamba and len(holding) == len(mamba):
             alignments.update(group.prefill_checkpoint_alignment for group in holding)
         else:

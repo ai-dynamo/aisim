@@ -17,7 +17,13 @@ import math
 from pathlib import Path
 from typing import Any
 
-from .native_artifact import NativeCollection, _expected_scheduled, _rank_artifacts, select_native_measurements
+from .native_artifact import (
+    NativeCollection,
+    _expected_scheduled,
+    _observed_forward,
+    _rank_artifacts,
+    select_native_measurements,
+)
 
 _UNOBSERVED = [
     "sampled_continuation_token_ids",
@@ -417,56 +423,13 @@ def _observed_execution(measurement, fpm, history, prefixes, previous_forward, *
         ):
             raise ValueError("benchmark_sample has invalid sample or process-local forward index")
         previous_forward = sample["forward_index"]
-        timing, graph = sample.get("timing"), sample.get("cudagraph")
-        if not isinstance(timing, dict) or timing.get("basis") not in {"schedule_to_output", "inter_output"}:
-            raise ValueError("benchmark_sample has invalid timing basis")
-        start, end = timing.get("start_monotonic"), timing.get("end_monotonic")
-        if (
-            type(end) not in {int, float}
-            or not math.isfinite(end)
-            or (
-                start is not None
-                and (
-                    type(start) not in {int, float}
-                    or not math.isfinite(start)
-                    or start > end
-                    or not math.isclose(end - start, raw["wall_time"], rel_tol=1e-9, abs_tol=1e-9)
-                )
-            )
-        ):
-            raise ValueError("benchmark_sample contradicts its local timing interval")
-        if start is None:
-            if glm:
-                raise ValueError(
-                    f"benchmark_sample.timing.start_monotonic of a GLM-5.3-Flash producer sample must be recorded: "
-                    f"expected a number, found None: {path}"
-                )
-            reasons.append("sample timing start is unavailable")
-        if not isinstance(graph, dict) or graph.get("status") not in {"observed", "unavailable"}:
-            raise ValueError("benchmark_sample has invalid graph observation status")
-        if glm and graph["status"] != "observed":
-            raise ValueError(
-                "benchmark_sample.cudagraph.status of a GLM-5.3-Flash producer sample must be observed: "
-                f"expected 'observed', found {graph['status']!r}: {path}"
-            )
-        values = [
-            graph.get(name) for name in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
-        ]
-        if graph["status"] == "unavailable":
-            if any(value is not None for value in values):
-                raise ValueError("unavailable graph observation contains observed values")
-            reasons.append("per-sample CUDA graph dispatch is unavailable")
-        elif (
-            values[0] not in {"NONE", "PIECEWISE", "FULL"}
-            or not all(_integer(value) for value in values[1:])
-            or values[2] - values[1] != values[3]
-        ):
-            raise ValueError("benchmark_sample has invalid observed graph dispatch or padding")
+        basis, graph, missing = _observed_forward(sample, raw["wall_time"], glm=glm, path=path)
+        reasons.extend(missing)
         observed.append(
             {
                 "sample_index": index,
                 "forward_index": previous_forward,
-                "timing_basis": timing["basis"],
+                "timing_basis": basis,
                 "cudagraph": graph,
             }
         )

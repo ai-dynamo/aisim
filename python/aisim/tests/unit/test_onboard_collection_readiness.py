@@ -879,13 +879,11 @@ def test_readiness_blocks_a_glm_smoke_whose_protocol_names_nine_repetitions(tmp_
     request, root = _glm_smoke(tmp_path, monkeypatch, shape=_then(_glm_producer_shape(tmp_path), _nine_repetitions))
     report = assess_readiness(request, root, root / "fpm-checkpoint")
     assert not report["ready_for_full_collection"]
-    message = "measurement_protocol.producer must be the GLM-5.3-Flash producer's record: expected "
+    message = "expected 10 saved raw samples"
     assert {item["cell"]["workload_kind"] for item in report["selected_cells"]} == {"prefill", "decode"}
     for item in report["selected_cells"]:
         assert item["status"] != "ready"
-        assert any(message in blocker and "'measurement_repeats': 9" in blocker for blocker in item["blockers"]), item[
-            "blockers"
-        ]
+        assert any(message in blocker for blocker in item["blockers"]), item["blockers"]
 
 
 def test_measurement_reader_holds_each_glm_cell_to_the_producer_protocol(tmp_path, monkeypatch):
@@ -894,7 +892,10 @@ def test_measurement_reader_holds_each_glm_cell_to_the_producer_protocol(tmp_pat
     from collector.fpm_forward.native_artifact import validate_native_collection
     from collector.fpm_forward.repeatability import load_repeatability_source
 
-    _request, root = _glm_smoke(tmp_path, monkeypatch, shape=_then(_glm_producer_shape(tmp_path), _nine_repetitions))
+    def misstate_protocol(_phase, payload):
+        payload["measurement_protocol"]["producer"]["measurement_repeats"] = 9
+
+    _request, root = _glm_smoke(tmp_path, monkeypatch, shape=_then(_glm_producer_shape(tmp_path), misstate_protocol))
     (campaign,) = [path / "smoke" for path in (root / "fpm-artifacts").iterdir()]
     plan = load_repeatability_source(campaign)
     assert {cell.workload_kind for cell in plan.cells} == {"prefill", "decode"}
