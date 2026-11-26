@@ -2108,6 +2108,62 @@ def test_weight_only_sparse_mla_uses_the_default_cache_of_its_serving_gpu(tmp_pa
                 assert estimate_kv_bytes_per_token(model, **args) == 61 * (512 * 2 + 64 * 2 + 132) == 78_324
 
 
+def test_sparse_auto_transfer_with_missing_gpu_uses_only_hardware_independent_defaults(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config import CorePredictionConfig
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("zai-org/GLM-5-FP8")
+    model = _write_config(tmp_path, {**raw, "architectures": [_UNKNOWN_WRAPPER], "text_config": raw})
+    for target in ({}, {"system": "gb200", "systems_paths": [str(tmp_path)]}):
+        args = dict(tp_size=8, pp_size=1, **target)
+        assert estimate_kv_bytes_per_token(model, **args, backend_version="0.23.0") == 100_152
+        for version in ("0.24.0rc1", "0.33.0", "current"):
+            with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
+                estimate_kv_bytes_per_token(model, **args, backend_version=version)
+        assert estimate_kv_bytes_per_token(model, **args, kvcache_quant_mode="bfloat16") == 100_152
+        with pytest.raises(ValueError, match="runtime latent and indexer cache formats"):
+            estimate_kv_bytes_per_token(model, **args, kvcache_quant_mode="fp8")
+
+    worker = dict(
+        parallelism={"tensor": 8},
+        timing={"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
+        kv_cache={"capacity": {"type": "fixed", "blocks": 256}},
+    )
+    engine = dict(
+        mode="disaggregated",
+        model=model,
+        hardware="gb200",
+        backend="vllm",
+        backend_version="0.33.0",
+        systems_paths=[str(tmp_path)],
+        workers={"prefill": worker, "decode": worker},
+        kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50},
+        context_length=4096,
+    )
+    with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine}))
+    for timing, transfer, controls in (
+        (worker["timing"], 100_152, {}),
+        ({"type": "default"}, "auto", {"kvcache_quant_mode": "bfloat16"}),
+        ({"type": "default", "kvcache_quant_mode": "bfloat16"}, "auto", {}),
+    ):
+        worker["timing"] = timing
+        engine["kv_transfer"]["bytes_per_token"] = transfer
+        config = CorePredictionConfig.model_validate({"engine": {**engine, **controls}})
+        deployment = prediction_to_replay_spec(config).backend_deployment
+        assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == 100_152
+        assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == 100_152
+
+    raw["learnable_sink"] = True
+    _write_config(tmp_path, {"text_config": raw})
+    args = dict(tp_size=8, pp_size=1, backend="sglang")
+    with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
+        estimate_kv_bytes_per_token(model, **args, backend_version="0.5.19")
+    assert estimate_kv_bytes_per_token(model, **args, backend_version="0.5.20") == 100_152
+
+
 def test_nested_sparse_index_declaration_requires_a_complete_known_layout(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config

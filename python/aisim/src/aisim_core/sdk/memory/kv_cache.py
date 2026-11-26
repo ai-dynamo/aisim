@@ -833,6 +833,7 @@ class NaiveKVCacheEstimator:
         self._selected_decoder: dict | None = None
         self._scalar_cache_problem: str | None = None
         self._nested_index_head_dim: int | None = None
+        self._sparse_cache_needs_target = False
 
     @classmethod
     def from_model_path(
@@ -1073,17 +1074,25 @@ class NaiveKVCacheEstimator:
             return
         mode = _automatic_decoder_kv_mode(document or {}, raw, backend, backend_version)
         if self._nested_index_head_dim is not None:
-            if backend == "sglang" and sm_version is not None:
+            release = parse_support_matrix_version(backend_version)
+            if backend == "sglang":
                 # SGLang selects the DSA pool before loading the quantized weights.
-                release = parse_support_matrix_version(backend_version)
                 bf16_sinks = raw.get("learnable_sink") and release is not None and release >= Version("0.5.20")
-                mode = KVCacheQuantMode.fp8 if sm_version >= 100 and not bf16_sinks else KVCacheQuantMode.bfloat16
+                self._sparse_cache_needs_target = not bf16_sinks and sm_version is None
+                mode = (
+                    KVCacheQuantMode.fp8
+                    if sm_version is not None and sm_version >= 100 and not bf16_sinks
+                    else KVCacheQuantMode.bfloat16
+                )
             elif backend == "vllm":
                 # FlashMLA on Hopper keeps the model dtype under auto, independently of FP8 expert weights.
                 declared = raw.get("kv_cache_quant_algo")
                 if mode is None and declared in ("fp8", "nvfp4"):
                     mode = KVCacheQuantMode[declared]
-                release = parse_support_matrix_version(backend_version)
+                # From 0.24 the SM120 backend changes auto to fp8_ds_mla even on a weight-only checkpoint.
+                self._sparse_cache_needs_target = (
+                    mode is None and sm_version is None and (release is None or release >= Version("0.24.0rc1"))
+                )
                 if sm_version is not None and (
                     120 <= sm_version < 130
                     or (
@@ -1455,6 +1464,10 @@ class NaiveKVCacheEstimator:
         if geom.get("kv_lora_rank") and self.dtype_bytes == KVCacheQuantMode.nvfp4.value.memory:
             raise ValueError("an nvfp4 KV cache is modeled only for standard K/V attention")
         if self._nested_index_head_dim is not None:
+            if self._sparse_cache_needs_target:
+                raise ValueError(
+                    "automatic sparse MLA cache precision requires the target GPU or explicit KV precision"
+                )
             if self.dtype_bytes != KVCacheQuantMode.bfloat16.value.memory:
                 # FlashMLA stores per-128 latent scales and BF16 RoPE. Other sparse backends use a different layout.
                 raise ValueError("quantized sparse MLA requires the runtime latent and indexer cache formats")
@@ -1520,6 +1533,7 @@ class NaiveKVCacheEstimator:
         try:
             quantization = KVCacheQuantMode[mode]
             self.dtype_bytes = quantization.value.memory
+            self._sparse_cache_needs_target = False
             if "deepseek_v4" in self.geometry:
                 self._v4_cache_mode = quantization
         except KeyError as error:

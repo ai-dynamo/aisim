@@ -106,8 +106,9 @@ included, before the scheduler loads.
   point. The line holds the accepted repetitions of the point and each
   rejected repetition with its reason. The producer fails the run when one
   point has more than 10 rejected repetitions. The collector checks the
-  recorded evidence for rejected attempts. Only accepted measurements
-  contribute to the median.
+  recorded evidence for rejected attempts. It also checks the limit from
+  the final accepted attempt number, even if the sidecar omits the rejected
+  list. Only accepted measurements contribute to the median.
 - Request tokens come from `collector/glm53flash_attention_tokens.py`
   (seed 53, ordinary BPE vocabulary of the pinned tokenizer).
 - The repetition evidence file records each prompt as offsets into the seeded

@@ -926,6 +926,34 @@ def test_rejected_decode_matches_interleaved_pure_forwards_and_a_missing_dispatc
     )
 
 
+@pytest.mark.parametrize("over_limit", [False, True])
+@pytest.mark.parametrize("records_rejections", [False, True])
+def test_glm_final_attempt_respects_the_producer_retry_limit(tmp_path, monkeypatch, over_limit, records_rejections):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[DECODE_POINTS[0]])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    rejected_count = load_producer(monkeypatch).MAX_REJECTED_REPETITIONS + int(over_limit)
+
+    def add_rejections(record):
+        for accepted in record["repetitions"]:
+            accepted["attempt"] += rejected_count
+        if records_rejections:
+            rejected = copy.deepcopy(record["repetitions"][0])
+            rejected.pop("role")
+            rejected.pop("repetition")
+            rejected["dispatches"][-1] = None
+            rejected["fpms"][-1]["benchmark_sample"]["cudagraph"] = {"status": "unavailable"}
+            rejected["rejection_reason"] = "missing actual graph dispatch receipt"
+            record["rejected_repetitions"] = [{**rejected, "attempt": index} for index in range(rejected_count)]
+        else:
+            record.pop("rejected_repetitions", None)
+
+    _check_altered_repetition(
+        tmp_path, cell, payload, artifact, add_rejections, "producer limit" if over_limit else None
+    )
+
+
 @pytest.mark.parametrize("records_counts", [True, False])
 def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_path, records_counts):
     cell = glm_cell("decode")

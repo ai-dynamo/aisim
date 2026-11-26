@@ -149,7 +149,7 @@ including Kimi K2.5's DeepSeek language decoder. [vLLM expert placement](https:/
 A selected sparse MLA decoder stores a latent, BF16 rotary keys, and a scaled
 FP8 index per layer. For GLM-5.3-NVFP4 with BF16 KV, each of 78 layers stores
 512 × 2 + 64 × 2 + 132 bytes, or 100,152 bytes per token across the decoder.
-With vLLM on Hopper, DeepSeek-V3.2 uses BF16 KV by default despite its FP8 weights. Its 61 layers transfer 78,324 bytes per token. Quantized sparse MLA requires the selected backend's latent and indexer formats.
+With vLLM on Hopper, DeepSeek-V3.2 uses BF16 KV by default despite its FP8 weights. Its 61 layers transfer 78,324 bytes per token. When the automatic cache format depends on the GPU, the estimate requires its compute capability from the deployment's system data or an explicit KV precision. Quantized sparse MLA requires the selected backend's latent and indexer formats.
 For example, FlashMLA stores an extra four FP32 scales in a 512-element FP8
 latent. Shared capacity also needs the runtime indexer allocation. Recurrent and
 other per-layer layouts require their runtime state or group measurements.

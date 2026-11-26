@@ -305,6 +305,8 @@ def _is_hex(value: object, digits: int) -> bool:
 
 
 _GLM_RUNTIME = Path(__file__).parent / "runtime" / "glm53flash"
+# The GLM producer aborts a point on its eleventh rejected repetition.
+_GLM_MAX_REJECTED_REPETITIONS = 10
 # The timing boundary that the GLM-5.3-Flash producer records in its rank artifacts and that its published rows carry.
 GLM_TIMING_BOUNDARY = "dynamo_vllm_instrumented_scheduler_fpm_wall_time"
 
@@ -882,6 +884,11 @@ def _validate_glm_repetitions(
                     f"{error}: dispatch differs from the scheduled token count {tokens} for {role} {index}: {path}"
                 )
             previous_forward = forward
+    # Attempt IDs include every rejection, even on older records that omit the rejected attempts.
+    if previous_attempt + 1 - len(repetitions) > _GLM_MAX_REJECTED_REPETITIONS:
+        raise ValueError(
+            f"{error}: exceeds the producer limit of {_GLM_MAX_REJECTED_REPETITIONS} rejected repetitions: {path}"
+        )
     if "rejected_repetitions" in record and (
         previous_attempt != len(repetitions) + len(rejected_ids) - 1
         or any(attempt > previous_attempt for attempt in rejected_ids)
