@@ -36,6 +36,8 @@ impl<T> G1Acquire<T> {
 
 mod g1_manager;
 mod grouped;
+mod grouped_prefix;
+mod grouped_transfer;
 pub(crate) mod sglang_backend;
 mod state_cache_manager;
 mod vllm_backend;
@@ -46,9 +48,15 @@ pub(crate) use g1_manager::{
     DestinationReservation, G1Manager, NativeAllocation, SourceReleaseOrder, SourceReuseDependency,
     StateHandoff,
 };
+#[cfg(test)]
+pub(crate) use grouped::GroupedBlockPool;
 pub(crate) use grouped::GroupedKvPool;
+pub(crate) use grouped_prefix::{AdmissionLimits, GroupedPrefixRules, VllmRuleVersion};
+pub(crate) use grouped_transfer::GroupedTransferRules;
 pub(crate) use sglang_backend::SglangKvManager;
-pub(crate) use vllm_backend::{BlockRequestLease, mamba_prefill_checkpoint, state_boundaries};
+pub(crate) use vllm_backend::{
+    BlockRequestLease, PrefixHashMemo, mamba_prefill_checkpoint, state_boundaries,
+};
 
 #[cfg(test)]
 pub(crate) use vllm_backend::{apply_mtp_prefix_recompute, apply_prefix_recompute};

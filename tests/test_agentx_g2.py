@@ -423,6 +423,7 @@ def _mtp_with_drop_off(engine: dict, depth: int) -> dict:
     return worker
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("window", [False, True])
 def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
     """Both API boundaries accept MTP with G2: a recurrent state with the block drop off, a sliding window with it."""
@@ -443,6 +444,7 @@ def test_agentic_g2_accepts_mtp_for_a_state_cache(window: bool) -> None:
     _runtime.run_replay_json(json.dumps(payload))
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_hybrid_g2_forward_waits_for_stores_of_a_draft_slot_preemption() -> None:
     """A request preempted for MTP draft slots makes the forward wait for its slow stores.
 
@@ -499,6 +501,7 @@ def test_hybrid_g2_forward_waits_for_stores_of_a_draft_slot_preemption() -> None
     assert report["num_requests"] == len(turns)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_agentic_g2_runs_multi_worker_attention_dp_pd_with_mtp_on_one_shared_pool(tmp_path) -> None:
     """Two DP2 prefill workers and one DP2 decode worker share one G2 pool under MTP.
 
@@ -544,6 +547,48 @@ def test_agentic_g2_runs_on_several_aggregated_workers_with_private_pools() -> N
     assert report["agentic_qualification"] == "functional_only"
     workers = {entry["logical_worker_id"] for row in report["per_request"] for entry in row["routing_history"]}
     assert workers == {0, 1}
+
+
+@pytest.mark.parametrize("scope", ["cluster_shared", "dp_rank_local"])
+@pytest.mark.parametrize("prefill,decode", [(1, 3), (3, 1), (2, 3)])
+def test_agentic_g2_runs_on_several_prefill_and_decode_workers(scope, prefill, decode) -> None:
+    """P/D accepts several workers per role; a private pool restores only on the worker that stored the prefix."""
+    config = _config("agentx-g2-shared-pd.yaml")
+    workers = config["engine"]["workers"]
+    workers["decode"] = copy.deepcopy(workers["prefill"])
+    for role, replicas in (("prefill", prefill), ("decode", decode)):
+        workers[role]["parallelism"]["replicas"] = replicas
+        host = workers[role]["kv_cache"]["host_offload"]
+        host["scope"] = scope
+        if scope == "dp_rank_local":
+            del host["shared_d2h_bandwidth_gbps"], host["shared_h2d_bandwidth_gbps"]
+    single = copy.deepcopy(config)
+    for role in ("prefill", "decode"):
+        single["engine"]["workers"][role]["parallelism"]["replicas"] = 1
+    report, baseline = _run(config), _run(single)
+    assert report["completed_requests"] == baseline["completed_requests"] == 4
+    assert report["agentic_qualification"] == "functional_only"
+    for role, replicas in (("prefill", prefill), ("decode", decode)):
+        used = {
+            entry["logical_worker_id"]
+            for row in report["per_request"]
+            for entry in row["routing_history"]
+            if entry["pool"] == role
+        }
+        assert used == set(range(replicas))
+    restored = _restored(report)["first_admission_host_reused_input_tokens"]
+    if prefill == 2:
+        # The child runs on the other prefill worker, so the parent's prefix stays in GPU memory.
+        assert restored == 0
+        assert _restored(report)["first_admission_g1_reused_input_tokens"] == 8
+    elif scope == "cluster_shared" or prefill == 1:
+        # One pool, or one prefill worker: the parent finds its prefix as with 1P1D.
+        assert restored == _restored(baseline)["first_admission_host_reused_input_tokens"] == 8
+        assert report["committed_prefill_tokens"] == baseline["committed_prefill_tokens"]
+    else:
+        # Round robin sends the resumed parent to a prefill worker that never stored it.
+        assert restored == 0
+        assert report["committed_prefill_tokens"] > baseline["committed_prefill_tokens"]
 
 
 def _planner_pass(prefills: int, prefill_tokens: int, decodes: int, kv: int) -> list[dict]:
@@ -639,6 +684,7 @@ def _canonical_mtp(config: dict) -> dict:
     return config
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_agentic_canonical_mtp_executes_with_local_g2() -> None:
     config = _canonical_mtp(_config("agentx-g2-local.yaml"))
     config["engine"]["workers"]["aggregated"]["kv_cache"]["capacity"]["blocks"] = 4
@@ -649,6 +695,7 @@ def test_agentic_canonical_mtp_executes_with_local_g2() -> None:
     assert _restored(report)["first_admission_host_reused_input_tokens"] > 0
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("replicas,attention_dp", [(1, 2), (2, 1), (2, 2)])
 def test_agentic_canonical_mtp_executes_on_static_local_g2_fleets(replicas, attention_dp, tmp_path) -> None:
     config = _canonical_mtp(_config("agentx-g2-local.yaml"))

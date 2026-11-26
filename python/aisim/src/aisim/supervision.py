@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,8 @@ from .package_identity import PROGRAM_ENVIRONMENT, program_name
 from .resources import ResourceLimitError, descendants_of, discover_host, resolve_budget
 
 _CONTEXT = "_AISIM_SUPERVISED_BUDGET"
+# Mirrors aisim_core.data.default_systems.DOWNLOAD_MARKER_ENV without importing the data layer here.
+_DOWNLOAD_MARKER = "_AISIM_DOWNLOAD_MARKER"
 _THREAD_VARIABLES = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -279,9 +282,11 @@ def _run_process(
     env[PROGRAM_ENVIRONMENT] = program_name()
     events_path = directory / "events.jsonl"
     ready_path = directory / "ready"
+    download_path = directory / "downloading"
     env[_CONTEXT] = json.dumps(
         {**budget, "supervisor_pid": os.getpid(), "events_path": str(events_path), "ready_path": str(ready_path)}
     )
+    env[_DOWNLOAD_MARKER] = str(download_path)
     pass_fds: tuple[int, ...] = ()
     env.pop(OUTPUT_LOCK_FD_ENVIRONMENT, None)
     if output_lock is not None:
@@ -296,6 +301,7 @@ def _run_process(
     reason = ""
     status = "completed"
     shutdown_started: float | None = None
+    init_started = started
     try:
         while True:
             current = discover_host()
@@ -307,7 +313,10 @@ def _run_process(
             if current.available_memory_bytes < budget["reserved_host_memory_bytes"]:
                 reason, status = "available host memory fell below reserved headroom", "resource_limited"
                 break
-            if not ready_path.exists() and time.monotonic() - started > policy.initialization_timeout_seconds:
+            if download_path.exists():
+                # A first-use dataset download is a transfer, not a hung start: the deadline restarts when it ends.
+                init_started = time.monotonic()
+            if not ready_path.exists() and time.monotonic() - init_started > policy.initialization_timeout_seconds:
                 reason, status = "execution initialization timed out", "timed_out"
                 break
             if ready_path.exists() and ready_path.read_text() == "shutdown":
@@ -374,6 +383,7 @@ OUTPUT_LOCK_FD_ENVIRONMENT = "AISIM_OUTPUT_DIR_LOCK_FD"
 
 # Mirrors stack.py and output_adapter.py without importing runner or result modules here.
 _BUILTIN_STACKS = frozenset({"engine"})
+_STOPPED_EXIT_CODES = {"resource_limited": 3, "cancelled": 130, "timed_out": 124}
 _STACK_GROUP = "aisim.runner_factories"
 _OUTPUT_ADAPTER_GROUP = "aisim.output_adapters"
 
@@ -416,6 +426,11 @@ def _require_known_sections(raw: dict[str, Any], *, command: str, stack: str) ->
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    with ExitStack() as cleanup:
+        return _main(argv, cleanup)
+
+
+def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
     from .cli_args import _apply_overrides, _extract_output_configs, _load_mapping, build_parser
     from .config.ais_perf_model import anchor_paths, warn_old_keys
     from .config.cli import config_folder
@@ -424,6 +439,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
+    if args.command in ("data", "fetch", "init"):
+        # Dataset commands download for minutes and need no execution supervision.
+        from .data_cli import run_data_command
+
+        if args.command != "data":
+            args.data_command = args.command
+        try:
+            return run_data_command(args)
+        except KeyboardInterrupt:
+            return 130
     if args.command == "onboard":
         from .support.cli import run_support_command
 
@@ -489,9 +514,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if (
                 config.traffic is not None
                 and config.traffic.load.agentic_warmup_policy != "repeated_prefixes"
-                and (args.stack != "engine" or (args.command == "predict" and args.online))
+                and args.command == "predict"
+                and args.online
             ):
-                raise ValueError(f"{config.traffic.load.agentic_warmup_policy} CLI requires offline --stack engine")
+                raise ValueError(f"{config.traffic.load.agentic_warmup_policy} requires offline execution")
             encoder = config.engine.workers.encoder
             if encoder is not None:
                 if args.command == "predict" and (args.stack != "engine" or args.online or adapter_raw):
@@ -506,12 +532,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Old estimator fields keep working and warn once, here in the process the
         # user started. The call stays outside every try: when warnings are turned
         # into errors, the warning must not be reported as a configuration error.
-        warn_old_keys(raw, args.command, source=args.config, file_raw=file_raw)
+        warn_old_keys(raw, args.command, source=args.config, file_raw=file_raw, stacklevel=3)
     # The output directory stays locked until the last report below is written.
     with OutputDirectoryOwnership() as ownership:
         event_output = None
         output_lock = None
+        worker_command = [sys.executable, "-m", "aisim.resource_worker", "cli"]
         if raw is not None:
+            warmup = "repeated_prefixes" if config.traffic is None else config.traffic.load.agentic_warmup_policy
+            if args.stack not in _BUILTIN_STACKS and warmup != "repeated_prefixes":
+                # Only the stack knows its warmup support. Ask a supervised process before output cleanup
+                # (--overwrite, or reuse of a failed run's directory), resource admission or output adapters.
+                directory = cleanup.enter_context(tempfile.TemporaryDirectory(prefix="aisim-warmup-"))
+                refusal = Path(directory) / "refusal"
+                command = [sys.executable, "-m", "aisim.resource_worker", "warmup-support", str(refusal), args.stack]
+                try:
+                    probe = run_process([*command, warmup], policy=policy)
+                except ResourceLimitError as exc:
+                    probe = {"status": "resource_limited", "reason": str(exc)}
+                if probe["status"] == "failed" and probe.get("exit_code", 0) < 0:
+                    probe = {"status": "cancelled", "reason": "warmup support check cancelled"}
+                if probe["status"] in _STOPPED_EXIT_CODES:
+                    # Without the stack's answer, stop before cleanup with the execution run's exit code.
+                    sys.stderr.write(f"aisim: {probe['reason']}\n")
+                    return _STOPPED_EXIT_CODES[probe["status"]]
+                if probe.get("exit_code") == 2:
+                    reason = "the selected stack does not advertise this agentic warmup policy"
+                    try:
+                        reason = refusal.read_text(encoding="utf-8") or reason
+                    except OSError:
+                        pass
+                    parser.error(f"{args.config}: {reason}")
+                try:
+                    from yaml import safe_dump
+
+                    current = anchor_paths(_load_mapping(args.config), config_folder(args.config), args.command)
+                    _apply_overrides(current, args.overrides, command=args.command)
+                    # YAML tags distinguish equal Python scalars such as True, 1, and 1.0;
+                    # mapping order also determines the order of adapter runtime hooks.
+                    if safe_dump(current, canonical=True, sort_keys=False) != safe_dump(
+                        raw, canonical=True, sort_keys=False
+                    ):
+                        raise ValueError("configuration changed during the warmup support check; retry the command")
+                except (OSError, ValueError, AttributeError) as exc:
+                    parser.error(f"{args.config}: {exc}")
+                # Execute the exact checked mapping, including anchored paths and overrides.
+                # Keeping the snapshot alive through execution closes the later file-edit race too.
+                snapshot = Path(directory) / "config.pickle"
+                with snapshot.open("wb") as target:
+                    pickle.dump(raw, target)
+                worker_command = [sys.executable, "-m", "aisim.resource_worker", "cli-prepared", str(snapshot)]
             try:
                 output = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
             except (OSError, ValueError) as exc:
@@ -521,7 +591,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resource_plan = None
         try:
             report = run_process(
-                [sys.executable, "-m", "aisim.resource_worker", "cli", *arguments],
+                [*worker_command, *arguments],
                 policy=policy,
                 events_output=event_output,
                 output_lock=output_lock,
@@ -558,12 +628,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         _save_report(args.output_dir, filename, payload, overwrite=args.overwrite)
                     except (OSError, ValueError) as exc:
                         sys.stderr.write(f"could not save {filename}: {exc}\n")
-        if report["status"] == "resource_limited":
-            return 3
-        if report["status"] == "cancelled":
-            return 130
-        if report["status"] == "timed_out":
-            return 124
+        if report["status"] in _STOPPED_EXIT_CODES:
+            return _STOPPED_EXIT_CODES[report["status"]]
         code = int(report.get("exit_code") or 0)
         return 1 if code < 0 else code
 

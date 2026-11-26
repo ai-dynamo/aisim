@@ -124,9 +124,17 @@ jobs:
     name: Select Full CI Scope
     needs: verify-target
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # Main pushes first wait MAIN_DEBOUNCE_SECONDS (ten minutes) for newer merges.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      # Main batching reads the scope recorded by earlier main Full CI runs.
+      actions: read
     outputs:
       pr-number: ${{ needs.verify-target.outputs.pr-number }}
+      comparison-base: ${{ steps.plan.outputs.comparison_base }}
+      superseded: ${{ steps.plan.outputs.superseded }}
       run_all: ${{ steps.plan.outputs.run_all }}
       readme_commands: ${{ steps.plan.outputs.readme_commands }}
       platform_wheels: ${{ steps.plan.outputs.platform_wheels }}
@@ -136,6 +144,7 @@ jobs:
       rust: ${{ steps.plan.outputs.rust }}
       rust_feature_modes: ${{ steps.plan.outputs.rust_feature_modes }}
       public_api_rust: ${{ steps.plan.outputs.public_api_rust }}
+      application_test_wheel: ${{ steps.plan.outputs.application_test_wheel }}
       application_wheel: ${{ steps.plan.outputs.application_wheel }}
       application_tests: ${{ steps.plan.outputs.application_tests }}
       python_compatibility: ${{ steps.plan.outputs.python_compatibility }}
@@ -207,17 +216,36 @@ jobs:
         env:
           FORCE_ALL: ${{ steps.scope.outputs.force_all }}
           PATHS_FILE: ${{ steps.scope.outputs.paths }}
+          COMPARISON_BASE: ${{ needs.verify-target.outputs.comparison-base }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           args=(
             --base64-paths-file "${PATHS_FILE}"
+            --comparison-base "${COMPARISON_BASE}"
             --github-output "${GITHUB_OUTPUT}"
             --summary "${GITHUB_STEP_SUMMARY}"
           )
           if [[ "${FORCE_ALL}" == "true" ]]; then
             args+=(--force-all)
           fi
+          # Only pushes to main are batched; release, PR-copy, and manual runs
+          # keep their scope and comparison base.
+          if [[ "${GITHUB_EVENT_NAME}:${GITHUB_REF}" == "push:refs/heads/main" ]]; then
+            args+=(--main-push --repository "${REPOSITORY}" --sha "${GITHUB_SHA}"
+              --run-id "${GITHUB_RUN_ID}" --run-attempt "${GITHUB_RUN_ATTEMPT}")
+          fi
           python scripts/ci/select_full_ci.py "${args[@]}"
+      - name: Defer the test suite to the newer main commit
+        # Later main runs read this step's conclusion (success or skipped) to
+        # identify full-scope candidates, then require successful comparisons.
+        # Keep the name equal to SUPERSEDED_STEP in scripts/ci/select_full_ci.py.
+        if: steps.plan.outputs.superseded == 'true'
+        shell: bash
+        run: >-
+          echo "::notice title=Superseded main commit::This run builds, verifies, and stages
+          the wheel only; the full test suite runs with a newer main commit."
 
   fast-ci:
     name: Require Fast CI
@@ -240,6 +268,52 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/ci/require_fast_ci.py
 
+  op-latency-data:
+    # Every Full CI job that reads operation tables needs the pinned dataset. Downloading it in each parallel job
+    # gets the runners rate limited by Hugging Face and the jobs time out, so it is downloaded once here and the
+    # others restore it from the artifact (see .github/actions/prefetch-op-latency-data).
+    name: Op-latency data
+    needs: [fast-ci, select-full-ci]
+    if: >-
+      ${{ needs.select-full-ci.outputs.rust == 'true' ||
+      needs.select-full-ci.outputs.rust_feature_modes == 'true' ||
+      needs.select-full-ci.outputs.public_api_rust == 'true' ||
+      needs.select-full-ci.outputs.application_tests == 'true' ||
+      needs.select-full-ci.outputs.python_compatibility == 'true' ||
+      needs.select-full-ci.outputs.engine_golden_regression == 'true' ||
+      needs.select-full-ci.outputs.collector_data == 'true' ||
+      needs.select-full-ci.outputs.readme_commands == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Download the pinned op-latency dataset once for this run
+        env:
+          # A token lifts the anonymous rate limit; the dataset is public, so any valid read token works.
+          HF_TOKEN: ${{ secrets.HF_READ_AISIM_INFX_CACHE }}
+        run: |
+          python -m pip install --quiet pydantic pyarrow pyyaml huggingface_hub
+          archive="${RUNNER_TEMP}/op-latency-data.tar"
+          if ! python scripts/ci/op_latency_handoff.py pack --output "${archive}"; then
+            echo "::warning::The download with the read token failed; retrying anonymously"
+            env -u HF_TOKEN python scripts/ci/op_latency_handoff.py pack --output "${archive}"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: op-latency-data
+          path: ${{ runner.temp }}/op-latency-data.tar
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
   platform-wheels:
     name: Platform Wheels
     needs: [fast-ci, select-full-ci]
@@ -250,7 +324,7 @@ jobs:
 
   collector-data:
     name: Collector Data
-    needs: [fast-ci, select-full-ci, verify-target]
+    needs: [fast-ci, select-full-ci, verify-target, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.collector_data == 'true' }}
     uses: ./.github/workflows/collector-check.yml
     with:
@@ -263,7 +337,7 @@ jobs:
     uses: ./.github/workflows/prediction-regression-gate.yml
     with:
       expected_sha: ${{ github.sha }}
-      old-ref: ${{ needs.verify-target.outputs.comparison-base }}
+      old-ref: ${{ needs.select-full-ci.outputs.comparison-base }}
 
   cargo-deny:
     name: Cargo Deny (workspace, ${{ matrix.arch }})
@@ -274,20 +348,15 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: prod-aisim-default-amd64-v1
+            runner: ubuntu-24.04
             cargo_deny_target: x86_64-unknown-linux-musl
             cargo_deny_sha256: 0e8c2aa59128612c90d9e09c02204e912f29a5b8d9a64671b94608cbe09e064f
           - arch: arm64
-            runner: prod-aisim-default-arm64-v1
+            runner: ubuntu-24.04-arm
             cargo_deny_target: aarch64-unknown-linux-musl
             cargo_deny_sha256: 2b3567a60b7491c159d1cef8b7d8479d1ad2a31e29ef49462634ad4552fcc77d
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -317,18 +386,18 @@ jobs:
 
   rust:
     name: Rust (${{ matrix.arch }})
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.rust == 'true' }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-    runs-on: prod-aisim-default-${{ matrix.arch }}-v1
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -336,21 +405,20 @@ jobs:
       - uses: ./.github/actions/setup-python-rust
         with:
           python-version: "3.12"
+      - name: Compose the op-latency systems root for Rust tests
+        uses: ./.github/actions/prefetch-op-latency-data
+        with:
+          github-env: "true"
       - run: cargo test --workspace
 
   rust-feature-modes:
     name: Rust feature modes
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.rust_feature_modes == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-feature-tests
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -374,6 +442,10 @@ jobs:
           wait "${package_pid}" || result=1
           wait "${rust_pid}" || result=1
           exit "${result}"
+      - name: Compose the op-latency systems root for Rust tests
+        uses: ./.github/actions/prefetch-op-latency-data
+        with:
+          github-env: "true"
       - name: Test with Python embedding enabled
         run: |
           export AIC_REQUIRE_EMBEDDED_ROUND_TRIP=1
@@ -382,18 +454,18 @@ jobs:
 
   public-api-rust:
     name: Public API Rust (${{ matrix.arch }})
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.public_api_rust == 'true' }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-    runs-on: prod-aisim-default-${{ matrix.arch }}-v1
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -401,6 +473,10 @@ jobs:
       - uses: ./.github/actions/setup-python-rust
         with:
           python-version: "3.12"
+      - name: Compose the op-latency systems root for Rust tests
+        uses: ./.github/actions/prefetch-op-latency-data
+        with:
+          github-env: "true"
       - run: cargo test --manifest-path crates/tests/public-api/Cargo.toml
 
   application-wheel:
@@ -610,13 +686,14 @@ jobs:
     environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Application Test Wheel (${{ matrix.arch }})
     needs: [fast-ci, select-full-ci]
-    if: ${{ needs.select-full-ci.outputs.application_tests == 'true' }}
+    if: ${{ needs.select-full-ci.outputs.application_test_wheel == 'true' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
-            build_timeout_minutes: 10
+            # Cold release builds need room for repair, provenance, and upload.
+            build_timeout_minutes: 15
             # quay.io/pypa/manylinux_2_28_x86_64:2026.08.24-1
             container_image: quay.io/pypa/manylinux_2_28_x86_64@sha256:4dc41da7df20400310c80d162a2fe2d2c2f3d9734d8dec20f6b9843711618deb
           - arch: arm64
@@ -640,6 +717,8 @@ jobs:
       - run: python -m pip install --require-hashes -r scripts/release/requirements.txt
       - name: Build the application test wheel once
         run: python scripts/release/build_manylinux_wheel.py --output-dir application-test-dist
+      - name: Check the wheel stays under 100 MiB and packages no op data
+        run: python scripts/ci/measure_wheel_data.py --wheel application-test-dist/*.whl --max-wheel-mib 100
       - name: Check exact wheel configuration provenance
         run: |
           python scripts/ci/check_bundled_configs.py extract --check \
@@ -668,25 +747,22 @@ jobs:
   application-tests:
     environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && 'automated-release' || 'pr-wheel-staging' }}
     name: Application Tests (${{ matrix.arch }}, ${{ matrix.shard.suite }}, ${{ matrix.shard.group }})
-    needs: [fast-ci, select-full-ci, application-test-wheel]
+    needs: [fast-ci, select-full-ci, application-test-wheel, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.application_tests == 'true' }}
     strategy:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
+        # Every leg pays runner start-up, checkout and install, so short
+        # suites share one. Keep each leg shorter than `contracts`.
         shard:
           - {suite: contracts, group: 1, groups: 1}
           - {suite: unit, group: 1, groups: 4}
           - {suite: unit, group: 2, groups: 4}
           - {suite: unit, group: 3, groups: 4}
           - {suite: unit, group: 4, groups: 4}
-          - {suite: integration, group: 1, groups: 1}
-          - {suite: cli-build, group: 1, groups: 4}
-          - {suite: cli-build, group: 2, groups: 4}
-          - {suite: cli-build, group: 3, groups: 4}
-          - {suite: cli-build, group: 4, groups: 4}
-          - {suite: support-matrix, group: 1, groups: 1}
-          - {suite: tools-build, group: 1, groups: 1}
+          - {suite: integration-build, group: 1, groups: 1}
+          - {suite: cli-build, group: 1, groups: 1}
     runs-on: prod-aisim-default-${{ matrix.arch }}-v1
     timeout-minutes: 15
     container:
@@ -697,7 +773,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
+          # Only the repository contracts read Git history. The operands are
+          # ordered this way because `&& 0 || 1` always yields 1 (0 is falsy).
+          fetch-depth: ${{ matrix.shard.suite != 'contracts' && 1 || 0 }}
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
@@ -715,6 +793,7 @@ jobs:
           repo: ${{ vars.WHEEL_STORAGE_REPO }}
           token: ${{ secrets.ARTIFACTORY_TOKEN }}
       - name: Install the prebuilt application and test dependencies
+        id: install
         shell: bash
         run: |
           set -euo pipefail
@@ -724,15 +803,15 @@ jobs:
             echo "::error::expected exactly one application test wheel, found ${#wheels[@]}"
             exit 1
           fi
-          python -m pip install uv
+          python -m pip install uv==0.13.10
           python -m uv pip install --system "${wheels[0]}[dev,learned]"
           echo "AISIM_TEST_WHEEL=${GITHUB_WORKSPACE}/${wheels[0]}" >> "${GITHUB_ENV}"
+      - uses: ./.github/actions/prefetch-op-latency-data
       - name: Run repository and package contracts
         if: matrix.shard.suite == 'contracts'
         run: |
           python -m uv pip install --system "${AISIM_TEST_WHEEL}[dev]" --group scripts/pyproject.toml:ci --group scripts/pyproject.toml:fpm-accuracy --group scripts/pyproject.toml:e2e-accuracy
           python -m pip check
-          python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
           python scripts/ci/check_application_test_inventory.py --output application-test-inventory.json
           python -m pytest -q \
             python/aisim/tests/unit/cli/test_aisim_compatibility.py \
@@ -761,16 +840,10 @@ jobs:
         if: matrix.shard.suite == 'cli-build' && matrix.shard.group == 1
         run: python -m pytest -q tests/e2e/cli/test_cli_recommend.py --timeout=180
         working-directory: python/aisim
-      - name: Run migrated integration tests against the installed wheel
-        if: matrix.shard.suite == 'integration'
-        run: >-
-          python -m pytest -q -ra
-          tests/integration
-          -n 2
-          --timeout=600
-        working-directory: python/aisim
+      # A leg's later suites still run and report after an earlier one fails;
+      # they skip when the installation failed or the job was cancelled.
       - name: Run remaining CLI build tests
-        if: matrix.shard.suite == 'cli-build'
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.shard.suite == 'cli-build' }}
         run: >-
           python -m pytest -q
           tests/e2e/cli
@@ -781,8 +854,16 @@ jobs:
           -n 4
           --timeout=180
         working-directory: python/aisim
+      - name: Run migrated integration tests against the installed wheel
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.shard.suite == 'integration-build' }}
+        run: >-
+          python -m pytest -q -ra
+          tests/integration
+          -n 2
+          --timeout=600
+        working-directory: python/aisim
       - name: Run support-matrix build tests
-        if: matrix.shard.suite == 'support-matrix'
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.shard.suite == 'integration-build' }}
         run: >-
           python -m pytest -q
           tests/e2e/support_matrix
@@ -791,7 +872,7 @@ jobs:
           --timeout=180
         working-directory: python/aisim
       - name: Run tool build tests
-        if: matrix.shard.suite == 'tools-build'
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.shard.suite == 'integration-build' }}
         run: >-
           python -m pytest -q
           tests/e2e/tools
@@ -813,13 +894,8 @@ jobs:
         needs.fast-ci.result == 'success' &&
         needs.select-full-ci.result == 'success'
       }}
-    runs-on: prod-aisim-default-amd64-v1
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -830,7 +906,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.verify-target.outputs.comparison-base }}
+          ref: ${{ needs.select-full-ci.outputs.comparison-base }}
           path: license-baseline-source
           persist-credentials: false
       - name: Check Python dependency licenses
@@ -875,7 +951,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.verify-target.outputs.comparison-base }}
+          ref: ${{ needs.select-full-ci.outputs.comparison-base }}
           path: license-baseline-source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -897,7 +973,7 @@ jobs:
 
   license-evidence:
     name: License compliance evidence
-    needs: [fast-ci, verify-target, python-compliance, license-crate-inventory]
+    needs: [fast-ci, select-full-ci, verify-target, python-compliance, license-crate-inventory]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -916,7 +992,7 @@ jobs:
       - name: Generate license compliance evidence
         env:
           SOURCE_SHA: ${{ github.sha }}
-          BASE_SHA: ${{ needs.verify-target.outputs.comparison-base }}
+          BASE_SHA: ${{ needs.select-full-ci.outputs.comparison-base }}
         run: |
           python scripts/ci/generate_license_evidence.py "${RUNNER_TEMP}/license-inventories/head" \
             --base-dir "${RUNNER_TEMP}/license-inventories/base" \
@@ -933,19 +1009,14 @@ jobs:
 
   python-compatibility:
     name: Python ${{ matrix.python-version }} compatibility
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.python_compatibility == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.13"]
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -955,6 +1026,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install AISim and development dependencies
         run: python -m pip install './python/aisim[dev]'
+      - uses: ./.github/actions/prefetch-op-latency-data
       - name: Verify interpreter and dependency compatibility
         run: |
           python -m pip check
@@ -966,25 +1038,22 @@ jobs:
 
   engine-golden-regression:
     name: Engine Golden Regression
-    needs: [fast-ci, select-full-ci]
+    needs: [fast-ci, select-full-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.engine_golden_regression == 'true' }}
-    runs-on: prod-aisim-default-amd64-v1
+    # Builds from source with no NVIDIA-internal dependency; numerical
+    # sentinels use checked-in expected values, so no full history is needed.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
-    container:
-      image: ${{ vars.CI_JOB_CONTAINER_IMAGE }}
-      env:
-        HOME: /__w/aisim/aisim
-        USER: runner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-python-rust
         with:
           python-version: "3.13"
       - name: Install AISim and development dependencies
         run: python -m pip install './python/aisim[dev]'
+      - uses: ./.github/actions/prefetch-op-latency-data
       - name: Run engine-step golden regression suite
         run: >-
           python -m pytest -q -rx -n 4
@@ -999,7 +1068,6 @@ jobs:
           crates/core/parity_tests/perfmodel/test_afd_execution_plan_parity.py
       - name: Check native prediction numerical sentinels
         run: |
-          python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
           python scripts/prediction_regression/check_prediction_numerics.py --output numerical-sentinels.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
@@ -1071,7 +1139,7 @@ jobs:
       - run: release-smoke/bin/aiconfigurator version
 
   readme-commands:
-    needs: [verify-target, select-full-ci, fast-ci]
+    needs: [verify-target, select-full-ci, fast-ci, op-latency-data]
     if: ${{ needs.select-full-ci.outputs.readme_commands == 'true' }}
     uses: ./.github/workflows/readme-checks.yml
     permissions:
@@ -1089,6 +1157,7 @@ jobs:
       - verify-target
       - select-full-ci
       - fast-ci
+      - op-latency-data
       - platform-wheels
       - collector-data
       - prediction-regression
@@ -1130,7 +1199,7 @@ jobs:
               "rust-feature-modes": "rust_feature_modes",
               "public-api-rust": "public_api_rust",
               "application-wheel": "application_wheel",
-              "application-test-wheel": "application_tests",
+              "application-test-wheel": "application_test_wheel",
               "application-tests": "application_tests",
               "python-compatibility": "python_compatibility",
               "engine-golden-regression": "engine_golden_regression",
@@ -1151,6 +1220,14 @@ jobs:
                   invalid_outputs.append(f"{output}={selected!r}")
                   continue
               expected[job] = "success" if selected == "true" else "skipped"
+          # The data job runs exactly when one of the jobs that read operation tables does.
+          data_readers = (
+              "rust", "rust_feature_modes", "public_api_rust", "application_tests",
+              "python_compatibility", "engine_golden_regression", "collector_data", "readme_commands",
+          )
+          expected["op-latency-data"] = (
+              "success" if any(plan.get(output) == "true" for output in data_readers) else "skipped"
+          )
           failures = []
           summary = [
               f"### Full CI evidence for `{os.environ.get('GITHUB_SHA', 'local')}`",
@@ -1169,6 +1246,12 @@ jobs:
               summary.append(f"| {name} | {outcome} (`{result}`, expected `{wanted}`) |")
               if result != wanted:
                   failures.append(f"{name}={result}, expected {wanted}")
+          if plan.get("superseded") == "true":
+              summary += [
+                  "",
+                  "Superseded main commit: its wheel was built, verified, and staged;"
+                  " its tests are deferred to the successor run named in Select Full CI Scope.",
+              ]
           if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
               with open(summary_path, "a", encoding="utf-8") as handle:
                   handle.write("\n".join(summary) + "\n")

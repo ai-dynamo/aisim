@@ -604,6 +604,16 @@ impl Dsv41StageOp {
         db: &PerfDatabase,
         ctx: &RuntimeContext,
     ) -> Result<PerformanceResult, AicError> {
+        self.query_with(ctx, |_, op, child| op.query(db, child))
+    }
+
+    /// [`Self::query`] taking each child's result from `query`, which
+    /// receives the child's index, the child and the context it runs at.
+    pub(crate) fn query_with(
+        &self,
+        ctx: &RuntimeContext,
+        mut query: impl FnMut(usize, &Op, &RuntimeContext) -> Result<PerformanceResult, AicError>,
+    ) -> Result<PerformanceResult, AicError> {
         let (s, prefix) = self.scope(ctx.s as f64, ctx.prefix as f64);
         let mut scoped = *ctx;
         scoped.s = s as u32;
@@ -612,12 +622,12 @@ impl Dsv41StageOp {
             scoped.num_tokens = ctx.batch_size * scoped.s;
         }
         let mut total = None;
-        for op in &self.children {
+        for (index, op) in self.children.iter().enumerate() {
             let mut child = scoped;
             if self.is_context && op.is_logits_gemm() {
                 child.num_tokens = ctx.batch_size;
             }
-            let result = op.query(db, &child)?;
+            let result = query(index, op, &child)?;
             total = Some(match total {
                 None => result,
                 Some(prev) => PerformanceResult::plus(prev, result),
@@ -631,11 +641,9 @@ impl Dsv41StageOp {
 mod tests {
     use super::*;
     use crate::common::enums::TransferPolicy;
-    use std::path::PathBuf;
 
     fn test_db(mode: DatabaseMode) -> PerfDatabase {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../python/aisim/src/aisim_core/systems");
+        let root = crate::test_systems::path("");
         PerfDatabase::load(&root, "gb300", "sglang", "0.5.14")
             .unwrap()
             .with_mode(mode, TransferPolicy::ALL)

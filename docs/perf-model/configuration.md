@@ -162,8 +162,8 @@ estimator first, then the remaining estimators in the same global priority
 order. Each native mode tries the ordered `systems_paths` before moving to
 another estimator.
 Omitted roots preserve configured SDK discovery (or the systems-path environment
-override when the SDK uses its packaged default); an explicit `default` entry
-selects the packaged root.
+override when the SDK uses its default root, composed from the pinned op-latency
+dataset); an explicit `default` entry selects that default root.
 The resolved paths are shared by preflight, construction and capacity estimation.
 Selection occurs
 at construction; queries do not silently switch estimators on a data-domain error.
@@ -285,7 +285,11 @@ total past KV, widens the former and preserves the latter.
 
 The canonical constructor currently supports explicit speculative schemes with
 OP/SOL timing. FPM interpolation and regression are unsupported candidates for
-these schemes. An explicit FPM request with `fallback_policy="deny"` fails;
+these schemes, except that an explicit vLLM `fpm_regression` request prices an
+MTP scheme at the depth it was fitted at (see
+[engine replay timing](#engine-replay-timing)) and is selected as for legacy
+`nextn`. Otherwise an explicit FPM request with
+`fallback_policy="deny"` fails;
 `auto` or an explicit mode with `fallback_policy="allow"` can select a supported
 OP candidate while preserving the complete speculative identity. They do not
 drop speculation to obtain an autoregressive estimate. Separately, an ordinary
@@ -425,6 +429,75 @@ rejected; measured DCP profiles without `fpm_profile` retain their existing rout
 Profile/schema and precision conflicts fail before estimator fallback. Omitted precision fields are filled
 from the profile and preserved in the resolved canonical configuration.
 
+A published FPM library (`fpm/fpm_forward_perf.parquet`, schema `aic_fpm_forward_perf/v6`) may declare an
+optional `resources` block in its `fpm_forward_perf.metadata.json` sidecar. The block uses the deployment
+`resources` schema (`runtime_memory`, `cache_layout`, `cache_groups`, `mamba_cache`, `max_num_tokens`,
+`max_batch_size`, `provenance`). When the data library loads an entry it resolves each deployment's resources as
+the `fpm_profile` deployment's own `resources`, then the sidecar `resources`, then pending. The first block found
+is used whole, never merged field by field. Sidecar resources apply only when the selector matches the profile's
+model and deployment identity, including precision and implementation fields. A selector naming `worker_type`
+requires that same explicit deployment role; it cannot fill a shared deployment whose role is omitted or null.
+A sidecar with no selector applies to the single deployment the load requests; it never selects among several.
+A selector's `system`, `backend` and `backend_version` must equal the library's verified identity; a contradicting
+selector leaves the resources pending. In a library that holds several models, the selector must name `model_path`,
+otherwise the sidecar resources attach to no model.
+The selector and verified library identity must identify one distinct deployment. An absent or partial selector
+matching several deployments (for example, `tp: 1` matching both DEP4 and DEP8) leaves their resources pending.
+Supplying resources explicitly for one deployment does not disambiguate the sidecar evidence for the others.
+
+| FPM deployment field | Default | Behavior |
+| --- | --- | --- |
+| `fpm_profile.deployments[].resources_source` | `user` (omitted when serialized) | The data loader marks sidecar-derived blocks as `metadata`. A later library load re-resolves those blocks from its sidecar, including after a dataset repin. Set `user` when replacing a derived block with an explicit override. |
+
+The source tag survives profile and native configuration round trips. It is provenance, not part of the
+deployment identity; explicit user blocks keep precedence on every load.
+
+Pending means missing: a timing-only data load keeps the draft profile and reports pending resources. For plain
+autoregressive profiles, the draft constructs through `best_available` and answers timing queries; cache sizing,
+replay, and a load that requires resources fail with the fields to supply. A block with valid geometry but no
+`runtime_memory` or declared bytes still serves plain autoregressive timing queries; cache sizing and replay
+need the memory. Speculative-round profiles require resources with observed `runtime_memory` at
+`best_available` construction, even for timing queries; geometry alone or declared non-KV bytes do not suffice.
+Entries published without `resources` stay valid. Loading uses only the library and its sidecar and never reads
+`measurements/`.
+
+Libraries can aggregate several models and deployment cells on the declared system, backend and backend version.
+The collector's sidecar `model_paths` inventory, when present, must match the table's `model_path` values; the
+manifest's `identity.model` must occur in that verified column. Historical sidecars without an inventory use the
+table column as the model record. Validation and loading check this binding before staging; native selection
+then requires the exact model path and deployment-cell identity and never substitutes another model's curves.
+An explicit `coordinate_system` must be `iteration_totals_balanced_v1`; null is rejected. Historical reconstructed
+sidecars may omit it for verified row-contract recovery. Runtime-memory `runtime_framework_version` evidence may
+be omitted or null, but a supplied string must contain a non-whitespace character.
+
+The sidecar's `row_count`, selector topology degrees and repeat counts, and measurement-file `bytes` require
+JSON integer literals; `1.0`, strings and booleans are rejected. JSON Schema treats `1.0` as an integer,
+so schema validation alone is insufficient for publication. Run
+`aisim_core.data.fpm_checks.check_fpm_dataset(root, include_measurements=True)` before publishing: it uses the
+strict sidecar and measurement-manifest readers in addition to artifact integrity checks. It also binds the
+library rows to the entry: every row's `system`, `backend` and `backend_version` must equal the entry's, a
+declared `configuration_selector` must agree with the rows' recorded `dcp` (an unrecorded `dcp` is not DCP1, and a
+recorded one must be positive and divide `tp`), and a per-row `measurement_policy` requires the row
+`measurement_policy` and `measurement_repeats` columns with consistent values. Prediction-only checks
+leave evaluation files optional.
+
+A staging `output_dir` holds one library at a time: staging another library there replaces it, and a
+configuration returned for the earlier library then reads the new one. Give each library whose configuration stays
+in use its own `output_dir`. The staged root also carries `perf_data_reuse_manifest.yaml`, `query_versions.yaml` and
+`attention_lane_defaults.yaml` from the first source root that has each, so donor-backed operations price as they do
+through the source roots; a change to one of them restages the root. Directories that several source roots provide,
+such as a family directory, are merged, and the earlier root wins for a file both provide. Staging again repairs an
+installed root that lost a file, and a repin drops the generated library path and staged roots of an earlier pin
+whichever cache directory held them, keeping any path you set yourself. Under `ensure_data` each staging directory is
+keyed by the ordered source roots, the verified library pair, the contents of the copied definition and policy files
+and the links the build would make, so editing one in place, publishing a corrected pair under the same configuration ID,
+or a higher-priority root gaining a table at an existing path gives a new directory and leaves a configuration returned earlier reading the definition it was built from; the roots
+that key describes are the complete staging input.
+
+For library loads, `FpmData.resources` and `memory_pending` describe deployment zero. The loader does not select
+a worker or role: inspect `resources_by_deployment` and `memory_pending_by_deployment` in `fpm_profile.deployments`
+order for other deployments. Without a profile, readiness describes the requested configuration.
+
 Each deployment may declare `worker_type: prefill`, `decode`, or `aggregated`.
 The canonical construction request selects only the matching role's precision,
 scheduler envelope, cache geometry and memory evidence. Separate P/D deployments
@@ -475,7 +548,9 @@ follows the configured estimator ordering and policy.
   The corresponding top-level quant mode must remain unset. This selects null
   profile values exactly; it does not make precision matching a wildcard.
   `fpm_parquet_path` selects an external FPM parquet with its same-stem metadata
-  sidecar. Unknown fields are rejected.
+  sidecar. The op-level engine never reads a library, so it is compiled without this path, whether automatic search
+  selected it or it was named; the saved configuration keeps the path and rebuilds the same model.
+  Unknown fields are rejected.
 
 Sampling defaults to `bins_per_axis: [4, 4]` and `max_observations: 64` per
 logical store. Rectangular grids were already supported. Regression's
@@ -862,7 +937,9 @@ A vLLM regression fitted at `nextn > 0` gives a valid estimate only when its
 training timings cover complete MTP rounds, drafting and verification, as a
 measured speculative-round profile's do; `nextn` records the depth, not how
 the timings were obtained. Replay times such a role only at that depth:
-the snapshot pins `nextn`, and the engine's `aic_nextn` must equal it. Each
+the snapshot pins `nextn`, and the engine's `aic_nextn` must equal it. An MTP
+draft is `depth` extra target-shaped layers, so the snapshot also times an
+engine configured with `speculation: {kind: mtp, params: {depth: N}}`. Each
 decode request counts once in the totals with its past KV, as in the
 telemetry; only its `extend_lengths` entry carries the tokens it verifies: one
 plus the drafts the scheduler gave it, fewer than `nextn` when the token budget
@@ -876,9 +953,10 @@ decode in one rank pass; an SGLang rank runs a prefill batch alone (mixed chunk
 is not modeled), so it does not. Every aggregated worker whose engine runs
 attention DP above one also needs cross-rank aggregated. A regression store is
 ready with a usable fit and a learned store when the forest has it. It rejects
-a rank hosting the vision encoder, a speculation scheme, `nextn > 0` for a
-learned model or a non-vLLM regression (SGLang's telemetry reports an MTP
-decode request's extend as 1), bounded decoder replay, and an automatic selection that
+a rank hosting the vision encoder, a speculation scheme other than MTP,
+`nextn > 0` or MTP for a learned model or a non-vLLM regression (SGLang's
+telemetry reports an MTP decode request's extend as 1), bounded decoder replay,
+and an automatic selection that
 would fall back to an untrained regression. Replay also rejects such a role
 whose engine sets a `decode_speedup_ratio` other than 1: replay then prices
 each rank's phases, which these estimators never do. A pass on which no rank
@@ -951,34 +1029,44 @@ Each config is an entry.
   - a perf-model file, a template file named by `from`, and inline JSON;
   - the value written under `engine.ais_perf_model` or
     `search_space.ais_perf_model` in a `predict`, `recommend` or search YAML
-    file, when `aisim predict`, `aisim recommend`,
+    or JSON file, when `aisim predict`, `aisim recommend`,
     `CorePredictionConfig.from_yaml`, `CoreRecommendationConfig.from_yaml` or
     `SmartSearchConfig.from_yaml` reads the file.
 
-  A configuration file reports it like this:
+  These configuration readers select JSON for `.json` filenames (case
+  insensitive) and YAML otherwise.
+  A YAML configuration file reports it like this:
   `engine.ais_perf_model in predict.yaml: the key 'estimation_mode' is written twice (lines 9 and 11); write it once`.
+  A JSON configuration file reports it like this:
+  `predict.json: engine.ais_perf_model.estimation_mode is written twice`.
+  JSON errors use decoded key paths without line numbers, so escaped and
+  literal spellings of the same key count as a repeat.
   `aisim predict` and `aisim recommend` then exit with code `2`
-  before they touch the output directory. A key that a YAML merge (`<<`)
+  before they touch the output directory. In YAML, a key that a merge (`<<`)
   brings in does not repeat a key written next to it.
 - The same commands and loaders reject a configuration file that writes
   `ais_perf_model` itself twice in its section. They also reject a file that
   writes the section (`engine`, or `search_space` in a search file) twice
-  when one of these sections writes `ais_perf_model`. The YAML reader would
-  keep the last one and drop the others without a word. The error has the
-  same form and names the first and the last line:
+  when one of these sections writes `ais_perf_model`. Without this check,
+  the reader for the file's format would keep the last one and drop the
+  others without a word. YAML errors name the first and the last line:
   `engine.ais_perf_model in predict.yaml: the key 'ais_perf_model' is written twice (lines 8 and 10); write it once`
   or
   `engine.ais_perf_model in predict.yaml: the key 'engine' is written twice (lines 1 and 14); write it once`.
+  JSON errors name the decoded path instead:
+  `predict.json: engine.ais_perf_model is written twice` or
+  `predict.json: engine is written twice`.
   A file with several of these repeats reports the section first, then
   `ais_perf_model`, then a key inside the value.
 - `ais_perf_model`, or its section, that a YAML merge (`<<`) brings in next
   to a written one is not a repeat: the written one is used. When only a
   merge brings the value in, the value that the YAML reader keeps is the one
   that is checked for a key written twice.
-- A key written twice is not checked in a value given with `--set`. The YAML
-  reader keeps the last value there. It does the same for a key repeated
-  anywhere else in a configuration file, such as an old estimator field, and
-  for a section written twice when none of them writes `ais_perf_model`.
+- A key written twice is not checked in a value given with `--set`, which
+  always uses YAML parsing and keeps the last value. Elsewhere in a
+  configuration file, the reader for the file's format keeps the last
+  value of a repeated key, such as an old estimator field, or a section
+  written twice when none of them writes `ais_perf_model`.
   `aisim perf-model migrate` makes the same checks when it reads a file.
   Python data passed to `model_validate` cannot hold a key twice.
 - When a consumer needs a worker type the value does not have, the error lists
@@ -1496,7 +1584,8 @@ model, which records no identity; a native snapshot without an enabled, ready
 correction store for the iterations replay prices for the role (prefill, decode,
 or any of prefill, decode and mixed for an aggregated worker); a snapshot
 without `kv_block_size`; one saved for another worker role, model or hardware;
-and snapshots with an FPM profile, speculation, pipeline parallelism (engine
+and snapshots with an FPM profile, speculation other than the vLLM MTP
+regression case below, pipeline parallelism (engine
 replay runs only `pipeline: 1`) or context parallelism.
 `engine.estimator_config.state_snapshot` is rejected: a snapshot belongs to one
 role.
@@ -1544,7 +1633,7 @@ handled as follows:
 | `tp`, `pp`, `attention_dp`, `moe_tp_size` or `moe_ep_size` `unknown` | The role needs one explicit value for each unknown width, such as `parallelism: {preset: false, tensor: 1, pipeline: 1, attention_data: 1}`; known widths are still pinned. `tp * pp * attention_dp` must equal `deployment_limits.num_gpus` when known. |
 | `deployment_limits.max_kv_tokens` | Required. The role's KV capacity is fixed to that many tokens in whole `kv_block_size` blocks and KV memory is not searched; a different fixed capacity or a `memory_fraction` search is a conflict. |
 | `deployment_limits.max_num_batched_tokens`, `max_num_seqs` | Required. The role's `max_batched_tokens` and `max_sequences` domains keep only values at most the recorded limit; an empty domain is an error. |
-| `nextn > 0` | For a vLLM regression, pinned as for a native snapshot: `engine.nextn` takes the saved depth, and `engine.nextn_accepted` is required. Rejected for other backends. |
+| `nextn > 0` or `speculation: {kind: mtp, params: {depth: N}}` | For a vLLM `fpm_regression` snapshot fitted with either spelling, the depth is pinned as for a native snapshot. Replay accepts only 1–5 draft tokens; larger MTP depths remain valid for cost prediction and snapshot restoration, but replay rejects them. Recommendation uses `engine.nextn` and requires `engine.nextn_accepted`; prediction also accepts `engine.speculation: {kind: mtp, params: {depth: N}, expected_accepted_tokens: A}` at the same depth. Rejected for other backends and for `fpm_learned`. |
 
 A snapshot whose `backend_version` is unset (`null`) is rejected: save the
 deployed version or `"unknown"`. `deployment_limits.num_gpus` and

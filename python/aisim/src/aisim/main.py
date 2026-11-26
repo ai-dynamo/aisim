@@ -27,7 +27,6 @@ from .config.cli import (
 from .config.common import split_config_sections
 from .config_adapter import (
     ConfigAdapterResolutionError,
-    PredictionAdapterContext,
     SimulationConfigAdapter,
     resolve_config_adapters,
 )
@@ -56,7 +55,7 @@ from .output_adapter import (
 )
 from .perf_model_cli import run_perf_model_command
 from .power import normalize_power_summary
-from .predict import PredictionExecutionError, run_prediction
+from .predict import PredictionExecutionError, compile_prediction_adapters, run_prediction
 from .replay.dashboard import write_replay_dashboard
 from .resource_worker import _exception_message
 from .resources import (
@@ -68,7 +67,6 @@ from .resources import (
 )
 from .stack import StackResolutionError, resolve_runner_factory
 from .support.cli import run_support_command
-from .sweeper.provider import AdapterReplaySpec
 from .sweeper.replay import ReplayOutputRequirements
 
 
@@ -138,39 +136,14 @@ def _resolve_section_adapters(sections: dict[str, dict[str, Any]], stack: str) -
     return adapters
 
 
-def _prediction_adapter_context(
-    config: CorePredictionConfig,
-) -> PredictionAdapterContext:
-    return PredictionAdapterContext(
-        engine=config.engine.model_dump(mode="json", exclude_none=True),
-        traffic=config.traffic.model_dump(mode="json", exclude_none=True),
-        evaluation=config.evaluation.model_dump(mode="json", exclude_none=True),
-    )
-
-
-def _compile_prediction_adapters(
-    configs: dict[str, dict[str, Any]],
-    adapters: dict[str, SimulationConfigAdapter],
-    *,
-    stack: str,
-    context: PredictionAdapterContext,
-) -> dict[str, AdapterReplaySpec]:
-    compiled: dict[str, AdapterReplaySpec] = {}
-    for section, raw in configs.items():
-        name = f"{stack}.{section}"
-        adapter = adapters[name]
-        compiled[name] = adapter.compile_prediction(raw, context)
-    return compiled
-
-
 def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     core_raw, adapter_raw = split_config_sections(raw, command="predict")
     config = CorePredictionConfig.model_validate(core_raw)
     capture_telemetry = args.capture_telemetry or args.export_html
     if capture_telemetry and (args.stack != "engine" or args.online):
         raise ValueError("telemetry capture requires offline --stack engine")
-    if config.traffic.load.agentic_warmup_policy != "repeated_prefixes" and (args.stack != "engine" or args.online):
-        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} CLI requires offline --stack engine")
+    if config.traffic.load.agentic_warmup_policy != "repeated_prefixes" and args.online:
+        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} requires offline execution")
     if (
         config.engine.speculation is not None
         and config.engine.speculation.kind == "ngram"
@@ -322,12 +295,6 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     output_adapters = resolve_output_adapters(output_configs)
     core_raw, adapter_raw = split_config_sections(raw, command="recommend")
     config = CoreRecommendationConfig.model_validate(core_raw)
-    if (
-        config.traffic is not None
-        and config.traffic.load.agentic_warmup_policy != "repeated_prefixes"
-        and args.stack != "engine"
-    ):
-        raise ValueError(f"{config.traffic.load.agentic_warmup_policy} CLI requires offline --stack engine")
     adapters = _resolve_section_adapters(adapter_raw, args.stack)
     result = run_recommendation(
         config,
@@ -354,12 +321,7 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         unknown_sections = set(candidate_adapters) - set(adapter_raw)
         if unknown_sections:
             raise RuntimeError(f"recommendation produced unconfigured adapter sections {sorted(unknown_sections)}")
-        compiled_adapters = _compile_prediction_adapters(
-            candidate_adapters,
-            adapters,
-            stack=args.stack,
-            context=_prediction_adapter_context(prediction),
-        )
+        compiled_adapters = compile_prediction_adapters(prediction, candidate_adapters, adapters, stack=args.stack)
         concrete = prediction_mapping(
             prediction,
             {adapters[name].section: spec.config for name, spec in compiled_adapters.items()},
@@ -436,21 +398,30 @@ def _write_resource_plan(args, plan: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(plan, indent=2, allow_nan=False) + "\n")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] | None = None) -> int:
     # A supervised worker writes under its supervisor's output-directory lock;
     # a direct call takes its own. Either way the lock ends with this command.
     with OutputDirectoryOwnership():
         adopt_inherited_output_lock()
         try:
-            return _main(argv)
+            return _main(argv, _prepared_config=_prepared_config)
         finally:
             # Parsing or validation can exit before any preparation claims it.
             discard_inherited_output_lock()
 
 
-def _main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    if args.command in ("data", "fetch", "init"):
+        if args.command != "data":
+            args.data_command = args.command
+        from .data_cli import run_data_command
+
+        try:
+            return run_data_command(args)
+        except KeyboardInterrupt:
+            return 130
     if args.command == "onboard":
         try:
             return run_support_command(args)
@@ -471,10 +442,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
     except StackResolutionError as exc:
         parser.error(str(exc))
     try:
-        raw = _load_mapping(args.config)
-        # Paths written in the file start at the file's folder; --set paths start at the working directory.
-        raw = anchor_paths(raw, config_folder(args.config), args.command)
-        _apply_overrides(raw, args.overrides, command=args.command)
+        if _prepared_config is None:
+            raw = _load_mapping(args.config)
+            # Paths written in the file start at the file's folder; --set paths start at the working directory.
+            raw = anchor_paths(raw, config_folder(args.config), args.command)
+            _apply_overrides(raw, args.overrides, command=args.command)
+        else:
+            raw = _prepared_config
         if args.command == "predict":
             return _predict(args, raw, factory)
         return _recommend(args, raw, factory)

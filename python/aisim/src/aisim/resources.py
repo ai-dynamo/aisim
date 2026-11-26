@@ -18,7 +18,7 @@ import math
 import os
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
@@ -54,6 +54,11 @@ class ResourceEstimate:
     estimated_peak_bytes: int | None
     reason: str = ""
     api_version: int = 1
+
+
+@dataclass(frozen=True)
+class _WekaProfileEstimate(ResourceEstimate):
+    materialization_peak_bytes: int = field(kw_only=True)
 
 
 class ResourceLimitError(RuntimeError):
@@ -590,7 +595,15 @@ def _estimate_weka_trace(workload: Mapping[str, Any], *, inspection_budget_bytes
                 peak,
                 "initial profile trace materialization estimate exceeds live headroom",
             )
-        return _profile_estimate(lower)
+        return _WekaProfileEstimate(
+            "agentic-profile-unqualified-v1",
+            None,
+            0,
+            lower,
+            None,
+            "profile growth after initial trace materialization requires live supervision",
+            materialization_peak_bytes=peak,
+        )
     return estimate
 
 
@@ -616,25 +629,23 @@ class _TraceCounters:
     # Dynamo, Agentic Mooncake and Weka loaders hold every u64 source hash
     # array at once. Mooncake-family loaders convert each row as it is read.
     retains_source_hashes: bool
-    # Mooncake-delta setup replaces each turn's hashes with its synthesized prompt.
-    materializes_inputs: bool = False
+    # An agentic graph plans every request's output IDs before its first dispatch.
+    # A session trace holds only authored IDs and draws the rest at each dispatch.
+    plans_every_output: bool
     # A snapshot expands prompts only for selected plays after their cuts.
     expands_every_input: bool = True
     hashes: int = 0
     authored_outputs: int = 0
     outputs: int = 0
     largest_input: int = 0
-    total_input: int = 0
+    largest_output: int = 0
     requests: int = 0
 
     @property
     def lower_bound(self) -> int:
         loaded = 8 * self.hashes + 4 * self.authored_outputs if self.retains_source_hashes else 0
-        if self.materializes_inputs:
-            prepared = max(4 * self.hashes, 4 * (self.total_input + self.outputs))
-        else:
-            prepared = 4 * (self.hashes + self.outputs)
-        return max(loaded, prepared, 4 * self.largest_input if self.expands_every_input else 0)
+        prepared = 4 * (self.hashes + (self.outputs if self.plans_every_output else self.authored_outputs))
+        return max(loaded, prepared, 4 * self.largest_output, 4 * self.largest_input if self.expands_every_input else 0)
 
 
 class _InspectionStopped(Exception):
@@ -689,7 +700,6 @@ def _scan_mooncake(events: Any, counters: _TraceCounters, state: dict[str, Any],
             elif event == "end_map":
                 length = hashes * block_size if row_input is None else row_input
                 counters.largest_input = max(counters.largest_input, length)
-                counters.total_input += length
                 counters.hashes += hashes
                 counters.authored_outputs += authored
                 hashes = authored = 0
@@ -699,7 +709,9 @@ def _scan_mooncake(events: Any, counters: _TraceCounters, state: dict[str, Any],
             row_input = _token_length(value)
             row = True
         elif prefix in _MOONCAKE_OUTPUTS:
-            counters.outputs += _token_length(value)
+            output = _token_length(value)
+            counters.outputs += output
+            counters.largest_output = max(counters.largest_output, output)
             row = True
 
 
@@ -713,12 +725,12 @@ def _scan_applied_compute(events: Any, counters: _TraceCounters, state: dict[str
     for prefix, event, value in events:
         if prefix == "assistant_response_length.item":
             length = _token_length(value)
-            counters.outputs += length
+            counters.largest_output = max(counters.largest_output, length)
             prompt += length
         elif prefix == "tool_call_output_length.item" or prefix == "input_prompt_length":
             prompt += _token_length(value)
         elif prefix == "final_assistant_response_length":
-            counters.outputs += _token_length(value)
+            counters.largest_output = max(counters.largest_output, _token_length(value))
         elif prefix == "num_turns":
             counters.requests += _token_length(value) + 1
         elif prefix == "":
@@ -765,9 +777,11 @@ def _scan_dynamo(events: Any, counters: _TraceCounters, state: dict[str, Any], l
                 contextual = row.get("agent_context", False)
                 if agentic is not None and contextual != agentic:
                     raise ResourceLimitError("Dynamo request trace cannot mix requests with and without agent_context")
-                agentic = state["agentic"] = contextual
+                agentic = state["agentic"] = counters.plans_every_output = contextual
+                output = _token_length(row.get("request.output_tokens"))
                 counters.hashes += row_hashes
-                counters.outputs += _token_length(row.get("request.output_tokens"))
+                counters.outputs += output
+                counters.largest_output = max(counters.largest_output, output)
                 counters.largest_input = max(
                     counters.largest_input, _token_length(row.get("request.replay.input_length"))
                 )
@@ -852,7 +866,8 @@ def _scan_finite_trace(
 ) -> _TraceCounters:
     counters = _TraceCounters(
         retains_source_hashes=format_name in {"agentic_mooncake", "dynamo", "weka"},
-        materializes_inputs=format_name == "mooncake-delta",
+        # A Dynamo trace's first request selects standard or agentic mode.
+        plans_every_output=format_name in {"agentic_mooncake", "weka"},
         expands_every_input=not snapshot,
     )
     limit = None if inspection_budget_bytes is None else inspection_budget_bytes - WORKER_BASELINE_BYTES
@@ -986,8 +1001,8 @@ def estimate_workload(
         model = "dynamo-eager-u32-v1"
         peak = WORKER_BASELINE_BYTES + 2 * tokens + count * (4096 + 16 * osl)
     elif stack == "engine":
-        # Every turn retains only its own prompt delta or hash IDs, planned
-        # output IDs and transcript share, which a one-token block prefix cache
+        # Every turn retains only its own hash IDs
+        # and transcript share, which a one-token block prefix cache
         # can index. Completed sessions' prefixes can remain in every cache a
         # turn visited, even after they leave the active concurrency window.
         # Producers cap each pool separately before summing its copies. The
@@ -998,7 +1013,7 @@ def estimate_workload(
             raise ValueError("session cache copies must be positive")
         history = (turns - 1) * (isl + osl)
         tokens = active * (history + isl) * 4
-        lower = count * turns * osl * 4
+        lower = osl * 4  # One request's output IDs, drawn at dispatch.
         model = "engine-session-metadata-v2"
         peak = (
             WORKER_BASELINE_BYTES + count * turns * (4096 + copies * 32 * (isl + osl)) + active * 32 * history + tokens
@@ -1059,6 +1074,14 @@ def build_plan(
         raise ResourceLimitError("runner returned an invalid host resource estimate")
     workers = min(requested_parallelism, budget["cpu_limit"], free // peak) if peak else 0
     reason = "" if workers else "candidate exceeds the host memory budget"
+    profile_minimum = None
+    if isinstance(estimate, _WekaProfileEstimate) and stack == "engine" and not callable(estimator):
+        from .runner import EngineReplayRunnerFactory
+
+        if type(factory) is EngineReplayRunnerFactory and factory.runtime is None:
+            profile_minimum = max(
+                estimate.materialization_peak_bytes, WORKER_BASELINE_BYTES + estimate.lower_bound_bytes
+            )
     if peak is None:
         if free < _reserved_bytes(peak, estimate.lower_bound_bytes, external=callable(estimator)):
             reason = (
@@ -1069,7 +1092,7 @@ def build_plan(
         elif not os.environ.get("_AISIM_SUPERVISED_BUDGET"):
             reason = f"unknown peak requires supervised serial execution: {estimate.reason}"
         else:
-            workers = 1  # Unqualified estimates require serial, continuously monitored execution.
+            workers = min(requested_parallelism, budget["cpu_limit"], free // profile_minimum) if profile_minimum else 1
             reason = estimate.reason
     return {
         "schema_version": 1,
@@ -1080,6 +1103,7 @@ def build_plan(
         "estimate": asdict(estimate),
         "requested_parallelism": requested_parallelism,
         "effective_parallelism": workers,
+        **({"profile_worker_min_bytes": profile_minimum} if profile_minimum is not None else {}),
         "reason": reason,
     }
 
@@ -1206,9 +1230,9 @@ def descendants_of(process: psutil.Process) -> list[psutil.Process]:
     return descendants
 
 
-def _child_memory_bytes() -> int:
+def _child_memory_bytes(parent: psutil.Process | None = None) -> int:
     try:
-        children = descendants_of(psutil.Process())
+        children = descendants_of(parent if parent is not None else psutil.Process())
         total = 0
         for child in children:
             try:
@@ -1218,6 +1242,21 @@ def _child_memory_bytes() -> int:
         return total
     except psutil.Error as exc:
         raise ResourceLimitError(f"cannot inspect owned execution processes: {exc}") from exc
+
+
+def profile_worker_pressure(worker_pids: Iterable[int], rss_limit: int) -> dict[str, int] | None:
+    """Sample the RSS of each worker and its descendants while a profile wave runs."""
+    for pid in worker_pids:
+        try:
+            process = psutil.Process(pid)
+            rss = process.memory_info().rss + _child_memory_bytes(process)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error as exc:
+            raise ResourceLimitError(f"cannot inspect profile worker: {exc}") from exc
+        if rss > rss_limit:
+            return {"worker_pid": pid, "worker_rss_bytes": rss, "worker_rss_limit_bytes": rss_limit}
+    return None
 
 
 def _trace_identity(workload: Mapping[str, Any]) -> tuple[Any, ...] | None:
@@ -1268,6 +1307,7 @@ class GuardedRunnerFactory:
         external = callable(getattr(self.factory, "estimate_host_resources", None))
         plans = []
         reservations = []
+        partition_profile_wave = False
         for spec in specs:
             plan = build_plan(
                 _replay_resource_workload(spec, self.stack),
@@ -1280,6 +1320,12 @@ class GuardedRunnerFactory:
             plans.append(plan)
             estimate = plan["estimate"]
             observed = self._observed_reservation(spec, estimate)
+            minimum = plan.get("profile_worker_min_bytes")
+            if minimum is not None and len(specs) > 1:
+                require_plan(plan)
+                reservations.append(minimum)
+                partition_profile_wave = True
+                continue
             if estimate["estimated_peak_bytes"] is None and observed is None and len(specs) > 1:
                 raise _SerialAdmissionRequired(
                     "candidate wave requires supervised serial execution",
@@ -1293,6 +1339,8 @@ class GuardedRunnerFactory:
                 if observed is not None and len(specs) > 1
                 else _reserved_bytes(estimate["estimated_peak_bytes"], estimate["lower_bound_bytes"], external=external)
             )
+        if partition_profile_wave:
+            host = discover_host()  # A large trace scan can outlive the initial headroom snapshot.
         budget = resolve_budget(self.policy, host)
         budget["coordinator_memory_bytes"] += _child_memory_bytes()
         available = max(
@@ -1303,7 +1351,12 @@ class GuardedRunnerFactory:
             ),
         )
         required = sum(reservations)
-        admitted = required <= available and len(specs) <= budget["cpu_limit"]
+        share = available // len(specs) if partition_profile_wave else None
+        admitted = (
+            required <= available
+            and len(specs) <= budget["cpu_limit"]
+            and (share is None or max(reservations) <= share)
+        )
         plan = {
             "status": "admitted" if admitted else "resource_limited",
             "reserved_bytes": reservations,
@@ -1313,6 +1366,8 @@ class GuardedRunnerFactory:
             "workers": len(specs),
             "candidates": plans,
         }
+        if share is not None:
+            plan["profile_worker_rss_limit_bytes"] = share
         if not admitted:
             raise ResourceLimitError("candidate wave exceeds current host headroom", plan=plan)
         return plan

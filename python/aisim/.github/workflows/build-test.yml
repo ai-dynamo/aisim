@@ -65,7 +65,7 @@ jobs:
         run: cargo test --workspace --no-default-features
       - name: Install the local wheel and upper compatibility package
         run: |
-          python -m pip install uv
+          python -m pip install uv==0.13.10
           uv sync --extra dev
       - name: Test Python package contracts
         run: |
@@ -102,7 +102,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install AIC and test dependencies
         run: |
-          python -m pip install uv
+          python -m pip install uv==0.13.10
           uv sync --python ${{ matrix.python-version }} --extra dev --locked
       - name: Verify Python and NumPy compatibility
         run: |
@@ -255,7 +255,7 @@ jobs:
             aic-core/rust/aiconfigurator-core
       - name: Install AIC and test dependencies
         run: |
-          python -m pip install uv
+          python -m pip install uv==0.13.10
           uv sync --extra dev
           uv pip install --python .venv/bin/python maturin
       - name: Build the aisim_core Rust extension
@@ -270,10 +270,10 @@ jobs:
       - name: Run Rust unit tests (cargo test)
         # The crate's own oracle/unit tests were previously NOT in any gate,
         # which let "match Python" pins go stale silently (e.g. the b200
-        # mem_bw test survived a YAML correction unnoticed). The py:: binding
-        # tests self-initialize the interpreter (prepare_freethreaded_python),
-        # so plain `cargo test --lib` covers them; PYO3_PYTHON pins the venv
-        # interpreter for linking.
+        # mem_bw test survived a YAML correction unnoticed). This command
+        # builds without the `python` feature, so it does not compile the
+        # py:: binding tests (`perfmodel::py` and `mod python` need that
+        # feature). PYO3_PYTHON has an effect only when that feature is on.
         env:
           PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
         run: cargo test --release --lib

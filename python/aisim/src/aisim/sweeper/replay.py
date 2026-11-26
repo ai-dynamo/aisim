@@ -213,6 +213,9 @@ class BackendDeploymentSpec:
     # Per-worker tokenization: ``{"workers", "base_ms", "per_input_token_ms"}``.
     # Omitted from canonical JSON when unset, so existing spec identities hold.
     tokenization: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
+    # Unqueued request-path CPU overhead: ``{"base_ms", "per_input_token_ms"}``.
+    # Omitted from canonical JSON when unset.
+    extra_cpu_overhead: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
     # Per-worker detokenization: ``{"workers", "base_ms", "per_output_ms"}``.
     # Omitted from canonical JSON when unset.
     detokenization: dict[str, JSONValue] | None = field(default=None, metadata={OMIT_IF_NONE: True})
@@ -478,6 +481,8 @@ class RunnerCapabilities:
 
     supports_agentic_primers_only: bool = False
     supports_weka_chat_template: bool = False
+    supports_kvcr_g3: bool = False
+    supports_telemetry: bool = False
 
     def supports_backend_topology(self, backend: str, topology: str) -> bool:
         """Return whether a backend/topology pair is supported.
@@ -519,6 +524,30 @@ class RunnerCapabilities:
             raise ValueError(
                 f"ReplaySpec API version {api_version} is incompatible with "
                 f"runner version {self.replay_spec_api_version}"
+            )
+
+    def require_output_support(self, output_requirements: ReplayOutputRequirements) -> None:
+        """Raise before runner creation when a requested capture is never produced.
+
+        The runner still rejects finer combinations, such as telemetry on paths
+        without native samples.
+        """
+
+        if output_requirements.capture_telemetry and not self.supports_telemetry:
+            raise ValueError("runner does not support replay telemetry; use --stack engine")
+
+    def require_agentic_warmup_policy(self, policy: str) -> None:
+        """Raise when the runner does not advertise an agentic warmup policy."""
+
+        if policy not in {"repeated_prefixes", "live_trajectory_v1", "primers_only"}:
+            raise ValueError("unknown agentic_warmup_policy")
+        if policy == "live_trajectory_v1" and not self.supports_agentic_live_warmup:
+            raise ValueError(
+                "runner does not support live agentic warmup; update the adapter before selecting live_trajectory_v1"
+            )
+        if policy == "primers_only" and not self.supports_agentic_primers_only:
+            raise ValueError(
+                "runner does not support primers-only agentic warmup; update the adapter before selecting primers_only"
             )
 
     def require_compatible(self, spec: ReplaySpec) -> None:
@@ -565,6 +594,9 @@ class RunnerCapabilities:
             rank = args.get("rank", args)
             if not isinstance(rank, Mapping):
                 continue
+            kvcr = rank.get("kvcr")
+            if isinstance(kvcr, Mapping) and kvcr.get("g3") is not None and not self.supports_kvcr_g3:
+                raise ValueError("runner does not support kvcr.g3; use --stack engine")
             timing = rank.get("timing_model")
             identity = timing.get("config", {}) if isinstance(timing, Mapping) else {}
             if not isinstance(identity, Mapping):
@@ -682,6 +714,11 @@ class RunnerCapabilities:
                 raise ValueError("runner does not support engine.tokenization; use --stack engine")
             if spec.execution_mode != "offline":
                 raise ValueError("engine.tokenization requires offline replay")
+        if deployment.extra_cpu_overhead is not None:
+            if not self.supports_tokenization:
+                raise ValueError("runner does not support engine.extra_cpu_overhead; use --stack engine")
+            if spec.execution_mode != "offline":
+                raise ValueError("engine.extra_cpu_overhead requires offline replay")
         if deployment.detokenization is not None:
             if is_afd:
                 raise ValueError("engine.detokenization is unsupported for AFD")
@@ -765,22 +802,11 @@ class RunnerCapabilities:
             "primers_only",
         }:
             raise ValueError("unknown agentic_warmup_policy")
-        if warmup_policy == "live_trajectory_v1":
-            if not agentic_warmup or agentic_profile is None:
-                raise ValueError("live_trajectory_v1 requires agentic_warmup and agentic_profile")
-            if not self.supports_agentic_live_warmup:
-                raise ValueError(
-                    "runner does not support live agentic warmup; "
-                    "update the adapter before selecting live_trajectory_v1"
-                )
-        if warmup_policy == "primers_only":
-            if not agentic_warmup:
-                raise ValueError("primers_only requires agentic_warmup")
-            if not self.supports_agentic_primers_only:
-                raise ValueError(
-                    "runner does not support primers-only agentic warmup; "
-                    "update the adapter before selecting primers_only"
-                )
+        if warmup_policy == "live_trajectory_v1" and (not agentic_warmup or agentic_profile is None):
+            raise ValueError("live_trajectory_v1 requires agentic_warmup and agentic_profile")
+        if warmup_policy == "primers_only" and not agentic_warmup:
+            raise ValueError("primers_only requires agentic_warmup")
+        self.require_agentic_warmup_policy(warmup_policy)
         if agentic_snapshot is not None:
             try:
                 snapshot = AgenticSnapshotOptions.model_validate(agentic_snapshot)

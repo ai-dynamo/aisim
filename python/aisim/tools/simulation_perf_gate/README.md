@@ -140,13 +140,14 @@ The default per-process timeout is 120 seconds.
 trusted `pull-request/<N>` branch, like the forward-performance workflow. Its
 selector uses the complete PR change set. Runtime, model data, dependency, and
 benchmark changes select the gate; unrelated and documentation-only changes skip
-it. No repository enable variable is required. The selector verifies that the
-trusted copy matches the current PR head.
+it. Pushes for draft PRs and PRs whose base is not `main` or `release/*` also
+skip; manual dispatch still compares them. No repository enable variable is
+required. The selector verifies that the trusted copy matches the current PR head.
 
 Revision and protocol checks run in the hosted selection job. A two-entry build
 matrix builds base and head in parallel with the same container, Python, Rust,
 and release settings. Each side also builds Dynamo at
-`def3b79b15c266805540a678dd400aeb6ccada1d`, with both AISim dependencies
+`df666fbc6284e540ea0f5cac613da7f992b1fc7b`, with both AISim dependencies
 pointing at that side's exact source. Cargo resolves the local core's dependency
 graph from Dynamo's existing lock before compilation. The wheel build uses
 `--locked` with that resolved graph. Additional offline

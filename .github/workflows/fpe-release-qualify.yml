@@ -64,7 +64,7 @@ jobs:
         run: python scripts/fpe/run_release_fpe.py record-wheel
       - name: Install the release's locked dependencies and exact wheel
         run: |
-          python -m pip install uv==0.12.6
+          python -m pip install uv==0.13.10
           project=$(python -c 'from pathlib import Path; from scripts.release.package_identity import project_directory; print(project_directory(Path("release-source")))')
           uv sync --project "${project}" --locked --no-install-project --no-dev --python "$(command -v python)"
           uv pip install --python "${project}/.venv/bin/python" --no-deps fpe-release-wheel/*.whl
@@ -126,7 +126,7 @@ jobs:
           token: ${{ secrets.ARTIFACTORY_TOKEN }}
       - name: Install the release's locked dependencies and exact wheel
         run: |
-          python -m pip install uv==0.12.6
+          python -m pip install uv==0.13.10
           project=$(python -c 'from pathlib import Path; from scripts.release.package_identity import project_directory; print(project_directory(Path("release-source")))')
           uv sync --project "${project}" --locked --no-install-project --no-dev --python "$(command -v python)"
           uv pip install --python "${project}/.venv/bin/python" --no-deps fpe-release-wheel/*.whl

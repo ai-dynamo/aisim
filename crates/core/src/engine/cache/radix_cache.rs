@@ -189,6 +189,8 @@ pub struct TreeNode {
     /// Bumped whenever this edge's tail changes in place (leaf extension or partial eviction),
     /// so a [`PrefixMatchHint`] ending at this node is not reused across such a change.
     edge_version: u64,
+    /// Recurrent state exists at this exact endpoint; a split never inherits it.
+    mamba_checkpoint: bool,
 }
 
 /// Where a read-only prefix match fully matched its deepest node, so the same page hashes can be
@@ -204,6 +206,7 @@ pub(crate) struct PrefixMatchHint {
 pub struct RadixCache {
     nodes: SlotMap<NodeId, TreeNode>,
     root: NodeId,
+    mamba_checkpoints: usize,
     pub page_pool: PagePool,
     page_size: usize,
     #[cfg(test)]
@@ -266,10 +269,12 @@ impl RadixCache {
             lock_ref: 0,
             last_access_time: Instant::now(),
             edge_version: 0,
+            mamba_checkpoint: false,
         });
         Self {
             nodes,
             root,
+            mamba_checkpoints: 0,
             page_pool: PagePool::new(total_tokens, page_size),
             page_size,
             #[cfg(test)]
@@ -762,6 +767,44 @@ impl RadixCache {
         (matched_pages * self.page_size, current)
     }
 
+    /// Hybrid reuse needs KV and recurrent state at the same endpoint. Return the
+    /// checkpoint-qualified prefix and the ordinary KV branch position separately.
+    pub(crate) fn mamba_prefix_match(&self, page_keys: &[LocalBlockHash]) -> (usize, usize) {
+        let mut current = self.root;
+        let mut pages = 0;
+        let mut checkpoint_pages = 0;
+        while pages < page_keys.len() {
+            let Some(&child) = self.nodes[current].children.get(&page_keys[pages]) else {
+                break;
+            };
+            let node = &self.nodes[child];
+            if node.value.is_empty() {
+                break;
+            }
+            let common = Self::key_match(&node.key, &page_keys[pages..]);
+            pages += common;
+            if common != node.key.len() {
+                break;
+            }
+            current = child;
+            if node.mamba_checkpoint {
+                checkpoint_pages = pages;
+            }
+        }
+        (checkpoint_pages * self.page_size, pages * self.page_size)
+    }
+
+    pub(crate) fn mark_mamba_checkpoint(&mut self, node: NodeId) {
+        if node != self.root && !self.nodes[node].mamba_checkpoint {
+            self.nodes[node].mamba_checkpoint = true;
+            self.mamba_checkpoints += 1;
+        }
+    }
+
+    pub(crate) fn mamba_checkpoint_count(&self) -> usize {
+        self.mamba_checkpoints
+    }
+
     /// Read-only prefix match length (does not mutate timestamps or split nodes).
     /// Used for LPM scheduling scoring.
     #[cfg(test)]
@@ -992,6 +1035,7 @@ impl RadixCache {
                 && self.hicache.is_none()
                 && !self.is_swa_boundary(current)
                 && self.nodes[current].children.is_empty()
+                && !self.nodes[current].mamba_checkpoint
                 && (self.nodes[current].lock_ref == 0
                     || (allow_locked_tail_extension
                         && current == start_node
@@ -1083,7 +1127,7 @@ impl RadixCache {
             return;
         }
         let edge = &mut self.nodes[node];
-        if edge.children.is_empty() && edge.lock_ref <= 1 {
+        if !edge.mamba_checkpoint && edge.children.is_empty() && edge.lock_ref <= 1 {
             // Exact: doubling a long leaf for a short turn only gets shrunk back at unlock.
             edge.key.reserve_exact(pages);
             edge.value.reserve_exact(pages);
@@ -1153,6 +1197,7 @@ impl RadixCache {
             lock_ref,
             last_access_time: accessed,
             edge_version: 0,
+            mamba_checkpoint: false,
         };
         let inter_id = self.nodes.insert(intermediate);
         if let Some(host) = &mut self.hicache
@@ -1194,6 +1239,7 @@ impl RadixCache {
             lock_ref: 0,
             last_access_time: now,
             edge_version: 0,
+            mamba_checkpoint: false,
         };
         let ck = key[0];
         let new_id = self.nodes.insert(new_node);
@@ -1339,6 +1385,10 @@ impl RadixCache {
                 let victim_node = &mut nodes[victim_id];
                 victim_node.key.truncate(split_pos);
                 victim_node.edge_version += 1;
+                if victim_node.mamba_checkpoint {
+                    self.mamba_checkpoints -= 1;
+                    victim_node.mamba_checkpoint = false;
+                }
                 let evicted_values = &victim_node.value[split_pos..];
                 if let Some(belady) = &mut self.belady {
                     for page in evicted_values {
@@ -1360,6 +1410,9 @@ impl RadixCache {
                 .nodes
                 .remove(victim_id)
                 .expect("evictable leaf disappeared before removal");
+            if victim_node.mamba_checkpoint {
+                self.mamba_checkpoints -= 1;
+            }
             self.forget_swa_boundary(victim_id);
             let tokens = victim_node.key.len() * self.page_size;
             let parent_id = victim_node.parent;
@@ -1405,6 +1458,57 @@ mod tests {
     use super::*;
     use crate::engine::common::hashing::compute_seq_hash_for_block;
     use uuid::Uuid;
+
+    #[test]
+    fn mamba_checkpoints_survive_splits_but_not_endpoint_eviction() {
+        let mut cache = RadixCache::new(32, 1);
+        let tokens: Vec<u32> = (0..8).collect();
+        let pages = cache.page_pool.allocate(tokens.len()).unwrap();
+        let endpoint = cache.insert(&tokens, &pages);
+        cache.mark_mamba_checkpoint(cache.root());
+        cache.mark_mamba_checkpoint(endpoint);
+        cache.mark_mamba_checkpoint(endpoint);
+        assert_eq!(cache.mamba_checkpoint_count(), 1);
+
+        // A split creates KV at token 4, but no recurrent state there.
+        let (_, split) = cache.match_prefix(&tokens[..4]);
+        assert_ne!(split, endpoint);
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&tokens[..6])),
+            (0, 6)
+        );
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&tokens)),
+            (8, 8)
+        );
+        cache.mark_mamba_checkpoint(split);
+        assert_eq!(cache.mamba_checkpoint_count(), 2);
+
+        // Extending a checkpoint must retain its original endpoint.
+        let extended: Vec<u32> = (0..10).collect();
+        let more = cache.page_pool.allocate(2).unwrap();
+        let mut all_pages = pages;
+        all_pages.extend(more);
+        let tail = cache.insert(&extended, &all_pages);
+        assert_ne!(tail, endpoint);
+        cache.mark_mamba_checkpoint(tail);
+        assert_eq!(cache.mamba_checkpoint_count(), 3);
+        // LRU removes the whole tail leaf and its token-10 checkpoint.
+        assert_eq!(cache.evict(1).0, 2);
+        assert_eq!(cache.mamba_checkpoint_count(), 2);
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&extended)),
+            (8, 8)
+        );
+        cache.evict(4); // Removing the marked token-8 endpoint leaves token 4.
+        assert_eq!(cache.mamba_checkpoint_count(), 1);
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&tokens)),
+            (4, 4)
+        );
+        cache.evict(4);
+        assert_eq!(cache.mamba_checkpoint_count(), 0);
+    }
 
     fn oracle_for_prompts(prompts: &[&[u32]]) -> BeladyOracle {
         BeladyOracle::new(
@@ -1838,6 +1942,45 @@ mod tests {
             cache.node(tail).value.capacity(),
             cache.node(tail).value.len()
         );
+    }
+
+    #[test]
+    fn mamba_checkpoint_does_not_reserve_unusable_tail_capacity() {
+        let mut cache = RadixCache::new(32, 1);
+        let tokens: Vec<u32> = (0..4).collect();
+        let mut pages = cache.page_pool.allocate(tokens.len()).unwrap();
+        let tail = cache.insert(&tokens, &pages);
+        cache.inc_lock_ref(tail);
+        cache.mark_mamba_checkpoint(tail);
+        let capacities = (
+            cache.node(tail).key.capacity(),
+            cache.node(tail).value.capacity(),
+        );
+
+        cache.reserve_leaf_extension(tail, 65_536);
+
+        assert_eq!(
+            (
+                cache.node(tail).key.capacity(),
+                cache.node(tail).value.capacity()
+            ),
+            capacities
+        );
+        let extended: Vec<u32> = (0..6).collect();
+        pages.extend(cache.page_pool.allocate(2).unwrap());
+        let child = cache.insert_from_node(tail, tokens.len(), &extended, &pages);
+
+        assert_ne!(child, tail);
+        assert_eq!(cache.node(child).parent, Some(tail));
+        assert_eq!(*cache.node(tail).key, cache.page_hashes(&tokens));
+        assert_eq!(cache.mamba_checkpoint_count(), 1);
+        assert_eq!(
+            cache.mamba_prefix_match(&cache.page_hashes(&extended)),
+            (4, 6)
+        );
+        cache.dec_lock_ref(tail);
+        assert_eq!(cache.protected_size, 0);
+        assert_eq!(cache.evictable_size, 6);
     }
 
     #[test]

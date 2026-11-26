@@ -114,8 +114,8 @@ Manual dispatches and site-change triggers are listed below.
 | [FPE Support Matrix](../../.github/workflows/fpe-support-matrix.yml) | Called by Main branch nightly CI; manual dispatch with `expected_sha` | Broad native operation-level support qualification |
 | [Release branch nightly CI](../../.github/workflows/release-nightly-ci.yml) | Daily at 09:23 UTC; manual dispatch on `main` | Schedules FPE support-matrix refreshes for discovered `release/*` branches |
 | [FPE Support Matrix (release)](../../.github/workflows/fpe-release-qualify.yml) | Called once per release by Release branch nightly CI | Builds the release wheel, probes all shards, and uploads its qualified matrix artifact |
-| [codeowners](../../.github/workflows/codeowners.yml) | PRs and pushes to `main` | Independent ownership coverage and generated-file checks; overlaps with Fast CI |
-| [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; selects relevant PR files before benchmarking; manual dispatch for a PR | Paired base/head prediction-runtime benchmark, outside Full CI |
+| [codeowners](../../.github/workflows/fast-ci.yml) | Part of every Fast CI run | Required repository-policy status, including ownership coverage and generated-file checks |
+| [Forward Prediction Performance (advisory)](../../.github/workflows/performance.yml) | Every trusted `pull-request/*` push; benchmarks only ready PRs targeting `main` or `release/*` with relevant files; manual dispatch for any PR | Paired base/head prediction-runtime benchmark, outside Full CI |
 | [E2E Accuracy Matrix](../../.github/workflows/e2e-accuracy.yml) | Daily at 10:17 UTC for `main` and all `release/*` heads; manual dispatch for one evaluated SHA, plus preview-only pinned `agentx_revision` and optional `agentx_campaign_catalog` ([constraints](#agentx-accuracy-extension)) | Advisory accuracy campaigns using one wheel for both CLIs; publishes qualified artifacts |
 | [GitHub Pages](../../.github/workflows/pages.yml) | FPE Support Matrix, Main branch nightly CI, Release branch nightly CI, E2E Accuracy Matrix, or FPM Accuracy Matrix completion; relevant site changes on PRs/`main`; daily at 09:17 UTC; manual dispatch | Validates qualified FPE and accuracy snapshots, tests FPE branch selection in Chromium, and builds public pages; deployment is restricted to trusted `main` |
 
@@ -128,6 +128,14 @@ or changed revisions fail selection; empty, incomplete, or oversized file lists
 run the benchmark conservatively. Manual dispatch forces a comparison after the
 same revision checks: the trusted copy must match the current PR head.
 
+Automatic pushes skip draft PRs and stacked PRs, whose base is not `main` or
+`release/*`, before reading the file list. The summary names the reason;
+nothing allocates the benchmark runner. Selection runs again on each trusted
+push, so a PR that is marked ready or retargeted is compared on its next push.
+Manual dispatch with `pr_number` compares any PR without waiting. The
+[Simulation Performance (advisory)](../../.github/workflows/simulation-performance.yml)
+workflow uses the same selector with its own path list, so it follows these rules.
+
 If the PR changes the performance gate's Python files or the shared prediction
 grid, the benchmark job also runs the PR's controller against the same base and
 head installations. This validates new matrix cases before merge and reports
@@ -136,8 +144,9 @@ packages and requires no additional runner or manual dispatch.
 Gate documentation-only changes do not select a benchmark or an additional
 controller run.
 
-Ownership checks, prediction performance, E2E accuracy, and Pages run independently
-of the Fast/Full validation gates. E2E accuracy does not gate nightly staging.
+Prediction performance, E2E accuracy, and Pages run independently
+of the Fast/Full validation gates. Ownership validation is part of Fast CI and
+also supplies the required `codeowners` status. E2E accuracy does not gate nightly staging.
 Pages consumes qualification evidence after producer completion.
 The DCO sign-off check and review services are additional PR signals, not jobs
 inside Fast CI. See [CONTRIBUTING.md](../../CONTRIBUTING.md) for DCO requirements.
@@ -163,7 +172,10 @@ configures automated review separately from GitHub Actions.
    or release owner.
 
 Trusted copy-pr-bot branches also launch Full CI automatically as a coverage
-backstop. Check that the copy's SHA matches the PR head before using its result.
+backstop. The bot copies ready PRs only: drafts run Fast CI until they are
+marked ready, or until a maintainer comments `/ok to test <sha>` to copy one
+explicitly (see [copy-pr-bot.yaml](../../.github/copy-pr-bot.yaml)).
+Check that the copy's SHA matches the PR head before using its result.
 If that run already validates the current head, a second manual launch is
 unnecessary. The maintainer admission boundary remains in place. Conditional
 Codex review and a review-completion dispatcher are not implemented by these
@@ -176,15 +188,42 @@ Fast CI has three substantive jobs, followed by an aggregate result:
 
 | Job | Checks |
 | --- | --- |
-| Repository Policy | Copyright and packaged legal files; CODEOWNERS policy tests, ownership coverage, and generated artifacts; workflow/selection and qualification contract tests |
+| codeowners (repository policy) | Copyright and packaged legal files; bundled-configuration provenance; local documentation links; script dependency locks when relevant; CODEOWNERS policy tests, ownership coverage, and generated artifacts; workflow/selection and qualification contract tests |
 | Python Static Checks | Ruff lint and formatting on the configured AISim/test paths, Python syntax compilation, and changed-line whitespace |
 | Rust Format | `cargo fmt --all -- --check` |
 | Fast CI Success | Requires the three jobs to succeed for every PR, branch push, or manual run |
 
 Draft and non-draft PRs run the same Fast CI checks without a label requirement.
 The aggregate fails if any required job fails, is canceled, or is skipped.
-The exact Ruff paths are listed in [the workflow](../../.github/workflows/fast-ci.yml);
-this is not a claim that every migrated source file is linted.
+Ruff checks all Python packages under `python/aisim/src/`, including
+`aisim_core` and the legacy import shims, plus `python/aisim/collector/`.
+The [workflow](../../.github/workflows/fast-ci.yml) also lists the test paths
+checked by Ruff.
+
+The repository-policy job retains the required check name `codeowners`; the
+separate ownership workflow is consolidated into this job. It validates the
+exact PR head first, including rejection of shadow `.github/CODEOWNERS` and
+`docs/CODEOWNERS` files. For PR events it also validates GitHub's proposed merge
+when that commit's tree differs from the head. Identical trees reuse the head
+result. Both checks use the same ownership-test, full-tree coverage, and
+generated-file validation commands. Other policy checks run once on the head.
+Pushes and manual runs validate their exact target. The required `codeowners`
+status and its Infra/maintainer review routing remain in place.
+
+Script lock regeneration runs when the complete change touches its manifest,
+requirements locks, uv configuration, or the selection/validation machinery.
+PRs and trusted copies use the complete PR diff, not only the latest push.
+Lifecycle pushes use the entire push range. Manual runs, missing history,
+changed PR heads, and unavailable comparison metadata regenerate every lock
+conservatively. Hash-verified dependency installation and all other validation
+continue on every run. This reduces repeated resolver work; it is not a change
+to application-test coverage or a promise of a large latency reduction.
+
+The [PR #896 evidence record](../../benchmarks/evidence/ci-pr-896/README.md)
+contains the historical raw timing excerpts and their limitations. Quantified
+runner-work and elapsed-time savings remain unmeasured hypotheses: the
+unpaired runs do not establish a net improvement or exercise hosted lock
+skipping. The selector tests establish skip/regenerate behavior separately.
 
 Every standalone run publishes `Fast CI Success`. Full CI contains only a
 lightweight **Require Fast CI** job, which reads the standalone run and verifies
@@ -200,8 +239,19 @@ separate Fast run; this preserves validation in both admission contexts.
 The Dynamo README profile uses fixed AISim/Dynamo RC source revisions. Its
 three-wheel bundle is built on a miss and reused through Artifactory on matching
 subsequent runs. The key includes both source revisions, the build recipe and
-storage tooling, locked harness dependencies, Python/Rust/uv versions, and the
-job image reference, effective OS/package inventory, and storage endpoint/repository. A changed key or expired manifest rebuilds
+storage tooling, locked harness dependencies, Python/Rust/uv versions, the job
+image reference, the OS ID and version, the native build packages, and storage
+endpoint/repository. The native build packages are the job's `apt-get`
+prerequisites except `gh`, plus every installed package they depend on: the
+compilers, linker, glibc, kernel headers, libclang, protoc, CMake, and linked
+libraries. Each is keyed by its full installed version, including epochs and
+Ubuntu packaging revisions: security and stable updates can change headers,
+compilers, or libraries without changing the upstream version. For example,
+`linux-libc-dev` `6.8.0-149.149` and `6.8.0-151.151` ship different public
+headers and must use different keys. Packages the build cannot reach keep the
+key. The full `dpkg` inventory and its hash are recorded outside
+the key in `rc-build-environment.json` in the job's `readme-rc-build-inputs`
+artifact. A changed key or expired manifest rebuilds
 the bundle. Cross-run reuse accepts successful Full CI producers from this
 repository's `main`, or the exact same admitted PR head; another PR cannot
 populate the cache for this PR or for `main`.
@@ -262,6 +312,23 @@ manual branch validation, launch standalone Fast CI first, as shown below.
 The gate reads Actions metadata with a read-only token; it does not dispatch
 another workflow or grant new release permissions.
 
+### Operation data
+
+Operation tables are not packaged; they come from the dataset revision pinned in
+`op_latency_pin.json`. Downloading that dataset (thousands of files) in every parallel
+Full CI job gets the runners rate limited by Hugging Face (HTTP 429) and the jobs time out,
+so one `Op-latency data` job downloads it once, with the read token in
+`HF_READ_AISIM_INFX_CACHE` and an anonymous retry, and uploads it as the `op-latency-data`
+artifact. It runs exactly when a job that reads operation tables is selected, and those jobs
+(`rust`, `rust-feature-modes`, `public-api-rust`, `application-tests`,
+`python-compatibility`, `engine-golden-regression`, `collector-data`, `readme-commands`) wait
+for it. The [prefetch action](../../.github/actions/prefetch-op-latency-data/action.yml)
+restores the artifact with
+[`op_latency_handoff.py`](../../scripts/ci/op_latency_handoff.py), then composes its systems
+root from the warm cache, verifying every file's hash; run outside Full CI, with no artifact,
+it downloads the dataset itself. `Full CI Success` requires the data job exactly when one of
+those jobs is selected.
+
 ### Component selection
 
 [The selector](../../scripts/ci/select_full_ci.py) uses the complete changed-file set
@@ -269,7 +336,9 @@ of a trusted PR copy, classifying both paths of a rename. The independent
 [selection cases](../../.github/full-ci-selection-cases.yml) document expected
 components and their consumer rationale; Fast CI checks this contract.
 
-- **Main, release, and manual runs:** every Full CI component.
+- **Release and manual runs:** every Full CI component.
+- **Main pushes:** every Full CI component for the newest commit of a burst of
+  merges; see [batched main validation](#batched-main-validation).
 - **Trusted PR copies:** components affected by the change. Documentation and
   review-policy-only changes can mark every expensive component N/A.
 - **Unknown paths, shared dependency/test configuration, or CI execution
@@ -280,6 +349,60 @@ components and their consumer rationale; Fast CI checks this contract.
 selection outputs, missing dependencies, failures, cancellations, and unexpected
 skips. A skipped component is acceptable only when the selector explicitly
 marked it N/A.
+
+### Batched main validation
+
+Merges often land minutes apart. After a push to `main`, **Select Full CI Scope**
+waits ten minutes (`MAIN_DEBOUNCE_SECONDS` in the selector), then reads `main`
+with the job's read-only token:
+
+| `main` after the wait | Scope | Comparison base |
+| --- | --- | --- |
+| Still this commit | Every component | Last full-scope main commit with successful comparisons |
+| A newer commit that contains this one and has a scheduled or successful Full CI push run | Superseded: build, verify, and stage this commit's wheel | Previous main commit, used only by license evidence |
+| No eligible successor run, unreadable state, or a commit that does not contain this one | Every component | Last full-scope main commit with successful comparisons |
+
+Reruns (`github.run_attempt > 1`) always select every component, even if `main`
+advanced after the first attempt. Retrying a failed full-scope run therefore
+cannot turn its failed tests into explicit N/A components.
+
+A superseded run builds the application test wheel, verifies and smoke-tests it in
+**Application Wheel**, collects license evidence, and stages the wheel through
+`automated-release`. Its application test legs and every other component are
+explicit N/A, and `Full CI Success` reports the commit as superseded.
+**Its staged wheel was built and verified. Its full test suite was deferred to
+the successor Full CI run named in the scope summary.** Check the successor
+result. A later failure can come from any commit in the batch. The successor's
+**Select Full CI Scope** summary lists the commits it covers. Manual Full CI runs only branch heads, so check an individual deferred
+commit locally or through a PR.
+
+The newest run compares old and new revisions from the last full-scope main
+commit whose prediction-regression gate, Python dependency licenses, Cargo
+dependency inventories, and license compliance evidence jobs all completed
+successfully. Selection alone does not advance the baseline: a canceled or
+unfinished comparison must still be covered by a later run. Other full-suite
+jobs may still be running or may have failed without disqualifying that baseline.
+Earlier scopes come from the Actions API: the
+**Defer the test suite to the newer main commit** step
+succeeds in a superseded run and is skipped in a full-scope run. Selections that
+are still running, failed, or superseded are passed over, as are full-scope runs
+with missing, unfinished, or unsuccessful comparison jobs. Runs from before
+batching count as full scope but require the same comparison evidence.
+The selector reads main push history in pages of 30 runs, continuing into older
+pages until it finds comparison-validated evidence or exhausts the available
+Actions history. A burst of superseded pushes therefore does not displace the
+baseline from a fixed lookback window. If no available run has that evidence,
+or the selected commit is not an ancestor, **Select Full CI Scope** fails without
+publishing a plan or comparison base. It never falls back to an unvalidated
+parent: that commit may already contain deferred changes, hiding them from the
+comparison. If `main` cannot be read, the run selects the full scope and still
+requires a validated comparison ancestor. If earlier runs cannot be read,
+selection also fails.
+
+Release branches, trusted PR copies, and manual runs are not batched. Every main
+run starts its expensive jobs ten minutes later. Main runs keep unique
+concurrency groups: batching narrows a superseded run's scope and never cancels
+the run.
 
 ### Validation components
 
@@ -309,7 +432,7 @@ explicit exception and its workflow contract test.
 | Rust workspace and public API | Workspace tests and external Rust consumer tests on amd64 and arm64 |
 | Rust feature modes | Supported feature builds/tests, including embedded Python and replay benchmarks |
 | Cargo Deny | Workspace dependency license and banned-package policy on both architectures |
-| Application wheels and tests | One prebuilt test wheel per architecture, installed into the application shards below; wheel verification and release-artifact contracts reuse it |
+| Application wheels and tests | One prebuilt test wheel per architecture (its own `application_test_wheel` component), installed into the application shards below; wheel verification and release-artifact contracts reuse it |
 | Python compatibility | Cross-package contracts and dependency checks on Python 3.11 and 3.13; application shards use Python 3.12 |
 | Engine Golden Regression | Engine-step and compiled-engine parity suites, plus frozen native numerical checks |
 | Platform Wheels | Build, repair, install, and exercise Linux x86-64/ARM64 and macOS ARM64 wheels |
@@ -323,17 +446,33 @@ explicit exception and its workflow contract test.
 16 frozen queries on B200: eight vLLM 0.24.0 queries for dense Qwen3-32B and
 MoE MiniMax-M2.5, plus four Qwen3-32B queries each for TRT-LLM 1.3.0rc20 and
 SGLang 0.5.14. Every backend covers prefill/decode and short/long sequences.
+These collections are frozen data coordinates outside the queryable version
+slots; the script admits them for its own queries, so promoting a newer
+collection changes neither the expected values nor the query inputs.
 The [manifest](../../.github/prediction-numerical-sentinels.json)
-records a full baseline commit that must resolve in the checkout. Fast CI and
-the numerical-check job explicitly fetch that SHA from `origin` if missing;
-full branch history alone can omit a baseline from a squashed PR. Fetch or
-commit-validation failures remain errors. Fetch-only mode does not load the
-AISim runtime; the subsequent checks validate the complete manifest.
-To prepare a checkout locally, run:
+records each query's inputs and expected value, but no source commit: a commit
+from a squashed PR branch is not on `main`, and a mirror without the PR refs
+cannot fetch it. In a clone with full history,
+`git log -p -- .github/prediction-numerical-sentinels.json` shows each change
+to the expected values and the PR that made it; that PR holds the evidence of
+how its values were produced. The current values come from:
 
-```sh
-python scripts/prediction_regression/check_prediction_numerics.py --fetch-baseline-only
-```
+| PR | Values |
+| --- | --- |
+| #187 | the eight vLLM cases |
+| #244 | the four MiniMax values, changed (see below) |
+| #261 | the four TRT-LLM and four SGLang Qwen3-32B cases, added (see below) |
+| #728 | the two TRT-LLM Qwen3-32B prefill values, changed |
+
+Full CI runs this check (`engine-golden-regression`) on every push to `main`
+and `release/*` and on every manual dispatch, because those runs select all
+components. On a trusted PR copy (`pull-request/*`), it runs only when
+`scripts/ci/select_full_ci.py` selects it: for Rust code, prediction or engine
+code, and collector or performance data, and whenever the selector falls back
+to the full matrix (a CI or shared repository contract change, an unclassified
+path such as this manifest, or more than 3000 changed files). A PR copy that
+changes only documentation skips it. A pass means the values hold within
+tolerance, not that they reproduce exactly.
 
 Tolerances are 2% relative and 0.0001 ms absolute. Missing, duplicate, failed, nonfinite,
 nonpositive, or out-of-tolerance results fail. Intentional modeling changes
@@ -361,12 +500,18 @@ prediction-stability values, not measured whole-model accuracy.
 
 After the PR #244 squash merge, its original baseline commit was no longer
 reachable in fresh CI checkouts. All eight sentinels were revalidated at
-`ba64235a645580a8a1b20a424fffef6514ff0103`; the manifest now references that
-permanent main-branch merge commit, which survives subsequent squash merges.
-Expected values, query inputs, and tolerances are unchanged.
+`ba64235a645580a8a1b20a424fffef6514ff0103`, the PR #244 squash commit on
+`main`, with unchanged expected values, query inputs, and tolerances. On `main`,
+the manifest recorded `a4c77310` (PR #187, a `main` commit), then commits from
+the squashed branches of PR #244 (`af91885d`), PR #261 (`d066e918`) and
+PR #728 (`fc6e26a8`). A fresh checkout reaches those only by fetching the PR's
+commit by SHA, which fails in a mirror without those PR refs, so the manifest
+no longer records a commit.
 
-The 16-case manifest was reproduced from runtime and packaged data at
-`d066e918705b98e2d55eed55743ce8d225f129ea`. The original eight vLLM values
+When PR #261 extended the manifest to 16 cases, the values were reproduced from
+runtime and packaged data at `d066e918705b98e2d55eed55743ce8d225f129ea`, a
+commit on that PR's branch. PR #728 later changed two of them; the other 14
+values are still those of that reproduction. The original eight vLLM values
 were reproduced exactly and retained unchanged. The eight added backend values
 use the same four dense-model query shapes and SILICON mode, without shared
 layer reuse. These operator-level queries complement the engine integration
@@ -380,6 +525,15 @@ harness, the report explicitly contains new-side statistics only. Frozen
 goldens establish numerical stability; hardware accuracy is supported by the
 specific measured configurations in the
 [accuracy evidence](../../README.md#accuracy-evidence).
+
+Engine Golden Regression and both prediction-snapshot collections build AISim
+from source on GitHub-hosted `ubuntu-24.04` runners without the CI job
+container; they use no NVIDIA-internal service. Each job, and each side of the
+comparison, may run on a different CPU model. The compiled engine uses baseline
+x86-64 code generation, the golden and sentinel checks use relative
+tolerances, and the comparison reports drift above a 0.01% relative change
+without blocking on it. Investigate drift on a PR that does not change
+numerical behavior as a runner difference; do not refresh goldens to absorb it.
 
 The macOS platform-wheel and daily README jobs use the ARM64 `macos-15` runner.
 This replaces `macos-14`, which GitHub is
@@ -395,19 +549,25 @@ round trips, with wheel hashes and request counts in `installed-cli-*` artifacts
 
 ## Application test inventory and exceptions
 
-Full CI uses **12 application jobs per architecture, 24 total**. Paths in this
+Full CI uses **7 application jobs per architecture, 14 total**. Paths in this
 table are relative to `python/aisim/` unless marked repository-root.
 
 | Shard | Test selection | Parallelism per architecture |
 | --- | --- | --- |
 | `contracts` | Repository-root `tests/`, `tests/cross_package/`, CLI compatibility, and collection inventory | One job; four workers for repository-root tests |
 | `unit` | Entire `tests/unit/` and `tests/golden/`, including unmarked tests | Four disjoint groups, four workers each |
-| `integration` | Entire `tests/integration/` against the installed native wheel and packaged data | One job, two workers |
-| `cli-build` | Build-marked `tests/e2e/cli/`; recommendation E2E runs separately within group 1 | Four disjoint groups, four workers each; recommendation runs serially |
-| `support-matrix` | Build-marked `tests/e2e/support_matrix/` | One job, pytest automatic worker count |
-| `tools-build` | Build-marked `tests/e2e/tools/`; installed FPM verification reuses the wheel | One job, pytest automatic worker count |
+| `cli-build` | Build-marked `tests/e2e/cli/`; recommendation E2E runs first, separately | One job, four workers; recommendation runs serially |
+| `integration-build` | Entire `tests/integration/` against the installed native wheel and packaged data, then build-marked `tests/e2e/support_matrix/` and `tests/e2e/tools/`; installed FPM verification reuses the wheel | One job; two workers for integration, pytest automatic worker count for the build-marked suites |
 
-The `support-matrix` shard includes the required native FPE probes from
+Each job pays for runner start-up, checkout and dependency installation, so
+suites that run for only a few minutes share a job. Keep every job shorter than
+`contracts`, the longest, so that sharing does not lengthen Full CI. Within a
+job each suite is a separate step: a later suite still runs and reports when an
+earlier one fails, and is skipped only when installation failed or the job was
+cancelled. Only `contracts` checks out the full Git history, which the
+repository-root tests read; the other jobs fetch the tested commit alone.
+
+The `integration-build` shard's support-matrix tests include the required native FPE probes from
 `.github/fpe-required-probes.json`. Resolved identities must be unique under the
 nightly qualifier's identity fields. Each identity must exist in the live matrix
 inventory and have a topology passing prefill, decode start, decode end, and
@@ -417,8 +577,10 @@ model/system/backend matrix remains in nightly. The tests resolve each selector
 through the installed wheel's current version policy using nightly's discovery
 helper, so version-policy changes are exercised before release.
 
-Unit and CLI groups use pytest-split's `least_duration` partitioning. Every
-group is scheduled when application tests are selected. Integration coverage
+Unit groups use pytest-split's `least_duration` partitioning. The CLI job keeps
+the same options with a single group, so splitting it again only needs more
+matrix entries. Every group is scheduled when application tests are selected.
+Integration coverage
 includes configuration-adapter estimates, memory estimation, configuration
 picking, and TRT-LLM KV capacity; selecting the whole directory includes newly
 added modules without requiring a marker.
@@ -464,6 +626,7 @@ timeout behavior. Local editable installs do not replace installed-wheel CI.
 | **Require Fast CI** failed or timed out | Open the linked/latest standalone Fast run for the same branch and SHA; resolve its failure or dispatch Fast CI first, then rerun Full CI |
 | `Fast CI Success` failed with missing or skipped substantive jobs | Inspect the required job results and cancellation history; draft status and labels do not skip Fast CI |
 | Full CI job skipped | Read **Select Full CI Scope** and the aggregate summary; only explicit N/A is acceptable |
+| Main run green with only wheel jobs executed | A newer main commit superseded it; the newer commit's run carries the full suite ([batched main validation](#batched-main-validation)) |
 | Full CI canceled after another PR run starts | A newer run replaced validation in the same PR/branch concurrency group; inspect the replacement run's SHA and results |
 | `Full CI Success` green, workflow still `waiting` | Validation finished; main/release wheel staging may be waiting for `automated-release` approval |
 | New nightly pending, earlier nightly waiting | Nightly's single concurrency group includes protected staging; an unapproved run can hold later validation behind it |
@@ -564,13 +727,14 @@ latency target. A manual FPE run does not publish nightly release artifacts.
 
 The Full CI target is **ten minutes from workflow creation to `Full CI Success`**,
 including runner queues, the standalone Fast prerequisite, and cold setup. Release-approval waits and FPE
-qualification are outside that target. Compare exact run SHAs and selected
+qualification are outside that target, as is the ten-minute wait before a main
+push selects its scope. Compare exact run SHAs and selected
 components; a documentation-only run and a complete matrix measure different
 workloads. Use job timestamps rather than the overall workflow completion time
 when staging is waiting.
 
-The application wheel-build job allows ten minutes on AMD64 and fifteen on
-ARM64. The ARM64 build budget includes cold release compilation, manylinux
+The application wheel-build job allows fifteen minutes on both AMD64 and
+ARM64. The build budget includes cold release compilation, manylinux
 repair, provenance checks, and wheel handoff; compilation can consume most of
 ten minutes before those final steps run. Application test shards retain their
 separate fifteen-minute job budget and all per-test timeouts.
@@ -605,6 +769,35 @@ complete CI run before changing `CI_JOB_CONTAINER_IMAGE` to the new image digest
 Keep the previous digest for rollback. Manylinux release/platform builders have
 their own image definitions; changing the shared runner image does not replace
 all builders.
+
+### Runner placement
+
+GitHub-hosted runners cannot resolve NVIDIA Artifactory, so every job that reads
+or writes wheels in Artifactory runs on the self-hosted
+`prod-aisim-default-amd64-v1` or `prod-aisim-default-arm64-v1` pool inside the
+CI job image. Those pools have a fixed concurrency limit. Full CI jobs that need
+nothing from the NVIDIA network run on GitHub-hosted runners without a job
+container instead, so they do not queue for the self-hosted pools:
+
+| Job | Runner |
+| --- | --- |
+| Cargo Deny, Rust, Public API Rust | `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64) |
+| Python Dependency Licenses | `ubuntu-24.04` |
+| Collector Data / Perf data sanity (informational) | `ubuntu-24.04` |
+| Python 3.11 and 3.13 compatibility, Rust feature modes | `ubuntu-24.04` |
+| Collector Data / Check collector data | `ubuntu-24.04` |
+
+These jobs install Python with `actions/setup-python` and the stable Rust
+toolchain as before. Hosted images already provide `cc`, `c++` and `make`, so
+`ci_install_build_tools.sh` skips apt there. A workflow contract test keeps
+these jobs on hosted labels without a container, secrets, an environment or wheel
+storage. Moving one back to a self-hosted pool needs a reason, such as a new
+Artifactory dependency.
+
+Python compatibility, Rust feature modes and the collector data check build
+AISim from source with `pip install './python/aisim[dev]'` instead of
+downloading the application test wheel from Artifactory, so they need no
+internal network access either.
 
 ### Maintenance ownership
 

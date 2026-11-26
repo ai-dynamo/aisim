@@ -68,6 +68,7 @@ def _static(model, prefill=False):
     return model.static_phase_latency(batch_size=2, input_tokens=512, output_tokens=4, prefill=prefill)
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("database_mode", ["SILICON", "SOL"])
 @pytest.mark.parametrize("depth", [2, 5])
 def test_mtp_public_cost_matches_legacy_nextn(database_mode, depth):
@@ -88,6 +89,7 @@ def test_mtp_public_cost_matches_legacy_nextn(database_mode, depth):
         explicit.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("database_mode", ["SILICON", "SOL"])
 def test_eagle_public_cost_matches_existing_sdk_engine(database_mode):
     # A tree and width greater than five remain valid cost-model inputs.
@@ -142,6 +144,7 @@ def _packed_decode(batch, width, s):
     return [{"scheduled_requests": {"num_decode_requests": batch * width, "sum_decode_kv_tokens": batch * width * s}}]
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("depth", [1, 3])
 def test_mtp_packed_decode_counters_match_static_decode_pricing(depth):
     # B real requests at verification width v and per-request attention
@@ -163,6 +166,7 @@ def test_mtp_packed_decode_counters_match_static_decode_pricing(depth):
         model.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("depth", [0, 1])
 def test_op_level_detailed_ranks_report_operation_evidence(depth):
     model = _mtp_model(depth)
@@ -194,6 +198,7 @@ def test_op_level_detailed_ranks_report_operation_evidence(depth):
         model.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_mtp_static_cost_is_not_limited_by_replay_depth():
     config = _config(database_mode="SOL", speculation={"kind": "mtp", "params": {"depth": 7}})
     model = RustForwardPassPerfModel.best_available(config)
@@ -211,6 +216,7 @@ def test_mtp_static_cost_is_not_limited_by_replay_depth():
         model.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("speculation", [None, {"kind": "ngram", "params": {"num_speculative_tokens": 3}}])
 def test_existing_no_sd_and_ngram_costs_are_preserved(speculation):
     config = _config(database_mode="SOL", speculation=speculation)
@@ -238,6 +244,7 @@ def test_existing_no_sd_and_ngram_costs_are_preserved(speculation):
         model.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_standalone_local_draft_preserves_resolved_geometry_and_cost(tmp_path):
     draft = tmp_path / "standalone-draft"
     draft.mkdir()
@@ -283,6 +290,7 @@ def test_standalone_local_draft_preserves_resolved_geometry_and_cost(tmp_path):
         model.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_resolved_draft_content_survives_save_without_source_file(tmp_path):
     source = tmp_path / "synthetic-eagle"
     source.mkdir()
@@ -314,6 +322,7 @@ def test_resolved_draft_content_survives_save_without_source_file(tmp_path):
         original.close()
 
 
+@pytest.mark.usefixtures("raw_data_coordinates")
 def test_different_draft_geometry_keeps_distinct_identity_and_cost():
     first = _eagle_spec()
     second = copy.deepcopy(first)
@@ -397,21 +406,50 @@ def test_checkpoint_resolution_classifies_only_recognized_availability_errors(mo
     assert attempted_paths == [path]
 
 
-@pytest.mark.parametrize("mode", ["fpm_interpolation", "fpm_regression"])
-def test_explicit_fpm_rejects_unimplemented_speculative_cost(mode):
+_MTP = {"kind": "mtp", "params": {"depth": 3}}
+_NGRAM = {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
+
+
+@pytest.mark.parametrize("entrypoint", ["normalize_config", "best_available"])
+def test_learned_rejects_mtp_before_reading_the_artifact(entrypoint, tmp_path):
+    config = _config(
+        estimation_mode="fpm_learned",
+        speculation=_MTP,
+        estimator_config={"fpm_learned": {"artifact_path": str(tmp_path / "missing.json"), "adaptation": "frozen"}},
+    )
+    with pytest.raises(ValueError, match="fpm_learned does not support speculative decoding"):
+        getattr(RustForwardPassPerfModel, entrypoint)(config)
+
+
+@pytest.mark.parametrize(("mode", "backend"), [("fpm_interpolation", "vllm"), ("fpm_regression", "sglang")])
+def test_explicit_fpm_rejects_unimplemented_speculative_cost(mode, backend):
     with pytest.raises(ValueError, match="speculat.*op_level|op_level.*speculat"):
-        RustForwardPassPerfModel.best_available(
-            _config(estimation_mode=mode, speculation={"kind": "mtp", "params": {"depth": 3}})
-        )
+        RustForwardPassPerfModel.best_available(_config(estimation_mode=mode, backend=backend, speculation=_MTP))
 
 
+@pytest.mark.parametrize("fallback", ["deny", "allow"])
+def test_a_vllm_regression_keeps_an_mtp_scheme(fallback):
+    model = RustForwardPassPerfModel.best_available(
+        _config(estimation_mode="fpm_regression", fallback_policy=fallback, speculation=_MTP)
+    )
+    try:
+        resolved = model.diagnostics()["provenance"]
+        assert resolved["selected_estimation_mode"] == "fpm_regression"
+        assert (resolved["config"]["nextn"], resolved["config"]["speculation"]["params"]) == (0, _MTP["params"])
+    finally:
+        model.close()
+
+
+@pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize(
-    ("mode", "fallback"), [("auto", "deny"), ("fpm_interpolation", "allow"), ("fpm_regression", "allow")]
-)
-@pytest.mark.parametrize(
-    "spec",
-    [{"kind": "mtp", "params": {"depth": 3}}, {"kind": "ngram", "params": {"num_speculative_tokens": 3}}],
-    ids=["mtp", "ngram"],
+    ("mode", "fallback", "spec"),
+    [
+        ("auto", "deny", _MTP),
+        ("fpm_interpolation", "allow", _MTP),
+        ("auto", "deny", _NGRAM),
+        ("fpm_interpolation", "allow", _NGRAM),
+        ("fpm_regression", "allow", _NGRAM),
+    ],
 )
 def test_selection_preserves_speculation(mode, fallback, spec):
     config = _config(database_mode="SOL", estimation_mode=mode, fallback_policy=fallback, speculation=spec)

@@ -160,7 +160,11 @@ Full CI uploads `license-artifacts` for trusted PR copies and post-merge pushes
 to `main` and `release/*`. It contains `deps.csv` (Python and Rust dependency
 versions and licenses), `deps-diff.csv`, and `evidence.json` with the source and
 comparison commit identities. PR evidence compares with the validated PR base;
-post-merge evidence compares with the push's previous commit. Missing baseline
+`release/*` evidence and superseded `main` commits compare with the push's
+previous commit. Other `main` evidence compares with the last full-scope main
+commit whose prediction and license comparisons completed successfully, with a
+selection failure when no validated ancestor can be established
+([batched main validation](README.md#batched-main-validation)). Missing baseline
 inputs fail CI. Python inventories resolve runtime requirements at collection
 time on amd64/Python 3.12; they are not a wheel payload or a frozen PyPI lock.
 An unchanged Python manifest reuses the same resolution for both commits.
@@ -444,9 +448,8 @@ keeps its source, locked dependencies, wheel, and inventory unchanged.
 | `collector-check.yml` | Source install can build a local wheel | Disposable install wheel; cross-backend `.md`/`.json` reports only |
 | `readme-checks.yml` | Source/development/release/macOS profiles keep isolated workspaces without a storage environment; the separate Dynamo job builds or reuses a verified matching pinned RC wheel set in `pr-wheel-staging` | Artifactory `readme-rc-wheels-<build-input-hash>` for the three RC wheels and build-input record; Actions retains only its completion manifest and command/provenance reports; every README command runs afresh |
 | `accuracy-digest.yml` | No product wheel generation; consumes qualified accuracy data | Actions preview, report, and delivery-state data only |
-| `fast-ci.yml` | No product wheel producer; dependency installs/tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
+| `fast-ci.yml` | No product wheel producer; dependency installs and policy/ownership tests may create temporary fixture wheels | Actions source provenance only; fixtures are disposable |
 | `pages.yml` | No product wheel producer; dependencies/tests and allowlisted site packaging | Pages/site and validation data only |
-| `codeowners.yml` | No wheel generation | No wheel handoff |
 | `slack-review-digest.yml` | No wheel generation | No wheel handoff |
 
 The platform Dockerfile's legacy `aiconfigurator` migration-fixture wheel remains inside the local test build stage. The shared manylinux builder's unrepaired wheel is temporary; only its repaired caller-selected output enters a retained handoff. Simulation transfers include every wheel in the bundle, not just the AISim filename. No exported Actions or BuildKit cache is used as a wheel handoff; ordinary dependency-install caches do not change the producer/consumer storage contract.

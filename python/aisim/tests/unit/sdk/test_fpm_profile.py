@@ -1139,6 +1139,26 @@ def test_speculative_round_profile_rejects_implicit_or_mismatched_execution(spec
         _normalize(config)
 
 
+@pytest.mark.parametrize("resources", ["missing", "geometry", "declared", "observed"])
+def test_speculative_round_construction_requires_observed_memory(speculative_profile, resources):
+    deployment = speculative_profile["deployments"][0]
+    if resources == "missing":
+        deployment.pop("resources")
+    elif resources != "observed":
+        deployment["resources"].pop("runtime_memory")
+        if resources == "declared":
+            deployment["resources"].update(
+                weights_bytes=100, activations_bytes=20, runtime_overhead_bytes=30, comm_overhead_bytes=50
+            )
+    config = _request(speculative_profile, "direct", nextn=3)
+    if resources == "observed":
+        normalized = RustForwardPassPerfModel.normalize_config(config)
+        assert normalized["fpm_profile"]["deployments"][0]["resources"]["runtime_memory"]["kv_cache_bytes"] == 600
+    else:
+        with pytest.raises(ValueError, match="resources are pending|require observed runtime memory"):
+            RustForwardPassPerfModel.best_available(config)
+
+
 def test_speculative_round_memory_forwards_depth_and_uses_observed_pool(
     speculative_profile, profile_memory, monkeypatch
 ):
@@ -1577,7 +1597,8 @@ def test_cache_group_transfer_bytes_follow_the_rust_rules(grouped_profile, index
 
 
 def test_cache_group_transfer_bytes_can_exceed_the_page(grouped_profile):
-    # A transfer size above the page of the group is valid: the field allows bytes beyond the page.
+    # The measured bytes that vLLM 0.32.0 reads for one attention block of GLM-5.3-Flash at TP 4, against the page
+    # of 13,045,120 bytes of the hand-made vLLM 0.31.0 profile (benchmarks/evidence/nixl-pd-transfer-bytes-20261115/).
     groups = grouped_profile["deployments"][0]["resources"]["cache_groups"]
     groups[0].update(page_size_bytes=13_045_120, transfer_bytes_per_block=21_978_496)
     group = load_fpm_profile(grouped_profile).deployments[0].resources.cache_groups[0]
