@@ -416,6 +416,7 @@ def derive_snapshot_roles(value: dict[str, Any]) -> dict[str, Any]:
         return value
     for role, snapshot in snapshots.items():
         _check_role_identity(value, snapshot)
+        _reject_window_state_snapshot(snapshot)
         _pin_block_size(value, snapshot)
         shape = _pin_parallel_shape(value, snapshot)
         if snapshot.fitted:
@@ -468,6 +469,37 @@ def _check_role_identity(value: dict[str, Any], snapshot: SnapshotRole) -> None:
         raise _conflict(
             snapshot, "the vision encoder_parallel", vision.get("encoder_parallel"), identity.get("encoder_parallel")
         )
+
+
+def _reject_window_state_snapshot(snapshot: SnapshotRole) -> None:
+    """Reject a Gemma 4 vLLM snapshot whose deployed KV block is not the window-state pool's block.
+
+    The snapshot records the deployed block size (vLLM's --block-size). The engine pool, and so the
+    estimator's kv_block_size, uses the global group's block, which vLLM grows to match the sliding
+    layers' page (64 to 128 at TP1 and TP2; unchanged at TP4). Only an unchanged block can be restored.
+    """
+    from aisim_core.sdk.memory import estimate_state_cache
+
+    from ..compiler import _is_gemma4
+
+    identity = snapshot.identity
+    if identity["backend"] != "vllm" or not _is_gemma4(str(identity["model"])):
+        return
+    saved = identity["kv_block_size"]
+    shape = (identity.get("tp") or 1, identity.get("pp") or 1)
+    resolved = None
+    if UNKNOWN not in (saved, *shape):
+        state = estimate_state_cache(
+            str(identity["model"]), backend="vllm", tp_size=int(shape[0]), pp_size=int(shape[1]), block_size=int(saved)
+        )
+        resolved = state["block_size"]
+        if resolved == int(saved):
+            return
+    found = "an unknown block" if resolved is None else f"a {resolved}-token block"
+    raise ValueError(
+        f"{snapshot.describe()} cannot time a Gemma 4 vLLM role: its deployed kv_block_size={saved} gives the "
+        f"window-state pool {found}, so the saved identity cannot be restored"
+    )
 
 
 def _pin_block_size(value: dict[str, Any], snapshot: SnapshotRole) -> None:

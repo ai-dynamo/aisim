@@ -344,7 +344,8 @@ def _deployment(
         worker, vl_metadata, vision = _host_worker(engine, engine.workers.aggregated, workload)
         _require_exclusive_context_parallelism(worker)
         parallel = _parallel_mapping(worker, prefix="")
-        worker, state_size = _resolve_state_cache(engine, worker, "aggregated")
+        window = _gemma4_window_state_applies(engine, [(worker, "aggregated")])
+        worker, state_size = _resolve_state_cache(engine, worker, "aggregated", window=window)
         return BackendDeploymentSpec(
             parallel_config=parallel,
             performance_model_metadata={"aggregated": {**_state_metadata(engine, worker, state_size), **vl_metadata}},
@@ -357,8 +358,10 @@ def _deployment(
     assert engine.workers.prefill is not None and engine.workers.decode is not None
     prefill, vl_metadata, vision = _host_worker(engine, engine.workers.prefill, workload)
     _require_disaggregated_context_parallelism(engine.backend, prefill, engine.workers.decode)
-    prefill, prefill_state = _resolve_state_cache(engine, prefill, "prefill")
-    decode, decode_state = _resolve_state_cache(engine, engine.workers.decode, "decode")
+    # Decode resumes from the transferred state, so both roles take the window state or neither does.
+    window = _gemma4_window_state_applies(engine, [(prefill, "prefill"), (engine.workers.decode, "decode")])
+    prefill, prefill_state = _resolve_state_cache(engine, prefill, "prefill", window=window)
+    decode, decode_state = _resolve_state_cache(engine, engine.workers.decode, "decode", window=window)
     transfer_bytes_per_token = None
     if engine.kv_transfer is not None:
         configured = engine.kv_transfer.bytes_per_token
@@ -394,15 +397,14 @@ def _deployment(
 
 
 def _resolve_state_cache(
-    engine: EnginePredictionConfig, worker: WorkerPredictionConfig, role: str
+    engine: EnginePredictionConfig, worker: WorkerPredictionConfig, role: str, *, window: bool
 ) -> tuple[WorkerPredictionConfig, dict[str, Any] | None]:
-    """Return the worker with resolved state geometry and its sizing report."""
+    """Return the worker with resolved state geometry and its sizing report.
+
+    ``window`` is whether Gemma 4's window state applies to the deployment (``_gemma4_window_state_applies``).
+    """
     cache = worker.kv_cache
-    if (
-        cache.state_cache is None
-        and _vllm_sliding_window_model(engine)
-        and _window_state_pool_known(engine, worker, role)
-    ):
+    if cache.state_cache is None and window:
         cache = _with_gemma4_window_state(engine, cache)
         worker = worker.model_copy(update={"kv_cache": cache})
     if cache.state_cache is None:
@@ -422,6 +424,15 @@ def _resolve_state_cache(
         }
     )
     return worker.model_copy(update={"kv_cache": resolved}), size
+
+
+def _gemma4_window_state_applies(
+    engine: EnginePredictionConfig, roles: list[tuple[WorkerPredictionConfig, str]]
+) -> bool:
+    """Whether Gemma 4's window state applies: a vLLM sliding-window model whose every role's pool can be sized."""
+    return _vllm_sliding_window_model(engine) and all(
+        _window_state_pool_known(engine, worker, role) for worker, role in roles
+    )
 
 
 def _window_state_pool_known(engine: EnginePredictionConfig, worker: WorkerPredictionConfig, role: str) -> bool:

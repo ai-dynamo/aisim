@@ -276,12 +276,20 @@ def gemma4_window_geometry(
     runtime = None
     kv_quant_mode = sample.get("kvcache_quant_mode") or None
     if fpm_profile is not None:
-        deployment = _profile_deployment(sample, role, backend_version, model=model, fpm_profile=fpm_profile)
-        resources = deployment.resources
-        # A grouped profile models the window groups itself; one without runtime memory has no pool to divide.
-        if resources is None or resources.cache_layout == "grouped" or resources.runtime_memory is None:
+
+        def recorded_pool(name: str):
+            deployment = _profile_deployment(sample, name, backend_version, model=model, fpm_profile=fpm_profile)
+            resources = deployment.resources
+            # A grouped profile models the window groups itself; one without runtime memory has no pool to divide.
+            if resources is None or resources.cache_layout == "grouped" or resources.runtime_memory is None:
+                return deployment, None
+            return deployment, resources.runtime_memory
+
+        deployment, runtime = recorded_pool(role)
+        # Decode resumes from the transferred state, so both P/D roles take the window state or neither does.
+        peer = {"prefill": "decode", "decode": "prefill"}.get(role)
+        if runtime is None or (peer is not None and recorded_pool(peer)[1] is None):
             return None
-        runtime = resources.runtime_memory
         # The window is sized at the precision the profile was measured at; an override must match it.
         deployment.validate_overrides(kvcache_quant_mode=kv_quant_mode)
         kv_quant_mode = deployment.kv_cache_dtype

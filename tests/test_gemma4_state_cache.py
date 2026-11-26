@@ -4,6 +4,7 @@
 """Gemma 4 on vLLM keeps its sliding-window layers as one fixed state per request."""
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -393,3 +394,103 @@ def test_the_sweeper_rejects_a_kv_dtype_that_contradicts_the_profile():
     profile = _grouped_profile("linear", kv_cache_dtype="fp8")
     with pytest.raises(ValueError, match="FPM profile identity conflict"):
         gemma4_window_geometry(sample, "agg", 64, backend_version="0.32.0", fpm_profile=profile)
+
+
+def _gemma4_snapshot(backend="vllm", tp=1):
+    from aisim.sweeper.state_snapshot import SnapshotRole
+
+    identity = {"model": GEMMA4, "backend": backend, "system": "h200_sxm", "kv_block_size": 64, "tp": tp, "pp": 1}
+    summary = {"identity": identity, "selected_estimation_mode": "fpm_regression", "kind": "regression"}
+    return SnapshotRole(role="agg", path="/snapshots/gemma4", summary=summary, config={})
+
+
+def test_recommend_rejects_a_gemma4_vllm_snapshot_whose_block_grows(monkeypatch):
+    from aisim.sweeper import state_snapshot
+
+    monkeypatch.setattr(state_snapshot, "load_snapshot_role", lambda role, reference: _gemma4_snapshot(tp=1))
+    value = {
+        "model_name": GEMMA4,
+        "hardware_sku": "h200_sxm",
+        "deployment_mode": ["agg"],
+        "role_estimator_controls": {"agg": {"estimator_config": {"state_snapshot": {"path": "/snapshots/gemma4"}}}},
+    }
+    # At TP1 the deployed 64-token block gives the window-state pool 128-token global blocks.
+    with pytest.raises(ValueError, match="kv_block_size=64 gives the window-state pool a 128-token block"):
+        state_snapshot.derive_snapshot_roles(value)
+
+
+def test_a_gemma4_snapshot_with_an_unknown_tensor_width_is_rejected():
+    from aisim.sweeper.state_snapshot import UNKNOWN, _reject_window_state_snapshot
+
+    with pytest.raises(ValueError, match="an unknown block"):
+        _reject_window_state_snapshot(_gemma4_snapshot(tp=UNKNOWN))
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        # At TP4 both page sizes match, so the pool keeps the deployed 64-token block.
+        _gemma4_snapshot(tp=4),
+        _gemma4_snapshot(backend="sglang"),
+    ],
+    ids=["tp4", "sglang"],
+)
+def test_gemma4_snapshots_whose_block_restores_pass_the_guard(snapshot):
+    from aisim.sweeper.state_snapshot import _reject_window_state_snapshot
+
+    _reject_window_state_snapshot(snapshot)
+
+
+def _pd_profile(prefill_runtime_memory):
+    """A linear FP8-KV profile with prefill and decode deployments; only decode records its pool unless asked."""
+    profile = _grouped_profile("linear", kv_cache_dtype="fp8")
+    decode = profile["deployments"][0]
+    decode["worker_type"] = "decode"
+    prefill = deepcopy(decode)
+    prefill["worker_type"] = "prefill"
+    if not prefill_runtime_memory:
+        # Declared non-KV memory instead of a recorded pool: AISim cannot divide a prefill pool.
+        del prefill["resources"]["runtime_memory"]
+        prefill["resources"].update(
+            weights_bytes=50 * 10**9, activations_bytes=10**9, runtime_overhead_bytes=10**9, comm_overhead_bytes=0
+        )
+    profile["deployments"] = [prefill, decode]
+    return profile
+
+
+def _pd_payload(profile):
+    payload = _linear_profile_payload()
+    engine = payload["engine"]
+    engine["mode"] = "disaggregated"
+    worker = engine["workers"].pop("aggregated")
+    # The scheduler limits the profile recorded its runtime memory at.
+    worker["scheduler"] = {"max_sequences": 256, "max_batched_tokens": 8192}
+    engine["workers"] = {"prefill": deepcopy(worker), "decode": deepcopy(worker)}
+    engine["fpm_profile"] = profile
+    return payload
+
+
+@pytest.mark.parametrize("prefill_runtime_memory", [True, False])
+def test_disaggregated_roles_take_the_window_state_together(prefill_runtime_memory):
+    spec = prediction_to_replay_spec(
+        CorePredictionConfig.model_validate(_pd_payload(_pd_profile(prefill_runtime_memory)))
+    )
+    roles = (spec.backend_deployment.prefill_engine_args, spec.backend_deployment.decode_engine_args)
+    # Decode resumes from the transferred state, so a prefill pool AISim cannot size keeps both roles uniform.
+    assert ["state_cache" in args for args in roles] == [prefill_runtime_memory] * 2
+
+
+@pytest.mark.parametrize("prefill_runtime_memory", [True, False])
+def test_the_sweeper_gives_disaggregated_roles_the_window_state_together(prefill_runtime_memory):
+    from aisim.sweeper.deploy import gemma4_window_geometry
+
+    shape = {
+        f"{role}_{key}": 1 for role in ("prefill", "decode") for key in ("tp", "pp", "attention_dp", "moe_tp", "moe_ep")
+    }
+    sample = {**_sweeper_sample(), **shape}
+    profile = _pd_profile(prefill_runtime_memory)
+    states = [
+        gemma4_window_geometry(sample, role, 64, backend_version="0.32.0", fpm_profile=profile)
+        for role in ("prefill", "decode")
+    ]
+    assert [state is not None for state in states] == [prefill_runtime_memory] * 2
