@@ -976,10 +976,11 @@ impl AicTimingModel {
     /// through [`TimingModel::predict_iteration_ms`] and never a phase, so
     /// work the iteration query cannot describe is rejected here: a vision
     /// tower, speculative decoding other than the MTP rounds a vLLM regression
-    /// was fitted to, and bounded decoder replay. Such a regression pins its
-    /// depth, `nextn` or an MTP scheme's, which the scheduler's `aic_nextn`
-    /// must match. Only vLLM's telemetry gives an MTP decode request its
-    /// verification width as extend.
+    /// was fitted to or a learned artifact was trained on, and bounded decoder
+    /// replay. Such an estimator pins its depth, `nextn` or an MTP scheme's,
+    /// which the scheduler's `aic_nextn` must match. vLLM's telemetry and the
+    /// SGLang step-capture hook give an MTP decode request its verification
+    /// width as extend.
     fn require_fitted_role(
         config: &AicTimingConfig,
         mode: EstimationMode,
@@ -6450,9 +6451,11 @@ mod tests {
                     .expect("this learned replay must fail")
                     .to_string()
             };
+            // MTP passes the role check; the artifact's recorded depth is
+            // checked once it loads, so this missing source fails instead.
             let mut speculative = learned();
             speculative.nextn = 1;
-            assert!(build(speculative, false).contains("does not support speculative decoding"));
+            assert!(!build(speculative, false).contains("speculative decoding"));
             assert!(build(learned(), true).contains("vision encoder"));
             let mut decoder = learned();
             decoder.decoder_replay = true;

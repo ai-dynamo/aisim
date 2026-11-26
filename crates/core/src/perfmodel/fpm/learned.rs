@@ -346,6 +346,7 @@ impl LearnedForwardPassModel {
         if artifact.stores.is_empty() {
             return Err(invalid("no stores"));
         }
+        trained_nextn(&artifact.metadata)?;
         let allowed = allowed_workload_kinds(artifact.worker_type);
         for (kind, store) in &artifact.stores {
             if !allowed.contains(kind) {
@@ -386,6 +387,12 @@ impl LearnedForwardPassModel {
 
     pub(crate) fn metadata(&self) -> &serde_json::Value {
         &self.metadata
+    }
+
+    /// The MTP draft depth of the steps this artifact was trained on:
+    /// `metadata.nextn`, or 0 (no speculative decoding) when absent.
+    pub(crate) fn trained_nextn(&self) -> u32 {
+        trained_nextn(&self.metadata).expect("validated when loaded")
     }
 
     pub(crate) fn has_store(&self, kind: ForwardPassRegressionWorkloadKind) -> bool {
@@ -451,6 +458,22 @@ impl LearnedForwardPassModel {
             )));
         }
         Ok(Some(ms.max(MIN_POSITIVE_PREDICTION_MS)))
+    }
+}
+
+/// `metadata.nextn`: the MTP draft depth the training steps ran at, recorded
+/// by the trainer. Absent means steps without speculative decoding.
+fn trained_nextn(metadata: &serde_json::Value) -> Result<u32, AicError> {
+    match metadata.get("nextn") {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .and_then(|nextn| u32::try_from(nextn).ok())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "metadata.nextn {value} is not a non-negative integer"
+                ))
+            }),
     }
 }
 

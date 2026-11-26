@@ -127,6 +127,13 @@ still selects the regression, then Runner preflight rejects its untrained fit;
 it does not retry OP. Select `estimation_mode: op_level` explicitly for OP
 timing. See
 [engine replay timing](../../perf-model/configuration.md#engine-replay-timing).
+An explicit `fpm_learned` artifact trained on MTP-on step captures also accepts
+MTP (`nextn: N` or `kind: mtp` with `depth: N`) on vLLM or SGLang workers. It
+prices each speculative decode step as one measured round at verify width
+`nextn + 1` and requires the artifact's recorded training depth
+(`metadata.nextn`) to equal N; an artifact trained without MTP is rejected. See
+[learned MTP](../../perf-model/fpm_ml/configuration.md#mtp-speculative-decoding).
+Other schemes remain rejected for both fitted estimators.
 
 `kind: mtp` also supports [G2 host offload](kv-cache.md#host-offload-g2)
 on aggregated and P/D vLLM workers with prefix caching enabled and

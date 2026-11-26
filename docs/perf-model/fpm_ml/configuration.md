@@ -37,10 +37,30 @@ a training or runtime checkpoint. Omitted `correction.enabled` resolves to
 hybrid correction. Learned mode
 requires `fallback_policy: deny`; `allow` and the legacy `regression` policy
 are invalid configurations. Learned source open, checksum, parsing and identity
-errors fail construction. Learned mode also rejects active speculative decoding
-(`nextn != 0` or `speculation.kind` other than `none`). An explicit
+errors fail construction. Learned mode supports MTP speculative decoding
+(`nextn: N` or `speculation: {kind: mtp, params: {depth: N}}`) and rejects
+every other `speculation.kind` except `none`. An explicit
 `speculation: {kind: none}` is accepted and normalized to no speculation;
 it must not contain parameters or a draft checkpoint.
+
+### MTP speculative decoding
+
+A learned artifact prices the steps it was trained on. Trained on MTP-on step
+captures, each decode step is a complete measured round (Option 2 in
+[whole-forward methods](../methods/whole-forward.md#consuming-a-measured-round)):
+target verification, sampling and draft work are already in the label, so no
+draft tail or STP scaling is added. Replay queries the artifact with each
+decode request's verify width `nextn + 1` as its extend length, as the SGLang
+step-capture hook records it.
+
+The artifact records the MTP draft depth of its training steps in
+`metadata.nextn`; an absent field means steps without speculative decoding
+(depth 0). Construction requires this depth to equal the configuration's
+speculative depth (`nextn`, or the MTP scheme's `depth`), so an artifact
+trained without MTP is never used for MTP, and an MTP artifact is never used
+for plain decode or another depth. The trainer writes `metadata.nextn` from the
+steps' `spec_num_steps`, or from `--nextn` for telemetry without that field
+(see [Train](learned-forward-pass-model.md#2-train)).
 
 ## Estimator namespaces
 

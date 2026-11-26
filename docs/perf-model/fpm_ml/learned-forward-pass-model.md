@@ -192,6 +192,14 @@ python -m aisim_core.sdk.fpm_learned train \
   Aggregated engines get up to four stores (`pure_decode`,
   `contains_locally_mixed`, `cross_rank_aggregated`, `pure_prefill`), selected
   by the same rule the regression fallback uses.
+- `metadata.nextn` records the MTP draft depth of the training steps; replay
+  accepts the artifact only at that depth (see
+  [MTP speculative decoding](configuration.md#mtp-speculative-decoding)). The
+  trainer reads it from the SGLang step-capture fields `spec_num_steps` and
+  `spec_num_draft_tokens`, which must agree on one chain depth
+  (`spec_num_draft_tokens = spec_num_steps + 1`) across active steps. For
+  telemetry without these fields, declare the depth with `--nextn N`; the
+  default is 0 (no speculative decoding). Train one artifact per depth.
 - `--join-ranks` defaults to `none`: every record is one iteration.
   `counter` keys records by `(worker_id, counter_id)` and rejects repeated
   keys, but refuses records from more than one `dp_rank` per key. Dynamo's

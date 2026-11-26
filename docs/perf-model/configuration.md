@@ -288,7 +288,9 @@ OP/SOL timing. FPM interpolation and regression are unsupported candidates for
 these schemes, except that an explicit vLLM `fpm_regression` request prices an
 MTP scheme at the depth it was fitted at (see
 [engine replay timing](#engine-replay-timing)) and is selected as for legacy
-`nextn`. Otherwise an explicit FPM request with
+`nextn`, and an explicit `fpm_learned` request prices it at the depth its
+artifact was trained at (see
+[learned MTP](fpm_ml/configuration.md#mtp-speculative-decoding)). Otherwise an explicit FPM request with
 `fallback_policy="deny"` fails;
 `auto` or an explicit mode with `fallback_policy="allow"` can select a supported
 OP candidate while preserving the complete speculative identity. They do not

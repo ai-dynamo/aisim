@@ -920,6 +920,48 @@ def _write_training_checkpoint(
             raise
 
 
+def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | None = None) -> int:
+    """MTP draft depth of the training steps, recorded as artifact ``metadata.nextn``.
+
+    The SGLang step-capture hook records ``spec_num_steps`` (draft depth) and
+    ``spec_num_draft_tokens`` (verify width, ``spec_num_steps + 1`` for the
+    chain drafts replay prices) on every step. Steps must agree on one depth.
+    ``nextn`` declares the depth for telemetry without these fields and must
+    match a recorded depth. Without either, the steps ran without speculative
+    decoding (depth 0).
+    """
+    if nextn is not None and (isinstance(nextn, bool) or not isinstance(nextn, int) or nextn < 0):
+        raise ValueError(f"nextn must be a non-negative integer, got {nextn!r}")
+    recorded: set[int] = set()
+    unrecorded = False
+    for index, metrics_by_rank in enumerate(iterations):
+        for fpm in metrics_by_rank:
+            sched = _sched(fpm)
+            if not _rank_active(sched):
+                continue
+            steps = sched.get("spec_num_steps")
+            if steps is None:
+                unrecorded = True
+                continue
+            steps = int(steps)
+            draft_tokens = sched.get("spec_num_draft_tokens")
+            if steps > 0 and draft_tokens is not None and int(draft_tokens) != steps + 1:
+                raise ValueError(
+                    f"iteration {index}: spec_num_draft_tokens={draft_tokens} != spec_num_steps + 1; "
+                    "only chain MTP drafts (verify width nextn + 1) are supported"
+                )
+            recorded.add(steps)
+    if len(recorded) > 1 or (recorded and unrecorded):
+        found = sorted(recorded) + (["unrecorded"] if unrecorded else [])
+        raise ValueError(f"training steps mix speculative depths {found}; train one artifact per depth")
+    if recorded:
+        (depth,) = recorded
+        if nextn is not None and nextn != depth:
+            raise ValueError(f"nextn={nextn} does not match the steps' recorded spec_num_steps={depth}")
+        return depth
+    return nextn or 0
+
+
 def train(
     iterations: Sequence[Sequence[dict[str, Any]]],
     worker_type: str,
@@ -936,8 +978,13 @@ def train(
     metadata: dict[str, Any] | None = None,
     online_checkpoint_dir: str | os.PathLike[str] | None = None,
     identity: dict[str, Any] | None = None,
+    nextn: int | None = None,
 ) -> dict[str, Any]:
     """Fit each workload store and return the prediction artifact unchanged.
+
+    ``metadata.nextn`` records the MTP draft depth the training steps ran at
+    (see :func:`training_nextn`); replay accepts the artifact only at that
+    depth.
 
     ``online_checkpoint_dir`` additionally exports the exact fitted rows and
     bin mapper for Rust online fitting. It requires a canonical ``identity``
@@ -951,6 +998,9 @@ def train(
         raise ValueError(f"invalid worker_type {worker_type!r}")
     if target not in TARGETS:
         raise ValueError(f"target must be one of {TARGETS}, got {target!r}")
+    if metadata and "nextn" in metadata:
+        raise ValueError("metadata cannot set nextn; pass nextn= or let the trainer read it from the steps")
+    trained_nextn = training_nextn(iterations, nextn)
     checkpoint_identity = _checkpoint_identity(identity, worker_type) if identity is not None else None
     if (
         checkpoint_identity is not None
@@ -1035,6 +1085,7 @@ def train(
             "train_rows": counts,
             "trees_fitted": trees,
             **(metadata or {}),
+            "nextn": trained_nextn,
             **({"identity": checkpoint_identity} if checkpoint_identity is not None else {}),
         },
     }
@@ -1089,6 +1140,10 @@ def validate_artifact(artifact: dict[str, Any]) -> None:
     if unknown:
         raise ValueError(f"unknown features {unknown}")
     _reject_duplicate_features(features)
+    metadata = artifact.get("metadata") or {}
+    recorded_nextn = metadata.get("nextn", 0) if isinstance(metadata, dict) else 0
+    if isinstance(recorded_nextn, bool) or not isinstance(recorded_nextn, int) or recorded_nextn < 0:
+        raise ValueError(f"metadata.nextn {recorded_nextn!r} is not a non-negative integer")
     stores = artifact.get("stores")
     if not isinstance(stores, dict) or not stores:
         raise ValueError("artifact stores must be a non-empty mapping")
@@ -1243,6 +1298,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
         early_stopping=args.early_stopping,
         online_checkpoint_dir=args.online_checkpoint_dir,
         identity=identity,
+        nextn=args.nextn,
         metadata={
             "sources": [os.fspath(p) for p in args.fpm],
             "join_ranks": args.join_ranks,
@@ -1307,6 +1363,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="also export fitted rows and bins to a new directory for Rust online fitting (early stopping must be off)",
     )
     tr.add_argument("--identity", help="canonical FPM configuration JSON; required with --online-checkpoint-dir")
+    tr.add_argument(
+        "--nextn",
+        type=int,
+        default=None,
+        help="MTP draft depth of the steps, for telemetry that does not record spec_num_steps "
+        "(default: read from the steps, else 0); recorded as metadata.nextn",
+    )
     tr.add_argument(
         "--early-stopping",
         action="store_true",

@@ -691,3 +691,55 @@ def test_train_hisim_slot_features_roundtrip() -> None:
     )
     # 30 shallow trees on 96 slot columns: a loose fit is enough to prove the slot path is wired end to end
     assert report["pure_decode"]["mape_pct"] < 12.0
+
+
+def _mtp_fpm(nd: int, kv: int, wall: float, *, steps: int | None, draft_tokens: int | None = None) -> dict:
+    fpm = _decode_fpm(nd, kv, wall)
+    if steps is not None:
+        fpm["scheduled_requests"]["spec_num_steps"] = steps
+        fpm["scheduled_requests"]["spec_num_draft_tokens"] = steps + 1 if draft_tokens is None else draft_tokens
+    return fpm
+
+
+def test_training_nextn_reads_the_capture_hook_depth():
+    """``metadata.nextn`` comes from the steps' ``spec_num_steps``; idle ranks do not count."""
+    idle = _decode_fpm(0, 0, 0.0)
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=3), idle]]) == 3
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=3)]], nextn=3) == 3
+    assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]]) == 0
+    # Telemetry without the hook fields declares its depth.
+    assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]], nextn=2) == 2
+
+
+@pytest.mark.parametrize(
+    ("iterations", "nextn", "match"),
+    [
+        ([[_mtp_fpm(1, 50, 0.01, steps=3)], [_mtp_fpm(1, 50, 0.01, steps=2)]], None, "mix speculative depths"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=3)], [_decode_fpm(1, 50, 0.01)]], None, "mix speculative depths"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=3)]], 2, "does not match the steps' recorded spec_num_steps=3"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=3, draft_tokens=8)]], None, "only chain MTP drafts"),
+        ([[_decode_fpm(1, 50, 0.01)]], -1, "non-negative integer"),
+    ],
+)
+def test_training_nextn_rejects_ambiguous_depths(iterations, nextn, match):
+    with pytest.raises(ValueError, match=match):
+        fpm_learned.training_nextn(iterations, nextn)
+
+
+def test_train_records_nextn_and_validate_checks_it():
+    pytest.importorskip("sklearn")
+    iterations = [[_mtp_fpm(n, 100 * n, 0.01 + 0.001 * n, steps=3)] for n in range(1, 31)]
+    artifact = fpm_learned.train(iterations, "decode", max_iter=5)
+    assert artifact["metadata"]["nextn"] == 3
+    fpm_learned.validate_artifact(artifact)
+    assert (
+        fpm_learned.train([[_decode_fpm(n, 100 * n, 0.01)] for n in range(1, 31)], "decode", max_iter=5)["metadata"][
+            "nextn"
+        ]
+        == 0
+    )
+    with pytest.raises(ValueError, match="metadata cannot set nextn"):
+        fpm_learned.train(iterations, "decode", max_iter=5, metadata={"nextn": 0})
+    artifact["metadata"]["nextn"] = -1
+    with pytest.raises(ValueError, match="metadata.nextn -1 is not a non-negative integer"):
+        fpm_learned.validate_artifact(artifact)
