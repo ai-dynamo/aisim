@@ -40,8 +40,7 @@ def _payload(*, model=GEMMA4, backend="vllm", tensor=1, timing=None, **cache):
                 "aggregated": {
                     "parallelism": {"tensor": tensor, "moe_tensor": tensor},
                     "kv_cache": kv_cache,
-                    "timing": timing
-                    or {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
+                    "timing": timing or {"type": "fixed", "prefill_ms": 1.0, "decode_ms": 1.0},
                 }
             },
         },
@@ -76,9 +75,7 @@ def _args(payload):
         ({"tp_size": 2, "kvcache_quant_mode": "fp8"}, 128, 64 * 2048, 5120),
     ],
 )
-def test_gemma4_state_estimator_follows_vllm_cache_groups(
-    controls, global_block, page, token_bytes
-):
+def test_gemma4_state_estimator_follows_vllm_cache_groups(controls, global_block, page, token_bytes):
     from aisim_core.sdk import estimate_state_cache
 
     result = estimate_state_cache(GEMMA4, **controls)
@@ -89,10 +86,7 @@ def test_gemma4_state_estimator_follows_vllm_cache_groups(
     assert result["fixed_blocks"] == 85
     assert result["bytes_per_request"] == 85 * block_bytes
     assert result["sliding_window_lookahead_tokens"] == 0
-    groups = [
-        (group["block_size"], group["sliding_window"], group["layers"])
-        for group in result["cache_groups"]
-    ]
+    groups = [(group["block_size"], group["sliding_window"], group["layers"]) for group in result["cache_groups"]]
     assert groups == [(global_block, None, 5)] + [(64, 1024, 5)] * 5
     json.dumps(result)
 
@@ -132,9 +126,7 @@ def test_vllm_gemma4_gets_a_window_state_without_configuring_one():
         "sliding_window": {"lookahead_tokens": 0},
     }
     assert args["num_gpu_blocks"] == 400
-    info = spec.backend_deployment.performance_model_metadata["aggregated"][
-        "state_cache"
-    ]
+    info = spec.backend_deployment.performance_model_metadata["aggregated"]["state_cache"]
     assert (info["source"], info["state_blocks"]) == ("inferred", 85)
     runtime = RecordingRuntime()
     EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
@@ -212,18 +204,14 @@ _ENGINE = SimpleNamespace(speculation=None, nextn=0)
         ({"bytes_per_token": 64}, _ENGINE, "explicit kv_cache.bytes_per_token"),
     ],
 )
-def test_gemma4_window_state_rejects_features_that_lose_the_window(
-    updates, engine, error
-):
+def test_gemma4_window_state_rejects_features_that_lose_the_window(updates, engine, error):
     cache = KvCachePredictionConfig().model_copy(update=updates)
     with pytest.raises(ValueError, match=error):
         compiler._with_gemma4_window_state(engine, cache)
 
 
 def test_gemma4_window_state_allows_the_v0_32_offloading_connector():
-    cache = KvCachePredictionConfig().model_copy(
-        update={"host_offload": SimpleNamespace(connector="offloading_v0_32")}
-    )
+    cache = KvCachePredictionConfig().model_copy(update={"host_offload": SimpleNamespace(connector="offloading_v0_32")})
     assert compiler._with_gemma4_window_state(_ENGINE, cache).state_cache is not None
 
 
@@ -248,15 +236,11 @@ def test_analytical_state_pool_divides_the_uniform_budget(monkeypatch):
     (probe,) = probes
     # The budget probe is the uniform worker's memory request, without the state pool.
     assert probe["gpu_memory_utilization"] == 0.92
-    assert (
-        not {"state_cache", "kv_cache_bytes_per_token", "num_gpu_blocks"} & probe.keys()
-    )
+    assert not {"state_cache", "kv_cache_bytes_per_token", "num_gpu_blocks"} & probe.keys()
 
 
 def test_analytical_state_pool_keeps_the_uniform_byte_budget():
-    payload = _payload(
-        tensor=2, timing={"type": "default"}, capacity={"type": "default"}
-    )
+    payload = _payload(tensor=2, timing={"type": "default"}, capacity={"type": "default"})
     payload["engine"]["backend_version"] = "0.32.0"
     _, args = _args(payload)
     diagnostics = {}
@@ -351,9 +335,7 @@ def _grouped_profile(layout):
 
 
 def test_a_grouped_fpm_profile_keeps_its_own_window_model():
-    payload = _payload(
-        timing={"type": "default"}, capacity={"type": "default"}, prefix_caching=False
-    )
+    payload = _payload(timing={"type": "default"}, capacity={"type": "default"}, prefix_caching=False)
     engine = payload["engine"]
     engine.update(hardware="h200_sxm", backend_version="0.32.0", context_length=8192)
     engine["fpm_profile"] = _grouped_profile("grouped")

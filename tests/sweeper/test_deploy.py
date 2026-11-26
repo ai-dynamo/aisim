@@ -565,9 +565,7 @@ def test_fixed_timing_drops_the_forward_model_field(monkeypatch):
     assert deployment.performance_model_metadata["aggregated"]["config"]["forward_model"] == "op_level"
 
 
-GEMMA4_TP2 = ReplicaParallelConfig(
-    ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1
-)
+GEMMA4_TP2 = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1)
 
 
 def _gemma4_deployment(space_overrides=None, **selection):
@@ -616,9 +614,7 @@ def test_gemma4_candidate_gets_the_window_state_predict_uses():
         diagnostics=diagnostics,
     )
     # The same byte budget as the uniform candidate, divided into the state pool's blocks.
-    assert engine["num_gpu_blocks"] == diagnostics["total_kv_size_bytes"] // (
-        128 * 10240
-    )
+    assert engine["num_gpu_blocks"] == diagnostics["total_kv_size_bytes"] // (128 * 10240)
 
 
 def test_gemma4_candidate_rejects_speculation_like_predict():
