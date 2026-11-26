@@ -767,9 +767,12 @@ the point comparison plus an accuracy-metrics table.
   `n`, `sum_ape` and `sum_sq_ape` so entries pool steps exactly. Both performance
   models price steps through `RustForwardPassPerfModel.best_available` with the
   replay's compiled timing configuration. Mixed prefill+decode steps are not
-  shown. GLM drops each step whose `device_time_s_by_category` lacks its target
-  forward (`extend` for prefill, `target_verify` for MTP decode), and the record
-  before it, because SGLang 0.5.20 recorded that forward on the adjacent record.
+  shown. SGLang 0.5.20 can record a step's device time on the adjacent record.
+  GLM therefore drops each step whose `device_time_s_by_category` lacks its target
+  forward (`extend` for prefill, `target_verify` for MTP decode) and the record
+  before it, and both records of a pair where one measures under 0.5x and its
+  neighbour over 1.5x the held-out learned model. Both performance models drop
+  the same steps (`dropped_shifted`). Training drops only the first, model-free kind.
 - The learned FPM is never stored. `scripts/e2e_accuracy/agentx_learned.py` pins
   each model's public step captures to an immutable dataset revision. Every
   evaluation retrains the replay model on seeds 42 and 7 and the step-error model
@@ -798,7 +801,7 @@ collection are used.
 form one complete campaign. Each result records `performance_model`
 (`op_level` or `fpm_learned`), `accuracy_metrics` (`tpot_ms` and `ttft_ms` with
 `n`, `excluded`, `e2e`, `e2e_se`, `quantile`, `quantile_se`; `step` with `seed`,
-`dropped_unattributed` and `decode`/`prefill` sums, or null) and `cpu_overhead`
+`dropped_shifted` and `decode`/`prefill` sums, or null) and `cpu_overhead`
 (`tokenization` and `extra_cpu_overhead`, or null). Validation recomputes the
 point estimates from the published request pairs. Historical publications without
 these fields remain readable as op-based results under `details/<run-id>.json`.

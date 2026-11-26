@@ -189,7 +189,7 @@ def fixtures(site, weka=False):
             **request_metrics(run["pairs"]),
             "step": {
                 "seed": 7,
-                "dropped_unattributed": 3 if run["backend"] == "sglang" else 0,
+                "dropped_shifted": 3 if run["backend"] == "sglang" else 0,
                 "decode": step_accumulator([1.0, 3.0] if learned else [20.0, 24.0]),
                 "prefill": step_accumulator([5.0, 7.0] if learned else [30.0, 34.0]),
             },

@@ -483,7 +483,7 @@ def validate_public(value):
         "quantile_se",
         "step",
         "seed",
-        "dropped_unattributed",
+        "dropped_shifted",
         "decode",
         "prefill",
         "sum_sq_ape",
@@ -856,13 +856,9 @@ def validate_performance_model(run):
             raise ValueError("Request metrics do not reconcile with the published pairs")
     step = metrics["step"]
     if step is not None:
-        if not isinstance(step, dict) or set(step) != {"seed", "dropped_unattributed", *STEP_KINDS}:
+        if not isinstance(step, dict) or set(step) != {"seed", "dropped_shifted", *STEP_KINDS}:
             raise ValueError("Invalid step metrics")
-        if (
-            type(step["seed"]) is not int
-            or type(step["dropped_unattributed"]) is not int
-            or step["dropped_unattributed"] < 0
-        ):
+        if type(step["seed"]) is not int or type(step["dropped_shifted"]) is not int or step["dropped_shifted"] < 0:
             raise ValueError("Invalid step provenance")
         for kind in STEP_KINDS:
             item = step[kind]

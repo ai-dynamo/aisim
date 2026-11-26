@@ -8,7 +8,9 @@ No trained model is stored. Every evaluation downloads the pinned public step ca
 - the held-out artifact on seed 42 only, which prices the seed-7 steps for the step-error columns.
 
 Both performance models score the same held-out seed-7 steps at the evaluated lane count, through
-``RustForwardPassPerfModel.best_available`` with the replay's compiled timing configuration.
+``RustForwardPassPerfModel.best_available`` with the replay's compiled timing configuration. SGLang 0.5.20
+captures drop steps whose device time landed on an adjacent record (``unattributed`` and
+``shifted_pairs``); training drops only the model-free ``unattributed`` steps.
 """
 
 import gzip
@@ -193,39 +195,65 @@ def step_kind(fpm):
     return "prefill" if prefill else "decode" if decode else None
 
 
-def score_steps(model, lanes, timing_config, workdir):
-    """Held-out seed-7 step error at one lane count with the replay's compiled timing config."""
-    spec = STEP_CAPTURES.get(model)
-    if spec is None:
-        return None
+def _estimator(timing_config):
     engine_step = runtime_module("aisim_core.sdk.rust_engine_step")
     # The compiled config names the collection the replay was pinned to; like agentx_predict, accept it
     # for this one construction only, so the opt-in never reaches later replays.
     previous = os.environ.get("AIC_ALLOW_UNLISTED_VERSIONS")
     os.environ["AIC_ALLOW_UNLISTED_VERSIONS"] = "1"
     try:
-        estimator = engine_step.RustForwardPassPerfModel.best_available(timing_config)
+        return engine_step.RustForwardPassPerfModel.best_available(timing_config)
     finally:
         if previous is None:
             del os.environ["AIC_ALLOW_UNLISTED_VERSIONS"]
         else:
             os.environ["AIC_ALLOW_UNLISTED_VERSIONS"] = previous
+
+
+def shifted_pairs(records, predict):
+    """Flags adjacent records whose measured times split one step: one under 0.5x the reference
+    prediction next to one over 1.5x. Category checks miss chunk-to-chunk shifts between prefills."""
+    ratio = [records[i]["wall_time"] * 1e3 / predict(r) if _busy(r) else None for i, r in enumerate(records)]
+    flags = [False] * len(records)
+    for index, value in enumerate(ratio):
+        if value is None or value >= 0.5:
+            continue
+        for neighbour in (index - 1, index + 1):
+            if 0 <= neighbour < len(records) and ratio[neighbour] is not None and ratio[neighbour] > 1.5:
+                flags[index] = flags[neighbour] = True
+    return flags
+
+
+def score_steps(model, lanes, timing_config, workdir, reference_config=None):
+    """Held-out seed-7 step error at one lane count with the replay's compiled timing config.
+
+    Where the captures carry SGLang 0.5.20's device-time shift, ``reference_config`` (the held-out learned
+    model) also flags shifted pairs. Both performance models drop the same steps.
+    """
+    spec = STEP_CAPTURES.get(model)
+    if spec is None:
+        return None
+    estimator = _estimator(timing_config)
+    reference = _estimator(reference_config) if spec["drop_unattributed"] else None
     errors = {"decode": [], "prefill": []}
     dropped = 0
     for window_lanes, records in windows(spec, TEST_SEED, workdir / "hf", scoring=True):
         if window_lanes != lanes:
             continue
-        retained, flagged = kept(spec, records)
-        dropped += flagged
-        for fpm in retained:
+        flags = [False] * len(records)
+        if reference is not None:
+            pairs = shifted_pairs(records, lambda fpm: reference.estimate_forward_pass_time_ms([fpm]))
+            flags = [a or b for a, b in zip(unattributed(records), pairs, strict=True)]
+        dropped += sum(flags)
+        for fpm, flag in zip(records, flags, strict=True):
             kind, measured = step_kind(fpm), fpm["wall_time"] * 1e3
-            if kind is None or measured <= 0:
+            if flag or kind is None or measured <= 0:
                 continue
             errors[kind].append(abs(estimator.estimate_forward_pass_time_ms([fpm]) / measured - 1) * 100)
     if not any(errors.values()):
         return None
     return {
         "seed": TEST_SEED,
-        "dropped_unattributed": dropped,
+        "dropped_shifted": dropped,
         **{kind: step_accumulator(values) for kind, values in errors.items()},
     }

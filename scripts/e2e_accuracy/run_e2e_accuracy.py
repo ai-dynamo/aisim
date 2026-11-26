@@ -416,9 +416,7 @@ def predict_point(point: dict) -> dict:
             )
         },
     }
-    row.update(
-        measurement_chart_metrics(bench["metrics"], total_gpus, decode_gpus=config.get("num_decode_gpu"))
-    )
+    row.update(measurement_chart_metrics(bench["metrics"], total_gpus, decode_gpus=config.get("num_decode_gpu")))
     row.update(baseline_chart_metrics(baseline, total_gpus))
     row["configuration"] = {
         "backend_version": baseline.backend_version,
@@ -595,9 +593,7 @@ def predict_resolved_point(point):
             mtp_acceptance_source=mtp["kind"],
         )
     total_gpus = row["aisimulate_total_gpus"]
-    row.update(
-        measurement_chart_metrics(bench["metrics"], total_gpus, decode_gpus=config.get("num_decode_gpu"))
-    )
+    row.update(measurement_chart_metrics(bench["metrics"], total_gpus, decode_gpus=config.get("num_decode_gpu")))
     try:
         if config["spec_method"] == "mtp":
             row["aic_status"] = "unsupported"

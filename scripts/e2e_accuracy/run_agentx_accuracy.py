@@ -395,6 +395,18 @@ def apply_performance_model(config, performance_model, artifact_path=None):
     return config
 
 
+def held_out_timing(timing, artifact_path):
+    """The compiled timing configuration with the frozen held-out learned FPM as its estimator."""
+    timing = json.loads(json.dumps(timing))
+    timing["estimation_mode"] = LEARNED
+    timing["fallback_policy"] = "deny"
+    timing["estimator_config"] = {
+        **timing.get("estimator_config", {}),
+        "fpm_learned": {"artifact_path": str(artifact_path), "adaptation": "frozen"},
+    }
+    return timing
+
+
 def compiled_deployment(directory):
     path = directory / "compiled-replay.json"
     return read(path)["backend_deployment"] if path.exists() else None
@@ -484,12 +496,13 @@ def run_one(root, run, directory, timeout, context, performance_model=OP_LEVEL, 
     if timing is not None and timing["estimation_mode"] != performance_model:
         raise ValueError("Compiled replay timing differs from the requested performance model")
     step = None
-    if timing is not None and workdir is not None:
-        if performance_model == LEARNED:
-            # Step error is held out: the seed-42 model prices the seed-7 steps.
-            timing = json.loads(json.dumps(timing))
-            timing["estimator_config"]["fpm_learned"]["artifact_path"] = str(learned["held_out"])
-        step = score_steps(run["model"], run["lanes"], timing, workdir)
+    if timing is not None and workdir is not None and learned is not None:
+        # Step error is held out: the seed-42 learned model prices the seed-7 steps, and it is also the
+        # reference that flags device-time shifts for both performance models.
+        held_out = held_out_timing(timing, learned["held_out"])
+        step = score_steps(
+            run["model"], run["lanes"], held_out if performance_model == LEARNED else timing, workdir, held_out
+        )
     settings = {
         "Estimation": performance_model,
         "Timing correction": False,
@@ -569,7 +582,7 @@ def campaign(args):
     results = []
     for run in selected:
         for performance_model in performance_models(run):
-            if performance_model == LEARNED and run["model"] not in trained:
+            if run["model"] not in trained:
                 trained[run["model"]] = learned_artifacts(run["model"], workdir)
             results.append(
                 run_one(

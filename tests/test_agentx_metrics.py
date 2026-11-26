@@ -96,7 +96,7 @@ def published(**changes):
             **request_metrics(run["pairs"]),
             "step": {
                 "seed": 7,
-                "dropped_unattributed": 0,
+                "dropped_shifted": 0,
                 "decode": step_accumulator([1.0, 2.0]),
                 "prefill": step_accumulator([]),
             },
@@ -307,3 +307,10 @@ def test_sglang_hook_windows_follow_the_published_manifest(tmp_path, monkeypatch
     assert [lanes for lanes, _ in agentx_learned.windows(spec, 7, tmp_path)] == [14, 8, 8]
     assert [lanes for lanes, _ in agentx_learned.windows(spec, 7, tmp_path, scoring=True)] == [14, 8]
     assert [lanes for lanes, _ in agentx_learned.windows(spec, 42, tmp_path)] == [8]
+
+
+def test_shifted_pairs_flag_both_records_of_a_split_step():
+    records = [fpm(prefill=1, wall=0.010), fpm(prefill=1, wall=0.002), fpm(prefill=1, wall=0.030), fpm(), fpm(decode=1)]
+    # Predicted 10 ms each: 0.2x next to 3x is one step split across two records; idle records never pair.
+    assert agentx_learned.shifted_pairs(records, lambda r: 10.0) == [False, True, True, False, False]
+    assert agentx_learned.shifted_pairs(records[:2], lambda r: 10.0) == [False, False]

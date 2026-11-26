@@ -1364,7 +1364,7 @@ test("AgentX agreed metrics pool steps exactly and average request errors over r
   vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
   const request=(e2e,se,n,excluded=0)=>({n,excluded,e2e,e2e_se:se,quantile:e2e/2,quantile_se:se});
   const step=(n,sum,sq)=>({n,sum_ape:sum,sum_sq_ape:sq});
-  const run=(e2e,se,steps)=>({accuracy_metrics:{tpot_ms:request(e2e,se,10,1),ttft_ms:request(e2e*2,se,10),step:{seed:7,dropped_unattributed:2,decode:steps,prefill:step(0,0,0)}}});
+  const run=(e2e,se,steps)=>({accuracy_metrics:{tpot_ms:request(e2e,se,10,1),ttft_ms:request(e2e*2,se,10),step:{seed:7,dropped_shifted:2,decode:steps,prefill:step(0,0,0)}}});
   context.runs=[run(10,3,step(2,4,10)),run(20,4,step(2,8,34))];
   const {request:agg,steps}=vm.runInContext("({request:window.AgentX.requestAggregate(runs),steps:window.AgentX.stepAggregate(runs)})",context);
   assert.equal(agg["tpot_ms/e2e"].v,15);
