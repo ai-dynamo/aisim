@@ -102,13 +102,14 @@ def glm_cell(phase: str, *, dp: int = 1) -> FPMCell:
 
 def _glm_forward_sample(point, wall, forward, step):
     tokens = point["total_prefill_tokens"] or point["batch_size"]
+    start = 100.0 * forward
     return {
         "sample_index": step,
         "forward_index": forward,
         "timing": {
             "basis": "schedule_to_output" if step == 0 else "inter_output",
-            "start_monotonic": float(forward),
-            "end_monotonic": forward + wall,
+            "start_monotonic": start,
+            "end_monotonic": start + wall,
         },
         "cudagraph": {
             "status": "observed",
@@ -397,7 +398,7 @@ def _glm_producer_shape(tmp_path, breakage=None):
             forward += 11 if phase == "decode" else 5
             for index, wall in enumerate(walls):
                 sample = copy.deepcopy(templates[phase])
-                start = 100.0 * position + index
+                start = 100.0 * forward
                 # The producer numbers each raw sample by its position, as Dynamo's merge requires.
                 sample["sample_index"] = index
                 sample["forward_index"] = forward
@@ -844,7 +845,54 @@ def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_pa
     assert len(database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)) == 1
 
 
-def test_glm_forward_indices_are_monotonic_across_all_executed_points_of_one_rank(tmp_path):
+@pytest.mark.parametrize(
+    ("corruption", "reason"),
+    [
+        ("prep-count", "scheduled token count"),
+        ("unobserved-count", "scheduled token count"),
+        ("seed-chunk", "aligned starts"),
+        ("repetition-chunk", "aligned starts"),
+        ("chunk-length", "positive lengths"),
+        ("clock", "starts before the preceding output"),
+    ],
+)
+def test_glm_publication_checks_preparation_and_rank_time(tmp_path, corruption, reason):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[DECODE_POINTS[0]])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+
+    def corrupt(record):
+        repetition = record["repetitions"][0]
+        repetition["prefill_chunks"] = [[[0, 2176]], [[2176, 1919]]]
+        record["seed"] = {"prefill_chunks": [[[0, 2176]]]}
+        repetition["scheduled_token_counts"][:0] = [2176, 1919]
+        repetition["dispatches"][:0] = [
+            {"runtime_mode": "NONE", "num_unpadded_tokens": count, "num_padded_tokens": count, "num_paddings": 0}
+            for count in (2176, 1919)
+        ]
+        if corruption == "prep-count":
+            repetition["scheduled_token_counts"][0] = 1
+        elif corruption == "unobserved-count":
+            repetition["dispatches"][0] = None
+            repetition["scheduled_token_counts"][0] = True
+        elif corruption == "seed-chunk":
+            record["seed"]["prefill_chunks"][0][0][0] = 1
+        elif corruption == "repetition-chunk":
+            repetition["prefill_chunks"][1][0][0] = 2177
+        elif corruption == "chunk-length":
+            repetition["prefill_chunks"][0][0][1] = 0
+        else:
+            for fpm in repetition["fpms"]:
+                interval = fpm["benchmark_sample"]["timing"]
+                interval["start_monotonic"] += 3600
+                interval["end_monotonic"] += 3600
+
+    _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, reason)
+
+
+@pytest.mark.parametrize("fault", ["index", "time"])
+def test_glm_forwards_are_ordered_across_all_executed_points_of_one_rank(tmp_path, fault):
     cell = glm_cell("decode")
     payload = glm_native_payload("decode", points=DECODE_POINTS)
     _glm_producer_shape(tmp_path)("decode", payload)
@@ -852,16 +900,24 @@ def test_glm_forward_indices_are_monotonic_across_all_executed_points_of_one_ran
     sidecar = artifact.with_suffix(".repetitions.jsonl")
     assert len(_validate(tmp_path, cell).points) == 2
     records = [json.loads(line) for line in _sidecar_lines(sidecar)]
-    first = records[0]["repetitions"][0]["fpms"][0]["benchmark_sample"]["forward_index"]
-    records[1]["repetitions"][0]["fpms"][0]["benchmark_sample"]["forward_index"] = first
+    if fault == "index":
+        first = records[0]["repetitions"][0]["fpms"][0]["benchmark_sample"]["forward_index"]
+        records[1]["repetitions"][0]["fpms"][0]["benchmark_sample"]["forward_index"] = first
+        reason = "repeated or unordered forward"
+    else:
+        for fpm in records[1]["repetitions"][0]["fpms"]:
+            timing = fpm["benchmark_sample"]["timing"]
+            timing["start_monotonic"] -= 500
+            timing["end_monotonic"] -= 500
+        reason = "starts before the preceding output"
     lines = [json.dumps(record).encode() for record in records]
     _rewrite_sidecar(payload, sidecar, lines)
     for row, line in zip(payload["results"], lines, strict=True):
         row["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
     artifact.write_text(json.dumps(payload))
-    with pytest.raises(ValueError, match="repeated or unordered forward"):
+    with pytest.raises(ValueError, match=reason):
         _validate(tmp_path, cell)
-    with pytest.raises(ValueError, match="repeated or unordered forward"):
+    with pytest.raises(ValueError, match=reason):
         database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
 
 

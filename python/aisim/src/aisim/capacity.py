@@ -606,6 +606,7 @@ def estimate_kv_bytes_per_token(
         moe_tp_size=moe_tp_size,
         moe_ep_size=moe_ep_size,
         allow_hf_config_download=True,
+        backend=backend,
     )
     kvcache_quant_mode = _quant_mode_name("kvcache", kvcache_quant_mode)
     if getattr(estimator, "architecture", None) == "DeepseekV4ForCausalLM":

@@ -487,7 +487,11 @@ Copyright contributors to the vLLM project. Copyright 2023-2024 SGLang Team.
 These source files are licensed under the Apache License, Version 2.0; see the
 [public SGLang license at the reference revision](https://github.com/sgl-project/sglang/blob/71de97b264b04dcd514cf904003028aefe9775c8/LICENSE).
 
+The per-backend Step-3.7 cache geometry in `src/aisim_core/sdk/memory/kv_cache.py` adapts the sliding KV-head selection from [SGLang v0.5.20 `python/sglang/srt/configs/model_config.py`](https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/configs/model_config.py) and its [Step attention implementation](https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/models/step3p5.py). AISim checks agreement with the model’s sliding KV-head count and computes a rank-local byte estimate. Copyright 2023-2024 SGLang Team. Licensed under the [Apache License, Version 2.0](https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/LICENSE).
+
 ## vLLM
+
+The scheduler-capacity bound in `src/aisim_core/sdk/memory/kv_cache.py` adapts and modifies the uniform-page grouping in vLLM’s `_get_kv_cache_groups_uniform_page_size`. AISim uses the physical row width and number of padded groups to bound independent cold requests, including one reserved row. The source functions are in [v0.14.0 `vllm/v1/core/kv_cache_utils.py`](https://github.com/vllm-project/vllm/blob/b17039bccc17b94a2ea107272ad7bc93508708df/vllm/v1/core/kv_cache_utils.py), [v0.31.0 `kv_cache_utils.py`](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_utils.py), [v0.32.0 `kv_cache_utils.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_utils.py) and [v0.33.0 `vllm/v1/core/kv_cache_planning.py`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_planning.py). Copyright contributors to the vLLM project. Licensed under the [Apache License, Version 2.0](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE).
 
 Selected synchronous MTP scheduling, uniform full-attention KV allocation,
 host-offload behaviors, and the async engine's CPU-tier load polling in the
@@ -1663,6 +1667,8 @@ c. If you institute litigation or other proceedings against Meta or any entity (
 ```
 
 ## Hugging Face Transformers
+
+The default sliding/full layer count in `src/aisim_core/sdk/memory/kv_cache.py` is derived from [`Gemma4TextConfig` in Transformers v5.24.0](https://github.com/huggingface/transformers/blob/eeee11099135592f1d03c2871fbd3d8132e5a4d7/src/transformers/models/gemma4/configuration_gemma4.py). AISim counts the periodic full layers and the required final full layer directly. Copyright 2026 the HuggingFace Team. Licensed under the [Apache License, Version 2.0](https://github.com/huggingface/transformers/blob/eeee11099135592f1d03c2871fbd3d8132e5a4d7/LICENSE).
 
 The `rotate_half` function in `collector/trtllm/collect_mla.py` is copied from
 `transformers.models.llama.modeling_llama.rotate_half` in the Hugging Face

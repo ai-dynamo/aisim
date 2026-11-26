@@ -521,14 +521,34 @@ def _observed_forward(sample: dict, wall_time: float, *, glm: bool, path: Path) 
     return timing["basis"], graph, reasons
 
 
+def _validate_glm_chunks(stage: dict, path: Path) -> None:
+    chunks = stage.get("prefill_chunks", [])
+    if not isinstance(chunks, list) or any(
+        not isinstance(step, list)
+        or not step
+        or any(
+            not isinstance(chunk, list)
+            or len(chunk) != 2
+            or type(chunk[0]) is not int
+            or chunk[0] < 0
+            or chunk[0] % CHUNK_ALIGN
+            or type(chunk[1]) is not int
+            or chunk[1] <= 0
+            for chunk in step
+        )
+        for step in chunks
+    ):
+        raise ValueError(f"native GLM-5.3-Flash prefill_chunks require aligned starts and positive lengths: {path}")
+
+
 def _validate_glm_repetitions(
     record: dict[str, Any],
     row: dict[str, Any],
     rank: object,
     producer: dict[str, Any],
     path: Path,
-    previous_forward: int = -1,
-) -> int:
+    previous: tuple[int, float] = (-1, -math.inf),
+) -> tuple[int, float]:
     """Verify the accepted forwards and match the measured forwards to the saved rank samples."""
     point = row["point"]
     repetitions = record.get("repetitions")
@@ -554,6 +574,11 @@ def _validate_glm_repetitions(
     if point["point_type"] == "decode":
         # The first decode advances every request by one token before the measured step.
         steps.insert(0, {**scheduled, "sum_decode_kv_tokens": scheduled["sum_decode_kv_tokens"] - point["batch_size"]})
+    seed = record.get("seed", {})
+    if not isinstance(seed, dict):
+        raise ValueError(f"{error}: invalid prefix seed evidence: {path}")
+    _validate_glm_chunks(seed, path)
+    previous_forward, previous_output = previous
     previous_attempt = -1
     for index, repetition in enumerate(repetitions):
         role = "warmup" if index < warmups else "measurement"
@@ -567,6 +592,7 @@ def _validate_glm_repetitions(
         ):
             raise ValueError(f"{error}: invalid accepted {role} at repetition {index}: {path}")
         previous_attempt = repetition["attempt"]
+        _validate_glm_chunks(repetition, path)
         fpms = repetition.get("fpms")
         if not isinstance(fpms, list) or len(fpms) != len(steps):
             raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
@@ -578,8 +604,20 @@ def _validate_glm_repetitions(
         counts = repetition.get("scheduled_token_counts")
         if "scheduled_token_counts" in repetition and (not isinstance(counts, list) or len(counts) != len(dispatches)):
             raise ValueError(f"{error}: scheduled token count list must align with the dispatch receipts: {path}")
-        scheduled_counts = counts[-len(steps) :] if counts is not None else None
-        previous_output = None
+        if counts is not None:
+            for count, dispatch in zip(counts[: -len(steps)], dispatches[: -len(steps)], strict=True):
+                # Prefix preparation can lack a graph observation. Its recorded scheduler count is still positive.
+                if (
+                    type(count) is not int
+                    or count <= 0
+                    or (
+                        dispatch is not None
+                        and (not isinstance(dispatch, dict) or not _same(dispatch.get("num_unpadded_tokens"), count))
+                    )
+                ):
+                    raise ValueError(
+                        f"{error}: dispatch differs from its scheduled token count for {role} {index}: {path}"
+                    )
         for step, (fpm, expected) in enumerate(zip(fpms, steps, strict=True)):
             if (
                 not isinstance(fpm, dict)
@@ -603,6 +641,8 @@ def _validate_glm_repetitions(
                     raise ValueError(f"{error}: measurement {position} differs from its saved raw sample: {path}")
             basis, graph, _ = _observed_forward(sample, fpm["wall_time"], glm=True, path=path)
             timing = sample["timing"]
+            if not step and timing["start_monotonic"] < previous_output:
+                raise ValueError(f"{error}: accepted forward starts before the preceding output: {path}")
             if step and timing["start_monotonic"] != previous_output:
                 raise ValueError(f"{error}: inter-output interval must start at the preceding output: {path}")
             previous_output = timing["end_monotonic"]
@@ -620,13 +660,13 @@ def _validate_glm_repetitions(
             # schedule one token per request, independent of the amount of prefix KV they read.
             tokens = expected["sum_prefill_tokens"] + expected["num_decode_requests"]
             if graph["num_unpadded_tokens"] != tokens or (
-                scheduled_counts is not None and not _same(scheduled_counts[step], tokens)
+                counts is not None and not _same(counts[step - len(steps)], tokens)
             ):
                 raise ValueError(
                     f"{error}: dispatch differs from the scheduled token count {tokens} for {role} {index}: {path}"
                 )
             previous_forward = forward
-    return previous_forward
+    return previous_forward, previous_output
 
 
 def _validate_glm_provenance(
@@ -773,7 +813,7 @@ def _validate_glm_provenance(
     rank = payload.get("dp")
     rank = rank.get("rank") if isinstance(rank, dict) else None
     line_digests: dict[int, str] = {}
-    previous_forward = -1
+    previous = (-1, -math.inf)
     for line in raw.splitlines():
         try:
             record = json.loads(line)
@@ -785,7 +825,7 @@ def _validate_glm_provenance(
         line_digests[benchmark_id] = hashlib.sha256(line).hexdigest()
         row = rows_by_id.get(benchmark_id)
         if row is not None and row.get("repetition_evidence_sha256") == line_digests[benchmark_id]:
-            previous_forward = _validate_glm_repetitions(record, row, rank, expected_producer, path, previous_forward)
+            previous = _validate_glm_repetitions(record, row, rank, expected_producer, path, previous)
     for row in payload["results"]:
         point = row["point"]
         if not _is_hex(row.get("repetition_evidence_sha256"), 64):
