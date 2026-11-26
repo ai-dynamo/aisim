@@ -558,6 +558,13 @@ def test_qsa_projection_weights_are_part_of_the_resident_inventory(model_path):
     op_sum = sum(op.get_weights() for op in model.context_ops)
     projections = model.get_resident_weights_bytes() - op_sum
 
+    # The module op itself keeps reporting zero. MiniMax-M3's inventory is built
+    # from these same op weights, so leaving the Rust arm untouched is what
+    # keeps M3's residency unchanged; Qwen4 prices the bytes in its own
+    # override, once.
+    (module,) = [op for op in model.context_ops if getattr(op, "_name", "") == "context_qsa_attention"]
+    assert module.get_weights() == 0.0
+
     tp = model.config.tp_size
     local_heads = max(1, model._num_heads // tp)
     local_kv_heads = max(1, model._num_kv_heads // tp)
