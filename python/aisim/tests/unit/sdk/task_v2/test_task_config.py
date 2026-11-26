@@ -1844,8 +1844,9 @@ def _build_fake_summary(
     return s
 
 
+@pytest.mark.parametrize(("backend", "map_only"), [("sglang", False), ("vllm", False), ("vllm", True)])
 @pytest.mark.parametrize("version", ["previous", "current"])
-def test_gemma_sweep_and_single_point_use_the_selected_sglang_release(tmp_path, version):
+def test_gemma_sweep_and_single_point_use_the_selected_release(tmp_path, version, backend, map_only):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
@@ -1860,11 +1861,13 @@ def test_gemma_sweep_and_single_point_use_the_selected_sglang_release(tmp_path, 
                 for i, kind in enumerate(text["layer_types"])
                 if kind == "full_attention"
             }
+            if map_only:
+                del text["global_head_dim"], text["num_global_key_value_heads"]
         (directory / "config.json").write_text(json.dumps(document))
         task = Task(
             model_path=str(directory),
             system_name="gb300",
-            backend_name="sglang",
+            backend_name=backend,
             backend_version=version,
             serving_mode="agg",
             database_mode="SOL",

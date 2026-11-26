@@ -2127,11 +2127,12 @@ def test_selected_qwen_and_gemma_physical_defaults(tmp_path):
     gemma["per_layer_config"] = {
         f"{i:02}": {"head_dim": 128, "num_key_value_heads": 16} for i in range(gemma["num_hidden_layers"])
     }
+    gemma["per_layer_config"]["00"]["head_dim"] = 256
     for document in (checkpoint, {"text_config": gemma}):
         model = _write_config(tmp_path, document)
-        with pytest.raises(ValueError, match="per_layer_config requires runtime cache geometry"):
+        with pytest.raises(ValueError, match="one Gemma 4 cache geometry"):
             estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend_version="0.33.0")
-        with pytest.raises(ValueError, match="per_layer_config requires runtime cache geometry"):
+        with pytest.raises(ValueError, match="one Gemma 4 cache geometry"):
             memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.33.0", **opts)
 
 
@@ -2197,6 +2198,44 @@ def test_sglang_gemma4_uses_the_layer_shapes_of_its_release(tmp_path, registered
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.23")
 
 
+def test_registered_gemma4_flat_and_per_layer_release_selection(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.config_builders import build_model_config
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = document["text_config"]
+    text["per_layer_config"] = {
+        str(i): {"head_dim": 512, "num_key_value_heads": 2}
+        for i, kind in enumerate(text["layer_types"])
+        if kind == "full_attention"
+    }
+    path = _write_config(tmp_path, document)
+    config = build_model_config(tp_size=1, pp_size=1, attention_dp_size=1, moe_tp_size=1, moe_ep_size=1)
+    for backend in ("sglang", "vllm"):
+        assert get_model(path, config, backend).get_kvcache_bytes_per_sequence(1) == 225_280
+
+    for override in text["per_layer_config"].values():
+        override.update(num_key_value_heads=4, head_dim=128)
+    different_path = tmp_path / "overridden"
+    different_path.mkdir()
+    path = _write_config(different_path, document)
+    for backend in ("sglang", "vllm"):
+        with pytest.raises(ValueError, match="release"):
+            get_model(path, config, backend)
+    for version, width in (("0.26.0", 225_280), ("0.28.0rc1", 215_040), ("0.32.0", 215_040)):
+        assert estimate_kv_bytes_per_token(path, tp_size=1, pp_size=1, backend_version=version) == width
+        assert get_model(path, config, "vllm", version).get_kvcache_bytes_per_sequence(1) == width
+    with pytest.raises(ValueError, match="cannot read global Gemma 4 heads"):
+        get_model(path, config, "vllm", "0.27.1")
+    text["allow_global_per_layer_attribute_access"] = True
+    legacy_path = tmp_path / "global-access"
+    legacy_path.mkdir()
+    path = _write_config(legacy_path, document)
+    assert get_model(path, config, "vllm", "0.27.1").get_kvcache_bytes_per_sequence(1) == 225_280
+
+
 def test_registered_gemma4_with_release_independent_heads_skips_the_catalog(monkeypatch):
     from aisim.capacity import estimate_kv_bytes_per_token
 
@@ -2222,6 +2261,7 @@ def test_selected_moe_weights_use_the_constructor_count_and_routed_width(tmp_pat
     opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=24 * _GIB)
     for name, count, width, backend, version in (
         ("deepseek-ai/DeepSeek-V3", 256, 2048, "sglang", "0.5.20"),
+        ("moonshotai/Kimi-K2.5", 256, 2048, "sglang", "0.5.20"),
         ("MiniMaxAI/MiniMax-M2.5", 256, 1536, "sglang", "0.5.20"),
         ("Qwen/Qwen3-VL-30B-A3B-Instruct", 60, 768, "sglang", "0.5.20"),
         ("mistralai/Mixtral-8x7B-v0.1", 8, 14336, "vllm", "0.33.0"),
@@ -2240,6 +2280,79 @@ def test_selected_moe_weights_use_the_constructor_count_and_routed_width(tmp_pat
         for estimate in (memory.estimate_num_gpu_blocks, memory.estimate_kv_cache):
             with pytest.raises(ValueError, match="no KV budget"):
                 estimate(model, "missing", backend, version, **opts)
+
+
+@pytest.mark.parametrize(
+    ("backend", "release", "value_dim", "supported"),
+    [
+        ("sglang", "0.5.6.post2", 256, True),
+        ("sglang", "0.5.7", 256, False),
+        ("sglang", "0.5.18", 0, False),
+        ("sglang", "0.5.19", 0, True),
+        ("sglang", "0.5.20", 128, True),
+        ("sglang", "0.5.20", 256, False),
+        ("vllm", "0.33.0", 256, True),
+    ],
+)
+def test_selected_dense_value_dimension_matches_the_serving_pool(tmp_path, backend, release, value_dim, supported):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    text = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
+    text["v_head_dim"] = value_dim
+    model = _write_config(tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "text_config": text})
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=24 * _GIB)
+    for fn, args, kwargs in (
+        (estimate_kv_bytes_per_token, (model,), dict(tp_size=1, pp_size=1, backend=backend, backend_version=release)),
+        (memory.estimate_kv_cache, (model, "missing", backend, release), opts),
+        (memory.estimate_num_gpu_blocks, (model, "missing", backend, release), opts),
+    ):
+        if supported:
+            assert fn(*args, **kwargs)
+        else:
+            with pytest.raises(ValueError, match="asymmetric SGLang"):
+                fn(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("release", "headers", "configured", "error"),
+    [
+        ("0.32.0", ("F16",), None, None),
+        ("0.32.1rc0", ("F16",), None, "vLLM float16 model dtype"),
+        ("0.33.0", ("BF16",), None, None),
+        ("0.33.0", ("F16",), "bfloat16", None),
+        ("0.33.0", ("BF16",), "float16", "vLLM float16 model dtype"),
+        ("0.33.0", ("F32", "F16"), None, None),
+        ("0.33.0", ("F16", "BF16"), None, "resolved vLLM model dtype"),
+    ],
+)
+def test_explicit_vllm_bfloat16_cache_reads_local_weight_headers(tmp_path, release, headers, configured, error):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    text = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
+    text.pop("dtype", None)
+    text.pop("torch_dtype", None)
+    if configured:
+        text["dtype"] = configured
+    model = _write_config(tmp_path, {"text_config": text})
+    for i, dtype in enumerate(headers):
+        size = 4 if dtype == "F32" else 2
+        tensor = {"dtype": dtype, "shape": [1], "data_offsets": [0, size]}
+        header = json.dumps({f"weight_{i}": tensor}).encode()
+        header += b" " * (-len(header) % 8)
+        (tmp_path / f"model-{i}.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + bytes(size))
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=24 * _GIB)
+    for fn, args, kwargs in (
+        (estimate_kv_bytes_per_token, (model,), dict(tp_size=1, pp_size=1, backend="vllm", backend_version=release)),
+        (memory.estimate_kv_cache, (model, "missing", "vllm", release), opts),
+        (memory.estimate_num_gpu_blocks, (model, "missing", "vllm", release), opts),
+    ):
+        if error:
+            with pytest.raises(ValueError, match=error):
+                fn(*args, **kwargs, kvcache_quant_mode="bfloat16")
+        else:
+            assert fn(*args, **kwargs, kvcache_quant_mode="bfloat16")
 
 
 def test_sglang_pool_heads_and_vllm_float_cache_use_the_serving_config(tmp_path):
@@ -2733,11 +2846,17 @@ def test_homogeneous_pipeline_groups_transfer_only_the_resident_layers(tmp_path)
                 )
 
 
-def test_normalized_gemma_per_layer_heads_require_their_physical_cache_geometry(tmp_path):
+def test_serialized_gemma4_uses_the_vllm_release_for_transfer_and_capacity(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     raw = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")["text_config"]
+    model = _write_config(tmp_path, {"text_config": raw})
+    opts = _missing_system_cache_options(tmp_path, tp_size=8, capacity=192 * _GIB)
+    args = (model, "missing", "vllm", "0.33.0")
+    blocks = memory.estimate_num_gpu_blocks(*args, **opts)
+    assert blocks > 0
+
     # Gemma4TextConfig.to_dict moves the global widths into per-layer overrides.
     head_dim = raw.pop("global_head_dim")
     heads = raw.pop("num_global_key_value_heads")
@@ -2747,12 +2866,12 @@ def test_normalized_gemma_per_layer_heads_require_their_physical_cache_geometry(
         if kind == "full_attention"
     }
     model = _write_config(tmp_path, {"text_config": raw})
-    with pytest.raises(ValueError, match="requires runtime cache geometry"):
+    with pytest.raises(ValueError, match="vLLM release"):
         estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1)
-    opts = _missing_system_cache_options(tmp_path, tp_size=8, capacity=192 * _GIB)
-    for fn in (memory.estimate_kv_cache, memory.estimate_num_gpu_blocks):
-        with pytest.raises(ValueError, match="requires runtime cache geometry"):
-            fn(model, "missing", "vllm", "0.33.0", **opts)
+    for version in ("0.28.0", "0.30.0", "0.32.0", "0.33.0"):
+        assert estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1, backend_version=version) == 35_840
+    assert memory.estimate_num_gpu_blocks(*args, **opts) == blocks
+    assert memory.estimate_kv_cache(*args, **opts)["total_kv_size_tokens"] == blocks * 16
 
 
 @pytest.mark.parametrize("form", ["flat", "wrapped", "registered", "registered-without-inner-type"])
@@ -2937,6 +3056,36 @@ def test_sglang_fp8_experts_must_fit_both_axes_of_the_declared_tile(tmp_path, na
     for fn in (memory.estimate_kv_cache, memory.estimate_num_gpu_blocks):
         if reason:
             with pytest.raises(ValueError, match=reason):
+                fn(model, "missing", "sglang", "0.5.20", **opts)
+        else:
+            assert fn(model, "missing", "sglang", "0.5.20", **opts)
+
+
+@pytest.mark.parametrize(
+    ("tp", "shape", "excluded", "error"),
+    [
+        (8, [128, 128], [], None),
+        (16, [128, 128], [], "mlp.gate_up_proj.*1600"),
+        (16, [64, 128], [], "mlp.down_proj.*1600"),
+        (16, [128, 128], ["mlp"], None),
+        (16, [128, 128], ["model.layers.0.mlp"], "mlp.gate_up_proj.*1600"),
+        (8, [256, 128], ["mlp"], "self_attn.qkv_proj"),
+        (8, [256, 128], ["mlp", "q_proj", "k_proj"], "all shards"),
+        (8, [256, 128], ["mlp", "q_proj", "k_proj", "v_proj"], None),
+        (8, [128, 128], ["language_model.model.layers.62.self_attn.q_proj"], "all shards"),
+        (8, [128], [], "two positive integer block dimensions"),
+    ],
+)
+def test_sglang_dense_fp8_linear_shards_fit_the_serialized_blocks(tmp_path, tp, shape, excluded, error):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    text = _load_pre_downloaded_hf_config("Qwen/Qwen3-32B-FP8")
+    text["quantization_config"].update(weight_block_size=shape, modules_to_not_convert=excluded)
+    model = _write_config(tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "text_config": text})
+    opts = _missing_system_cache_options(tmp_path, tp_size=tp, capacity=80 * _GIB)
+    for fn in (memory.estimate_kv_cache, memory.estimate_num_gpu_blocks):
+        if error:
+            with pytest.raises(ValueError, match=error):
                 fn(model, "missing", "sglang", "0.5.20", **opts)
         else:
             assert fn(model, "missing", "sglang", "0.5.20", **opts)

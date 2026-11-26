@@ -897,10 +897,11 @@ def _parse_llama4_vision_config(
     )
 
 
-def gemma4_cache_requires_release(config: dict) -> bool:
-    """SGLang switched from flat global fields to Transformers' effective per-layer config in 0.5.22."""
+def gemma4_cache_requires_release(config: dict, backend: str) -> bool:
+    """Identify Gemma cache fields whose serving semantics changed between releases."""
     return "per_layer_config" in config or (
-        not config.get("attention_k_eq_v")
+        backend == "sglang"
+        and not config.get("attention_k_eq_v")
         and config.get("num_global_key_value_heads") not in (None, config.get("num_key_value_heads", 4))
     )
 
@@ -909,19 +910,39 @@ def gemma4_cache_shapes(
     config: dict, backend: str | None = None, backend_version: str | None = None
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     """Return the (KV heads, head dimension) of the sliding and full attention pools."""
-    heads = config.get("num_key_value_heads", 4) or config.get("num_attention_heads")
+    has_per_layer_config = "per_layer_config" in config
+    heads = config.get("num_key_value_heads", 4)
     dim = config.get("head_dim", 256)
-    if dim is None:
-        dim = config["hidden_size"] // layout_integer(config["num_attention_heads"], "num_attention_heads")
+    if not (backend == "vllm" and has_per_layer_config):
+        heads = heads or config.get("num_attention_heads")
+        if dim is None:
+            dim = config["hidden_size"] // layout_integer(config["num_attention_heads"], "num_attention_heads")
     base = (layout_integer(heads, "num_key_value_heads"), layout_integer(dim, "head_dim"))
     release = common.parse_support_matrix_version(backend_version)
-    if backend == "sglang" and release is None and gemma4_cache_requires_release(config):
+    if (
+        backend == "sglang"
+        and release is None
+        and not has_per_layer_config
+        and gemma4_cache_requires_release(config, backend)
+    ):
         raise ValueError("Gemma 4 cache geometry requires the SGLang release or a runtime profile")
-    legacy = backend == "sglang" and release is not None and release < Version("0.5.22")
-    if backend == "vllm" and "per_layer_config" in config:
-        raise ValueError("explicit Gemma 4 per_layer_config requires runtime cache geometry for each layer")
-    if backend == "sglang" and not legacy and "per_layer_config" in config:
-        overrides = config["per_layer_config"] or {}
+    flat_sglang = backend == "sglang" and release is not None and release < Version("0.5.22")
+    flat_vllm = backend == "vllm" and release is not None and release < Version("0.28.0rc1")
+    # vLLM 0.27 still reads the global attributes, but its Transformers 5.14 pin
+    # rejects a global read when a per-layer override changes that attribute.
+    guarded_flat_read = (
+        flat_vllm and release >= Version("0.27.0rc1") and not config.get("allow_global_per_layer_attribute_access")
+    )
+    explicit_shapes = None
+    if (
+        has_per_layer_config
+        and backend in ("sglang", "vllm")
+        and not flat_sglang
+        and (not flat_vllm or guarded_flat_read)
+    ):
+        overrides = config["per_layer_config"]
+        if overrides is None:
+            overrides = {}
         layers = layout_integer(config["num_hidden_layers"], "num_hidden_layers")
         types = config.get("layer_types") or [
             "sliding_attention" if (i + 1) % 6 else "full_attention" for i in range(layers)
@@ -947,17 +968,42 @@ def gemma4_cache_shapes(
                 layout_integer(fields.get("num_key_value_heads", base[0]), "num_key_value_heads"),
                 layout_integer(fields.get("head_dim", base[1]), "head_dim"),
             )
+            if guarded_flat_read and shape != base:
+                raise ValueError(f"vLLM {backend_version} cannot read global Gemma 4 heads with per-layer overrides")
             if shape != shapes.setdefault(kind, shape):
-                raise ValueError("SGLang requires one Gemma 4 cache geometry per attention layer type")
-        full = shapes["full_attention"]
-        base = shapes.get("sliding_attention", full)
-    else:
-        full_heads = config.get("num_global_key_value_heads") if legacy or config.get("attention_k_eq_v") else None
+                raise ValueError("AISim requires one Gemma 4 cache geometry per attention layer type")
+        if not flat_vllm:
+            explicit_shapes = shapes
+    if explicit_shapes is None or release is None:
+        use_flat_sglang_heads = backend == "sglang" and (flat_sglang or release is None)
+        full_heads = (
+            config.get("num_global_key_value_heads")
+            if use_flat_sglang_heads or config.get("attention_k_eq_v")
+            else None
+        )
+        if backend == "vllm" and has_per_layer_config:
+            if flat_vllm and release < Version("0.19.0"):
+                raise ValueError("this vLLM release has no Gemma 4 model")
+            if flat_vllm and config.get("global_head_dim", 512) is None:
+                raise ValueError(f"vLLM {backend_version} needs the flat Gemma 4 global_head_dim")
+            if config.get("attention_k_eq_v") and full_heads is None:
+                raise ValueError(
+                    "tied Gemma 4 heads require flat num_global_key_value_heads or a per-layer vLLM release"
+                )
         full_dim = config.get("global_head_dim", 512 if backend in ("sglang", "vllm") else dim)
         full = (
             layout_integer(heads if full_heads is None else full_heads, "num_global_key_value_heads"),
             layout_integer(dim if full_dim is None else full_dim, "global_head_dim"),
         )
+        # Three-argument SDK callers have no release. Both readers must agree on each active layer type.
+        if explicit_shapes is not None and (
+            explicit_shapes.get("sliding_attention", base) != base or explicit_shapes["full_attention"] != full
+        ):
+            name = "SGLang" if backend == "sglang" else "vLLM"
+            raise ValueError(f"Gemma 4 per_layer_config requires the {name} release or a runtime profile")
+    else:
+        full = explicit_shapes["full_attention"]
+        base = explicit_shapes.get("sliding_attention", full)
     if backend == "sglang" and config.get("v_head_dim") not in (None, 0, full[1]):
         raise ValueError("asymmetric SGLang Gemma 4 key/value head dimensions require runtime cache geometry")
     return base, full
@@ -1927,6 +1973,17 @@ def _get_language_quantization_config(raw_config: dict) -> dict | None:
     return nested.get("quantization_config", {}) if isinstance(nested, dict) else {}
 
 
+def fp8_weight_block_shape(quantization: dict, *, sglang: bool, experts: bool = False) -> tuple[int, int]:
+    """Return the serialized FP8 weight block used by the selected backend."""
+    shape = quantization.get("weight_block_size", [128, 128])
+    if sglang and quantization.get("quant_method") == "mxfp8":
+        shape = [1, 32]  # SGLang's MXFP8 reader fixes both axes even when the checkpoint supplies another shape.
+    if not isinstance(shape, (list, tuple)) or len(shape) != 2 or any(type(n) is not int or n <= 0 for n in shape):
+        kind = "expert " if experts else ""
+        raise ValueError(f"weight_block_size must supply two positive integer {kind}block dimensions")
+    return shape[0], shape[1]
+
+
 def validate_fp8_moe_shard(
     raw_config: dict,
     intermediate_size: int,
@@ -1937,12 +1994,9 @@ def validate_fp8_moe_shard(
     quantized_experts: bool = True,
 ) -> None:
     """Check the checkpoint blocks partitioned by the gate/up and SGLang down projections."""
-    quantization = _get_language_quantization_config(raw_config) or {}
-    shape = quantization.get("weight_block_size", [128, 128])
-    if sglang_tp_size is not None and quantization.get("quant_method") == "mxfp8":
-        shape = [1, 32]  # SGLang's MXFP8 reader fixes both axes even when the checkpoint supplies another shape.
-    if not isinstance(shape, (list, tuple)) or len(shape) != 2 or any(type(n) is not int or n <= 0 for n in shape):
-        raise ValueError("weight_block_size must supply two positive integer expert block dimensions")
+    shape = fp8_weight_block_shape(
+        _get_language_quantization_config(raw_config) or {}, sglang=sglang_tp_size is not None, experts=True
+    )
     if not quantized_experts:
         return
     shard = intermediate_size // moe_tp_size

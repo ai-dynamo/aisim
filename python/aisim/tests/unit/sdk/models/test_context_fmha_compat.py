@@ -311,8 +311,8 @@ def test_estimate_path_data_fallback_reaches_the_built_context_ops(monkeypatch, 
     captured = []
     real_get_model = models.get_model
 
-    def capture(model_path, model_config, backend_name):
-        captured.append(real_get_model(model_path, model_config, backend_name))
+    def capture(model_path, model_config, backend_name, backend_version=None):
+        captured.append(real_get_model(model_path, model_config, backend_name, backend_version))
         raise ModelBuilt
 
     monkeypatch.setattr(models, "get_model", capture)
