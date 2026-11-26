@@ -87,8 +87,7 @@ impl Worker {
     fn observed(rank: &Value) -> Result<Self, AicError> {
         let config = &rank["resolved_config"];
         let groups = rank.pointer("/cache/groups").and_then(Value::as_array);
-        // Older probes record the concrete per-layer classes. Only recognize an ordinary attention
-        // stack when every attention group identifies its layers; custom or incomplete classes stay unknown.
+        // Only an entirely identified ordinary attention stack establishes non-MLA operation.
         let mut ordinary = None;
         let mut hybrid = false;
         let mut mamba = false;
@@ -97,17 +96,8 @@ impl Worker {
                 mamba |= Self::contains_spec(group, "vllm.v1.kv_cache_interface.MambaSpec");
                 hybrid |= group["kind"] == "state" || group["sliding_window"].as_u64().is_some();
                 if group["kind"] == "attention" {
-                    let standard = group["layer_classes"].as_object().is_some_and(|classes| {
-                        !classes.is_empty() && classes.values().all(|name| {
-                            matches!(
-                                name.as_str(),
-                                Some(
-                                    "vllm.model_executor.layers.attention.Attention"
-                                        | "vllm.model_executor.layers.attention.attention.Attention"
-                                )
-                            )
-                        })
-                    });
+                    let mut layers = layout::decoder_layers(group).peekable();
+                    let standard = layers.peek().is_some() && layers.all(|(_, ordinary)| ordinary);
                     ordinary = Some(ordinary.unwrap_or(true) && standard);
                 }
             }
@@ -319,6 +309,7 @@ pub(crate) struct NixlIdentity {
     pub version: Option<String>,
     pub(crate) modeled_version: Option<String>,
     pub(crate) disable_hma: Option<String>,
+    pub(crate) measured_mamba: bool,
     pub(crate) workers: Vec<Worker>,
     pub(crate) engines: layout::Deployment,
     pub(crate) rosters: Vec<Vec<Worker>>,
@@ -423,7 +414,8 @@ impl NixlIdentity {
         capture: Capture,
     ) -> Result<bool, AicError> {
         if capture == Capture::References
-            && (entry.get("worker_observations_sha256").is_some()
+            && (entry.get("worker_observations").is_some()
+                || entry.get("worker_observations_sha256").is_some()
                 || entry.get("worker_attention_backends").is_some_and(|v| {
                     v.as_array().is_none_or(|names| {
                         names.iter().any(|n| {
@@ -458,20 +450,27 @@ impl NixlIdentity {
         }
         let mut complete = roster::validate_source(entry, capture, self.phase_width, self.tp_size)?
             || capture == Capture::BoundReferences;
-        if capture == Capture::References
-            && let Some(workers) = entry["worker_observations"].as_array()
-        {
-            roster::validate(
-                entry,
-                workers,
-                self.phase_width,
-                self.tp_size,
-                entry["rank_capacities"].as_array().map(Vec::as_slice),
-                false,
-            )?;
-            complete = true;
-        }
         let start = self.workers.len();
+        // The original finalizer kept the initialized common settings and capacity coordinates,
+        // but omitted every worker view. A resolved cache layout still applies to those ranks.
+        if capture == Capture::References && complete {
+            let config = &entry["runtime_settings"];
+            let common = Worker::observed(&serde_json::json!({"resolved_config":config}))?;
+            if common.gpu_cache_layout.is_some()
+                || common.use_mla.is_some()
+                || common.permit_permute.is_some()
+                || common.host_buffer == Some(true)
+            {
+                for rank in entry["rank_capacities"].as_array().into_iter().flatten() {
+                    self.workers.push(Worker {
+                        phase: rank["phase"].as_str().map(str::to_owned),
+                        dp_rank: rank["dp_rank"].as_u64(),
+                        tp_rank: rank["tp_rank"].as_u64(),
+                        ..common.clone()
+                    });
+                }
+            }
+        }
         if let Some(workers) = entry["worker_observations"].as_array() {
             for worker in workers {
                 // New snapshots spell unavailable optional fields as null or an empty name list.
@@ -641,12 +640,35 @@ impl NixlIdentity {
         Ok(found)
     }
 
+    fn measured_groups(&mut self, resources: &Value) -> Result<(), AicError> {
+        // The importer records a prefill checkpoint count (including zero) only for Mamba.
+        if resources["cache_groups"].as_array().is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|g| g["kind"] == "state" && g["prefill_checkpoint_blocks"].is_u64())
+        }) {
+            self.measured_mamba = true;
+            record(
+                &mut self.disable_hma,
+                Some("false"),
+                "disable_hybrid_kv_cache_manager",
+            )?;
+        }
+        Ok(())
+    }
+
     fn probe(&mut self, entry: &Value) -> Result<(), AicError> {
         self.collection(entry, Capture::Full)?;
         let version = entry["schema_version"].as_str();
         let current = version == Some("aisimulate-onboarding-runtime-probe/v2");
+        let snapshot = &entry["nixl_observation"];
+        if !current
+            && (snapshot.get("worker_observations").is_some()
+                || snapshot.get("worker_observations_sha256").is_some())
+        {
+            return Err(roster::invalid());
+        }
         if current {
-            let snapshot = &entry["nixl_observation"];
             let recorded = [
                 "/runtime_settings/model_config/model",
                 "/runtime_settings/model_config/dtype",
@@ -695,6 +717,7 @@ impl NixlIdentity {
             Some(
                 "aisimulate-onboarding-runtime-probe/v1" | "aisimulate-onboarding-runtime-probe/v2",
             ) => {
+                self.measured_groups(&entry["observed_resources"])?;
                 let memory = &entry["observed_resources"]["runtime_memory"];
                 self.memory(memory)?;
                 let legacy = entry["schema_version"] == "aisimulate-onboarding-runtime-probe/v1";
@@ -743,11 +766,7 @@ impl NixlIdentity {
             return Ok(identity);
         };
         identity.probe(&evidence)?;
-        if let Some(probe) = evidence.get("runtime_probe")
-            && probe["schema_version"]
-                .as_str()
-                .is_some_and(|s| s.starts_with(PROBE_FAMILY))
-        {
+        if let Some(probe) = evidence.get("runtime_probe") {
             identity.probe(probe)?;
         }
         let format = evidence["observation_provenance"].as_str();
@@ -765,6 +784,13 @@ impl NixlIdentity {
         if !bound && evidence.get("worker_observation_digests").is_some() {
             return Err(roster::invalid());
         }
+        if capture != Capture::Full
+            && evidence["cell_observations"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        {
+            return Err(roster::invalid());
+        }
         let mut digests = Vec::new();
         if let Some(cells) = evidence["cell_observations"].as_array() {
             for cell in cells {
@@ -774,6 +800,18 @@ impl NixlIdentity {
                     .as_str()
                     .and_then(|s| serde_json::from_str(s).ok());
                 let nested: Value = nested.unwrap_or_default();
+                if capture != Capture::Full
+                    && (!roster::identified_source(&nested)
+                        || nested["runtime_settings"]
+                            .as_object()
+                            .is_none_or(|s| s.is_empty())
+                        || nested["artifacts"].as_array().is_none_or(Vec::is_empty))
+                {
+                    return Err(roster::invalid());
+                }
+                if roster::identified_source(&nested) {
+                    identity.measured_groups(cell)?;
+                }
                 if bound {
                     let capacities = nested["rank_capacities"]
                         .as_array()
@@ -795,9 +833,10 @@ impl NixlIdentity {
                         false,
                     )?);
                 }
-                if nested["schema_version"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with(PROBE_FAMILY))
+                if nested.get("nixl_observation").is_some()
+                    || nested["schema_version"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with(PROBE_FAMILY))
                 {
                     identity.probe(&nested)?;
                 } else if !identity.collection(&nested, capture)? {
@@ -858,6 +897,15 @@ impl NixlIdentity {
         recorded_version: Option<&str>,
         prefix_caching: bool,
     ) -> Result<(), AicError> {
+        if self.measured_mamba {
+            for worker in self
+                .workers
+                .iter_mut()
+                .chain(self.rosters.iter_mut().flatten())
+            {
+                worker.requires_hma = true;
+            }
+        }
         if self
             .workers
             .iter()
@@ -898,10 +946,12 @@ impl NixlIdentity {
                 return Err(conflict("kv_cache_layout or worker settings"));
             }
         }
-        if self.workers.iter().any(|w| w.requires_hma)
-            && self.disable_hma.as_deref() == Some("true")
-        {
-            return Err(conflict("disable_hybrid_kv_cache_manager"));
+        if self.workers.iter().any(|w| w.requires_hma) {
+            record(
+                &mut self.disable_hma,
+                Some("false"),
+                "disable_hybrid_kv_cache_manager",
+            )?;
         }
         if self
             .workers
@@ -1454,7 +1504,8 @@ mod tests {
     #[test]
     fn complete_anonymous_cells_must_describe_the_same_physical_workers() {
         let cell = |names: Value| {
-            let captures = json!({"source":"runtime_observations","worker_attention_backends":names,
+            let captures = json!({"source":"runtime_observations","observation_schema":"aisimulate-runtime-observation/v1",
+                "runtime_settings":{"parallel_config":{"tensor_parallel_size":2}},"artifacts":[{"path":"rank.json","sha256":"0".repeat(64)}],"worker_attention_backends":names,
                 "rank_capacities":[{"phase":"prefill","tp_rank":0,"dp_rank":0},{"phase":"prefill","tp_rank":1,"dp_rank":0}]});
             json!({"runtime_memory":{"provenance":captures.to_string()}})
         };
@@ -1601,6 +1652,37 @@ mod tests {
     }
 
     #[test]
+    fn attention_specs_identify_decoder_layouts_for_subclasses() {
+        let subclass = "vllm.model_executor.layers.attention.prefill_prefix_lm_attention.PrefillPrefixLMAttention";
+        let view = json!({"shape":[10,2,64,16],"stride_bytes":[10240,2048,32,2],"block_axis":0});
+        let mut rank = json!({"schema_version":"aisimulate-runtime-observation/v1","runtime":{"version":"0.33.0"},
+            "cache":{"groups":[{"kind":"attention","layer_names":["a","b"],"layer_classes":{"a":subclass,"b":subclass}}],
+                "tensor_allocations":[{"layers":["a","b"],"host_resident":false,"layer_stride":4096}],
+                "layer_tensors":{"a":[view],"b":[view]}}});
+        for (spec, ordinary) in [
+            ("FullAttentionSpec", true),
+            ("SlidingWindowSpec", true),
+            ("SinkFullAttentionSpec", true),
+            ("MLAAttentionSpec", false),
+            ("SlidingWindowMLASpec", false),
+            ("HiddenStateCacheSpec", false),
+        ] {
+            let spec = json!({"spec_type":format!("vllm.v1.kv_cache_interface.{spec}")});
+            rank["cache"]["groups"][0]["layer_specs"] = json!({"a":spec,"b":spec});
+            let worker = Worker::observed(&rank).unwrap();
+            assert_eq!(worker.use_mla, ordinary.then_some(false));
+            assert_eq!(
+                worker.gpu_cache_layout,
+                if ordinary {
+                    Layouts::named("BLHNC")
+                } else {
+                    None
+                }
+            );
+        }
+    }
+
+    #[test]
     fn grouped_workers_preserve_their_initialized_layout_and_buffer_restrictions() {
         let wrap = |name| {
             json!({"kind":"state","spec_type":"vllm.v1.kv_cache_interface.UniformTypeKVCacheSpecs",
@@ -1693,6 +1775,46 @@ mod tests {
         let null_snapshot = json!({"schema_version":"aisimulate-onboarding-runtime-probe/v1","nixl_observation":null});
         for record in [probe, compact, null_snapshot] {
             assert!(NixlIdentity::observed(None, &record.to_string(), Some(1), Some(1)).is_err());
+        }
+    }
+
+    #[test]
+    fn original_compact_cells_keep_initialized_layout_and_mamba_requirements() {
+        let compact = |layout: &str, groups: Value| {
+            let entry = json!({
+                "source":"vllm_initialized_cache", "observer_schema_version":"v1",
+                "runtime_settings":{"cache_config":{"kv_cache_layout":layout},"model_config":{"use_mla":false}},
+                "artifacts":[{"path":"rank.json","sha256":"0".repeat(64)}],
+                "rank_capacities":[{"dp_rank":0,"tp_rank":0}]
+            });
+            json!({"observation_provenance":"source_references","cell_observations":[{
+                "cache_groups":groups, "runtime_memory":{"provenance":entry.to_string()}
+            }]})
+        };
+        let left = observe(compact("LBNHC", json!([])), "prefill");
+        let right = observe(compact("LBHNC", json!([])), "decode");
+        assert_eq!(left.mismatch(&right).unwrap().0, "kv_cache_layout");
+        assert!(left.mismatch(&left).is_none());
+        let disabled = observe(
+            json!({"runtime_settings":{"scheduler_config":{
+                "disable_hybrid_kv_cache_manager":true
+            }}}),
+            "prefill",
+        );
+        assert!(disabled.mismatch(&right).is_none());
+        for count in [0, 1] {
+            let mamba = observe(
+                compact(
+                    "LBHNC",
+                    json!([{"kind":"state","prefill_checkpoint_blocks":count}]),
+                ),
+                "decode",
+            );
+            assert!(mamba.workers.iter().all(|w| w.requires_hma));
+            assert_eq!(
+                disabled.mismatch(&mamba).unwrap().0,
+                "disable_hybrid_kv_cache_manager"
+            );
         }
     }
 

@@ -366,6 +366,44 @@ fn view_dimensions(
         .then_some(dims)
 }
 
+/// A stock decoder can subclass Attention without changing its cache. The per-layer spec
+/// identifies its logical axes even inside a UniformTypeKVCacheSpecs group. Older probes
+/// may only name the concrete layer class.
+pub(super) fn decoder_layers(group: &Value) -> impl Iterator<Item = (&str, bool)> {
+    let names = group["layer_names"].as_array();
+    let legacy = group["layer_classes"]
+        .as_object()
+        .or_else(|| group["layer_specs"].as_object())
+        .filter(|_| names.is_none());
+    names
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .chain(
+            legacy
+                .into_iter()
+                .flat_map(|layers| layers.keys().map(String::as_str)),
+        )
+        .map(move |name| {
+            let ordinary = match group["layer_specs"][name]["spec_type"].as_str() {
+                Some(spec) => matches!(
+                    spec,
+                    "vllm.v1.kv_cache_interface.FullAttentionSpec"
+                        | "vllm.v1.kv_cache_interface.SlidingWindowSpec"
+                        | "vllm.v1.kv_cache_interface.SinkFullAttentionSpec"
+                ),
+                None => matches!(
+                    group["layer_classes"][name].as_str(),
+                    Some(
+                        "vllm.model_executor.layers.attention.Attention"
+                            | "vllm.model_executor.layers.attention.attention.Attention"
+                    )
+                ),
+            };
+            (name, ordinary)
+        })
+}
+
 pub(super) fn from_strides(rank: &Value) -> Result<Option<Layouts>, AicError> {
     if rank["schema_version"] != "aisimulate-runtime-observation/v1" {
         return Ok(None);
@@ -387,18 +425,8 @@ pub(super) fn from_strides(rank: &Value) -> Result<Option<Layouts>, AicError> {
         groups
             .iter()
             .filter(|g| g["kind"] == "attention")
-            .filter_map(|g| g["layer_classes"].as_object())
-            .flat_map(|classes| classes.iter())
-            .filter(|(_, class)| {
-                matches!(
-                    class.as_str(),
-                    Some(
-                        "vllm.model_executor.layers.attention.Attention"
-                            | "vllm.model_executor.layers.attention.attention.Attention"
-                    )
-                )
-            })
-            .map(|(layer, _)| layer.as_str())
+            .flat_map(decoder_layers)
+            .filter_map(|(name, ordinary)| ordinary.then_some(name))
             .collect::<BTreeSet<_>>()
     });
     let mut candidates = LAYOUTS.to_vec();

@@ -28,33 +28,26 @@ fn sha256(s: &str) -> bool {
 }
 
 fn file_references(files: &Value, path_key: &str) -> Result<Value, AicError> {
-    let mut paths = BTreeSet::new();
-    let mut references = Vec::new();
+    let mut sorted = BTreeMap::new();
     for file in files.as_array().ok_or_else(invalid)? {
         let path = file[path_key]
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or_else(invalid)?;
-        let hash = file["sha256"]
-            .as_str()
-            .filter(|s| sha256(s))
-            .ok_or_else(invalid)?;
-        let kind = file
-            .get("kind")
-            .filter(|v| !v.is_null())
-            .map(|v| v.as_str().filter(|s| !s.is_empty()).ok_or_else(invalid))
-            .transpose()?;
-        if !paths.insert(path) {
+        if !file["sha256"].as_str().is_some_and(sha256)
+            || file
+                .get("kind")
+                .is_some_and(|v| !v.is_null() && v.as_str().is_none_or(str::is_empty))
+            || sorted.insert(path, file.clone()).is_some()
+        {
             return Err(invalid());
         }
-        references.push((kind, path, hash));
     }
-    references.sort_unstable();
-    Ok(serde_json::json!(references))
+    Ok(Value::Array(sorted.into_values().collect()))
 }
 
-/// Bind the portable projection to its recorded sources, independently of worker order.
-/// The onboarding verifier separately rehashes the original files.
+/// Bind the entire portable observation and its recorded file associations. Only the order
+/// of file references and worker/capacity rows is immaterial.
 pub(crate) fn digest(
     entry: &Value,
     source: Option<&str>,
@@ -65,31 +58,20 @@ pub(crate) fn digest(
     let source = source
         .filter(|s| if formal { !s.is_empty() } else { sha256(s) })
         .ok_or_else(invalid)?;
-    let sorted_rows = |field: &str| {
-        entry[field].as_array().map(|records| {
-            let mut rows = records.iter().map(Value::to_string).collect::<Vec<_>>();
-            rows.sort_unstable();
-            rows
-        })
-    };
-    let mut contents = vec![
-        Value::from(source),
-        if formal {
-            entry["backend_version"].clone()
-        } else {
-            Value::Null
-        },
-        entry["runtime"].clone(),
-        entry["runtime_settings"].clone(),
-        serde_json::json!(sorted_rows("worker_observations")),
-        serde_json::json!(sorted_rows("rank_capacities")),
-    ];
+    let mut observation = entry.as_object().cloned().ok_or_else(invalid)?;
+    if draft {
+        observation.remove("worker_observations_sha256");
+    }
+    for key in ["worker_observations", "rank_capacities"] {
+        if let Some(rows) = observation.get_mut(key).and_then(Value::as_array_mut) {
+            rows.sort_by_cached_key(Value::to_string);
+        }
+    }
     let mut files = serde_json::Map::new();
     if draft {
         let index = inventory["observations_index"]
             .as_str()
             .ok_or_else(invalid)?;
-        // A draft retains its indexed capture and the frozen launch and model inputs.
         let sources = inventory["source_artifacts"]
             .as_array()
             .ok_or_else(invalid)?;
@@ -108,14 +90,13 @@ pub(crate) fn digest(
             if index["path"].as_str().is_none_or(str::is_empty) || index["sha256"] != source {
                 return Err(invalid());
             }
-            files.insert("observations_index".into(), index.clone());
+        }
+        if entry["artifacts"].as_array().is_none_or(Vec::is_empty) {
+            return Err(invalid());
         }
         for key in ["artifacts", "runtime_artifacts", "launch_artifacts"] {
-            if key == "artifacts" && entry[key].as_array().is_none_or(Vec::is_empty) {
-                return Err(invalid());
-            }
             if let Some(refs) = entry.get(key) {
-                files.insert(key.into(), file_references(refs, "path")?);
+                observation.insert(key.into(), file_references(refs, "path")?);
             }
         }
     }
@@ -127,11 +108,19 @@ pub(crate) fn digest(
             files.insert(key.into(), file_references(refs, path_key)?);
         }
     }
-    contents.push(Value::Object(files));
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(Value::Array(contents).to_string())
-    ))
+    let mut contents = serde_json::json!([source, observation, files]);
+    contents.sort_all_objects();
+    Ok(format!("{:x}", Sha256::digest(contents.to_string())))
+}
+
+pub(super) fn identified_source(entry: &Value) -> bool {
+    let formal = entry["source"] == "vllm_initialized_cache"
+        && (entry["observer_schema_version"].is_string() || entry["plan_sha256"].is_string());
+    let probe = entry["source"] == "runtime_observations"
+        && (entry["observation_schema"] == "aisimulate-runtime-observation/v1"
+            || entry.pointer("/launch/topology").is_some()
+            || entry.pointer("/observations_index/sha256").is_some());
+    formal || probe
 }
 
 /// A full capture retains raw files for every worker and scheduler. A historical compact cell
@@ -143,13 +132,7 @@ pub(super) fn validate_source(
     selected_width: Option<u64>,
     selected_tp: Option<u64>,
 ) -> Result<bool, AicError> {
-    let formal = entry["source"] == "vllm_initialized_cache"
-        && (entry["observer_schema_version"].is_string() || entry["plan_sha256"].is_string());
-    let probe = entry["source"] == "runtime_observations"
-        && (entry["observation_schema"] == "aisimulate-runtime-observation/v1"
-            || entry.pointer("/launch/topology").is_some()
-            || entry.pointer("/observations_index/sha256").is_some());
-    if !formal && !probe {
+    if !identified_source(entry) {
         return Ok(false);
     }
     let parallel = &entry["runtime_settings"]["parallel_config"];
@@ -176,17 +159,8 @@ pub(super) fn validate_source(
     let width = width.or(selected_width);
     let capacities = entry["rank_capacities"].as_array();
     if capture != Capture::Full {
-        if probe
-            && entry.get("worker_attention_backends").is_some()
-            && entry.pointer("/launch/topology").is_some()
-            && entry.get("launch_artifacts").is_some()
-            && capacities.is_none()
-        {
-            return Err(invalid());
-        }
-        if let Some(capacities) = capacities
-            && entry.get("worker_observations").is_none()
-        {
+        let capacities = capacities.ok_or_else(invalid)?;
+        if entry.get("worker_observations").is_none() {
             validate(entry, capacities, width, tp, None, true)?;
             if entry["worker_attention_backends"]
                 .as_array()
@@ -195,7 +169,7 @@ pub(super) fn validate_source(
                 return Err(invalid());
             }
         }
-        return Ok(false);
+        return Ok(true);
     }
     let files = entry["artifacts"].as_array().ok_or_else(invalid)?;
     if files.iter().any(|f| f["evidence"].is_null()) {
@@ -682,7 +656,11 @@ mod tests {
         entry.as_object_mut().unwrap().remove("artifacts");
         assert!(validate_source(&entry, Capture::Full, None, None).is_err());
         entry["artifacts"] = json!([{"path":"worker.json","sha256":"old"}]);
-        assert!(!validate_source(&entry, Capture::References, None, None).unwrap());
+        assert!(validate_source(&entry, Capture::References, None, None).is_err());
+        entry["rank_capacities"] = json!([
+            {"phase":"prefill","dp_rank":0,"tp_rank":0}, {"phase":"prefill","dp_rank":0,"tp_rank":1}
+        ]);
+        assert!(validate_source(&entry, Capture::References, None, None).unwrap());
     }
 
     #[test]

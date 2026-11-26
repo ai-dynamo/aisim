@@ -279,6 +279,7 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
     configs = _profile_parallel_configs(
         profile,
         prefix_caching=(search_space.prefill_enable_prefix_caching, search_space.decode_enable_prefix_caching),
+        max_batched_tokens_for=lambda role: _role_runtime(search_space, "vllm", role)[0],
         hardware_sku=search_space.hardware_sku_for("agg" if deployment_mode == "agg" else "prefill"),
         decode_hardware_sku=(search_space.hardware_sku_for("decode") if deployment_mode == "disagg" else None),
         backend="vllm",
@@ -445,7 +446,15 @@ def _heterogeneous_disagg_configs(
                 ),
                 **_engine_memory_kwargs(search_space),
                 **_estimator_root_kwargs(search_space, role),
-                **({"fpm_profile": search_space.fpm_profile} if search_space.fpm_profile is not None else {}),
+                **(
+                    {
+                        "fpm_profile": search_space.fpm_profile,
+                        "prefill_enable_prefix_caching": search_space.prefill_enable_prefix_caching,
+                        "decode_enable_prefix_caching": search_space.decode_enable_prefix_caching,
+                    }
+                    if search_space.fpm_profile is not None
+                    else {}
+                ),
                 **(
                     {"candidate_configs": list(dict.fromkeys(getattr(config, role) for config in candidate_configs))}
                     if candidate_configs is not None

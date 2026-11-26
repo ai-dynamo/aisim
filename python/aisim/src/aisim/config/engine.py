@@ -1774,6 +1774,10 @@ def require_runtime_version(memory, *, backend_version: str | None, feature: str
 GROUPED_PREFIX_CACHING_VERSIONS = ("0.31.0", "0.32.0", "0.33.0")
 
 
+class GroupedPrefixEvidenceError(ValueError):
+    """A measured grouped deployment cannot supply the requested warm prefix policy."""
+
+
 class GroupedPrefixGeometryError(ValueError):
     """The evidence enables prefix caching, but the native cache geometry cannot run it."""
 
@@ -1810,7 +1814,7 @@ def grouped_prefix_caching_requirements(
     memory = deployment.resources.runtime_memory
     # The evidence: the runtime memory records prefix caching on and the hash block that replay must follow.
     if memory is None or memory.enable_prefix_caching is not True or memory.hash_block_size_tokens is None:
-        raise ValueError(f"grouped FPM cache requires {field}=false for cold replay")
+        raise GroupedPrefixEvidenceError(f"grouped FPM cache requires {field}=false for cold replay")
     if backend_version not in GROUPED_PREFIX_CACHING_VERSIONS:
         raise ValueError("grouped FPM cache prefix caching is modeled for vLLM 0.31.0, 0.32.0 and 0.33.0 only")
     require_runtime_version(memory, backend_version=backend_version, feature="prefix caching")
@@ -1854,7 +1858,7 @@ def grouped_prefix_caching_requirements(
         raise ValueError(
             "GLM-5.3-Flash prefix caching requires prefix_match_unit and max_batched_tokens that are multiples of 4"
         )
-    if any(group.kind == "convolution" for group in groups):
+    if pd_rank or any(group.kind == "convolution" for group in groups):
         from aisim import _runtime
 
         try:

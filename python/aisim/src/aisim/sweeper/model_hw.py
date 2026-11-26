@@ -161,8 +161,18 @@ def parallel_configs_for(
     ``deployment_mode`` is ``"agg"`` (-> ``list[ReplicaParallelConfig]``) or
     ``"disagg"`` (-> ``list[DisaggParallelConfig]``). Raises
     :class:`NoViableParallelConfig` when no shape can hold the sequence within the
-    budget.
+    budget. Grouped P/D defaults to prefix caching on prefill and cold decode. A role that requests
+    prefix caching requires captured warm geometry.
     """
+
+    def runtime_for(role):
+        values = (role_runtime or {}).get(role, (max_num_tokens, max_batch_size, memory_fraction))
+        if len(values) == 3:
+            return (*values, None)
+        if len(values) == 4:
+            return values
+        raise ValueError("role_runtime values must be (tokens, batch, memory) or (tokens, batch, memory, fixed_tokens)")
+
     profile = None
     if fpm_profile is not None:
         from aisim_core.sdk.fpm_profile import load_fpm_profile
@@ -176,6 +186,7 @@ def parallel_configs_for(
         configs = _profile_parallel_configs(
             profile,
             prefix_caching=(prefill_enable_prefix_caching, decode_enable_prefix_caching),
+            max_batched_tokens_for=lambda role: runtime_for("agg" if deployment_mode == "agg" else role)[0],
             hardware_sku=hardware_sku,
             backend=backend,
             backend_version=backend_version,
@@ -249,16 +260,7 @@ def parallel_configs_for(
 
     def feasible_for(role: str, shapes):
         profile_role = worker_type if role == "agg" else role
-        runtime = (role_runtime or {}).get(role, (max_num_tokens, max_batch_size, memory_fraction))
-        if len(runtime) == 3:
-            role_tokens, role_batch, role_memory = runtime
-            fixed_tokens = None
-        elif len(runtime) == 4:
-            role_tokens, role_batch, role_memory, fixed_tokens = runtime
-        else:
-            raise ValueError(
-                "role_runtime values must be (tokens, batch, memory) or (tokens, batch, memory, fixed_tokens)"
-            )
+        role_tokens, role_batch, role_memory, fixed_tokens = runtime_for(role)
         role_seq_len = resolved_role_seq_len(role)
         grouped_shapes = set()
         if profile is not None:
@@ -355,6 +357,7 @@ def _profile_parallel_configs(
     profile,
     *,
     prefix_caching: tuple[bool, bool] = (True, False),
+    max_batched_tokens_for: Callable[[str], int] | None = None,
     hardware_sku: str,
     backend: str,
     backend_version: str | None,
@@ -369,10 +372,14 @@ def _profile_parallel_configs(
 ):
     """Enumerate only declared deployment shapes; replicas do not change a cell."""
     from aisim.config.engine import (
+        GroupedPrefixEvidenceError,
+        GroupedPrefixGeometryError,
         grouped_pd_pair_requirement,
         grouped_pd_transfer_requirements,
+        grouped_prefix_caching_requirements,
     )
 
+    @cache
     def shapes_for(system, role):
         return {
             ParallelShape(
@@ -388,6 +395,31 @@ def _profile_parallel_configs(
             and deployment.backend_version == backend_version
             and deployment.worker_type in (None, role)
         }
+
+    prefix_errors = []
+
+    @cache
+    def supports_prefix(role, shape):
+        if not prefix_caching[0 if role == "prefill" else 1]:
+            return True
+        system = (decode_hardware_sku or hardware_sku) if role == "decode" else hardware_sku
+        deployment = shapes_for(system, role)[shape]
+        if deployment.resources.cache_layout != "grouped":
+            return True
+        try:
+            grouped_prefix_caching_requirements(
+                deployment,
+                backend_version=backend_version,
+                architecture=profile.architecture,
+                prefix_match_unit=None,
+                max_batched_tokens=max_batched_tokens_for(role) if max_batched_tokens_for else DEFAULT_MAX_NUM_TOKENS,
+                field=f"{role}_enable_prefix_caching",
+                pd_rank=True,
+            )
+        except (GroupedPrefixEvidenceError, GroupedPrefixGeometryError) as error:
+            prefix_errors.append(error)
+            return False
+        return True
 
     def replicas(shape, budget):
         return (
@@ -417,8 +449,13 @@ def _profile_parallel_configs(
     if deployment_mode == "agg":
         shapes = shapes_for(hardware_sku, worker_type)
         if candidate_configs is not None:
-            return [config for config in candidate_configs if config.shape in shapes]
-        configs = [ReplicaParallelConfig(shape, count) for shape in shapes for count in allowed_counts("agg", shape)]
+            configs = [config for config in candidate_configs if config.shape in shapes]
+        else:
+            configs = [
+                ReplicaParallelConfig(shape, count) for shape in shapes for count in allowed_counts("agg", shape)
+            ]
+        if worker_type in ("prefill", "decode"):
+            configs = [config for config in configs if supports_prefix(worker_type, config.shape)]
     elif deployment_mode == "disagg":
         prefill_shapes = shapes_for(hardware_sku, "prefill")
         decode_shapes = shapes_for(decode_hardware_sku or hardware_sku, "decode")
@@ -430,9 +467,11 @@ def _profile_parallel_configs(
             if requirement:
                 requirements[requirement] = None
                 return False
-            if validate_transfer and prefill.resources.cache_layout == "grouped":
+            if prefill.resources.cache_layout != "grouped":
+                return True
+            if validate_transfer:
                 grouped_pd_transfer_requirements(prefill, decode, backend_version=backend_version, kv_transfer=None)
-            return True
+            return supports_prefix("prefill", prefill_shape) and supports_prefix("decode", decode_shape)
 
         if candidate_configs is not None:
             # Replica counts do not change a deployment's transfer geometry.
@@ -488,10 +527,12 @@ def _profile_parallel_configs(
                         minimum = max(1, (needed + width - 1) // width)
                         for count in range(minimum, available // width + 1):
                             configs.append(DisaggParallelConfig(prefill=replica, decode=decode_replica(dest, count)))
-        if requirements and not configs:
+        if requirements and not configs and not prefix_errors:
             raise NoViableParallelConfig(f"no prefill/decode deployment pair with {' and '.join(requirements)}")
     else:
         raise ValueError("FPM profiles support only agg or disagg deployment modes")
+    if not configs and prefix_errors:
+        raise prefix_errors[0]
     if deployment_mode == "disagg" or candidate_configs is not None or min_gpu_budget is None:
         return configs
     return [config for config in configs if config.total_gpus >= min_gpu_budget]

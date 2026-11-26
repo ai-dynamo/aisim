@@ -341,17 +341,22 @@ def _probe_provenance(provenance: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     schema = value.get("schema_version") if isinstance(value, dict) else None
+    snapshot = value.get("nixl_observation") if isinstance(value, dict) else None
+    if (
+        schema != PROVENANCE_SCHEMA
+        and isinstance(snapshot, dict)
+        and ("worker_observations" in snapshot or "worker_observations_sha256" in snapshot)
+    ):
+        raise ValueError("a bound NIXL observation requires the current runtime probe schema")
     if schema not in (LEGACY_PROVENANCE_SCHEMA, PROVENANCE_SCHEMA):
         if isinstance(schema, str) and schema.startswith("aisimulate-onboarding-runtime-probe/"):
             raise ValueError(f"unsupported onboarding runtime probe version: {schema}")
         return None
-    snapshot = value.get("nixl_observation")
     if (
         schema == LEGACY_PROVENANCE_SCHEMA
         and "nixl_observation" in value
         and (
             not isinstance(snapshot, dict)
-            or "worker_observations_sha256" in snapshot
             or ("worker_attention_backends" in snapshot and not isinstance(snapshot["worker_attention_backends"], list))
         )
     ):
@@ -403,25 +408,13 @@ def _worker_observation_digest(
 ) -> str:
     from aisim import _runtime
 
-    fields = {
-        key: snapshot[key]
-        for key in ("runtime", "runtime_settings", "worker_observations", "rank_capacities")
-        if key in snapshot
-    }
-    if evidence.get("source") == "vllm_initialized_cache":
-        fields.update(
-            source=evidence["source"], backend_version=evidence["backend_version"], artifacts=evidence["artifacts"]
-        )
-        source = evidence["plan_sha256"]
-    else:
-        source = evidence["observations_index"]["sha256"]
-        if not draft:
-            fields["observations_index"] = evidence["observations_index"]
-            for key in ("artifacts", "runtime_artifacts", "launch_artifacts"):
-                if key in evidence:
-                    fields[key] = evidence[key]
+    source = (
+        evidence["plan_sha256"]
+        if evidence.get("source") == "vllm_initialized_cache"
+        else evidence["observations_index"]["sha256"]
+    )
     references = {k: inventory[k] for k in ("observations_index", "source_artifacts", "formal_data") if k in inventory}
-    return _runtime.nixl_observation_digest(json.dumps(fields), source, json.dumps(references), draft)
+    return _runtime.nixl_observation_digest(json.dumps(snapshot), source, json.dumps(references), draft)
 
 
 def _probe_sources(index: Path, evidence: dict[str, Any], digests: dict[Path, str]) -> list[dict[str, str]]:
@@ -553,6 +546,36 @@ def _request_launch(request: SupportRequest, launch: dict[str, Any]) -> dict[str
     return result
 
 
+def _ordered_runtime_evidence(value: Any) -> Any:
+    """Compare recovered evidence with the portable manifest, including its embedded cell JSON."""
+    if isinstance(value, list):
+        return [_ordered_runtime_evidence(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key == "provenance" and "kv_cache_bytes" in value and isinstance(item, str):
+            try:
+                result[key] = _json(_ordered_runtime_evidence(json.loads(item)))
+                continue
+            except ValueError:
+                pass
+        item = _ordered_runtime_evidence(item)
+        if isinstance(item, list) and key in (
+            "source_artifacts",
+            "formal_data",
+            "artifacts",
+            "runtime_artifacts",
+            "launch_artifacts",
+            "worker_observations",
+            "rank_capacities",
+            "worker_observation_digests",
+        ):
+            item.sort(key=_json)
+        result[key] = item
+    return result
+
+
 def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
     """Revalidate source files and the exact runtime binding of an imported draft."""
     manifest = runtime_probe_manifest(request)
@@ -573,7 +596,9 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
             if request_id(original) != finalized.get("source_request_id"):
                 raise ValueError("finalized runtime source request changed")
             source = verify_runtime_profile(original)
-            if source is None or finalized["runtime_probe"] != runtime_probe_manifest(original):
+            if source is None or _ordered_runtime_evidence(finalized["runtime_probe"]) != _ordered_runtime_evidence(
+                runtime_probe_manifest(original)
+            ):
                 raise ValueError("finalized runtime probe provenance changed")
             observations, evidence, _, _ = _verify_collection(
                 original, root, memory_revision=finalized.get("memory_revision")
@@ -587,7 +612,8 @@ def verify_runtime_profile(request: SupportRequest) -> dict[str, Any] | None:
                 source_references="observation_provenance" in finalized,
                 observation_format=finalized.get("observation_provenance", "source_references"),
             )
-            if request.profile_deployment().resources.model_dump(mode="json") != expected:
+            actual = request.profile_deployment().resources.model_dump(mode="json")
+            if _ordered_runtime_evidence(actual) != _ordered_runtime_evidence(expected):
                 raise ValueError("finalized runtime resources differ from verified formal observations")
             launch = source["provenance"]["launch"]
             if _request_launch(request, launch) != launch:
@@ -707,7 +733,7 @@ def preserve_runtime_overrides(previous: dict[str, Any], current: dict[str, Any]
             finalized = finalization_manifest(request)
             if finalized is not None and (
                 (
-                    finalized.get("runtime_probe") == manifest
+                    _ordered_runtime_evidence(finalized.get("runtime_probe")) == _ordered_runtime_evidence(manifest)
                     and finalized.get("source_request_id") == request_id(SupportRequest.model_validate(previous))
                 )
                 or (

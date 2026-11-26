@@ -2582,6 +2582,15 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
     memory.provenance = json.dumps(manifest)
     assert verify_runtime_profile(request)["status"] == "complete"
     assert _runtime.observed_model_dtype(memory.provenance)
+    for schema in (None, "aisimulate-onboarding-runtime-probe/v1"):
+        edited = {**manifest, "schema_version": schema}
+        if schema is None:
+            del edited["schema_version"]
+        memory.provenance = json.dumps(edited)
+        with pytest.raises(ValueError, match="bound NIXL observation"):
+            verify_runtime_profile(request)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(memory.provenance)
     for field in ("kind", "path", "sha256"):
         edited = json.loads(json.dumps(manifest))
         workers = [ref for ref in edited["source_artifacts"] if ref.get("kind") == "worker"]
@@ -2638,6 +2647,14 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
             assert all(set(artifact) == {"path", "sha256"} for artifact in compact["artifacts"])
             assert "worker_observations" not in compact
             assert "worker_observation_digests" not in saved
+            assert _runtime.observed_model_dtype(json.dumps(saved))
+            for key in ("rank_capacities", "source", "runtime_settings"):
+                memory["provenance"] = json.dumps({k: v for k, v in compact.items() if k != key})
+                with pytest.raises(ValueError, match="worker roster"):
+                    _runtime.observed_model_dtype(json.dumps(saved))
+            memory["provenance"] = "{"
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(saved))
             continue
         assert all(set(artifact) == {"kind", "path", "sha256"} for artifact in compact["artifacts"])
         assert [(r["phase"], r["tp_rank"], r["dp_rank"]) for r in compact["worker_observations"]] == [
@@ -2647,6 +2664,21 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
         assert saved["worker_observation_digests"] == [
             _runtime.nixl_observation_digest(json.dumps(compact), compact["observations_index"]["sha256"], "{}", False)
         ]
+        downgraded = {**saved, "observation_provenance": "source_references"}
+        del downgraded["worker_observation_digests"]
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(downgraded))
+        for section in ("instrumentation", "launch"):
+            edited = json.loads(json.dumps(compact))
+            if section == "instrumentation":
+                files = edited[section]["files"]
+                a, b = list(files)[:2]
+                files[a], files[b] = files[b], files[a]
+            else:
+                edited[section]["model_config"]["sha256"] = "0" * 64
+            memory["provenance"] = json.dumps(edited)
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(saved))
         injected = json.loads(json.dumps(compact))
         injected["artifacts"][0]["evidence"] = {"kind": "worker", "phase": "prefill"}
         memory["provenance"] = json.dumps(injected)
@@ -2711,6 +2743,16 @@ def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_so
     for reference in manifest["source_artifacts"]:
         assert hashlib.sha256(Path(reference["path"]).read_bytes()).hexdigest() == reference["sha256"]
     from aisim import _runtime
+
+    reordered = resolved.model_copy(deep=True)
+    reordered_manifest = json.loads(json.dumps(manifest))
+    reordered_manifest["source_artifacts"].reverse()
+    child = reordered_manifest["cell_observations"][0]["runtime_memory"]
+    compact = json.loads(child["provenance"])
+    compact["artifacts"].reverse()
+    child["provenance"] = json.dumps(compact)
+    reordered.profile_deployment().resources.runtime_memory.provenance = json.dumps(reordered_manifest)
+    assert verify_runtime_profile(reordered) is None
 
     for key, path_key in (("source_artifacts", "path"), ("formal_data", "relative_path")):
         edited = json.loads(json.dumps(manifest))

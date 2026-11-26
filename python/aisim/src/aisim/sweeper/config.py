@@ -1285,8 +1285,8 @@ class SearchSpace(BaseModel):
                         continue
                     if self.aic_nextn or self.speculation is not None:
                         raise ValueError("grouped FPM cache requires vLLM without speculative decoding")
-                    if getattr(self, f"{role}_enable_prefix_caching"):
-                        # The search has no prefix_match_unit. Each candidate is checked again with its own budget.
+                    if role == "agg" and self.agg_enable_prefix_caching:
+                        # Disaggregated enumeration already checked the eligible roles with their token budgets.
                         grouped_prefix_caching_requirements(
                             deployment,
                             backend_version=backend_version,
@@ -1294,7 +1294,7 @@ class SearchSpace(BaseModel):
                             prefix_match_unit=None,
                             max_batched_tokens=_role_runtime(self, "vllm", role)[0],
                             field=f"{role}_enable_prefix_caching",
-                            pd_rank=role != "agg",
+                            pd_rank=False,
                         )
                     if getattr(self, f"{role}_native_host_offload") is not None:
                         raise ValueError("grouped FPM cache supports only HBM without host offload")

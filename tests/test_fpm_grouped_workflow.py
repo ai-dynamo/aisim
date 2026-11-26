@@ -961,6 +961,7 @@ def test_grouped_kv_load_sizes_each_pd_role_by_its_bytes(grouped_case):
         "backend": "vllm",
         "backend_version": "0.31.0",
         "deployment_mode": "disagg",
+        "prefill_enable_prefix_caching": False,
         "gpu_budget": 4,
         "max_num_tokens": 128,
         "max_batch_size": 4,
@@ -1035,6 +1036,7 @@ def test_grouped_kv_load_sizes_each_pd_role_with_its_own_context_length(grouped_
         backend="vllm",
         backend_version="0.31.0",
         deployment_mode="disagg",
+        prefill_enable_prefix_caching=False,
         gpu_budget=4,
         max_num_tokens=128,
         max_batch_size=4,
@@ -2210,6 +2212,7 @@ def test_direct_grouped_pd_parallel_configs(grouped_case, pinned, case, error):
     kwargs = dict(
         gpu_budget=4,
         deployment_mode="disagg",
+        prefill_enable_prefix_caching=False,
         backend="vllm",
         backend_version=version,
         fpm_profile=profile,
@@ -2224,6 +2227,104 @@ def test_direct_grouped_pd_parallel_configs(grouped_case, pinned, case, error):
     else:
         with pytest.raises(ValueError, match=error):
             parallel_configs_for(profile["model"], "h200_sxm", **kwargs)
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize(
+    "flags,cold_role,refused",
+    [
+        ({}, "prefill", "prefill"),
+        ({"prefill": False, "decode": False}, "prefill", None),
+        ({"prefill": True, "decode": False}, "prefill", "prefill"),
+        ({"prefill": False, "decode": True}, "decode", "decode"),
+        ({"prefill": True, "decode": True}, "decode", "decode"),
+        ({"prefill": False, "decode": True}, "prefill", None),
+        ({"prefill": True, "decode": False}, "decode", None),
+        ({"prefill": True, "decode": True}, None, None),
+    ],
+)
+def test_direct_grouped_pd_prefix_policy_checks_each_role(grouped_case, pinned, flags, cold_role, refused):
+    from aisim.sweeper.parallel_enum import (
+        DisaggParallelConfig,
+        ParallelShape,
+        ReplicaParallelConfig,
+    )
+
+    profile, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(profile))
+    tensor = profile["deployments"][0]
+    profile["deployments"] = [{**deepcopy(tensor), "worker_type": role} for role in ("prefill", "decode")]
+    for row in profile["deployments"]:
+        if row["worker_type"] == cold_role:
+            memory = row["resources"]["runtime_memory"]
+            memory.update(enable_prefix_caching=False, mamba_cache_mode="none")
+            memory.pop("hash_block_size_tokens")
+    rank = ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), 1)
+    pair = DisaggParallelConfig(rank, rank)
+
+    def candidates(role=None):
+        candidate = rank if role else pair
+        return parallel_configs_for(
+            profile["model"],
+            "h200_sxm",
+            deployment_mode="agg" if role else "disagg",
+            worker_type=role or "aggregated",
+            backend="vllm",
+            backend_version="0.31.0",
+            gpu_budget=candidate.total_gpus,
+            max_seq_len=128,
+            max_num_tokens=128,
+            max_batch_size=4,
+            fpm_profile=profile,
+            systems_paths=[str(root)],
+            candidate_configs=[candidate] if pinned else None,
+            **{f"{role}_enable_prefix_caching": value for role, value in flags.items()},
+        )
+
+    if refused:
+        for role in (None, refused):
+            with pytest.raises(ValueError, match=f"{refused}_enable_prefix_caching=false for cold replay"):
+                candidates(role)
+    else:
+        assert candidates() == [pair]
+        assert candidates("prefill") == candidates("decode") == [rank]
+
+
+def test_warm_grouped_pd_search_keeps_the_supported_shape(grouped_case):
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.model_hw import NoViableParallelConfig
+    from aisim.sweeper.search_space import enumerate_branches
+
+    profile, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(profile))
+    cold, warm = profile["deployments"]
+    memory = cold["resources"]["runtime_memory"]
+    memory.update(enable_prefix_caching=False, mamba_cache_mode="none")
+    memory.pop("hash_block_size_tokens")
+    _write_timings(root, profile, version="0.31.0")
+    search = {**_pd_search(profile, root), "prefill_enable_prefix_caching": True}
+
+    def recommend(*rows):
+        choices = dict(search)
+        if rows:
+            pins = [
+                {"tp": row["tp"], "attention_dp": row["dp"], "moe_tp": row["moe_tp"], "moe_ep": row["moe_ep"]}
+                for row in rows
+            ]
+            choices["parallel_configs_by_mode"] = {"disagg": [{"prefill": p, "decode": p} for p in pins]}
+        smart = SmartSearchConfig(
+            search_space=choices, workload=Workload(isl=128, osl=2, concurrency=1, request_count=2)
+        )
+        (branch,) = enumerate_branches(smart, max_seq_len=128)
+        return branch.parallel_configs
+
+    (pair,) = recommend()
+    assert pair.prefill.shape.tp == pair.decode.shape.tp == warm["tp"]
+    assert recommend(warm) == (pair,)
+    with pytest.raises(
+        NoViableParallelConfig, match="pinned parallel_configs are legal/KV-feasible for no configured backend"
+    ):
+        recommend(warm, cold)
 
 
 @pytest.mark.parametrize("observed_role", ["prefill", "decode"])
