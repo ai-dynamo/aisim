@@ -35,10 +35,20 @@ def _save(path, payload):
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def _port():
+def _port(port=0):
     with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
+        listener.bind(("127.0.0.1", port))
         return listener.getsockname()[1]
+
+
+def _system_port():
+    # The pinned Dynamo sidecar parses DYN_SYSTEM_PORT as a signed i16.
+    for port in random.SystemRandom().sample(range(20000, 32768), 64):
+        try:
+            return _port(port)
+        except OSError:
+            continue
+    raise RuntimeError("no available Dynamo sidecar system port below 32768")
 
 
 @contextmanager
@@ -211,9 +221,10 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
             "kv_cache_config": {"enable_block_reuse": False, "free_gpu_memory_fraction": 0.85},
         },
     )
-    grpc, http, system = (_port() for _ in range(3))
+    system = _system_port()
+    grpc, http = _port(), _port()
     while len({grpc, http, system}) != 3:
-        grpc, http, system = (_port() for _ in range(3))
+        grpc, http = _port(), _port()
     url = f"http://127.0.0.1:{http}"
     script = Path(__file__).with_name("trtllm_serve.py").resolve()
     mounts = (root.parent.parent, snapshot, bindings, script.parent)
