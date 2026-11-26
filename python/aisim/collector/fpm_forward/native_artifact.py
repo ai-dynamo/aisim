@@ -547,7 +547,9 @@ def _glm_scheduled_counts(stage: dict, path: Path) -> list | None:
     return counts if counts is not None else observed
 
 
-def _validate_glm_chunks(stage: dict, path: Path, point: dict, *, counts: list | None = None) -> None:
+def _validate_glm_chunks(
+    stage: dict, path: Path, point: dict, *, counts: list | None = None, seed: bool = False
+) -> None:
     chunks = stage.get("prefill_chunks", [])
     if not isinstance(chunks, list) or any(
         not isinstance(step, list)
@@ -630,25 +632,45 @@ def _validate_glm_chunks(stage: dict, path: Path, point: dict, *, counts: list |
             minimums[pos] = maximums[pos] = total + decodes
 
     if counts is not None:
-        # Chunk lists omit decode-only outputs. Each such output can schedule at most one
-        # token per request. Unknown receipts and mixed steps may admit more than one match.
-        positions = {0}
-        for count in counts:
-            following = set(positions) if count is None or count <= point["batch_size"] else set()
-            for pos in positions:
-                if pos < len(chunks) and (count is None or (minimums[pos] <= count <= maximums[pos])):
-                    following.add(pos + 1)
-            positions = following
-        if len(chunks) not in positions:
-            raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
+        # A one-token prefill request finishes as soon as its prompt runs. In an accepted
+        # decode attempt every pure decode output is an FPM; the caller removed those two outputs.
+        if point["point_type"] == "prefill" or "repetition" in stage:
+            if len(counts) != len(chunks) or any(
+                count is not None and not low <= count <= high
+                for count, low, high in zip(counts, minimums, maximums, strict=False)
+            ):
+                raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
+        else:
+            # A discarded decode attempt can interleave extra pure-decode outputs with its chunks.
+            positions = {0}
+            for count in counts:
+                following = set(positions) if count is None or count <= point["batch_size"] else set()
+                for pos in positions:
+                    if pos < len(chunks) and (count is None or minimums[pos] <= count <= maximums[pos]):
+                        following.add(pos + 1)
+                positions = following
+            if len(chunks) not in positions:
+                raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
 
-    if point["point_type"] == "decode" and "repetition" in stage and chunks:
-        # The final preparation chunks finish these prompts before the first accepted pure-decode forward.
-        ends = [start + tokens for start, tokens in chunks[-1]]
-        if (limits is not None and Counter(ends) - Counter(limits)) or (
-            len(ends) == point["batch_size"] and sum(ends) != point["total_kv_read_tokens"] - point["batch_size"]
+    accepted_decode = point["point_type"] == "decode" and "repetition" in stage
+    if accepted_decode or (seed and limits is not None):
+        # The first chunk for each request can start at a cached prefix. A later chunk must
+        # continue from a previous end. Process a whole step before making its new ends available.
+        ends: Counter[int] = Counter()
+        for step in chunks:
+            starts = Counter(start for start, _ in step)
+            if seed and any(start for start in starts - ends):
+                raise ValueError(f"GLM seed chunks must start each fresh prompt at zero and continue it: {path}")
+            ends -= starts
+            ends.update(start + count for start, count in step)
+        if (limits is not None and ends != Counter(n for n in limits if n)) or (
+            accepted_decode
+            and (
+                ends.total() != point["batch_size"]
+                or sum(end * n for end, n in ends.items()) != point["total_kv_read_tokens"] - point["batch_size"]
+            )
         ):
-            raise ValueError(f"GLM final preparation chunks must finish the prompts read by the decode forward: {path}")
+            raise ValueError(f"GLM preparation chunks must finish the prompts recorded for this stage: {path}")
 
 
 def _validate_glm_repetitions(
@@ -687,7 +709,7 @@ def _validate_glm_repetitions(
     seed = record.get("seed", {})
     if not isinstance(seed, dict):
         raise ValueError(f"{error}: invalid prefix seed evidence: {path}")
-    _validate_glm_chunks(seed, path, point)
+    _validate_glm_chunks(seed, path, point, seed=True)
     rejected = record.get("rejected_repetitions", [])
     if not isinstance(rejected, list) or any(not isinstance(attempt, dict) for attempt in rejected):
         raise ValueError(f"{error}: invalid rejected repetitions: {path}")
@@ -698,6 +720,22 @@ def _validate_glm_repetitions(
         if type(attempt_id) is not int or attempt_id < 0 or attempt_id in rejected_ids:
             raise ValueError(f"{error}: invalid or duplicate rejected attempt ID: {path}")
         rejected_ids.add(attempt_id)
+        if point["point_type"] == "prefill" and "fpms" in attempt and "dispatches" in attempt:
+            fpms, dispatches = attempt["fpms"], attempt["dispatches"]
+            if not isinstance(fpms, list) or len(fpms) != len(dispatches):
+                raise ValueError(f"{error}: rejected prefill forwards and dispatches must align: {path}")
+            for fpm, receipt in zip(fpms, dispatches, strict=True):
+                graph = (fpm.get("benchmark_sample") or {}).get("cudagraph") if isinstance(fpm, dict) else None
+                if (
+                    receipt is not None
+                    and isinstance(graph, dict)
+                    and graph.get("status") == "observed"
+                    and any(
+                        not _same(graph.get(key), receipt[key])
+                        for key in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
+                    )
+                ):
+                    raise ValueError(f"{error}: rejected prefill forward contradicts its dispatch: {path}")
     previous_forward, previous_output = previous
     previous_attempt = -1
     for index, repetition in enumerate(repetitions):
@@ -717,7 +755,11 @@ def _validate_glm_repetitions(
         if not isinstance(fpms, list) or len(fpms) != len(steps):
             raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
         dispatches = repetition.get("dispatches")
-        if not isinstance(dispatches, list) or len(dispatches) < len(steps):
+        if (
+            not isinstance(dispatches, list)
+            or len(dispatches) < len(steps)
+            or (point["point_type"] == "prefill" and len(dispatches) != len(steps))
+        ):
             raise ValueError(f"{error}: missing dispatch receipt for {role} {index}: {path}")
         # Earlier dispatches can build the prefix. Only the final ones are the forwards of this repetition.
         receipts = dispatches[-len(steps) :]
@@ -774,6 +816,11 @@ def _validate_glm_repetitions(
                     f"{error}: dispatch differs from the scheduled token count {tokens} for {role} {index}: {path}"
                 )
             previous_forward = forward
+    if "rejected_repetitions" in record and (
+        previous_attempt != len(repetitions) + len(rejected_ids) - 1
+        or any(attempt > previous_attempt for attempt in rejected_ids)
+    ):
+        raise ValueError(f"{error}: the complete attempt history must end at the last accepted repetition: {path}")
     return previous_forward, previous_output
 
 

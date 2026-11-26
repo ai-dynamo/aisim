@@ -138,16 +138,18 @@ When the fallback reads an unregistered wrapper’s nested decoder at TP greater
 than one, the scalar request must supply the actual `dcp_size`. At TP1 the
 only legal value is one. The block API passes its DCP setting explicitly.
 
+A selected decoder’s automatic KV precision follows the requested backend release. For a symmetric per-tensor FP8 compressed-tensors checkpoint, vLLM selects FP8 from 0.22.0 and SGLang from 0.5.19. Earlier releases keep the model dtype. For a 32-layer BF16 Llama decoder at TP8 with one 128-element KV head per rank, that changes the transfer from 16,384 to 8,192 bytes per token. A config-only deployment with an unknown release uses the model dtype for these checkpoints.
+
 For vLLM expert parallelism, the estimate prices the rank holding the most
 experts. For example, its three EP ranks hold 43, 43 and 42 of Qwen3-30B-A3B's
-128 experts. A block-quantized expert shard must contain complete weight blocks.
+128 experts. SGLang’s unpadded CUDA FP8 experts require the local gate and up projections to fit the checkpoint’s output tile. Its row-parallel down projection must also fit the input tile. For a 768-wide expert and a 32 × 128 weight block, TP2 fits both axes and TP8 leaves a 96-wide shard.
 SGLang prefill context parallelism replicates the dense MLA cache on each rank,
 including Kimi K2.5's DeepSeek language decoder. [vLLM expert placement](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/fused_moe/expert_map_manager.py), [SGLang Kimi K2.5 implementation](https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/models/kimi_k25.py)
 
 A selected sparse MLA decoder stores a latent, BF16 rotary keys, and a scaled
 FP8 index per layer. For GLM-5.3-NVFP4 with BF16 KV, each of 78 layers stores
 512 × 2 + 64 × 2 + 132 bytes, or 100,152 bytes per token across the decoder.
-Quantized sparse MLA requires the selected backend's latent and indexer formats.
+With vLLM on Hopper, DeepSeek-V3.2 uses BF16 KV by default despite its FP8 weights. Its 61 layers transfer 78,324 bytes per token. Quantized sparse MLA requires the selected backend's latent and indexer formats.
 For example, FlashMLA stores an extra four FP32 scales in a 512-element FP8
 latent. Shared capacity also needs the runtime indexer allocation. Recurrent and
 other per-layer layouts require their runtime state or group measurements.

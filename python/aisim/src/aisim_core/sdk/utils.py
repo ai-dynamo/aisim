@@ -1865,18 +1865,23 @@ def _get_language_quantization_config(raw_config: dict) -> dict | None:
     return nested.get("quantization_config", {}) if isinstance(nested, dict) else {}
 
 
-def validate_fp8_moe_shard(raw_config: dict, intermediate_size: int, moe_tp_size: int) -> None:
-    """FP8 block-quantized experts must shard on complete weight blocks."""
+def validate_fp8_moe_shard(
+    raw_config: dict, intermediate_size: int, moe_tp_size: int, *, sglang_tp_size: int | None = None
+) -> None:
+    """Check the checkpoint blocks partitioned by the gate/up and SGLang down projections."""
     quantization = _get_language_quantization_config(raw_config) or {}
     shape = quantization.get("weight_block_size", [128, 128])
-    if not isinstance(shape, (list, tuple)) or not shape or type(shape[0]) is not int or shape[0] <= 0:
-        raise ValueError("weight_block_size must supply a positive integer expert block width")
-    block = shape[0]
-    if (intermediate_size // moe_tp_size) % block:
-        raise ValueError(
-            f"Invalid quantized MoE configuration: (moe_intermediate_size={intermediate_size} / "
-            f"moe_tp_size={moe_tp_size}) % weight_block_size={block} != 0."
-        )
+    if sglang_tp_size is not None and quantization.get("quant_method") == "mxfp8":
+        shape = [1, 32]  # SGLang's MXFP8 reader fixes both axes even when the checkpoint supplies another shape.
+    if not isinstance(shape, (list, tuple)) or len(shape) != 2 or any(type(n) is not int or n <= 0 for n in shape):
+        raise ValueError("weight_block_size must supply two positive integer expert block dimensions")
+    # The row-parallel down projection also shards its input across SGLang tensor-parallel ranks.
+    for block in shape if sglang_tp_size and sglang_tp_size > 1 else shape[:1]:
+        if (intermediate_size // moe_tp_size) % block:
+            raise ValueError(
+                f"Invalid quantized MoE configuration: (moe_intermediate_size={intermediate_size} / "
+                f"moe_tp_size={moe_tp_size}) % weight_block_size={block} != 0."
+            )
 
 
 def _infer_quantization_fields(raw_config: dict) -> dict[str, object]:

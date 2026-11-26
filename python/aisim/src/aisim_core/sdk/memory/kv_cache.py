@@ -55,6 +55,8 @@ from collections.abc import Callable
 from functools import partial
 from typing import Any
 
+from packaging.version import Version
+
 from aisim_core.data.ensure import MissingDataError
 from aisim_core.decoder_config import (
     FPM_DECODER_ARCHITECTURES,
@@ -80,6 +82,7 @@ from aisim_core.sdk.common import (
     KVCacheQuantMode,
     MoEQuantMode,
     dsa_kv_cache_entry_bytes,
+    parse_support_matrix_version,
 )
 from aisim_core.sdk.config import validate_parallel_size
 from aisim_core.sdk.config_builders import apply_nextn, build_model_config, validate_moe_controls, validate_nextn
@@ -118,7 +121,55 @@ _SELECTED_DECODER_ARCHITECTURES = {
 }
 
 
-def _automatic_decoder_kv_mode(document: dict, raw: dict, backend: str) -> KVCacheQuantMode | None:
+# A missing field in a known Transformers config can have a fixed class default.
+# An explicit null still follows the model's own derived-dimension path.
+_DECODER_HEAD_DEFAULTS = {
+    # model_type: (head_dim, num_key_value_heads)
+    "gemma3_text": (256, 4),
+    "gemma4_text": (256, 4),
+    "glm4_moe": (None, 8),
+    "gpt_oss": (64, 8),
+    "llama4_text": (128, 8),
+    "minimax_m2": (128, 8),
+    "mistral": (None, 8),
+    "mixtral": (None, 8),
+    "qwen2": (None, 32),
+    "qwen2_moe": (None, 16),
+    "qwen3": (128, 32),
+    "qwen3_moe": (None, 4),
+    "qwen3_vl_text": (128, 32),
+    "qwen3_vl_moe_text": (None, 16),
+}
+
+
+def _config_only_backend_version(
+    system: str | None, backend: str, requested: str | None, systems_path: str | list[str] | None = None
+) -> str | None:
+    """Resolve cache semantics for a config-only estimate, including a deployment with no local timing data."""
+    if backend not in ("vllm", "sglang") or requested not in (None, "current", "previous", "next"):
+        return requested
+    if system is None:
+        return None
+    try:
+        slots = perf_database.get_version_slots(system, backend, systems_paths=systems_path) or {}
+        if requested is None and not slots:
+            return perf_database.get_latest_database_version(system, backend, systems_paths=systems_path)
+        return slots.get(requested or "current")
+    except MissingDataError:
+        return None
+
+
+def _config_only_sm_version(system: str | None, systems_path: str | list[str] | None) -> int | None:
+    """Read the target CUDA capability when its system spec is available offline."""
+    try:
+        return perf_database.load_system_spec(system, systems_path).get("gpu", {}).get("sm_version")
+    except MissingDataError:
+        return None
+
+
+def _automatic_decoder_kv_mode(
+    document: dict, raw: dict, backend: str, backend_version: str | None
+) -> KVCacheQuantMode | None:
     """Resolve the serving backend's automatic cache dtype, retaining the checkpoint metadata's original scope."""
     if backend not in ("vllm", "sglang"):
         return None
@@ -139,12 +190,17 @@ def _automatic_decoder_kv_mode(document: dict, raw: dict, backend: str) -> KVCac
             return None
     if not isinstance(quant, dict):
         return None
+    release = parse_support_matrix_version(backend_version)
     method = str(quant.get("quant_method", "")).lower()
     scheme = quant.get("kv_cache_scheme")
     if backend == "sglang" and method in ("fp8", "mxfp8"):
+        if release is None or release < Version("0.5.18"):
+            return None
         algo = quant.get("kv_cache_quant_algo")  # Both names use SGLang's Fp8Config.
         return KVCacheQuantMode.fp8 if isinstance(algo, str) and algo.upper() == "FP8" else None
     if method.replace("_", "-") == "compressed-tensors" and scheme is not None:
+        if release is None or release < Version("0.5.19" if backend == "sglang" else "0.22.0"):
+            return None
         fp8 = isinstance(scheme, dict) and scheme.get("type") == "float" and scheme.get("num_bits") == 8
         if backend == "sglang":
             if (
@@ -160,16 +216,23 @@ def _automatic_decoder_kv_mode(document: dict, raw: dict, backend: str) -> KVCac
         return KVCacheQuantMode.fp8
     section = quant.get("quantization") or {}
     producer = (quant.get("producer") or {}).get("name")
-    if not (method.startswith("modelopt") or producer == "modelopt" or "modelopt_quant_config" in section):
+    if not (
+        method.startswith("modelopt")
+        or producer == "modelopt"
+        or "modelopt_quant_config" in section
+        or (backend == "sglang" and quant is sidecar and section.get("quant_algo"))
+    ):
         return None
     if backend == "sglang":
-        if quant.get("quant_algo") is not None and isinstance(scheme, dict):
-            fp8 = scheme.get("type") == "float" and scheme.get("num_bits") == 8
-        else:
-            # ModelOpt's flat reader ignores a string kv_cache_scheme. Its legacy reader uses kv_cache_quant_algo.
-            algo = (quant if quant.get("quant_algo") is not None else section).get("kv_cache_quant_algo")
-            fp8 = isinstance(algo, str) and algo.upper() == "FP8"
-        return KVCacheQuantMode.fp8 if fp8 else None
+        if quant.get("quant_algo") is not None:
+            if isinstance(scheme, dict):
+                return KVCacheQuantMode.fp8 if scheme.get("type") == "float" and scheme.get("num_bits") == 8 else None
+            # The flat reader learned to fall back to kv_cache_quant_algo in 0.5.15.
+            if release is None or release < Version("0.5.15"):
+                return None
+            section = quant
+        algo = section.get("kv_cache_quant_algo")
+        return KVCacheQuantMode.fp8 if isinstance(algo, str) and algo.upper() == "FP8" else None
     if not method.startswith("modelopt") and not section.get("quant_algo"):
         return None  # vLLM normalizes a legacy ModelOpt section to a quant_method before resolving its cache.
     algo = (
@@ -182,9 +245,12 @@ def _automatic_decoder_kv_mode(document: dict, raw: dict, backend: str) -> KVCac
         if algo.get("type") == "float" and algo.get("num_bits") == 8 and algo.get("dynamic") is False:
             return KVCacheQuantMode.fp8
         if algo.get("type") == "float" and algo.get("num_bits") == 4:
-            return KVCacheQuantMode.nvfp4
-        return None
-    return {"fp8": KVCacheQuantMode.fp8, "nvfp4": KVCacheQuantMode.nvfp4}.get(str(algo).lower())
+            algo = "nvfp4"
+        else:
+            return None
+    if str(algo).lower() == "nvfp4":
+        return KVCacheQuantMode.nvfp4 if release is not None and release >= Version("0.20.0") else None
+    return KVCacheQuantMode.fp8 if str(algo).lower() == "fp8" else None
 
 
 _ONE_GIB = 1 << 30
@@ -779,6 +845,9 @@ class NaiveKVCacheEstimator:
         moe_ep_size: int = 1,
         moe_tp_size: int = 1,
         backend: str = "vllm",
+        backend_version: str | None = None,
+        system: str | None = None,
+        systems_paths: list[str] | None = None,
     ) -> NaiveKVCacheEstimator:
         """Build from an HF ``config.json`` (local dir / pre-cached / optional download).
 
@@ -801,6 +870,7 @@ class NaiveKVCacheEstimator:
             moe_ep_size=moe_ep_size,
             moe_tp_size=moe_tp_size,
             backend=backend,
+            backend_version=backend_version,
         )
 
         if estimator._selected_decoder is not None:
@@ -814,9 +884,27 @@ class NaiveKVCacheEstimator:
                 sidecar = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
             if sidecar is not None:
                 estimator._selected_decoder = attach_quantization_sidecar(estimator._selected_decoder, sidecar)
-                estimator._set_checkpoint_cache_precision(estimator._selected_decoder, backend, hf_config)
+            raw = estimator._selected_decoder
+            if sidecar is not None or (
+                system is not None
+                and (
+                    estimator._nested_index_head_dim is not None
+                    or raw.get("quantization_config")
+                    or raw.get("hf_quant_config")
+                    or hf_config.get("compression_config")
+                )
+            ):
+                version = _config_only_backend_version(system, backend, backend_version, systems_paths)
+                sm = (
+                    _config_only_sm_version(system, systems_paths)
+                    if estimator._nested_index_head_dim is not None
+                    else None
+                )
+                estimator._set_checkpoint_cache_precision(raw, backend, version, hf_config, sm_version=sm)
         elif "deepseek_v4" in estimator.geometry:
-            estimator._set_checkpoint_cache_precision(_load_model_config_from_model_path(model_path), backend)
+            estimator._set_checkpoint_cache_precision(
+                _load_model_config_from_model_path(model_path), backend, backend_version
+            )
         return estimator
 
     @classmethod
@@ -829,6 +917,7 @@ class NaiveKVCacheEstimator:
         moe_ep_size: int = 1,
         moe_tp_size: int = 1,
         backend: str = "vllm",
+        backend_version: str | None = None,
     ) -> NaiveKVCacheEstimator:
         """Build directly from an already-loaded HF ``config.json`` dictionary.
 
@@ -888,6 +977,39 @@ class NaiveKVCacheEstimator:
                 if selected_type is not None and not isinstance(selected_type, str):
                     raise ValueError(f"{key}.model_type must be a string") from error
                 selected = _SELECTED_DECODER_ARCHITECTURES.get(selected_type)
+                classes = raw_decoder.get("architectures") or []
+                named = classes[0] if isinstance(classes, list) and classes and isinstance(classes[0], str) else None
+                if (
+                    selected
+                    and named
+                    and named != selected
+                    and not (selected == "Step3p5ForCausalLM" and ARCHITECTURE_TO_MODEL_FAMILY.get(named) == "STEP3P7")
+                ):
+                    raise ValueError(f"model_type={selected_type!r} conflicts with architectures={named!r}") from error
+                if selected_type is None and named:
+                    selected_type = next(
+                        (kind for kind, name in _SELECTED_DECODER_ARCHITECTURES.items() if name == named),
+                        None,
+                    )
+                head_dim, kv_heads = _DECODER_HEAD_DEFAULTS.get(selected_type, (None, None))
+                if head_dim is not None and "attention_head_dim" not in raw_decoder:
+                    raw_decoder.setdefault("head_dim", head_dim)
+                if kv_heads is not None and not any(
+                    name in raw_decoder for name in ("num_kv_heads", "n_head_kv", "n_kv_heads")
+                ):
+                    raw_decoder.setdefault("num_key_value_heads", kv_heads)
+                if selected_type == "gemma3_text":
+                    if "sliding_window_size" not in raw_decoder:
+                        raw_decoder.setdefault("sliding_window", 4096)
+                    if raw_decoder.get("layer_types") is None:
+                        raw_decoder.pop("layer_types", None)
+                        layout_integer(raw_decoder.setdefault("sliding_window_pattern", 6), "sliding_window_pattern")
+                    if raw_decoder.get("use_bidirectional_attention") and raw_decoder.get("sliding_window"):
+                        raw_decoder["sliding_window"] = (
+                            layout_integer(raw_decoder["sliding_window"], "sliding_window") // 2 + 1
+                        )
+                if selected_type == "gemma4_text":
+                    raw_decoder.setdefault("global_head_dim", 512)
                 if not raw_decoder.get("architectures") and selected_type in (
                     "deepseek_v32",
                     "glm_moe_dsa",
@@ -903,6 +1025,7 @@ class NaiveKVCacheEstimator:
                     moe_ep_size=moe_ep_size,
                     moe_tp_size=moe_tp_size,
                     backend=backend,
+                    backend_version=backend_version,
                 )
                 if hf_config.get("hf_quant_config") is not None:
                     raw_decoder = attach_quantization_sidecar(raw_decoder, hf_config["hf_quant_config"])
@@ -910,8 +1033,8 @@ class NaiveKVCacheEstimator:
                 # complete native timing config (for example max_position_embeddings).
                 decoder.architecture = decoder.architecture or selected
                 decoder._selected_decoder = _attach_inferred_quant_fields(dict(raw_decoder))
-                decoder._resolve_nested_cache(raw_decoder, architecture)
-                decoder._set_checkpoint_cache_precision(decoder._selected_decoder, backend, hf_config)
+                decoder._resolve_nested_cache(raw_decoder, architecture, backend)
+                decoder._set_checkpoint_cache_precision(decoder._selected_decoder, backend, backend_version, hf_config)
                 decoder.architecture = decoder.architecture or architecture
                 return decoder
         estimator = cls(
@@ -931,25 +1054,57 @@ class NaiveKVCacheEstimator:
                 "compressed KV storage varies with position; use the native sequence geometry or a runtime profile"
             )
         if "deepseek_v4" in estimator.geometry:
-            estimator._set_checkpoint_cache_precision(_attach_inferred_quant_fields(dict(hf_config)), backend)
+            estimator._set_checkpoint_cache_precision(
+                _attach_inferred_quant_fields(dict(hf_config)), backend, backend_version
+            )
         return estimator
 
-    def _set_checkpoint_cache_precision(self, raw: dict, backend: str, document: dict | None = None) -> None:
-        if "deepseek_v4" in self.geometry or self._nested_index_head_dim is not None:
-            inferred = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
-            if "deepseek_v4" in self.geometry:
-                self._v4_cache_mode = inferred
-            else:
-                self.set_kvcache_quant_mode((inferred or KVCacheQuantMode.bfloat16).name)
+    def _set_checkpoint_cache_precision(
+        self,
+        raw: dict,
+        backend: str,
+        backend_version: str | None,
+        document: dict | None = None,
+        *,
+        sm_version: int | None = None,
+    ) -> None:
+        if "deepseek_v4" in self.geometry:
+            self._v4_cache_mode = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
             return
-        mode = _automatic_decoder_kv_mode(document or {}, raw, backend)
+        mode = _automatic_decoder_kv_mode(document or {}, raw, backend, backend_version)
+        if self._nested_index_head_dim is not None:
+            if backend == "sglang" and sm_version is not None:
+                # SGLang selects the DSA pool before loading the quantized weights.
+                release = parse_support_matrix_version(backend_version)
+                bf16_sinks = raw.get("learnable_sink") and release is not None and release >= Version("0.5.20")
+                mode = KVCacheQuantMode.fp8 if sm_version >= 100 and not bf16_sinks else KVCacheQuantMode.bfloat16
+            elif backend == "vllm":
+                # FlashMLA on Hopper keeps the model dtype under auto, independently of FP8 expert weights.
+                declared = raw.get("kv_cache_quant_algo")
+                if mode is None and declared in ("fp8", "nvfp4"):
+                    mode = KVCacheQuantMode[declared]
+                release = parse_support_matrix_version(backend_version)
+                if sm_version is not None and (
+                    120 <= sm_version < 130
+                    or (
+                        100 <= sm_version < 110
+                        and self.architecture == "GlmMoeDsaForCausalLM"
+                        and (release is None or release >= Version("0.32.0"))
+                    )
+                ):
+                    mode = mode or KVCacheQuantMode.fp8
+            else:
+                mode = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
         self.dtype_bytes = mode.value.memory if mode is not None else self.weight_dtype_bytes
 
-    def _resolve_nested_cache(self, decoder: dict, wrapper: str | None) -> None:
+    def _resolve_nested_cache(self, decoder: dict, wrapper: str | None, backend: str) -> None:
         """Use the selected decoder's storage declarations before admitting it to the generic scalar estimator."""
         layers = self.geometry.get("layers")
         if self.pp_size > 1 and (
-            not layers or layers % self.pp_size or self.geometry.get("num_swa_layers") or "deepseek_v4" in self.geometry
+            not layers
+            or layers % self.pp_size
+            or (self.geometry.get("num_swa_layers") and self.geometry.get("num_global_layers"))
+            or "deepseek_v4" in self.geometry
         ):
             self._scalar_cache_problem = (
                 "per-rank pipeline KV sizing requires the resident attention layers on each stage"
@@ -990,14 +1145,15 @@ class NaiveKVCacheEstimator:
             "index_source_layer_ids",
             "per_layer_config",
         )
-        separate_heads = any(decoder.get(key) for key in ("swa_num_key_value_heads", "swa_head_dim"))
+        step = ARCHITECTURE_TO_MODEL_FAMILY.get(self.architecture) == "STEP3P7"
+        # vLLM uses Step's decoder-wide KV heads on every attention layer.
+        separate_heads = not (step and backend == "vllm") and any(
+            decoder.get(key) for key in ("swa_num_key_value_heads", "swa_head_dim")
+        )
         if (
             any(decoder.get(key) for key in per_layer)
             or (separate_heads and not (self.geometry.get("swa_kv_heads") or self.geometry.get("swa_head_dim")))
-            or (
-                decoder.get("attention_other_setting")
-                and ARCHITECTURE_TO_MODEL_FAMILY.get(self.architecture) != "STEP3P7"
-            )
+            or (decoder.get("attention_other_setting") and not step)
         ):
             self._scalar_cache_problem = "per-layer cache sizing of this decoder requires runtime cache geometry"
             return
@@ -1352,7 +1508,10 @@ class NaiveKVCacheEstimator:
 
     def _attention_group_rates(self) -> tuple[float, float]:
         sliding, full = self._attention_layer_rates()
-        return sliding * self.geometry["num_swa_layers"], full * self.geometry["num_global_layers"]
+        stages = self.pp_size if self._selected_decoder is not None else 1
+        return sliding * (self.geometry["num_swa_layers"] // stages), full * (
+            self.geometry["num_global_layers"] // stages
+        )
 
     def set_kvcache_quant_mode(self, mode: str) -> None:
         """Apply an explicit KV precision independently of the checkpoint's weight width."""
@@ -1395,7 +1554,7 @@ class NaiveKVCacheEstimator:
                 self.architecture not in ("LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM")
                 or self.tp_size != 1
                 or layers % self.pp_size
-                or geom.get("num_swa_layers")
+                or (geom.get("num_swa_layers") and geom.get("num_global_layers"))
                 or geom.get("num_experts")
                 or self.weight_dtype_bytes < 2
                 or any(raw.get(key) for key in ("quantization_config", "hf_quant_config", "quant_algo"))
@@ -1992,12 +2151,14 @@ def estimate_kv_cache(
                 f"unsupported model/backend/GPU for KV-cache estimation: "
                 f"model={model_path}, backend={backend}, gpu_sku={system}: {exc}"
             ) from exc
+        version = _config_only_backend_version(system, backend, backend_version, systems_path)
         naive = NaiveKVCacheEstimator.from_model_path(
             model_path,
             tp_size=int(tp_size),
             pp_size=int(pp_size),
             allow_hf_config_download=allow_hf_config_download,
             backend=backend,
+            backend_version=version,
             moe_ep_size=int(moe_ep_size or 1),
             moe_tp_size=int(moe_tp_size or 1),
         )
@@ -2053,23 +2214,40 @@ def estimate_kv_cache(
             if not intermediate or intermediate % naive.moe_tp_size:
                 raise ValueError("expert intermediate width must be positive and divisible by moe_tp_size") from exc
         if raw is not None and experts and moe_quant_mode in (None, "fp8_block"):
-            validates_tiles = hasattr(model_class, "_validate_fp8_block_quantized_moe_config") or (
-                model_class is None and "weight_block_size" in (raw.get("quantization_config") or {})
+            quant = raw.get("quantization_config") or {}
+            if backend == "sglang" and quant.get("quant_method") == "mxfp8":
+                release = parse_support_matrix_version(version)
+                if release is None or release < Version("0.5.9"):
+                    raise ValueError("SGLang MXFP8 expert weights require backend version 0.5.9 or later") from exc
+                sm = _config_only_sm_version(system, systems_path)
+                if sm is not None and sm < 100:
+                    raise ValueError(
+                        "SGLang MXFP8 expert weights require a Blackwell CUDA GPU (SM100 or later)"
+                    ) from exc
+            sglang_fp8 = backend == "sglang" and (
+                quant.get("quant_method") == "mxfp8"
+                or (quant.get("quant_method") == "fp8" and quant.get("weight_block_size") is not None)
             )
-            if validates_tiles and (
-                moe_quant_mode == "fp8_block"
-                or _infer_quant_modes_from_raw_config(raw, naive.architecture).get("moe_quant_mode")
-                is MoEQuantMode.fp8_block
+            if sglang_fp8 and quant.get("activation_scheme") != "dynamic":
+                raise ValueError("SGLang block-quantized FP8 expert weights require dynamic activations") from exc
+            sdk_tiles = hasattr(model_class, "_validate_fp8_block_quantized_moe_config") or (
+                model_class is None and "weight_block_size" in quant
+            )
+            if sglang_fp8 or (
+                sdk_tiles
+                and (
+                    moe_quant_mode == "fp8_block"
+                    or _infer_quant_modes_from_raw_config(raw, naive.architecture).get("moe_quant_mode")
+                    is MoEQuantMode.fp8_block
+                )
             ):
-                validate_fp8_moe_shard(raw, intermediate, naive.moe_tp_size)
+                validate_fp8_moe_shard(
+                    raw,
+                    intermediate,
+                    naive.moe_tp_size,
+                    sglang_tp_size=max(tp_size * attention_dp_size, naive.moe_tp_size) if backend == "sglang" else None,
+                )
         # With no deployment specified, preserve the conservative unsharded expert weight estimate.
-        version = backend_version
-        if backend == "vllm" and version in (None, "current", "previous", "next"):
-            try:
-                slots = perf_database.get_version_slots(system, backend, systems_paths=systems_path) or {}
-            except MissingDataError:
-                slots = {}  # A config-only estimate uses the unknown-version bound when no catalog is cached.
-            version = slots.get(version or "current")
         if kvcache_quant_mode is not None:
             naive.set_kvcache_quant_mode(kvcache_quant_mode)
         estimate = naive.estimate(

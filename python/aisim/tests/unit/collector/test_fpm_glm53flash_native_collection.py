@@ -829,6 +829,10 @@ def test_glm_publication_matches_each_dispatch_to_its_scheduled_tokens(tmp_path,
         ("prefix", "prefix or new tokens"),
         ("rejected-chunk", "scheduled token counts|prefix or new tokens"),
         ("reused-id", "invalid accepted"),
+        ("missing-id", "complete attempt history"),
+        ("trailing-reject", "complete attempt history"),
+        ("rejected-dispatch", "contradicts its dispatch"),
+        ("extra-prefill-dispatch", "invalid|missing dispatch"),
     ],
 )
 def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_path, fault, reason):
@@ -843,6 +847,12 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
         if fault == "prefix":
             warmup["prefill_chunks"][0][0][0] = 0
             return
+        if fault == "extra-prefill-dispatch":
+            warmup["scheduled_token_counts"].insert(0, 1)
+            warmup["dispatches"].insert(
+                0, {"runtime_mode": "NONE", "num_padded_tokens": 1, "num_unpadded_tokens": 1, "num_paddings": 0}
+            )
+            return
         for repetition in record["repetitions"]:
             repetition["attempt"] += 1
         rejected = copy.deepcopy(warmup)
@@ -852,8 +862,16 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
         record["rejected_repetitions"] = [rejected]
         if fault == "rejected-chunk":
             rejected["prefill_chunks"][0][0][1] = 4
-        else:
+        elif fault == "reused-id":
             rejected["attempt"] = warmup["attempt"]
+        elif fault == "missing-id":
+            record["repetitions"][-1]["attempt"] += 1
+        elif fault == "trailing-reject":
+            rejected["attempt"] = len(record["repetitions"]) + 1
+        else:
+            rejected["fpms"][0]["benchmark_sample"]["cudagraph"].update(
+                num_padded_tokens=1, num_unpadded_tokens=1, num_paddings=0
+            )
 
     _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, reason)
 
@@ -886,12 +904,15 @@ def test_glm_publication_reads_the_measured_tail_after_prefix_preparation(tmp_pa
         ("prep-count", "scheduled token count"),
         ("unobserved-count", "scheduled token count"),
         ("seed-chunk", "aligned starts"),
+        ("incomplete-seed", "finish the prompts"),
+        ("unseeded-prefix", "start each fresh prompt at zero"),
         ("repetition-chunk", "aligned starts"),
         ("chunk-length", "positive lengths"),
         ("chunk-outside-prompt", "exceeds the recorded prompt"),
         ("chunk-count", "contradicts the scheduled token counts"),
         ("chunk-receipt", "contradicts the scheduled token counts"),
         ("decode-prefix", "finish the prompts"),
+        ("broken-chain", "finish the prompts"),
         ("prep-padding", "preparation dispatch receipt or padding"),
         ("prep-type", "preparation dispatch receipt or padding"),
         ("rejected-alignment", "aligned starts"),
@@ -920,12 +941,20 @@ def test_glm_publication_checks_preparation_and_rank_time(tmp_path, corruption, 
             repetition["scheduled_token_counts"][0] = True
         elif corruption == "seed-chunk":
             record["seed"]["prefill_chunks"][0][0][0] = 1
+        elif corruption == "incomplete-seed":
+            record["seed"].update(lengths=[2176], prefill_chunks=[[[0, 4]]])
+        elif corruption == "unseeded-prefix":
+            record["seed"].update(lengths=[2176], prefill_chunks=[[[2048, 128]]])
         elif corruption == "repetition-chunk":
             repetition["prefill_chunks"][1][0][0] = 2177
         elif corruption == "chunk-length":
             repetition["prefill_chunks"][0][0][1] = 0
         elif corruption == "decode-prefix":
             repetition["prefill_chunks"][1][0][0] = 0
+        elif corruption == "broken-chain":
+            repetition["prefill_chunks"][0][0][1] = 4
+            repetition["scheduled_token_counts"][0] = 4
+            repetition["dispatches"][0].update(num_unpadded_tokens=4, num_padded_tokens=4)
         elif corruption == "chunk-outside-prompt":
             repetition["prefill_chunks"][0][0][1] = 21760
         elif corruption in {"chunk-count", "chunk-receipt"}:
@@ -946,6 +975,25 @@ def test_glm_publication_checks_preparation_and_rank_time(tmp_path, corruption, 
                 interval["end_monotonic"] += 3600
 
     _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, reason)
+
+
+def test_glm_decode_preparation_must_finish_every_prompt_in_the_batched_forward(tmp_path):
+    cell = glm_cell("decode")
+    payload = glm_native_payload("decode", points=[DECODE_POINTS[1]])
+    _glm_producer_shape(tmp_path)("decode", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+
+    def corrupt(record):
+        first = record["repetitions"][0]
+        # B=2. A single 1,919-token chunk can finish only one of the two 4,095-token prompts.
+        first["prompt_specs"] = [[[0, 4095]], [[128, 4095]]]
+        first["prefill_chunks"] = [[[2176, 1919]]]
+        first["scheduled_token_counts"].insert(0, 1919)
+        first["dispatches"].insert(
+            0, {"runtime_mode": "NONE", "num_unpadded_tokens": 1919, "num_padded_tokens": 1919, "num_paddings": 0}
+        )
+
+    _check_altered_repetition(tmp_path, cell, payload, artifact, corrupt, "finish the prompts")
 
 
 @pytest.mark.parametrize("fault", ["index", "time"])

@@ -460,6 +460,8 @@ def test_prediction_host_offload_auto_geometry_uses_aggregated_shape(
             "moe_tp_size": 1,
             "moe_ep_size": 1,
             "backend": "vllm",
+            "backend_version": None,
+            "system": "h200_sxm",
             "kvcache_quant_mode": None,
         }
     ]

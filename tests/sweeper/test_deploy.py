@@ -300,7 +300,7 @@ def test_fixed_host_offload_descriptor_lowers_into_aggregated_engine_args():
 
 def test_disagg_auto_transfer_geometry_uses_prefill_source_shape(monkeypatch):
     def estimate(_model, *, backend, **shape):
-        assert backend == "sglang"
+        assert backend == "sglang" and shape["backend_version"] == BACKEND_VERSION
         return 10_000 * shape["tp_size"] + shape["pp_size"]
 
     monkeypatch.setattr(deploy_module, "estimate_kv_bytes_per_token", estimate)

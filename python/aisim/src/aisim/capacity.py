@@ -573,6 +573,7 @@ def estimate_kv_bytes_per_token(
     system: str | None = None,
     backend: str = "vllm",
     backend_version: str | None = None,
+    systems_paths: list[str] | None = None,
     attention_dp_size: int = 1,
 ) -> int:
     """Derive per-rank KV bytes/token from the resolved Hugging Face config."""
@@ -607,6 +608,9 @@ def estimate_kv_bytes_per_token(
         moe_ep_size=moe_ep_size,
         allow_hf_config_download=True,
         backend=backend,
+        backend_version=backend_version,
+        system=system,
+        systems_paths=systems_paths,
     )
     kvcache_quant_mode = _quant_mode_name("kvcache", kvcache_quant_mode)
     if getattr(estimator, "architecture", None) == "DeepseekV4ForCausalLM":

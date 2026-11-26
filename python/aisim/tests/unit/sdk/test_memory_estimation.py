@@ -2084,6 +2084,30 @@ def test_nested_sparse_mla_marginal_includes_indexer_and_bf16_rope(tmp_path, nam
                 fn(model, "missing", "sglang", "0.5.20", **opts, kvcache_quant_mode=mode)
 
 
+def test_weight_only_sparse_mla_uses_the_default_cache_of_its_serving_gpu(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3.2")
+    model = _write_config(tmp_path, {"text_config": raw})
+    for system, sm in (("hopper", 90), ("blackwell", 100), ("sm120", 120)):
+        (tmp_path / f"{system}.yaml").write_text(f"gpu: {{sm_version: {sm}}}\n")
+        for backend, version in (("vllm", "0.33.0"), ("sglang", "0.5.20")):
+            args = dict(
+                tp_size=8,
+                pp_size=1,
+                backend=backend,
+                backend_version=version,
+                system=system,
+                systems_paths=[str(tmp_path)],
+            )
+            if sm == 120 or (backend == "sglang" and sm == 100):
+                with pytest.raises(ValueError, match="runtime latent and indexer cache formats"):
+                    estimate_kv_bytes_per_token(model, **args)
+            else:
+                assert estimate_kv_bytes_per_token(model, **args) == 61 * (512 * 2 + 64 * 2 + 132) == 78_324
+
+
 def test_nested_sparse_index_declaration_requires_a_complete_known_layout(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
@@ -2103,6 +2127,25 @@ def test_nested_sparse_index_declaration_requires_a_complete_known_layout(tmp_pa
         model = _write_config(folder, {"text_config": {**raw, **declaration}})
         with pytest.raises(ValueError, match="complete supported MLA and indexer geometry"):
             estimate_kv_bytes_per_token(model, tp_size=16, pp_size=1)
+
+
+def test_homogeneous_pipeline_groups_transfer_only_the_resident_layers(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    gemma = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")["text_config"]
+    gemma["layer_types"] = ["full_attention"] * 30
+    qwen = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
+    qwen.update(
+        use_sliding_window=True, sliding_window=1024, max_window_layers=0, layer_types=["sliding_attention"] * 28
+    )
+    for raw, width in ((gemma, 122_880), (qwen, 114_688)):
+        model = _write_config(tmp_path, {"text_config": raw})
+        for backend in ("vllm", "sglang"):
+            for pp_size in (1, 2):
+                assert (
+                    estimate_kv_bytes_per_token(model, tp_size=1, pp_size=pp_size, backend=backend) == width // pp_size
+                )
 
 
 def test_normalized_gemma_per_layer_heads_require_their_physical_cache_geometry(tmp_path):
@@ -2282,8 +2325,63 @@ def test_wrapped_fp8_moe_shards_must_contain_whole_weight_blocks(tmp_path, name,
                 assert fn(*args, **valid, moe_quant_mode=mode)
 
 
+@pytest.mark.parametrize(
+    ("name", "shape", "tp", "reason"),
+    [
+        ("deepseek-ai/DeepSeek-V3", [128, 128], 32, "weight_block_size=128"),
+        ("Qwen/Qwen3-30B-A3B-FP8", [32, 128], 8, "weight_block_size=128"),
+        ("Qwen/Qwen3-30B-A3B-FP8", [128], 2, "two positive integer"),
+        ("Qwen/Qwen3-30B-A3B-FP8", [32, 128], 2, None),
+    ],
+)
+def test_sglang_fp8_experts_must_fit_both_axes_of_the_declared_tile(tmp_path, name, shape, tp, reason):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config(name)
+    raw.pop("architectures")
+    raw["quantization_config"]["weight_block_size"] = shape
+    model = _write_config(tmp_path, {"text_config": raw})
+    opts = _missing_system_cache_options(tmp_path, tp_size=tp, capacity=192 * _GIB)
+    opts.update(moe_tp_size=tp, moe_ep_size=1)
+    for fn in (memory.estimate_kv_cache, memory.estimate_num_gpu_blocks):
+        if reason:
+            with pytest.raises(ValueError, match=reason):
+                fn(model, "missing", "sglang", "0.5.20", **opts)
+        else:
+            assert fn(model, "missing", "sglang", "0.5.20", **opts)
+
+
+def test_sglang_mxfp8_experts_use_the_fixed_checkpoint_block(tmp_path):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("Qwen/Qwen3-30B-A3B-FP8")
+    raw["quantization_config"].update(quant_method="mxfp8", kv_cache_quant_algo="FP8")
+    model = _write_config(tmp_path, {"text_config": raw})
+    opts = _missing_system_cache_options(tmp_path, tp_size=2, capacity=192 * _GIB)
+    result = memory.estimate_kv_cache(model, "missing", "sglang", "0.5.20", **opts)
+    assert result["kv_size_per_token_bytes"] == 24_576
+    assert (
+        memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+        == result["total_kv_size_tokens"] // 16
+    )
+
+    with pytest.raises(ValueError, match="backend version 0.5.9"):
+        memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.8.post1", **opts)
+
+    (tmp_path / "hopper.yaml").write_text("gpu: {sm_version: 90}\n")
+    with pytest.raises(ValueError, match="MXFP8 expert weights require a Blackwell"):
+        memory.estimate_kv_cache(model, "hopper", "sglang", "0.5.20", **opts)
+
+    raw["architectures"] = ["Qwen3ForCausalLM"]
+    _write_config(tmp_path, {"text_config": raw})
+    with pytest.raises(ValueError, match="qwen3_moe.*conflicts.*Qwen3ForCausalLM"):
+        memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+
+
 @pytest.mark.parametrize("named", [True, False])
-@pytest.mark.parametrize("source", ["sidecar", "root_inline", "text_inline", "weight_only", "unquantized"])
+@pytest.mark.parametrize(
+    "source", ["sidecar", "unlabelled_sidecar", "root_inline", "text_inline", "weight_only", "unquantized"]
+)
 def test_wrapped_checkpoint_kv_precision_prices_transfers_and_blocks(tmp_path, named, source):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim.compiler import prediction_to_replay_spec
@@ -2308,6 +2406,8 @@ def test_wrapped_checkpoint_kv_precision_prices_transfers_and_blocks(tmp_path, n
     else:
         if source == "unquantized":
             sidecar["quantization"]["kv_cache_quant_algo"] = None
+        elif source == "unlabelled_sidecar":
+            sidecar.pop("producer")
         (tmp_path / "hf_quant_config.json").write_text(json.dumps(sidecar))
     model = _write_config(tmp_path, wrapper)
     weights = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=8, pp_size=1).weight_bytes()
@@ -2329,7 +2429,9 @@ def test_wrapped_checkpoint_kv_precision_prices_transfers_and_blocks(tmp_path, n
             kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50},
         )
         # At TP8 each rank holds one KV head: two 128-element arrays in each of 80 layers.
-        fp8 = source in ("root_inline", "sidecar") or (source == "text_inline" and backend == "sglang")
+        fp8 = source in ("root_inline", "sidecar") or (
+            source in ("text_inline", "unlabelled_sidecar") and backend == "sglang"
+        )
         automatic = 20_480 if fp8 else 40_960
         deployment = prediction_to_replay_spec(
             CorePredictionConfig.model_validate({"engine": engine})
@@ -2348,11 +2450,157 @@ def test_wrapped_checkpoint_kv_precision_prices_transfers_and_blocks(tmp_path, n
             assert memory.estimate_num_gpu_blocks(*args, **opts, kvcache_quant_mode=override) == blocks
 
 
-def test_wrapped_decoder_capacity_uses_the_layers_on_each_pipeline_rank(tmp_path):
+@pytest.mark.parametrize(
+    ("method", "backend", "version", "width"),
+    [
+        ("compressed-tensors", "vllm", "0.14.0", 16_384),
+        ("compressed-tensors", "vllm", "0.21.0", 16_384),
+        ("compressed-tensors", "vllm", "0.22.0", 8_192),
+        ("compressed-tensors", "sglang", "0.5.10", 16_384),
+        ("compressed-tensors", "sglang", "0.5.18", 16_384),
+        ("compressed-tensors", "sglang", "0.5.19", 8_192),
+        ("modelopt", "vllm", "0.19.1", 16_384),
+        ("modelopt", "vllm", "0.20.0", 4_608),
+    ],
+)
+def test_versioned_checkpoint_cache_reaches_both_compiled_workers_and_block_capacity(
+    tmp_path, method, backend, version, width
+):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config import CorePredictionConfig
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("meta-llama/Meta-Llama-3.1-8B")
+    raw["quantization_config"] = {
+        "quant_method": method,
+        "kv_cache_scheme": {
+            "num_bits": 4 if method == "modelopt" else 8,
+            "type": "float",
+            "strategy": "tensor",
+            "symmetric": True,
+            "dynamic": False,
+        },
+    }
+    model = _write_config(tmp_path, {**raw, "architectures": [_UNKNOWN_WRAPPER], "text_config": raw})
+    worker = dict(
+        parallelism={"tensor": 8},
+        timing={"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
+        kv_cache={"capacity": {"type": "fixed", "blocks": 256}},
+    )
+    engine = dict(
+        mode="disaggregated",
+        model=model,
+        hardware="gb200",
+        backend=backend,
+        backend_version=version,
+        context_length=4096,
+        workers={"prefill": worker, "decode": worker},
+        kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50},
+    )
+    ranks = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
+    assert (
+        ranks.prefill_engine_args["kv_transfer_bytes_per_token"]
+        == ranks.decode_engine_args["kv_transfer_bytes_per_token"]
+        == width
+    )
+    # TP8 stores one KV head per rank, 128 elements per head in 32 layers. NVFP4 uses 9 bytes per 16 elements.
+    assert estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1, backend=backend, backend_version=version) == width
+    assert (
+        estimate_kv_bytes_per_token(
+            model, tp_size=8, pp_size=1, backend=backend, backend_version=version, kvcache_quant_mode="bfloat16"
+        )
+        == 16_384
+    )
+    weights = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=8, pp_size=1).weight_bytes()
+    budget = 16 << 20
+    opts = _missing_system_cache_options(tmp_path, tp_size=8, capacity=weights + budget)
+    result = memory.estimate_kv_cache(model, "missing", backend, version, **opts)
+    assert result["kv_size_per_token_bytes"] == width
+    assert memory.estimate_num_gpu_blocks(model, "missing", backend, version, **opts) == budget // (16 * width) - (
+        backend == "vllm"
+    )
+
+
+@pytest.mark.parametrize("metadata_field", ["quantization_config", "compression_config"])
+def test_auto_cache_precision_uses_the_hardware_version_slot(tmp_path, monkeypatch, metadata_field):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk import perf_database
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("meta-llama/Meta-Llama-3.1-8B")
+    model = _write_config(
+        tmp_path,
+        {
+            "text_config": raw,
+            metadata_field: {
+                "quant_method": "compressed-tensors",
+                "kv_cache_scheme": {"type": "float", "num_bits": 8, "strategy": "tensor", "symmetric": True},
+            },
+        },
+    )
+
+    def slots(system, backend, systems_paths):
+        assert (system, backend, systems_paths) == ("custom", "vllm", [str(tmp_path)])
+        return {"current": "0.22.0", "previous": "0.20.0"}
+
+    monkeypatch.setattr(perf_database, "get_version_slots", slots)
+    for selector, width in ((None, 8_192), ("current", 8_192), ("previous", 16_384), ("next", 16_384)):
+        assert (
+            estimate_kv_bytes_per_token(
+                model,
+                tp_size=8,
+                pp_size=1,
+                backend="vllm",
+                backend_version=selector,
+                system="custom",
+                systems_paths=[str(tmp_path)],
+            )
+            == width
+        )
+
+
+def test_gemma3_implicit_layer_pattern_matches_its_explicit_physical_pool(tmp_path):
+    raw = dict(
+        model_type="gemma3_text",
+        hidden_size=2560,
+        intermediate_size=10240,
+        num_hidden_layers=34,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        vocab_size=262208,
+        sliding_window=1024,
+        dtype="bfloat16",
+        max_position_embeddings=131072,
+    )
+    # Transformers supplies a 256-element head and one global layer per six layers, totaling five global layers.
+    budget = 101 * 34 * 65_536
+    for explicit in (False, True):
+        if explicit:
+            raw.update(
+                head_dim=256,
+                layer_types=["full_attention" if i % 6 == 0 else "sliding_attention" for i in range(1, 35)],
+            )
+        model = _write_config(tmp_path, {"architectures": ["Gemma3ForConditionalGeneration"], "text_config": raw})
+        estimator = NaiveKVCacheEstimator.from_model_path(model, tp_size=1, pp_size=1, allow_hf_config_download=False)
+        opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=estimator.weight_bytes() + budget)
+        assert (estimator.geometry["num_swa_layers"], estimator.geometry["num_global_layers"]) == (29, 5)
+        assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.33.0", **opts) == 97
+        with pytest.raises(ValueError, match="separate full and sliding pool sizes"):
+            memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+
+
+@pytest.mark.parametrize("omit_defaults", [False, True])
+@pytest.mark.parametrize("omit_class", [False, True])
+def test_wrapped_decoder_capacity_uses_the_layers_on_each_pipeline_rank(tmp_path, omit_defaults, omit_class):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     raw = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
+    if omit_defaults:
+        raw.pop("head_dim")  # Qwen3Config supplies 128, while hidden_size // num_attention_heads is 64.
+    if omit_class:
+        raw.pop("architectures")
     model = _write_config(tmp_path, {"text_config": raw})
     opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=80 * _GIB)
     for pp, width in ((1, 114_688), (2, 57_344), (4, 28_672)):
@@ -2470,7 +2718,11 @@ def test_sglang_native_fp8_needs_a_separate_kv_declaration(tmp_path, method):
         for algo, rate in ((None, 24_576), ("FP8", 12_288)):
             owner["quantization_config"] = {**quant, "kv_cache_quant_algo": algo}
             model = _write_config(tmp_path, document)
-            assert estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1, backend="sglang") == rate
+            for version, expected in (("0.5.17", 24_576), ("0.5.18", rate), ("0.5.20", rate), (None, 24_576)):
+                assert (
+                    estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1, backend="sglang", backend_version=version)
+                    == expected
+                )
             assert estimate_kv_bytes_per_token(model, tp_size=8, pp_size=1, backend="vllm") == 24_576
 
 
@@ -2505,7 +2757,7 @@ def test_fixed_capacity_pd_uses_the_prefill_backends_sharded_kv_geometry(tmp_pat
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     raw = _load_pre_downloaded_hf_config("stepfun-ai/Step-3.7-Flash")
-    raw["attention_other_setting"]["num_attention_groups"] = 16
+    raw["attention_other_setting"]["num_attention_groups"] = raw["swa_num_key_value_heads"] = 16
     checkpoint = _write_config(tmp_path, {"text_config": raw})
     worker = dict(
         parallelism={"tensor": 1},
