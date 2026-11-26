@@ -174,8 +174,19 @@ fn radix_completion_ancestor_refresh_matches_recorded_behavior() {
         let (_, lease) = admit(&mut mgr, prompt);
         mgr.finish(prompt, lease);
     }
+    // Legacy growth coalesces P/Q. A real partial match exposes the requested
+    // P -> Q topology before admitting the lease with its private X page.
+    let mut prefix = RadixRequestLease::default();
+    assert_eq!(
+        mgr.allocate_for_request_lease_capped(&p, &mut prefix, p.len())
+            .unwrap(),
+        4
+    );
+    let p_node = prefix.last_node();
+    mgr.abort(prefix);
     let (reused, active) = admit(&mut mgr, &pqx);
     assert_eq!(reused, 8);
+    assert_eq!(mgr.cache.node(active.last_node()).parent, Some(p_node));
     let (_, initial_b) = admit(&mut mgr, &b);
     mgr.finish(&b, initial_b);
     let mut locked_b = RadixRequestLease::default();
@@ -214,12 +225,12 @@ fn radix_completion_ancestor_refresh_matches_recorded_behavior() {
         })
         .collect();
     let b_hashes = compute_seq_hash_for_block(&compute_block_hash_for_seq(&b, 4));
-    assert_eq!(removed, if baseline { vec![hashes[0]] } else { b_hashes });
+    assert_eq!(removed, b_hashes);
     let mut repeat = RadixRequestLease::default();
     let reused = mgr
         .allocate_for_request_lease_capped(&p, &mut repeat, p.len())
         .unwrap();
-    assert_eq!(reused, if baseline { 0 } else { 4 });
+    assert_eq!(reused, 4);
     mgr.abort(repeat);
     observations.push(json!({
         "scenario": "complete_with_new_page_refreshes_ancestors",

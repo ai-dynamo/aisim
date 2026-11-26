@@ -370,7 +370,6 @@ pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
         unimplemented!("release_window_lock is SWA-only")
     }
 
-    /// Recheck dependencies omitted from a staged load-back before any adoption.
     /// Check that staged auxiliary backups belong to this anchor's window.
     fn validate_backup_window(
         &self,
@@ -381,6 +380,7 @@ pub trait TreeComponent<K: ChildKeyType, V: RadixValue> {
         Ok(())
     }
 
+    /// Recheck dependencies omitted from a staged load-back before any adoption.
     fn validate_load_back_window(
         &self,
         tree_core: &UnifiedTreeCore<K, V>,
