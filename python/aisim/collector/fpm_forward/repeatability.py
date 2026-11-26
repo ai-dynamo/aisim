@@ -26,6 +26,7 @@ from . import planner
 from .capabilities import ModelCapabilityProfile, ResolvedDTypeProfile
 from .config import FPMCollectionOptions
 from .execution_evidence import _deployment_hashes, file_evidence, inspect_execution_evidence
+from .glm53flash_points import GLM_SMOKE_MANIFEST
 from .measurement_evidence import compare_measurements, extract_measurement_evidence
 from .memory_admission import DTypeMemoryEstimate, TopologyMemoryDecision
 from .model_capability import ResolvedModelConfig
@@ -329,6 +330,15 @@ def freeze_repeatability_plan(
         entry = checkpoint.get("cells", {}).get(cell.cell_id, {})
         if entry.get("status") != "passed" or not entry.get("attempt_id"):
             raise ValueError(f"repeatability requires a passed source cell: {cell.cell_id}")
+        smoke = entry.get("smoke_manifest") == GLM_SMOKE_MANIFEST
+        if smoke and comparison_mode == "full_grid":
+            # A full_grid sample keeps the options of the source and runs without smoke, so it stages the whole list
+            # and can never measure exactly the frozen coordinates of the subset.
+            raise ValueError(
+                f"repeatability source cell {cell.cell_id}: a smoke collection measured a subset of its point list, "
+                "and a full_grid repeatability run stages the full list: use --repeatability-comparison-mode "
+                "bounded, or a formal collection as the source"
+            )
         cell_dir = root / "cells" / cell.cell_id
         collection = validate_native_collection(
             cell,
@@ -336,7 +346,13 @@ def freeze_repeatability_plan(
             expected_plan_sha256=source_plan.sha256,
             expected_attempt_id=entry["attempt_id"],
         )
-        _validate_points_receipts(source_plan, cell, cell_dir / "raw", entry["attempt_id"])
+        _validate_points_receipts(
+            source_plan,
+            cell,
+            cell_dir / "raw",
+            entry["attempt_id"],
+            smoke=smoke,
+        )
         selected = _select_points(
             collection, max_points_per_cell if comparison_mode == "bounded" else None, cell_id=cell.cell_id
         )

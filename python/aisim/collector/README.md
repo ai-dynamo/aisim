@@ -191,7 +191,9 @@ completion barrier, exit-code policy), and publishes the formal table only
 after every frozen cell passes.
 For multinode runs, select the installed controller with
 `--fpm-orchestrator lws|grove`. Start with `--plan-only` or a one-cell
-`--smoke --limit 1` run.
+`--smoke --limit 1` run. `--smoke` without `--limit` runs the first cell of
+each phase that the plan collects, and `--smoke --limit N` runs the first
+`N` cells of the plan.
 
 ```bash
 python3 -m collector.fpm_forward \
@@ -230,8 +232,11 @@ errors remain runnable so the target runtime supplies the observation.
 Model identity is resolved from a local checkpoint/config, the packaged AIC
 config cache, or Hugging Face. A real model architecture that is not registered
 by AIC uses a config-derived bootstrap template; an unresolved or empty config
-fails before planning. When the checkpoint exists only inside the runtime Pod,
-pass its real local metadata explicitly with
+fails before planning. A config of a registered architecture that the AIC
+parser refuses fails when the collector renders a cell, with
+`the config parser refuses the HF config of the supported architecture <name>:
+<error type>: <parser message>`. When the checkpoint exists only inside the
+runtime Pod, pass its real local metadata explicitly with
 `--fpm-model-config /path/to/config.json` (a directory containing `config.json`
 is also accepted). The resolved config snapshot and SHA-256 are frozen into the
 collection plan.
@@ -281,7 +286,12 @@ A completed schema-6 commit record cannot be finalized by this collector.
 A latency-only publication into a destination containing a schema-6 pair
 merges its rows, assigns them legacy execution identity, and writes a
 schema-7 commit record. Publish to a fresh output directory to leave the
-schema-6 pair unchanged.
+schema-6 pair unchanged. Rows of the GLM-5.3-Flash vLLM producer carry
+`measurement_policy: vllm_native_fpm_prefix_seed_median_v1`, and a pair that
+the collector writes holds rows of that policy only or none. The collector
+refuses a publication that would put them beside rows of another policy or
+rows without a policy, and it leaves the existing pair unchanged. Publish
+them to a clean destination.
 
 To resume a campaign created before power collection was introduced, pass
 `--no-fpm-measure-power` along with its original arguments and `--resume`.

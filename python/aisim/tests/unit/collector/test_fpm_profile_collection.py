@@ -1225,6 +1225,20 @@ def test_observed_runtime_drift_fails_after_recording_provenance(tmp_path, monke
     assert provenance["dynamo_version"] == "custom-dynamo"
 
 
+def test_checkpoint_quantization_is_inferred_once_for_a_plan(monkeypatch, no_models_or_timing_data):
+    calls = []
+    infer = capabilities._infer_quant_modes_from_raw_config
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return infer(*args, **kwargs)
+
+    monkeypatch.setattr(capabilities, "_infer_quant_modes_from_raw_config", counted)
+    plan = _plan(_profile())
+    assert {cell.kv_cache_dtype for cell in plan.cells} == {"fp8"}
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("kv_dtype", ["bfloat16", "fp8"])
 def test_declared_fp8_kv_metadata_does_not_override_vllm_027_selection(tmp_path, no_models_or_timing_data, kv_dtype):
     profile = _profile()

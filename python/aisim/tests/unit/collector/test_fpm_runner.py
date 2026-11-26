@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -18,16 +20,19 @@ from types import SimpleNamespace
 
 import collector.fpm_forward.runner as fpm_runner
 import pytest
-from collector.fpm_forward.config import FPMCollectionOptions, PrefillSamplingProfile
+from collector.fpm_forward.config import FPMCollectionOptions, PrefillSamplingProfile, with_kv_warmup_defaults
 from collector.fpm_forward.model_capability import ResolvedModelConfig, load_model_config
 from collector.fpm_forward.native_artifact import COLLECTOR_PROVENANCE_FILENAME
 from collector.fpm_forward.planner import BackendPolicy, FPMCell, build_collection_plan
 from collector.fpm_forward.runner import (
+    CHECKPOINT_SCHEMA,
+    GLM_ARCHITECTURE,
     POINTS_FILENAME,
     POINTS_RECEIPT_FILENAME,
     REMOTE_EXIT_MARKER,
     REMOTE_WORKDIR,
     KubernetesCellRunner,
+    _adapter_python_path,
     _cell_generator_overrides,
     _configured_sampling_metadata,
     _render_cell,
@@ -1661,8 +1666,8 @@ def test_run_collection_stages_owned_runtime_files(monkeypatch, tmp_path, pendin
     assert "database" not in checkpoint
 
 
-def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool):
-    """Run every cell of ``plan`` on an in-process cluster.
+def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool, every_cell: bool = True):
+    """Run the cells of ``plan`` on an in-process cluster: every cell, or the default selection of the run.
 
     Return the names that each cell stages, the point-list receipt that each cell records after execution, and the
     checkpoint. The receipt comes from the collector's own in-container check of the staged list.
@@ -1726,7 +1731,7 @@ def _staged_run(monkeypatch, root: Path, plan, *, smoke: bool):
         resume=False,
         retry_failed=False,
         smoke=smoke,
-        cell_limit=len(plan.cells),
+        cell_limit=len(plan.cells) if every_cell else None,
         publish_database=False,
     )
     assert errors == []
@@ -1847,6 +1852,560 @@ def test_formal_glm_run_stages_the_full_point_list(monkeypatch, tmp_path):
     # Both phases archive their runtime observations under the one formal attempt of the probe's configuration.
     index = json.loads((campaign / "runtime-observations.json").read_text())
     assert index["configurations"][plan.runtime_configuration]["attempts"][0]["status"] == "captured"
+
+
+def _expected_producer_receipt(plan, cell, attempt_id: str) -> dict:
+    """The producer receipt of a passed GLM-5.3-Flash cell, with the digests of the producer files of this checkout."""
+    producer = Path(fpm_runner.__file__).parent / "runtime/glm53flash"
+    return {
+        "attempt_id": attempt_id,
+        "cell_id": cell.cell_id,
+        "plan_sha256": plan.sha256,
+        "producer": {
+            "overlay_sha256": hashlib.sha256((producer / "glm53flash_prefix_scheduler.py").read_bytes()).hexdigest(),
+            "runtime_source_manifest_sha256": hashlib.sha256(
+                (producer / "runtime-source-sha256.json").read_bytes()
+            ).hexdigest(),
+        },
+        "schema_name": "aic_fpm_producer_receipt",
+        "schema_version": 1,
+    }
+
+
+def _rerun_smoke(root: Path, plan, *, retry_failed: bool) -> list:
+    return run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(root / "checkpoints"),
+        artifact_root=str(root / "artifacts"),
+        resume=True,
+        retry_failed=retry_failed,
+        smoke=True,
+        cell_limit=len(plan.cells),
+        publish_database=False,
+    )
+
+
+def _set_smoke_statuses(root: Path, status: str) -> None:
+    path = root / "checkpoints" / "fpm_forward_smoke.json"
+    checkpoint = json.loads(path.read_text())
+    for entry in checkpoint["cells"].values():
+        entry["status"] = status
+    path.write_text(json.dumps(checkpoint))
+
+
+def test_passed_glm_cell_keeps_a_producer_receipt(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    _staged, _receipts, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True)
+
+    campaign = tmp_path / "run" / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        attempt_id = checkpoint["cells"][cell.cell_id]["attempt_id"]
+        receipt = json.loads((campaign / "cells" / cell.cell_id / "producer-receipt.json").read_text())
+        assert receipt == _expected_producer_receipt(plan, cell, attempt_id)
+
+
+def test_smoke_receipts_match_the_smoke_selection_only(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    _staged, _receipts, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True)
+
+    campaign = tmp_path / "run" / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        raw = campaign / "cells" / cell.cell_id / "raw"
+        attempt_id = checkpoint["cells"][cell.cell_id]["attempt_id"]
+        fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=True)
+        with pytest.raises(ValueError) as error:
+            fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=False)
+        assert str(error.value).startswith("runtime benchmark-points receipt mismatch")
+        # A receipt that names the full list is no receipt of the smoke selection.
+        receipt = raw / "pod-0" / POINTS_RECEIPT_FILENAME
+        full = {**json.loads(receipt.read_text()), "sha256": plan.options.benchmark_points_sha256}
+        receipt.write_text(json.dumps(full))
+        with pytest.raises(ValueError) as error:
+            fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=True)
+        assert str(error.value).startswith("runtime benchmark-points receipt mismatch")
+        fpm_runner._validate_points_receipts(plan, cell, raw, attempt_id, smoke=False)
+
+
+def test_cell_of_another_model_keeps_no_producer_receipt(monkeypatch, tmp_path):
+    # The plans and runs of test_non_glm_cells_keep_their_launch_and_staging.
+    for kind in ("default", "v41"):
+        for phase in ("prefill", "decode"):
+            cell = _cell(phase=phase)
+            if kind == "v41":
+                cell = dataclasses.replace(cell, execution_identity=("0" * 64, "full", "hbm_tp_sharded", "text"))
+            plan = _plan(cell)
+            if kind == "v41":
+                plan.capability = SimpleNamespace(architecture="DeepseekV41ForCausalLM")
+                plan.options.decoder_replay = False
+            root = tmp_path / kind / phase
+            _staged, _receipts, checkpoint = _staged_run(monkeypatch, root, plan, smoke=False)
+            assert checkpoint["cells"][cell.cell_id]["status"] == "passed"
+            assert list((root / "artifacts").rglob("producer-receipt.json")) == []
+
+
+def test_rerun_removes_the_receipt_of_the_replaced_attempt(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged, _receipts, first = _staged_run(monkeypatch, root, plan, smoke=True)
+    _set_smoke_statuses(root, "failed")
+
+    def no_artifacts(*_args, **_kwargs):
+        raise ValueError("no artifacts")
+
+    monkeypatch.setattr(fpm_runner, "_runtime_collection_summary", no_artifacts)
+    _rerun_smoke(root, plan, retry_failed=True)
+
+    checkpoint = json.loads((root / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        entry = checkpoint["cells"][cell.cell_id]
+        assert entry["status"] == "failed"
+        assert entry["attempt_id"] != first["cells"][cell.cell_id]["attempt_id"]
+        assert not (campaign / "cells" / cell.cell_id / "producer-receipt.json").exists()
+
+
+def test_recovered_glm_cell_gets_a_producer_receipt(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged, _receipts, first = _staged_run(monkeypatch, root, plan, smoke=True)
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        (campaign / "cells" / cell.cell_id / "producer-receipt.json").unlink()
+    _set_smoke_statuses(root, "interrupted")
+    monkeypatch.setattr(
+        fpm_runner, "_render_cell", lambda *_args, **_kwargs: pytest.fail("a recovered cell was launched again")
+    )
+    _rerun_smoke(root, plan, retry_failed=False)
+
+    checkpoint = json.loads((root / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    for cell in plan.cells:
+        entry = checkpoint["cells"][cell.cell_id]
+        attempt_id = first["cells"][cell.cell_id]["attempt_id"]
+        assert (entry["status"], entry["attempt_id"]) == ("passed", attempt_id)
+        receipt = json.loads((campaign / "cells" / cell.cell_id / "producer-receipt.json").read_text())
+        assert receipt == _expected_producer_receipt(plan, cell, attempt_id)
+
+
+def _glm_cell_to_recover(tmp_path: Path, *, status: str, attempt_id: str = "attempt-1"):
+    """A smoke campaign with one complete GLM-5.3-Flash prefill cell that the checkpoint does not list as passed.
+
+    The rank artifact is in the shape that the producer writes and names the producer digests of this checkout, and the
+    checkpoint holds ``status`` and the attempt of the Collector provenance. Return the plan, the cell, the cell folder
+    and the two folders of the campaign.
+    """
+    from . import test_fpm_glm53flash_native_collection as nc
+
+    cell = nc.glm_cell("prefill")
+    plan = _plan(cell)
+    artifact_root = tmp_path / "artifacts"
+    cell_dir = artifact_root / plan.sha256[:16] / "smoke" / "cells" / cell.cell_id
+    pod = cell_dir / "raw" / "node0000"
+    pod.mkdir(parents=True)
+    provenance = pod / COLLECTOR_PROVENANCE_FILENAME
+    _write_provenance(provenance, cell_id=cell.cell_id, plan_sha256=plan.sha256, attempt_id=attempt_id)
+    record = json.loads(provenance.read_text())
+    record["runtime"]["backend_version"] = "0.33.0"
+    provenance.write_text(json.dumps(record))
+    # The artifact in the shape that the producer writes, so that publication reads its measurement record too.
+    payload = nc.glm_native_payload("prefill", points=[nc.PREFILL_COLD, nc.PREFILL_CACHED])
+    shape = tmp_path / "shape"
+    shape.mkdir()
+    nc._glm_producer_shape(shape)("prefill", payload)
+    nc.write_glm_rank(pod, payload)
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "fpm_forward_smoke.json").write_text(
+        json.dumps(
+            {
+                "schema": fpm_runner.CHECKPOINT_SCHEMA,
+                "plan_sha256": plan.sha256,
+                "cells": {cell.cell_id: {"status": status, "attempt_id": attempt_id}},
+            }
+        )
+    )
+    return plan, cell, cell_dir, artifact_root, checkpoint_dir
+
+
+def _resume_one_cell(plan, artifact_root: Path, checkpoint_dir: Path) -> list:
+    return run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(checkpoint_dir),
+        artifact_root=str(artifact_root),
+        resume=True,
+        retry_failed=False,
+        smoke=True,
+        cell_limit=1,
+        publish_database=False,
+    )
+
+
+def _later_producer_revision(tmp_path: Path, monkeypatch) -> None:
+    """Make the reader see a producer file with one more line, as a later checkout of the collector holds."""
+    from collector.fpm_forward import native_artifact
+
+    later = tmp_path / "later"
+    later.mkdir()
+    producer = Path(fpm_runner.__file__).parent / "runtime/glm53flash"
+    for name in ("glm53flash_prefix_scheduler.py", "runtime-source-sha256.json"):
+        shutil.copyfile(producer / name, later / name)
+    with (later / "glm53flash_prefix_scheduler.py").open("ab") as scheduler:
+        scheduler.write(b"\n# a later revision\n")
+    monkeypatch.setattr(native_artifact, "_GLM_RUNTIME", later)
+    native_artifact._glm_producer_record.cache_clear()
+
+
+@pytest.mark.parametrize("status", ["interrupted", "failed", "running"])
+def test_recovery_keeps_the_receipt_that_its_validation_read(tmp_path, monkeypatch, status):
+    from collector.fpm_forward import database, native_artifact
+    from collector.fpm_forward.native_artifact import validate_native_collection
+
+    from . import test_fpm_glm53flash_native_collection as nc
+
+    plan, cell, cell_dir, artifact_root, checkpoint_dir = _glm_cell_to_recover(tmp_path, status=status)
+    if status == "running":
+        # Recovery of a running entry first verifies the teardown of the abandoned workload.
+        (cell_dir / "k8s_deploy.yaml").write_text("apiVersion: v1\nkind: Pod\nmetadata:\n  name: cell\n")
+        monkeypatch.setattr(fpm_runner, "KubernetesCellRunner", lambda *_args: SimpleNamespace(cleanup=lambda: None))
+    # The collecting run compared the artifacts with its own producer files and wrote the receipt, and it stopped
+    # before the checkpoint listed the cell as passed.
+    receipt = native_artifact.write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id="attempt-1")
+    written = receipt.read_bytes()
+    monkeypatch.setattr(
+        fpm_runner, "_render_cell", lambda *_args, **_kwargs: pytest.fail("a recovered cell was launched again")
+    )
+    publication_plan = nc._glm_plan()
+    publication_plan.sha256 = plan.sha256
+    try:
+        _later_producer_revision(tmp_path, monkeypatch)
+        assert _resume_one_cell(plan, artifact_root, checkpoint_dir) == []
+        entry = json.loads((checkpoint_dir / "fpm_forward_smoke.json").read_text())["cells"][cell.cell_id]
+        assert (entry["status"], entry["attempt_id"], entry["artifact_recovery"]["original_status"]) == (
+            "passed",
+            "attempt-1",
+            status,
+        )
+        assert receipt.read_bytes() == written
+        collection = validate_native_collection(
+            cell, cell_dir / "raw", expected_plan_sha256=plan.sha256, expected_attempt_id="attempt-1"
+        )
+        assert len(collection.points) == 2
+        rows = database.aggregate_cell(publication_plan, cell, cell_dir, expected_attempt_id="attempt-1")
+        assert len(rows) == 2
+    finally:
+        native_artifact._glm_producer_record.cache_clear()
+
+
+def test_recovery_of_a_cell_without_a_receipt_writes_the_digests_of_the_recovering_checkout(tmp_path, monkeypatch):
+    from collector.fpm_forward.native_artifact import validate_native_collection
+
+    plan, cell, cell_dir, artifact_root, checkpoint_dir = _glm_cell_to_recover(tmp_path, status="interrupted")
+    monkeypatch.setattr(
+        fpm_runner, "_render_cell", lambda *_args, **_kwargs: pytest.fail("a recovered cell was launched again")
+    )
+    assert _resume_one_cell(plan, artifact_root, checkpoint_dir) == []
+    entry = json.loads((checkpoint_dir / "fpm_forward_smoke.json").read_text())["cells"][cell.cell_id]
+    assert entry["status"] == "passed"
+    receipt = cell_dir / "producer-receipt.json"
+    assert json.loads(receipt.read_text()) == _expected_producer_receipt(plan, cell, "attempt-1")
+    collection = validate_native_collection(
+        cell, cell_dir / "raw", expected_plan_sha256=plan.sha256, expected_attempt_id="attempt-1"
+    )
+    assert len(collection.points) == 2
+
+
+def _receipt_of_another_attempt(cell_dir: Path, plan, cell) -> str:
+    from collector.fpm_forward import native_artifact
+
+    native_artifact.write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id="attempt-0")
+    return "producer receipt names another attempt"
+
+
+def _receipt_of_another_plan(cell_dir: Path, _plan, cell) -> str:
+    from collector.fpm_forward import native_artifact
+
+    native_artifact.write_producer_receipt(cell, cell_dir, plan_sha256="0" * 64, attempt_id="attempt-1")
+    return "producer receipt names another plan"
+
+
+def _broken_receipt(cell_dir: Path, _plan, _cell) -> str:
+    (cell_dir / "producer-receipt.json").write_text("{")
+    return "invalid producer receipt"
+
+
+@pytest.mark.parametrize(
+    "plant", [_receipt_of_another_attempt, _receipt_of_another_plan, _broken_receipt], ids=["attempt", "plan", "broken"]
+)
+def test_recovery_leaves_a_cell_with_a_refused_receipt_unrecovered(tmp_path, monkeypatch, caplog, plant):
+    plan, cell, cell_dir, artifact_root, checkpoint_dir = _glm_cell_to_recover(tmp_path, status="failed")
+    refusal = plant(cell_dir, plan, cell)
+    planted = (cell_dir / "producer-receipt.json").read_bytes()
+    monkeypatch.setattr(
+        fpm_runner, "_render_cell", lambda *_args, **_kwargs: pytest.fail("a failed cell ran without the retry flag")
+    )
+    with caplog.at_level("INFO"):
+        errors = _resume_one_cell(plan, artifact_root, checkpoint_dir)
+    assert [item["classification"] for item in errors] == ["campaign_incomplete"]
+    entry = json.loads((checkpoint_dir / "fpm_forward_smoke.json").read_text())["cells"][cell.cell_id]
+    assert (entry["status"], entry["attempt_id"]) == ("failed", "attempt-1")
+    # Recovery neither accepts the receipt nor replaces it: the file stays as evidence until a new attempt removes it.
+    assert (cell_dir / "producer-receipt.json").read_bytes() == planted
+    assert f"FPM cell {cell.cell_id} (status=failed) is not recoverable from local artifacts: {refusal}" in caplog.text
+
+
+def _no_space(*_args, **_kwargs):
+    raise OSError(28, "No space left on device")
+
+
+def test_failed_receipt_write_fails_the_cell_and_a_resume_recovers_it(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    write = fpm_runner.write_producer_receipt
+    monkeypatch.setattr(fpm_runner, "write_producer_receipt", _no_space)
+    with pytest.raises(AssertionError):
+        # The helper asserts that the run reports no error, and each cell reports one.
+        _staged_run(monkeypatch, root, plan, smoke=True)
+    checkpoint = json.loads((root / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        entry = checkpoint["cells"][cell.cell_id]
+        assert (entry["status"], entry["error_type"]) == ("failed", "OSError")
+        assert "No space left on device" in entry["error"]
+        assert not (campaign / "cells" / cell.cell_id / "producer-receipt.json").exists()
+        assert (campaign / "cells" / cell.cell_id / "raw").is_dir()
+
+    # A resume without the retry flag recovers each cell from its artifacts, with no launch, once the write works.
+    monkeypatch.setattr(fpm_runner, "write_producer_receipt", write)
+    monkeypatch.setattr(
+        fpm_runner, "_render_cell", lambda *_args, **_kwargs: pytest.fail("a recovered cell was launched again")
+    )
+    assert _rerun_smoke(tmp_path / "run", plan, retry_failed=False) == []
+    recovered = json.loads((root / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    for cell in plan.cells:
+        entry = recovered["cells"][cell.cell_id]
+        assert (entry["status"], entry["artifact_recovery"]["original_status"]) == ("passed", "failed")
+        assert entry["attempt_id"] == checkpoint["cells"][cell.cell_id]["attempt_id"]
+        receipt = json.loads((campaign / "cells" / cell.cell_id / "producer-receipt.json").read_text())
+        assert receipt == _expected_producer_receipt(plan, cell, entry["attempt_id"])
+
+
+def test_failed_receipt_write_in_recovery_leaves_the_cell_unrecovered(tmp_path, monkeypatch, caplog):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged, _receipts, first = _staged_run(monkeypatch, root, plan, smoke=True)
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        (campaign / "cells" / cell.cell_id / "producer-receipt.json").unlink()
+    _set_smoke_statuses(root, "failed")
+    monkeypatch.setattr(fpm_runner, "write_producer_receipt", _no_space)
+    monkeypatch.setattr(
+        fpm_runner, "_render_cell", lambda *_args, **_kwargs: pytest.fail("a failed cell ran without the retry flag")
+    )
+    with caplog.at_level("INFO"):
+        errors = _rerun_smoke(root, plan, retry_failed=False)
+    assert [item["classification"] for item in errors] == ["campaign_incomplete"]
+    checkpoint = json.loads((root / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    for cell in plan.cells:
+        entry = checkpoint["cells"][cell.cell_id]
+        assert (entry["status"], entry["attempt_id"]) == ("failed", first["cells"][cell.cell_id]["attempt_id"])
+        assert not (campaign / "cells" / cell.cell_id / "producer-receipt.json").exists()
+        assert (
+            f"FPM cell {cell.cell_id} (status=failed) is not recoverable from local artifacts: "
+            "[Errno 28] No space left on device"
+        ) in caplog.text
+
+
+def test_recovery_whose_validation_fails_writes_no_receipt(tmp_path, monkeypatch):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged_run(monkeypatch, root, plan, smoke=True)
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    for cell in plan.cells:
+        (campaign / "cells" / cell.cell_id / "producer-receipt.json").unlink()
+    _set_smoke_statuses(root, "failed")
+
+    def no_artifacts(*_args, **_kwargs):
+        raise ValueError("no artifacts")
+
+    monkeypatch.setattr(fpm_runner, "_runtime_collection_summary", no_artifacts)
+    monkeypatch.setattr(
+        fpm_runner, "_render_cell", lambda *_args, **_kwargs: pytest.fail("a failed cell ran without the retry flag")
+    )
+    errors = _rerun_smoke(root, plan, retry_failed=False)
+    assert [item["classification"] for item in errors] == ["campaign_incomplete"]
+    checkpoint = json.loads((root / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    for cell in plan.cells:
+        assert checkpoint["cells"][cell.cell_id]["status"] == "failed"
+        assert not (campaign / "cells" / cell.cell_id / "producer-receipt.json").exists()
+
+
+def _two_layout_plan(tmp_path):
+    """A GLM-5.3-Flash plan with a second layout: two prefill cells, then two decode cells."""
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    prefill, decode = plan.cells
+    cells = (
+        prefill,
+        dataclasses.replace(prefill, cell_id="fpm-second-prefill"),
+        decode,
+        dataclasses.replace(decode, cell_id="fpm-second-decode"),
+    )
+    return dataclasses.replace(plan, cells=cells)
+
+
+def test_default_smoke_runs_one_cell_of_each_collected_phase(monkeypatch, tmp_path):
+    plan = _two_layout_plan(tmp_path)
+    prefill, _, decode, _ = plan.cells
+    staged, _, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True, every_cell=False)
+    # The cells run in the order of the plan. The checkpoint file sorts its keys.
+    assert list(staged) == [prefill.cell_id, decode.cell_id]
+    assert set(checkpoint["cells"]) == set(staged)
+
+
+@pytest.mark.parametrize(("smoke", "every_cell"), [(True, True), (False, False)])
+def test_limit_of_every_cell_and_run_without_smoke_run_every_cell(monkeypatch, tmp_path, smoke, every_cell):
+    plan = _two_layout_plan(tmp_path)
+    staged, _, checkpoint = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=smoke, every_cell=every_cell)
+    assert list(staged) == [cell.cell_id for cell in plan.cells]
+    assert set(checkpoint["cells"]) == set(staged)
+
+
+def test_smoke_with_a_limit_of_one_runs_the_first_cell(monkeypatch, tmp_path):
+    plan = _two_layout_plan(tmp_path)
+    root = tmp_path / "run"
+    # The first run installs the in-process cluster.
+    _staged_run(monkeypatch, root, plan, smoke=True, every_cell=False)
+    errors = run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(root / "one" / "checkpoints"),
+        artifact_root=str(root / "one" / "artifacts"),
+        resume=False,
+        retry_failed=False,
+        smoke=True,
+        cell_limit=1,
+        publish_database=False,
+    )
+    assert errors == []
+    checkpoint = json.loads((root / "one" / "checkpoints" / "fpm_forward_smoke.json").read_text())
+    assert set(checkpoint["cells"]) == {plan.cells[0].cell_id}
+
+
+@pytest.mark.parametrize("smoke", [True, False])
+def test_limit_of_zero_is_no_limit(monkeypatch, tmp_path, smoke):
+    plan = _two_layout_plan(tmp_path)
+    prefill, _, decode, _ = plan.cells
+    root = tmp_path / "run"
+    # The first run installs the in-process cluster.
+    staged, _, _ = _staged_run(monkeypatch, root, plan, smoke=smoke, every_cell=False)
+    staged.clear()
+    errors = run_collection(
+        plan,
+        generator_overrides={},
+        checkpoint_dir=str(root / "zero" / "checkpoints"),
+        artifact_root=str(root / "zero" / "artifacts"),
+        resume=False,
+        retry_failed=False,
+        smoke=smoke,
+        cell_limit=0,
+        publish_database=smoke,
+    )
+    assert errors == []
+    expected = [prefill.cell_id, decode.cell_id] if smoke else [cell.cell_id for cell in plan.cells]
+    assert list(staged) == expected
+    name = "fpm_forward_smoke.json" if smoke else "fpm_forward.json"
+    checkpoint = json.loads((root / "zero" / "checkpoints" / name).read_text())
+    assert set(checkpoint["cells"]) == set(expected)
+    if smoke:
+        assert (checkpoint["smoke"]["status"], checkpoint["smoke"]["cell_count"]) == ("passed", 2)
+
+
+def test_default_smoke_of_a_prefill_role_runs_its_one_phase(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_short_request_plan
+
+    plan = _glm_short_request_plan(tmp_path, "prefill")
+    staged, _, _ = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True, every_cell=False)
+    assert set(staged) == {plan.cells[0].cell_id}
+
+
+def test_resume_with_another_frozen_plan_writes_no_campaign_file(tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    checkpoints, artifacts = tmp_path / "checkpoints", tmp_path / "artifacts"
+    checkpoints.mkdir()
+    (checkpoints / "fpm_forward.json").write_text(
+        json.dumps({"schema": CHECKPOINT_SCHEMA, "plan_sha256": "0" * 64, "cells": {}})
+    )
+    with pytest.raises(ValueError) as error:
+        run_collection(
+            plan,
+            generator_overrides={},
+            checkpoint_dir=str(checkpoints),
+            artifact_root=str(artifacts),
+            resume=True,
+            retry_failed=False,
+        )
+    assert str(error.value) == "FPM checkpoint does not match the current frozen plan"
+    assert not artifacts.exists()
+
+
+def _tree_state(root: Path) -> dict:
+    """Each path under ``root`` with its inode, its modification time and, for a file, its bytes."""
+    return {
+        path: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes() if path.is_file() else None)
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def test_refused_resume_leaves_an_existing_campaign_folder_as_it_was(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged_run(monkeypatch, root, plan, smoke=True)
+    path = root / "checkpoints" / "fpm_forward_smoke.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "plan_sha256": "0" * 64}))
+    before = _tree_state(root)
+    with pytest.raises(ValueError) as error:
+        _rerun_smoke(root, plan, retry_failed=False)
+    assert str(error.value) == "FPM checkpoint does not match the current frozen plan"
+    assert _tree_state(root) == before
+
+
+def test_fresh_run_and_accepted_resume_write_the_campaign_files(monkeypatch, tmp_path):
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path)
+    root = tmp_path / "run"
+    _staged_run(monkeypatch, root, plan, smoke=True)
+    campaign = root / "artifacts" / plan.sha256[:16] / "smoke"
+    expected = {
+        "collection-plan.json": json.loads(json.dumps(plan.to_dict())),
+        "generator-overrides.json": json.loads(json.dumps(with_kv_warmup_defaults({}))),
+    }
+    for name, payload in expected.items():
+        assert json.loads((campaign / name).read_text()) == payload
+        (campaign / name).unlink()
+    assert _rerun_smoke(root, plan, retry_failed=False) == []
+    for name, payload in expected.items():
+        assert json.loads((campaign / name).read_text()) == payload
 
 
 def test_non_glm_cells_keep_their_launch_and_staging(monkeypatch, tmp_path):
@@ -3776,6 +4335,29 @@ def test_runtime_default_path_is_adapter_owned():
 
 
 @pytest.mark.parametrize(
+    ("architecture", "name"), [("DeepseekV41ForCausalLM", "V4.1"), (GLM_ARCHITECTURE, "GLM-5.3-Flash")]
+)
+@pytest.mark.parametrize("value", ["", None, "relative/overlay", "/opt/a::/opt/b", "/opt/a\n/opt/b", "/opt/a\r/opt/b"])
+def test_adapter_python_path_must_name_absolute_paths(architecture, name, value):
+    with pytest.raises(ValueError) as error:
+        _adapter_python_path(architecture, {"PYTHONPATH": {"name": "PYTHONPATH", "value": value}})
+    assert str(error.value) == f"{name} PYTHONPATH must name explicit absolute runtime paths"
+
+
+def test_adapter_python_path_puts_the_staged_files_first():
+    declared = {"PYTHONPATH": {"name": "PYTHONPATH", "value": "/opt/a:/opt/b"}}
+    for architecture in ("DeepseekV41ForCausalLM", GLM_ARCHITECTURE):
+        assert _adapter_python_path(architecture, declared) == {
+            "name": "PYTHONPATH",
+            "value": "/tmp/fpm-bench:/opt/a:/opt/b",
+        }
+    # A declared path that already holds the staged folder names it once, first.
+    repeated = {"PYTHONPATH": {"name": "PYTHONPATH", "value": "/opt/a:/tmp/fpm-bench:/opt/b"}}
+    assert _adapter_python_path(GLM_ARCHITECTURE, repeated)["value"] == "/tmp/fpm-bench:/opt/a:/opt/b"
+    assert _adapter_python_path("LlamaForCausalLM", declared) is None
+
+
+@pytest.mark.parametrize(
     ("producer", "phase", "measure_power", "smoke", "expected"),
     [
         ("generic", "prefill", True, False, True),
@@ -3856,6 +4438,59 @@ def test_power_window_cannot_be_set_through_the_environment(name, source):
 
     with pytest.raises(ValueError, match="--fpm-measure-power"):
         _cell_generator_overrides(_plan(cell), cell, base)
+
+
+@pytest.mark.parametrize(
+    "launch,value,refused",
+    # vLLM reads the variable as bool(int(value)) (vllm/envs.py:638): "00", " 0" and the Arabic-Indic digit zero read
+    # as off, "-1" as on, and a value that int() cannot read ("", "true", "0.0", "0x0") stops vLLM. None leaves the
+    # variable unset.
+    [
+        *[("slurm_probe", value, True) for value in ("1", "2", "-1", "true", "", "0.0", "0x0")],
+        *[("slurm_probe", value, False) for value in (None, "0", "00", " 0", "\u0660")],
+        ("kubernetes_probe", "1", False),
+        ("slurm_collection", "1", False),
+    ],
+)
+def test_slurm_probe_refuses_vllm_batch_invariant_in_the_collector_environment(
+    tmp_path, monkeypatch, launch, value, refused
+):
+    from collector.fpm_forward.runtime_probe import build_runtime_probe_plan, probe_generator_overrides
+
+    collection, probe = _glm53flash_probe_and_collection(tmp_path / "plan", 4)
+    facts = copy.deepcopy(probe.launch)
+    facts["deployment"]["executor"] = "slurm"
+    plan = {
+        "slurm_probe": build_runtime_probe_plan("gb300-tp4", facts, probe.runtime_instrumentation),
+        "kubernetes_probe": probe,
+        "slurm_collection": dataclasses.replace(
+            collection,
+            options=dataclasses.replace(
+                collection.options, executor="slurm", slurm_container_image=facts["deployment"]["image"]
+            ),
+        ),
+    }[launch]
+    # A probe hands every cell the request of its launch facts (runtime_probe.py), which declares no environment.
+    base = probe_generator_overrides(plan.launch) if launch != "slurm_collection" else {}
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+    without = [_cell_generator_overrides(plan, cell, base) for cell in plan.cells]
+    if value is not None:
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", value)
+
+    if refused:
+        text = (
+            f"VLLM_BATCH_INVARIANT is set to {value!r} in the environment of the collector, and srun can pass it to "
+            "vLLM in the step of a runtime probe; when vLLM reads it as on, it turns prefix caching off in a worker of "
+            "the TRITON_MLA or FLASHINFER backend while its scheduler keeps it on, and the import refuses such "
+            "records; unset it"
+        )
+        for cell in plan.cells:
+            with pytest.raises(ValueError, match=f"^{re.escape(text)}$"):
+                _cell_generator_overrides(plan, cell, base)
+        return
+    # A Kubernetes probe does not get the environment of the collector, and a collection launch is outside this rule:
+    # both are built as without the variable.
+    assert [_cell_generator_overrides(plan, cell, base) for cell in plan.cells] == without
 
 
 def test_historical_plans_without_measure_power_render_no_power_window():

@@ -68,6 +68,49 @@ def test_patch_release_gets_no_bundled_probe_observer(tmp_path):
         runtime_probe.probe_runtime(literal, output_dir=tmp_path / "execute", execute=True)
 
 
+def test_detected_versions_are_read_after_the_launch_sources_for_each_configuration(tmp_path):
+    import json
+
+    from collector.fpm_forward import runtime_probe
+
+    def missing(version):
+        return rf"^no bundled runtime observer for vLLM {version}; provide campaign-local --instrumentation$"
+
+    def launch(label, runtime=None):
+        identity = {"framework_version": label}
+        if runtime is not None:
+            identity["runtime_framework_version"] = runtime
+        return {"identity": identity}
+
+    one_version = "^bundled instrumentation selection requires one pinned runtime version$"
+    # The runtime version of the launch identity comes before a detected version.
+    with pytest.raises(ValueError, match=missing(r"0\.33\.1")):
+        runtime_probe.probe_runtime(
+            {"a": launch("0.33.1", "0.33.1")}, output_dir=tmp_path / "s1", detected_versions={"a": "0.33.2"}
+        )
+    # The bundle of the requested version comes before a detected version.
+    runtime_probe.probe_runtime({"a": launch("0.33.0")}, output_dir=tmp_path / "s2", detected_versions={"a": "0.33.1"})
+    saved = json.loads((tmp_path / "s2" / "probe-plan.json").read_text())
+    assert saved["bundle_sha256"] == bundled_instrumentation("0.33.0").sha256
+    # A preview reads a detected version too.
+    with pytest.raises(ValueError, match=missing(r"0\.33\.1")):
+        runtime_probe.probe_runtime(
+            {"a": launch("0.33.1")}, output_dir=tmp_path / "s3", detected_versions={"a": "0.33.1"}
+        )
+    # Each configuration reads its own detected version.
+    both = {"a": launch("0.33.1"), "b": launch("0.33.1")}
+    with pytest.raises(ValueError, match=missing(r"0\.33\.1")):
+        runtime_probe.probe_runtime(
+            both, output_dir=tmp_path / "s4", execute=True, detected_versions={"a": "0.33.1", "b": "0.33.1"}
+        )
+    # Two detected versions meet the one-version refusal before the bundle of the selected version is looked up.
+    other = {"a": launch("0.33.1"), "b": launch("0.33.2")}
+    with pytest.raises(ValueError, match=one_version):
+        runtime_probe.probe_runtime(
+            other, output_dir=tmp_path / "s5", execute=True, detected_versions={"a": "0.33.1", "b": "0.33.2"}
+        )
+
+
 @pytest.mark.parametrize("version", ["0.27.0", "0.28.0", "0.33.0"])
 def test_frozen_scheduler_export_preserves_native_benchmark_contract(tmp_path, monkeypatch, version):
     import importlib
@@ -288,8 +331,14 @@ def _v033_runtime(storage, layout, blocks):
         )
 
     if layout == "attention":
+        # A FullAttentionSpec has one token per state by default (kv_cache_interface.py:569).
         full = spec(
-            "FullAttentionSpec", block_size=16, page_size_bytes=4096, sliding_window=None, dtype="torch.bfloat16"
+            "FullAttentionSpec",
+            block_size=16,
+            page_size_bytes=4096,
+            sliding_window=None,
+            dtype="torch.bfloat16",
+            tokens_per_state=1,
         )
         groups = [group(["layer0"], full)]
         layers = {
@@ -607,8 +656,9 @@ def _fake_campaign(
     context = 1_048_576 if layout == "glm_tp4" else 4096
     config.model_config.max_model_len = context
     storage = _Storage(1024, blocks * page * (2 if packed else 1))
-    # The profiled allowance of the live GLM record.
-    available = 185_140_872_090 if layout == "glm_tp4" else storage.size + page
+    # The profiled allowance of the live GLM record. Otherwise the largest allowance that holds exactly the allocated
+    # blocks: vLLM sets the count of one worker to its allowance over the block bytes.
+    available = 185_140_872_090 if layout == "glm_tp4" else storage.size + page - 1
 
     class Tensor:
         def __init__(self, offset=0):

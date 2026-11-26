@@ -17,6 +17,8 @@ from collector.fpm_forward.config import semantic_generator_overrides, with_kv_w
 from collector.fpm_forward.database import aggregate_cell
 from collector.fpm_forward.measurement_evidence import extract_measurement_evidence
 from collector.fpm_forward.native_artifact import (
+    NativeCollection,
+    NativePointMeasurement,
     _expected_scheduled,
     validate_native_collection,
 )
@@ -34,8 +36,8 @@ from .test_fpm_measurement_evidence import (
     _remove_execution_protocol,
 )
 from .test_fpm_profile_collection import _plan, _profile, no_models_or_timing_data  # noqa: F401
-from .test_fpm_runner import _native_payload, _write_provenance
-from .test_fpm_runtime_memory import _vllm_config
+from .test_fpm_runner import _native_payload, _staged_run, _write_provenance
+from .test_fpm_runtime_memory import _glm_short_request_plan, _probe_backed_glm_plan, _vllm_config
 
 pytestmark = pytest.mark.unit
 
@@ -340,6 +342,190 @@ def test_freeze_selects_validated_native_extremes_and_reports_unselected_capture
     assert frozen == repeatability.freeze_repeatability_plan(
         plan, source, checkpoint, max_points_per_cell=6, comparison_mode="bounded"
     )
+
+
+def test_freeze_checks_the_receipts_of_a_smoke_source_against_the_smoke_selection(campaign, monkeypatch):
+    plan, source, checkpoint = campaign
+    recorded = []
+
+    def record(*_args, smoke=False):
+        recorded.append(smoke)
+
+    monkeypatch.setattr(repeatability, "_validate_points_receipts", record)
+    repeatability.freeze_repeatability_plan(plan, source, checkpoint, max_points_per_cell=6, comparison_mode="bounded")
+    assert recorded and set(recorded) == {False}
+
+    # A smoke cell of a generated list names its subset in the checkpoint entry.
+    saved = json.loads(checkpoint.read_text())
+    for entry in saved["cells"].values():
+        entry["smoke_manifest"] = "glm53flash_grid_v1_smoke"
+    checkpoint.write_text(json.dumps(saved))
+    recorded.clear()
+    repeatability.freeze_repeatability_plan(plan, source, checkpoint, max_points_per_cell=6, comparison_mode="bounded")
+    assert recorded and set(recorded) == {True}
+
+    # Only that name selects the subset, and only that name is refused in full_grid mode.
+    for other in (None, True, "glm53flash_grid_v1", "glm53flash_grid_v2_smoke"):
+        for entry in saved["cells"].values():
+            entry["smoke_manifest"] = other
+        checkpoint.write_text(json.dumps(saved))
+        for mode in ("bounded", "full_grid"):
+            recorded.clear()
+            repeatability.freeze_repeatability_plan(
+                plan, source, checkpoint, max_points_per_cell=6, comparison_mode=mode
+            )
+            assert recorded and set(recorded) == {False}
+
+
+def _glm_smoke_source(monkeypatch, tmp_path, plan):
+    """The campaign folder, the checkpoint path and the checkpoint of the runner's smoke run of ``plan``."""
+    _staged, _receipts, saved = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=True)
+    return (
+        tmp_path / "run" / "artifacts" / plan.sha256[:16] / "smoke",
+        tmp_path / "run" / "checkpoints" / "fpm_forward_smoke.json",
+        saved,
+    )
+
+
+def _read_the_staged_lists(monkeypatch):
+    """Replace the readers of rank artifacts, which the runner's staged runs do not write.
+
+    Each launch reports that it measured exactly the list that the runner staged for its cell, under the attempt of its
+    checkpoint. The point-list receipts, the freeze, the sample plans and the comparison of coordinates stay real.
+    """
+
+    def collection(cell, raw_root, *, expected_plan_sha256, expected_attempt_id):
+        listed = json.loads((raw_root.parent / runner.POINTS_FILENAME).read_text())[cell.workload_kind]
+        points = tuple(
+            NativePointMeasurement(
+                point=_point(item, cell.workload_kind, index + 1),
+                rank_wall_times=((0, 0.01),),
+                kv_seed_regime="real_prefix" if item["total_kv_read_tokens"] else "not_applicable",
+            )
+            for index, item in enumerate(listed)
+        )
+        return NativeCollection(
+            points=points,
+            rank_timings=(),
+            backend_version="0.33.0",
+            collector_attempt_id=expected_attempt_id,
+            runtime_run_id=f"run-{expected_attempt_id}",
+            runtime_grid_digest="grid",
+        )
+
+    monkeypatch.setattr(repeatability, "validate_native_collection", collection)
+    monkeypatch.setattr(repeatability, "select_native_measurements", lambda found, cell_id: list(found.points))
+    monkeypatch.setattr(repeatability, "_rank_artifacts", lambda _raw: [{}])
+    monkeypatch.setattr(repeatability, "extract_measurement_evidence", lambda *_args, **_kwargs: {"schema_version": 2})
+    monkeypatch.setattr(repeatability, "inspect_execution_evidence", lambda *_args, **_kwargs: {"status": "incomplete"})
+
+
+def test_freeze_checks_the_receipts_of_a_glm_smoke_cell_against_its_smoke_subset(monkeypatch, tmp_path):
+    plan = _glm_short_request_plan(tmp_path, "prefill")
+    [cell] = plan.cells
+    source, checkpoint, saved = _glm_smoke_source(monkeypatch, tmp_path, plan)
+    _read_the_staged_lists(monkeypatch)
+
+    frozen = repeatability.freeze_repeatability_plan(plan, source, checkpoint, comparison_mode="bounded")
+    staged = json.loads((source / "cells" / cell.cell_id / runner.POINTS_FILENAME).read_text())
+    assert frozen["cells"][0]["benchmark_points"] == staged
+
+    # The receipt names the smoke subset, so it is no receipt of a cell whose entry names no smoke.
+    entry = {key: value for key, value in saved["cells"][cell.cell_id].items() if key != "smoke_manifest"}
+    checkpoint.write_text(json.dumps({**saved, "cells": {cell.cell_id: entry}}))
+    with pytest.raises(ValueError, match="^runtime benchmark-points receipt mismatch"):
+        repeatability.freeze_repeatability_plan(plan, source, checkpoint, comparison_mode="bounded")
+
+    # The smoke entry does not excuse a receipt that names another list.
+    checkpoint.write_text(json.dumps(saved))
+    receipt = source / "cells" / cell.cell_id / "raw" / "pod-0" / runner.POINTS_RECEIPT_FILENAME
+    full = {**json.loads(receipt.read_text()), "sha256": plan.options.benchmark_points_sha256}
+    receipt.write_text(json.dumps(full))
+    with pytest.raises(ValueError, match="^runtime benchmark-points receipt mismatch"):
+        repeatability.freeze_repeatability_plan(plan, source, checkpoint, comparison_mode="bounded")
+
+
+def _repeat_glm_source(monkeypatch, tmp_path, plan, source, checkpoint, **kwargs):
+    monkeypatch.setattr(repeatability.planner, "_git_revision", lambda: plan.aic_revision)
+    return repeatability.run_repeatability(
+        source_plan=plan,
+        generator_overrides=json.loads((source / "generator-overrides.json").read_text()),
+        source_campaign_dir=source,
+        source_checkpoint_path=checkpoint,
+        output_dir=tmp_path / "validation",
+        **kwargs,
+    )
+
+
+def test_bounded_repeat_of_a_glm_smoke_source_measures_the_frozen_subset(monkeypatch, tmp_path):
+    plan = _glm_short_request_plan(tmp_path, "prefill")
+    [cell] = plan.cells
+    source, checkpoint, _saved = _glm_smoke_source(monkeypatch, tmp_path, plan)
+    _read_the_staged_lists(monkeypatch)
+
+    report = _repeat_glm_source(monkeypatch, tmp_path, plan, source, checkpoint, comparison_mode="bounded")
+    smoke = json.loads((source / "cells" / cell.cell_id / runner.POINTS_FILENAME).read_text())
+    attempts = [attempt for sample in report["samples"][cell.cell_id] for attempt in sample["attempts"]]
+    assert [attempt["status"] for attempt in attempts] == ["passed"] * 5
+    # Each sample stages the frozen coordinates of the smoke subset and no other point.
+    staged = sorted((tmp_path / "validation" / "samples").rglob(runner.POINTS_FILENAME))
+    assert len(staged) == 5
+    assert all(json.loads(path.read_text()) == smoke for path in staged)
+
+
+@pytest.mark.parametrize("mode", [{}, {"comparison_mode": "full_grid"}])
+def test_full_grid_repeat_of_a_glm_smoke_source_is_refused_before_a_launch(monkeypatch, tmp_path, mode):
+    plan = _glm_short_request_plan(tmp_path, "prefill")
+    [cell] = plan.cells
+    source, checkpoint, saved = _glm_smoke_source(monkeypatch, tmp_path, plan)
+    # No reader is replaced: the staged run holds no rank artifacts, so a read of one would raise another text.
+    launches = []
+    monkeypatch.setattr(repeatability, "run_collection", lambda *args, **kwargs: launches.append(args))
+    files = sorted(tmp_path.rglob("*"))
+
+    text = (
+        f"repeatability source cell {cell.cell_id}: a smoke collection measured a subset of its point list, and a "
+        "full_grid repeatability run stages the full list: use --repeatability-comparison-mode bounded, or a formal "
+        "collection as the source"
+    )
+    with pytest.raises(ValueError) as error:
+        repeatability.freeze_repeatability_plan(plan, source, checkpoint, **mode)
+    assert str(error.value) == text
+    with pytest.raises(ValueError) as error:
+        _repeat_glm_source(monkeypatch, tmp_path, plan, source, checkpoint, **mode)
+    assert str(error.value) == text
+    assert launches == []
+    assert sorted(tmp_path.rglob("*")) == files
+
+    # A cell that did not pass keeps its own refusal.
+    saved["cells"][cell.cell_id]["status"] = "failed"
+    checkpoint.write_text(json.dumps(saved))
+    with pytest.raises(ValueError, match="^repeatability requires a passed source cell"):
+        repeatability.freeze_repeatability_plan(plan, source, checkpoint, **mode)
+
+
+@pytest.mark.parametrize("mode", ["full_grid", "bounded"])
+def test_formal_glm_source_freezes_in_both_modes(monkeypatch, tmp_path, mode):
+    plan, _overrides = _probe_backed_glm_plan(tmp_path)
+    _staged, _receipts, saved = _staged_run(monkeypatch, tmp_path / "run", plan, smoke=False)
+    source = tmp_path / "run" / "artifacts" / plan.sha256[:16]
+    checkpoint = tmp_path / "run" / "checkpoints" / "fpm_forward.json"
+    assert all("smoke_manifest" not in entry for entry in saved["cells"].values())
+    _read_the_staged_lists(monkeypatch)
+
+    frozen = repeatability.freeze_repeatability_plan(plan, source, checkpoint, comparison_mode=mode)
+    assert [item["cell_id"] for item in frozen["cells"]] == [cell.cell_id for cell in plan.cells]
+    assert frozen["policy"]["comparison_mode"] == mode
+
+
+@pytest.mark.parametrize("mode", ["full_grid", "bounded"])
+def test_formal_source_of_a_user_list_freezes_in_both_modes(campaign, mode):
+    plan, source, checkpoint = campaign
+    frozen = repeatability.freeze_repeatability_plan(
+        plan, source, checkpoint, max_points_per_cell=6, comparison_mode=mode
+    )
+    assert frozen["policy"]["comparison_mode"] == mode
+    assert len(frozen["cells"][0]["points"]) == (6 if mode == "bounded" else 12)
 
 
 def test_too_small_budget_cannot_silently_drop_required_regimes(campaign):

@@ -773,6 +773,63 @@ root NOTICE file. The repository's Apache-2.0 LICENSE supplies the license
 text, and no upstream source file is vendored.
 
 
+The repository-root file
+`python/aisim/collector/fpm_forward/runtime_observations.py` adapts the region
+rule of vLLM's NIXL connector from vLLM v0.33.0, immutable commit
+`4ba787ec9959e566d3b587a796dff07673324da5`: the regions that the connector
+registers for the layers of a model with Mamba layers and a ring, the group ID
+of a shared region, the SSM and scratch marks, and the regions that one block
+of each cache group reads. The runtime probe import computes the
+`transfer_bytes_per_block` of each cache group from them.
+`python/aisim/tests/unit/collector/test_runtime_observations.py` holds the
+tests of this rule.
+
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/utils.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
+
+This is a modified Python adaptation, restricted to storage of whole block
+rows, MLA attention layers, Mamba groups of two or more layers and a ring. No
+upstream method body is copied. The identified upstream revision has no root
+NOTICE file. The repository's Apache-2.0 LICENSE supplies the license text, and
+no upstream source file is vendored.
+
+
+The repository-root file `python/aisim/collector/fpm_forward/glm53flash_points.py`
+adapts rules of vLLM v0.33.0, immutable commit
+`4ba787ec9959e566d3b587a796dff07673324da5`, for a Mamba cache in align mode
+with prefix caching. From `sched/scheduler.py`, `glm_align_stop` adapts the
+stops of the last prefill chunk: the last cacheable block boundary and, for a
+start inside a block, the next block boundary. From `kv_cache_interface.py`,
+`glm_align_stop` adapts the position of the prefill checkpoint and the validity
+test of a checkpoint inside the chunk, and `glm_point_blocks` adapts the one
+block of a ring group. From `single_type_kv_cache_manager.py`,
+`glm_point_blocks` adapts the blocks that a request holds in a Mamba group when
+it is admitted: its running block, the cached block of its prefix and the
+checkpoint block. The planner generates the GLM-5.3-Flash point list with these
+rules. `_glm_align_stop` in
+`python/aisim/collector/fpm_forward/runtime/glm53flash/glm53flash_prefix_scheduler.py`
+holds the same adaptation of the chunk stops and of the checkpoint test. The
+producer refuses a prefill point that vLLM would split.
+
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/sched/scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+
+Copyright contributors to the vLLM project. Licensed under Apache-2.0:
+https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
+
+This is a modified Python adaptation, restricted to no EAGLE, no speculative
+blocks, no hash lookahead tokens, no partial hash hits, no shared-prefix
+junction stop and no async scheduling. No upstream method body is copied. The identified upstream
+revision has no root NOTICE file. The repository's Apache-2.0 LICENSE supplies
+the license text, and no upstream source file is vendored.
+
+
 The inference-mode scope and MSA query-position metadata integration in
 `collector/vllm/collect_mla_module.py` and
 `collector/vllm/collect_msa_module.py` are adapted (modified) from serving

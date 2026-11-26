@@ -604,6 +604,19 @@ def test_source_validation_remains_native_and_rejects_leaking_duplicates(holdout
     assert not (tmp_path / "assessment/holdout-plan.json").exists()
 
 
+def test_report_names_the_policy_of_its_references(holdout_case, tmp_path):
+    # Each reference is the measurement of the formal table, and the sidecar of the table names its policy: a single
+    # sample, a single sample with a power window, or the median of the GLM-5.3-Flash producer.
+    request, source, _parquet, _rows = holdout_case
+    report = evaluate_interpolation_holdout(request, systems_root=source, output_dir=tmp_path / "assessment")
+    assert report["reference_measurement_policy"] == "dynamo_native_single_sample_v1"
+    assert report["limitations"][0] == (
+        "Each reference is the original formal-table measurement, taken under the policy that "
+        "reference_measurement_policy names; separate subset repeatability evidence does not remove measurement noise "
+        "from these errors."
+    )
+
+
 def test_other_identity_and_legacy_metadata_are_preserved_without_becoming_holdouts(holdout_case, tmp_path):
     request, source, parquet, rows = holdout_case
     for row in rows:

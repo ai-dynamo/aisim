@@ -38,10 +38,13 @@ _CELL_EXECUTION_FIELDS = frozenset({"execution_identity", "input_text_sha256"})
 _SPEC_TYPES = frozenset({*(_SPEC_MODULE + name for name in SPEC_KINDS), _UNIFORM_SPEC})
 # The vLLM 0.33.0 spec classes whose groups take no part in prefix caching (kv_cache_interface.py:998-1000). A
 # SlidingWindowMLASpec group takes part unless it replays a bounded window (:1015, :1027-1029), which no record holds.
+# The groups that replay share one window, so the import lets such groups stay out only when the windows that their
+# records hold are one (runtime_observations._scheduler_hash_block_sizes).
 _NO_PREFIX_CACHING_SPECS = frozenset({_SPEC_MODULE + "CircularBufferSpec"})
 # vLLM 0.33.0 cache settings that follow the prefix-caching mode (models/config.py:763-787), the
 # user prefix-match unit, and the block size that the engine core resolves in its own process
-# (engine/core.py:347-351). Importers record the mode per phase instead of comparing them.
+# (engine/core.py:347-351). Importers record the mode per phase instead of comparing them. Inside one phase, the
+# import compares prefix_match_unit between a worker and its scheduler (runtime_observations._phase_prefix_caching).
 _PHASE_CACHE_SETTINGS = (
     "enable_prefix_caching",
     "mamba_cache_mode",
@@ -557,6 +560,15 @@ def _spec_classes(group: dict[str, Any], names: list[str], hybrid: bool) -> list
             or type(item.get("page_size_bytes")) is not int
             or item["page_size_bytes"] <= 0
             or (not uniform and item.get("spec_type") != spec)
+            # Every attention spec has a token state, 1 by default, and a MambaSpec has -1 (kv_cache_interface.py:569,
+            # :1104). Without one the abstract property raises (:250-252). The observer records a fraction as a string.
+            or (hybrid and item.get("tokens_per_state") is None)
+            # An MLAAttentionSpec always has a role (:737, the roles at :196-198).
+            or (
+                hybrid
+                and item.get("spec_type") == _SPEC_MODULE + "MLAAttentionSpec"
+                and item.get("cache_role") not in ("SPARSE", "INDEXER")
+            )
             for item in specs.values()
         )
     ):
@@ -684,7 +696,11 @@ def _normalized_groups(cache: dict[str, Any], scheduler_cache: dict[str, Any], p
                 # Frozen older bundles lack this independent startup observation; keep their checks.
                 if "startup_blocks_per_request" in state:
                     startup = state["startup_blocks_per_request"]
-                    expected = 2 + checkpoint if state.get("mamba_cache_mode") == "align" else 1
+                    # vLLM counts the speculative blocks too (kv_cache_interface.py:1135-1141), as the concurrency
+                    # check of the import does. The count is 0 here: the check above refuses any other.
+                    expected = state["num_speculative_blocks"] + (
+                        2 + checkpoint if state.get("mamba_cache_mode") == "align" else 1
+                    )
                     if type(startup) is not int or startup != expected:
                         raise ValueError(f"runtime Mamba startup blocks_per_request contradicts its spec: {names}")
             # blocks_per_request is the steady count, held between block boundaries. In vLLM 0.33.0, a MambaSpec

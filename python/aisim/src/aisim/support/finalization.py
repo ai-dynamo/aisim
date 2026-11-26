@@ -301,6 +301,7 @@ def _verify_collection(
     from collector.fpm_forward.database import (
         aggregate_cell,
         published_dense_synthetic_cells,
+        published_median_policy,
         validate_formal_database_commit,
     )
     from collector.fpm_forward.glm53flash_points import GLM_POINTS_ORIGIN, glm_plan_manifest
@@ -465,7 +466,12 @@ def _verify_collection(
                 snapshots[path] = _digest(path.read_bytes())
         rows.extend(
             aggregate_cell(
-                frozen, cell, cell_dir, expected_attempt_id=attempt, dense_synthetic_kv=cell.cell_id in dense_cells
+                frozen,
+                cell,
+                cell_dir,
+                expected_attempt_id=attempt,
+                dense_synthetic_kv=cell.cell_id in dense_cells,
+                median_policy=published_median_policy(published),
             )
         )
         if probe_manifest is None:

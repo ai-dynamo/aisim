@@ -23,7 +23,7 @@ from typing import Any
 from aisim.fpm_advisory import prefill_graph_advisory
 
 from . import runner
-from .capabilities import checkpoint_fmha_quant_mode, has_checkpoint_fmha
+from .capabilities import bfloat16_kv_cache, checkpoint_fmha_quant_mode, has_checkpoint_fmha
 from .config import FPM_WARMUP_ITERATIONS, FPMCollectionOptions, collection_phases, semantic_generator_overrides
 from .entry import _load_generator_overrides
 from .model_capability import ResolvedModelConfig, load_model_config
@@ -278,13 +278,28 @@ def build_runtime_probe_plan(configuration: str, facts: dict[str, Any], bundle: 
         if actual != precision[name]:
             raise ValueError(f"precision.{name}={precision[name]!r} does not match checkpoint-native {actual!r}")
     # Collection labels FMHA with the checkpoint-native mode of an AIC KV-cache mode other than bfloat16, and the import
-    # accepts only that label, so another label is refused here, before any GPU work.
+    # accepts only that label, so another label is refused here, before any GPU work. Collection labels the FMHA of a
+    # bfloat16 KV cache bfloat16 (checkpoint_fmha_quant_mode), so another label is refused here too. For an
+    # unquantized float16 checkpoint the import also requires the label to equal the compute dtype half, so no label of
+    # a bfloat16 KV cache imports, and that cache is refused here as a whole.
     if has_checkpoint_fmha(precision["kvcache_quant_mode"]):
-        expected = checkpoint_fmha_quant_mode(config, architecture, precision["kvcache_quant_mode"])
+        expected = checkpoint_fmha_quant_mode(config, architecture, precision["kvcache_quant_mode"], inferred)
         if precision["fmha_quant_mode"] != expected:
             raise ValueError(
                 f"precision.fmha_quant_mode={precision['fmha_quant_mode']!r} does not match checkpoint-native "
                 f"{expected!r}"
+            )
+    elif bfloat16_kv_cache(precision["kvcache_quant_mode"]):
+        if precision["gemm_quant_mode"] == "half":
+            raise ValueError(
+                f"precision.kvcache_quant_mode={precision['kvcache_quant_mode']!r} cannot be imported for an "
+                "unquantized float16 checkpoint: the observation import accepts no FMHA label for it (a bfloat16 KV "
+                "cache takes the label bfloat16, and the label must equal the compute dtype half)"
+            )
+        if precision["fmha_quant_mode"] != "bfloat16":
+            raise ValueError(
+                f"precision.fmha_quant_mode={precision['fmha_quant_mode']!r} does not match 'bfloat16', the "
+                "collection label of a bfloat16 KV cache"
             )
     topology = ParallelTopology(**launch["topology"])
     is_moe = identity["model_kind"] == "moe"
@@ -867,6 +882,7 @@ def probe_runtime(
     output_dir: str | Path,
     execute: bool = False,
     resume: bool = False,
+    detected_versions: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Preview or capture all selected exact tuples; preserve every attempt."""
 
@@ -886,6 +902,13 @@ def probe_runtime(
                 # Existing literal-version previews can still select their
                 # historical bundle; this is not a claim of runtime detection.
                 version = identity["framework_version"]
+            if version is None and detected_versions and name in detected_versions:
+                # The version that the caller detected in the target container,
+                # taken as the version of the bundled selection only when neither
+                # source above gives one. When the selected configurations give
+                # one version in all and no bundle exists for it, the refusal
+                # below names the missing observer.
+                version = detected_versions[name]
             if version is None:
                 unresolved.append(name)
             else:
@@ -941,6 +964,18 @@ def probe_runtime(
                         configuration, facts["deployment"], root, resume=resume
                     )
                 plan = build_runtime_probe_plan(configuration, facts, bundle)
+                detected = (detected_versions or {}).get(configuration)
+                if detected is not None and bundle.manifest["runtime"]["version"] != detected:
+                    # The command of each launch compares the installed vLLM
+                    # version with the bundle version and stops on a difference
+                    # (runner._attempt_provenance_command). The detected version
+                    # is the installed version of the same image, so the same
+                    # comparison refuses here, before any launch.
+                    raise ValueError(
+                        f"instrumentation runtime version {bundle.manifest['runtime']['version']} differs from "
+                        f"vLLM {detected} detected in the target container; "
+                        f"provide campaign-local --instrumentation for vLLM {detected}"
+                    )
                 existing = index["configurations"].get(configuration)
                 if existing is not None and existing["launch"] != plan.launch:
                     raise ValueError("launch settings changed; use a fresh probe output directory")

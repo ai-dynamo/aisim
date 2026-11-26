@@ -460,7 +460,7 @@ def test_public_collect_smoke_readiness_and_resume_route_to_same_resolved_campai
         probes.append(deployment)
         return {"backend_version": "0.28.0", "dynamo_version": "1.5.0+fixture"}
 
-    frozen = SimpleNamespace(sha256="a" * 64)
+    frozen = SimpleNamespace(sha256="a" * 64, options=SimpleNamespace(benchmark_points_dropped_json=None))
 
     def resolve(command):
         args = collector_cli._parser().parse_args(command[3:])

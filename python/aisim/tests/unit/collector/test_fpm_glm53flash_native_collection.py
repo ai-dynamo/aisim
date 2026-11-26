@@ -159,8 +159,9 @@ def glm_native_payload(phase: str, *, points: list[dict], rank: int = 0, dp: int
             "pinned_model": GLM_MODEL,
             "pinned_revision": MODEL_REVISIONS[GLM_MODEL],
             "checkpoint_dir": f"/hf-hub/models--zai-org--GLM-5.3-Flash/snapshots/{MODEL_REVISIONS[GLM_MODEL]}",
-            "token_ids_sha256": hashlib.sha256(b"seeded token ids").hexdigest(),
-            "unique_token_count": 100000,
+            # The digest and the distinct-token count of the real stream of seed 53, generator version 2.
+            "token_ids_sha256": "b72027be2cc23b86e212485dc13b24b62969b583eae6ee40ac0124429f7cc15e",
+            "unique_token_count": 126303,
             "sampling": "prompt = concatenated [offset, length] rotations of the seeded stream (see prompt specs)",
             "chunk_start_alignment": 4,
             "decode_contexts_sha256": None,
@@ -359,7 +360,7 @@ def _validate(tmp_path: Path, cell: FPMCell):
     )
 
 
-def _glm_plan(template_id: str = GENERIC_RUNTIME_TEMPLATE_ID) -> SimpleNamespace:
+def _glm_plan() -> SimpleNamespace:
     """The parts of a collection plan that publication reads, for the GLM-5.3-Flash checkpoint."""
     return SimpleNamespace(
         sha256=PLAN_SHA256,
@@ -369,7 +370,10 @@ def _glm_plan(template_id: str = GENERIC_RUNTIME_TEMPLATE_ID) -> SimpleNamespace
         backend="vllm",
         options=SimpleNamespace(warmup_iterations=0),
         capability=SimpleNamespace(
-            support_level="native_runtime", template_id=template_id, template_version=1, aic_database_version="0.33.0"
+            support_level="native_runtime",
+            template_id=GENERIC_RUNTIME_TEMPLATE_ID,
+            template_version=1,
+            aic_database_version="0.33.0",
         ),
     )
 
@@ -538,6 +542,74 @@ def _evidence(payload: dict) -> dict:
     return payload["input_provenance"]
 
 
+def _rewrite_sidecar(payload: dict, sidecar: Path, lines: list[bytes]) -> None:
+    """Write ``lines`` as the sidecar, each with a line break, and give the manifest their digest and their count."""
+    raw = b"".join(line + b"\n" for line in lines)
+    sidecar.write_bytes(raw)
+    manifest = payload["input_provenance"]["repetition_evidence_manifest"]
+    manifest.update(sha256=hashlib.sha256(raw).hexdigest(), records=len(lines))
+
+
+def _swap_the_row_digests(payload: dict, _sidecar: Path) -> None:
+    first, second = payload["results"]
+    first["repetition_evidence_sha256"], second["repetition_evidence_sha256"] = (
+        second["repetition_evidence_sha256"],
+        first["repetition_evidence_sha256"],
+    )
+
+
+def _sidecar_lines(sidecar: Path) -> list[bytes]:
+    return sidecar.read_bytes().splitlines()
+
+
+def _repeat_the_first_id(payload: dict, sidecar: Path) -> None:
+    lines = [json.loads(line) for line in _sidecar_lines(sidecar)]
+    lines[1]["benchmark_id"] = lines[0]["benchmark_id"]
+    _rewrite_sidecar(
+        payload, sidecar, [json.dumps(line, sort_keys=True, separators=(",", ":")).encode() for line in lines]
+    )
+
+
+def _first_id_as_a_string(payload: dict, sidecar: Path) -> None:
+    lines = _sidecar_lines(sidecar)
+    first = json.loads(lines[0])
+    first["benchmark_id"] = str(first["benchmark_id"])
+    _rewrite_sidecar(payload, sidecar, [json.dumps(first, sort_keys=True, separators=(",", ":")).encode(), *lines[1:]])
+
+
+def _first_line_is_no_json(payload: dict, sidecar: Path) -> None:
+    _rewrite_sidecar(payload, sidecar, [b"not json", *_sidecar_lines(sidecar)[1:]])
+
+
+def _first_line_is_no_object(payload: dict, sidecar: Path) -> None:
+    _rewrite_sidecar(payload, sidecar, [b"[1]", *_sidecar_lines(sidecar)[1:]])
+
+
+def _first_line_is_no_utf8(payload: dict, sidecar: Path) -> None:
+    _rewrite_sidecar(payload, sidecar, [b"\xff", *_sidecar_lines(sidecar)[1:]])
+
+
+def _second_line_names_another_point(payload: dict, sidecar: Path) -> None:
+    # Rows 1 and 2 with sidecar lines 1 and 3. The second row carries the digest of the line with ID 3, so its own ID 2
+    # names no line.
+    lines = _sidecar_lines(sidecar)
+    second = json.loads(lines[1])
+    second["benchmark_id"] = 3
+    line = json.dumps(second, sort_keys=True, separators=(",", ":")).encode()
+    _rewrite_sidecar(payload, sidecar, [lines[0], line])
+    payload["results"][1]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
+
+
+def _first_line_id_is_a_boolean(payload: dict, sidecar: Path) -> None:
+    # The row of ID 1 carries the digest of the changed line, so only the type of the line's ID is wrong.
+    lines = _sidecar_lines(sidecar)
+    first = json.loads(lines[0])
+    first["benchmark_id"] = True
+    line = json.dumps(first, sort_keys=True, separators=(",", ":")).encode()
+    _rewrite_sidecar(payload, sidecar, [line, *lines[1:]])
+    payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
+
+
 REFUSALS = [
     pytest.param(
         "execution_identity",
@@ -697,20 +769,29 @@ REFUSALS = [
         lambda p, _: _evidence(p)["repetition_evidence_manifest"].update(records=3),
         id="manifest-records",
     ),
+    pytest.param(
+        "repetition_evidence_manifest",
+        lambda p, _: _evidence(p)["repetition_evidence_manifest"].update(records=2.0),
+        id="manifest-records-is-a-float",
+    ),
     pytest.param("repetition_evidence_manifest", _drop_a_line, id="sidecar-has-fewer-lines-than-records"),
     pytest.param("repetition_evidence_manifest", _add_a_line, id="sidecar-has-more-lines-than-rows"),
-    pytest.param("kvwarm", lambda p, _: p.pop("kvwarm"), id="kvwarm-absent"),
-    pytest.param("kvwarm", lambda p, _: p["kvwarm"].update(enabled=False), id="kvwarm-disabled"),
-    pytest.param("kvwarm", lambda p, _: p["kvwarm"].update(enabled=1), id="kvwarm-enabled-is-not-a-boolean"),
-    pytest.param("kvwarm", lambda p, _: p["kvwarm"].update(warm_eligible=False), id="kvwarm-not-eligible"),
-    pytest.param("kvwarm", lambda p, _: p["kvwarm"].update(skip_reason="skipped"), id="kvwarm-skip-reason"),
+    pytest.param("kvwarm.enabled", lambda p, _: p.pop("kvwarm"), id="kvwarm-absent"),
+    pytest.param("kvwarm.enabled", lambda p, _: p["kvwarm"].update(enabled=False), id="kvwarm-disabled"),
+    pytest.param("kvwarm.enabled", lambda p, _: p["kvwarm"].update(enabled=1), id="kvwarm-enabled-is-not-a-boolean"),
     pytest.param(
-        "kvwarm",
+        "kvwarm.warm_eligible", lambda p, _: p["kvwarm"].update(warm_eligible=False), id="kvwarm-not-eligible"
+    ),
+    pytest.param("kvwarm.skip_reason", lambda p, _: p["kvwarm"].update(skip_reason="skipped"), id="kvwarm-skip-reason"),
+    pytest.param(
+        "kvwarm.method",
         lambda p, _: p["kvwarm"].update(method="native_radix_cache_real_seed"),
         id="kvwarm-method",
     ),
     pytest.param(
-        "kvwarm", lambda p, _: p["kvwarm"].update(state_protocol="other_protocol"), id="kvwarm-state-protocol"
+        "kvwarm.state_protocol",
+        lambda p, _: p["kvwarm"].update(state_protocol="other_protocol"),
+        id="kvwarm-state-protocol",
     ),
     pytest.param("timing_boundary", lambda p, _: p.update(timing_boundary="wall_clock"), id="timing-boundary"),
     pytest.param(
@@ -722,6 +803,36 @@ REFUSALS = [
         "serving_config.async_scheduling",
         lambda p, _: p["serving_config"].update(async_scheduling=True),
         id="async-scheduling-on",
+    ),
+    pytest.param(
+        "serving_config.mamba_cache_mode",
+        lambda p, _: p["serving_config"].update(mamba_cache_mode="none"),
+        id="mamba-mode",
+    ),
+    pytest.param(
+        "serving_config.block_size",
+        lambda p, _: p["serving_config"].update(block_size=16),
+        id="scheduler-block-differs-from-the-hash-block",
+    ),
+    pytest.param(
+        "serving_config.need_mamba_block_aligned_split",
+        lambda p, _: p["serving_config"].update(need_mamba_block_aligned_split=False),
+        id="no-aligned-split",
+    ),
+    pytest.param(
+        "serving_config.block_size",
+        lambda p, _: p["serving_config"].update(block_size=2176.0, hash_block_size=2176.0),
+        id="blocks-are-floats",
+    ),
+    pytest.param(
+        "serving_config.block_size",
+        lambda p, _: p["serving_config"].update(hash_block_size=2176.0),
+        id="hash-block-is-a-float",
+    ),
+    pytest.param(
+        "serving_config.need_mamba_block_aligned_split",
+        lambda p, _: p["serving_config"].update(need_mamba_block_aligned_split=1),
+        id="aligned-split-is-not-a-boolean",
     ),
     pytest.param(
         "serving_config.enable_prefix_caching", lambda p, _: p.pop("serving_config"), id="serving-config-absent"
@@ -737,6 +848,24 @@ REFUSALS = [
         lambda p, _: p["results"][1].pop("repetition_evidence_sha256"),
         id="row-digest-absent",
     ),
+    pytest.param("repetition_evidence_sha256", _swap_the_row_digests, id="row-digests-swapped"),
+    pytest.param(
+        "repetition_evidence_sha256",
+        lambda p, _: p["results"][1].update(repetition_evidence_sha256=p["results"][0]["repetition_evidence_sha256"]),
+        id="row-digest-repeated",
+    ),
+    pytest.param(
+        "repetition_evidence_sha256",
+        lambda p, _: p["results"][0].update(repetition_evidence_sha256=hashlib.sha256(b"another point").hexdigest()),
+        id="row-digest-of-no-line",
+    ),
+    pytest.param("repetition_evidence", _repeat_the_first_id, id="sidecar-repeats-an-id"),
+    pytest.param("repetition_evidence", _first_id_as_a_string, id="sidecar-id-is-a-string"),
+    pytest.param("repetition_evidence", _first_line_is_no_json, id="sidecar-line-is-no-json"),
+    pytest.param("repetition_evidence", _first_line_is_no_object, id="sidecar-line-is-no-object"),
+    pytest.param("repetition_evidence", _first_line_is_no_utf8, id="sidecar-line-is-no-utf8"),
+    pytest.param("repetition_evidence", _first_line_id_is_a_boolean, id="sidecar-id-is-a-boolean"),
+    pytest.param("repetition_evidence_sha256", _second_line_names_another_point, id="row-id-of-no-line"),
     pytest.param(
         "kv_seed_regime", lambda p, _: p["results"][0].update(kv_seed_regime="real_prefix"), id="regime-of-cold-row"
     ),
@@ -744,6 +873,50 @@ REFUSALS = [
         "kv_seed_regime",
         lambda p, _: p["results"][1].update(kv_seed_regime="not_applicable"),
         id="regime-of-cached-row",
+    ),
+    pytest.param(
+        "input_provenance.generator",
+        lambda p, _: _evidence(p).update(generator="other"),
+        id="generator-is-not-the-pinned-one",
+    ),
+    pytest.param(
+        "input_provenance.generator_version",
+        lambda p, _: _evidence(p).update(generator_version=1),
+        id="generator-version-1",
+    ),
+    pytest.param(
+        "input_provenance.generator_version",
+        lambda p, _: _evidence(p).update(generator_version=3),
+        id="generator-version-3",
+    ),
+    pytest.param("input_provenance.seed", lambda p, _: _evidence(p).update(seed=54), id="seed-is-not-the-pinned-one"),
+    pytest.param(
+        "input_provenance.count", lambda p, _: _evidence(p).update(count=262239), id="count-is-not-the-producer-count"
+    ),
+    pytest.param(
+        "input_provenance.vocab_low",
+        lambda p, _: _evidence(p).update(vocab_low=1),
+        id="vocab-low-is-not-the-pinned-one",
+    ),
+    pytest.param(
+        "input_provenance.vocab_high_exclusive",
+        lambda p, _: _evidence(p).update(vocab_high_exclusive=154821),
+        id="vocab-high-is-not-the-pinned-one",
+    ),
+    pytest.param(
+        "input_provenance.tokenizer_json_sha256",
+        lambda p, _: _evidence(p).update(tokenizer_json_sha256="0" * 64),
+        id="tokenizer-digest-is-not-the-pinned-one",
+    ),
+    pytest.param(
+        "input_provenance.token_ids_sha256",
+        lambda p, _: _evidence(p).update(token_ids_sha256=hashlib.sha256(b"another stream").hexdigest()),
+        id="stream-digest-of-another-stream",
+    ),
+    pytest.param(
+        "input_provenance.unique_token_count",
+        lambda p, _: _evidence(p).update(unique_token_count=126302),
+        id="distinct-count-of-another-stream",
     ),
 ]
 
@@ -760,7 +933,7 @@ def test_glm_producer_artifact_refuses_each_unaudited_item(tmp_path, field, tamp
         _validate(tmp_path, cell)
 
 
-def test_glm_producer_token_evidence_passes_for_real_and_boundary_values(tmp_path, monkeypatch):
+def test_glm_producer_token_evidence_must_be_the_pinned_stream(tmp_path, monkeypatch):
     producer = load_producer(monkeypatch)
     # The producer draws its largest measured context of 131,072 tokens plus a window of 4,099 tokens for each of up
     # to 32 requests, from seed 53 over the pinned vocabulary of 154,820 ids. Its distinct-token count is that of the
@@ -769,39 +942,379 @@ def test_glm_producer_token_evidence_passes_for_real_and_boundary_values(tmp_pat
     tokens = seeded.generate(seeded.SEED, count, seeded.VOCAB_LOW, seeded.VOCAB_HIGH)
     assert (seeded.SEED, count, len(set(tokens))) == (53, 262240, 126303)
     cases = {
-        "producer": {"seed": seeded.SEED, "count": count, "unique_token_count": len(set(tokens))},
+        "producer": ({"seed": seeded.SEED, "count": count, "unique_token_count": len(set(tokens))}, None),
         # The smallest seed and a stream of one token.
-        "smallest": {"seed": 0, "count": 1, "unique_token_count": 1},
+        "smallest": ({"seed": 0, "count": 1, "unique_token_count": 1}, "input_provenance.seed"),
         # The largest seed and a stream that draws every id of the vocabulary, the most distinct tokens that it allows.
-        "largest": {"seed": 2**64 - 1, "count": count, "unique_token_count": seeded.VOCAB_HIGH - seeded.VOCAB_LOW},
+        "largest": (
+            {"seed": 2**64 - 1, "count": count, "unique_token_count": seeded.VOCAB_HIGH - seeded.VOCAB_LOW},
+            "input_provenance.seed",
+        ),
         # The ids 50 to 149 are 100 ids, because the upper bound is exclusive. They cap the distinct tokens of a longer
         # stream at 100.
-        "narrow-vocabulary": {"count": count, "unique_token_count": 100, "vocab_low": 50, "vocab_high_exclusive": 150},
+        "narrow-vocabulary": (
+            {"count": count, "unique_token_count": 100, "vocab_low": 50, "vocab_high_exclusive": 150},
+            "input_provenance.vocab_low",
+        ),
     }
-    for name, fields in cases.items():
+    for name, (fields, refused) in cases.items():
         cell = glm_cell("prefill")
         payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
         payload["input_provenance"].update(fields)
         write_glm_rank(_pod(tmp_path / name, cell), payload)
-        assert len(_validate(tmp_path / name, cell).points) == 2
+        if refused is None:
+            assert len(_validate(tmp_path / name, cell).points) == 2
+        else:
+            with pytest.raises(ValueError, match=rf"native GLM-5\.3-Flash result lacks valid {re.escape(refused)}: "):
+                _validate(tmp_path / name, cell)
+
+
+def test_fixture_holds_the_real_token_stream_record():
+    tokens = seeded.generate(seeded.SEED, 262240, seeded.VOCAB_LOW, seeded.VOCAB_HIGH)
+    digest = hashlib.sha256(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest()
+    evidence = glm_native_payload("prefill", points=[PREFILL_COLD])["input_provenance"]
+    record = native_artifact._glm_input_record(seeded.GENERATOR_VERSION)
+    assert (digest, len(set(tokens))) == (evidence["token_ids_sha256"], evidence["unique_token_count"])
+    assert (digest, len(set(tokens))) == (record["token_ids_sha256"], record["unique_token_count"])
+    assert native_artifact._glm_input_record(1) is None
+
+
+def test_seeded_input_record_cannot_be_changed_by_a_caller(tmp_path):
+    record = native_artifact._glm_input_record(seeded.GENERATOR_VERSION)
+    try:
+        with pytest.raises(TypeError):
+            record["seed"] = 54
+        with pytest.raises(TypeError):
+            del record["seed"]
+        # Every later validation of the process still compares with the pinned seed.
+        cell = glm_cell("prefill")
+        payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+        payload["input_provenance"]["seed"] = 54
+        write_glm_rank(_pod(tmp_path, cell), payload)
+        with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid input_provenance\.seed: "):
+            _validate(tmp_path, cell)
+    finally:
+        # A record that this test could change is drawn again for the tests that follow it.
+        native_artifact._glm_input_record.cache_clear()
 
 
 @pytest.mark.parametrize(
-    ("high", "accepted"),
+    ("benchmark_id", "refusal"),
+    [
+        pytest.param(False, "native point field 'benchmark_id' must be an integer, got False", id="boolean"),
+        pytest.param(2.0, "native point field 'benchmark_id' must be an integer, got 2.0", id="float"),
+        pytest.param("1", "native point field 'benchmark_id' must be an integer, got '1'", id="string"),
+    ],
+)
+def test_row_id_that_is_no_integer_is_refused_by_the_check_of_the_row_ids(tmp_path, benchmark_id, refusal):
+    # The row carries the digest of the line with ID 1. A plain lookup by its ID would not give that digest: no line has
+    # the key False (0), and the key 2.0 finds the line of the second row. The digest rule compares only a row whose ID
+    # is an integer and not a bool, so the check of the row IDs names the ID.
+    cell = glm_cell("prefill")
+    pod = _pod(tmp_path, cell)
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    artifact = write_glm_rank(pod, payload)
+    payload["results"][0]["point"]["benchmark_id"] = benchmark_id
+    artifact.write_text(json.dumps(payload))
+    with pytest.raises(ValueError) as error:
+        _validate(tmp_path, cell)
+    assert str(error.value) == refusal
+
+
+def test_digest_rule_passes_a_row_whose_id_is_a_list_without_an_error(tmp_path):
+    # The digest rule compares only a row whose ID is an integer, so a list ID passes it and every other rule of the
+    # GLM-5.3-Flash reader. The check of the row IDs comes after it.
+    cell = glm_cell("prefill")
+    pod = _pod(tmp_path, cell)
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    artifact = write_glm_rank(pod, payload)
+    payload["results"][0]["point"]["benchmark_id"] = [1]
+    artifact.write_text(json.dumps(payload))
+    stored = json.loads(artifact.read_text())
+    assert native_artifact._validate_glm_provenance(cell, stored, artifact) == stored["input_provenance"]
+
+
+def _other_execution_profile(payload: dict, _sidecar: Path) -> None:
+    payload["execution_identity"].update(execution_profile="decoder_bounded")
+
+
+def _no_chunk_alignment(payload: dict, _sidecar: Path) -> None:
+    _evidence(payload).update(chunk_start_alignment=1)
+
+
+def _kvwarm_disabled(payload: dict, _sidecar: Path) -> None:
+    payload["kvwarm"].update(enabled=False)
+
+
+def _wall_clock_boundary(payload: dict, _sidecar: Path) -> None:
+    payload.update(timing_boundary="wall_clock")
+
+
+def _async_scheduling(payload: dict, _sidecar: Path) -> None:
+    payload["serving_config"].update(async_scheduling=True)
+
+
+def _other_warmup_repeats(payload: dict, _sidecar: Path) -> None:
+    payload["producer"].update(warmup_repeats=6)
+
+
+def _cold_row_with_a_prefix_regime(payload: dict, _sidecar: Path) -> None:
+    payload["results"][0].update(kv_seed_regime="real_prefix")
+
+
+def _second_row_without_a_digest(payload: dict, _sidecar: Path) -> None:
+    payload["results"][1].pop("repetition_evidence_sha256")
+
+
+def _second_row_with_the_digest_of_no_line(payload: dict, _sidecar: Path) -> None:
+    payload["results"][1].update(repetition_evidence_sha256=hashlib.sha256(b"another point").hexdigest())
+
+
+def _float_record_count(payload: dict, _sidecar: Path) -> None:
+    _evidence(payload)["repetition_evidence_manifest"].update(records=2.0)
+
+
+def _mamba_mode_none(payload: dict, _sidecar: Path) -> None:
+    payload["serving_config"].update(mamba_cache_mode="none")
+
+
+def _small_scheduler_block(payload: dict, _sidecar: Path) -> None:
+    payload["serving_config"].update(block_size=16)
+
+
+def _no_aligned_split(payload: dict, _sidecar: Path) -> None:
+    payload["serving_config"].update(need_mamba_block_aligned_split=False)
+
+
+def _other_seed(payload: dict, _sidecar: Path) -> None:
+    _evidence(payload).update(seed=54)
+
+
+# The reader checks, in this order: the execution identity, the input fields, the sidecar manifest with the type of its
+# record count, kvwarm, the timing boundary, the serving keys enable_prefix_caching and async_scheduling, the Mamba
+# cache mode, the scheduler block, the aligned split, the producer record, the sidecar lines, then for each row in turn
+# the form of its digest, its digest against its line and its regime, and last the seeded input record. Each case names
+# a check that runs first and a check that runs second. An artifact with both faults is refused for the check that runs
+# first, whichever fault was written first.
+ORDERED_FAULTS = [
+    pytest.param(
+        _other_execution_profile,
+        "execution_identity",
+        _float_record_count,
+        "repetition_evidence_manifest",
+        id="execution-identity-before-the-record-count",
+    ),
+    pytest.param(
+        _no_chunk_alignment,
+        "input_provenance.chunk_start_alignment",
+        _float_record_count,
+        "repetition_evidence_manifest",
+        id="input-fields-before-the-record-count",
+    ),
+    pytest.param(
+        _float_record_count,
+        "repetition_evidence_manifest",
+        _kvwarm_disabled,
+        "kvwarm.enabled",
+        id="record-count-before-kvwarm",
+    ),
+    pytest.param(
+        _float_record_count,
+        "repetition_evidence_manifest",
+        _wall_clock_boundary,
+        "timing_boundary",
+        id="record-count-before-the-timing-boundary",
+    ),
+    pytest.param(
+        _async_scheduling,
+        "serving_config.async_scheduling",
+        _mamba_mode_none,
+        "serving_config.mamba_cache_mode",
+        id="async-scheduling-before-the-mamba-mode",
+    ),
+    pytest.param(
+        _async_scheduling,
+        "serving_config.async_scheduling",
+        _small_scheduler_block,
+        "serving_config.block_size",
+        id="async-scheduling-before-the-scheduler-block",
+    ),
+    pytest.param(
+        _async_scheduling,
+        "serving_config.async_scheduling",
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        id="async-scheduling-before-the-aligned-split",
+    ),
+    pytest.param(
+        _mamba_mode_none,
+        "serving_config.mamba_cache_mode",
+        _small_scheduler_block,
+        "serving_config.block_size",
+        id="mamba-mode-before-the-scheduler-block",
+    ),
+    pytest.param(
+        _mamba_mode_none,
+        "serving_config.mamba_cache_mode",
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        id="mamba-mode-before-the-aligned-split",
+    ),
+    pytest.param(
+        _small_scheduler_block,
+        "serving_config.block_size",
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        id="scheduler-block-before-the-aligned-split",
+    ),
+    pytest.param(
+        _mamba_mode_none,
+        "serving_config.mamba_cache_mode",
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        id="mamba-mode-before-the-producer-record",
+    ),
+    pytest.param(
+        _small_scheduler_block,
+        "serving_config.block_size",
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        id="scheduler-block-before-the-producer-record",
+    ),
+    pytest.param(
+        _no_aligned_split,
+        "serving_config.need_mamba_block_aligned_split",
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        id="aligned-split-before-the-producer-record",
+    ),
+    pytest.param(
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        _first_line_is_no_json,
+        "repetition_evidence",
+        id="producer-record-before-the-sidecar-lines",
+    ),
+    pytest.param(
+        _first_line_is_no_json,
+        "repetition_evidence",
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
+        id="sidecar-lines-before-the-rows",
+    ),
+    pytest.param(
+        _other_warmup_repeats,
+        "producer.warmup_repeats",
+        _swap_the_row_digests,
+        "repetition_evidence_sha256",
+        id="producer-record-before-the-row-digests",
+    ),
+    pytest.param(
+        _swap_the_row_digests,
+        "repetition_evidence_sha256",
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
+        id="row-digest-before-the-regime-of-its-row",
+    ),
+    pytest.param(
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
+        _second_row_with_the_digest_of_no_line,
+        "repetition_evidence_sha256",
+        id="regime-of-the-first-row-before-the-digest-of-the-second-row",
+    ),
+    pytest.param(
+        _cold_row_with_a_prefix_regime,
+        "kv_seed_regime",
+        _other_seed,
+        "input_provenance.seed",
+        id="row-regimes-before-the-seeded-input",
+    ),
+    pytest.param(
+        _second_row_without_a_digest,
+        "repetition_evidence_sha256",
+        _other_seed,
+        "input_provenance.seed",
+        id="row-digests-before-the-seeded-input",
+    ),
+]
+
+
+@pytest.mark.parametrize(("runs_first", "first_field", "runs_second", "second_field"), ORDERED_FAULTS)
+def test_two_faults_are_refused_for_the_first_in_the_order_of_the_reader(
+    tmp_path, runs_first, first_field, runs_second, second_field
+):
+    cell = glm_cell("prefill")
+    for name, tampers, field in (
+        ("first", [runs_first], first_field),
+        ("second", [runs_second], second_field),
+        ("both", [runs_first, runs_second], first_field),
+        ("both-written-the-other-way", [runs_second, runs_first], first_field),
+    ):
+        pod = _pod(tmp_path / name, cell)
+        payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+        artifact = write_glm_rank(pod, payload)
+        for tamper in tampers:
+            tamper(payload, pod / EVIDENCE_FILE)
+        artifact.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match=rf"native GLM-5\.3-Flash result lacks valid {re.escape(field)}: "):
+            _validate(tmp_path / name, cell)
+
+
+def test_sidecar_lines_in_another_order_than_the_rows_still_validate(tmp_path):
+    # The producer writes the lines in the order in which the points ran, so a row is bound to its line by its
+    # benchmark_id and not by its position.
+    cell = glm_cell("prefill")
+    pod = _pod(tmp_path, cell)
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    artifact = write_glm_rank(pod, payload)
+    _rewrite_sidecar(payload, pod / EVIDENCE_FILE, list(reversed(_sidecar_lines(pod / EVIDENCE_FILE))))
+    artifact.write_text(json.dumps(payload))
+    assert len(_validate(tmp_path, cell).points) == 2
+
+
+def test_record_count_of_one_must_be_an_integer(tmp_path):
+    # True equals 1 in Python, so only the type of the count tells it from the one record of this sidecar.
+    cell = glm_cell("prefill")
+    pod = _pod(tmp_path, cell)
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD])
+    artifact = write_glm_rank(pod, payload)
+    _evidence(payload)["repetition_evidence_manifest"]["records"] = True
+    artifact.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid repetition_evidence_manifest: "):
+        _validate(tmp_path, cell)
+
+
+def test_malformed_sidecar_manifest_of_another_contract_is_refused_with_a_text(tmp_path):
+    # The GLM-5.3-Flash reader does not read a token-stream manifest, so the comparison of the ranks meets it first.
+    cell = glm_cell("prefill", dp=2)
+    pod = _pod(tmp_path, cell)
+    for rank in range(2):
+        payload = glm_native_payload("prefill", points=[PREFILL_COLD], rank=rank, dp=2)
+        payload["input_provenance"]["token_stream_manifest"] = "x"
+        write_glm_rank(pod, payload)
+    with pytest.raises(ValueError, match="native input provenance token_stream_manifest must be a mapping, found 'x'"):
+        _validate(tmp_path, cell)
+
+
+@pytest.mark.parametrize(
+    ("high", "drawable"),
     [(2**63 + 1, True), (2**63 + 2, False)],
     ids=["range-at-the-generator-cap", "range-above-the-generator-cap"],
 )
-def test_glm_producer_vocabulary_range_follows_the_generator_cap(tmp_path, high, accepted):
-    # The generator takes at most 2**63 ids in its range, so the validator takes the same. A lower bound of 1 puts
-    # exactly 2**63 ids in the first range and one more in the second, and both upper bounds exceed 2**63.
+def test_glm_producer_vocabulary_range_follows_the_generator_cap(tmp_path, high, drawable):
+    # The generator takes at most 2**63 ids in its range, and so does the form check of the validator. A lower bound of
+    # 1 puts exactly 2**63 ids in the first range and one more in the second, and both upper bounds exceed 2**63. Only
+    # the pinned vocabulary passes the reader, so the first range is refused after the form check and the second by it.
     low = 1
     cell = glm_cell("prefill")
     payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
     payload["input_provenance"].update(vocab_low=low, vocab_high_exclusive=high)
     write_glm_rank(_pod(tmp_path, cell), payload)
-    if accepted:
+    if drawable:
         assert len(seeded.generate(seeded.SEED, 1, low, high)) == 1
-        assert len(_validate(tmp_path, cell).points) == 2
+        with pytest.raises(ValueError, match=r"native GLM-5\.3-Flash result lacks valid input_provenance\.vocab_low: "):
+            _validate(tmp_path, cell)
     else:
         with pytest.raises(ValueError, match="invalid token generator request"):
             seeded.generate(seeded.SEED, 1, low, high)
@@ -812,15 +1325,17 @@ def test_glm_producer_vocabulary_range_follows_the_generator_cap(tmp_path, high,
 
 
 def _change_the_sidecar(payload: dict, sidecar: Path) -> None:
-    raw = b'{"benchmark_id":1,"point_type":"prefill","note":"another rank"}\n'
+    line = b'{"benchmark_id":1,"point_type":"prefill","note":"another rank"}'
+    raw = line + b"\n"
     sidecar.write_bytes(raw)
     payload["input_provenance"]["repetition_evidence_manifest"]["sha256"] = hashlib.sha256(raw).hexdigest()
+    payload["results"][0]["repetition_evidence_sha256"] = hashlib.sha256(line).hexdigest()
 
 
 @pytest.mark.parametrize(
     "tamper",
     [
-        pytest.param(lambda p, _: _evidence(p).update(seed=_evidence(p)["seed"] + 1), id="input"),
+        pytest.param(lambda p, _: _evidence(p).update(checkpoint_dir="/another/checkpoint"), id="input"),
         pytest.param(_change_the_sidecar, id="sidecar-digest"),
     ],
 )
@@ -934,6 +1449,201 @@ def test_glm_publication_refuses_a_producer_record_whose_retained_median_moved(t
     assert "benchmark_measurement reduction disagrees with retained timing" in str(error.value)
 
 
+def _publication_refusal(tmp_path, phase, tamper) -> str:
+    """Shape a GLM-5.3-Flash artifact as the producer writes it, apply ``tamper``, and return publication's refusal.
+
+    The native validator must accept the tampered artifact, so that the refusal comes from the measurement record.
+    """
+    cell = glm_cell(phase)
+    points = [PREFILL_COLD, PREFILL_CACHED] if phase == "prefill" else DECODE_POINTS
+    payload = glm_native_payload(phase, points=points)
+    _glm_producer_shape(tmp_path)(phase, payload)
+    tamper(payload)
+    write_glm_rank(_pod(tmp_path, cell), payload)
+    _validate(tmp_path, cell)
+    with pytest.raises(ValueError) as error:
+        database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
+    return str(error.value)
+
+
+def _first_record(payload) -> dict:
+    return payload["results"][0]["fpms"][0]["benchmark_measurement"]
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_glm_publication_refuses_a_raw_sample_of_another_workload(tmp_path, phase):
+    def tamper(payload):
+        scheduled = _first_record(payload)["raw_fpms"][3]["scheduled_requests"]
+        if phase == "prefill":
+            scheduled["sum_prefill_tokens"] += 4
+        else:
+            scheduled["sum_decode_kv_tokens"] += 1
+
+    refusal = _publication_refusal(tmp_path, phase, tamper)
+    assert "benchmark_measurement raw sample 3 does not hold the workload of its point" in refusal
+
+
+@pytest.mark.parametrize("count", [1, 5])
+def test_glm_publication_refuses_a_global_warmup_in_the_protocol(tmp_path, count):
+    def tamper(payload):
+        payload["measurement_protocol"]["preparation"]["warmup_iterations"] = count
+
+    refusal = _publication_refusal(tmp_path, "prefill", tamper)
+    assert (
+        "measurement_protocol.preparation.warmup_iterations must be 0 for the GLM-5.3-Flash producer: "
+        f"expected 0, found {count}"
+    ) in refusal
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_glm_publication_refuses_a_raw_sample_whose_count_is_below_its_point(tmp_path, phase):
+    # The decode case holds the count of the first recorded step of a decode repetition: the point's KV total less one
+    # token for each request.
+    def tamper(payload):
+        row = payload["results"][0]
+        scheduled = row["fpms"][0]["benchmark_measurement"]["raw_fpms"][3]["scheduled_requests"]
+        if phase == "prefill":
+            scheduled["sum_prefill_tokens"] -= 4
+        else:
+            scheduled["sum_decode_kv_tokens"] -= row["point"]["batch_size"]
+
+    refusal = _publication_refusal(tmp_path, phase, tamper)
+    assert "benchmark_measurement raw sample 3 does not hold the workload of its point" in refusal
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_glm_publication_refuses_a_raw_sample_of_another_workload_in_a_later_point(tmp_path, phase):
+    def tamper(payload):
+        row = payload["results"][-1]
+        assert row is not payload["results"][0]
+        scheduled = row["fpms"][0]["benchmark_measurement"]["raw_fpms"][5]["scheduled_requests"]
+        if phase == "prefill":
+            scheduled["sum_prefill_tokens"] += 4
+        else:
+            scheduled["sum_decode_kv_tokens"] += 1
+
+    refusal = _publication_refusal(tmp_path, phase, tamper)
+    assert "benchmark_measurement raw sample 5 does not hold the workload of its point" in refusal
+
+
+_ABSENT = object()
+
+
+def _set_scheduled(index, key, value):
+    def tamper(payload):
+        sample = _first_record(payload)["raw_fpms"][index]
+        if key is None:
+            sample["scheduled_requests"] = value
+        elif value is _ABSENT:
+            del sample["scheduled_requests"][key]
+        else:
+            sample["scheduled_requests"][key] = value(sample["scheduled_requests"][key])
+
+    return tamper
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize(
+    ("index", "tamper"),
+    [
+        pytest.param(0, _set_scheduled(0, None, None), id="first-sample-without-a-mapping"),
+        pytest.param(9, _set_scheduled(9, None, []), id="last-sample-holds-a-list"),
+        pytest.param(3, _set_scheduled(3, "num_decode_requests", _ABSENT), id="key-absent"),
+        pytest.param(3, _set_scheduled(3, "num_prefill_requests", float), id="count-is-a-float"),
+        pytest.param(3, _set_scheduled(3, "sum_prefill_kv_tokens", bool), id="count-is-a-boolean"),
+        pytest.param(3, _set_scheduled(3, "sum_decode_kv_tokens", str), id="count-is-a-string"),
+    ],
+)
+def test_glm_publication_refuses_a_raw_sample_whose_workload_is_malformed(tmp_path, phase, index, tamper):
+    # The producer copies the integer counts of Dynamo's FPM into each raw sample, so a count of another JSON type that
+    # compares equal (1.0, False for 0) is no workload that the producer writes.
+    refusal = _publication_refusal(tmp_path, phase, tamper)
+    assert f"benchmark_measurement raw sample {index} does not hold the workload of its point" in refusal
+
+
+@pytest.mark.parametrize("value", [True, 0.0, 1.0, "0", None], ids=["boolean", "zero-float", "float", "string", "null"])
+def test_glm_publication_keeps_the_form_refusal_of_a_warmup_count_that_is_no_integer(tmp_path, value):
+    def tamper(payload):
+        payload["measurement_protocol"]["preparation"]["warmup_iterations"] = value
+
+    refusal = _publication_refusal(tmp_path, "prefill", tamper)
+    assert "measurement_protocol has malformed preparation settings" in refusal
+
+
+def _global_warmup(payload):
+    payload["measurement_protocol"]["preparation"]["warmup_iterations"] = 5
+
+
+def _warmup_history_of_another_status(payload):
+    payload["warmup_evidence"]["status"] = "pending"
+
+
+def _unobserved_is_text(payload):
+    payload["measurement_protocol"]["unobserved"] = "kv_cache_tensors"
+
+
+def _raw_sample_of_another_workload(payload):
+    _first_record(payload)["raw_fpms"][3]["scheduled_requests"]["sum_prefill_tokens"] += 4
+
+
+def _eleven_expected_samples(payload):
+    _first_record(payload)["expected_internal_samples"] = 11
+
+
+def _raw_sample_is_a_list(payload):
+    _first_record(payload)["raw_fpms"][3] = []
+
+
+def _raw_sample_without_its_sample_record(payload):
+    del _first_record(payload)["raw_fpms"][3]["benchmark_sample"]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "text"),
+    [
+        pytest.param(
+            _unobserved_is_text,
+            _global_warmup,
+            "measurement_protocol must describe unobserved inputs",
+            id="unobserved-inputs-before-the-global-warmup",
+        ),
+        pytest.param(
+            _global_warmup,
+            _warmup_history_of_another_status,
+            "measurement_protocol.preparation.warmup_iterations must be 0 for the GLM-5.3-Flash producer: "
+            "expected 0, found 5",
+            id="global-warmup-before-the-warmup-history",
+        ),
+        pytest.param(
+            _eleven_expected_samples,
+            _raw_sample_of_another_workload,
+            "benchmark_measurement does not hold the producer's ten measured repetitions",
+            id="ten-repetitions-before-the-raw-sample-workload",
+        ),
+        pytest.param(
+            _raw_sample_is_a_list,
+            lambda payload: None,
+            "benchmark_measurement has invalid raw counter/rank/timing evidence",
+            id="raw-sample-form-before-the-raw-sample-workload",
+        ),
+        pytest.param(
+            _raw_sample_of_another_workload,
+            _raw_sample_without_its_sample_record,
+            "benchmark_measurement raw sample 3 does not hold the workload of its point",
+            id="raw-sample-workload-before-the-observed-execution",
+        ),
+    ],
+)
+def test_glm_publication_reads_the_measurement_record_in_its_order(tmp_path, first, second, text):
+    # The check of the measurement record that runs first names its fault when an artifact holds two faults. A raw
+    # sample that is no mapping holds no workload, so the form check of the raw samples names it.
+    def tamper(payload):
+        first(payload)
+        second(payload)
+
+    assert text in _publication_refusal(tmp_path, "prefill", tamper)
+
+
 def test_glm_publication_refuses_an_artifact_without_the_producer_protocol(tmp_path):
     # The producer writes its measurement protocol into every rank artifact, so an artifact without it is not the
     # producer's, although the native validator accepts it.
@@ -946,28 +1656,20 @@ def test_glm_publication_refuses_an_artifact_without_the_producer_protocol(tmp_p
 
 
 @pytest.mark.parametrize(
-    ("stamps", "regime", "template_id", "published"),
+    ("stamps", "regime", "published"),
     [
         # The native row reports real_prefix, and publication labels the same prefix real_kv.
-        pytest.param(["prefill_real_seed"], "real_prefix", GENERIC_RUNTIME_TEMPLATE_ID, "real_kv", id="real-seed"),
-        pytest.param(["prefill_fake_prefix"], "fake_prefix", GENERIC_RUNTIME_TEMPLATE_ID, None, id="fake-prefix"),
-        # The DeepSeek V4.1 adapter stamps real KV on every point, cached prefill included. Its plans have their own
-        # template, and a point with this stamp keeps the label that it had before the prefix stamps counted.
-        pytest.param(["kvwarm_real_kv"], "real_kv", "deepseek_v41_text_native", "real_kv", id="real-kv"),
-        pytest.param(
-            ["prefill_real_seed", "kvwarm_real_kv"], "real_kv", "deepseek_v41_text_native", "real_kv", id="both"
-        ),
+        pytest.param(["prefill_real_seed"], "real_prefix", "real_kv", id="real-seed"),
+        pytest.param(["prefill_fake_prefix"], "fake_prefix", None, id="fake-prefix"),
     ],
 )
-def test_execution_identity_cached_prefill_accepts_real_prefix_stamp(
-    tmp_path, monkeypatch, stamps, regime, template_id, published
-):
+def test_execution_identity_cached_prefill_accepts_real_prefix_stamp(tmp_path, monkeypatch, stamps, regime, published):
     cell = glm_cell("prefill")
     write_glm_rank(_pod(tmp_path, cell), glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED]))
     valid = _validate(tmp_path, cell)
     cold, cached = valid.points
     collection = replace(valid, points=(cold, _restamp(cached, stamps, regime)))
-    plan = _glm_plan(template_id)
+    plan = _glm_plan()
     if published is None:
         with pytest.raises(ValueError) as error:
             _publish(monkeypatch, tmp_path, cell, collection, plan)
@@ -1045,7 +1747,30 @@ def test_published_glm_pair_loads_through_the_rust_fpm_loader(tmp_path):
         write_glm_rank(_pod(tmp_path / phase, cell), payload)
         rows += database.aggregate_cell(plan, cell, tmp_path / phase, expected_attempt_id=ATTEMPT_ID)
     systems = tmp_path / "systems"
-    database.write_formal_database(plan, rows, systems_root=systems / "data")
+    _parquet, metadata, _skipped = database.write_formal_database(plan, rows, systems_root=systems / "data")
+    assert {
+        (
+            row["measurement_policy"],
+            row["global_warmup_iterations"],
+            row["warmup_repeats"],
+            row["measurement_repeats"],
+            row["state_protocol"],
+            row["timing_boundary"],
+        )
+        for row in rows
+    } == {
+        (
+            "vllm_native_fpm_prefix_seed_median_v1",
+            0,
+            5,
+            10,
+            "glm53flash_prefix_cache_real_seed_v1",
+            "dynamo_vllm_instrumented_scheduler_fpm_wall_time",
+        )
+    }
+    sidecar = json.loads(metadata.read_text())
+    assert (sidecar["schema_version"], sidecar["measurement_policy"]) == (7, "vllm_native_fpm_prefix_seed_median_v1")
+    assert (sidecar["warmup_repeats"], sidecar["measurement_repeats"]) == (5, 10)
     system_file = f"{plan.system}.yaml"
     shutil.copyfile(Path(aisim_core.__file__).parent / "systems" / system_file, systems / system_file)
     engine = dict(
@@ -1082,6 +1807,254 @@ def test_published_glm_pair_loads_through_the_rust_fpm_loader(tmp_path):
         )
         fpm = dict(version=1, wall_time=1.0, scheduled_requests=scheduled)
         assert model.estimate_forward_pass_time_ms(fpm) == pytest.approx(row["latency_ms"])
+
+
+@pytest.mark.parametrize("mode", [None, "eager"], ids=["no-execution-mode", "eager"])
+def test_rows_of_other_models_keep_the_single_sample_policy(tmp_path, monkeypatch, mode):
+    # A cell without an execution identity has no execution mode, and a DeepSeek V4.1 cell has the audited mode eager.
+    # Only the mode of the GLM-5.3-Flash producer takes the median label.
+    cell = glm_cell("prefill")
+    write_glm_rank(_pod(tmp_path, cell), glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED]))
+    valid = _validate(tmp_path, cell)
+    rows = _publish(monkeypatch, tmp_path, cell, replace(valid, execution_mode=mode))
+    assert len(rows) == 2
+    for row in rows:
+        assert (row["measurement_policy"], row["warmup_repeats"], row["measurement_repeats"]) == (
+            database.SINGLE_SAMPLE_MEASUREMENT_POLICY,
+            0,
+            1,
+        )
+        assert not {"state_protocol", "timing_boundary"} & row.keys()
+
+
+def _producer_cells(tmp_path: Path) -> dict[str, tuple[FPMCell, Path]]:
+    """The prefill and the decode cell of GLM-5.3-Flash, each with an artifact in the shape that the producer writes."""
+    shape = _glm_producer_shape(tmp_path)
+    cells = {}
+    for phase, points in (("prefill", [PREFILL_COLD, PREFILL_CACHED]), ("decode", DECODE_POINTS)):
+        cell = glm_cell(phase)
+        payload = glm_native_payload(phase, points=points)
+        shape(phase, payload)
+        write_glm_rank(_pod(tmp_path / phase, cell), payload)
+        cells[phase] = (cell, tmp_path / phase)
+    return cells
+
+
+@pytest.mark.parametrize("warmup", [1, 5, -1, False, 0.0], ids=["one", "five", "negative", "boolean", "zero-float"])
+def test_glm_cell_under_a_plan_with_a_global_warmup_is_refused_before_a_pair_is_written(tmp_path, warmup):
+    # The loader of a published pair reads a median row only with a global warm-up of the integer 0, so a median row of
+    # this plan would make the whole pair unreadable. The single-sample label of a pair sealed with it has no such rule.
+    plan = _glm_plan()
+    plan.options = SimpleNamespace(warmup_iterations=warmup)
+    cell, cell_dir = _producer_cells(tmp_path)["prefill"]
+    with pytest.raises(ValueError) as error:
+        database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID)
+    assert str(error.value) == (
+        f"{cell.cell_id} is a GLM-5.3-Flash producer cell under a plan with warmup_iterations={warmup!r}, and its rows "
+        "carry measurement_policy='vllm_native_fpm_prefix_seed_median_v1', which requires a global warm-up of the "
+        "integer 0"
+    )
+    rows = database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    assert len(rows) == 2
+    assert [(row["measurement_policy"], repr(row["global_warmup_iterations"])) for row in rows] == [
+        (database.SINGLE_SAMPLE_MEASUREMENT_POLICY, repr(warmup))
+    ] * len(rows)
+
+
+def _powered_publication(monkeypatch, tmp_path, *, mode="native_graph_policy", measure_power=True):
+    """A cell whose validated collection holds power-window artifacts of ``mode``, and a plan with ``measure_power``."""
+    cell = glm_cell("prefill")
+    write_glm_rank(_pod(tmp_path, cell), glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED]))
+    valid = _validate(tmp_path, cell)
+    assert valid.execution_mode == "native_graph_policy"
+    powered = replace(
+        valid,
+        execution_mode=mode,
+        artifact_schema_version=database.FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION,
+        points=tuple(replace(point, power_w=100.0) for point in valid.points),
+    )
+    plan = _glm_plan()
+    plan.options = SimpleNamespace(warmup_iterations=0, measure_power=measure_power)
+    monkeypatch.setattr(database, "validate_native_collection", lambda *_args, **_kwargs: powered)
+    monkeypatch.setattr(database, "extract_measurement_evidence", lambda *_args, **_kwargs: {})
+    return plan, cell
+
+
+@pytest.mark.parametrize("median_policy", [True, False], ids=["median-label", "single-sample-label"])
+def test_glm_cell_with_power_window_artifacts_is_refused(tmp_path, monkeypatch, median_policy):
+    # The median label holds no power, and the power-window label names a single sample, so no label is true for the
+    # rows of a producer cell with a power window.
+    plan, cell = _powered_publication(monkeypatch, tmp_path)
+    with pytest.raises(ValueError) as error:
+        database.aggregate_cell(plan, cell, tmp_path, expected_attempt_id=ATTEMPT_ID, median_policy=median_policy)
+    assert str(error.value) == (
+        f"{cell.cell_id} wrote power-window artifacts for a GLM-5.3-Flash producer cell, and no FPM measurement "
+        "policy describes the rows of such a cell with a power window"
+    )
+
+
+@pytest.mark.parametrize("median_policy", [True, False], ids=["median-label", "single-sample-label"])
+def test_glm_cell_with_power_window_artifacts_under_a_plan_without_measure_power_keeps_that_refusal(
+    tmp_path, monkeypatch, median_policy
+):
+    # A producer cell with power-window artifacts under a plan without measure_power holds two faults. The refusal of
+    # the plan runs first, so the cell reads its text.
+    plan, cell = _powered_publication(monkeypatch, tmp_path, measure_power=False)
+    with pytest.raises(ValueError) as error:
+        database.aggregate_cell(plan, cell, tmp_path, expected_attempt_id=ATTEMPT_ID, median_policy=median_policy)
+    assert str(error.value) == f"{cell.cell_id} wrote power-window artifacts under a plan without measure_power"
+
+
+@pytest.mark.parametrize("mode", [None, "eager"], ids=["no-execution-mode", "eager"])
+def test_powered_cell_of_another_mode_keeps_the_power_window_label(tmp_path, monkeypatch, mode):
+    # Only the mode of the GLM-5.3-Flash producer is refused with power-window artifacts. A cell without an execution
+    # mode and a cell of the audited mode eager keep the power-window label and its power.
+    plan, cell = _powered_publication(monkeypatch, tmp_path, mode=mode)
+    rows = database.aggregate_cell(plan, cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
+    assert len(rows) == 2
+    assert {(row["measurement_policy"], row["power_w"]) for row in rows} == {
+        (database.POWER_WINDOW_MEASUREMENT_POLICY, 100.0)
+    }
+
+
+@pytest.mark.parametrize("order", ["median-first", "single-first"])
+def test_glm_rows_and_single_sample_rows_cannot_share_a_database(tmp_path, order):
+    plan = _glm_plan()
+    (prefill, prefill_dir), (decode, decode_dir) = _producer_cells(tmp_path).values()
+    median = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    single = database.aggregate_cell(plan, decode, decode_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    first, second = (median, single) if order == "median-first" else (single, median)
+    systems = tmp_path / "systems"
+    parquet, metadata, _skipped = database.write_formal_database(plan, first, systems_root=systems)
+    sealed = (parquet.read_bytes(), metadata.read_bytes())
+    with pytest.raises(ValueError) as error:
+        database.write_formal_database(plan, second, systems_root=systems)
+    assert str(error.value) == (
+        "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
+        "measurement_policy, and 'vllm_native_fpm_prefix_seed_median_v1' binds every row. Publish to a clean "
+        f"destination: {parquet}"
+    )
+    assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
+
+
+@pytest.mark.parametrize("order", ["median-first", "power-first"])
+def test_glm_rows_and_power_window_rows_read_the_power_window_refusal(tmp_path, order):
+    # A pair cannot hold power-window rows and median rows. The power-window refusal runs first, so it names the fault.
+    plan = _glm_plan()
+    (prefill, prefill_dir), (decode, decode_dir) = _producer_cells(tmp_path).values()
+    median = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    single = database.aggregate_cell(plan, decode, decode_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    power = [
+        {**row, "measurement_policy": database.POWER_WINDOW_MEASUREMENT_POLICY, "power_w": 120.0} for row in single
+    ]
+    first, second = (median, power) if order == "median-first" else (power, median)
+    systems = tmp_path / "systems"
+    parquet, metadata, _skipped = database.write_formal_database(plan, first, systems_root=systems)
+    sealed = (parquet.read_bytes(), metadata.read_bytes())
+    with pytest.raises(ValueError) as error:
+        database.write_formal_database(plan, second, systems_root=systems)
+    assert str(error.value) == (
+        "cannot mix power-window and latency-only FPM rows in one database: schema 8 requires every row to carry "
+        "measurement_policy='dynamo_native_single_sample_power_window_v1'. Publish to a clean destination, or collect "
+        f"every cell with the same --fpm-measure-power setting: {parquet}"
+    )
+    assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
+
+
+def test_glm_rows_cannot_join_rows_without_a_measurement_policy(tmp_path):
+    plan = _glm_plan()
+    (prefill, prefill_dir), (decode, decode_dir) = _producer_cells(tmp_path).values()
+    median = database.aggregate_cell(plan, prefill, prefill_dir, expected_attempt_id=ATTEMPT_ID)
+    single = database.aggregate_cell(plan, decode, decode_dir, expected_attempt_id=ATTEMPT_ID, median_policy=False)
+    bare = [{key: value for key, value in row.items() if key != "measurement_policy"} for row in single]
+    systems = tmp_path / "systems"
+    parquet, metadata, _skipped = database.write_formal_database(plan, bare, systems_root=systems)
+    sealed = (parquet.read_bytes(), metadata.read_bytes())
+    with pytest.raises(ValueError) as error:
+        database.write_formal_database(plan, median, systems_root=systems)
+    assert str(error.value) == (
+        "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
+        "measurement_policy, and 'vllm_native_fpm_prefix_seed_median_v1' binds every row. Publish to a clean "
+        f"destination: {parquet}"
+    )
+    assert (parquet.read_bytes(), metadata.read_bytes()) == sealed
+
+
+@pytest.mark.parametrize(
+    ("policy", "median"),
+    [
+        ("dynamo_native_single_sample_v1", False),
+        ("dynamo_native_single_sample_power_window_v1", False),
+        ("vllm_native_fpm_prefix_seed_median_v1", True),
+        (None, False),
+    ],
+    ids=["single-sample", "power-window", "median", "none"],
+)
+def test_only_the_median_label_of_a_sidecar_selects_the_median_rows(policy, median):
+    assert database.published_median_policy({"measurement_policy": policy}) is median
+
+
+@pytest.mark.parametrize("case", ["single-sample-label", "median-label"])
+def test_publication_verifies_with_the_label_of_its_sidecar(tmp_path, case):
+    import pyarrow.parquet as pq
+
+    plan = _glm_plan()
+    cells = _producer_cells(tmp_path)
+    median = case == "median-label"
+    rows = [
+        row
+        for cell, cell_dir in cells.values()
+        for row in database.aggregate_cell(plan, cell, cell_dir, expected_attempt_id=ATTEMPT_ID, median_policy=median)
+    ]
+    parquet, metadata, _skipped = database.write_formal_database(plan, rows, systems_root=tmp_path / "systems")
+    # As finalization and collection validation read a publication: the sidecar selects the label of the rows.
+    published = database.validate_formal_database_commit(
+        parquet, metadata, plan, required_cells=tuple(cell for cell, _cell_dir in cells.values())
+    )
+    assert database.published_median_policy(published) is median
+    again = [
+        row
+        for cell, cell_dir in cells.values()
+        for row in database.aggregate_cell(
+            plan,
+            cell,
+            cell_dir,
+            expected_attempt_id=ATTEMPT_ID,
+            median_policy=database.published_median_policy(published),
+        )
+    ]
+    canonical = lambda row: json.dumps(row, sort_keys=True, allow_nan=False)
+    assert sorted(map(canonical, again)) == sorted(map(canonical, pq.read_table(parquet).to_pylist()))
+
+
+def test_publication_and_readiness_aggregate_with_the_label_of_the_producer_contract():
+    """Publication and readiness aggregate with the label of the producer contract. Finalization and collection
+    validation take the label of the sidecar; tests/unit/test_onboard_runtime.py runs both on a producer campaign."""
+    import ast
+
+    import collector.fpm_forward
+
+    import aisim.support
+
+    sources = {
+        "collection_readiness": Path(aisim.support.__file__).parent / "collection_readiness.py",
+        "runner": Path(collector.fpm_forward.__file__).parent / "runner.py",
+    }
+    keywords = {}
+    for name, path in sources.items():
+        calls = [
+            node
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "aggregate_cell"
+        ]
+        keywords[name] = [
+            [ast.unparse(keyword.value) for keyword in call.keywords if keyword.arg == "median_policy"]
+            for call in calls
+        ]
+    assert keywords == {
+        "collection_readiness": [[]],
+        "runner": [[]],
+    }
 
 
 def test_glm_producer_record_must_name_the_supported_vllm(tmp_path):
@@ -1156,6 +2129,300 @@ def test_glm_producer_record_digests_are_those_of_the_shipped_producer_files():
     ):
         assert record[field] == hashlib.sha256((PRODUCER_DIR / name).read_bytes()).hexdigest()
     assert record["vllm_package_version"] == "0.33.0"
+
+
+def _receipt(cell_dir: Path, cell: FPMCell, **changes) -> Path:
+    """Write a producer receipt for the test cell, with ``changes`` applied to its top-level keys."""
+    receipt = {
+        "schema_name": "aic_fpm_producer_receipt",
+        "schema_version": 1,
+        "plan_sha256": PLAN_SHA256,
+        "cell_id": cell.cell_id,
+        "attempt_id": ATTEMPT_ID,
+        "producer": {"runtime_source_manifest_sha256": "a" * 64, "overlay_sha256": "b" * 64},
+        **changes,
+    }
+    path = cell_dir / "producer-receipt.json"
+    path.write_text(json.dumps(receipt))
+    return path
+
+
+def _cell_of_another_producer_revision(tmp_path: Path) -> FPMCell:
+    """A prefill cell whose artifact names the producer digests "a" * 64 and "b" * 64, not those of this checkout."""
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    payload["producer"].update(runtime_source_manifest_sha256="a" * 64, overlay_sha256="b" * 64)
+    write_glm_rank(_pod(tmp_path, cell), payload)
+    return cell
+
+
+def test_reader_without_a_receipt_keeps_the_rule_of_the_reading_checkout(tmp_path):
+    cell = _cell_of_another_producer_revision(tmp_path)
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path, cell)
+    text = str(refusal.value)
+    assert text.startswith(
+        "native GLM-5.3-Flash result lacks valid producer.runtime_source_manifest_sha256: expected '"
+    ), text
+    assert "found 'aaaa" in text
+
+
+def test_reader_takes_the_producer_digests_of_a_receipt(tmp_path):
+    cell = _cell_of_another_producer_revision(tmp_path)
+    _receipt(tmp_path, cell)
+    assert len(_validate(tmp_path, cell).points) == 2
+
+
+@pytest.mark.parametrize(
+    ("change", "name", "key", "expected"),
+    [
+        ({"plan_sha256": "0" * 64}, "plan", "plan_sha256", PLAN_SHA256),
+        ({"cell_id": "fpm-other"}, "cell", "cell_id", None),
+        ({"attempt_id": "a2"}, "attempt", "attempt_id", ATTEMPT_ID),
+        # A receipt of another plan, cell and attempt names the plan, the first binding that the reader compares.
+        ({"plan_sha256": "0" * 64, "cell_id": "fpm-other", "attempt_id": "a2"}, "plan", "plan_sha256", PLAN_SHA256),
+    ],
+    ids=["plan", "cell", "attempt", "plan-cell-and-attempt"],
+)
+def test_receipt_of_another_plan_cell_or_attempt_is_refused(tmp_path, change, name, key, expected):
+    cell = _cell_of_another_producer_revision(tmp_path)
+    path = _receipt(tmp_path, cell, **change)
+    expected = cell.cell_id if expected is None else expected
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path, cell)
+    assert str(refusal.value) == (
+        f"producer receipt names another {name}: {key} actual={change[key]!r} expected={expected!r}: {path}"
+    )
+
+
+_RECEIPT_KEYS = "['attempt_id', 'cell_id', 'plan_sha256', 'producer', 'schema_name', 'schema_version']"
+_RECEIPT_OBJECT = f"it must be a JSON object with exactly the keys {_RECEIPT_KEYS}"
+_RECEIPT_VERSION = "schema_version must be the integer 1"
+_RECEIPT_PRODUCER = (
+    "producer must be a JSON object with exactly the keys ['overlay_sha256', 'runtime_source_manifest_sha256']"
+)
+_RECEIPT_LINK = "it must be a regular file, not a symbolic link"
+_RECEIPT_TEXT = "it must be JSON text in UTF-8"
+
+
+def _write_receipt_text(text: str):
+    def write(cell_dir: Path, _cell: FPMCell) -> None:
+        (cell_dir / "producer-receipt.json").write_text(text)
+
+    return write
+
+
+def _write_receipt_bytes(data: bytes):
+    def write(cell_dir: Path, _cell: FPMCell) -> None:
+        (cell_dir / "producer-receipt.json").write_bytes(data)
+
+    return write
+
+
+def _write_receipt_without(key: str):
+    def write(cell_dir: Path, cell: FPMCell) -> None:
+        path = _receipt(cell_dir, cell)
+        receipt = json.loads(path.read_text())
+        del receipt[key]
+        path.write_text(json.dumps(receipt))
+
+    return write
+
+
+def _write_receipt_with(**changes):
+    def write(cell_dir: Path, cell: FPMCell) -> None:
+        _receipt(cell_dir, cell, **changes)
+
+    return write
+
+
+def _write_receipt_symlink(cell_dir: Path, cell: FPMCell) -> None:
+    """A symbolic link at the receipt path to a valid receipt in a folder beside the cell folder."""
+    elsewhere = cell_dir.parent / "elsewhere"
+    elsewhere.mkdir()
+    target = _receipt(elsewhere, cell)
+    (cell_dir / "producer-receipt.json").symlink_to(target)
+
+
+def _write_receipt_dangling_symlink(cell_dir: Path, _cell: FPMCell) -> None:
+    (cell_dir / "producer-receipt.json").symlink_to(cell_dir.parent / "missing.json")
+
+
+def _write_receipt_directory(cell_dir: Path, _cell: FPMCell) -> None:
+    (cell_dir / "producer-receipt.json").mkdir()
+
+
+@pytest.mark.parametrize(
+    ("write", "rule"),
+    [
+        (_write_receipt_text("[]"), _RECEIPT_OBJECT),
+        (_write_receipt_text("null"), _RECEIPT_OBJECT),
+        (_write_receipt_text("5"), _RECEIPT_OBJECT),
+        (_write_receipt_text("{"), _RECEIPT_TEXT),
+        (_write_receipt_bytes(b"\xff\xfe{}"), _RECEIPT_TEXT),
+        (_write_receipt_without("attempt_id"), _RECEIPT_OBJECT),
+        (_write_receipt_with(note="added"), _RECEIPT_OBJECT),
+        (_write_receipt_with(schema_version="1"), _RECEIPT_VERSION),
+        (_write_receipt_with(schema_version=True), _RECEIPT_VERSION),
+        (_write_receipt_with(schema_version=2), _RECEIPT_VERSION),
+        (_write_receipt_with(schema_version=1.0), _RECEIPT_VERSION),
+        (_write_receipt_with(schema_name="other"), "schema_name must be 'aic_fpm_producer_receipt'"),
+        (
+            _write_receipt_with(producer={"runtime_source_manifest_sha256": "a" * 63, "overlay_sha256": "b" * 64}),
+            "producer.runtime_source_manifest_sha256 must be 64 lowercase hexadecimal characters",
+        ),
+        (
+            _write_receipt_with(producer={"runtime_source_manifest_sha256": "A" * 64, "overlay_sha256": "b" * 64}),
+            "producer.runtime_source_manifest_sha256 must be 64 lowercase hexadecimal characters",
+        ),
+        (
+            _write_receipt_with(
+                producer={"runtime_source_manifest_sha256": "a" * 64, "overlay_sha256": "b" * 64, "note": "added"}
+            ),
+            _RECEIPT_PRODUCER,
+        ),
+        (_write_receipt_with(producer=[]), _RECEIPT_PRODUCER),
+        (_write_receipt_with(producer=5), _RECEIPT_PRODUCER),
+        (_write_receipt_symlink, _RECEIPT_LINK),
+        (_write_receipt_dangling_symlink, _RECEIPT_LINK),
+        (_write_receipt_directory, "it must be a regular file"),
+    ],
+    ids=[
+        "list",
+        "null",
+        "number",
+        "no-json",
+        "no-utf8",
+        "no-attempt-id",
+        "added-key",
+        "version-string",
+        "version-bool",
+        "version-2",
+        "version-float",
+        "other-schema",
+        "short-digest",
+        "upper-case-digest",
+        "producer-added-key",
+        "producer-list",
+        "producer-number",
+        "symlink",
+        "dangling-symlink",
+        "directory",
+    ],
+)
+def test_malformed_receipt_is_refused(tmp_path, write, rule):
+    cell_dir = tmp_path / "cell"
+    cell = _cell_of_another_producer_revision(cell_dir)
+    write(cell_dir, cell)
+    path = cell_dir / "producer-receipt.json"
+    with pytest.raises(ValueError) as refusal:
+        _validate(cell_dir, cell)
+    assert str(refusal.value) == f"invalid producer receipt: {rule}: {path}"
+
+
+def test_receipt_leaves_the_other_producer_fields_to_the_reader(tmp_path):
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    payload["producer"].update(runtime_source_manifest_sha256="a" * 64, overlay_sha256="b" * 64, warmup_repeats=6)
+    write_glm_rank(_pod(tmp_path / "warmup", cell), payload)
+    _receipt(tmp_path / "warmup", cell)
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path / "warmup", cell)
+    assert "lacks valid producer.warmup_repeats: expected 5, found 6" in str(refusal.value)
+
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    payload["producer"].update(runtime_source_manifest_sha256="c" * 64, overlay_sha256="c" * 64)
+    write_glm_rank(_pod(tmp_path / "digests", cell), payload)
+    _receipt(tmp_path / "digests", cell)
+    with pytest.raises(ValueError) as refusal:
+        _validate(tmp_path / "digests", cell)
+    # The expected digest is the one of the receipt, and the text says so.
+    assert str(refusal.value).startswith(
+        f"native GLM-5.3-Flash result lacks valid producer.runtime_source_manifest_sha256: expected {'a' * 64!r} "
+        f"(the value of the producer receipt of the cell), found {'c' * 64!r}: "
+    ), str(refusal.value)
+
+
+def test_receipt_is_not_read_for_a_cell_without_the_producer_contract(tmp_path):
+    # The artifact of test_v41_artifacts_keep_their_contract, with a receipt that no reader of the GLM-5.3-Flash
+    # producer contract would accept in its cell folder.
+    identity = ("c" * 64, "full", "hbm_tp_sharded", "text")
+    cell = replace(_cell(phase="prefill", strategy="pure_tp"), execution_identity=identity, input_text_sha256="a" * 64)
+    payload = _native_payload(phase="prefill", rank=0, dp=1)
+    payload.update(
+        execution_identity=dict(zip(EXECUTION_COLUMNS, identity, strict=True)),
+        execution_mode="eager",
+        input_provenance={
+            "source": "tokenizer_text",
+            "text_sha256": "a" * 64,
+            "token_ids_sha256": "b" * 64,
+            "tokenizer_revision": "pinned",
+            "token_count": 100,
+            "unique_token_count": 20,
+        },
+    )
+    (_pod(tmp_path, cell) / "benchmark.json").write_text(json.dumps(payload))
+    (tmp_path / "producer-receipt.json").write_text("[]")
+    with pytest.raises(ValueError, match="V4.1 native result lacks token-stream manifest"):
+        _validate(tmp_path, cell)
+
+
+def test_no_receipt_is_written_for_a_cell_without_the_producer_contract(tmp_path):
+    written = native_artifact.write_producer_receipt(
+        _cell(phase="prefill"), tmp_path, plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID
+    )
+    assert written is None
+    assert not (tmp_path / "producer-receipt.json").exists()
+
+
+def test_campaign_with_receipts_is_read_after_the_producer_files_change(tmp_path, monkeypatch):
+    shape = _glm_producer_shape(tmp_path)
+    cell = glm_cell("prefill")
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD, PREFILL_CACHED])
+    shape("prefill", payload)
+    write_glm_rank(_pod(tmp_path / "prefill", cell), payload)
+    receipt = native_artifact.write_producer_receipt(
+        cell, tmp_path / "prefill", plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID
+    )
+    assert receipt == tmp_path / "prefill" / "producer-receipt.json"
+    expected = {
+        "attempt_id": ATTEMPT_ID,
+        "cell_id": cell.cell_id,
+        "plan_sha256": PLAN_SHA256,
+        "producer": {
+            "overlay_sha256": hashlib.sha256(
+                (PRODUCER_DIR / "glm53flash_prefix_scheduler.py").read_bytes()
+            ).hexdigest(),
+            "runtime_source_manifest_sha256": hashlib.sha256(
+                (PRODUCER_DIR / "runtime-source-sha256.json").read_bytes()
+            ).hexdigest(),
+        },
+        "schema_name": "aic_fpm_producer_receipt",
+        "schema_version": 1,
+    }
+    # The receipt is the JSON text with an indent of two, sorted keys and a final line break, and the write through a
+    # temporary file leaves no other file in the cell folder.
+    assert receipt.read_text() == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+    assert sorted(item.name for item in (tmp_path / "prefill").iterdir()) == ["producer-receipt.json", "raw"]
+
+    # A later revision of the producer: one more line in the scheduler file of the reading checkout.
+    later = tmp_path / "later"
+    later.mkdir()
+    for name in ("glm53flash_prefix_scheduler.py", "runtime-source-sha256.json"):
+        shutil.copyfile(PRODUCER_DIR / name, later / name)
+    with (later / "glm53flash_prefix_scheduler.py").open("ab") as scheduler:
+        scheduler.write(b"\n# a later revision\n")
+    monkeypatch.setattr(native_artifact, "_GLM_RUNTIME", later)
+    native_artifact._glm_producer_record.cache_clear()
+    try:
+        assert len(_validate(tmp_path / "prefill", cell).points) == 2
+        rows = database.aggregate_cell(_glm_plan(), cell, tmp_path / "prefill", expected_attempt_id=ATTEMPT_ID)
+        assert len(rows) == 2
+        receipt.unlink()
+        with pytest.raises(ValueError, match=r"lacks valid producer\.overlay_sha256"):
+            _validate(tmp_path / "prefill", cell)
+    finally:
+        native_artifact._glm_producer_record.cache_clear()
 
 
 def test_glm_producer_vllm_must_be_the_collection_runtime(tmp_path):

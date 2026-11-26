@@ -10,6 +10,7 @@ in a prefill/decode (P/D) pair. It is the evidence for the
 `transfer_bytes_per_block` values of the GLM-5.3-Flash test profiles and for
 the oracle test of `crates/core/src/engine/kv_manager/grouped_transfer.rs`.
 `measurements.json` holds every request of the run.
+Its `sources` objects mark each number as measured or derived.
 
 ## Setup
 
@@ -117,6 +118,7 @@ The transfer bytes above do not depend on the row.
 
 One model, one TP size, one GPU type, equal TP on both sides, the default
 prefix match unit, no speculative decoding, and vLLM alone. The decode server
-never held every block of a prompt in this run. vLLM 0.33.0 was not measured.
+never held every block of a prompt in this run. A later run measured vLLM 0.33.0: see
+[`nixl-pd-transfer-bytes-20261117`](../nixl-pd-transfer-bytes-20261117/README.md).
 The values change with the TP size, because the block size and the state sizes
 change with it.

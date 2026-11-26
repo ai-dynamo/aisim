@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aisim.sdk.common import MULTIMODAL_TEXT_CONFIG_KEY
+from aisim.sdk.common import ARCHITECTURE_TO_MODEL_FAMILY, MULTIMODAL_TEXT_CONFIG_KEY
 from aisim.sdk.memory import NaiveKVCacheEstimator
 from aisim.sdk.utils import (
     HuggingFaceDownloadError,
@@ -21,7 +21,7 @@ from aisim.sdk.utils import (
     _get_model_config_path,
     _parse_hf_config_json,
 )
-from aisim_core.decoder_config import decoder_config_problem
+from aisim_core.decoder_config import decoder_config_problem, wrapper_key_problem
 from aisim_core.sdk.fpm_model_metadata import (
     attach_quantization_sidecar,
     decoder_config_key,
@@ -74,10 +74,13 @@ class ResolvedModelConfig:
         """Return decoder metadata, inheriting only identity and shared precision.
 
         A decoder config that is not one nonempty object, or that holds a decoder key, raises ValueError, as config
-        intake refuses it. Only a config with no decoder key is read flat.
+        intake refuses it. So does a registered wrapper that holds only the other decoder key. Only a config with no
+        decoder key is read flat.
         """
 
         payload = self.payload
+        if (problem := wrapper_key_problem(payload)) is not None:
+            raise ValueError(f"{problem}; supply one text decoder config")
         key = decoder_config_key(payload)
         decoder = payload.get(key)
         if key is not None and (problem := decoder_config_problem(key, decoder)) is not None:
@@ -120,7 +123,19 @@ class ResolvedModelConfig:
             parser_config = {**source, "architectures": [architecture], text_key: raw_config}
         try:
             parsed = _parse_hf_config_json(parser_config)
-        except ValueError:
+        except Exception as error:
+            # A config of a registered architecture that this parse refuses is
+            # refused with the type and the message of its error, in the form
+            # of the naive estimator's refusal. This parse reads a registered
+            # wrapper whose decoder names no class of its own together with
+            # its encoder and processor fields.
+            if architecture in ARCHITECTURE_TO_MODEL_FAMILY:
+                raise ValueError(
+                    f"the config parser refuses the HF config of the supported architecture {architecture}: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            if not isinstance(error, ValueError):
+                raise
             # Bootstrap templates intentionally admit real HF architectures
             # that the native AIC parser does not know yet. Normalize their
             # frozen config with the architecture-agnostic estimator so render
@@ -167,6 +182,8 @@ def _load_json_mapping(path: Path, *, description: str) -> tuple[dict[str, Any],
 
 
 def _attach_modelopt_sidecar(payload: dict[str, Any], sidecar: dict[str, Any]) -> dict[str, Any]:
+    if (problem := wrapper_key_problem(payload)) is not None:
+        raise ValueError(f"{problem}; supply one text decoder config")
     key = decoder_config_key(payload)
     decoder = payload.get(key)
     if payload.get("hf_quant_config") is not None and payload["hf_quant_config"] != sidecar:

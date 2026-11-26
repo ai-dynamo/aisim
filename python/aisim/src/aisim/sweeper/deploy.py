@@ -18,6 +18,10 @@ from .replay import BackendDeploymentSpec, EncoderPoolSpec, ForwardPassEstimator
 SGLANG_DEFAULT_CHUNKED_PREFILL_SIZE = 8192
 
 
+class InfeasibleEngineSetting(ValueError):
+    """An engine setting of a candidate that its FPM profile cannot run."""
+
+
 def _role_prefix(role: str) -> str:
     """Field prefix in the unrolled sample for a role (empty for agg shape fields)."""
     return "" if role == "agg" else f"{role}_"
@@ -249,14 +253,17 @@ def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any],
     if deployment.resources.cache_layout != "grouped":
         return
     # The search gate checks the largest budget of the domain. Each candidate is checked with its own, before replay.
-    payload["prefix_match_unit"] = grouped_prefix_caching_requirements(
-        deployment,
-        backend_version=backend_version,
-        architecture=profile.architecture,
-        prefix_match_unit=None,
-        max_batched_tokens=int(sample["agg_max_num_batched_tokens"]),
-        field="agg_enable_prefix_caching",
-    )
+    try:
+        payload["prefix_match_unit"] = grouped_prefix_caching_requirements(
+            deployment,
+            backend_version=backend_version,
+            architecture=profile.architecture,
+            prefix_match_unit=None,
+            max_batched_tokens=int(sample["agg_max_num_batched_tokens"]),
+            field="agg_enable_prefix_caching",
+        )
+    except ValueError as exc:
+        raise InfeasibleEngineSetting(str(exc)) from exc
     payload["vllm_version"] = deployment.backend_version
     # vLLM always sizes its pool with a model length, and the Rust gate refuses a rank without one.
     payload.setdefault("max_model_len", profile.context_length)

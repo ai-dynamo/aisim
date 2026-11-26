@@ -678,8 +678,7 @@ explains the retained workload routing and feature mathematics.
   Serialized groups that omit these fields still deserialize, and `None` is
   not serialized.
 - A vLLM 0.33.0 runtime probe import now writes `prefix_cacheable` for each
-  cache group, except a group that holds a `SlidingWindowMLASpec` layer. It
-  writes `transfer_bytes_per_block` for no group. An onboarding session whose
+  cache group, except a group that holds a `SlidingWindowMLASpec` layer. An onboarding session whose
   probe was imported before this change keeps working without the new field,
   also for a memory revision:
   - Before the formal collection, its accepted draft still verifies and stays
@@ -714,6 +713,24 @@ explains the retained workload routing and feature mathematics.
   replay do not read the field, so such a session does not need it. A new
   import of the same observations, as for `prefix_cacheable` above, also
   writes it.
+- A vLLM 0.33.0 runtime probe import now also writes
+  `transfer_bytes_per_block` for each cache group, only from a probe phase
+  with prefix caching and only for the measured cache shape, which
+  [memory accounting](../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets)
+  describes. For every other record it gives no value. A record without a
+  value never makes an import incomplete, and the result of a complete import
+  names the reason in `transfer_bytes_reason`. A session whose probe was imported
+  before this change keeps working without the field, in the same steps as for
+  `prefix_cacheable` above: its draft verifies, the existing collection
+  finalizes, and the finalized profile has no `transfer_bytes_per_block`. A
+  saved record that states the field must state the value of a fresh import.
+  The checks of the formal collection compare the field with the accepted
+  probe only when the saved probe resources hold it, so such a session is
+  checked without it, as before. Then the check over the whole role compares
+  it, and the check of one bound phase compares it unless that phase ran
+  without prefix caching.
+  Sizing and aggregated replay do not read the field. Reimport the same
+  observations to add the transfer evidence to a fresh draft.
 - Replay now holds grouped prefix-caching rules for vLLM 0.33.0. A new plan
   of a profile from the runtime probe with the label `0.33.0` sets
   `prefix_caching: true` when the profile meets the conditions of
@@ -727,16 +744,28 @@ explains the retained workload routing and feature mathematics.
   grouped profile is refused.
 - A profile imported before these fields existed holds no `prefix_cacheable`
   marks either, so its plan is cold and a configuration with prefix caching is
-  refused. If you set the marks by hand, also set
-  `runtime_memory.runtime_framework_version` to the version that the probe ran
-  on. With the marks and without the version, a label of `0.31.0` or `0.32.0`
+  refused. `aisim onboard plan` and `aisim onboard finalize` record the reason
+  of a cold plan of a grouped profile in `fpm.prefix_caching_reason` of
+  `support-plan.json`, and they print it when the probe ran with prefix
+  caching. When the marks are what the profile lacks, the text names them and
+  says to import the runtime probe again. Follow the steps for
+  `prefix_cacheable` above. Do not set the marks of an imported profile by
+  hand: the onboarding commands refuse a draft from the runtime probe import
+  whose cache groups state a mark that its saved import record does not state.
+  Only a hand-made profile sets the marks itself. If its evidence comes from a
+  probe, it also sets `runtime_memory.runtime_framework_version` to the version
+  that the probe ran on. With the marks and without the version, a label of
+  `0.31.0` or `0.32.0`
   on vLLM 0.33.0 evidence can plan grouped prefix caching on, which is not
   modeled.
 - An onboarding plan that an earlier AISim saved for a grouped profile holds
   `prefix_caching: false`, because that AISim planned every grouped profile
   cold or had no grouped rules for the vLLM version of the profile. The
   commands that verify a saved plan still accept it, and it keeps prefix
-  caching off until `aisim onboard plan --overwrite` writes the plan again. A
+  caching off until `aisim onboard plan --overwrite` writes the plan again.
+  Such a plan holds no `fpm.prefix_caching_reason`. It verifies without the
+  key, and `aisim onboard plan --overwrite` adds the key when the plan stays
+  cold. A
   profile of `backend_version` 0.31.0, 0.32.0 or 0.33.0 with prefix-caching
   evidence of that version then plans prefix caching on. `aisim onboard
   finalize` plans the resolved profile with the current rule.

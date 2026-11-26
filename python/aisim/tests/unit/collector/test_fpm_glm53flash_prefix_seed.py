@@ -12,6 +12,7 @@ hardware or timing evidence.
 
 from __future__ import annotations
 
+import ast
 import collections
 import copy
 import hashlib
@@ -111,6 +112,8 @@ class FakeBase:
 
     def _kvwarm_prepare(self, mode):
         self.warmup_planned.append(mode)
+        if mode == "decode":
+            self._bench_grid.reverse()
 
     def _bench_pop_next(self, point_type):
         if self._bench_grid and self._bench_grid[0].point_type == point_type:
@@ -612,6 +615,8 @@ def make_scheduler(module, tmp_path, points):
     s._glm_serving = {"hash_block_size": 4}
     # vLLM's scheduler configuration with the token budget of the onboarding request, not an unlimited one.
     s.scheduler_config = types.SimpleNamespace(max_num_batched_tokens=8192)
+    # vLLM sets the step budget to max_num_batched_tokens when the launch names no max_num_scheduled_tokens.
+    s.max_num_scheduled_tokens = 8192
     # With prefix caching, vLLM runs GLM-5.3-Flash in Mamba align mode. The block is the hash block of this fake.
     s.need_mamba_block_aligned_split = True
     s.cache_config = types.SimpleNamespace(block_size=4)
@@ -1071,8 +1076,8 @@ def test_dynamo_runtime_pins_match_the_ai_dynamo_1_7_0_dev20261109_build():
         "dynamo/common/forward_pass_metrics.py": "b1551b47794b1ed30f1e6c90eea404cb7ce7769e0263c86f1375cd39fb35513b",
     }
     assert {name: pins[name] for name in expected} == expected
-    # The 19 vLLM files and the five Dynamo files.
-    assert len(pins) == 24 and sum(name.startswith("dynamo/") for name in pins) == len(expected)
+    # The 23 vLLM files and the five Dynamo files.
+    assert len(pins) == 28 and sum(name.startswith("dynamo/") for name in pins) == len(expected)
 
 
 def test_native_warmup_planning_never_runs_under_the_producer(monkeypatch, tmp_path):
@@ -1086,6 +1091,53 @@ def test_native_warmup_planning_never_runs_under_the_producer(monkeypatch, tmp_p
     # planning that the grid build calls must not run.
     assert s._bench_grid_built
     assert s.warmup_planned == []
+    monkeypatch.delenv("DYN_FPM_GLM53FLASH_DECODE_CONTEXTS", raising=False)
+
+    def decode_grid():
+        points = [Point("decode", 1, 1, 0, 4096), Point("decode", 2, 2, 0, 8192), Point("decode", 3, 1, 0, 8192)]
+        s = make_scheduler(module, tmp_path, points)
+        s._glm_serving = {"hash_block_size": 2176}
+        s._glm_context_policy = module.glm_context_policy(1048576, 131072)
+        s._bench_explicit_points = points
+        s._bench_build_grid()
+        return s
+
+    # Native planning would run for a decode grid and reorder it. Under the producer it does not run, and the grid
+    # keeps the order of the frozen list.
+    s = decode_grid()
+    assert s.warmup_planned == []
+    assert [point.benchmark_id for point in s._bench_grid] == [1, 2, 3]
+    # Without the producer's override the fake planning runs, so the two assertions above can fail.
+    monkeypatch.delattr(module.Glm53FlashPrefixSeedScheduler, "_kvwarm_prepare")
+    s = decode_grid()
+    assert s.warmup_planned == ["decode"]
+    assert [point.benchmark_id for point in s._bench_grid] == [3, 2, 1]
+
+
+def test_pin_list_holds_the_vllm_files_that_the_producer_depends_on():
+    pins = json.loads(MANIFEST.read_text())
+    imported = {
+        node.module if isinstance(node, ast.ImportFrom) else node.names[0].name
+        for node in ast.parse(PRODUCER.read_text()).body
+        if isinstance(node, ast.Import | ast.ImportFrom)
+    }
+    # Every vLLM or Dynamo module that the producer imports at module level. A new one needs a pin below.
+    assert {name for name in imported if name.split(".")[0] in {"vllm", "dynamo"}} == {
+        "dynamo.vllm.instrumented_scheduler",
+        "vllm.sampling_params",
+        "vllm.tokenizers",
+        "vllm.v1.request",
+    }
+    # vllm.tokenizers takes get_tokenizer from its registry module. The scheduler configuration holds the step
+    # budgets of the decode rule, and the engine core runs the step loop.
+    added = {
+        "vllm/config/scheduler.py": "61485c7a1ef1c7c65339767f4b223f55de76d2ca152eb19df915c88f526be9de",
+        "vllm/sampling_params.py": "deebc01732f3f7c14b9912dbed0190570015f5e0635c802c8293a508c36e4848",
+        "vllm/tokenizers/registry.py": "66b226a537dd8bf1f5922a440b4352df7a756b8537fbfdf4cc5743d37bcd6472",
+        "vllm/v1/engine/core.py": "d02d32df5d15f0a8b8ffc731ed4bc6f7fcb68b8a9273ec5e4c5d1ab4bd7d7e01",
+    }
+    assert {name: pins.get(name) for name in added} == added
+    assert {"vllm/v1/request.py", "dynamo/vllm/instrumented_scheduler.py"} <= set(pins)
 
 
 def test_explicit_decode_points_stay_within_the_measured_context(monkeypatch, tmp_path):
@@ -1107,6 +1159,28 @@ def test_explicit_decode_points_stay_within_the_measured_context(monkeypatch, tm
     with pytest.raises(ValueError) as refused:
         build(262144)
     assert str(refused.value) == "GLM-5.3-Flash decode context 262144 exceeds the measured context limit 131072"
+
+
+def test_decode_context_floor_is_the_planner_minimum(monkeypatch, tmp_path):
+    from collector.fpm_forward.glm53flash_points import MIN_CONTEXT
+
+    module = load_producer(monkeypatch)
+    monkeypatch.delenv("DYN_FPM_GLM53FLASH_DECODE_CONTEXTS", raising=False)
+
+    def build(context):
+        points = [Point("decode", 1, 1, 0, context)]
+        s = make_scheduler(module, tmp_path, points)
+        s._glm_context_policy = module.glm_context_policy(1048576, 131072)
+        s._bench_explicit_points = points
+        s._bench_build_grid()
+        return s
+
+    with pytest.raises(ValueError) as refused:
+        build(2)
+    assert str(refused.value) == "GLM real decode requires per-request context >= 3; no clamping"
+    assert [point.total_kv_read_tokens for point in build(3)._bench_grid] == [3]
+    # The planner starts its decode axis at the smallest power of two above the largest refused context.
+    assert next(power for power in (1, 2, 4, 8) if power > 2) == MIN_CONTEXT
 
 
 def test_explicit_decode_points_stay_within_the_producer_batch_limit(monkeypatch, tmp_path):
@@ -1133,14 +1207,16 @@ def test_explicit_decode_points_prefill_their_suffixes_in_one_step(monkeypatch, 
     module = load_producer(monkeypatch)
     monkeypatch.delenv("DYN_FPM_GLM53FLASH_DECODE_CONTEXTS", raising=False)
 
-    def build(batch_size, budget=None):
+    def build(batch_size, budget=None, scheduled=None):
         points = [Point("decode", 1, batch_size, 0, batch_size * 4096)]
         s = make_scheduler(module, tmp_path, points)
         # The native hash block of GLM-5.3-Flash at TP4. Each 4,095-token prompt has a seed of 2,176 tokens, so each
         # request prefills 1,919 tokens before its first decode step.
         s._glm_serving = {"hash_block_size": 2176}
         if budget is not None:
-            s.scheduler_config.max_num_batched_tokens = budget
+            s.scheduler_config.max_num_batched_tokens = s.max_num_scheduled_tokens = budget
+        if scheduled is not None:
+            s.max_num_scheduled_tokens = scheduled
         s._glm_context_policy = module.glm_context_policy(1048576, 131072)
         s._bench_explicit_points = points
         s._bench_build_grid()
@@ -1167,6 +1243,22 @@ def test_explicit_decode_points_prefill_their_suffixes_in_one_step(monkeypatch, 
     )
     # One request may prefill its suffix over several steps, because no other request can decode before it.
     assert [point.batch_size for point in build(1, budget=1024)._bench_grid] == [1]
+    # vLLM limits a step by max_num_scheduled_tokens, which a launch can set below max_num_batched_tokens.
+    with pytest.raises(ValueError) as refused:
+        build(2, scheduled=3836)
+    assert str(refused.value) == (
+        "GLM-5.3-Flash decode point of 2 requests at context 4096 needs 3838 suffix tokens in one step, "
+        "above the token budget 3836"
+    )
+    assert [point.batch_size for point in build(2, scheduled=3838)._bench_grid] == [2]
+    # The input budget of a step starts at max_num_batched_tokens, so a larger max_num_scheduled_tokens cannot raise it.
+    with pytest.raises(ValueError) as refused:
+        build(2, budget=3836, scheduled=8192)
+    assert str(refused.value) == (
+        "GLM-5.3-Flash decode point of 2 requests at context 4096 needs 3838 suffix tokens in one step, "
+        "above the token budget 3836"
+    )
+    assert [point.batch_size for point in build(2, budget=3838, scheduled=8192)._bench_grid] == [2]
 
 
 def chunked_decode(module, tmp_path, batch_size, budget):
@@ -1177,7 +1269,7 @@ def chunked_decode(module, tmp_path, batch_size, budget):
     points = [Point("decode", 1, batch_size, 0, batch_size * 250)]
     s = make_scheduler(module, tmp_path, points)
     s._glm_serving = {"hash_block_size": 64}
-    s.scheduler_config.max_num_batched_tokens = budget
+    s.scheduler_config.max_num_batched_tokens = s.max_num_scheduled_tokens = budget
     return s, BudgetEngine(s, budget=budget, unit=64)
 
 

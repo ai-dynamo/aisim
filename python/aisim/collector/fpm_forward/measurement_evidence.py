@@ -17,7 +17,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from .native_artifact import NativeCollection, _rank_artifacts, select_native_measurements
+from .native_artifact import NativeCollection, _expected_scheduled, _rank_artifacts, select_native_measurements
 
 _UNOBSERVED = [
     "sampled_continuation_token_ids",
@@ -100,7 +100,8 @@ def _validate_protocol(protocol: Any, *, glm: bool, path: Path) -> None:
 
     ``glm`` is true when the frozen cell selects the GLM-5.3-Flash producer contract. That protocol must then hold the
     producer's record, its seeded token content and Dynamo's execution evidence contract exactly, with the same JSON
-    types (5.0 is not 5). The protocol of any other cell must not carry a producer record.
+    types (5.0 is not 5), and a global warm-up count of 0. The protocol of any other cell must not carry a producer
+    record.
     """
     if not isinstance(protocol, dict):
         raise ValueError("measurement_protocol must be a mapping")
@@ -153,6 +154,13 @@ def _validate_protocol(protocol: Any, *, glm: bool, path: Path) -> None:
         or not all(type(preparation.get(key)) is bool for key in ("prefill_real_seed", "decode_real_kv_warmup"))
     ):
         raise ValueError("measurement_protocol has malformed preparation settings")
+    # The producer's _bench_init (runtime/glm53flash/glm53flash_prefix_scheduler.py), which the scheduler's constructor
+    # calls, refuses a global warm-up: the producer runs five warm-up repetitions of each point instead.
+    if glm and preparation["warmup_iterations"] != 0:
+        raise ValueError(
+            "measurement_protocol.preparation.warmup_iterations must be 0 for the GLM-5.3-Flash producer: "
+            f"expected 0, found {preparation['warmup_iterations']!r}: {path}"
+        )
 
 
 def _validate_prompts(prompts: Any) -> bool:
@@ -265,6 +273,18 @@ def _read_measurement(
             "benchmark_measurement does not hold the producer's ten measured repetitions with their "
             "adjacent_upper_median estimate"
         )
+    if glm:
+        # Each of the producer's ten raw samples is the retained FPM of one repetition of the same point, so each holds
+        # the point's workload. Only the producer's records hold that: the raw samples of Dynamo's own
+        # adjacent_upper_median estimate are adjacent decode steps of one launch, whose KV total grows from step to
+        # step.
+        expected = _expected_scheduled(row["point"])
+        for index, sample in enumerate(measurement["raw_fpms"]):
+            scheduled = sample.get("scheduled_requests")
+            if not isinstance(scheduled, dict) or any(
+                type(scheduled.get(key)) is not int or scheduled[key] != value for key, value in expected.items()
+            ):
+                raise ValueError(f"benchmark_measurement raw sample {index} does not hold the workload of its point")
     return measurement, [] if recorded else [f"rank {rank}: injected prompt hashes unavailable"]
 
 

@@ -6,6 +6,11 @@
 The GLM-5.3-Flash producer (``runtime/glm53flash/glm53flash_prefix_scheduler.py``) measures an explicit point list
 only, and onboarding passes grid limits only. The planner freezes this list into the collection plan, so the plan
 hash covers it. The list keeps the shape of Dynamo's generic grid where the producer's rules allow it.
+
+``glm_align_stop`` and ``glm_point_blocks`` are modified adaptations of rules of vLLM v0.33.0
+(https://github.com/vllm-project/vllm/tree/4ba787ec9959e566d3b587a796dff07673324da5), Copyright contributors to the
+vLLM project, Apache-2.0. The comments in the two functions name the source files and lines, and
+THIRD_PARTY_NOTICES.md holds the entry.
 """
 
 from __future__ import annotations
@@ -16,21 +21,25 @@ import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from collector.glm53flash_runtime_identity import BASELINE_VERSIONS
+
 from .config import _powers_of_two_up_to
 
 if TYPE_CHECKING:
     from aisim_core.sdk.fpm_profile import FpmDeploymentProfile
 
     from .config import FPMCollectionOptions
+    from .types import ParallelTopology
 
 logger = logging.getLogger(__name__)
 
 GLM_ARCHITECTURE = "Glm5NextForConditionalGeneration"
 GLM_POINTS_ORIGIN = "glm53flash_grid_v1"
 GLM_SMOKE_MANIFEST = "glm53flash_grid_v1_smoke"
-# The producer's CHUNK_ALIGN, MAX_BATCH, MAX_NEW and MAX_CONTEXT. The producer module imports vLLM and Dynamo, so the
-# planner keeps copies.
+# The producer's CHUNK_ALIGN, MAX_BATCH, MAX_NEW, MAX_CONTEXT and TP_SIZES. The producer module imports vLLM and Dynamo,
+# so the planner keeps copies.
 CHUNK_ALIGN = 4
+TP_SIZES = (1, 2, 4, 8)
 MAX_BATCH = 32
 MAX_NEW = 8192
 MAX_CONTEXT = 131072
@@ -82,6 +91,44 @@ def glm_align_stop(
     return min((stop for stop in stops if start < stop < end), default=None)
 
 
+def glm_point_blocks(
+    workload_kind: str,
+    point: dict[str, int],
+    *,
+    hash_block_size: int,
+    state_groups: Sequence[tuple[int, int]],
+    checkpoint_alignment: int | None,
+) -> int:
+    """Return the cache blocks that the requests of one point hold, for the deployment that needs the most.
+
+    ``state_groups`` holds, for each deployment, the number of its ring groups and of its Mamba groups. The count is
+    the one of vLLM 0.33.0's allocator when it admits a request, for the launch that the collector renders: prefix
+    caching, the Mamba mode align, no speculative block and no async scheduling. It holds for a prefill that runs in
+    one chunk and a decode whose suffix is at most one hash block, as every point of the list does. A request holds the
+    attention blocks of its tokens and one block in each ring group and each Mamba group. A request with a prefix holds
+    one more block in each Mamba group, the cached block of its prefix beside its running block, and so does a decode
+    request at a context of at least one hash block. A prefill of more than one hash block of new tokens in a launch
+    with a prefill checkpoint block (``checkpoint_alignment``) also holds that block in each Mamba group.
+    """
+    # Mamba groups: single_type_kv_cache_manager.py:1740-1795 caps the new blocks of a request at its running block,
+    # the block of a partial prefix hit and the checkpoint block, and adds the cached block of the prefix. The
+    # checkpoint block counts only when the chunk saves a checkpoint inside it (kv_cache_interface.py:1189-1210),
+    # which needs more than one hash block of new tokens. A decode step takes no checkpoint block. The ring takes one
+    # block (kv_cache_interface.py:982-989).
+    unit = hash_block_size
+    batch = point["batch_size"]
+    context = point["total_kv_read_tokens"] // batch
+    if workload_kind == "prefill":
+        new = point["total_prefill_tokens"] // batch
+        attention = -(-(context + new) // unit)
+        mamba = 1 + (context > 0) + (checkpoint_alignment is not None and new > unit)
+    else:
+        # A decode step at a context of x tokens holds x + 1 tokens: the context and the token that it writes.
+        attention = -(-(context + 1) // unit)
+        mamba = 1 + (context >= unit)
+    return batch * (attention + max(ring + mamba_groups * mamba for ring, mamba_groups in state_groups))
+
+
 def glm_points(
     *,
     hash_block_size: int,
@@ -91,9 +138,8 @@ def glm_points(
     measured_context: int,
     kv_cache_bytes: int,
     page_size_bytes: int,
-    state_groups: int,
+    state_groups: Sequence[tuple[int, int]],
     checkpoint_alignment: int | None,
-    checkpoint_groups: int,
 ) -> tuple[dict[str, Any], dict[str, dict[str, int]]]:
     """Return the point list and, for each phase, its candidates and the number of them that each rule dropped.
 
@@ -106,6 +152,7 @@ def glm_points(
     Before a decode batch decodes, each request prefills its prompt beyond its cached seed. These suffixes of a batch
     of two or more requests fit the token budget too, so every request decodes in the same step. The producer divides
     a total evenly, so every request of a point gets the same prefix, the same new tokens and the same decode context.
+    The capacity rule keeps a point whose blocks by ``glm_point_blocks`` fit the usable blocks of the cache.
     """
     if token_budget % CHUNK_ALIGN:
         raise ValueError("GLM-5.3-Flash collection requires a token budget that is a multiple of 4")
@@ -118,13 +165,15 @@ def glm_points(
     unit = hash_block_size
     usable = kv_cache_bytes // page_size_bytes
 
-    def fits(batch_size: int, tokens: int) -> bool:
-        # An estimate of the blocks that the native cache managers give a request: ceil((tokens + 1) / unit) blocks of
-        # its attention, one block in each state group and one more in each group with a prefill checkpoint block. A
-        # request with a prefix hit can hold more than one block in a recurrent-state group, for example the cached
-        # block of its prefix and the block of its running state, so a point near the capacity limit can still fail
-        # when it runs.
-        return batch_size * (-(-(tokens + 1) // unit) + state_groups + checkpoint_groups) <= usable
+    def fits(workload_kind: str, point: dict[str, int]) -> bool:
+        blocks = glm_point_blocks(
+            workload_kind,
+            point,
+            hash_block_size=unit,
+            state_groups=state_groups,
+            checkpoint_alignment=checkpoint_alignment,
+        )
+        return blocks <= usable
 
     def batch_sizes(limit: int) -> list[int]:
         return sorted({*_powers_of_two_up_to(limit), limit})
@@ -155,15 +204,14 @@ def glm_points(
         for batch in batch_sizes(min(MAX_BATCH, prefill_batch_limit, prefill_budget // new)):
             prefill_candidates += len(rungs)
             split += len(rungs) - len(whole)
-            prefill.extend(
-                {
+            for rung in whole:
+                point = {
                     "batch_size": batch,
                     "total_prefill_tokens": batch * new,
                     "total_kv_read_tokens": batch * rung * unit,
                 }
-                for rung in whole
-                if fits(batch, rung * unit + new)
-            )
+                if fits("prefill", point):
+                    prefill.append(point)
     contexts = {measured, *(value for value in _powers_of_two_up_to(measured) if value >= MIN_CONTEXT)}
     # The producer accepts a decode repetition only if its first decode step holds every request. vLLM prefills the
     # suffixes of two or more requests in one step only if they fit the token budget together, so the budget bounds the
@@ -178,11 +226,10 @@ def glm_points(
         candidates = sorted({*batch_sizes(decode_limit), limit})
         decode_candidates += len(candidates)
         over_budget += sum(batch > limit for batch in candidates)
-        decode.extend(
-            {"batch_size": batch, "total_kv_read_tokens": batch * context}
-            for batch in candidates
-            if batch <= limit and fits(batch, context)
-        )
+        for batch in candidates:
+            point = {"batch_size": batch, "total_kv_read_tokens": batch * context}
+            if batch <= limit and fits("decode", point):
+                decode.append(point)
     dropped = {
         "prefill": {
             "candidates": prefill_candidates,
@@ -229,9 +276,15 @@ def glm_plan_manifest(
     """Return the canonical JSON and the SHA-256 of the point list for a plan's options and profile deployments.
 
     The third value is the canonical JSON of the dropped counts of ``glm_points``. The planner resolves
-    ``options.max_prefill_isl`` first. The cells of a plan share one list, so the deployments must share one hash block
-    and one prefill checkpoint alignment, and the capacity rule takes the smallest capacity, the largest page, the most
-    state groups and the most groups with a prefill checkpoint block among them.
+    ``options.max_prefill_isl`` first. Both phases take one token budget, ``options.max_prefill_isl``; the function does
+    not read ``options.max_num_batched_tokens``. A phase whose batch limit neither its own option nor
+    ``options.max_num_seqs`` sets takes the ``max_batch_size`` that the deployments share, which the runner renders for
+    its cells. The cells of a plan share one list, so the deployments must share one hash block and one prefill
+    checkpoint alignment. For the same reason a phase that the plan collects is refused when it has no batch limit and
+    the deployments hold different ``max_batch_size`` values: one list would leave out the larger points of one of them.
+    A phase that the plan does not collect is never measured, and its points take the smallest value. The capacity rule
+    takes the smallest capacity and the largest page among the deployments, and each point takes the most blocks that
+    the groups of one deployment give it.
     """
     memories = [deployment.resources.runtime_memory for deployment in deployments]
     hash_blocks = {None if memory is None else memory.hash_block_size_tokens for memory in memories}
@@ -242,11 +295,14 @@ def glm_plan_manifest(
     # state group, so a deployment whose groups do not all hold a block takes no internal checkpoint.
     # The plan's one point list serves every cell, so a deployment without an internal checkpoint cannot share it with
     # one that has it.
-    alignments, checkpoint_groups = set(), 0
+    alignments, state_groups = set(), []
     for deployment in deployments:
-        mamba = [group for group in deployment.resources.cache_groups if group.prefill_checkpoint_blocks is not None]
+        groups = deployment.resources.cache_groups
+        mamba = [group for group in groups if group.prefill_checkpoint_blocks is not None]
         holding = [group for group in mamba if group.prefill_checkpoint_blocks == 1]
-        checkpoint_groups = max(checkpoint_groups, len(holding))
+        # The tail ring is a state group without the prefill checkpoint field.
+        rings = sum(group.kind == "state" and group.prefill_checkpoint_blocks is None for group in groups)
+        state_groups.append((rings, len(mamba)))
         if mamba and len(holding) == len(mamba):
             alignments.update(group.prefill_checkpoint_alignment for group in holding)
         else:
@@ -259,25 +315,48 @@ def glm_plan_manifest(
         raise ValueError(
             "GLM-5.3-Flash collection requires one prefill checkpoint alignment across the accepted deployments"
         )
-    prefill_batch_limit = options.max_prefill_batch_size or options.max_num_seqs
-    decode_batch_limit = options.max_decode_batch_size or options.max_num_seqs
-    if prefill_batch_limit is None or decode_batch_limit is None:
-        raise ValueError("GLM-5.3-Flash collection requires --fpm-max-num-seqs or the per-phase batch limits")
+    batch_limits = {}
+    for phase, own in (("prefill", options.max_prefill_batch_size), ("decode", options.max_decode_batch_size)):
+        limit = own or options.max_num_seqs
+        if limit is None:
+            # The runner renders the max_batch_size of each cell's deployment for a phase without a limit. The list is
+            # one list for every deployment, so for deployments of different batch sizes it would leave out the larger
+            # points of one of them.
+            sizes = {deployment.resources.max_batch_size for deployment in deployments}
+            if len(sizes) > 1 and phase in options.workload_kinds:
+                shared = [deployment.tp for deployment in deployments]
+                held = ", ".join(
+                    f"the accepted deployment at TP {deployment.tp}"
+                    + (
+                        f" (DP {deployment.dp}, MoE TP {deployment.moe_tp}, MoE EP {deployment.moe_ep})"
+                        if shared.count(deployment.tp) > 1
+                        else ""
+                    )
+                    + f" holds {deployment.resources.max_batch_size}"
+                    for deployment in deployments
+                )
+                raise ValueError(
+                    "GLM-5.3-Flash collection generates one point list for every deployment, and the request sets no "
+                    f"batch limit for the {phase} cells while the deployments that it selects hold different "
+                    f"max_batch_size values: {held}; select deployments that share one max_batch_size with "
+                    "--fpm-gpu-counts or --fpm-parallel-presets, or probe the runtime again so that the deployments "
+                    "record one max_batch_size"
+                )
+            limit = min(sizes)
+        batch_limits[phase] = limit
+    _require_mamba_hash_block(deployments)
     payload, dropped = glm_points(
         hash_block_size=hash_blocks.pop(),
         token_budget=options.max_prefill_isl,
-        prefill_batch_limit=prefill_batch_limit,
-        decode_batch_limit=decode_batch_limit,
+        prefill_batch_limit=batch_limits["prefill"],
+        decode_batch_limit=batch_limits["decode"],
         measured_context=glm_measured_context(options),
         kv_cache_bytes=min(memory.kv_cache_bytes for memory in memories),
         page_size_bytes=max(
             group.page_size_bytes for deployment in deployments for group in deployment.resources.cache_groups
         ),
-        state_groups=max(
-            sum(group.kind == "state" for group in deployment.resources.cache_groups) for deployment in deployments
-        ),
+        state_groups=state_groups,
         checkpoint_alignment=alignments.pop(),
-        checkpoint_groups=checkpoint_groups,
     )
     _, canonical, digest = _manifest(payload)
     return canonical, digest, json.dumps(dropped, sort_keys=True, separators=(",", ":"))
@@ -350,3 +429,110 @@ def glm_smoke_subset(
         held = "four points" if len(phases) == 2 else f"two {phases[0]} points"
         raise ValueError(f"GLM-5.3-Flash smoke subset requires the generated list to hold its {held}")
     return _manifest({"schema_version": payload["schema_version"], **smoke})
+
+
+def _require_mamba_hash_block(deployments: Sequence[FpmDeploymentProfile]) -> None:
+    """Refuse a deployment whose hash block differs from the block of one of its Mamba groups.
+
+    The producer refuses such a launch when the engine starts. A Mamba group is a cache group with the prefill
+    checkpoint field, which the import writes for a MambaSpec group only. The tail ring is a state group of its own
+    4-token block without that field, so the rule does not read it. A deployment without a hash block is skipped. For a
+    generated list, ``glm_plan_manifest`` refuses it before this rule.
+    """
+    for deployment in deployments:
+        memory = deployment.resources.runtime_memory
+        hash_block = None if memory is None else memory.hash_block_size_tokens
+        if hash_block is None:
+            continue
+        for group in deployment.resources.cache_groups:
+            if group.prefill_checkpoint_blocks is not None and group.block_size_tokens != hash_block:
+                raise ValueError(
+                    "GLM-5.3-Flash collection requires a hash block of the Mamba block size: the accepted profile "
+                    f"holds hash_block_size_tokens={hash_block} and cache group {group.name} holds "
+                    f"block_size_tokens={group.block_size_tokens}; use a profile from a runtime probe at the default "
+                    "prefix-caching settings, which give the hash block the Mamba block size"
+                )
+
+
+def validate_glm_limits(options: FPMCollectionOptions, deployments: Sequence[FpmDeploymentProfile]) -> None:
+    """Refuse a token budget and a hash block of a plan that the producer refuses when the engine starts.
+
+    The rules hold for a generated and for a user list. ``deployments`` are those that get cells. Each phase that the
+    plan collects is checked with the budget that the runner renders for its cells:
+    ``options.prefill_sampling.max_total_prefill_tokens`` for a prefill cell, and for a decode cell
+    ``options.max_num_batched_tokens`` or, with that unset, the ``max_num_tokens`` of its deployment. Each must be a
+    multiple of the producer's chunk alignment. Each deployment's hash block must then be the block of its Mamba groups.
+
+    The text names the source of the value and what to change. A value that equals the token limit that the runtime
+    probe of a deployment with runtime memory recorded needs a new probe, since runtime memory takes only that limit.
+    Otherwise, for an aggregated plan, for a prefill budget that is the shared option and for a decode budget without
+    runtime memory, the text names both options at one value; else it names --fpm-max-prefill-isl. The other limits of
+    the plan, such as the batch limit, still apply to the new value, and a plan that sets neither option can meet the
+    decode text after the prefill text.
+    """
+    rule = "GLM-5.3-Flash collection requires a token budget that is a multiple of 4"
+    recorded = {
+        deployment.resources.max_num_tokens
+        for deployment in deployments
+        if deployment.resources.runtime_memory is not None
+    }
+    probe = (
+        ", the token limit that a runtime probe recorded in the accepted profile; probe the runtime again with a token "
+        "limit that is a multiple of 4"
+    )
+
+    # The value must also stay within the token limit of each deployment that the request selects, whose envelope the
+    # planner checks before memory admission.
+    bound = " within the max_num_tokens of each deployment that the request selects" if deployments else ""
+    shared = f"; set --fpm-max-prefill-isl and --fpm-max-num-batched-tokens to one multiple of 4{bound}"
+
+    phases = options.workload_kinds
+    if "prefill" in phases:
+        budget = options.prefill_sampling.max_total_prefill_tokens
+        if budget % CHUNK_ALIGN:
+            if budget in recorded:
+                remedy = probe
+            elif options.worker_type == "aggregated" or budget == options.max_num_batched_tokens:
+                remedy = shared
+            else:
+                remedy = "; set --fpm-max-prefill-isl to a multiple of 4"
+            raise ValueError(f"{rule}: the prefill cells get a budget of {budget} tokens{remedy}")
+    if "decode" in phases:
+        if options.max_num_batched_tokens is not None:
+            budget = options.max_num_batched_tokens
+            if budget % CHUNK_ALIGN:
+                # Runtime memory requires the option to equal the recorded limit.
+                remedy = probe if recorded else shared
+                raise ValueError(f"{rule}: the decode cells get --fpm-max-num-batched-tokens={budget}{remedy}")
+        else:
+            for deployment in deployments:
+                budget = deployment.resources.max_num_tokens
+                if budget % CHUNK_ALIGN:
+                    remedy = probe if deployment.resources.runtime_memory is not None else shared
+                    raise ValueError(
+                        f"{rule}: the decode cells of the accepted deployment at TP {deployment.tp} get its "
+                        f"resources.max_num_tokens={budget}{remedy}"
+                    )
+    _require_mamba_hash_block(deployments)
+
+
+def validate_glm_layout(topologies: Sequence[ParallelTopology], runtime_version: str | None) -> None:
+    """Refuse a runtime version and a parallel layout that the producer refuses when the engine starts.
+
+    ``runtime_version`` is the vLLM version of the runtime, never a data label. The producer takes the exact version
+    string only, so a local version suffix is another runtime. A plan without a runtime version leaves the version to
+    the producer's gate. The layout rule reads the axes of each topology, not its strategy name: a one-GPU cell has the
+    strategy ``single``.
+    """
+    baseline = BASELINE_VERSIONS["vllm"]
+    if runtime_version is not None and runtime_version != baseline:
+        raise ValueError(
+            f"GLM-5.3-Flash collection supports vLLM {baseline} only, and the runtime of this plan is vLLM "
+            f"{runtime_version!r}"
+        )
+    for topology in topologies:
+        if topology.tp not in TP_SIZES or (topology.pp, topology.dp, topology.moe_ep, topology.cp) != (1, 1, 1, 1):
+            raise ValueError(
+                "GLM-5.3-Flash collection supports pure tensor parallelism only (TP 1, 2, 4 or 8, with DP, PP, CP and "
+                f"expert parallelism 1): request the preset pure_tp. Got {topology.to_dict()}"
+            )

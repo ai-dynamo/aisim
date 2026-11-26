@@ -367,7 +367,8 @@ def _resource_values(resources: dict[str, Any]) -> dict[str, Any]:
 
 
 # Cache group fields that sessions imported before these fields existed did not save. The import of a vLLM 0.33.0
-# record writes prefix_cacheable and no transfer_bytes_per_block.
+# record writes prefix_cacheable, and it writes transfer_bytes_per_block only for the measured cache shape from a
+# probe phase with prefix caching.
 _LATER_GROUP_FIELDS = ("prefix_cacheable", "transfer_bytes_per_block")
 # The runtime memory field that such sessions did not save. The import of a vLLM 0.33.0 record writes it.
 _LATER_MEMORY_FIELDS = ("runtime_framework_version",)
@@ -445,6 +446,13 @@ def _request_launch(request: SupportRequest, launch: dict[str, Any]) -> dict[str
             result["collection"].pop(field, None)
         else:
             result["collection"][field] = value
+    if "warmup_iterations" in result["collection"]:
+        from collector.fpm_forward.config import FPM_WARMUP_ITERATIONS
+
+        # A launch holds the count that the probe ran with: normalize_probe_launch writes the collector default
+        # when the request names none. So None compares as that default and never removes the field.
+        warmup = request.collection.warmup_iterations
+        result["collection"]["warmup_iterations"] = FPM_WARMUP_ITERATIONS if warmup is None else warmup
     return result
 
 
@@ -746,8 +754,11 @@ def verify_collection_runtime(
 
     if geometry(source["provenance"]) != geometry(result["provenance"]):
         raise ValueError("formal runtime cache group geometry differs from the accepted probe")
-    expected = _resource_values(source["resources"])
-    actual = _resource_values(result["resources"])
+    # Both imports compare in the fields of the saved probe resources. A session saved before a later cache group
+    # field existed, such as transfer_bytes_per_block, is compared without that field, as it was then.
+    saved = manifest["observed_resources"]
+    expected = as_saved_resources(saved, _resource_values(source["resources"]))
+    actual = as_saved_resources(saved, _resource_values(result["resources"]))
     expected["runtime_memory"].pop("kv_cache_bytes")
     capacity = actual["runtime_memory"].pop("kv_cache_bytes")
     if actual != expected:
@@ -1039,6 +1050,18 @@ def import_observations(
             reason = json.loads(request.fpm_profile.provenance).get("cache_layout_reason")
             if reason is not None:
                 results[name]["cache_layout_reason"] = reason
+            # Without a typed layout claim the profile stays grouped; name the linear form when one is exact.
+            linear = linear_runtime_resources(result["resources"])
+            if linear is not None and not {"cache_layout", "kv_bytes_per_token", "cache_groups"} & set(overrides):
+                results[name]["linear_layout_hint"] = (
+                    "a linear layout describes this measurement exactly "
+                    f"(kv_bytes_per_token={linear['kv_bytes_per_token']}); to get a linear profile, add "
+                    "cache_layout: linear to inputs.resource_overrides of this configuration in the checkpoint and "
+                    "run onboard import-observations again into a fresh --output-dir"
+                )
+            # Keep the reason when the probe could not establish the connector transfer bytes.
+            if "transfer_bytes_reason" in result:
+                results[name]["transfer_bytes_reason"] = result["transfer_bytes_reason"]
     state, _ = save_checkpoint(
         checkpoint, patch={"configurations": patches}, expected_revision=state.revision, accept=[]
     )
@@ -1068,7 +1091,7 @@ def run_runtime_command(args: argparse.Namespace) -> int:
     names = _selected(state, args.configuration)
     output = _new_root(args.output_dir, checkpoint, fresh=False)
     overrides = {key: getattr(args, key) for key in FPMDeployment.model_fields if getattr(args, key, None) is not None}
-    launches, failed = {}, {}
+    launches, failed, detected = {}, {}, {}
     for name in names:
         try:
             _, launches[name], _ = checkpoint_launch(
@@ -1084,8 +1107,13 @@ def run_runtime_command(args: argparse.Namespace) -> int:
 
                 observed = detect_runtime_versions(FPMDeployment.model_validate(launches[name]["deployment"]))
                 actual = observed["backend_version"]
+                detected[name] = actual
                 # Preserve old numeric launch identities when observation agrees.
                 # Custom labels carry a separate runtime pin into instrumentation.
+                # The detected version also goes to the probe beside the launches.
+                # The probe reads it when the launch identity holds no runtime
+                # version and no bundle exists for the requested version, and it
+                # compares it with the instrumentation version before any launch.
                 if actual != launches[name]["identity"].get("framework_version"):
                     launches[name]["identity"]["runtime_framework_version"] = actual
                 if launches[name]["identity"].get("framework_version") is None:
@@ -1096,7 +1124,12 @@ def run_runtime_command(args: argparse.Namespace) -> int:
             failed[name] = {"status": "incomplete", "diagnostics": [str(exc)]}
     result = (
         probe_runtime(
-            launches, instrumentation=args.instrumentation, output_dir=output, execute=args.execute, resume=args.resume
+            launches,
+            instrumentation=args.instrumentation,
+            output_dir=output,
+            execute=args.execute,
+            resume=args.resume,
+            detected_versions=detected,
         )
         if launches
         else {"status": "failed", "configurations": {}}
