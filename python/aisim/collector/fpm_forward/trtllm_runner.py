@@ -217,7 +217,7 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
     url = f"http://127.0.0.1:{http}"
     script = Path(__file__).with_name("trtllm_serve.py").resolve()
     mounts = (root.parent.parent, snapshot, bindings, script.parent)
-    engine_env = os.environ | {
+    engine_env = {
         "HF_HUB_OFFLINE": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONPATH": os.pathsep.join((str(bundle), str(bindings))),
@@ -246,6 +246,9 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
         "--container-workdir=/tmp",
         "env",
         "TMPDIR=/tmp",
+        # Pyxis can keep image defaults for environment variables like
+        # PYTHONPATH. Apply these assignments inside the container.
+        *(f"{key}={value}" for key, value in engine_env.items()),
         "python3",
         # The collector directory contains types.py. Safe-path mode prevents
         # the script directory from shadowing Python's standard library.
@@ -263,7 +266,7 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
     ]
     _save(raw / "launch.json", {"command": launch, "observer_enabled": enabled})
     with ExitStack() as stack:
-        engine = stack.enter_context(_process(launch, raw / "engine.log", engine_env))
+        engine = stack.enter_context(_process(launch, raw / "engine.log", os.environ))
         frontend = stack.enter_context(
             _process(
                 [str(sidecar_python), "-m", "dynamo.frontend", "--http-host", "127.0.0.1"],
