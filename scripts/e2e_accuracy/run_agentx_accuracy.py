@@ -22,9 +22,11 @@ from scripts.e2e_accuracy.agentx_contract import (
     INDEX,
     SUMMARY_SCHEMA,
     canonical,
+    detail_path,
     digest,
     driver_digest,
     native_completion_qualified,
+    result_key,
     score,
     validate_catalog,
     validate_public,
@@ -40,6 +42,9 @@ from scripts.e2e_accuracy.agentx_inputs import (
     replay_config,
     safe_path,
 )
+from scripts.e2e_accuracy.agentx_learned import LEARNED, OP_LEVEL, STEP_CAPTURES, score_steps
+from scripts.e2e_accuracy.agentx_learned import artifacts as learned_artifacts
+from scripts.e2e_accuracy.agentx_metrics import request_metrics
 from scripts.e2e_accuracy.simulation_features import compare_speculation
 from scripts.e2e_accuracy.simulation_features import unavailable as unavailable_features
 from scripts.e2e_accuracy.simulation_features import validate as validate_simulation
@@ -367,14 +372,57 @@ def public_report(payload, observations, category, boundary="complete_finite_coh
     )
 
 
-def run_one(root, run, directory, timeout, context):
+def performance_models(run):
+    """Op-based for every run; the learned FPM only where pinned step captures exist."""
+    return (OP_LEVEL, LEARNED) if run["model"] in STEP_CAPTURES else (OP_LEVEL,)
+
+
+def apply_performance_model(config, performance_model, artifact_path=None):
+    """Price every aggregated step with one estimator; the learned FPM is frozen, never adapted online."""
+    if performance_model == OP_LEVEL:
+        return config
+    if performance_model != LEARNED or artifact_path is None:
+        raise ValueError(f"Unsupported AgentX performance model: {performance_model}")
+    config["engine"]["workers"]["aggregated"]["timing"] = {
+        "type": "default",
+        "estimation_mode": LEARNED,
+        "fallback_policy": "deny",
+        "estimator_config": {
+            "fpm_learned": {"artifact_path": str(artifact_path), "adaptation": "frozen"},
+            "correction": {"enabled": False},
+        },
+    }
+    return config
+
+
+def compiled_deployment(directory):
+    path = directory / "compiled-replay.json"
+    return read(path)["backend_deployment"] if path.exists() else None
+
+
+def cpu_overhead(deployment):
+    """Replay's effective pre-first-token CPU terms: the queued tokenizer and the unqueued fixed delay."""
+    if deployment is None:
+        return None
+    tokenization, extra = deployment.get("tokenization"), deployment.get("extra_cpu_overhead")
+    return {
+        "tokenization": None
+        if not tokenization
+        else {key: tokenization.get(key) for key in ("workers", "base_ms", "per_input_token_ms")},
+        "extra_cpu_overhead": None if not extra else {key: extra.get(key) for key in ("base_ms", "per_input_token_ms")},
+    }
+
+
+def run_one(root, run, directory, timeout, context, performance_model=OP_LEVEL, learned=None, workdir=None):
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "feature-context.json").write_bytes(canonical(context))
     observations = read(artifact(root, run, "observations"))
     if sum(r["phase"] == "profile" for r in observations) != run["measured_requests"]:
         raise ValueError("Measured cohort count mismatch")
     trace = prepare_trace(root, run, directory)
-    config = replay_config(root, run)
+    config = apply_performance_model(
+        replay_config(root, run), performance_model, learned["replay"] if learned else None
+    )
     config["traffic"]["source"]["paths"] = [str(trace.resolve())]
     config_path = directory / "input-config.json"
     config_path.write_bytes(canonical(config))
@@ -431,8 +479,19 @@ def run_one(root, run, directory, timeout, context):
             outcome["outcome"] == "completed",
         )
     worker = config["engine"]["workers"]["aggregated"]
+    deployment = compiled_deployment(directory)
+    timing = deployment["agg_engine_args"]["timing_model"]["config"] if deployment else None
+    if timing is not None and timing["estimation_mode"] != performance_model:
+        raise ValueError("Compiled replay timing differs from the requested performance model")
+    step = None
+    if timing is not None and workdir is not None:
+        if performance_model == LEARNED:
+            # Step error is held out: the seed-42 model prices the seed-7 steps.
+            timing = json.loads(json.dumps(timing))
+            timing["estimator_config"]["fpm_learned"]["artifact_path"] = str(learned["held_out"])
+        step = score_steps(run["model"], run["lanes"], timing, workdir)
     settings = {
-        "Estimation": "op_level",
+        "Estimation": performance_model,
         "Timing correction": False,
         "Context length": config["engine"].get("context_length"),
         "Maximum batched tokens": worker["scheduler"].get("max_batched_tokens"),
@@ -452,6 +511,16 @@ def run_one(root, run, directory, timeout, context):
         "cache_alignment": cache_alignment,
         "report": report,
         "op_data": outcome.get("op_data", []),
+        "performance_model": performance_model,
+        "accuracy_metrics": {
+            **(
+                request_metrics(scores["pairs"])
+                if outcome["outcome"] == "completed"
+                else dict.fromkeys(("tpot_ms", "ttft_ms"))
+            ),
+            "step": step,
+        },
+        "cpu_overhead": cpu_overhead(deployment),
     }
     if "feature_metadata" in run["artifacts"]:
         result["feature_metadata"] = read(artifact(root, run, "feature_metadata"))
@@ -495,20 +564,29 @@ def campaign(args):
         run for index, run in enumerate(load_runs(args.inputs, catalog)) if index % args.shard_count == args.shard_index
     ]
     evaluated_driver = driver_digest()
-    results = [
-        run_one(
-            args.inputs,
-            run,
-            args.output / run["id"],
-            args.point_timeout,
-            {
-                "benchmark_id": run["id"],
-                "evaluated_revision": args.commit,
-                "dataset_revision": args.revision,
-            },
-        )
-        for run in selected
-    ]
+    workdir = args.output / "learned"
+    trained = {}
+    results = []
+    for run in selected:
+        for performance_model in performance_models(run):
+            if performance_model == LEARNED and run["model"] not in trained:
+                trained[run["model"]] = learned_artifacts(run["model"], workdir)
+            results.append(
+                run_one(
+                    args.inputs,
+                    run,
+                    args.output / run["id"] / performance_model,
+                    args.point_timeout,
+                    {
+                        "benchmark_id": run["id"],
+                        "evaluated_revision": args.commit,
+                        "dataset_revision": args.revision,
+                    },
+                    performance_model,
+                    trained.get(run["model"]),
+                    workdir,
+                )
+            )
     snapshot = {
         "branch": args.branch,
         "commit_sha": args.commit,
@@ -537,7 +615,10 @@ def qualify(args):
             raise ValueError("AgentX shards evaluated different revisions")
         snapshot = shard["snapshot"]
         runs.extend(shard["runs"])
-    if len({r["id"] for r in runs}) != len(runs) or {r["id"] for r in runs} != {r["id"] for r in catalog["runs"]}:
+    sources = {r["id"]: r for r in load_runs(args.inputs, catalog)}
+    expected = {(run["id"], model) for run in sources.values() for model in performance_models(run)}
+    keys = [result_key(r) for r in runs]
+    if len(set(keys)) != len(keys) or set(keys) != expected:
         raise ValueError("Incomplete or duplicate AgentX cohort")
     if snapshot["driver_sha256"] != driver_digest():
         raise ValueError("AgentX qualification driver differs from replay driver")
@@ -556,7 +637,6 @@ def qualify(args):
     snapshot["completed_at"] = datetime.now(UTC).isoformat()
     args.output.mkdir(parents=True, exist_ok=True)
     summaries = []
-    sources = {r["id"]: r for r in load_runs(args.inputs, catalog)}
     for run in runs:
         validate_result(run)
         features = run.get("simulation_features")
@@ -580,7 +660,7 @@ def qualify(args):
             raise ValueError("Result identity differs from the reviewed catalog")
         if "feature_metadata" in run and run["feature_metadata"] != document(args.inputs, source, "feature_metadata"):
             raise ValueError("Result silicon features differ from retained evidence")
-        relative = "details/" + run["id"] + ".json"
+        relative = detail_path(run)
         detail = {"schema": SUMMARY_SCHEMA, "snapshot": snapshot, **run}
         target = args.output / relative
         target.parent.mkdir(parents=True, exist_ok=True)

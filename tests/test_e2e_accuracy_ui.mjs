@@ -1305,7 +1305,8 @@ test("AgentX performance-model labels use recorded estimator and prediction data
   const label=runs=>{context.runs=runs;return vm.runInContext("window.AgentX.performanceModel(runs)",context);};
   const run={backend:"vllm",measured_backend_version:"0.30.0",prediction_backend_version:"0.31.0",config_summary:[{name:"Estimation",value:"op_level"}]};
   assert.equal(label([run,run]),"Op-based perf model (vllm 0.31.0)");
-  assert.equal(vm.runInContext("window.AgentX.performanceModel(runs,true)",context),"Op-based (vllm 0.31.0)");
+  assert.equal(vm.runInContext("window.AgentX.performanceModel(runs,true)",context),"Op-based");
+  assert.equal(label([{...run,performance_model:"fpm_learned",config_summary:[{name:"Estimation",value:"fpm_learned"}]}]),"Learned FPM perf model (vllm 0.31.0)");
   assert.equal(label([{...run,config_summary:[]}]),"Unrecorded perf model (vllm 0.31.0)");
   assert.equal(label([{...run,prediction_backend_version:null}]),"Op-based perf model (vllm version unrecorded)");
   const regression={...run,config_summary:[{name:"Estimation",value:"fpm_regression"}]};
@@ -1355,4 +1356,25 @@ test("summary version readers reject unknown and mixed field contracts", () => {
     app.set("input", input);
     assert.throws(() => app.run("validateSummary(input)"), /unexpected field/);
   }
+});
+
+
+test("AgentX agreed metrics pool steps exactly and average request errors over runs", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const request=(e2e,se,n,excluded=0)=>({n,excluded,e2e,e2e_se:se,quantile:e2e/2,quantile_se:se});
+  const step=(n,sum,sq)=>({n,sum_ape:sum,sum_sq_ape:sq});
+  const run=(e2e,se,steps)=>({accuracy_metrics:{tpot_ms:request(e2e,se,10,1),ttft_ms:request(e2e*2,se,10),step:{seed:7,dropped_unattributed:2,decode:steps,prefill:step(0,0,0)}}});
+  context.runs=[run(10,3,step(2,4,10)),run(20,4,step(2,8,34))];
+  const {request:agg,steps}=vm.runInContext("({request:window.AgentX.requestAggregate(runs),steps:window.AgentX.stepAggregate(runs)})",context);
+  assert.equal(agg["tpot_ms/e2e"].v,15);
+  assert.equal(agg["tpot_ms/e2e"].se,2.5);
+  assert.equal(agg["tpot_ms/e2e"].req,20);
+  assert.equal(agg.excluded,2);
+  // Pooled APEs 1,3,3,5: mean 3, sample variance 8/3.
+  assert.equal(steps.decode.mape,3);
+  assert.ok(Math.abs(steps.decode.se-Math.sqrt(8/3/4))<1e-12);
+  assert.equal(steps.decode.n,4);
+  assert.equal(steps.prefill,null);
+  assert.equal(steps.dropped,4);
 });

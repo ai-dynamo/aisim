@@ -29,31 +29,67 @@ window.AgentX = (() => {
     return {...values,point_errors:Object.fromEntries(metrics.map(m => [m,avg(runs.map(r => r.point_errors[m]))])),point_counts:Object.fromEntries(metrics.map(m=>[m,runs.filter(r=>finite(r.point_errors[m])).length])),request_errors,coverage};
   }
 
+  const performanceNames={op_level:"Op-based",fpm_learned:"Learned FPM",fpm_interpolation:"FPM interpolation",fpm_regression:"FPM regression"};
+  const estimationOf=run=>run.performance_model||run.config_summary?.find(item=>item.name==="Estimation")?.value;
   function performanceModel(runs, compact=false) {
     return [...new Set(runs.map(run => {
-      const estimation=run.config_summary?.find(item=>item.name==="Estimation")?.value;
-      const name={op_level:"Op-based",fpm_interpolation:"FPM interpolation",fpm_regression:"FPM regression"}[estimation] || estimation || "Unrecorded";
-      return `${name}${compact?"":" perf model"} (${run.backend} ${run.prediction_backend_version || "version unrecorded"})`;
+      const estimation=estimationOf(run), name=performanceNames[estimation] || estimation || "Unrecorded";
+      return compact?name:`${name} perf model (${run.backend} ${run.prediction_backend_version || "version unrecorded"})`;
     }))].join("; ");
   }
-
-  function cells(result) {
-    return metrics.map(m => `<td>${fmt(result.point_errors[m])}<small>n=${result.point_counts[m]} run${result.point_counts[m]===1?"":"s"}</small></td>`).join("") +
-      ["tpot_ms","ttft_ms"].map(m => `<td title="${result.request_errors[m].count} scored requests">${fmt(result.request_errors[m].mape)}<small>n=${result.request_errors[m].count.toLocaleString()}</small></td>`).join("") +
-      `<td>${(result.coverage.matched || 0).toLocaleString()} / ${(result.coverage.measured || 0).toLocaleString()}</td>`;
+  const performanceClass=runs=>runs.some(r=>estimationOf(r)==="fpm_learned")?"agentx-learned":"agentx-op";
+  const REQUEST_METRICS=[["tpot_ms","e2e"],["ttft_ms","e2e"],["tpot_ms","quantile"],["ttft_ms","quantile"]];
+  function cpuOverhead(run){
+    const c=run.cpu_overhead;if(!c)return "—";
+    const us=v=>finite(v)?String(Math.round(v*1e6)/1e3):"?";
+    const t=c.tokenization,x=c.extra_cpu_overhead;
+    const tok=t?`Tokenizer (queued, ${t.workers} worker${t.workers===1?"":"s"}): ${t.base_ms?t.base_ms+" ms + ":""}${us(t.per_input_token_ms)} µs/token`:"Tokenizer (queued): none";
+    const ext=x?`Unqueued: ${x.base_ms} ms + ${us(x.per_input_token_ms)} µs/token`:"Unqueued: none measured";
+    return `<span class="agentx-cpu">${esc(tok)}</span><span class="agentx-cpu">${esc(ext)}</span>`;
+  }
+  function specDec(run){
+    const f=(run.simulation_features?.roles||[]).flatMap(r=>r.features).find(x=>x.id==="speculation");
+    const m=f?.parameters?.method;
+    if(!m||m==="off"||f.state!=="enabled")return "None";
+    const d=f.parameters.draft_length;
+    return `${esc(m.toUpperCase())}${d?`<small>${esc(d)} draft tokens</small>`:""}`;
+  }
+  // Request metrics: equal-weight mean over runs; stderr sqrt(sum se²)/n. Steps: pooled sums over runs.
+  function requestAggregate(runs){
+    const out={};
+    for(const [m,k] of REQUEST_METRICS){
+      const rows=runs.map(r=>r.accuracy_metrics?.[m]).filter(x=>x&&finite(x[k]));
+      const n=rows.length;
+      out[m+"/"+k]=n?{v:rows.reduce((s,r)=>s+r[k],0)/n,se:rows.every(r=>finite(r[k+"_se"]))?Math.sqrt(rows.reduce((s,r)=>s+r[k+"_se"]**2,0))/n:null,req:rows.reduce((s,r)=>s+r.n,0),runs:n}:null;
+    }
+    out.excluded=runs.reduce((s,r)=>s+(r.accuracy_metrics?.tpot_ms?.excluded||0),0);
+    return out;
+  }
+  function stepAggregate(runs){
+    const steps=runs.map(r=>r.accuracy_metrics?.step).filter(Boolean);
+    const out={dropped:steps.reduce((s,x)=>s+x.dropped_unattributed,0)};
+    for(const kind of ["decode","prefill"]){
+      const n=steps.reduce((s,x)=>s+x[kind].n,0),sum=steps.reduce((s,x)=>s+x[kind].sum_ape,0),sq=steps.reduce((s,x)=>s+x[kind].sum_sq_ape,0);
+      out[kind]=n>1?{mape:sum/n,se:Math.sqrt(Math.max(sq-n*(sum/n)**2,0)/(n-1)/n),n}:null;
+    }
+    return out;
+  }
+  const errorText=(v,se,digits=1)=>`${v.toFixed(digits)}%${finite(se)?` <span class="agentx-se">± ${se.toFixed(digits)}</span>`:""}`;
+  function cells(runs){
+    const a=requestAggregate(runs),step=stepAggregate(runs);
+    const sc=k=>{const x=step[k];return x?`<td class="agentx-metric">${errorText(x.mape,x.se)}<small>n=${x.n.toLocaleString()} steps</small></td>`:'<td class="agentx-metric">—</td>';};
+    return sc("decode")+sc("prefill")+REQUEST_METRICS.map(([m,k])=>{const x=a[m+"/"+k];return x?`<td class="agentx-metric">${errorText(x.v,x.se)}<small>n=${x.req.toLocaleString()} req${x.runs>1?` · ${x.runs} runs`:""}${m==="tpot_ms"&&k==="e2e"&&a.excluded?` · ${a.excluded} excluded &lt;1 ms`:""}</small></td>`:'<td class="agentx-metric">—</td>';}).join("");
+  }
+  function metricsTable(runs){
+    const a=requestAggregate(runs),st=stepAggregate(runs);
+    const srow=(k,label)=>{const x=st[k];return x?`<tr data-metric="step-${k}"><th scope="row">${label}</th><td>${x.mape.toFixed(2)}%</td><td>± ${x.se.toFixed(2)}%</td><td class="agentx-samples">${x.n.toLocaleString()} steps</td></tr>`:"";};
+    const row=(m,k,label)=>{const x=a[m+"/"+k];return x?`<tr data-metric="${k}-${m}"><th scope="row">${label}</th><td>${x.v.toFixed(2)}%</td><td>${finite(x.se)?`± ${x.se.toFixed(2)}%`:"—"}</td><td class="agentx-samples">${x.req.toLocaleString()} requests</td></tr>`:"";};
+    return `<h3 class="agentx-metrics-title">Accuracy metrics (unsigned)</h3><div class="table-scroll"><table class="agentx-summary-table agentx-metrics-table"><thead><tr><th scope="col">Metric</th><th scope="col">Error</th><th scope="col">Stderr</th><th scope="col" class="agentx-samples">Samples</th></tr></thead><tbody>${srow("decode","Step error, decode (held-out steps)")}${srow("prefill","Step error, prefill (held-out steps)")}${row("tpot_ms","e2e","TPOT e2e error (request-average)")}${row("ttft_ms","e2e","TTFT e2e error (request-average)")}${row("tpot_ms","quantile","TPOT per-request quantile error, p5–p95")}${row("ttft_ms","quantile","TTFT per-request quantile error, p5–p95")}</tbody></table></div><p class="agentx-summary-note">Closed-loop replay; matched requests only. Silicon requests with TPOT under 1 ms (burst delivery) are excluded from TPOT: ${a.excluded} here.${st.dropped?` ${st.dropped.toLocaleString()} held-out steps are dropped because SGLang recorded their target forward on the adjacent record.`:""} Request-metric stderr is a 1,000-resample bootstrap over requests; step stderr is std/√n over steps.</p>`;
   }
   function comparisonRows(result) {
-    return [
-      ["point","tpot_ms","TPOT","ms/token"],
-      ["point","ttft_ms","TTFT","ms"],
-      ["point","output_tokens_s","Output throughput","output tokens/s"],
-      ["request","ttft_ms","TTFT","ms"],
-      ["request","tpot_ms","TPOT","ms/token"],
-    ].map(([scope,metric,label,unit])=>{
-      const request=scope==="request",values=request?result.request_errors[metric]:null;
-      const count=request?values.count:result.point_counts[metric];
-      const samples=`${count.toLocaleString()} ${request?"request":"run"}${count===1?"":"s"}`;
-      return `<tr data-metric="${scope}-${metric}"${request&&metric==="ttft_ms"?' class="agentx-request-start"':""}><th scope="row">${request?"Request":"Point"} ${label}<small>${unit}</small></th><td>${fmt(request?values.silicon:result.silicon[metric],"")}</td><td>${fmt(request?values.prediction:result.prediction[metric],"")}</td><td class="agentx-error"><strong>${fmt(request?values.mape:result.point_errors[metric])}</strong><small>${request?"MAPE":"Mean point error"}</small><small class="agentx-inline-count">${samples}</small></td><td class="agentx-samples">${samples}</td></tr>`;
+    return [["tpot_ms","TPOT","ms/token"],["ttft_ms","TTFT","ms"],["output_tokens_s","Output throughput","output tokens/s"]].map(([metric,label,unit])=>{
+      const count=result.point_counts[metric], samples=`${count.toLocaleString()} run${count===1?"":"s"}`;
+      return `<tr data-metric="point-${metric}"><th scope="row">Point ${label}<small>${unit}</small></th><td>${fmt(result.silicon[metric],"")}</td><td>${fmt(result.prediction[metric],"")}</td><td class="agentx-error"><strong>${fmt(result.point_errors[metric])}</strong><small>Mean point error</small><small class="agentx-inline-count">${samples}</small></td><td class="agentx-samples">${samples}</td></tr>`;
     }).join("");
   }
   const benchmarkFeatureLabels = {
@@ -113,11 +149,10 @@ window.AgentX = (() => {
     }).join("");
     return `<aside class="agentx-features" aria-labelledby="agentx-features-title"><div class="agentx-features-heading"><h2 id="agentx-features-title">Feature Parity</h2><a href="../../feature-support-matrix/#agentx">Support matrix ↗</a></div><p class="agentx-feature-scope">Selected run</p><table class="agentx-feature-table" aria-label="Selected run feature settings"><thead><tr><th scope="col">Feature</th><th scope="col">Silicon</th><th scope="col">AISim</th></tr></thead><tbody>${rows}</tbody></table>${point.feature_dataset_revision?`<p class="agentx-feature-revision">🤗 Feature evidence · <code title="${esc(point.feature_dataset_revision)}">${esc(point.feature_dataset_revision.slice(0,12))}</code></p>`:""}</aside>`;
   }
-  const pointDefinition = `<p><strong>Per-point:</strong> compare the aggregate result across the benchmark’s conversation requests.</p><p><strong>Request average:</strong> compare requests individually, then average their errors.</p><p>Tool-call waits are excluded from TTFT/TPOT calculations. Point error can be smaller because over- and under-predictions cancel when averaged.</p>`;
   const pointHelp = `<button type="button" id="agentx-point-info" class="agentx-info" aria-label="About point TTFT and TPOT error" aria-describedby="agentx-point-tooltip"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 7v4"/><circle cx="8" cy="4.5" r="0.6" fill="currentColor" stroke="none"/></svg></button>`;
-  const headings = `<tr><th scope="col">Model / concurrency</th><th scope="col">Hardware / backend</th><th scope="col">Performance model</th><th scope="col">${pointHelp} Point TPOT error</th><th scope="col">Point TTFT error</th><th scope="col">Point output-throughput error</th><th scope="col">Request TPOT MAPE</th><th scope="col">Request TTFT MAPE</th><th scope="col">Matched / measured</th></tr>`;
-  function bindPointHelp(target) {
-    const button=target.querySelector("#agentx-point-info"), tooltip=target.querySelector("#agentx-point-tooltip");
+  const headings = `<tr><th scope="col" rowspan="2">Model / concurrency</th><th scope="col" rowspan="2">SpecDec</th><th scope="col" rowspan="2">Hardware / backend</th><th scope="col" rowspan="2">Performance model</th><th scope="col" rowspan="2">CPU overhead</th><th scope="colgroup" colspan="2" class="agentx-group"><button type="button" id="agentx-step-info" class="agentx-info" aria-label="About step error" aria-describedby="agentx-step-tooltip"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 7v4"/><circle cx="8" cy="4.5" r="0.6" fill="currentColor" stroke="none"/></svg></button> Step error</th><th scope="colgroup" colspan="2" class="agentx-group">${pointHelp} e2e error</th><th scope="colgroup" colspan="2" class="agentx-group"><button type="button" id="agentx-quantile-info" class="agentx-info" aria-label="About per-request quantile error" aria-describedby="agentx-quantile-tooltip"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 7v4"/><circle cx="8" cy="4.5" r="0.6" fill="currentColor" stroke="none"/></svg></button> Per-request quantile error (p5–p95)</th></tr><tr><th scope="col" class="agentx-sub">Decode</th><th scope="col" class="agentx-sub">Prefill</th><th scope="col" class="agentx-sub">TPOT</th><th scope="col" class="agentx-sub">TTFT</th><th scope="col" class="agentx-sub">TPOT</th><th scope="col" class="agentx-sub">TTFT</th></tr>`;
+  function bindPointHelp(target, b="#agentx-point-info", t="#agentx-point-tooltip") {
+    const button=target.querySelector(b), tooltip=target.querySelector(t);
     let timer;
     const hide=()=>{clearTimeout(timer);if(tooltip.matches(":popover-open"))tooltip.hidePopover();};
     const show=()=>{
@@ -145,7 +180,7 @@ window.AgentX = (() => {
       "AISim self-collected dataset: coming soon"; // TODO: link the public self-collected E2E HF dataset after migration.
   }
   function pointUrl(run, branch) {
-    const params = new URLSearchParams({branch,category:run.category,model:run.model,lanes:run.lanes});
+    const params = new URLSearchParams({branch,category:run.category,model:run.model,lanes:run.lanes,perf:estimationOf(run)||""});
     const campaign=new URL(location.href).searchParams.get("campaign");
     if(campaign) params.set("campaign",campaign);
     return `./agentx/point.html?${params}#view=point&stage=profile&variant=observed`;
@@ -204,15 +239,15 @@ window.AgentX = (() => {
       const activeUrl=new URL(location.href);activeUrl.searchParams.delete("campaign");
       target.innerHTML = `<p class="evidence-brief">${esc(branch)} · evaluated ${esc(data.snapshot.commit_sha.slice(0,12))} · ${esc(data.snapshot.completed_at)}${entry.last_update?.status === "failed" ? " · Update failed; showing previous results" : ""}${data.snapshot.preview ? " · Preview" : ""}${data.snapshot.measurement_campaign_status==="partial" ? " · Partial silicon campaign: only retained profiles are shown; remaining profiles did not qualify. Unscored dataset archive; not eligible for promotion." : ""}</p>` +
         (archived?`<p class="agentx-beta">Archived finite campaign. <a href="${esc(activeUrl)}">View current campaign ↗</a></p>`:"")+
-        `<div class="table-scroll"><table class="agentx-table"><thead>${headings}</thead><tbody>${[...new Set(data.runs.map(r=>JSON.stringify([r.category,r.model,r.hardware,r.backend,r.precision,r.tensor_parallel])))].map((key,index) => {
-          const points=data.runs.filter(r=>JSON.stringify([r.category,r.model,r.hardware,r.backend,r.precision,r.tensor_parallel])===key), first=points[0], id=`ax-model-${index}`;
-          return `<tr class="agentx-model"><th><button type="button" data-agentx-expand="${id}" aria-expanded="true">▾ ${esc(first.model)}</button><small class="source-tag">${first.category==="agentx"?"AgentX official":"Self-collected"}</small></th><td>${esc(first.hardware)} · ${[...new Set(points.map(r=>`${r.backend} ${r.measured_backend_version || "version unrecorded"}`))].map(esc).join(", ")}<small>${esc(first.precision)} · TP${first.tensor_parallel}</small></td><td class="agentx-perf-model">${esc(performanceModel(points,true))}</td>${cells(aggregate(points))}</tr>` +
+        `<div class="table-scroll"><table class="agentx-table"><thead>${headings}</thead><tbody>${[...new Set(data.runs.map(r=>JSON.stringify([r.category,r.model,r.hardware,r.backend,r.precision,r.tensor_parallel,performanceModel([r],true)])))].map((key,index) => {
+          const points=data.runs.filter(r=>JSON.stringify([r.category,r.model,r.hardware,r.backend,r.precision,r.tensor_parallel,performanceModel([r],true)])===key), first=points[0], id=`ax-model-${index}`;
+          return `<tr class="agentx-model ${performanceClass(points)}"><th><button type="button" data-agentx-expand="${id}" aria-expanded="false">▸ ${esc(first.model)}</button><small class="source-tag">${first.category==="agentx"?"AgentX official":"Self-collected"}</small></th><td>${specDec(first)}</td><td>${esc(first.hardware)} · ${[...new Set(points.map(r=>`${r.backend} ${r.measured_backend_version || "version unrecorded"}`))].map(esc).join(", ")}<small>${esc(first.precision)} · TP${first.tensor_parallel}</small></td><td class="agentx-perf-model">${esc(performanceModel(points,true))}</td><td>${cpuOverhead(first)}</td>${cells(points)}</tr>` +
             [...new Set(points.map(r=>r.lanes))].sort((a,b)=>a-b).map(lanes=>{
               const matches=points.filter(r=>r.lanes===lanes), point=matches[0], failed=matches.filter(r=>r.outcome!=="completed").length;
-              return `<tr data-agentx-parent="${id}" data-agentx-href="${esc(pointUrl(point,branch))}" tabindex="0" aria-label="${lanes} lanes: open details"><th><a href="${esc(pointUrl(point,branch))}">${lanes} lane${lanes===1?"":"s"} ↗</a><small>${matches.length} run${matches.length===1?"":"s"}${failed?` · ${failed} unavailable`:""}</small></th><td>${source(point)}</td><td class="agentx-perf-model">${esc(performanceModel(matches,true))}</td>${cells(aggregate(matches))}</tr>`;
+              return `<tr hidden class="${performanceClass(points)}" data-agentx-parent="${id}" data-agentx-href="${esc(pointUrl(point,branch))}" tabindex="0" aria-label="${lanes} lanes: open details"><th><a href="${esc(pointUrl(point,branch))}">${lanes} lane${lanes===1?"":"s"} ↗</a><small>${matches.length} run${matches.length===1?"":"s"}${failed?` · ${failed} unavailable`:""}</small></th><td>${specDec(point)}</td><td>${source(point)}</td><td class="agentx-perf-model">${esc(performanceModel(matches,true))}</td><td>${cpuOverhead(point)}</td>${cells(matches)}</tr>`;
             }).join("");
-        }).join("")}</tbody></table></div><div id="agentx-point-tooltip" role="tooltip" popover>${pointDefinition}</div><details class="agentx-method"><summary>Metrics and provenance</summary>${methodology()}${provenance(data.snapshot,data.runs)}</details>`;
-      bindPointHelp(target);
+        }).join("")}</tbody></table></div><div id="agentx-point-tooltip" role="tooltip" popover><p><strong>e2e error</strong> compares mean latency over the matched requests: |mean AISim / mean silicon − 1|.</p><p>It is unsigned. ± is the bootstrap standard error over 1,000 request resamples. For TPOT, silicon requests under 1 ms (burst delivery) are excluded.</p></div><div id="agentx-quantile-tooltip" class="agentx-tooltip" role="tooltip" popover><p><strong>Per-request quantile error</strong> compares the distributions of per-request latency. At each percentile p5, p10, …, p95 it takes |AISim percentile / silicon percentile − 1|, then averages the 19 values.</p><p>It is unsigned. ± is the bootstrap standard error. A low per-request quantile error with a high e2e error means the shape matches, but a few tail requests pull the mean.</p></div><div id="agentx-step-tooltip" class="agentx-tooltip" role="tooltip" popover><p><strong>Step error</strong> is the forward-pass model alone: the MAPE of predicted vs measured scheduler-step time, ± std/√n. It uses the held-out seed-7 step capture at the same lane count and the profiling window (Qwen windows also include the client warm-up).</p><p><strong>Prefill</strong>: steps with a prefill chunk and no decode. <strong>Decode</strong>: decode-only steps (GLM: MTP verify rounds). Qwen mixed prefill+decode steps are not shown.</p><p>Learned is the model trained on seed 42 only. The replay uses seeds 42 and 7 pooled. Both models price steps with the replay's compiled timing config. GLM drops steps whose target forward SGLang 0.5.20 recorded on the adjacent record, and that record; the point page shows the count. No model is stored: each evaluation retrains from the pinned captures with a fixed seed.</p></div><details class="agentx-method"><summary>Metrics and provenance</summary>${methodology()}${provenance(data.snapshot,data.runs)}</details>`;
+      bindPointHelp(target);bindPointHelp(target,"#agentx-quantile-info","#agentx-quantile-tooltip");bindPointHelp(target,"#agentx-step-info","#agentx-step-tooltip");
       target.querySelectorAll("[data-agentx-href]").forEach(row => {
         row.addEventListener("click", event => { if (!event.target.closest("a,button")) location.href=row.dataset.agentxHref; });
         row.addEventListener("keydown", event => { if (event.key === "Enter" && event.target === row) location.href=row.dataset.agentxHref; });
@@ -230,7 +265,7 @@ window.AgentX = (() => {
 
   const githubIcon = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38v-1.49c-2.23.48-2.69-.95-2.69-.95-.36-.92-.89-1.17-.89-1.17-.73-.5.06-.49.06-.49.8.06 1.22.82 1.22.82.71 1.22 1.87.87 2.33.67.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.74.54 1.49v2.21c0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>`;
   function methodology() {
-    return `<ul class="agentx-notes"><li>Per-point error compares the aggregate result across a benchmark’s conversation requests. TTFT/TPOT aggregate successful request timings; workload duration and throughput include tool-call waits.</li><li>Point error is 100 × |AISim mean − silicon mean| / silicon mean. Run errors are averaged equally across repeats and variants.</li><li>Request MAPE gives each valid, uniquely matched request equal weight. All measured requests remain in accounting.</li><li>Throughput is output tokens/s within the benchmark’s measured boundary, including between-turn delays.</li><li>Preparation and warmup are unscored. Missing measurements and zero denominators remain unavailable. No shape metrics or timing calibration.</li></ul>`;
+    return `<ul class="agentx-notes"><li>Errors are unsigned percentages over uniquely matched requests. e2e error is 100 × |mean AISim / mean silicon − 1| of request TTFT or TPOT. Per-request quantile error averages 100 × |AISim pN / silicon pN − 1| over p5, p10, …, p95.</li><li>± is the standard error: a 1,000-resample bootstrap over requests for request metrics, std/√n over steps for step error. Entries average their runs equally.</li><li>Silicon TPOT under 1 ms is burst delivery, not decode pacing; those requests are excluded from TPOT and counted.</li><li>Step error prices held-out seed-7 step captures at the same lane count. The learned FPM row replays a model retrained from pinned seed-42 and seed-7 captures with a fixed seed and frozen adaptation; its step error uses a seed-42-only model.</li><li>Preparation and warmup are unscored. Missing measurements and zero denominators remain unavailable. No timing calibration.</li></ul>`;
   }
   function provenance(snapshot,runs) {
     return `<ul class="agentx-notes provenance"><li>${githubIcon} <strong>AISim repository commit:</strong> <a href="https://github.com/ai-dynamo/aisim/commit/${esc(snapshot.commit_sha)}" target="_blank" rel="noopener"><code>${esc(snapshot.commit_sha)}</code></a></li><li><span role="img" aria-label="Hugging Face">🤗</span> <strong>Silicon dataset revision:</strong> <code>${esc(snapshot.dataset_revision)}</code></li><li><strong>Measured framework:</strong> ${[...new Set(runs.map(r=>`${r.backend} ${r.measured_backend_version}`))].map(esc).join("; ")}</li><li><strong>Prediction database:</strong> ${[...new Set(runs.map(r=>`${r.backend} ${r.prediction_backend_version||"unavailable"}`))].map(esc).join("; ")}</li><li><strong>Evaluated:</strong> ${esc(snapshot.completed_at)}${snapshot.preview?" · Preview":""}${snapshot.measurement_campaign_status==="partial"?" · Partial silicon campaign; dataset remains unscored and ineligible for promotion.":""}</li><li><strong>Wheel SHA256:</strong> <code>${esc(snapshot.wheel_sha256)}</code></li>${[...new Map(runs.flatMap(r=>(r.op_data||[]).map(d=>[d.file,d]))).values()].map(d=>`<li>${githubIcon} <strong>Op data:</strong> <a href="https://github.com/ai-dynamo/aisim/blob/${esc(snapshot.commit_sha)}/python/aisim/src/aisim_core/systems/data/${esc(d.file)}">${esc(d.file)}</a><br><code>${esc(d.sha256)}</code></li>`).join("")}</ul>`;
@@ -268,10 +303,10 @@ window.AgentX = (() => {
       if(!params.has("campaign") && params.get("category")==="self_collected" && ["length","cache","repeat"].some(k=>params.has(k)) && loaded.data.runs.some(r=>r.category==="self_collected"&&r.boundary==="successful_profile_span")) {
         const archived=new URL(location.href);archived.searchParams.set("campaign","finite-v1");location.replace(archived);return;
       }
-      const runs=loaded.data.runs.filter(r=>r.category===params.get("category") && r.model===params.get("model") && r.lanes===Number(params.get("lanes")));
+      const runs=loaded.data.runs.filter(r=>r.category===params.get("category") && r.model===params.get("model") && r.lanes===Number(params.get("lanes")) && (!params.get("perf") || estimationOf(r)===params.get("perf")));
       if(!runs.length) throw new Error("This concurrency was not evaluated.");
       const first=runs[0];
-      document.getElementById("point-title").textContent=`${first.model} · ${first.lanes} lane${first.lanes===1?"":"s"}`;
+      document.getElementById("point-title").textContent=`${first.model} · ${first.lanes} lane${first.lanes===1?"":"s"} · ${performanceModel([first],true)}`;
       root.innerHTML=`<p class="agentx-identity"><span class="source-tag">${first.category==="agentx"?"AgentX official":"Self-collected"}</span> ${esc(first.hardware)} · ${esc(first.backend)} · ${esc(first.precision)} · TP${first.tensor_parallel} · ${source(first)}</p><div id="variant-controls" class="filter-toolbar"></div><p id="selected-run-label" class="evidence-brief"></p><div id="selected-run"></div>`;
       const controls=document.getElementById("variant-controls");
       if(params.get("campaign")==="finite-v1")root.insertAdjacentHTML("afterbegin",'<p class="evidence-brief">Archived finite campaign · historical measurements and predictions.</p>');
@@ -305,7 +340,7 @@ window.AgentX = (() => {
         const point=record?{...measured,feature_metadata:record.feature_metadata,feature_dataset_revision:featureData.feature_dataset_revision}:measured;
         document.getElementById("selected-run-label").textContent=`Selected run · ${!finite?"Observed outputs · Weka profile":`${Number(length).toLocaleString()} tokens · ${cache} · repeat ${repeat}`} · ${point.outcome}${point.reason?" · "+point.reason.replaceAll("_"," "):""}${point.snapshot.measurement_campaign_status==="partial"?" · Partial silicon campaign · unscored dataset; not eligible for promotion":""}`;
         const lanes=`${first.lanes} lane${first.lanes===1?"":"s"}`;
-        const accuracy=`<div class="agentx-summary-layout">${featureChecklist(point)}<section class="agentx-summary-main"><h2>Concurrency summary</h2><p>${runs.length>1?"All ":""}${runs.length} run${runs.length===1?"":"s"} · ${lanes} · ${group.coverage.matched.toLocaleString()} / ${group.coverage.measured.toLocaleString()} requests matched · ${esc(performanceModel(points))}</p><div class="table-scroll"><table class="agentx-summary-table"><thead><tr><th scope="col">Metric</th><th scope="col"><span class="comparison-source-dot silicon" aria-hidden="true"></span>Silicon</th><th scope="col"><span class="comparison-source-dot aisim" aria-hidden="true"></span>AISim</th><th scope="col">Error</th><th scope="col" class="agentx-samples">Samples</th></tr></thead><tbody>${comparisonRows(group)}</tbody></table></div><p class="agentx-summary-note">Point rows average scored runs equally. Request rows average the individual requests scored for that metric.</p></section></div>`;
+        const accuracy=`<div class="agentx-summary-layout">${featureChecklist(point)}<section class="agentx-summary-main"><h2>Concurrency summary</h2><p>${runs.length>1?"All ":""}${runs.length} run${runs.length===1?"":"s"} · ${lanes} · ${group.coverage.matched.toLocaleString()} / ${group.coverage.measured.toLocaleString()} requests matched · ${esc(performanceModel(points))}</p><div class="table-scroll"><table class="agentx-summary-table"><thead><tr><th scope="col">Metric</th><th scope="col"><span class="comparison-source-dot silicon" aria-hidden="true"></span>Silicon</th><th scope="col"><span class="comparison-source-dot aisim" aria-hidden="true"></span>AISim</th><th scope="col">Error</th><th scope="col" class="agentx-samples">Samples</th></tr></thead><tbody>${comparisonRows(group)}</tbody></table></div><p class="agentx-summary-note">Point rows: silicon vs AISim point values for reference.</p>${metricsTable(points)}</section></div>`;
         const evidence=`<h2>Metrics and provenance</h2>${methodology()}${coverageEvidence(point)}${provenance(point.snapshot,[point])}${featureEvidence(point)}${simulationEvidence(point)}<h2>AISim replay configuration</h2><ul>${point.config_summary.map(item=>`<li><strong>${esc(item.name)}:</strong> ${esc(item.value??"Unavailable")}</li>`).join("")}</ul><h2>Sources and limitations</h2><ul><li>${source(point)}</li><li>${point.boundary==="complete_finite_cohort"?"Finite measured cohort, including between-turn delays.":"Fixed profiling admission window; silicon and replay may progress through different requests."}</li><li>Request comparison requires a unique successful match and equal output lengths. Source identity does not establish identical prompts or cache history.</li><li>Curve MAPE uses covered, positive silicon observations on a one-second phase grid. Curve smoothing is described per chart. Zero and missing values are counted; preparation remains unscored.</li><li>Accuracy is advisory. No timing calibration is applied.</li></ul>`;
         target.innerHTML=`<div class="replay-dashboard embedded ${document.documentElement.dataset.theme==="light"?"light":""}">${fragment}</div>`;
         const state=new URLSearchParams(location.hash.slice(1)),view=state.get("view"),stage=state.get("stage")==="preparation"?"preparation":"profile";
@@ -320,5 +355,5 @@ window.AgentX = (() => {
       await select();
     }catch(error){root.innerHTML=`<p role="alert">${esc(error.message)}</p>`;}
   }
-  return {load,detail,aggregate,performanceModel,featureChecklist,validateFeatureEvidence};
+  return {load,detail,aggregate,performanceModel,requestAggregate,stepAggregate,featureChecklist,validateFeatureEvidence};
 })();
