@@ -1872,7 +1872,7 @@ def _expected_producer_receipt(plan, cell, attempt_id: str) -> dict:
     }
 
 
-def _rerun_smoke(root: Path, plan, *, retry_failed: bool) -> list:
+def _rerun_smoke(root: Path, plan, *, retry_failed: bool, publish_database: bool = False) -> list:
     return run_collection(
         plan,
         generator_overrides={},
@@ -1882,7 +1882,7 @@ def _rerun_smoke(root: Path, plan, *, retry_failed: bool) -> list:
         retry_failed=retry_failed,
         smoke=True,
         cell_limit=len(plan.cells),
-        publish_database=False,
+        publish_database=publish_database,
     )
 
 
@@ -2134,8 +2134,7 @@ def test_passed_glm_cell_with_incomplete_samples_can_start_a_new_attempt(tmp_pat
     from .test_fpm_runtime_memory import _glm_plan
 
     plan = _glm_plan(tmp_path, worker_type="prefill")
-    with monkeypatch.context() as staged:
-        _, _, checkpoint = _staged_run(staged, tmp_path, plan, smoke=True)
+    _, _, checkpoint = _staged_run(monkeypatch, tmp_path, plan, smoke=True)
     (cell,) = plan.cells
     attempt = checkpoint["cells"][cell.cell_id]["attempt_id"]
     cell_dir = tmp_path / "artifacts" / plan.sha256[:16] / "smoke" / "cells" / cell.cell_id
@@ -2150,24 +2149,47 @@ def test_passed_glm_cell_with_incomplete_samples_can_start_a_new_attempt(tmp_pat
     nc._glm_producer_shape(tmp_path)("prefill", payload)
     artifact = nc.write_glm_rank(pod, payload)
     assert _runtime_collection_summary(cell, cell_dir / "raw", plan=plan)["measured_point_count"] == 2
+    checkpoint_path = tmp_path / "checkpoints/fpm_forward_smoke.json"
+    assert _rerun_smoke(tmp_path, plan, retry_failed=False, publish_database=True) == []
+    passed = json.loads(checkpoint_path.read_bytes())
+    assert passed["smoke"]["status"] == "passed"
     record = json.loads(artifact.read_bytes())
     record["results"][0]["fpms"][0]["benchmark_measurement"]["raw_fpms"].pop()
     artifact.write_text(json.dumps(record))
 
-    checkpoint_path = tmp_path / "checkpoints/fpm_forward_smoke.json"
-    errors = _rerun_smoke(tmp_path, plan, retry_failed=False)
-    assert [error["classification"] for error in errors] == ["campaign_incomplete"]
-    entry = json.loads(checkpoint_path.read_bytes())["cells"][cell.cell_id]
-    assert (entry["status"], entry["attempt_id"]) == ("failed", attempt)
-    assert "expected 10 saved raw samples" in entry["error"]
+    with monkeypatch.context() as retained:
+        retained.setattr(fpm_runner, "_runtime_collection_summary", _runtime_collection_summary)
+        errors = _rerun_smoke(tmp_path, plan, retry_failed=False, publish_database=True)
+        assert [error["classification"] for error in errors] == ["campaign_incomplete"]
+        failed = json.loads(checkpoint_path.read_bytes())
+        entry = failed["cells"][cell.cell_id]
+        assert (entry["status"], entry["attempt_id"]) == ("failed", attempt)
+        assert "expected 10 saved raw samples" in entry["error"]
+        assert "smoke" not in failed
 
-    def stop_at_render(*args, **kwargs):
-        raise RuntimeError("Rendering replacement")
+        # Older checkpoints could already have a failed cell under a passed smoke summary.
+        checkpoint_path.write_text(json.dumps({**failed, "smoke": passed["smoke"]}))
+        errors = _rerun_smoke(tmp_path, plan, retry_failed=False)
+        assert [error["classification"] for error in errors] == ["campaign_incomplete"]
+        assert json.loads(checkpoint_path.read_bytes()) == failed
 
-    monkeypatch.setattr(fpm_runner, "_render_cell", stop_at_render)
-    errors = _rerun_smoke(tmp_path, plan, retry_failed=True)
-    assert [error["error_message"] for error in errors] == ["Rendering replacement"]
-    assert json.loads(checkpoint_path.read_bytes())["cells"][cell.cell_id]["attempt_id"] != attempt
+        def stop_at_render(*args, **kwargs):
+            assert "smoke" not in json.loads(checkpoint_path.read_bytes())
+            raise RuntimeError("Rendering replacement")
+
+        checkpoint_path.write_text(json.dumps(passed))
+        retained.setattr(fpm_runner, "_render_cell", stop_at_render)
+        errors = _rerun_smoke(tmp_path, plan, retry_failed=True, publish_database=True)
+        assert [error["error_message"] for error in errors] == ["Rendering replacement"]
+        failed_retry = json.loads(checkpoint_path.read_bytes())
+        assert failed_retry["cells"][cell.cell_id]["attempt_id"] != attempt
+        assert "smoke" not in failed_retry
+
+    assert _rerun_smoke(tmp_path, plan, retry_failed=True, publish_database=True) == []
+    passed_retry = json.loads(checkpoint_path.read_bytes())
+    assert passed_retry["cells"][cell.cell_id]["status"] == "passed"
+    assert passed_retry["cells"][cell.cell_id]["attempt_id"] != failed_retry["cells"][cell.cell_id]["attempt_id"]
+    assert passed_retry["smoke"] == passed["smoke"]
 
 
 def test_recovery_of_a_cell_without_a_receipt_writes_the_digests_of_the_recovering_checkout(tmp_path, monkeypatch):

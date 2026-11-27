@@ -2311,6 +2311,9 @@ def _run_collection_impl(
     else:
         target_cells = plan.cells
 
+    def all_target_cells_passed() -> bool:
+        return all(checkpoint["cells"].get(cell.cell_id, {}).get("status") == "passed" for cell in target_cells)
+
     formal_database_terminal = False
     database_entry = checkpoint.get("database")
     if (
@@ -2437,6 +2440,10 @@ def _run_collection_impl(
             if entry.get(key) != value:
                 entry[key] = value
                 checkpoint_changed = True
+    # Older checkpoints can already contain a passed smoke summary for a failed cell.
+    if smoke and "smoke" in checkpoint and not all_target_cells_passed():
+        del checkpoint["smoke"]
+        checkpoint_changed = True
     if checkpoint_changed:
         _atomic_json(checkpoint_path, checkpoint)
 
@@ -2716,7 +2723,7 @@ def _run_collection_impl(
     )
     if formal_database_terminal:
         return errors
-    all_passed = all(checkpoint["cells"].get(cell.cell_id, {}).get("status") == "passed" for cell in target_cells)
+    all_passed = all_target_cells_passed()
     if not publish_database:
         if not all_passed and not errors:
             errors.append(
