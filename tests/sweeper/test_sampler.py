@@ -5,6 +5,7 @@
 
 import json
 import uuid
+from dataclasses import replace
 
 import pytest
 
@@ -24,12 +25,13 @@ from aisim.sweeper.sampler import (
     SeededBayesianBranchSampler,
     SmallestFirstBranchSampler,
     Suggestion,
+    _add_integer_parameters,
     _decoder_for,
     _index_decoder,
     _vizier_algorithm,
     make_branch_sampler,
 )
-from aisim.sweeper.search_space import BranchSpace, ConditionalDimensionSpace
+from aisim.sweeper.search_space import BranchSpace, ConditionalDimensionSpace, _union_scheduler_ranges
 
 pytestmark = [
     pytest.mark.timeout(300),
@@ -104,6 +106,46 @@ def _branch() -> BranchSpace:
             ],  # discrete float
         },
     )
+
+
+def test_sparse_log_scheduler_domains_preserve_budgets_and_scale():
+    from vizier import pyvizier as vz
+
+    name = "agg_max_num_batched_tokens"
+    # One large declared interval and a distant measured setting must fit without expanding either range.
+    ceiling = 100_000_000
+    exact = 1_000_000_000
+    for top, measured in [(65, 128), (ceiling, exact)]:
+        bounds = _union_scheduler_ranges([range(64, top + 1), range(measured, measured + 1)])
+        branch = replace(
+            _branch(),
+            knob_choices={"backend": ["trtllm"]},
+            integer_ranges={name: bounds},
+            log_integer_ranges=frozenset({name}),
+        )
+        random = make_branch_sampler(branch, study_id="sparse", algorithm="random", seed=42)
+        suggestions = [row.selection[name] for row in random.suggest(24)]
+        assert all(64 <= value <= top or value == measured for value in suggestions)
+
+        # The embedded and seeded Vizier samplers register their dimensions through the same function.
+        space = vz.SearchSpace()
+        decoders = {}
+        _add_integer_parameters(space.root, vz, branch, decoders)
+        parameter = space.get(name)
+        assert parameter.scale_type == vz.ScaleType.LOG
+        if top == 65:
+            assert set(suggestions) == {64, 65, 128}
+            assert parameter.feasible_values == [64, 65, 128]
+            assert [decoders[name](value) for value in parameter.feasible_values] == [64, 65, 128]
+        else:
+            assert [decoders[name](value) for value in (64, top, top + 1, measured - 1, measured)] == [
+                64,
+                top,
+                top,
+                measured,
+                measured,
+            ]
+    assert _union_scheduler_ranges([range(64, 100), range(64, 129)]) == (64, 128)
 
 
 def test_seeded_bayesian_uses_float64_from_an_fp32_runtime() -> None:

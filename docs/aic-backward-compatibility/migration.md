@@ -751,7 +751,7 @@ explains the retained workload routing and feature mathematics.
 
 ### Rust P/D reservation events
 
-Rust callers constructing `aisim_core::engine::LifecycleEvent::DestinationReserved` or `aisim_core::replay::HandoffFact::DestinationReserved` must supply the new `full_local_hit` field. Use `false` for existing producers unless the destination confirms that its local cache covers the entire transfer, including the state and window groups. Propagate the value when translating a lifecycle event into a handoff fact. In `destination_missing` mode a complete hit skips the payload and still notifies the source.
+Rust callers constructing `aisim_core::engine::LifecycleEvent::DestinationReserved` or `aisim_core::replay::HandoffFact::DestinationReserved` must supply the new `full_local_hit` field. Set it to `true` when the destination's NIXL connector confirms that the Pull requires no external KV read. This can happen even with a non-cacheable state group. Zero missing full-attention blocks can still require a window or state payload. Use `false` when the connector decision is unknown. Propagate the value when translating a lifecycle event into a handoff fact. In `destination_missing` mode a confirmed local hit skips the payload and still notifies the source.
 
 ```rust
 let event = LifecycleEvent::DestinationReserved {

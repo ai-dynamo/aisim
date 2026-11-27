@@ -45,7 +45,7 @@ from .parallel_projection import (
     ParallelProjection,
 )
 from .replay import canonical_json
-from .search_space import BranchSpace, matches_parallel_domains
+from .search_space import BranchSpace, IntegerRangeUnion, matches_parallel_domains
 
 _CONSTANT_PARAM = "_sweeper_constant"
 _METRIC = "objective"
@@ -147,6 +147,25 @@ def _index_decoder(choices: list[Any]) -> Callable[[Any], Any]:
     return lambda v: choices[round(float(v))]
 
 
+def _add_integer_parameters(root, vz, branch, decoders):
+    for knob, bounds in branch.integer_ranges.items():
+        scale = vz.ScaleType.LOG if knob in branch.log_integer_ranges else vz.ScaleType.LINEAR
+        decoders[knob] = lambda value: round(float(value))
+        if isinstance(bounds, IntegerRangeUnion):
+            # A sparse set of endpoints fits directly in Vizier's discrete domain.
+            if all(len(interval) <= 2 for interval in bounds.intervals):
+                endpoints = [value for interval in bounds.intervals for value in interval]
+                root.add_discrete_param(knob, feasible_values=endpoints, scale_type=scale)
+                continue
+            # Vizier has no disjoint integer range. Project its physical, scaled
+            # coordinate to the nearest feasible value without expanding the union.
+            minimum, maximum = bounds[0], bounds[-1]
+            decoders[knob] = lambda value, domain=bounds: domain[domain.nearest_index(float(value))]
+        else:
+            minimum, maximum = bounds
+        root.add_int_param(knob, min_value=minimum, max_value=maximum, default_value=minimum, scale_type=scale)
+
+
 def _vizier_modules() -> tuple[Any, Any]:
     """Import the optional Vizier runtime only after the caller opts into sampling.
 
@@ -239,15 +258,7 @@ class VizierBranchSampler:
                 scale_type=(vz.ScaleType.LOG if knob in branch.log_float_ranges else vz.ScaleType.LINEAR),
             )
             self._decoders[knob] = float
-        for knob, (minimum, maximum) in branch.integer_ranges.items():
-            root.add_int_param(
-                knob,
-                min_value=minimum,
-                max_value=maximum,
-                default_value=minimum,
-                scale_type=(vz.ScaleType.LOG if knob in branch.log_integer_ranges else vz.ScaleType.LINEAR),
-            )
-            self._decoders[knob] = lambda value: round(float(value))
+        _add_integer_parameters(root, vz, branch, self._decoders)
         for knob, choices in branch.knob_choices.items():
             # Dedupe scalar choices before passing them to Vizier. Structured and
             # heterogeneous choices are encoded by index below, so duplicate decoded
@@ -400,10 +411,9 @@ class RandomBranchSampler:
             if name in branch.log_discrete_choices:
                 values.sort(key=float)
             self._domains.append((name, values, len(values), name in branch.log_discrete_choices))
-        for name, (minimum, maximum) in branch.integer_ranges.items():
-            self._domains.append(
-                (name, range(minimum, maximum + 1), maximum - minimum + 1, name in branch.log_integer_ranges)
-            )
+        for name, bounds in branch.integer_ranges.items():
+            values = bounds if isinstance(bounds, IntegerRangeUnion) else range(bounds[0], bounds[1] + 1)
+            self._domains.append((name, values, len(values), name in branch.log_integer_ranges))
         self._continuous = any(lower != upper for lower, upper in branch.float_ranges.values())
         self._weighted = any(logarithmic and size > 1 for _, _, size, logarithmic in self._domains)
         size = math.prod(size for _, _, size, _ in self._domains)
@@ -440,6 +450,8 @@ class RandomBranchSampler:
                 sampled = math.exp(self._rng.uniform(math.log(values[0]), math.log(values[-1])))
                 if isinstance(values, range):
                     digit = max(0, min(size - 1, round(sampled) - values.start))
+                elif isinstance(values, IntegerRangeUnion):
+                    digit = values.nearest_index(sampled)
                 else:
                     digit = min(range(size), key=lambda i: abs(float(values[i]) - sampled))
             else:
@@ -671,15 +683,7 @@ class SeededBayesianBranchSampler:
                 scale_type=(vz.ScaleType.LOG if knob in branch.log_float_ranges else vz.ScaleType.LINEAR),
             )
             self._decoders[knob] = float
-        for knob, (minimum, maximum) in branch.integer_ranges.items():
-            root.add_int_param(
-                knob,
-                min_value=minimum,
-                max_value=maximum,
-                default_value=minimum,
-                scale_type=(vz.ScaleType.LOG if knob in branch.log_integer_ranges else vz.ScaleType.LINEAR),
-            )
-            self._decoders[knob] = lambda value: round(float(value))
+        _add_integer_parameters(root, vz, branch, self._decoders)
         for knob, raw_choices in branch.knob_choices.items():
             choices = list(raw_choices)
             all_strings = all(isinstance(choice, str) for choice in choices)

@@ -2868,20 +2868,16 @@ def test_mixed_fpm_scheduler_domains_preserve_each_valid_shape(grouped_case, lin
     (branch,) = enumerate_branches(config, max_seq_len=512)
     assert {c.prefill.shape.tp for c in branch.parallel_configs} == {1, 2}
     for role in ("prefill", "decode"):
-        assert branch.knob_choices[f"{role}_max_num_batched_tokens"] == (
-            [96, 128] if linear else [64, 96, 128]
-        )
+        assert branch.knob_choices[f"{role}_max_num_batched_tokens"] == ([96, 128] if linear else [64, 96, 128])
 
 
 @pytest.mark.parametrize("relative_load", [False, True], ids=["fixed", "kv-relative"])
-def test_selected_scheduler_envelope_precedes_kv_load_materialization(
-    grouped_case, relative_load
-):
+def test_selected_scheduler_envelope_precedes_kv_load_materialization(grouped_case, relative_load):
     from unittest.mock import Mock
 
     from aisim.runner import EngineReplayRunnerFactory
-    from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
     from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
     from aisim.sweeper.search import _materialize_one
     from aisim.sweeper.search_space import enumerate_branches
 
@@ -2943,6 +2939,36 @@ def test_selected_scheduler_envelope_precedes_kv_load_materialization(
                     "infeasible",
                     "kv_capacity",
                 )
+
+
+def test_mixed_scheduler_log_range_excludes_budgets_unsupported_on_every_shape(grouped_case):
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.sampler import RandomBranchSampler
+    from aisim.sweeper.search_space import enumerate_branches
+
+    original, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(original))
+    # The measured linear TP2 topology requires 128. The declared grouped TP1 allows up to 65.
+    declared = _with_transfer_markers(original)["deployments"][1]["resources"]
+    declared["max_num_tokens"] = 65
+    profile["deployments"][1]["resources"] = declared
+    raw = _pd_search(_mixed_profile(profile), root)
+    fields = ["prefill_max_num_batched_tokens", "decode_max_num_batched_tokens"]
+    raw["engine_integer_log_ranges"] = {name: [64, 128] for name in fields}
+    config = SmartSearchConfig(search_space=raw, workload=Workload(isl=32, osl=3, request_count=2, concurrency=1))
+    (branch,) = enumerate_branches(config, max_seq_len=512)
+    assert {pair.prefill.shape.tp for pair in branch.parallel_configs} == {1, 2}
+    suggestions = RandomBranchSampler(branch, seed=42).suggest(64)
+    for name in fields:
+        assert {row.selection[name] for row in suggestions} == {64, 65, 128}
+        assert name in branch.log_integer_ranges
+
+    both_declared = _with_transfer_markers(original)
+    both_declared["deployments"][1]["resources"] = declared
+    raw["fpm_profile"] = _mixed_profile(both_declared)
+    config = SmartSearchConfig(search_space=raw, workload=config.workload)
+    (dense,) = enumerate_branches(config, max_seq_len=512)
+    assert all(dense.integer_ranges[name] == (64, 128) for name in fields)
 
 
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):

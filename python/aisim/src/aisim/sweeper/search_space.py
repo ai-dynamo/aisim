@@ -72,6 +72,31 @@ _ROLE_OPTIONAL_ENGINE = ("block_size", "gpu_memory_utilization")
 
 
 @dataclass(frozen=True)
+class IntegerRangeUnion:
+    """Sorted disjoint intervals of feasible integer settings, stored without expanding them."""
+
+    intervals: tuple[range, ...]
+
+    def __len__(self) -> int:
+        return sum(len(interval) for interval in self.intervals)
+
+    def __getitem__(self, index: int) -> int:
+        if index < 0:
+            index += len(self)
+        for interval in self.intervals:
+            if 0 <= index < len(interval):
+                return interval[index]
+            index -= len(interval)
+        raise IndexError(index)
+
+    def nearest_index(self, value: float) -> int:
+        index = bisect_left(self, value)
+        if index and (index == len(self) or value - self[index - 1] <= self[index] - value):
+            return index - 1
+        return index
+
+
+@dataclass(frozen=True)
 class ConditionalDimensionSpace:
     """Namespaced selector and its conditionally active child dimensions."""
 
@@ -100,7 +125,7 @@ class BranchSpace:
     # Continuous workload dimensions. Currently only Pareto ``kv_load_ratio`` uses
     # this; list-valued component knobs remain discrete choices above.
     float_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
-    integer_ranges: dict[str, tuple[int, int]] = field(default_factory=dict)
+    integer_ranges: dict[str, tuple[int, int] | IntegerRangeUnion] = field(default_factory=dict)
     log_float_ranges: frozenset[str] = frozenset()
     log_integer_ranges: frozenset[str] = frozenset()
     log_discrete_choices: frozenset[str] = frozenset()
@@ -502,6 +527,19 @@ def _heterogeneous_disagg_configs(
             f"heterogeneous P/D roles have no legal pair within gpu_budget={search_space.gpu_budget}"
         )
     return configs
+
+
+def _union_scheduler_ranges(ranges: list[range]) -> tuple[int, int] | IntegerRangeUnion:
+    """Combine allowed ranges in physical value order, keeping large contiguous spans compact."""
+    merged = []
+    for interval in sorted(set(ranges), key=lambda item: (item.start, item.stop)):
+        if merged and interval.start <= merged[-1].stop:
+            merged[-1] = range(merged[-1].start, max(merged[-1].stop, interval.stop))
+        else:
+            merged.append(interval)
+    if len(merged) == 1:
+        return (merged[0].start, merged[0][-1])
+    return IntegerRangeUnion(tuple(merged))
 
 
 def _fpm_scheduler_domains(space, mode, candidates):
@@ -1054,7 +1092,7 @@ def enumerate_branches(
             # the constant path so every decoded selection carries the requested ratio.
             knob_choices["kv_load_ratio"] = [float(config.workload.kv_load_ratio)]
         log_float_ranges: set[str] = set()
-        integer_ranges: dict[str, tuple[int, int]] = {}
+        integer_ranges: dict[str, tuple[int, int] | IntegerRangeUnion] = {}
         log_integer_ranges: set[str] = set()
         log_discrete_choices = {name for name in ss.engine_log_discrete if name in knob_choices}
         active_roles = {"agg"} if deployment_mode == "agg" else {"prefill", "decode"}
@@ -1081,9 +1119,7 @@ def enumerate_branches(
                 knob_choices[name] = sorted({values[0] for values in sampled})
                 log_discrete_choices.add(name)
             else:
-                if sampled:
-                    bounds = (min(values[0] for values in sampled), max(values[-1] for values in sampled))
-                integer_ranges[name] = (int(bounds[0]), int(bounds[1]))
+                integer_ranges[name] = _union_scheduler_ranges(sampled) if sampled else (int(bounds[0]), int(bounds[1]))
                 log_integer_ranges.add(name)
         if config.workload.load_choices is not None:
             knob_choices["traffic_load"] = list(config.workload.load_choices)
