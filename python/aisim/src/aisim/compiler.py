@@ -302,12 +302,15 @@ def _apply_measured_cpu_overhead(
 
         from .sweeper.forward_pass_estimator import resolve_systems_paths
 
-        version = resolve_query_version(
-            system,
-            engine.backend,
-            version or "current",
-            systems_paths=list(resolve_systems_paths(worker.timing.systems_paths or engine.systems_paths)),
-        )
+        try:
+            version = resolve_query_version(
+                system,
+                engine.backend,
+                version or "current",
+                systems_paths=list(resolve_systems_paths(worker.timing.systems_paths or engine.systems_paths)),
+            )
+        except ValueError:
+            return deployment  # no version slot to resolve (a self-contained replay): nothing to key a measurement by
     from aisim_core.host_cost.replay import measured_overhead
 
     measured = measured_overhead(

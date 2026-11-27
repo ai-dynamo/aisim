@@ -394,3 +394,41 @@ def test_compiler_resolves_an_omitted_backend_version_before_the_lookup(local, m
 def test_the_compiler_needs_the_host_cpu_with_the_endpoint():
     with pytest.raises(ValueError, match="given together"):
         prediction_to_replay_spec(_prediction(), cpu_overhead_endpoint="chat")
+
+
+def test_an_edited_tokenizer_intercept_fails_verification(dataset, tmp_path):
+    root = _copy(dataset, tmp_path)
+    path = root / "data/host-cost/sglang/0.5.21/b300_sxm/glm/aisim-manifest.json"
+    data = json.loads(path.read_text())
+    data["provenance"]["host_cost"]["fit"]["base_ms"] += 5.0
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="base_ms differs"):
+        check_entry(root, "data/host-cost/sglang/0.5.21/b300_sxm/glm/aisim-manifest.json")
+
+
+def test_results_are_independent_and_a_local_dataset_is_read_again(dataset, tmp_path, monkeypatch):
+    root = _copy(dataset, tmp_path)
+    monkeypatch.setenv(replay.LOCAL_ENV, str(root))
+    first = _measured()
+    first.tokenization["per_input_token_us"] = 99.0
+    assert _measured().tokenization["per_input_token_us"] != 99.0
+    # Republished in place: the next call sees the new measurement, not a cached one.
+    _rewrite_unqueued(root, "vllm", "0.31.0", [{"run": "new", "base_ms": 40.0, "total_per_input_token_us": 1.7}])
+    register_entries(root, ["data/host-cost/vllm/0.31.0/b300_sxm/qwen2/unqueued-chat/aisim-manifest.json"])
+    later = _measured()
+    assert later.tokenization["base_ms"] + later.extra_cpu_overhead["base_ms"] == pytest.approx(40.0)
+
+
+def test_an_unresolvable_default_version_leaves_the_replay_unchanged(local, monkeypatch):
+    import aisim_core.sdk.perf_database as perf_database
+
+    def no_slots(*_args, **_kwargs):
+        raise ValueError("no queryable versions")
+
+    monkeypatch.setattr(perf_database, "resolve_query_version", no_slots)
+    config = _prediction()
+    config = config.model_copy(update={"engine": config.engine.model_copy(update={"backend_version": None})})
+    deployment = prediction_to_replay_spec(
+        config, cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
+    ).backend_deployment
+    assert deployment.tokenization is None and deployment.extra_cpu_overhead is None

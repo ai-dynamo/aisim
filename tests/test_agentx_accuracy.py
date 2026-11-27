@@ -83,7 +83,13 @@ def simulation_record(identity="agentx-446063", revision="a" * 40, dataset="b" *
     from scripts.e2e_accuracy.simulation_features import unavailable
 
     record = unavailable(
-        {"benchmark_id": identity, "evaluated_revision": revision, "dataset_revision": dataset}, result(), "disabled"
+        {
+            "benchmark_id": identity,
+            "evaluated_revision": revision,
+            "dataset_revision": dataset,
+        },
+        result(),
+        "disabled",
     )
     record.update(execution_mode="offline", configuration_sha256="c" * 64)
     record["roles"][0].update(backend_version="0.5.21", compiled_sha256="d" * 64)
@@ -107,8 +113,12 @@ def bundle(run=None):
     summary_run = {k: v for k, v in run.items() if k not in {"pairs", "report"}}
     summary_run["detail_path"] = f"details/{run['id']}.json"
     files = {
-        "summary.json": canonical({"schema": SUMMARY_SCHEMA, "snapshot": snapshot, "runs": [summary_run]}),
-        summary_run["detail_path"]: canonical({"schema": SUMMARY_SCHEMA, "snapshot": snapshot, **run}),
+        "summary.json": canonical(
+            {"schema": SUMMARY_SCHEMA, "snapshot": snapshot, "runs": [summary_run]}
+        ),
+        summary_run["detail_path"]: canonical(
+            {"schema": SUMMARY_SCHEMA, "snapshot": snapshot, **run}
+        ),
     }
     seal(files, snapshot)
     return files
@@ -121,20 +131,32 @@ def seal(files, snapshot=None):
             "schema": "aisimulate.agentx.qualification.v1",
             "status": "complete",
             "snapshot": snapshot,
-            "files": {k: hashlib.sha256(v).hexdigest() for k, v in files.items() if k != "qualification.json"},
+            "files": {
+                k: hashlib.sha256(v).hexdigest()
+                for k, v in files.items()
+                if k != "qualification.json"
+            },
         }
     )
 
 
 @pytest.mark.parametrize(
-    "corruption", ["later_identity", "later_provenance", "earlier_accounting", "later_feature_parameters"]
+    "corruption",
+    [
+        "later_identity",
+        "later_provenance",
+        "earlier_accounting",
+        "later_feature_parameters",
+    ],
 )
 def test_incomplete_silicon_evidence_cannot_hide_bundle_corruption(corruption):
     from test_benchmark_features import silicon_metadata
 
     features = silicon_metadata("incomplete-silicon")
     features["features"][0].update(state="unknown", evidence=[])
-    first = result(id="incomplete-silicon", category="self_collected", feature_metadata=features)
+    first = result(
+        id="incomplete-silicon", category="self_collected", feature_metadata=features
+    )
     second = result(id="later-result")
     if corruption == "later_feature_parameters":
         offload = next(row for row in features["features"] if row["id"] == "cache.g2")
@@ -144,7 +166,9 @@ def test_incomplete_silicon_evidence_cannot_hide_bundle_corruption(corruption):
         first["request_errors"]["ttft_ms"]["count"] += 1
         expected_error = "Request denominator does not reconcile"
     elif corruption == "later_provenance":
-        second["simulation_features"] = simulation_record("later-result", revision="f" * 40)
+        second["simulation_features"] = simulation_record(
+            "later-result", revision="f" * 40
+        )
         expected_error = "Simulation features differ"
     else:
         expected_error = "overview and detail disagree"
@@ -180,7 +204,9 @@ def test_macro_points_micro_requests_and_no_error_of_means():
 
 
 @pytest.mark.parametrize("backend,version", [("sglang", "0.5.21"), ("vllm", "0.31.0")])
-def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp_path, monkeypatch, backend, version):
+def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(
+    tmp_path, monkeypatch, backend, version
+):
     config = tmp_path / "config.json"
     config.write_text(
         json.dumps(
@@ -213,13 +239,17 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     modules = {
         "aisim": api,
         "aisim_core": SimpleNamespace(),
-        "aisim.compiler": SimpleNamespace(prediction_to_replay_spec=lambda value: value),
+        "aisim.compiler": SimpleNamespace(
+            prediction_to_replay_spec=lambda value: value
+        ),
         # No get_latest_database_version: the reviewed pin must take precedence.
         "aisim.sdk.perf_database": SimpleNamespace(),
         "aisim.replay.dashboard": SimpleNamespace(),
         # The predictor reads operation data from the default systems root; point it at the fixture
         # instead of downloading the pinned dataset.
-        "aisim_core.data.default_systems": SimpleNamespace(default_systems_path=lambda: tmp_path / "systems"),
+        "aisim_core.data.default_systems": SimpleNamespace(
+            default_systems_path=lambda: tmp_path / "systems"
+        ),
     }
     # predict() runs as its own process; here the opt-in it sets must not outlive the test.
     monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "0")
@@ -252,7 +282,9 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     packaged.parent.mkdir(parents=True)
     packaged.write_bytes(b"packaged fixture data")
     result = agentx_predict.predict(config, tmp_path)
-    assert result["reason"] == "replay_capability_unavailable"  # past the data check, stopped by the stub capability
+    assert (
+        result["reason"] == "replay_capability_unavailable"
+    )  # past the data check, stopped by the stub capability
     assert captured[0]["engine"]["backend_version"] == version
     captured.clear()
 
@@ -266,9 +298,71 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     assert "prediction_database_version" not in captured[0]
 
 
+@pytest.mark.parametrize("host_cpu", [None, "Intel(R) Xeon(R) Platinum 8559C"])
+def test_measured_cpu_overhead_needs_the_stated_serving_host_cpu(
+    tmp_path, monkeypatch, host_cpu
+):
+    config = {
+        "engine": {
+            "backend": "vllm",
+            "backend_version": "measured",
+            "hardware": "b300_sxm",
+        }
+    }
+    if host_cpu is not None:
+        config["serving_host_cpu"] = host_cpu
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({**config, "prediction_database_version": "0.31.0"}))
+    data = (
+        tmp_path
+        / "systems/data/b300_sxm/attention/vllm/0.31.0/context_attention_perf.parquet"
+    )
+    data.parent.mkdir(parents=True)
+    data.write_bytes(b"fixture data")
+    calls = []
+
+    def compile_spec(value, cpu_overhead_endpoint=None, cpu_overhead_host_cpu=None):
+        calls.append((value, cpu_overhead_endpoint, cpu_overhead_host_cpu))
+        return value
+
+    def unsupported(spec):
+        raise NotImplementedError("stub capability")
+
+    modules = {
+        "aisim": SimpleNamespace(
+            ReplayOutputRequirements=lambda **kwargs: kwargs,
+            CorePredictionConfig=SimpleNamespace(model_validate=lambda value: value),
+            EngineReplayRunnerFactory=lambda: SimpleNamespace(
+                capabilities=lambda: SimpleNamespace(require_compatible=unsupported)
+            ),
+        ),
+        "aisim_core": SimpleNamespace(),
+        "aisim.compiler": SimpleNamespace(prediction_to_replay_spec=compile_spec),
+        "aisim.sdk.perf_database": SimpleNamespace(),
+        "aisim.replay.dashboard": SimpleNamespace(),
+        "aisim_core.data.default_systems": SimpleNamespace(
+            default_systems_path=lambda: tmp_path / "systems"
+        ),
+    }
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "0")
+    monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
+    assert (
+        agentx_predict.predict(path, tmp_path)["reason"]
+        == "replay_capability_unavailable"
+    )
+    [(parsed, endpoint, cpu)] = calls
+    assert "serving_host_cpu" not in parsed
+    # The SKU alone never implies a host CPU: without a stated one, nothing is measured in.
+    assert (endpoint, cpu) == ((None, None) if host_cpu is None else ("chat", host_cpu))
+
+
 @pytest.mark.parametrize("missing", ["utils", "common", "lookup"])
-def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkeypatch, missing):
-    parsed = SimpleNamespace(engine=SimpleNamespace(model="test/model"), model_dump=lambda **_: {})
+def test_optional_wheel_feature_capabilities_report_unsupported(
+    tmp_path, monkeypatch, missing
+):
+    parsed = SimpleNamespace(
+        engine=SimpleNamespace(model="test/model"), model_dump=lambda **_: {}
+    )
     api = SimpleNamespace(
         ReplayOutputRequirements=lambda **_: {},
         CorePredictionConfig=SimpleNamespace(model_validate=lambda _: parsed),
@@ -286,7 +380,9 @@ def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkey
         if missing == "lookup"
         else SimpleNamespace(get_model_config_from_model_path=lambda _: {}),
         "aisim_core.sdk.common": SimpleNamespace(),
-        "aisim_core.data.default_systems": SimpleNamespace(default_systems_path=lambda: tmp_path / "systems"),
+        "aisim_core.data.default_systems": SimpleNamespace(
+            default_systems_path=lambda: tmp_path / "systems"
+        ),
     }
 
     def import_module(name):
@@ -296,12 +392,20 @@ def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkey
 
     monkeypatch.setattr(agentx_predict, "runtime_module", import_module)
     monkeypatch.setattr(agentx_predict, "asdict", lambda value: value)
-    data = tmp_path / "systems/data/b300_sxm/attention/vllm/0.31.0/context_attention_perf.parquet"
+    data = (
+        tmp_path
+        / "systems/data/b300_sxm/attention/vllm/0.31.0/context_attention_perf.parquet"
+    )
     data.parent.mkdir(parents=True)
     data.write_bytes(b"synthetic op-data")
     config = tmp_path / "config.json"
     config.write_bytes(
-        canonical({"engine": {"backend": "vllm", "hardware": "B300"}, "prediction_database_version": "0.31.0"})
+        canonical(
+            {
+                "engine": {"backend": "vllm", "hardware": "B300"},
+                "prediction_database_version": "0.31.0",
+            }
+        )
     )
     (tmp_path / "feature-context.json").write_text("{}")
     assert agentx_predict.predict(config, tmp_path) == {
@@ -330,7 +434,11 @@ def test_driver_digest_includes_runtime_namespace_selection():
 
     def changed(name):
         content = (root / name).read_bytes()
-        return content + b"\n# changed namespace policy\n" if name == "scripts/release/package_identity.py" else content
+        return (
+            content + b"\n# changed namespace policy\n"
+            if name == "scripts/release/package_identity.py"
+            else content
+        )
 
     assert driver_digest(changed) != driver_digest()
 
@@ -348,12 +456,18 @@ def test_portable_driver_digest_tracks_cache_validation_location(historical):
     files["scripts/e2e_accuracy/agentx_contract.py"] = b'"agentx_inputs.py"'
     if historical:
         names += ("../../benchmarks/evidence/accuracy/qwen-weka/cache_probe.py",)
-        files["scripts/e2e_accuracy/agentx_inputs.py"] = b"importlib.util.spec_from_file_location"
-        files["benchmarks/evidence/accuracy/qwen-weka/cache_probe.py"] = b"historical geometry"
+        files["scripts/e2e_accuracy/agentx_inputs.py"] = (
+            b"importlib.util.spec_from_file_location"
+        )
+        files["benchmarks/evidence/accuracy/qwen-weka/cache_probe.py"] = (
+            b"historical geometry"
+        )
     expected = hashlib.sha256(
         canonical(
             {
-                name: hashlib.sha256(files[posixpath.normpath("scripts/e2e_accuracy/" + name)]).hexdigest()
+                name: hashlib.sha256(
+                    files[posixpath.normpath("scripts/e2e_accuracy/" + name)]
+                ).hexdigest()
                 for name in names
             }
         )
@@ -416,7 +530,9 @@ def test_profile_cutoff_accepts_accounted_client_cancellation_without_hiding_ser
     assert native["telemetry"]["completion_status"] == "server_unsettled"
     assert native["agentic_profile"]["server_unsettled_requests"] == 1
     assert not native_completion_qualified(native, "complete_finite_cohort")
-    assert native_completion_qualified({"telemetry": {"completion_status": "completed"}}, "complete_finite_cohort")
+    assert native_completion_qualified(
+        {"telemetry": {"completion_status": "completed"}}, "complete_finite_cohort"
+    )
 
 
 @pytest.mark.parametrize(
@@ -434,7 +550,9 @@ def test_profile_cutoff_accepts_accounted_client_cancellation_without_hiding_ser
         ("finished_at_ms", 640_001),
     ],
 )
-def test_unsettled_profile_requires_complete_accounting_and_bounded_deadlines(field, value):
+def test_unsettled_profile_requires_complete_accounting_and_bounded_deadlines(
+    field, value
+):
     native = cutoff_native()
     native["agentic_profile"][field] = value
     assert not native_completion_qualified(native, "successful_profile_span")
@@ -471,12 +589,16 @@ def test_unsettled_profile_rejects_unexplained_work_and_incomplete_replays(case)
     elif case == "timeout":
         telemetry["completion_status"] = "time_limited"
     else:
-        telemetry["phase_boundaries"].append({"phase": "preparation", "completion_status": "aborted"})
+        telemetry["phase_boundaries"].append(
+            {"phase": "preparation", "completion_status": "aborted"}
+        )
     assert not native_completion_qualified(native, "successful_profile_span")
 
 
 def test_every_measured_request_accounted_and_metric_denominators():
-    actual = [observation(str(i)) for i in range(7)] + [observation("warm", phase="preparation")]
+    actual = [observation(str(i)) for i in range(7)] + [
+        observation("warm", phase="preparation")
+    ]
     actual[1]["status"] = "failed"
     actual[6].update(ttft_ms=0, tpot_ms=None)
     predicted = [
@@ -502,7 +624,11 @@ def test_every_measured_request_accounted_and_metric_denominators():
         "unmatched_predictions": 1,
         "input_length_mismatch": 1,
     }
-    assert x["request_errors"]["ttft_ms"]["count"] == x["request_errors"]["tpot_ms"]["count"] == 1
+    assert (
+        x["request_errors"]["ttft_ms"]["count"]
+        == x["request_errors"]["tpot_ms"]["count"]
+        == 1
+    )
     assert len(x["pairs"]) == 7
     assert x["pairs"][6]["ttft_ms_ape"] is None
 
@@ -523,11 +649,15 @@ def test_units_finite_cohort_delays_and_profile_boundary():
     assert x["silicon"]["ttft_ms"] == 100
     assert all(v is None for v in x["point_errors"].values())
     assert x["request_errors"]["ttft_ms"]["count"] == 0
-    ambiguous = score([observation(), observation()], [observation()], "successful_profile_span")
+    ambiguous = score(
+        [observation(), observation()], [observation()], "successful_profile_span"
+    )
     assert ambiguous["coverage"]["ambiguous_measurement"] == 2
     assert ambiguous["coverage"]["measured"] == len(ambiguous["pairs"]) == 2
     assert ambiguous["request_errors"]["ttft_ms"]["count"] == 0
-    unknown = score([observation(identity_valid=False)], [observation()], "successful_profile_span")
+    unknown = score(
+        [observation(identity_valid=False)], [observation()], "successful_profile_span"
+    )
     assert unknown["coverage"]["missing_measurement_identity"] == 1
     assert unknown["request_errors"]["ttft_ms"]["count"] == 0
     excluded = score(
@@ -557,7 +687,9 @@ def test_qwen_preparation_relabel_and_native_milliseconds():
             ]
         }
     }
-    rows = normalize_native(native, [observation("warm", phase="preparation")], "self_collected")
+    rows = normalize_native(
+        native, [observation("warm", phase="preparation")], "self_collected"
+    )
     assert rows[0]["phase"] == "preparation"
     assert rows[0]["ttft_ms"] == 300
     assert rows[0]["tpot_ms"] is None
@@ -629,7 +761,11 @@ def test_checksum_failure_before_replay(tmp_path):
     with pytest.raises(ValueError, match="checksum"):
         artifact(
             tmp_path,
-            {"artifacts": {"trace": {"path": "data.json", "sha256": "a" * 64, "bytes": 7}}},
+            {
+                "artifacts": {
+                    "trace": {"path": "data.json", "sha256": "a" * 64, "bytes": 7}
+                }
+            },
             "trace",
         )
 
@@ -742,14 +878,23 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
     snapshot = json.loads(bundle()["summary.json"])["snapshot"]
     del snapshot["completed_at"]
     snapshot.update(cohort_sha256=catalog["snapshot_id"], driver_sha256=driver_digest())
-    args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
+    args = Namespace(
+        inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public"
+    )
     for selected in ([], [run, run], [{**run, "model": "wrong/model"}]):
-        (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": selected}))
+        (tmp_path / "shard-0.json").write_bytes(
+            canonical({"snapshot": snapshot, "runs": selected})
+        )
         with pytest.raises(ValueError):
             qualify(args)
-    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [run]}))
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "runs": [run]})
+    )
     qualify(args)
-    files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
+    files = {
+        p.relative_to(args.output).as_posix(): p.read_bytes()
+        for p in args.output.rglob("*.json")
+    }
     assert validate_bundle(files)["runs"][0]["id"] == run["id"]
 
 
@@ -774,7 +919,9 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
         "result_drift",
     ],
 )
-def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_path, problem):
+def test_new_self_collected_publication_requires_retained_complete_receipts(
+    tmp_path, problem
+):
     from argparse import Namespace
 
     from test_benchmark_features import metadata, silicon_metadata
@@ -810,8 +957,14 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
         indexed["speculation"].update(
             state="enabled",
             parameters=[
-                {"name": "method", "value": "unknown" if problem == "speculation_method" else "mtp"},
-                {"name": "draft_length", "value": None if problem == "speculation_length" else 3},
+                {
+                    "name": "method",
+                    "value": "unknown" if problem == "speculation_method" else "mtp",
+                },
+                {
+                    "name": "draft_length",
+                    "value": None if problem == "speculation_length" else 3,
+                },
             ],
         )
     elif problem == "disabled_speculation":
@@ -837,8 +990,12 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
         run["feature_metadata"]["features"][0]["state"] = "not_applicable"
     snapshot = json.loads(bundle()["summary.json"])["snapshot"]
     snapshot.update(cohort_sha256=catalog["snapshot_id"], driver_sha256=driver_digest())
-    args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
-    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [run]}))
+    args = Namespace(
+        inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public"
+    )
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "runs": [run]})
+    )
     if problem is not None:
         with pytest.raises(ValueError):
             qualify(args)
@@ -848,10 +1005,16 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
                 validate_bundle(bundle(run))
     else:
         qualify(args)
-        files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
+        files = {
+            p.relative_to(args.output).as_posix(): p.read_bytes()
+            for p in args.output.rglob("*.json")
+        }
         published = validate_bundle(files)["runs"][0]["feature_metadata"]
         assert published == features
-        assert all(row["observed"] == {"state": "unknown", "count": None} for row in published["features"])
+        assert all(
+            row["observed"] == {"state": "unknown", "count": None}
+            for row in published["features"]
+        )
 
 
 @pytest.mark.parametrize("incomplete_first", [True, False])
@@ -866,7 +1029,9 @@ def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(
     release = "release/0.14.0"
     incomplete = silicon_metadata("fresh-weka")
     incomplete["features"][0].update(state="unknown", evidence=[])
-    incomplete_run = result(id="fresh-weka", category="self_collected", feature_metadata=incomplete)
+    incomplete_run = result(
+        id="fresh-weka", category="self_collected", feature_metadata=incomplete
+    )
     if missing_metadata:
         del incomplete_run["feature_metadata"]
     archives, artifacts, jobs = {}, [], []
@@ -885,7 +1050,9 @@ def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(
                 zipped.writestr(name, content)
         archives[identity] = archive.getvalue()
         key = publisher.artifact_key(branch)
-        artifacts.append({"id": identity, "name": f"e2e-agentx-web-{key}", "expired": False})
+        artifacts.append(
+            {"id": identity, "name": f"e2e-agentx-web-{key}", "expired": False}
+        )
         jobs.append(
             {
                 "name": f"Qualify AgentX accuracy ({key})",
@@ -917,10 +1084,16 @@ def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(
     def git(args, **kwargs):
         if "for-each-ref" in args:
             return release + "\n"
-        return (Path(__file__).resolve().parents[1] / args[-1].split(":", 1)[1]).read_bytes()
+        return (
+            Path(__file__).resolve().parents[1] / args[-1].split(":", 1)[1]
+        ).read_bytes()
 
     monkeypatch.setattr(publisher, "api", api)
-    monkeypatch.setattr(publisher, "api_items", lambda path, _: artifacts if path.endswith("/artifacts") else jobs)
+    monkeypatch.setattr(
+        publisher,
+        "api_items",
+        lambda path, _: artifacts if path.endswith("/artifacts") else jobs,
+    )
     monkeypatch.setattr(publisher, "ancestor", lambda *args: True)
     monkeypatch.setattr(publisher.subprocess, "check_output", git)
     output = tmp_path / "published"
@@ -928,7 +1101,10 @@ def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(
     assert not (output / publisher.artifact_key("main")).exists()
     accepted = output / publisher.artifact_key(release)
     assert validate_bundle(
-        {path.relative_to(accepted).as_posix(): path.read_bytes() for path in accepted.rglob("*.json")}
+        {
+            path.relative_to(accepted).as_posix(): path.read_bytes()
+            for path in accepted.rglob("*.json")
+        }
     )
     assert json.loads((output / "updates.json").read_text()) == {
         "main": {"status": "failed", "run_id": "123"},
@@ -993,7 +1169,9 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(
     def git(args, **kwargs):
         if "for-each-ref" in args:
             return ""
-        return (Path(__file__).resolve().parents[1] / args[-1].split(":", 1)[1]).read_bytes()
+        return (
+            Path(__file__).resolve().parents[1] / args[-1].split(":", 1)[1]
+        ).read_bytes()
 
     monkeypatch.setattr(publisher.subprocess, "check_output", git)
     publisher.prepare(tmp_path, tmp_path / "accepted")
@@ -1001,7 +1179,10 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(
     job["conclusion"] = "failure"
     publisher.prepare(tmp_path, tmp_path / "failed")
     assert not (tmp_path / "failed" / key).exists()
-    assert json.loads((tmp_path / "failed/updates.json").read_text())["main"]["status"] == "failed"
+    assert (
+        json.loads((tmp_path / "failed/updates.json").read_text())["main"]["status"]
+        == "failed"
+    )
     job["head_sha"] = "e" * 40
     with pytest.raises(ValueError, match="Untrusted"):
         publisher.prepare(tmp_path, tmp_path / "foreign")
@@ -1014,7 +1195,9 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(
     job["conclusion"] = "success"
     features = silicon_metadata("fresh-weka")
     features["features"][0].update(state="unknown", evidence=[])
-    incomplete_run = result(id="fresh-weka", category="self_collected", feature_metadata=features)
+    incomplete_run = result(
+        id="fresh-weka", category="self_collected", feature_metadata=features
+    )
     if missing_metadata:
         del incomplete_run["feature_metadata"]
     files = bundle(incomplete_run)
@@ -1029,7 +1212,10 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(
             zipped.writestr(name, content)
     publisher.prepare(tmp_path, tmp_path / "incomplete")
     assert not (tmp_path / "incomplete" / key).exists()
-    assert json.loads((tmp_path / "incomplete/updates.json").read_text())["main"]["status"] == "failed"
+    assert (
+        json.loads((tmp_path / "incomplete/updates.json").read_text())["main"]["status"]
+        == "failed"
+    )
     # Recoverable receipt age cannot bypass exact producer verification.
     corrupted = dict(files)
     if incomplete_corruption == "job":
@@ -1038,12 +1224,16 @@ def test_publisher_requires_successful_trusted_job_and_exact_driver(
     else:
         for name in ("summary.json", "details/fresh-weka.json"):
             value = json.loads(corrupted[name])
-            value["snapshot"]["driver_sha256" if incomplete_corruption == "driver" else "run_id"] = (
-                "f" * 64 if incomplete_corruption == "driver" else "999"
-            )
+            value["snapshot"][
+                "driver_sha256" if incomplete_corruption == "driver" else "run_id"
+            ] = "f" * 64 if incomplete_corruption == "driver" else "999"
             corrupted[name] = canonical(value)
         seal(corrupted)
-        expected_error = "driver differs" if incomplete_corruption == "driver" else "attempt mismatch"
+        expected_error = (
+            "driver differs"
+            if incomplete_corruption == "driver"
+            else "attempt mismatch"
+        )
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as zipped:
         for name, content in corrupted.items():

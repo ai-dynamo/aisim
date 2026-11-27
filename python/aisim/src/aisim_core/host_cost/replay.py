@@ -20,6 +20,7 @@ to other data.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -75,11 +76,21 @@ def measured_overhead(
 ) -> HostOverhead | None:
     """The measured overhead of this deployment on host CPU ``host_cpu``, or ``None`` when it has not been measured."""
     pin = _pin(os.environ if env is None else env)
-    return _cached(pin, backend, backend_version, endpoint, system, host_cpu, model)
+    args = (pin, backend, backend_version, endpoint, system, host_cpu, model)
+    # Only a full commit SHA is immutable; a local directory or a branch can be republished in place, so it is read
+    # again. Callers get their own copy either way.
+    found = _cached(*args) if pin.local_root is None and _FULL_SHA.fullmatch(pin.revision or "") else _read(*args)
+    return copy.deepcopy(found)
 
 
 @lru_cache(maxsize=64)
 def _cached(
+    pin: DataPin, backend: str, backend_version: str, endpoint: str, system: str, host_cpu: str, model: str
+) -> HostOverhead | None:
+    return _read(pin, backend, backend_version, endpoint, system, host_cpu, model)
+
+
+def _read(
     pin: DataPin, backend: str, backend_version: str, endpoint: str, system: str, host_cpu: str, model: str
 ) -> HostOverhead | None:
     config = {

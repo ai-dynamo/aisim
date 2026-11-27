@@ -217,7 +217,7 @@ Both stages can be filled from measurements instead of by hand. A caller opts
 in by naming the request endpoint and the serving nodes' host CPU model, for
 example `prediction_to_replay_spec(config, cpu_overhead_endpoint="chat",
 cpu_overhead_host_cpu="Intel(R) Xeon(R) Platinum 8559C")`; the AgentX accuracy
-harness does this for B300. The two arguments go together: a system name does
+harness does this when run with `--serving-host-cpu`. The two arguments go together: a system name does
 not say which CPU its hosts have. Replay then reads the
 [host-cost data](../../reference/host-cost-schema.md) of the dataset revision
 pinned in `aisim_core/data/host_cost_pin.json`, keyed by backend, backend
@@ -235,6 +235,12 @@ version, endpoint, host CPU and tokenizer:
   below it, else the nearest above). An omitted `engine.backend_version` is
   the `current` default and resolves the way replay resolves it for the
   performance data. Host CPU, tokenizer and endpoint must match exactly.
+- The vLLM tokenizer measurement includes prefix-cache block hashing, which
+  vLLM runs only with prefix caching on (its default). The fit is applied
+  whatever `prefix_caching` says; with prefix caching off it overstates the
+  queued tokenizer stage (on B300 Qwen2, 1.532 instead of about
+  1.230 µs/token without hashing). Set `engine.tokenization` by hand for that
+  case.
 - A deployment with no tokenizer measurement gets nothing: there is no
   default. Online replay, adapters, AFD, encoder pools and SGLang frontend
   stages are left unchanged.

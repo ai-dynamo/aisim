@@ -367,7 +367,7 @@ def public_report(payload, observations, category, boundary="complete_finite_coh
     )
 
 
-def run_one(root, run, directory, timeout, context):
+def run_one(root, run, directory, timeout, context, serving_host_cpu=None):
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "feature-context.json").write_bytes(canonical(context))
     observations = read(artifact(root, run, "observations"))
@@ -376,6 +376,10 @@ def run_one(root, run, directory, timeout, context):
     trace = prepare_trace(root, run, directory)
     config = replay_config(root, run)
     config["traffic"]["source"]["paths"] = [str(trace.resolve())]
+    if serving_host_cpu is not None:
+        # No receipt records the serving nodes' CPU; the operator states it, and only then is measured CPU overhead
+        # applied.
+        config["serving_host_cpu"] = serving_host_cpu
     config_path = directory / "input-config.json"
     config_path.write_bytes(canonical(config))
     with (directory / "replay.log").open("w") as log:
@@ -506,6 +510,7 @@ def campaign(args):
                 "evaluated_revision": args.commit,
                 "dataset_revision": args.revision,
             },
+            args.serving_host_cpu,
         )
         for run in selected
     ]
@@ -621,6 +626,11 @@ if __name__ == "__main__":
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shards", type=Path)
     parser.add_argument("--point-timeout", type=int, default=1200)
+    parser.add_argument(
+        "--serving-host-cpu",
+        help="Host CPU model of the nodes every selected point was served on (as lscpu reports it); enables the "
+        "measured CPU overhead in replay. Omit when any point's serving CPU is not verified.",
+    )
     args = parser.parse_args()
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         parser.error("Invalid shard selection")

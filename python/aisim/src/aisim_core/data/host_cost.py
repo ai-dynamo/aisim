@@ -392,8 +392,10 @@ def check_entry(root: str | Path, path: str) -> Manifest:
     rows = [HostCostRow(**row) for row in table.to_pylist()]
     recomputed = fit_rows([row.model_dump() for row in rows])
     stored = read_fit(manifest)
-    if abs(recomputed.per_input_token_us - stored.per_input_token_us) > 1e-9 * max(1.0, abs(stored.per_input_token_us)):
-        raise ValueError("stored fit differs from the fit of the rows")
+    for name in ("base_ms", "per_input_token_us"):
+        want, have = getattr(recomputed, name), getattr(stored, name)
+        if abs(want - have) > 1e-9 * max(1.0, abs(have)):
+            raise ValueError(f"stored fit {name} differs from the fit of the rows")
     return manifest
 
 

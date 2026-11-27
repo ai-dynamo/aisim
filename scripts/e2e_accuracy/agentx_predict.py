@@ -31,10 +31,6 @@ def _op_data_root():
     return Path(default_systems.default_systems_path()) / "data"
 
 
-# Host CPU of the AgentX campaign's serving nodes, per system (as recorded by the host-cost runs on those nodes).
-AGENTX_HOST_CPU = {"b300_sxm": "Intel(R) Xeon(R) Platinum 8559C"}
-
-
 def predict(config_path, output):
     started = time.monotonic()
     # Branch wheels have different capabilities. Import inside this isolated
@@ -52,6 +48,7 @@ def predict(config_path, output):
     config = json.loads(config_path.read_text())
     engine = config["engine"]
     pinned = config.pop("prediction_database_version", None)
+    host_cpu = config.pop("serving_host_cpu", None)
     version = pinned or database.get_latest_database_version(system=engine["hardware"], backend=engine["backend"])
     if not version:
         return {"outcome": "unsupported", "reason": "database_unavailable"}
@@ -74,9 +71,8 @@ def predict(config_path, output):
     if not data_file.is_file():
         return {"outcome": "unsupported", "reason": "database_unavailable", "prediction_backend_version": version}
     parsed = api.CorePredictionConfig.model_validate(config)
-    # AgentX replays real chat requests: apply the measured serving-path CPU overhead where the wheel has it, for the
-    # host CPU of the campaign's serving nodes.
-    host_cpu = AGENTX_HOST_CPU.get(engine["hardware"])
+    # AgentX replays real chat requests: apply the measured serving-path CPU overhead where the wheel has it, only
+    # when the operator stated the serving nodes' host CPU (no receipt records it; the SKU does not determine it).
     overhead = (
         {"cpu_overhead_endpoint": "chat", "cpu_overhead_host_cpu": host_cpu}
         if host_cpu is not None
