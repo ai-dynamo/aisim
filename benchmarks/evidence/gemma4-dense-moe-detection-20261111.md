@@ -24,8 +24,9 @@ search-space AFD pin, `0c331e377` keeps a dense checkpoint's omitted MoE width a
 `1`, `59344e5df` resolves an omitted pair at attention width one,
 `2a126f94e` pins the routed rejection on the capacity bridge, `64b4f53d9`
 states the width rule in the legacy CLI help, and `5a3fea421` resolves the
-width-one omission in `ModelConfig` too. The commit after `5a3fea421` changes
-only this document.
+width-one omission in `ModelConfig` too. The commits after `5a3fea421` change
+only documentation: `baa7d698c` corrects the fallback-eligibility list in
+`docs/perf-model/memory.md`, and the commit after it changes only this document.
 See [Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -64,7 +65,8 @@ hardware-fact and preflight pins, `474614019` adds the search-space AFD pin,
 resolves an omitted pair at attention width one, `2a126f94e` pins the routed
 rejection on the capacity bridge, `64b4f53d9` states the width rule in the
 legacy CLI help, and `5a3fea421` resolves the width-one omission in
-`ModelConfig`. The commit after `5a3fea421` changes only this document. Everything sits on
+`ModelConfig`. The commits after `5a3fea421` change only documentation
+(`memory.md` and this document). Everything sits on
 three merges of `main` on top of the reviewed
 commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
