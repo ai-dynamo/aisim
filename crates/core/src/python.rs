@@ -4839,18 +4839,21 @@ fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult
 
 /// Compact initialized worker fields for a hash-bound onboarding observation.
 #[pyfunction]
-#[pyo3(signature = (records, architecture=None, kv_cache_bytes=None))]
+#[pyo3(signature = (records, architecture=None, kv_cache_bytes=None, cache_groups=None))]
 fn nixl_worker_observations(
     records: &str,
     architecture: Option<&str>,
     kv_cache_bytes: Option<u64>,
+    cache_groups: Option<&str>,
 ) -> PyResult<String> {
-    let parsed: serde_json::Value = serde_json::from_str(records)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let parse = |s: &str| {
+        serde_json::from_str(s).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    };
     Ok(crate::perfmodel::fpm::NixlIdentity::compact_observation(
-        &parsed,
+        &parse(records)?,
         architecture,
         kv_cache_bytes,
+        cache_groups.map(parse).transpose()?.as_ref(),
     )
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
     .to_string())

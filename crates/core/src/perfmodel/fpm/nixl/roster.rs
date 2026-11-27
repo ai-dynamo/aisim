@@ -436,13 +436,31 @@ fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError>
         if stride == 0 && (hybrid || !allocation["shared_by"].is_array()) {
             return Err(capacity_conflict());
         }
-        for name in allocation["layers"]
-            .as_array()
-            .or(allocation["shared_by"].as_array())
-            .ok_or_else(capacity_conflict)?
-        {
+        let offset = allocation["offset"]
+            .as_u64()
+            .ok_or_else(capacity_conflict)?;
+        let (layers, layer_stride) = if let Some(layers) = allocation["layers"].as_array() {
+            (
+                layers,
+                allocation["layer_stride"]
+                    .as_u64()
+                    .ok_or_else(capacity_conflict)?,
+            )
+        } else {
+            (
+                allocation["shared_by"]
+                    .as_array()
+                    .ok_or_else(capacity_conflict)?,
+                0,
+            )
+        };
+        for (index, name) in layers.iter().enumerate() {
             let name = name.as_str().ok_or_else(capacity_conflict)?;
-            if allocations.insert(name, (id, stride)).is_some() {
+            let start = layer_stride
+                .checked_mul(index as u64)
+                .and_then(|n| n.checked_add(offset))
+                .ok_or_else(capacity_conflict)?;
+            if allocations.insert(name, (id, stride, start)).is_some() {
                 return Err(capacity_conflict());
             }
         }
@@ -454,7 +472,8 @@ fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError>
             .ok_or_else(capacity_conflict)?
         {
             let name = name.as_str().ok_or_else(capacity_conflict)?;
-            let (storage, stride) = allocations.remove(name).ok_or_else(capacity_conflict)?;
+            let (storage, stride, start) =
+                allocations.remove(name).ok_or_else(capacity_conflict)?;
             let saved = tensors.get(name).ok_or_else(capacity_conflict)?;
             if saved.is_array() != hybrid {
                 return Err(capacity_conflict());
@@ -474,7 +493,24 @@ fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError>
                     .as_u64()
                     .and_then(|n| usize::try_from(n).ok())
                     .ok_or_else(capacity_conflict)?;
-                if view["storage_id"] != storage || !block.is_multiple_of(kernel) {
+                let offset = view["storage_offset_bytes"]
+                    .as_u64()
+                    .ok_or_else(capacity_conflict)?;
+                // The indexed single-view layouts start at the recorded layer offset.
+                // v0.33 can place multiple state or attention views inside the layer's page.
+                let inside_layer = if hybrid {
+                    offset
+                        .checked_sub(start)
+                        .zip(group["layer_specs"][name]["page_size_bytes"].as_u64())
+                        .is_some_and(|(within, page)| within < page)
+                } else {
+                    offset == start
+                };
+                if view["storage_id"] != storage
+                    || !inside_layer
+                    || offset >= storages[storage]
+                    || !block.is_multiple_of(kernel)
+                {
                     return Err(capacity_conflict());
                 }
                 let ratio = block / kernel;
@@ -618,7 +654,8 @@ fn rank_limits(entry: &Value, mut page: Option<u64>) -> Result<(Option<u64>, boo
                 workers.insert((pool(record), record["tp_rank"].as_u64()), record);
             }
             Some("scheduler") => {
-                schedulers.insert(pool(record), &record["cache"]);
+                pool_field("num_blocks", &[cache, &record["raw_cache_config"]])?;
+                schedulers.insert(pool(record), cache);
             }
             _ => {}
         }
@@ -1334,6 +1371,8 @@ pub(super) fn validate_source(
     if !identified_source(entry) {
         return Ok(false);
     }
+    let mut tp = selected_tp;
+    let mut dp = None;
     for record in std::iter::once(entry).chain(
         entry["artifacts"]
             .as_array()
@@ -1346,6 +1385,25 @@ pub(super) fn validate_source(
             &record["runtime_settings"]["parallel_config"],
             &record["resolved_config"]["parallel_config"],
         ];
+        for (axis, field, size) in [
+            ("tp", "tensor_parallel_size", &mut tp),
+            ("dp", "data_parallel_size", &mut dp),
+        ] {
+            for value in [
+                topology.get(axis),
+                configs[0].get(field),
+                configs[1].get(field),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|v| !v.is_null())
+            {
+                let value = super::positive(value).ok_or_else(invalid)?;
+                if size.replace(value).is_some_and(|saved| saved != value) {
+                    return Err(invalid());
+                }
+            }
+        }
         if ["pp", "cp"].iter().any(|key| {
             topology
                 .get(*key)
@@ -1368,27 +1426,10 @@ pub(super) fn validate_source(
             return Err(invalid());
         }
     }
-    let parallel = &entry["runtime_settings"]["parallel_config"];
-    let topology = &entry["launch"]["topology"];
-    let axis = |saved: &str, initialized: &str| {
-        let a = topology[saved].as_u64();
-        let b = parallel[initialized].as_u64();
-        if a.zip(b).is_some_and(|(x, y)| x != y) {
-            Err(invalid())
-        } else {
-            Ok(a.or(b))
-        }
-    };
-    let tp = axis("tp", "tensor_parallel_size")?;
-    let width = tp
-        .zip(axis("dp", "data_parallel_size")?)
-        .and_then(|(t, d)| t.checked_mul(d));
-    if tp.zip(selected_tp).is_some_and(|(a, b)| a != b)
-        || width.zip(selected_width).is_some_and(|(a, b)| a != b)
-    {
+    let width = tp.zip(dp).and_then(|(t, d)| t.checked_mul(d));
+    if width.zip(selected_width).is_some_and(|(a, b)| a != b) {
         return Err(invalid());
     }
-    let tp = tp.or(selected_tp);
     let width = width.or(selected_width);
     let capacities = entry["rank_capacities"].as_array();
     if capture != Capture::Full {
@@ -2075,19 +2116,19 @@ mod tests {
             "spec_page_size_bytes":96,"pool_id":"pool","block_size_tokens":8,"layer_names":["a","b"],
             "layer_specs":{"a":spec,"b":spec}}]});
         let mut worker = json!({"num_blocks":100,"layer_tensors":{"a":[{"block_axis":0,
-            "kernel_block_size_tokens":4,"kernel_block_stride":3,"shape":[299,2],"stride_bytes":[32,2],"storage_id":"s"}]},
+            "kernel_block_size_tokens":4,"kernel_block_stride":3,"shape":[299,2],"stride_bytes":[32,2],"storage_id":"s","storage_offset_bytes":4}]},
             "storages":[{"storage_id":"s","size_bytes":9600}],"model_runner":{"kernel_block_sizes":[4]},
-            "tensor_allocations":[{"layers":["a"],"block_stride":96,"storage_id":"s","size":9600}]});
+            "tensor_allocations":[{"layers":["a"],"layer_stride":96,"block_stride":96,"offset":0,"storage_id":"s","size":9600}]});
         let groups = [group];
         check_scheduler_groups(&groups, &scheduler).unwrap();
         let measured = [
-            json!({"block_size_tokens":8,"layer_names":["a"],"layer_specs":{"a":{"tokens_per_state":2}}}),
+            json!({"block_size_tokens":8,"layer_names":["a"],"layer_specs":{"a":{"tokens_per_state":2,"page_size_bytes":96}}}),
         ];
         check_tensor_blocks(&worker, &measured).unwrap();
         let mut shared = worker.clone();
         shared["tensor_allocations"] =
-            json!([{"shared_by":["a"],"storage_id":"s","size":9600,"block_stride":0}]);
-        shared["layer_tensors"]["a"] = json!({"storage_id":"s","block_axis":0,
+            json!([{"shared_by":["a"],"storage_id":"s","size":9600,"block_stride":0,"offset":0}]);
+        shared["layer_tensors"]["a"] = json!({"storage_id":"s","storage_offset_bytes":0,"block_axis":0,
             "kernel_block_size_tokens":8,"shape":[100,2],"stride_bytes":[96,2]});
         check_tensor_blocks(
             &shared,

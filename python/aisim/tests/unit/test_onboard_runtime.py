@@ -3351,8 +3351,16 @@ def _with_transfer_bytes(group):
     ids=["wrong_marker", "missing_other_key", "transfer_bytes_without_a_measurement"],
 )
 def test_a_saved_draft_with_other_group_differences_is_refused(tmp_path, capsys, monkeypatch, edit):
+    from aisim.support import runtime
     from aisim.support.runtime import verify_runtime_profile
 
+    # Reproduce the earlier draft writer: it projected workers without the selected groups.
+    project = runtime._worker_observations
+
+    def old_writer(*args, cache_groups, **kwargs):
+        return project(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_worker_observations", old_writer)
     _save_as(monkeypatch, edit)
     _, _, request, _ = _imported(tmp_path, capsys, layout="mamba_hybrid")
     monkeypatch.undo()

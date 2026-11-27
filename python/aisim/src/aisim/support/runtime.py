@@ -400,6 +400,7 @@ def _worker_observations(
     *,
     checkpoint: Path | None = None,
     kv_cache_bytes: int | None = None,
+    cache_groups: list[dict[str, Any]] | None = None,
 ) -> list:
     from aisim import _runtime
 
@@ -414,7 +415,12 @@ def _worker_observations(
             record = {**record, "launch": launch}
         records.append({**item, "evidence": record})
     return json.loads(
-        _runtime.nixl_worker_observations(json.dumps({**evidence, "artifacts": records}), architecture, kv_cache_bytes)
+        _runtime.nixl_worker_observations(
+            json.dumps({**evidence, "artifacts": records}),
+            architecture,
+            kv_cache_bytes,
+            json.dumps(cache_groups) if cache_groups is not None else None,
+        )
     )
 
 
@@ -484,6 +490,7 @@ def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str, invent
             architecture,
             checkpoint=staged if staged.is_file() else None,
             kv_cache_bytes=inventory["observed_resources"]["runtime_memory"]["kv_cache_bytes"],
+            cache_groups=inventory["observed_resources"]["cache_groups"],
         )
         if version := evidence.get("runtime", {}).get("version"):
             snapshot["runtime"] = {"version": version}

@@ -1544,6 +1544,94 @@ def test_nixl_compaction_checks_named_and_physical_layouts(tmp_path, field, head
             _merge_resources([result["resources"]], {}, source_references=True)
 
 
+def test_nixl_archive_checks_selected_groups_in_both_phases(tmp_path):
+    from aisim import _runtime
+    from aisim.support.finalization import _merge_resources
+
+    path, launch = _strided_fixture(tmp_path)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = result["resources"]
+
+    def raw():
+        _runtime.GroupedPdObservation(
+            "decode",
+            (resources["runtime_memory"]["provenance"], None, "auto"),
+            groups=json.dumps(resources["cache_groups"]),
+        )
+
+    raw()
+    _merge_resources([resources], {}, source_references=True)
+    group = resources["cache_groups"][0]
+    original = group["block_size_tokens"]
+    group["block_size_tokens"] = 2 * original
+    with pytest.raises(ValueError, match="block_size_tokens"):
+        raw()
+    with pytest.raises(ValueError, match="block_size_tokens"):
+        _merge_resources([resources], {}, source_references=True)
+    group["block_size_tokens"] = original
+
+    evidence = result["provenance"]
+    for file in evidence["artifacts"]:
+        record = file["evidence"]
+        if record["phase"] == "decode":
+            group = record["cache"]["groups"][0]
+            group.update(spec_type="vllm.v1.kv_cache_interface.SlidingWindowSpec", sliding_window=32)
+    resources["runtime_memory"]["provenance"] = json.dumps(evidence)
+    with pytest.raises(ValueError, match="sliding_window"):
+        raw()
+    with pytest.raises(ValueError, match="sliding_window"):
+        _merge_resources([resources], {}, source_references=True)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["scheduler_raw_blocks", "worker_tp", "scheduler_dp", "allocation_offset", "second_layer_offset"],
+)
+def test_nixl_archive_checks_recorded_pool_topology_and_view_offsets(tmp_path, change):
+    from aisim import _runtime
+    from aisim.support.finalization import _merge_resources
+
+    # Two layers of one non-dense allocation use different byte offsets.
+    path, launch = _strided_fixture(tmp_path, layout="LHBNC")
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = result["resources"]
+    _runtime.observed_model_dtype(resources["runtime_memory"]["provenance"])
+    _merge_resources([resources], {}, source_references=True)
+
+    def edit(record):
+        if record["phase"] != "decode" or record["dp_rank"] != 0:
+            return
+        cache = record["cache"]
+        if record["kind"] == "scheduler":
+            if change == "scheduler_raw_blocks":
+                record.setdefault("raw_cache_config", {})["num_blocks"] = cache["num_blocks"] - 1
+            elif change == "scheduler_dp":
+                record["resolved_config"]["parallel_config"]["data_parallel_size"] *= 2
+        elif record["tp_rank"] == 1:
+            if change == "worker_tp":
+                record["resolved_config"]["parallel_config"]["tensor_parallel_size"] *= 2
+            elif change == "allocation_offset":
+                cache["tensor_allocations"][0]["offset"] = cache["storages"][0]["size_bytes"]
+            elif change == "second_layer_offset":
+                # Keep the view inside the backing storage while moving it outside its layer.
+                cache["layer_tensors"]["layer1"]["storage_offset_bytes"] -= 2
+
+    if change != "scheduler_raw_blocks":
+        _mutate(path, edit)
+        assert validate_observations(path, launch)["tp2"]["status"] == "incomplete"
+    for file in result["provenance"]["artifacts"]:
+        edit(file["evidence"])
+    memory = resources["runtime_memory"]
+    memory["provenance"] = json.dumps(result["provenance"])
+    diagnostic = "worker roster" if change in ("worker_tp", "scheduler_dp") else "kv_cache_bytes"
+    with pytest.raises(ValueError, match=diagnostic):
+        _runtime.observed_model_dtype(memory["provenance"])
+    with pytest.raises(ValueError, match=diagnostic):
+        _merge_resources([resources], {}, source_references=True)
+
+
 @pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
 def test_vllm_032_kernel_block_subdivision_keeps_manager_block_stride(tmp_path, layout):
     path, launch = _strided_fixture(tmp_path, layout=layout, kernel=8)
@@ -2109,6 +2197,9 @@ def test_aggregated_phases_with_different_prefix_caching_import_the_prefill_valu
         json.dumps(resources["cache_groups"]),
         memory=json.dumps({key: val for key, val in memory.items() if key != "provenance"}),
     )
+    from aisim.support.finalization import _merge_resources
+
+    _merge_resources([resources], {}, source_references=True)
     # The mode-dependent settings and the engine-core block size leave the compared runtime settings.
     cache = provenance["runtime_settings"]["cache_config"]
     assert not {

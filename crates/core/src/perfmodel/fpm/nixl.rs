@@ -758,12 +758,22 @@ impl NixlIdentity {
         entry: &Value,
         architecture: Option<&str>,
         kv_cache_bytes: Option<u64>,
+        cache_groups: Option<&Value>,
     ) -> Result<Value, AicError> {
         if let Some(records) = entry.as_array() {
             return Self::compact_workers(records, architecture);
         }
-        // Check the retained raw measurements before replacing the files with references.
-        roster::validate_source(entry, Capture::Full, None, None)?;
+        // As in a raw cell, reconcile the stated groups with all worker phases before
+        // projecting them. Historical imports may omit optional normalized group fields.
+        let mut identity = Self {
+            architecture: architecture.map(str::to_owned),
+            ..Self::default()
+        };
+        if let Some(groups) = cache_groups {
+            identity.normalized_groups(groups)?;
+        }
+        entry["artifacts"].as_array().ok_or_else(roster::invalid)?;
+        identity.observation(entry, None, Capture::Full, false)?;
         let measured = roster::selected_memory(entry)?;
         if let Some(bytes) = kv_cache_bytes
             && (measured["kv_cache_bytes"]
@@ -775,11 +785,7 @@ impl NixlIdentity {
         {
             return Err(conflict("kv_cache_bytes"));
         }
-        let records = entry["artifacts"].as_array().ok_or_else(roster::invalid)?;
-        Ok(serde_json::json!(Self::project_workers(
-            records.iter().map(|r| &r["evidence"]),
-            architecture
-        )?))
+        Ok(serde_json::json!(identity.workers))
     }
 
     pub(crate) fn compact_workers(
