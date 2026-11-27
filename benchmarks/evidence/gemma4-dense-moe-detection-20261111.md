@@ -12,7 +12,7 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `64b4f53d9`. It contains the omitted-MoE-pair
+The current code head is `5a3fea421`. It contains the omitted-MoE-pair
 rejection, the single-dimension fallback resolution, the pre-database width
 gate, the FPE generator guard and the hardware-fact/AFD pins described below, on
 top of `0faa4f402e2b3fe6ab302921d08c39572941ac8a`, which merges `main` at
@@ -22,9 +22,10 @@ and the generator guard, `98ebca229` applies the omitted-pair rejection,
 `c543294ee` adds the hardware-fact and preflight pins, `474614019` adds the
 search-space AFD pin, `0c331e377` keeps a dense checkpoint's omitted MoE width at
 `1`, `59344e5df` resolves an omitted pair at attention width one,
-`2a126f94e` pins the routed rejection on the capacity bridge, and `64b4f53d9`
-states the width rule in the legacy CLI help. The commit after `64b4f53d9`
-changes only this document.
+`2a126f94e` pins the routed rejection on the capacity bridge, `64b4f53d9`
+states the width rule in the legacy CLI help, and `5a3fea421` resolves the
+width-one omission in `ModelConfig` too. The commit after `5a3fea421` changes
+only this document.
 See [Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -36,7 +37,8 @@ is preserved by the rebase in `d4faab7fd`, `45d70db42` and `c63cd7668`; the
 the classification itself and the non-integer expert metadata check**
 (pre-rebase `8f3a62e0`, now `31800b398`): both expert fields must be integers
 (excluding booleans), or absent, before sentinel and range checks; and the
-ambiguous-omitted-MoE-pair rejection in `estimate_kv_cache` described below. The branch
+ambiguous-omitted-MoE-pair rejection in `estimate_kv_cache` and
+`ModelConfig.resolve_moe_parallelism` described below. The branch
 also changes `.github/workflows/ci.yml` to enforce bridge imports in an admitted
 Full CI run.
 
@@ -54,14 +56,15 @@ feasible/infeasible status are meaningful.
 
 `0faa4f402e2b3fe6ab302921d08c39572941ac8a` is the reviewed commit and keeps
 the historical verification results recorded for it. The current code head is
-`64b4f53d9`: `372f2e7c2` adds the single-dimension fallback resolution, the
+`5a3fea421`: `372f2e7c2` adds the single-dimension fallback resolution, the
 pre-database width gate and the FPE generator guard, `98ebca229` applies the
 config contract's omitted-MoE-pair rejection, `c543294ee` adds the
 hardware-fact and preflight pins, `474614019` adds the search-space AFD pin,
 `0c331e377` keeps a dense checkpoint's omitted MoE width at `1`, `59344e5df`
 resolves an omitted pair at attention width one, `2a126f94e` pins the routed
-rejection on the capacity bridge, and `64b4f53d9` states the width rule in the
-legacy CLI help. The commit after `64b4f53d9` changes only this document. Everything sits on
+rejection on the capacity bridge, `64b4f53d9` states the width rule in the
+legacy CLI help, and `5a3fea421` resolves the width-one omission in
+`ModelConfig`. The commit after `5a3fea421` changes only this document. Everything sits on
 three merges of `main` on top of the reviewed
 commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
@@ -134,7 +137,8 @@ became `moe_tp_size=moe_ep_size=1`.
 
 Both shapes of that default conflict with
 `ModelConfig.resolve_moe_parallelism`, which requires
-`tp_size * attention_dp_size * cp_size == moe_tp_size * moe_ep_size`:
+`tp_size * attention_dp_size * cp_size == moe_tp_size * moe_ep_size`. Both
+layers now share one rule, including the width-one exception:
 
 - Exactly one dimension omitted defeated the config's inference from the
   attention width, so a valid routed request such as `tp_size=4` with
@@ -159,6 +163,13 @@ canonical FPM identity records an unsharded pair as unset. Rejecting the pair at
 width one made every single-GPU routed `estimate_num_gpu_blocks` call a terminal
 error, so the estimator resolves those to `1x1` while still rejecting an
 ambiguous omission at a wider width.
+
+`ModelConfig.resolve_moe_parallelism` applies the same width-one exception
+(`5a3fea421`), so the CLI estimate path no longer rejects the default routed
+invocation (`tp_size=1` and no MoE widths) while the estimator accepts it. At a
+wider width it still raises. The resolved `1, 1` is the only possible layout,
+and the canonical unsharded FPM identity is unaffected because the producers
+decide the `None`/`None` representation before building a config.
 
 Dense checkpoints are the exception, because nothing reads the widths:
 `ModelConfig` skips the invariant and dense models build no expert ops. They
@@ -243,7 +254,7 @@ keeps a well-formed dense checkpoint fallback-eligible.
 
 ### Verification at the current head
 
-Local run at `64b4f53d9` on macOS arm64, Python 3.13.18, with the native
+Local run at `5a3fea421` on macOS arm64, Python 3.13.18, with the native
 extension rebuilt from this head's tree (`maturin build --release --locked`,
 the `pyproject.toml`
 `extension-module,jemalloc` features, and the wheel's
@@ -264,14 +275,14 @@ minutes.
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection (the twelve paths in the command below; includes the ambiguous-omitted-pair, width-one, producer-trace and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `64b4f53d9` | 1,242 passed, 0 failed |
-| Full CLI unit suite (`python/aisim/tests/unit/cli`), covering the updated `--moe-*-size` help text | `64b4f53d9` | 479 passed, 0 failed |
+| Targeted pytest selection (the twelve paths in the command below; includes the ambiguous-omitted-pair, width-one, producer-trace and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `5a3fea421` | 1,244 passed, 0 failed |
+| Full CLI unit suite (`python/aisim/tests/unit/cli`), covering the updated `--moe-*-size` help text and the width-one CLI path | `5a3fea421` | 480 passed, 0 failed |
 | `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `372f2e7c2` | 1,476 passed, 0 failed, 1 ignored |
 | `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2`, then `2a126f94e` | 5 passed; no skips at `372f2e7c2`, 6 passed at `2a126f94e` (adds the routed omitted-pair `BadConfig` pin) |
 | `cargo fmt --all -- --check` / `cargo fmt --check -p aisim-core` | `372f2e7c2`, then `2a126f94e` | clean |
 
 The pytest row is this command, run from the repository root at
-`64b4f53d9`:
+`5a3fea421`:
 
 ```
 VIRTUAL_ENV=python/aisim/.venv PYTHONPATH=python/aisim/src \
@@ -593,6 +604,7 @@ Pinned by
 | `test_estimate_kv_cache_infers_an_omitted_moe_dimension` | `tp_size=4` with `moe_tp_size=2` and no `moe_ep_size` is resolved by the config contract and estimated natively, instead of failing the width check because the estimator filled `1` |
 | `test_estimate_kv_cache_rejects_an_ambiguous_omitted_moe_pair` | An omitted `moe_tp_size`/`moe_ep_size` pair at `tp_size=4` raises the config contract's error before the perf-DB lookup and before the naive fallback, neither of which may price a layout the engine refuses |
 | `test_estimate_kv_cache_resolves_an_omitted_moe_pair_at_attention_width_one` | An omitted pair at `tp_size=1` resolves to `1x1` and prices the same as an explicit pair, on both the native and naive paths |
+| `test_both_missing_moe_parallelism_resolves_at_attention_width_one` and `test_routed_estimate_resolves_an_omitted_pair_only_at_attention_width_one` | `ModelConfig` and the CLI estimate path resolve the omitted pair to `1x1` at attention width one and still raise at a wider width |
 | `test_replay_worker_metadata_and_the_estimator_agree_on_an_unsharded_route` and `test_sweeper_metadata_and_the_estimator_agree_on_an_unsharded_route` | The Replay and sweeper producers emit `None`/`None` for an unsharded route, and that exact metadata estimates natively rather than raising |
 | `test_from_request_rejects_an_omitted_moe_pair` | `KVCacheEstimator.from_request` applies the same rejection for callers that bypass `estimate_kv_cache` |
 | `test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint` | A multi-GPU dense Gemma 4 request with the pair omitted still estimates natively, because dense checkpoints do not read the MoE dims |
