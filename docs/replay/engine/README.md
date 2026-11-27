@@ -214,9 +214,11 @@ engine:
 ### Measured CPU overhead
 
 Both stages can be filled from measurements instead of by hand. A caller opts
-in by naming the request endpoint, for example
-`prediction_to_replay_spec(config, cpu_overhead_endpoint="chat")`; the AgentX
-accuracy harness does this. Replay then reads the
+in by naming the request endpoint and the serving nodes' host CPU model, for
+example `prediction_to_replay_spec(config, cpu_overhead_endpoint="chat",
+cpu_overhead_host_cpu="Intel(R) Xeon(R) Platinum 8559C")`; the AgentX accuracy
+harness does this for B300. The two arguments go together: a system name does
+not say which CPU its hosts have. Replay then reads the
 [host-cost data](../../reference/host-cost-schema.md) of the dataset revision
 pinned in `aisim_core/data/host_cost_pin.json`, keyed by backend, backend
 version, endpoint, host CPU and tokenizer:
@@ -225,12 +227,14 @@ version, endpoint, host CPU and tokenizer:
   `engine.extra_cpu_overhead` from the unqueued measurement (client TTFT minus
   engine time at one request in flight). The unqueued fixed and per-token
   terms are the measured totals less the tokenizer's, so the two stages
-  reproduce the measured total.
+  reproduce the measured total. A measured total smaller than its paired
+  tokenizer stage cannot be split this way and is refused with an error.
 - A field the config sets, including an explicit zero, always wins; only unset
   fields are filled.
 - An uncollected backend version reuses the closest collected one (at or
-  below it, else the nearest above). Host CPU, tokenizer and endpoint must
-  match exactly.
+  below it, else the nearest above). An omitted `engine.backend_version` is
+  the `current` default and resolves the way replay resolves it for the
+  performance data. Host CPU, tokenizer and endpoint must match exactly.
 - A deployment with no tokenizer measurement gets nothing: there is no
   default. Online replay, adapters, AFD, encoder pools and SGLang frontend
   stages are left unchanged.

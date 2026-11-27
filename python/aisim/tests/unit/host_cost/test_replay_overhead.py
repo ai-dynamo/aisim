@@ -6,6 +6,7 @@
 import json
 import random
 import re
+import shutil
 
 import pytest
 
@@ -30,12 +31,12 @@ QWEN = "Qwen/Qwen3.5-397B-A17B"
 GLM = "nvidia/GLM-5.3-NVFP4"
 
 
-def _tokenizer_run(tmp_path, name, *, framework, version, tokenizer, per_token_us):
+def _tokenizer_run(tmp_path, name, *, framework, version, tokenizer, per_token_us, base_ms=0.0):
     rng = random.Random(name)
     rows = []
     for index in range(60):
         tokens = rng.randrange(2_000, 180_000)
-        total = per_token_us * tokens / 1000.0 * (1 + rng.uniform(-0.005, 0.005))
+        total = base_ms + per_token_us * tokens / 1000.0 * (1 + rng.uniform(-0.005, 0.005))
         rows.append(
             {
                 "request": index,
@@ -73,12 +74,18 @@ def dataset(tmp_path_factory):
     index = DatasetIndex(schema_version="aisim-dataset-index/v1", dataset_id="test/aisim-data", categories={})
     (root / "catalog/dataset.json").write_text(index.model_dump_json(by_alias=True))
     tokenizers = {}
-    for framework, version, tokenizer, model, per_token in (
-        ("vllm", "0.31.0", "qwen2", QWEN, 1.5),
-        ("sglang", "0.5.21", "glm", "zai-org/GLM-5", 1.2),
+    for framework, version, tokenizer, model, per_token, base in (
+        ("vllm", "0.31.0", "qwen2", QWEN, 1.5, 0.0),
+        ("sglang", "0.5.21", "glm", "zai-org/GLM-5", 1.2, 0.3),
     ):
         run = _tokenizer_run(
-            tmp_path, framework, framework=framework, version=version, tokenizer=tokenizer, per_token_us=per_token
+            tmp_path,
+            framework,
+            framework=framework,
+            version=version,
+            tokenizer=tokenizer,
+            per_token_us=per_token,
+            base_ms=base,
         )
         tokenizers[framework] = write_entry(root, run, system="b300_sxm", model=model, gpu_time=None)
     register_entries(root, list(tokenizers.values()))
@@ -126,7 +133,14 @@ def local(dataset, monkeypatch):
 
 
 def _measured(**kwargs):
-    defaults = {"backend": "vllm", "backend_version": "0.31.0", "endpoint": "chat", "system": "b300_sxm", "model": QWEN}
+    defaults = {
+        "backend": "vllm",
+        "backend_version": "0.31.0",
+        "endpoint": "chat",
+        "system": "b300_sxm",
+        "host_cpu": CPU,
+        "model": QWEN,
+    }
     return replay.measured_overhead(**{**defaults, **kwargs})
 
 
@@ -193,14 +207,25 @@ def test_both_measured_deployments_read_tokenization_and_unqueued_overhead(local
         {"model": "example/model"},  # no measured tokenizer
         {"endpoint": "completions"},  # no measured endpoint
         {"backend": "trtllm", "backend_version": "1.3.0rc29"},  # no measured framework
+        {"host_cpu": "AMD EPYC 9654 96-Core Processor"},  # a B300 host with another CPU
     ],
 )
 def test_unmeasured_deployments_have_no_default(local, kwargs):
     assert _measured(**kwargs) is None
 
 
+CONFIG = {
+    "system": "b300_sxm",
+    "backend": "vllm",
+    "backend_version": "0.31.0",
+    "model": QWEN,
+    "endpoint": "chat",
+    "host_cpu": CPU,
+}
+
+
 def test_ensure_data_wires_host_cost_and_names_the_entries(local):
-    config = {"system": "b300_sxm", "backend": "vllm", "backend_version": "0.31.0", "model": QWEN, "endpoint": "chat"}
+    config = dict(CONFIG)
     ensured = ensure_data(config, DataPin(local_root=local, categories=("host-cost",)))
     host_cost = ensured.config["host_cost"]
     assert host_cost["tokenization"]["base_ms"] + host_cost["extra_cpu_overhead"]["base_ms"] == pytest.approx(29.5)
@@ -210,14 +235,68 @@ def test_ensure_data_wires_host_cost_and_names_the_entries(local):
     assert unmeasured.config["host_cost"] is None
     assert unmeasured.datasets["host-cost"]["configuration_ids"] == []
 
-    with pytest.raises(MissingDataError, match="endpoint"):
-        ensure_data(
-            {k: v for k, v in config.items() if k != "endpoint"}, DataPin(local_root=local, categories=("host-cost",))
-        )
+    for name in ("endpoint", "host_cpu"):
+        with pytest.raises(MissingDataError, match=name):
+            ensure_data(
+                {k: v for k, v in config.items() if k != name}, DataPin(local_root=local, categories=("host-cost",))
+            )
+
+
+def _copy(dataset, tmp_path):
+    root = tmp_path / "copy"
+    shutil.copytree(dataset, root)
+    return root
+
+
+def _rewrite_unqueued(root, framework, version, runs):
+    """Replace one unqueued entry in place (same configuration ID), as a partly refreshed dataset would."""
+    directory = next((root / "data/host-cost" / framework / version).rglob("unqueued-chat"))
+    old = Manifest.model_validate_json((directory / "aisim-manifest.json").read_bytes())
+    tokenizer_path = next(
+        path
+        for path in (root / "data/host-cost" / framework).rglob("aisim-manifest.json")
+        if Manifest.model_validate_json(path.read_bytes()).purpose == "host-cost-profile"
+    )
+    shutil.rmtree(directory)
+    write_unqueued_entry(
+        root,
+        framework=framework,
+        version=version,
+        system="b300_sxm",
+        endpoint="chat",
+        model=old.identity.model,
+        runs=runs,
+        tokenizer_manifest=Manifest.model_validate_json(tokenizer_path.read_bytes()),
+        method={"measure": "test"},
+    )
+    return old
+
+
+def test_a_manifest_that_differs_from_its_catalog_entry_is_refused(dataset, tmp_path):
+    root = _copy(dataset, tmp_path)
+    old = _rewrite_unqueued(root, "vllm", "0.31.0", [{"run": "new", "base_ms": 100.0, "total_per_input_token_us": 1.7}])
+    new = Manifest.model_validate_json(
+        (root / "data/host-cost/vllm/0.31.0/b300_sxm/qwen2/unqueued-chat/aisim-manifest.json").read_bytes()
+    )
+    # Same configuration ID; only the catalog still names the old manifest bytes.
+    assert new.configuration_id == old.configuration_id
+    with pytest.raises(MissingDataError, match="failed verification"):
+        ensure_data(dict(CONFIG), DataPin(local_root=root, categories=("host-cost",)))
+
+
+def test_a_total_smaller_than_its_tokenizer_stage_is_refused(dataset, tmp_path):
+    root = _copy(dataset, tmp_path)
+    # A fixed cost outside the engine (0.05 ms) below the selected tokenizer's fixed cost (about 0.3 ms) passes the
+    # writer, but cannot be split into the two stages.
+    _rewrite_unqueued(root, "sglang", "0.5.20", [{"run": "r", "base_ms": 0.05, "total_per_input_token_us": 1.56}])
+    register_entries(root, ["data/host-cost/sglang/0.5.20/b300_sxm/glm/unqueued-chat/aisim-manifest.json"])
+    config = {**CONFIG, "backend": "sglang", "backend_version": "0.5.20", "model": GLM}
+    with pytest.raises(DataConflictError, match="cannot be split"):
+        ensure_data(config, DataPin(local_root=root, categories=("host-cost",)))
 
 
 def test_a_configuration_id_cannot_pick_host_cost_entries(local):
-    config = {"system": "b300_sxm", "backend": "vllm", "backend_version": "0.31.0", "model": QWEN, "endpoint": "chat"}
+    config = dict(CONFIG)
     pin = DataPin(local_root=local, categories=("host-cost",), configuration_id="cfg-" + "0" * 64)
     with pytest.raises(DataConflictError, match="cannot select host-cost data"):
         ensure_data(config, pin)
@@ -246,7 +325,9 @@ def test_compiler_applies_the_measured_overhead_only_when_asked(local):
     off = prediction_to_replay_spec(_prediction()).backend_deployment
     assert off.tokenization is None and off.extra_cpu_overhead is None
 
-    on = prediction_to_replay_spec(_prediction(), cpu_overhead_endpoint="chat").backend_deployment
+    on = prediction_to_replay_spec(
+        _prediction(), cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
+    ).backend_deployment
     measured = _measured()
     assert on.tokenization == pytest.approx(
         {
@@ -263,17 +344,19 @@ def test_compiler_applies_the_measured_overhead_only_when_asked(local):
     )
 
     glm = prediction_to_replay_spec(
-        _prediction(backend="sglang", version="0.5.20", model=GLM), cpu_overhead_endpoint="chat"
+        _prediction(backend="sglang", version="0.5.20", model=GLM),
+        cpu_overhead_endpoint="chat",
+        cpu_overhead_host_cpu=CPU,
     ).backend_deployment
     assert glm.tokenization["base_ms"] + glm.extra_cpu_overhead["base_ms"] == pytest.approx(12.6)
 
     unmeasured = prediction_to_replay_spec(
-        _prediction(hardware="h200_sxm"), cpu_overhead_endpoint="chat"
+        _prediction(hardware="h200_sxm"), cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
     ).backend_deployment
     assert unmeasured.tokenization is None and unmeasured.extra_cpu_overhead is None
 
     online = prediction_to_replay_spec(
-        _prediction(), execution_mode="online", cpu_overhead_endpoint="chat"
+        _prediction(), execution_mode="online", cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
     ).backend_deployment
     assert online.tokenization is None and online.extra_cpu_overhead is None
 
@@ -282,13 +365,32 @@ def test_caller_set_fields_win_over_the_measured_overhead(local):
     both = prediction_to_replay_spec(
         _prediction(tokenization={"per_input_token_us": 2}, extra_cpu_overhead={"base_ms": 1}),
         cpu_overhead_endpoint="chat",
+        cpu_overhead_host_cpu=CPU,
     ).backend_deployment
     assert both.tokenization == pytest.approx({"workers": 1, "base_ms": 0.0, "per_input_token_ms": 0.002})
     assert both.extra_cpu_overhead == pytest.approx({"base_ms": 1.0, "per_input_token_ms": 0.0})
 
     # An explicit zero turns one stage off and leaves the other measured.
     partial = prediction_to_replay_spec(
-        _prediction(tokenization={"per_input_token_us": 0}), cpu_overhead_endpoint="chat"
+        _prediction(tokenization={"per_input_token_us": 0}), cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
     ).backend_deployment
     assert partial.tokenization is None
     assert partial.extra_cpu_overhead["base_ms"] == pytest.approx(_measured().extra_cpu_overhead["base_ms"])
+
+
+def test_compiler_resolves_an_omitted_backend_version_before_the_lookup(local, monkeypatch):
+    import aisim_core.sdk.perf_database as perf_database
+
+    # The documented default ``current`` resolves through the performance data's version slots.
+    monkeypatch.setattr(perf_database, "resolve_query_version", lambda system, backend, version, **_: "0.31.0")
+    config = _prediction()
+    config = config.model_copy(update={"engine": config.engine.model_copy(update={"backend_version": None})})
+    spec = prediction_to_replay_spec(config, cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU)
+    deployment = spec.backend_deployment
+    assert deployment.tokenization is not None and deployment.extra_cpu_overhead is not None
+    assert deployment.extra_cpu_overhead["base_ms"] == pytest.approx(_measured().extra_cpu_overhead["base_ms"])
+
+
+def test_the_compiler_needs_the_host_cpu_with_the_endpoint():
+    with pytest.raises(ValueError, match="given together"):
+        prediction_to_replay_spec(_prediction(), cpu_overhead_endpoint="chat")

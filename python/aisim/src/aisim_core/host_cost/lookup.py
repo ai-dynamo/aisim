@@ -180,13 +180,14 @@ def choose(
     version: str,
     endpoint: str,
     system: str,
+    cpu_model: str,
     tokenizer: str,
 ) -> tuple[Choice | None, Choice | None]:
     """The tokenizer entry and the unqueued entry for one deployment, from catalog identities alone.
 
-    The host CPU is the one the tokenizer entries of ``system`` were measured on; the unqueued entry must name the
-    same CPU. ``(None, None)`` when no tokenizer entry matches: an unmeasured deployment has no default, and an
-    unqueued entry without a tokenizer slope to split against is not used.
+    ``cpu_model`` is the deployment's host CPU; both entries must have been measured on exactly that CPU. ``(None,
+    None)`` when no tokenizer entry matches: an unmeasured deployment has no default, and an unqueued entry without a
+    tokenizer slope to split against is not used.
     """
 
     def matches(entry: CatalogEntry, purpose: str) -> bool:
@@ -196,17 +197,14 @@ def choose(
             and entry.identity.hardware == system
             and _setting(entry, "tokenizer_key") == tokenizer
             and _setting(entry, "endpoint") == endpoint
+            and _setting(entry, "cpu_model") == cpu_model
         )
 
     tokenizers = [e for e in catalog if matches(e, PURPOSE)]
-    cpus = {_setting(e, "cpu_model") for e in tokenizers}
-    if len(cpus) > 1:
-        raise ValueError(f"{system} has host-cost entries from several host CPUs {sorted(map(str, cpus))}")
     found = _closest(tokenizers, version, lambda e: e.identity.framework_version, True)
     if found is None:
         return None, None
-    cpu = _setting(found[0], "cpu_model")
-    unqueued = [e for e in catalog if matches(e, UNQUEUED_PURPOSE) and _setting(e, "cpu_model") == cpu]
+    unqueued = [e for e in catalog if matches(e, UNQUEUED_PURPOSE)]
     extra = _closest(unqueued, version, lambda e: e.identity.framework_version, True)
     return Choice(*found), None if extra is None else Choice(*extra)
 
@@ -254,11 +252,20 @@ def overhead(
         unqueued_choice, unqueued_manifest = unqueued
         fit = read_unqueued_fit(unqueued_manifest)
         # Split the measured total against the tokenizer stage replay actually queues (fixed and per-token terms), so
-        # the two stages reproduce the measured total.
+        # the two stages reproduce the measured total. A total smaller than the paired tokenizer stage cannot be
+        # represented (flooring the residual would make the stages exceed the measurement), so the pair is refused.
         extra = {
-            "base_ms": max(fit.base_ms - tokenization["base_ms"], 0.0),
-            "per_input_token_us": max(fit.total_per_input_token_us - tokenization["per_input_token_us"], 0.0),
+            "base_ms": fit.base_ms - tokenization["base_ms"],
+            "per_input_token_us": fit.total_per_input_token_us - tokenization["per_input_token_us"],
         }
+        short = {name: value for name, value in extra.items() if value < 0}
+        if short:
+            raise ValueError(
+                f"unqueued entry {unqueued_manifest.configuration_id} (total base_ms {fit.base_ms:g}, "
+                f"per_input_token_us {fit.total_per_input_token_us:g}) is smaller than its paired tokenizer entry "
+                f"{tokenizer_manifest.configuration_id} (base_ms {tokenization['base_ms']:g}, per_input_token_us "
+                f"{tokenization['per_input_token_us']:g}); the measured total cannot be split into the two stages"
+            )
         provenance["extra_cpu_overhead"] = {
             "configuration_id": unqueued_manifest.configuration_id,
             "version": unqueued_manifest.identity.framework_version,

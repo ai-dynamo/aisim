@@ -5,8 +5,9 @@
 
 :func:`measured_overhead` returns the ``engine.tokenization`` and ``engine.extra_cpu_overhead`` blocks of one
 deployment, keyed by (backend, backend version, endpoint, host CPU, tokenizer), or ``None`` for a deployment that has
-not been measured: there is no default. The data comes through :func:`aisim_core.data.ensure.ensure_data` with a
-``host-cost`` pin:
+not been measured: there is no default. The host CPU is the caller's: a system name does not say which CPU its
+serving nodes have, so it is matched exactly against the CPU each entry was measured on. The data comes through
+:func:`aisim_core.data.ensure.ensure_data` with a ``host-cost`` pin:
 
 * ``AISIM_HOST_COST_LOCAL=<dir>``: a local dataset-layout directory (no network),
 * ``AISIM_HOST_COST_DATASET=<repo>@<revision>``: another revision (a full commit SHA reuses the cache offline),
@@ -68,17 +69,18 @@ def measured_overhead(
     backend_version: str,
     endpoint: str,
     system: str,
+    host_cpu: str,
     model: str,
     env: Mapping[str, str] | None = None,
 ) -> HostOverhead | None:
-    """The measured overhead of this deployment, or ``None`` when it has not been measured."""
+    """The measured overhead of this deployment on host CPU ``host_cpu``, or ``None`` when it has not been measured."""
     pin = _pin(os.environ if env is None else env)
-    return _cached(pin, backend, backend_version, endpoint, system, model)
+    return _cached(pin, backend, backend_version, endpoint, system, host_cpu, model)
 
 
 @lru_cache(maxsize=64)
 def _cached(
-    pin: DataPin, backend: str, backend_version: str, endpoint: str, system: str, model: str
+    pin: DataPin, backend: str, backend_version: str, endpoint: str, system: str, host_cpu: str, model: str
 ) -> HostOverhead | None:
     config = {
         "system": system,
@@ -86,6 +88,7 @@ def _cached(
         "backend_version": backend_version,
         "model": model,
         "endpoint": endpoint,
+        "host_cpu": host_cpu,
     }
     found = ensure_data(config, pin).config.get("host_cost")
     return None if found is None else HostOverhead.from_dict(found)

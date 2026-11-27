@@ -31,6 +31,10 @@ def _op_data_root():
     return Path(default_systems.default_systems_path()) / "data"
 
 
+# Host CPU of the AgentX campaign's serving nodes, per system (as recorded by the host-cost runs on those nodes).
+AGENTX_HOST_CPU = {"b300_sxm": "Intel(R) Xeon(R) Platinum 8559C"}
+
+
 def predict(config_path, output):
     started = time.monotonic()
     # Branch wheels have different capabilities. Import inside this isolated
@@ -70,10 +74,13 @@ def predict(config_path, output):
     if not data_file.is_file():
         return {"outcome": "unsupported", "reason": "database_unavailable", "prediction_backend_version": version}
     parsed = api.CorePredictionConfig.model_validate(config)
-    # AgentX replays real chat requests: apply the measured serving-path CPU overhead where the wheel has it.
+    # AgentX replays real chat requests: apply the measured serving-path CPU overhead where the wheel has it, for the
+    # host CPU of the campaign's serving nodes.
+    host_cpu = AGENTX_HOST_CPU.get(engine["hardware"])
     overhead = (
-        {"cpu_overhead_endpoint": "chat"}
-        if "cpu_overhead_endpoint" in inspect.signature(compiler.prediction_to_replay_spec).parameters
+        {"cpu_overhead_endpoint": "chat", "cpu_overhead_host_cpu": host_cpu}
+        if host_cpu is not None
+        and "cpu_overhead_host_cpu" in inspect.signature(compiler.prediction_to_replay_spec).parameters
         else {}
     )
     spec = compiler.prediction_to_replay_spec(parsed, **overhead)

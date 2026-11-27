@@ -697,9 +697,10 @@ def _ensure_host_cost(
 ) -> None:
     """Wire ``config["host_cost"]``: the measured tokenizer and unqueued overhead, or ``None`` when unmeasured.
 
-    The configuration names ``system``, ``backend``, ``backend_version``, ``model`` and ``endpoint``. Entries are
-    chosen from the catalog first (closest collected version, tokenizer of the model, the system's host CPU), so only
-    the chosen ones are fetched. An unmeasured deployment is not an error: it has no default, so it wires ``None``.
+    The configuration names ``system``, ``backend``, ``backend_version``, ``model``, ``endpoint`` and ``host_cpu``
+    (the deployment's host CPU model, matched exactly). Entries are chosen from the catalog first (closest collected
+    version, tokenizer of the model), so only the chosen ones are fetched; each loaded manifest must be the bytes the
+    catalog pins. An unmeasured deployment is not an error: it has no default, so it wires ``None``.
     """
     from aisim_core.host_cost.lookup import choose, overhead, tokenizer_key
 
@@ -707,10 +708,11 @@ def _ensure_host_cost(
         # Entries are chosen by deployment (closest version, tokenizer, host CPU); an ID cannot pick one of them.
         raise DataConflictError(
             f"configuration {pin.configuration_id} cannot select host-cost data: host-cost entries are chosen from "
-            "backend, backend_version, endpoint, system and model; unset AISIM_DATA_CONFIGURATION for host-cost"
+            "backend, backend_version, endpoint, system, host_cpu and model; unset AISIM_DATA_CONFIGURATION for "
+            "host-cost"
         )
     config = out.config
-    missing = [name for name in ("backend_version", "model", "endpoint") if not config.get(name)]
+    missing = [name for name in ("backend_version", "model", "endpoint", "host_cpu") if not config.get(name)]
     if missing:
         raise MissingDataError(f"a host-cost selection needs {', '.join(missing)} in the configuration")
     if pin.local_root is not None:
@@ -734,6 +736,7 @@ def _ensure_host_cost(
                 version=config["backend_version"],
                 endpoint=config["endpoint"],
                 system=config["system"],
+                cpu_model=config["host_cpu"],
                 tokenizer=key,
             )
             if key is not None
@@ -751,29 +754,31 @@ def _ensure_host_cost(
     manifests = []
     for choice in chosen:
         try:
+            # The catalog's pinned manifest digest, identity and purpose first: a partly refreshed local dataset
+            # whose manifest no longer matches its catalog entry must be refused. Then the entry's own check.
+            pinned = read_entry_manifest(root, choice.entry, loader=loader)
             manifest = loader.load(root, choice.entry.manifest.path)
+            if manifest.model_dump_json() != pinned.model_dump_json():
+                raise LoaderError("manifest changed during verification")
         except (LoaderError, ValueError) as exc:
             raise MissingDataError(
                 f"host-cost data {choice.entry.configuration_id} in {where} failed verification: {exc}",
                 selection=selection,
                 source=where,
             ) from exc
-        if (manifest.configuration_id, manifest.purpose, manifest.identity) != (
-            choice.entry.configuration_id,
-            choice.entry.purpose,
-            choice.entry.identity,
-        ):
-            raise MissingDataError(f"host-cost catalog and manifest identity differ in {where}", source=where)
         manifests.append(manifest)
-    config["host_cost"] = (
-        overhead(
-            config["backend_version"],
-            (tokenizer, manifests[0]),
-            (unqueued, manifests[1]) if unqueued is not None else None,
-        ).to_dict()
-        if tokenizer is not None
-        else None
-    )
+    try:
+        config["host_cost"] = (
+            overhead(
+                config["backend_version"],
+                (tokenizer, manifests[0]),
+                (unqueued, manifests[1]) if unqueued is not None else None,
+            ).to_dict()
+            if tokenizer is not None
+            else None
+        )
+    except ValueError as exc:
+        raise DataConflictError(f"host-cost data in {where}: {exc}") from exc
     out.datasets["host-cost"] = {
         "repo": pin.repo,
         "revision": revision,
