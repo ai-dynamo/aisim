@@ -226,19 +226,24 @@ def _estimator(timing_config):
             os.environ["AIC_ALLOW_UNLISTED_VERSIONS"] = previous
 
 
-def packed(fpm, width):
-    """Operation-level decode counters packed by verification width ``v``: ``B*v`` requests and ``B*v*s`` KV.
+def op_level_query(fpm, width):
+    """A captured step in the operation-level query convention; the learned FPM reads the capture as is.
 
-    Captures record logical requests. The operation-level query does not apply the width itself; the
-    learned FPM and the shift detector keep the logical counts.
+    - Decode counters are packed by verification width ``v``: ``B*v`` requests and ``B*v*s`` KV tokens.
+      Captures record logical requests, and the operation-level query does not apply the width itself.
+    - Prefill KV is the cached prefix only. SGLang hook captures total prefix plus fresh tokens in
+      ``sum_prefill_kv_tokens``; their ``past_kv_lengths`` hold the per-request prefix.
+    - Per-request lists describe logical requests, so the query carries none: the native validator
+      rejects lists that disagree with packed counts.
     """
-    if width == 1 or step_kind(fpm) != "decode":
-        return fpm
-    # Per-request lists (extend, past-KV and accept lengths) describe logical requests; the packed
-    # query must not carry them, or the native validator rejects the count mismatch.
-    s = {key: value for key, value in fpm["scheduled_requests"].items() if not isinstance(value, list)}
-    s["num_decode_requests"] *= width
-    s["sum_decode_kv_tokens"] *= width
+    source = fpm["scheduled_requests"]
+    s = {key: value for key, value in source.items() if not isinstance(value, list)}
+    kind = step_kind(fpm)
+    if kind == "decode":
+        s["num_decode_requests"] *= width
+        s["sum_decode_kv_tokens"] *= width
+    elif kind == "prefill" and isinstance(source.get("past_kv_lengths"), list):
+        s["sum_prefill_kv_tokens"] = sum(source["past_kv_lengths"])
     return {**fpm, "scheduled_requests": s}
 
 
@@ -277,9 +282,9 @@ def score_steps(model, lanes, timing_config, workdir, reference_config=None):
         return None
     if timing_config.get("speculation"):
         raise ValueError("AgentX step scoring supports legacy nextn speculation only")
-    # Replay packs operation-level decode by the configured verification width; the learned FPM reads
-    # logical counts.
-    width = 1 if timing_config.get("estimation_mode") == LEARNED else int(timing_config.get("nextn") or 0) + 1
+    # The learned FPM reads captures as recorded; operation-level timing reads replay's query convention.
+    op_level = timing_config.get("estimation_mode") != LEARNED
+    width = int(timing_config.get("nextn") or 0) + 1
     estimator = _available(timing_config)
     reference = _available(reference_config) if spec["drop_unattributed"] else None
     if estimator is None or (spec["drop_unattributed"] and reference is None):
@@ -298,7 +303,7 @@ def score_steps(model, lanes, timing_config, workdir, reference_config=None):
             kind, measured = step_kind(fpm), fpm["wall_time"] * 1e3
             if flag or kind is None or measured <= 0:
                 continue
-            predicted = estimator.estimate_forward_pass_time_ms([packed(fpm, width)])
+            predicted = estimator.estimate_forward_pass_time_ms([op_level_query(fpm, width) if op_level else fpm])
             errors[kind].append(abs(predicted / measured - 1) * 100)
     if not any(errors.values()):
         return None

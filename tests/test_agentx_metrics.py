@@ -349,7 +349,11 @@ def test_operation_level_decode_is_packed_by_verification_width(tmp_path, monkey
     step["scheduled_requests"].update(
         sum_decode_kv_tokens=2584, extend_lengths=[4], past_kv_lengths=[2584], spec_accept_lengths=[3]
     )
+    # Zero-prefix prefill as SGLang hooks record it: KV total counts the 8,192 fresh tokens.
     prefill = fpm(prefill=1, wall=0.01)
+    prefill["scheduled_requests"].update(
+        sum_prefill_tokens=8192, sum_prefill_kv_tokens=8192, past_kv_lengths=[0], extend_lengths=[8192]
+    )
     seen = []
 
     class Estimator:
@@ -367,10 +371,17 @@ def test_operation_level_decode_is_packed_by_verification_width(tmp_path, monkey
     agentx_learned.score_steps("m", 8, op, tmp_path)
     # Packed counts without the logical per-request lists, which the native validator would reject.
     assert seen[0] == ("op_level", {"num_prefill_requests": 0, "num_decode_requests": 4, "sum_decode_kv_tokens": 10336})
-    assert seen[1][1] == prefill["scheduled_requests"]
+    # Operation-level prefill KV is the cached prefix only.
+    assert seen[1][1] == {
+        "num_prefill_requests": 1,
+        "num_decode_requests": 0,
+        "sum_prefill_tokens": 8192,
+        "sum_prefill_kv_tokens": 0,
+    }
     seen.clear()
     agentx_learned.score_steps("m", 8, {**op, "estimation_mode": "fpm_learned"}, tmp_path)
-    assert seen[0][1] == step["scheduled_requests"]  # The learned FPM reads logical requests.
+    # The learned FPM reads captures as recorded.
+    assert [x[1] for x in seen] == [step["scheduled_requests"], prefill["scheduled_requests"]]
 
 
 def test_wheels_without_learned_mtp_publish_op_based_results_without_step_metrics(tmp_path, monkeypatch):

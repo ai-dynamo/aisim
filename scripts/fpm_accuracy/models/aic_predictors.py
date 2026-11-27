@@ -27,6 +27,20 @@ AicMode = Literal["fpm", "regression", "op_level"]
 OP_LEVEL_CONFIG_OPTION = "op_level_config"
 # The op-level baseline always selects these; an override must not change them.
 _OP_LEVEL_FIXED = {"estimation_mode", "fallback_policy", "database_mode", "estimator_config", "worker_type"}
+# Layout and speculation the measured worker record defines; overriding them would price a different
+# deployment. ``model`` and ``system`` stay overridable to name the database entry for the same worker.
+_OP_LEVEL_IDENTITY = {
+    "backend",
+    "tp",
+    "pp",
+    "attention_dp",
+    "dcp",
+    "moe_tp_size",
+    "moe_ep_size",
+    "cp_size",
+    "nextn",
+    "speculation",
+}
 
 
 class _AicPredictor(ForwardPassTimePredictor):
@@ -194,6 +208,9 @@ class AicOpLevelPredictor(_AicPredictor):
         options = dict(context.options)
         overrides = dict(options.pop(OP_LEVEL_CONFIG_OPTION, None) or {})
         engine_config = cls._native_engine_config(context)
+        # predict() sends logical decode counts; the op-level query needs them packed by verification width.
+        if int(engine_config.get("nextn") or 0) > 0:
+            raise DependencyError("Op-level scoring does not support speculative decoding (nextn > 0).")
         request = config_type.from_legacy_engine_config(engine_config, context.worker_role, options)
         return cls(perf_model.best_available(op_level_request(request, overrides)), engine_config)
 
@@ -207,7 +224,7 @@ def op_level_request(request: Any, overrides: Mapping[str, Any]) -> Any:
     unknown = sorted(set(overrides) - names)
     if unknown:
         raise ConfigurationError(f"unknown op-level configuration fields: {', '.join(unknown)}")
-    fixed = sorted(set(overrides) & _OP_LEVEL_FIXED)
+    fixed = sorted(set(overrides) & (_OP_LEVEL_FIXED | _OP_LEVEL_IDENTITY))
     if fixed:
         raise ConfigurationError(f"op-level configuration cannot override: {', '.join(fixed)}")
     return replace(

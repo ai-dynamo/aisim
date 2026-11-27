@@ -98,6 +98,9 @@ def main():
         help="Smoke only: selected configuration paths; cannot qualify for publication",
     )
     args = parser.parse_args()
+    if args.op_level_config and args.comparison_output:
+        # The comparison is written only beside a publication qualification, which local op-level runs skip.
+        parser.error("--op-level-config is local only and cannot write --comparison-output")
     if not eligible_branch(args.branch):
         parser.error("branch must be main or release >= 0.12.0")
     for revision in (args.commit, args.evaluator_sha, args.hf_revision):
@@ -202,6 +205,7 @@ def main():
     elif op_level_config is not None:
         # The public overview accepts only the published method lists; the op-level baseline stays local.
         (args.output / "LOCAL_ONLY.txt").write_text("Local op-level baseline; not qualified for publication.\n")
+        (args.output / "op-level-config.json").write_text(json.dumps(op_level_config, indent=2, sort_keys=True) + "\n")
     else:
         qualification = {
             "schema_version": 3 if scenario_data is not None else 2,

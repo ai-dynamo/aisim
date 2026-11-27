@@ -730,14 +730,17 @@ Initial coverage is explicitly selected in the reviewed private HF catalog
 
 GLM uses the recorded AgentX corpus, its live-trajectory warmup/snapshot, and a
 one-hour profiling run per point. It has no 4K/32K, cold/warm, or repeat sweep.
-Each Qwen run is a finite cohort of eight measured requests per lane: 8, 32, or
-128 requests at 1, 4, or 16 lanes. Its detail selectors choose one of 12 runs per
-concurrency; the concurrency summary still covers all 12.
+Current Qwen Weka runs are one-hour profiles, one concurrency row per lane count
+(six rows). In the archived `finite-v1` campaign, each Qwen run is a finite cohort
+of eight measured requests per lane: 8, 32, or 128 requests at 1, 4, or 16 lanes.
+Its detail selectors choose one of 12 runs per concurrency; the concurrency
+summary still covers all 12.
 
 One table contains both sources, tagged beneath each model name. Model rows are
-folded by default and expand on click. Concurrency rows open details; Qwen has exactly three such
-rows, combining all prompt/cache variants and repeats. Detail selectors default
-to 4K, cold, repeat 0 and persist in the URL. The selected run is labeled separately
+folded by default and expand on click. Concurrency rows open details. In
+`finite-v1`, Qwen has exactly three such rows, combining all prompt/cache variants
+and repeats, and its detail selectors default to 4K, cold, repeat 0 and persist in
+the URL. The selected run is labeled separately
 from the concurrency summary. Branches retain their own evidence, including
 unsupported outcomes; a release never borrows main's AgentX results.
 

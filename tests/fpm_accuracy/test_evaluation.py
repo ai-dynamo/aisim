@@ -1232,6 +1232,18 @@ def test_op_level_reports_decode_context_parallelism_as_unsupported():
         aic_predictors.AicOpLevelPredictor.create(context)
 
 
+def test_op_level_reports_speculative_decoding_as_unsupported(monkeypatch):
+    parallelism = SimpleNamespace(decode_context_parallel_size=1)
+    context = SimpleNamespace(
+        worker=SimpleNamespace(config=SimpleNamespace(parallelism=parallelism)), options={}, worker_role="aggregated"
+    )
+    monkeypatch.setattr(aic_predictors, "_import_aisim_forward_pass_perf_model", lambda: object())
+    monkeypatch.setattr(aic_predictors, "_canonical_config_type", lambda: object())
+    monkeypatch.setattr(aic_predictors.AicOpLevelPredictor, "_native_engine_config", lambda context: {"nextn": 3})
+    with pytest.raises(aic_predictors.DependencyError, match="speculative decoding"):
+        aic_predictors.AicOpLevelPredictor.create(context)
+
+
 def test_op_level_request_selects_uncorrected_op_level_and_rejects_bad_overrides():
     @dataclass(frozen=True)
     class Request:
@@ -1241,6 +1253,8 @@ def test_op_level_request_selects_uncorrected_op_level_and_rejects_bad_overrides
         fallback_policy: str = "allow"
         database_mode: str = "HYBRID"
         estimator_config: dict = field(default_factory=dict)
+        tp: int = 8
+        nextn: int = 0
 
     request = aic_predictors.op_level_request(Request(), {"backend_version": "0.31.0"})
     assert (request.estimation_mode, request.fallback_policy, request.database_mode) == ("op_level", "deny", "SILICON")
@@ -1250,6 +1264,8 @@ def test_op_level_request_selects_uncorrected_op_level_and_rejects_bad_overrides
         aic_predictors.op_level_request(Request(), {"nope": 1})
     with pytest.raises(ConfigurationError, match="cannot override: estimation_mode"):
         aic_predictors.op_level_request(Request(), {"estimation_mode": "fpm_learned"})
+    with pytest.raises(ConfigurationError, match="cannot override: nextn, tp"):
+        aic_predictors.op_level_request(Request(), {"tp": 4, "nextn": 3})
 
 
 def test_real_op_level_predicts_from_the_packaged_database(tmp_path):
