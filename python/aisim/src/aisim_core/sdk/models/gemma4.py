@@ -171,13 +171,7 @@ def _valid_gemma4_v1_record(collection: dict, table: str, event: object, path: P
         required = perf_database._COLLECTION_EVENT_REQUIRED_KEYS
         if fields - {*required, "classified_failures"}:
             return False
-        if event.get("classified_failures") is not None:
-            perf_database._validate_non_negative_row_count(
-                event["classified_failures"], field="classified_failures", path=str(path)
-            )
-        perf_database._validate_collection_event(
-            {k: event[k] for k in required if k in event}, table=table, index=0, path=str(path)
-        )
+        perf_database._validate_collection_event(event, table=table, index=0, path=str(path))
         return True
     except (TypeError, ValueError):
         return False
@@ -200,10 +194,11 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str, *, 
     tables = collection.get("tables")
     if not isinstance(tables, dict):
         tables = {}
+    # FPM has its own metadata sidecar; only op measurements qualify the serving image here.
     files = {
         Path(name).stem
         for name in perf_database._version_dir_data_filenames(str(directory))
-        if name.endswith((".parquet", ".txt"))
+        if name.endswith((".parquet", ".txt")) and name != "fpm_forward_perf.parquet"
     }
     repository = "vllm/vllm-openai-xpu" if framework == "vllm_xpu" else "vllm/vllm-openai"
     image = f"{repository}:v{version}"

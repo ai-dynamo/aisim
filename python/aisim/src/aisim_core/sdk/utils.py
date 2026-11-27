@@ -1160,7 +1160,9 @@ def gemma4_cache_shapes(
                 else config.get("num_hidden_layers", 30) != 1
             )
             for kind in ("full_attention", "sliding_attention") if sliding else ("full_attention",):
-                if kind in rope and not isinstance(rope[kind], dict):
+                if (kind in rope and not isinstance(rope[kind], dict)) or (
+                    kind not in rope and any(key in rope for key in ("full_attention", "sliding_attention"))
+                ):
                     raise ValueError(f"Gemma 4 vLLM attention requires rope_parameters.{kind} to be a mapping")
     heads = config.get("num_key_value_heads", 4)
     dim = config.get("head_dim", 256)

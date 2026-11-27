@@ -778,7 +778,7 @@ _COLLECTION_EVENT_REQUIRED_KEYS = (
     "rows",
     "status",
 )
-_COLLECTION_EVENT_OPTIONAL_KEYS = ("source_campaign_rows", "source_campaign_status", "runtime")
+_COLLECTION_EVENT_OPTIONAL_KEYS = ("source_campaign_rows", "source_campaign_status", "classified_failures", "runtime")
 _COLLECTION_STATUSES = frozenset({"complete", "partial"})
 # Mirror the authored collection_meta runtime contract in collector.provenance
 # without making the installed core depend on the GPU collector package.
@@ -838,6 +838,10 @@ def _validate_collection_event(event: object, *, table: str, index: int, path: s
         if not isinstance(event[key], str) or not event[key].strip():
             raise ValueError(f"{path}: {field_path}.{key} must be a non-empty string")
     _validate_non_negative_row_count(event["rows"], field=f"{field_path}.rows", path=path)
+    if event.get("classified_failures") is not None:
+        _validate_non_negative_row_count(
+            event["classified_failures"], field=f"{field_path}.classified_failures", path=path
+        )
     if event["status"] not in _COLLECTION_STATUSES:
         raise ValueError(f"{path}: {field_path}.status must be 'complete' or 'partial'")
 

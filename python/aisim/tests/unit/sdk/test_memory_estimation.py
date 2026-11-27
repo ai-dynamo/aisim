@@ -2409,16 +2409,20 @@ def test_vllm_gemma_flat_and_per_layer_configs_need_the_effective_rope_mapping(t
                 model = _write_config(tmp_path, document | {"text_config": child})
                 width = estimate_kv_bytes_per_token(model, **options)
                 assert width > 0 and _compiled_vllm_transfer_widths(model, version) == (width, width)
+                flat = {"rope_type": "default", "rope_theta": 10_000.0}
+                model = _write_config(tmp_path, document | {"text_config": child | {"rope_scaling": flat}})
+                assert _compiled_vllm_transfer_widths(model, version) == (width, width)
             model = _write_config(tmp_path, document | {"text_config": child | {"rope_scaling": None}})
             with pytest.raises(ValueError, match="rope_parameters to be a mapping"):
                 estimate_kv_bytes_per_token(model, **options)
             with pytest.raises(ValueError, match="rope_parameters to be a mapping"):
                 _compiled_vllm_transfer_widths(model, version)
         for kind in ("full_attention", "sliding_attention"):
-            rope = {**text["rope_parameters"], kind: None}
-            model = _write_config(tmp_path, document | {"text_config": child | {"rope_scaling": rope}})
-            with pytest.raises(ValueError, match=rf"rope_parameters\.{kind} to be a mapping"):
-                _compiled_vllm_transfer_widths(model, "0.32.0")
+            partial = {k: v for k, v in text["rope_parameters"].items() if k != kind}
+            for rope in (partial, partial | {kind: None}):
+                model = _write_config(tmp_path, document | {"text_config": child | {"rope_scaling": rope}})
+                with pytest.raises(ValueError, match=rf"rope_parameters\.{kind} to be a mapping"):
+                    _compiled_vllm_transfer_widths(model, "0.32.0")
 
 
 def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
@@ -2686,6 +2690,8 @@ def test_gemma4_v2_per_event_runtime_and_zero_rows(tmp_path):
         collector_ref="rev", collector_hash="h", case_plan_hash="p", collected_at="2026-01-01", status="partial"
     )
     name = "context_attention_perf"
+    # FPM publishes separate metadata for its backend-first timing table.
+    pq.write_table(pa.table({"latency": [1]}), tmp_path / "fpm_forward_perf.parquet")
     for stock_rows, foreign_rows, merged_rows, retained_rows, expected in (
         (1, 0, 1, 1, [True]),
         (2, 0, 1, 1, [True]),
@@ -2695,7 +2701,10 @@ def test_gemma4_v2_per_event_runtime_and_zero_rows(tmp_path):
         (0, 0, 1, 1, [False]),
     ):
         pq.write_table(pa.table({"latency": range(retained_rows)}), tmp_path / f"{name}.parquet")
-        events = [event | {"rows": stock_rows, "runtime": runtime}, event | {"rows": foreign_rows}]
+        events = [
+            event | {"rows": stock_rows, "runtime": runtime, "classified_failures": 1},
+            event | {"rows": foreign_rows},
+        ]
         tables = {name: {"rows": merged_rows, "status": "partial", "collections": events}}
         (tmp_path / "collection_meta.yaml").write_text(
             json.dumps({"schema_version": 2, "runtime": custom, "tables": tables})
@@ -3344,6 +3353,138 @@ def _onevision_qwen2_7b(child_dtype):
     }
 
 
+def _onevision_fp8_weights():
+    # nm-testing/llava-onevision-qwen2-7b-ov-hf-FP8-dynamic, config.json at
+    # 674147caa388d820100eb2b8916262abe0d1e814. Each of the 26 SigLIP layers has six excluded linears.
+    document = _onevision_qwen2_7b("bfloat16")
+    document["text_config"]["vocab_size"] = 152128
+    vision_linears = (
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.out_proj",
+        "mlp.fc1",
+        "mlp.fc2",
+    )
+    document["quantization_config"] = {
+        "quant_method": "compressed-tensors",
+        "format": "float-quantized",
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear"],
+                "weights": {"num_bits": 8, "type": "float", "strategy": "channel", "dynamic": False, "symmetric": True},
+                "input_activations": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "strategy": "token",
+                    "dynamic": True,
+                    "symmetric": True,
+                },
+            }
+        },
+        "ignore": [
+            f"vision_tower.vision_model.encoder.layers.{i}.{module}" for i in range(26) for module in vision_linears
+        ]
+        + ["multi_modal_projector.linear_1", "multi_modal_projector.linear_2", "language_model.lm_head"],
+    }
+    return document
+
+
+def test_vllm_onevision_fp8_decoder_projection_coverage(tmp_path):
+    document = _onevision_fp8_weights()
+    quant = document["quantization_config"]
+    args = _missing_system_cache_options(tmp_path, tp_size=1, capacity=12 * _GIB)
+    args.update(
+        max_num_tokens=512, max_batch_size=1, memory_fraction_value=1, naive_kv_reservation=0.8, tolerance_fraction=0
+    )
+    model = _write_config(tmp_path, document)
+    # The checkpoint has a weight_scale for each of the 28 * 7 decoder projections.
+    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (57_344, 57_344)
+    assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **args) == 3104
+    for target in ("language_model.model.layers.27.self_attn.o_proj", r"re:.*\.mlp\.down_proj$"):
+        quant["ignore"].append(target)
+        model = _write_config(tmp_path, document)
+        with pytest.raises(ValueError, match="no KV budget"):
+            memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **args)
+        quant["ignore"].pop()
+    quant["kv_cache_scheme"] = {"num_bits": 8, "type": "float", "strategy": "tensor", "symmetric": True}
+    document["compression_config"] = document.pop("quantization_config")
+    document["text_config"]["quantization_config"] = {
+        "quant_method": "compressed-tensors",
+        "config_groups": {},
+        "format": "dense",
+    }
+    model = _write_config(tmp_path, document)
+    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (57_344, 57_344)
+    with pytest.raises(ValueError, match="no KV budget"):
+        memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **args)
+
+
+def test_vllm_onevision_w8_group_scales_and_activation_scheme():
+    document = _onevision_fp8_weights()
+    quant = document["quantization_config"]
+    group = quant["config_groups"]["group_0"]
+    options = dict(backend="vllm", backend_version="0.32.0", tp_size=1, pp_size=1)
+    quant["format"] = "pack-quantized"
+    group["weights"].update(type="int", strategy="group", group_size=128)
+    group["input_activations"] = None
+    matrix_weights = 28 * (4 * 3584**2 + 3 * 3584 * 18944)
+    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 9_322_758_144 + 2 * (
+        matrix_weights // 128
+    )
+    group["weights"]["group_size"] = 16
+    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 16_464_609_280
+    quant["format"] = "int-quantized"
+    group["weights"].update(strategy="channel", group_size=None)
+    group["input_activations"] = {"num_bits": 8, "type": "int", "strategy": "token", "dynamic": True}
+    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 9_322_758_144
+    group["input_activations"]["strategy"] = "tensor"
+    with pytest.raises(ValueError, match="W8 weights"):
+        NaiveKVCacheEstimator.from_hf_config(document, **options)
+    group["input_activations"] = {"type": "int"}
+    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 9_322_758_144
+
+
+@pytest.mark.parametrize(
+    ("version", "group_activations", "group_packed_weights"),
+    [
+        ("0.10.0", False, False),
+        ("0.10.1rc1", True, False),
+        ("0.10.1.1", True, False),
+        ("0.10.2rc1", True, True),
+        ("0.11.0", True, True),
+    ],
+)
+def test_vllm_per_group_weight_formats(tmp_path, version, group_activations, group_packed_weights):
+    from aisim.generator.naive import _estimate_model_weight_bytes
+
+    document = _onevision_fp8_weights()
+    quant = document["quantization_config"]
+    group = quant["config_groups"]["group_0"]
+    for supported_format, per_group in (
+        ("float-quantized", group_activations),
+        ("pack-quantized", group_packed_weights),
+    ):
+        if supported_format == "pack-quantized":
+            # nm-testing/TinyLlama-1.1B-Chat-v1.0-W8A16-G128-compressed (b307a916) stores channel INT8 weights.
+            group["weights"]["type"] = "int"
+            group["input_activations"] = None
+        for root, override, supported in (
+            (supported_format, "dense", not per_group),
+            ("dense", supported_format, per_group),
+        ):
+            quant["format"] = root
+            group["format"] = override
+            checkpoint = tmp_path / f"{root}-{override}"
+            checkpoint.mkdir()
+            model = _write_config(checkpoint, document)
+            if supported:
+                assert _estimate_model_weight_bytes(model, backend="vllm", backend_version=version) == 9_322_758_144
+            else:
+                with pytest.raises(RuntimeError, match="W8 weights"):
+                    _estimate_model_weight_bytes(model, backend="vllm", backend_version=version)
+
+
 @pytest.mark.parametrize("child_dtype", ["bfloat16", "float32", "float8_e4m3fn"])
 def test_vllm_wrapper_uses_the_execution_dtype_for_auto_kv_and_unquantized_weights(tmp_path, child_dtype):
     from aisim.capacity import estimate_kv_bytes_per_token
@@ -3486,6 +3627,12 @@ def test_vllm_opt_with_compressed_kv_and_unquantized_weights(tmp_path, key):
     assert _compiled_vllm_transfer_widths(path, "0.32.0") == (18_432, 18_432)
     opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=2 * _GIB)
     assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) > 0
+    quant.update(quant_method="modelopt")
+    path = _write_config(
+        tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "text_config": child, key: quant}
+    )
+    with pytest.raises(ValueError, match="quant_algo"):
+        memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts)
 
 
 @pytest.mark.parametrize(
@@ -3522,7 +3669,7 @@ def test_vllm_uses_the_parent_config_and_registered_language_model(
         assert _compiled_vllm_transfer_widths(model, version) == (expected, expected)
 
 
-@pytest.mark.parametrize("config_type", ["falcon", "gpt2", "gptj", "gpt-sw3", "deepseek_v3"])
+@pytest.mark.parametrize("config_type", ["falcon", "gpt2", "gptj", "gpt-sw3", "gpt_neo", "gemma4_text", "deepseek_v3"])
 def test_vllm_opt_uses_its_head_count_with_foreign_config_aliases(tmp_path, config_type):
     child = dict(
         model_type=config_type,
@@ -3539,8 +3686,20 @@ def test_vllm_opt_uses_its_head_count_with_foreign_config_aliases(tmp_path, conf
     )
     if config_type in ("gpt2", "gptj", "gpt-sw3"):
         child.update(n_head=12, n_layer=12, n_embd=768, n_positions=2048)
+    elif config_type == "gpt_neo":
+        child.update(
+            num_heads=12,
+            num_layers=12,
+            hidden_size=768,
+            max_position_embeddings=2048,
+            attention_types=[[["global", "local"], 6]],
+        )
     else:
         child.update(num_attention_heads=12, num_hidden_layers=12, hidden_size=768, max_position_embeddings=2048)
+    if config_type == "gemma4_text":
+        child.update(
+            layer_types=["full_attention"] * 12, global_head_dim=64, num_global_key_value_heads=1, attention_k_eq_v=True
+        )
     path = _write_config(tmp_path, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": child})
     assert _compiled_vllm_transfer_widths(path, "0.32.0") == (36_864, 36_864)
 
@@ -3591,11 +3750,24 @@ def test_vllm_fp8_linear_weights_keep_parent_dtype_for_embeddings(tmp_path):
     from aisim.generator.naive import _estimate_model_weight_bytes
 
     document = _onevision_qwen2_7b("float8_e4m3fn")
-    document["quantization_config"] = {"quant_method": "fp8"}
+    document["quantization_config"] = {"quant_method": "fp8", "activation_scheme": "dynamic"}
     document["text_config"].update(num_hidden_layers=1, hidden_size=4096, num_attention_heads=32)
     path = _write_config(tmp_path, document)
     # Both vocabulary matrices remain FP16 even when the serialized linear weights are FP8.
-    assert _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") > 2 * 152064 * 4096 * 2
+    assert _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") == (
+        2 * 152064 * 4096 * 2 + 4 * 4096**2 + 3 * 4096 * 18944
+    )
+    opts = dict(backend="vllm", backend_version="0.32.0", tp_size=1, pp_size=1)
+    quant = document["quantization_config"]
+    quant["ignored_layers"] = ["language_model.model.layers.0.mlp.down_proj"]
+    unquantized = {k: v for k, v in document.items() if k != "quantization_config"}
+    assert (
+        NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes()
+        == NaiveKVCacheEstimator.from_hf_config(unquantized, **opts).weight_bytes()
+    )
+    del quant["activation_scheme"]
+    with pytest.raises(ValueError, match="activation_scheme"):
+        NaiveKVCacheEstimator.from_hf_config(document, **opts)
 
 
 def test_dispatched_deepseek_counts_resident_weights_and_routed_layers(tmp_path):
@@ -3626,12 +3798,22 @@ def test_dispatched_deepseek_counts_resident_weights_and_routed_layers(tmp_path)
             == 74_893_717_504
         )
         assert metadata["is_moe"] is False
-    raw.update(first_k_dense_replace=60, quantization_config={"quant_method": "fp8"})
+    raw.update(first_k_dense_replace=60, quantization_config={"quant_method": "fp8", "activation_scheme": "dynamic"})
     estimator = NaiveKVCacheEstimator.from_hf_config(
         raw, backend="sglang", backend_version="0.5.23", tp_size=8, pp_size=1, moe_tp_size=8
     )
     assert estimator.geometry["num_routed_layers"] == 1
     assert 0 < estimator.weight_bytes() < 14 * _GIB
+    raw["first_k_dense_replace"] = 30
+    raw["quantization_config"]["weight_block_size"] = [128, 128]
+    options = dict(backend="sglang", backend_version="0.5.23", tp_size=8, pp_size=1, moe_tp_size=8)
+    block_fp8 = NaiveKVCacheEstimator.from_hf_config(raw, **options).weight_bytes()
+    raw["quantization_config"]["ignored_layers"] = ["mlp.experts"]
+    bf16 = NaiveKVCacheEstimator.from_hf_config(raw, **options).weight_bytes()
+    # Each rank keeps 256 experts in 31 layers, each with three 7168 x 256 matrices and FP32 scales.
+    params = 31 * 256 * 3 * 7168 * 256
+    assert bf16 - block_fp8 == params - 4 * (params // (128 * 128))
+    assert block_fp8 < 80 * _GIB < bf16
 
 
 def test_sglang_llava_uses_its_pinned_transformers_causal_lm(tmp_path):
@@ -4980,7 +5162,7 @@ def test_wrapped_checkpoint_kv_precision_prices_transfers_and_blocks(tmp_path, n
             "kv_cache_scheme": {"num_bits": 8, "type": "float", "dynamic": False},
         }
     elif source == "weight_only":
-        raw["quantization_config"] = {"quant_method": "fp8"}
+        raw["quantization_config"] = {"quant_method": "fp8", "activation_scheme": "dynamic"}
     else:
         if source == "unquantized":
             sidecar["quantization"]["kv_cache_quant_algo"] = None

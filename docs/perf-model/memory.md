@@ -113,9 +113,19 @@ class list. Its Idefics3 model constructs a Llama decoder directly. SGLang's
 LLaVA selects the decoder from the Transformers config class shipped with that
 SGLang release. In registered vLLM wrappers, unquantized decoder weights and
 automatic KV storage use the parent model's execution dtype. A compressed-tensors
-KV scheme changes the cache alone. A separate 8-bit weight scheme targeting all
-decoder linear layers reduces their resident weight estimate. A selected
-encoder-only attention implementation has no persistent KV blocks to transfer.
+KV scheme changes the cache alone. For a dense Llama, Mistral, Qwen2 or Qwen3
+decoder on one pipeline stage, the estimator reduces its projection reserve
+when the only weight group uses a supported 8-bit scheme with the sole target
+`Linear`. Literal exclusions for the vision tower, multimodal projector,
+embeddings or output head still permit that reduction. The embeddings and
+output head use model precision. A decoder projection exclusion or an
+unresolved pattern keeps the model-precision reserve for the projections.
+Packed group-wise INT8 weights include one execution-dtype scale per group
+when groups of 32, 64 or 128 align with the projection shards and the scales
+partition across ranks. For block-FP8 DeepSeek
+experts, SGLang's estimate includes the resident expert shards and their scales.
+A selected encoder-only attention implementation has no persistent KV blocks
+to transfer.
 Automatic sizing uses each backend's checkpoint metadata. For example, the ModelOpt sidecar for
 Llama-3.1-70B-Instruct-FP8 selects a 20,480-byte FP8 cache per token at TP8.
 BF16 takes 40,960 bytes. An explicit `kvcache_quant_mode` selects the cache

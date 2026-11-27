@@ -436,14 +436,18 @@ def _select_text_decoder(
             "gpt-sw3": (768, 12, 12, 1024),
             "gpt_bigcode": (768, 12, 12, 1024),
             "gptj": (4096, 16, 28, 2048),
+            "gpt_neo": (2048, 16, 24, 2048),
             "codegen": (4096, 16, 28, 2048),
             "openai-gpt": (768, 12, 12, 512),
         }
         if kind in gpt_defaults:
             attributes = ("hidden_size", "num_attention_heads", "num_hidden_layers", "max_position_embeddings")
-            for field, alias, default in zip(
-                attributes, ("n_embd", "n_head", "n_layer", "n_positions"), gpt_defaults[kind], strict=True
-            ):
+            aliases = (
+                ("hidden_size", "num_heads", "num_layers", "max_position_embeddings")
+                if kind == "gpt_neo"
+                else ("n_embd", "n_head", "n_layer", "n_positions")
+            )
+            for field, alias, default in zip(attributes, aliases, gpt_defaults[kind], strict=True):
                 decoder.setdefault(field, decoder.get(alias, default))
         # OPT uses full multi-head attention and its own FFN fields even when a
         # different Transformers config provides the actual constructor arguments.
@@ -465,6 +469,18 @@ def _select_text_decoder(
         if hidden % heads:
             raise ValueError("OPT hidden size must be divisible by its attention head count")
         decoder.update(num_key_value_heads=heads, head_dim=hidden // heads, intermediate_size=decoder["ffn_dim"])
+        if native_dispatch:
+            # OPT constructs full multi-head attention in every layer, independent of the source config class.
+            decoder["model_type"] = "opt"
+            for field in (
+                "layer_types",
+                "sliding_window",
+                "sliding_window_pattern",
+                "use_sliding_window",
+                "per_layer_config",
+            ):
+                decoder.pop(field, None)
+            return "opt", named
         return kind, named
     if native_dispatch and named in ("LlamaForCausalLM", "MistralForCausalLM") and named != selected:
         if kind not in ("llama", "mistral", "qwen2", "qwen3"):
@@ -653,15 +669,37 @@ def _validate_sglang_dense_fp8(
             )
 
 
+def _outside_dense_decoder_projections(target: object) -> bool:
+    """Recognize literal compressed-tensors exclusions outside the dense decoder's projection matrices."""
+    if not isinstance(target, str) or target.startswith("re:"):
+        return False
+    module = target.rsplit(".", 1)[-1]
+    namespace = target.removeprefix("model.").partition(".")[0]
+    return module in ("lm_head", "embed_tokens", "embed_positions") or namespace in (
+        "vision_tower",
+        "vision_model",
+        "multi_modal_projector",
+        "connector",
+    )
+
+
 def _vllm_weight_config(document: dict) -> dict | None:
-    # ModelArchConfigConvertor checks the parent's two serialized spellings before the text config.
-    for config in (document, document.get("text_config")):
-        if isinstance(config, dict):
-            for key in ("quantization_config", "compression_config"):
-                if (quant := config.get(key)) is not None:
-                    if not isinstance(quant, dict):
-                        raise ValueError(f"vLLM {key} must be a JSON object")
-                    return quant
+    # get_quant_config loads the checkpoint's settings after ModelArchConfigConvertor chooses the quantizer class.
+    text = document.get("text_config")
+    for config, key in (
+        (document, "quantization_config"),
+        (text, "quantization_config"),
+        (document, "compression_config"),
+    ):
+        if isinstance(config, dict) and (quant := config.get(key)) is not None:
+            if not isinstance(quant, dict):
+                raise ValueError(f"vLLM {key} must be a JSON object")
+            if config is text and isinstance(parent_scheme := document.get("compression_config"), dict):
+                selected = str(parent_scheme.get("quant_method", "")).lower().replace("_", "-")
+                loaded = str(quant.get("quant_method", "")).lower().replace("_", "-")
+                if selected and loaded and selected != loaded:
+                    raise ValueError("vLLM selects a different quantizer from the text checkpoint settings")
+            return quant
     return None
 
 
@@ -1332,6 +1370,7 @@ class NaiveKVCacheEstimator:
         self.architecture: str | None = None
         self.dtype_bytes = dtype_bytes  # KV precision, fractional for NVFP4
         self.weight_dtype_bytes = dtype_bytes
+        self._weight_scale_group_size: int | None = None
         self._embedding_dtype_bytes = dtype_bytes
         self._quantized_weights = False
         self.tp_size = validate_parallel_size("tp_size", tp_size)
@@ -1417,7 +1456,7 @@ class NaiveKVCacheEstimator:
             backend_version=backend_version,
         )
 
-        if backend == "vllm" and gemma4:
+        if backend == "vllm" and gemma4 and estimator.architecture not in _VLLM_DENSE_DECODERS:
             check_gemma4_adapter_runtime(
                 hf_config, backend_version, tp_size, system=system, systems_paths=systems_paths
             )
@@ -1471,7 +1510,7 @@ class NaiveKVCacheEstimator:
             backend=backend,
             backend_version=backend_version,
         )
-        if backend == "vllm":
+        if backend == "vllm" and estimator.architecture not in _VLLM_DENSE_DECODERS:
             check_gemma4_adapter_runtime(hf_config, backend_version, tp_size)
         return estimator
 
@@ -1858,13 +1897,16 @@ class NaiveKVCacheEstimator:
                 quant = raw.get("hf_quant_config") or {}
             self.weight_dtype_bytes = model_dtype_bytes
             self._embedding_dtype_bytes = model_dtype_bytes
+            self._weight_scale_group_size = None
             method = str(quant.get("quant_method", "")).lower().replace("_", "-")
             self._quantized_weights = bool(quant or raw.get("quant_algo"))
             if method.startswith("modelopt") or "quantization" in quant:
-                section = quant.get("quantization") or quant
+                section = quant.get("quantization", quant)
                 if not isinstance(section, dict):
                     raise ValueError("ModelOpt quantization must be a mapping")
                 self._quantized_weights = bool(section.get("quant_algo"))
+                if method.startswith("modelopt") and not self._quantized_weights:
+                    raise ValueError("ModelOpt checkpoint is missing quant_algo")
             if method == "compressed-tensors":
                 groups = quant.get("config_groups", {})
                 if not isinstance(groups, dict):
@@ -1894,18 +1936,20 @@ class NaiveKVCacheEstimator:
                 if self.pp_size == 1 and self.architecture in _VLLM_DENSE_DECODERS and len(weight_groups) == 1:
                     group = weight_groups[0]
                     weights = group["weights"]
+                    ignored = quant.get("ignore", [])
                     if (
                         group["targets"] == ["Linear"]
-                        and quant.get("ignore", []) in ([], ["lm_head"])
+                        and isinstance(ignored, list)
+                        and all(_outside_dense_decoder_projections(target) for target in ignored)
                         and weights.get("num_bits") == 8
                         and weights.get("type") in ("float", "int")
                         and weights.get("symmetric", True)
-                        and weights.get("strategy") in ("tensor", "channel", "block")
+                        and weights.get("strategy") in ("tensor", "channel", "block", "group")
                         and not weights.get("dynamic", False)
                     ):
                         group_format = group.get("format")
                         root_format = quant.get("format")
-                        if group_format is None or (release is not None and release < Version("0.11.1rc1")):
+                        if group_format is None or (release is not None and release < Version("0.10.1rc1")):
                             group_format = root_format
                         elif release is None and group_format != root_format:
                             raise ValueError("a compressed-tensors group format override requires the vLLM release")
@@ -1915,16 +1959,56 @@ class NaiveKVCacheEstimator:
                             "float-quantized",
                             "nvfp4-pack-quantized",
                         )
-                        packed_channel = (
-                            group_format == "pack-quantized"
-                            and weights["strategy"] == "channel"
+                        # v0.10.1 reads activation formats per group, but still dispatches packed weights globally.
+                        packed_format = (
+                            root_format if release is not None and release < Version("0.10.2rc1") else group_format
+                        )
+                        packed = (
+                            packed_format == "pack-quantized"
+                            and weights["strategy"] in ("channel", "group")
                             and (weights["type"] == "int" or group.get("input_activations") is None)
                         )
-                        if not activation_format and not packed_channel:
+                        inputs = group.get("input_activations")
+                        if activation_format and weights["type"] == "int" and not packed:
+                            # For W8A8, vLLM supports static per-tensor or dynamic per-token activations.
+                            if not isinstance(inputs, dict) or not inputs:
+                                raise ValueError("vLLM compressed-tensors W8A8 requires an input activation scheme")
+                            input_strategy = inputs.get("strategy")
+                            if input_strategy is None and inputs.get("group_size") is None:
+                                input_strategy = "tensor"
+                            activation_format = (
+                                inputs.get("num_bits", 8) == 8
+                                and (input_strategy, inputs.get("dynamic", False))
+                                in (("tensor", False), ("token", True))
+                                and weights["strategy"] in ("tensor", "channel")
+                            )
+                        if not activation_format and not packed:
                             raise ValueError(
                                 f"vLLM cannot load these compressed-tensors W8 weights in {group_format!r}"
                             )
-                        self.weight_dtype_bytes = 1
+                        if weights["strategy"] != "group":
+                            self.weight_dtype_bytes = 1
+                        elif packed and weights["type"] == "int" and inputs is None:
+                            size = layout_integer(weights.get("group_size"), "compressed-tensors W8 group_size")
+                            geom = self.geometry
+                            hidden, inter = geom["hidden"], geom["inter"]
+                            heads, dim = geom["num_attention_heads"], geom["head_dim"]
+                            sharded = size * self.tp_size
+                            partitioned_scales = weights.get("actorder") in (None, False, "static", "weight")
+                            if (
+                                size in (32, 64, 128)
+                                and partitioned_scales
+                                and all((hidden, inter, heads, dim))
+                                and not (hidden % size or inter % sharded or heads * dim % sharded)
+                            ):
+                                self._weight_scale_group_size = size
+                                self.weight_dtype_bytes = 1
+            elif method == "fp8":
+                if quant.get("activation_scheme") not in ("dynamic", "static"):
+                    raise ValueError("vLLM FP8 checkpoints require a static or dynamic activation_scheme")
+                ignored = quant.get("ignored_layers") or quant.get("modules_to_not_convert") or []
+                if isinstance(ignored, list) and all(_outside_dense_decoder_projections(target) for target in ignored):
+                    self.weight_dtype_bytes = self._dtype_bytes(raw)
             elif self._quantized_weights and raw.get("quant_algo"):
                 self.weight_dtype_bytes = self._dtype_bytes(raw)
         self.dtype_bytes = mode.value.memory if mode is not None else model_dtype_bytes
@@ -2625,7 +2709,39 @@ class NaiveKVCacheEstimator:
                 matrices += 3 * hidden * ((layers - routed) * inter + routed * shared * moe_inter) // tp
                 # Norms, replicated gates and their correction biases may use FP32.
                 vectors = hidden + layers * (2 * hidden + q_rank + kv_rank) + routed * n_experts * (hidden + 1)
-                return int(embeddings + matrices * self.weight_dtype_bytes + 4 * vectors)
+                resident = embeddings + matrices * self.weight_dtype_bytes + 4 * vectors
+                quant = raw.get("quantization_config") or {}
+                if (
+                    self._cache_backend == "sglang"
+                    and quant.get("quant_method") == "fp8"
+                    and quant.get("weight_block_size")
+                ):
+                    if quant.get("activation_scheme") != "dynamic":
+                        raise ValueError("SGLang block-quantized FP8 weights require dynamic activations")
+                    block_n, block_k = fp8_weight_block_shape(quant, sglang=True, experts=True)
+                    ignored = quant.get("ignored_layers", quant.get("modules_to_not_convert"))
+                    if ignored is None:
+                        ignored = []
+                    if not isinstance(ignored, list) or not all(isinstance(name, str) and name for name in ignored):
+                        raise ValueError("SGLang FP8 exclusions must be a list of module names")
+                    quantized = routed
+                    if ignored:
+                        quantized = (
+                            sum(
+                                not _sglang_skips_modules(
+                                    ignored, (i,), self._cache_release, self._sglang_layer_prefix + "mlp.experts"
+                                )
+                                for i in _deepseek_routed_layers(raw, layers)
+                            )
+                            if self._cache_release is not None
+                            else 0
+                        )
+                    shard = moe_inter // self.moe_tp_size
+                    # w13 has two (shard, hidden) matrices and w2 has one (hidden, shard) matrix per local expert.
+                    scales = 2 * math.ceil(shard / block_n) * math.ceil(hidden / block_k)
+                    scales += math.ceil(hidden / block_n) * math.ceil(shard / block_k)
+                    resident += quantized * (expert_params * (1 - self.weight_dtype_bytes) + 4 * local_experts * scales)
+                return int(resident)
             expert_bytes = layers * expert_params * self.weight_dtype_bytes // pp
             return non_expert_bytes + expert_bytes
         else:
@@ -2639,7 +2755,11 @@ class NaiveKVCacheEstimator:
                     attn_params_per_layer = max(attn_params_per_layer, qkv_output * tp)
             ffn_params_per_layer = 3 * hidden * inter
             layer_params = layers * (attn_params_per_layer + ffn_params_per_layer)
-            return (embed_params * self._embedding_dtype_bytes + layer_params * self.weight_dtype_bytes) // (tp * pp)
+            weights = embed_params * self._embedding_dtype_bytes + layer_params * self.weight_dtype_bytes
+            if self._weight_scale_group_size:
+                # WNA16 stores one scale at the execution dtype per group of input features in each output row.
+                weights += -(-layer_params // self._weight_scale_group_size) * self._embedding_dtype_bytes
+            return weights // (tp * pp)
 
     # --------------------------- byte budget -> tokens ---------------------------- #
 
