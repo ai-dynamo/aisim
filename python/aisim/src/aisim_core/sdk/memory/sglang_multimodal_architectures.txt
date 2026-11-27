@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright the HuggingFace Team
+# SPDX-FileCopyrightText: Copyright 2024 The HuggingFace Inc. team and Google DeepMind.
+# SPDX-FileCopyrightText: Copyright 2018 The Google AI Language Team Authors, Facebook AI Research authors and The HuggingFace Inc. team.
+# SPDX-FileCopyrightText: Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Derived from the tagged multimodal declarations and stock EntryClass names.
 # https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/python/sglang/srt/configs/model_config.py
@@ -11,7 +14,7 @@
 # transformers rows identify supported composite Transformers entrypoints.
 # compatible and incompatible rows group additional PyTorch model class exports by suffix (- for none).
 # SGLang requires is_backend_compatible() in 0.5.6.post2 through 0.5.8 and calls it only when present from 0.5.9.
-# https://github.com/huggingface/transformers/tree/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models
+# https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/__init__.py
 multimodal 6 23 CLIPModel DeepseekOCRForCausalLM DeepseekVL2ForCausalLM DotsOCRForCausalLM DotsVLMForCausalLM
 multimodal 6 23 Gemma3ForConditionalGeneration Gemma3nForConditionalGeneration Glm4vForConditionalGeneration
 multimodal 6 23 Glm4vMoeForConditionalGeneration Grok1AForCausalLM Grok1VForCausalLM
@@ -541,6 +544,7 @@ incompatible 6 21 ForTokenClassification DiffLlama GPTBigCode Nemotron
 incompatible 6 21 FormerModel Blip2Q InstructBlipQ InstructBlipVideoQ
 incompatible 6 21 Model CTRL CTRLLMHead DiffLlama GPTBigCode KyutaiSpeechToText Mimi Moshi Nemotron RecurrentGemma
 incompatible 6 21 PreTrainedModel CTRL DiffLlama GPTBigCode KyutaiSpeechToText Mimi Moshi Nemotron RecurrentGemma
+incompatible 6 23 Model BayesianDetector PreTrained
 incompatible 6 23 - BltPatcher ClapAudioModelWithProjection ClapTextModelWithProjection DPRPretrainedReader DPRReader
 incompatible 6 23 - FastSpeech2ConformerHifiGan FastSpeech2ConformerWithHifiGan FlavaImageCodebook JanusVQVAE
 incompatible 6 23 - SeamlessM4TCodeHifiGan SpeechT5HifiGan

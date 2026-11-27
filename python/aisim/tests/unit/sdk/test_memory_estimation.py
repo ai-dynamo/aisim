@@ -3734,7 +3734,13 @@ def test_sglang_local_model_precedes_auto_map(tmp_path_factory, version):
         dep = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
         return tuple(args["kv_transfer_bytes_per_token"] for args in (dep.prefill_engine_args, dep.decode_engine_args))
 
-    for names in ([generation, "EncodecModel"], ["EncodecModel", generation], ["EncodecModel"]):
+    for names in (
+        [generation, "EncodecModel"],
+        ["EncodecModel", generation],
+        ["EncodecModel"],
+        [generation, "BayesianDetectorModel"],
+        ["PreTrainedModel", generation],
+    ):
         for mapping in (target, {}):
             with pytest.raises(ValueError, match="compatible model class for every architecture"):
                 widths(names, mapping)
