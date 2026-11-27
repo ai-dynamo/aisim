@@ -25,6 +25,7 @@ import yaml
 
 from aisim.sdk import perf_database
 from aisim.sdk.utils import (
+    _load_model_config_documents,
     _load_model_config_from_model_path,
     _parse_hf_config_json,
     get_model_config_from_model_path,
@@ -250,11 +251,13 @@ def _estimate_model_weight_bytes(
         logger.debug("Normalized parser error for %s: %s", model_path, e)
         try:
             options = dict(backend=backend, backend_version=backend_version, tp_size=1, pp_size=1)
-            if backend == "vllm" and (os.path.isdir(model_path) or raw_config.get("hf_quant_config") is not None):
-                # The SDK timing parser normalizes legacy sidecars to a scalar quantization method.
-                # Capacity needs the original checkpoint's class, exclusions and inline precedence.
+            if backend == "vllm" and os.path.isdir(model_path):
+                # Local checkpoint metadata can change between generator requests.
                 estimator = NaiveKVCacheEstimator.from_model_path(model_path, allow_hf_config_download=True, **options)
             else:
+                if backend == "vllm" and raw_config.get("hf_quant_config") is not None:
+                    # The timing parser normalizes legacy sidecars. Capacity needs the original class and exclusions.
+                    _, raw_config = _load_model_config_documents(model_path)
                 estimator = NaiveKVCacheEstimator.from_hf_config(raw_config, **options)
             weight_bytes = estimator.weight_bytes()
             if weight_bytes is None:

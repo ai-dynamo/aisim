@@ -96,6 +96,7 @@ from aisim_core.sdk.fpm_profile import FpmModelProfile, _load_fpm_timing_profile
 from aisim_core.sdk.memory.vllm_registry import (
     default_causal_lm,
     is_known_transformers_config,
+    is_registered_conditional_generator,
     select_architecture,
     select_wrapper_architecture,
 )
@@ -158,6 +159,7 @@ _TEXT_DEFAULTS_BY_MODEL_TYPE = dict(_TEXT_CONFIG_DEFAULTS.values())
 
 _FIXED_LLAMA_WRAPPERS = {"Idefics3ForConditionalGeneration", "SmolVLMForConditionalGeneration"}
 _TEXT_WRAPPERS = _TEXT_CONFIG_DEFAULTS.keys() | _FIXED_LLAMA_WRAPPERS
+_VLLM_NO_FP16_MODEL_TYPES = ("gemma2", "gemma3", "gemma3_text", "glm4")
 
 _VLLM_FP8_WEIGHT_DTYPES = {
     "F8_E4M3": "float8_e4m3fn",
@@ -318,6 +320,24 @@ def _sglang_llava_causal_lm(kind: str, version: str | None) -> str | None:
     if len(choices) != 1:
         raise ValueError(f"SGLang's LLaVA decoder for {kind!r} depends on the backend release")
     return choices.pop()
+
+
+def _uses_bare_decoder(config: dict, backend: str, version: str | None) -> bool:
+    kind = config.get("model_type")
+    if not isinstance(kind, str):
+        return False
+    if kind in _DECODER_GEOMETRY_DEFAULTS:
+        return True
+    # A bare HF config can provide the attributes for a different registered vLLM decoder.
+    names = config.get("architectures")
+    return (
+        backend == "vllm"
+        and isinstance(names, list)
+        and bool(names)
+        and all(isinstance(name, str) for name in names)
+        and is_known_transformers_config(kind, version)
+        and select_architecture(names, version, config.get("auto_map"), modeled=_VLLM_DENSE_DECODERS) is not None
+    )
 
 
 def _select_text_decoder(
@@ -776,6 +796,19 @@ def _vllm_fp8_linear_scale_bytes(quant: dict, geom: dict, tp: int) -> int:
         raise ValueError("vLLM FP8 projection shards must align with the checkpoint weight_block_size")
     matrices = ((q + 2 * kv, hidden), (hidden, q), (2 * ffn, hidden), (hidden, ffn))
     return 4 * sum(((out + block_n - 1) // block_n) * ((inp + block_k - 1) // block_k) for out, inp in matrices)
+
+
+def _compressed_tensor_strategy(args: dict) -> str:
+    strategy = args.get("strategy")
+    if strategy is not None:
+        return strategy
+    group_size = args.get("group_size")
+    if group_size is None:
+        return "tensor"
+    if group_size == -1:
+        return "channel"
+    layout_integer(group_size, "compressed-tensors group_size")
+    return "group"
 
 
 def _vllm_weight_config(document: dict) -> dict | None:
@@ -1530,31 +1563,17 @@ class NaiveKVCacheEstimator:
         gemma4 = isinstance(decoder, dict) and (
             architecture == "Gemma4ForConditionalGeneration" or decoder.get("model_type") == "gemma4_text"
         )
-        if isinstance(decoder, dict) and (
-            (
-                architecture not in ARCHITECTURE_TO_MODEL_FAMILY
-                and (
-                    key is not None
-                    or (
-                        backend == "vllm"
-                        and isinstance(decoder.get("model_type"), str)
-                        and decoder["model_type"] in _DECODER_GEOMETRY_DEFAULTS
-                    )
-                )
-            )
-            or (backend in ("sglang", "vllm") and gemma4 and gemma4_cache_requires_release(decoder, backend))
-        ):
-            backend_version = _config_only_backend_version(system, backend, backend_version, systems_paths)
+        fallback = isinstance(decoder, dict) and architecture not in ARCHITECTURE_TO_MODEL_FAMILY
+        gemma_release = backend in ("sglang", "vllm") and gemma4 and gemma4_cache_requires_release(decoder, backend)
+        version = backend_version
+        if gemma_release or (fallback and (key is not None or backend == "vllm")):
+            version = _config_only_backend_version(system, backend, backend_version, systems_paths)
+        fallback = fallback and (key is not None or _uses_bare_decoder(hf_config, backend, version))
+        if fallback or gemma_release:
+            backend_version = version
         # vLLM installs an adjacent checkpoint declaration into an empty root before class or child dispatch.
         sidecar = None
-        if architecture not in ARCHITECTURE_TO_MODEL_FAMILY and (
-            key is not None
-            or (
-                isinstance(decoder, dict)
-                and isinstance(decoder.get("model_type"), str)
-                and decoder["model_type"] in _DECODER_GEOMETRY_DEFAULTS
-            )
-        ):
+        if fallback:
             if backend != "vllm" or hf_config.get("quantization_config") is None:
                 if os.path.isdir(model_path):
                     sidecar = _load_local_quant_config(model_path)
@@ -1669,8 +1688,7 @@ class NaiveKVCacheEstimator:
                 ) from error
             parsed = None  # unsupported arch (the fallback's target) -> raw-key read, of its decoder when nested
             key = decoder_config_key(hf_config)
-            bare = resolve_bare and isinstance(model_type, str) and model_type in _DECODER_GEOMETRY_DEFAULTS
-            if key is not None or bare:
+            if key is not None or (resolve_bare and _uses_bare_decoder(hf_config, backend, backend_version)):
                 if key is None:
                     raw_decoder = dict(hf_config)
                 else:
@@ -1914,7 +1932,7 @@ class NaiveKVCacheEstimator:
             backend == "vllm"
             and release is not None
             and release >= Version("0.32.1rc0")
-            and model_type not in ("gemma2", "gemma3", "gemma3_text", "glm4")
+            and model_type not in _VLLM_NO_FP16_MODEL_TYPES
         )
         mode = _automatic_decoder_kv_mode(document or {}, raw, backend, backend_version)
         if self._nested_index_head_dim is not None:
@@ -2046,6 +2064,12 @@ class NaiveKVCacheEstimator:
                     raise ValueError(f"unsupported ModelOpt quant_algo {algo!r}")
                 if method in ("modelopt-mxfp8", "mxfp8") and algo != "MXFP8":
                     raise ValueError("ModelOpt MXFP8 checkpoints require quant_algo MXFP8")
+                if (
+                    algo == "MXFP8"
+                    and dtype in ("float16", "fp16", "half")
+                    and model_type not in _VLLM_NO_FP16_MODEL_TYPES
+                ):
+                    raise ValueError("vLLM ModelOpt MXFP8 requires bfloat16 execution")
                 self._quantized_weights = bool(algo)
                 ignored = section.get("exclude_modules", []) if "quantization" in quant else quant.get("ignore", [])
                 if method in ("modelopt-mxfp8", "mxfp8") and not section.get("quant_algo"):
@@ -2057,7 +2081,12 @@ class NaiveKVCacheEstimator:
                     if algo == "FP8" and self.architecture in _VLLM_DENSE_DECODERS - {"OPTForCausalLM"}:
                         self.weight_dtype_bytes = 1
                         self._vllm_fp8_linear = {"activation_scheme": "static"}
-                    elif algo == "MXFP8":
+                    elif (
+                        algo == "MXFP8"
+                        and self.architecture in _VLLM_DENSE_DECODERS
+                        and not self.geometry.get("num_experts")
+                    ):
+                        # Only dense residency includes rank-local scale storage. Keep the execution-width MoE reserve.
                         self.weight_dtype_bytes = 1
                         self._weight_scale_group = (32, 1)  # E8M0 scale per group of MXFP8 weights.
             elif method == "compressed-tensors":
@@ -2089,15 +2118,7 @@ class NaiveKVCacheEstimator:
                 if self.pp_size == 1 and self.architecture in _VLLM_DENSE_DECODERS and len(weight_groups) == 1:
                     group = weight_groups[0]
                     weights = dict(group["weights"])
-                    group_size = weights.get("group_size")
-                    if weights.get("strategy") is None:
-                        if group_size is None:
-                            weights["strategy"] = "tensor"
-                        elif group_size == -1:
-                            weights["strategy"] = "channel"
-                        else:
-                            layout_integer(group_size, "compressed-tensors group_size")
-                            weights["strategy"] = "group"
+                    weights["strategy"] = _compressed_tensor_strategy(weights)
                     ignored = quant.get("ignore", [])
                     if isinstance(ignored, list) and self.architecture != "OPTForCausalLM":
                         _check_fused_decoder_exclusions(
@@ -2137,7 +2158,7 @@ class NaiveKVCacheEstimator:
                                 isinstance(args, dict)
                                 and args.get("type") == "int"
                                 and args.get("num_bits", 8) == 8
-                                and args.get("strategy", "tensor") == "tensor"
+                                and _compressed_tensor_strategy(args) == "tensor"
                                 and not args.get("dynamic", False)
                                 for args in (inputs, outputs)
                             )
@@ -2148,7 +2169,7 @@ class NaiveKVCacheEstimator:
                             and isinstance(inputs, dict)
                             and inputs.get("type") == "int"
                             and inputs.get("num_bits", 8) in (4, 8)
-                            and inputs.get("strategy") in ("token", "group")
+                            and _compressed_tensor_strategy(inputs) in ("token", "group")
                             and inputs.get("dynamic") is True
                             and inputs.get("symmetric", True)
                         )
@@ -2161,12 +2182,9 @@ class NaiveKVCacheEstimator:
                             # For W8A8, vLLM supports static per-tensor or dynamic per-token activations.
                             if not isinstance(inputs, dict) or not inputs:
                                 raise ValueError("vLLM compressed-tensors W8A8 requires an input activation scheme")
-                            input_strategy = inputs.get("strategy")
-                            if input_strategy is None and inputs.get("group_size") is None:
-                                input_strategy = "tensor"
                             activation_format = (
                                 inputs.get("num_bits", 8) == 8
-                                and (input_strategy, inputs.get("dynamic", False))
+                                and (_compressed_tensor_strategy(inputs), inputs.get("dynamic", False))
                                 in (("tensor", False), ("token", True))
                                 and weights["strategy"] in ("tensor", "channel")
                             )
@@ -2819,29 +2837,26 @@ class NaiveKVCacheEstimator:
                     hidden_size=1024, intermediate_size=4096, num_hidden_layers=24, image_size=336, patch_size=14
                 )
             elif family == "internvl":
-                vision = dict(
-                    model_type="internvl_vision",
-                    hidden_size=1024,
-                    intermediate_size=4096,
-                    num_hidden_layers=24,
-                    image_size=448,
-                    patch_size=14,
-                )
+                vision = {}
             elif (
                 wrapper not in _TEXT_WRAPPERS
+                and not (
+                    self._cache_backend == "vllm"
+                    and is_registered_conditional_generator(wrapper, str(self._cache_release))
+                )
                 and not document.get("vision_tower")
                 and not document.get("mm_vision_tower")
                 and document.get("projector_config") is None
                 and document.get("mm_projector_type") is None
             ):
                 return decoder
-        if not isinstance(vision, dict) or not (
-            (
-                llava
-                and vision.get("model_type", "clip_vision_model" if clip else "siglip_vision_model")
-                in ("siglip_vision_model", "clip_vision_model")
-            )
-            or (intern and vision.get("model_type") in ("interns1_vision", "internvl_vision"))
+        default_kind = (
+            "internvl_vision" if family == "internvl" else ("clip_vision_model" if clip else "siglip_vision_model")
+        )
+        vision_kind = vision.get("model_type", default_kind) if isinstance(vision, dict) else None
+        if not (
+            (llava and vision_kind in ("siglip_vision_model", "clip_vision_model"))
+            or (intern and vision_kind in ("interns1_vision", "internvl_vision"))
         ):
             raise ValueError("whole-rank capacity requires resident weights for the vision tower and projector")
 
@@ -2854,13 +2869,19 @@ class NaiveKVCacheEstimator:
                 raise ValueError(f"vision_config.{field} requires two spatial dimensions")
             return layout_integer(value[0], field), layout_integer(value[1], field)
 
-        hidden = layout_integer(vision.get("hidden_size", 768 if llava else None), "vision hidden_size")
-        inter = layout_integer(vision.get("intermediate_size", 3072 if llava else None), "vision intermediate_size")
-        layers = layout_integer(vision.get("num_hidden_layers", 12 if llava else None), "vision num_hidden_layers")
+        # LLaVA supplies its own dimensions for an omitted tower. A partial dict uses the vision class defaults.
+        if vision_kind == "internvl_vision":
+            defaults = (1024, 4096, 24, 448, 14)
+        elif llava:
+            defaults = (768, 3072, 12, 224, 32 if vision_kind == "clip_vision_model" else 16)
+        else:
+            defaults = (None, None, None, None, None)
+        hidden = layout_integer(vision.get("hidden_size", defaults[0]), "vision hidden_size")
+        inter = layout_integer(vision.get("intermediate_size", defaults[1]), "vision intermediate_size")
+        layers = layout_integer(vision.get("num_hidden_layers", defaults[2]), "vision num_hidden_layers")
         channels = layout_integer(vision.get("num_channels", 3), "vision num_channels")
-        ih, iw = pair(vision.get("image_size", 224 if llava else None), "image_size")
-        patch_default = 32 if vision.get("model_type") == "clip_vision_model" else 16
-        ph, pw = pair(vision.get("patch_size", patch_default if llava else None), "patch_size")
+        ih, iw = pair(vision.get("image_size", defaults[3]), "image_size")
+        ph, pw = pair(vision.get("patch_size", defaults[4]), "patch_size")
         text = self.geometry["hidden"]
         features = document.get("vision_feature_layer")
         projector_in = hidden * (len(features) if llava and isinstance(features, list) else 1)

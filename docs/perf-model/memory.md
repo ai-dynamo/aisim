@@ -143,6 +143,8 @@ decoding capacity also needs the runtime draft weights and cache allocation.
 
 Marginal KV bytes describe the selected text decoder. Whole-rank capacity also reserves any resident encoder and projector. In the config-only fallback, LLaVA-family and Intern-S1 dense vision transformers use their declared patch, attention and feed-forward dimensions. The estimate reserves the full vision tower on each language rank as a conservative upper bound when encoder partitioning is unknown. A wrapper that declares an auxiliary encoder with an unrecognized layout requires measured resident weights for capacity. Its decoder can still supply the per-token transfer width.
 
+Registered vLLM conditional generation wrappers can construct an encoder when the checkpoint omits its configuration. Whole-rank capacity requires measured residency when the fallback cannot size that encoder. ModelOpt MXFP8 requires BF16 execution. For routed experts, the fallback reserves execution-width weights until the rank-local quantized matrices and their scales can be sized together.
+
 For a sliding-window decoder, the config-only shared pool estimate allows every
 scheduled token to be present in every attention layer. A prefill can occupy the
 retained window and its in-flight tokens at the same time. The runtime's

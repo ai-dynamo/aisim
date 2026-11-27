@@ -298,6 +298,33 @@ class TestEstimateModelWeightBytes:
         assert _estimate_model_weight_bytes("EleutherAI/pythia-70m") == 153354240
         mock_load_config.assert_called_once_with("EleutherAI/pythia-70m")
 
+    def test_remote_sidecar_and_root_are_reused_across_generations(self):
+        from aisim.sdk.memory import NaiveKVCacheEstimator
+        from aisim_core.sdk import utils
+
+        root = {
+            "architectures": ["LlavaForConditionalGeneration"],
+            "torch_dtype": "float16",
+            "text_config": {"model_type": "llama", "vocab_size": 2048},
+        }
+        sidecar = {"quant_method": "modelopt", "quantization": {"quant_algo": "FP8", "exclude_modules": ["*mlp*"]}}
+        utils._load_model_config_from_model_path.cache_clear()
+        with (
+            patch.object(utils, "_download_hf_config", return_value=root) as config_read,
+            patch.object(utils, "_download_hf_json", return_value=sidecar) as sidecar_read,
+            patch.object(
+                NaiveKVCacheEstimator, "from_model_path", side_effect=AssertionError("unexpected remote metadata read")
+            ),
+        ):
+            first = _estimate_model_weight_bytes("test/remote-sidecar", backend_version="0.32.0")
+            expected = NaiveKVCacheEstimator.from_hf_config(
+                {**root, "hf_quant_config": sidecar}, tp_size=1, pp_size=1, backend_version="0.32.0"
+            ).weight_bytes()
+            assert first == expected
+            assert _estimate_model_weight_bytes("test/remote-sidecar", backend_version="0.32.0") == first
+            config_read.assert_called_once_with("test/remote-sidecar")
+            sidecar_read.assert_called_once_with("test/remote-sidecar", "hf_quant_config.json", raise_on_404=False)
+
     @patch(
         "aisim.generator.naive._get_system_config",
         return_value={"gpus_per_node": 8, "vram_per_gpu": 80 * 1024**3},

@@ -2407,43 +2407,32 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
 
 
 @cache
-def _load_model_config_from_model_path(model_path: str) -> dict:
-    """
-    Get model configuration from model path.
-
-    The model_path can be:
-    1. A HuggingFace model path (e.g., "Qwen/Qwen3-32B")
-    2. A local directory path containing config.json
-
-    Args:
-        model_path: HuggingFace model path or local directory path
-
-    Returns:
-        dict: Raw model configuration dictionary
-
-    Raises:
-        ValueError: If the model config cannot be found
-        HuggingFaceDownloadError: If fetching from HuggingFace fails
-    """
-    # Check if it's a local path
+def _load_model_config_documents(model_path: str) -> tuple[dict, dict]:
+    """Load the timing parser's normalized metadata and the original checkpoint declaration together."""
     if os.path.isdir(model_path):
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
-        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
-
-    # Otherwise treat as HuggingFace path
-    if model_path in DefaultHFModels:
+        sidecar = _load_local_quant_config(model_path)
+    elif model_path in DefaultHFModels:
         config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
-        return _attach_inferred_quant_fields(
-            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
-        )
+        sidecar = _load_pre_downloaded_hf_quant_config(model_path)
+    else:
+        config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+        try:
+            sidecar = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
+        except Exception as exc:  # best-effort for optional quant config
+            logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
+            sidecar = None
+    checkpoint = {**config, "hf_quant_config": sidecar} if sidecar is not None else config
+    normalized = _attach_inferred_quant_fields(_attach_hf_quant_config(dict(config), sidecar))
+    return normalized, checkpoint
 
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
-    try:
-        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
-    except Exception as exc:  # best-effort for optional quant config
-        logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
-        hf_quant_config = None
-    return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+
+def _load_model_config_from_model_path(model_path: str) -> dict:
+    """Get normalized model metadata from a local directory, bundled config or Hugging Face."""
+    return _load_model_config_documents(model_path)[0]
+
+
+_load_model_config_from_model_path.cache_clear = _load_model_config_documents.cache_clear
 
 
 @cache

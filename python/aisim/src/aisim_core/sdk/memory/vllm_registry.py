@@ -79,6 +79,14 @@ def is_known_transformers_config(model_type: str, version: str | None) -> bool:
     return any(model_type in _registry(v).names["config"] for v in _RELEASES)
 
 
+def is_registered_conditional_generator(name: str | None, version: str | None) -> bool:
+    """A registered conditional generation wrapper can construct auxiliary modules from defaults."""
+    if not isinstance(name, str) or not name.endswith("ForConditionalGeneration"):
+        return False
+    release = _recorded_release(version)
+    return any(name in _registry(v).names["vllm"] for v in ((release,) if release is not None else _RELEASES))
+
+
 # These registrations load the same decoder implementation under another name.
 _IMPLEMENTATIONS = {
     "DeepseekV3BidirectionalModel": "DeepseekV3ForCausalLM",
@@ -137,7 +145,9 @@ def _select(names: list[str], version: str, remote_model: bool) -> str | None:
     return None
 
 
-def select_architecture(names: list[str], version: str | None, auto_map: object) -> str | None:
+def select_architecture(
+    names: list[str], version: str | None, auto_map: object, *, modeled: set[str] | None = None
+) -> str | None:
     """Select the decoder implementation for a nonempty list on a generation worker."""
     remote_model = isinstance(auto_map, dict) and any(
         isinstance(key, str) and key.startswith("AutoModel") for key in auto_map
@@ -145,8 +155,11 @@ def select_architecture(names: list[str], version: str | None, auto_map: object)
     if version is not None:
         release = _recorded_release(version)
         # Keep the original class and its compatibility checks on unrecorded releases.
-        return _select(names, release, remote_model) if release is not None else names[0]
-    choices = {_select(names, release, remote_model) for release in _RELEASES}
+        choices = {_select(names, release, remote_model) if release is not None else names[0]}
+    else:
+        choices = {_select(names, release, remote_model) for release in _RELEASES}
+    if modeled is not None:
+        choices = {name if name in modeled else None for name in choices}
     if len(choices) != 1:
         raise ValueError(f"vLLM decoder selection for {names!r} depends on the backend release")
     return choices.pop()

@@ -3511,6 +3511,31 @@ def test_auxiliary_weights_are_separate_from_marginal_decoder_kv(tmp_path):
         _estimate_model_weight_bytes(_write_config(tmp_path, unknown), backend_version="0.32.0")
 
 
+def test_vllm_implicit_and_partial_vision_towers():
+    text = _synthetic_multimodal_w8()["text_config"]
+    opts = dict(tp_size=1, pp_size=1, backend_version="0.32.0")
+    qwen = {"model_type": "qwen2_vl", "architectures": ["Qwen2VLForConditionalGeneration"], "text_config": text}
+    for raw in (qwen, {**qwen, "vision_config": {}}):
+        estimator = NaiveKVCacheEstimator.from_hf_config(raw, **opts)
+        assert estimator.kv_bytes_per_token() == 1536
+        with pytest.raises(ValueError, match="resident weights for the vision tower"):
+            estimator.weight_bytes()
+
+    def resident(wrapper, **extra):
+        return NaiveKVCacheEstimator.from_hf_config(
+            {"architectures": [wrapper], "text_config": text, **extra}, **opts
+        ).weight_bytes()
+
+    clip = {"model_type": "clip_vision_model", "patch_size": 32}
+    assert resident("LlavaForConditionalGeneration", vision_config={}) == resident(
+        "LlavaForConditionalGeneration", vision_config=clip
+    )
+    intern = resident("InternVLForConditionalGeneration", model_type="internvl")
+    assert intern == resident(
+        "InternVLForConditionalGeneration", model_type="internvl", vision_config={"model_type": "internvl_vision"}
+    )
+
+
 def test_vllm_effective_quantizer_class_sidecar_and_modelopt_exclusions(tmp_path):
     from pathlib import Path
 
@@ -3541,12 +3566,12 @@ def test_vllm_effective_quantizer_class_sidecar_and_modelopt_exclusions(tmp_path
         NaiveKVCacheEstimator.from_hf_config({**document, "quantization_config": complete}, **opts).weight_bytes()
         < weights
     )
-    mx = [
-        NaiveKVCacheEstimator.from_hf_config(
-            {**document, "quantization_config": {"quant_method": method}}, **opts
-        ).weight_bytes()
-        for method in ("modelopt_mxfp8", "mxfp8")
-    ]
+    mx = []
+    for method in ("modelopt_mxfp8", "mxfp8"):
+        declared = {**document, "quantization_config": {"quant_method": method}}
+        with pytest.raises(ValueError, match="MXFP8 requires bfloat16"):
+            NaiveKVCacheEstimator.from_hf_config(declared, **opts)
+        mx.append(NaiveKVCacheEstimator.from_hf_config({**declared, "torch_dtype": "bfloat16"}, **opts).weight_bytes())
     assert mx[0] == mx[1] < weights
     with pytest.raises(ValueError, match="quant_algo"):
         NaiveKVCacheEstimator.from_hf_config(
@@ -3579,6 +3604,23 @@ def test_compressed_tensors_fused_shards_and_packed_activations():
         NaiveKVCacheEstimator.from_hf_config(document, **opts)
     group["output_activations"] = group["input_activations"]
     assert NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes() == weight_only
+    for strategy in ({}, {"strategy": "group"}):
+        group["input_activations"] = {"type": "int", "dynamic": True, "group_size": 128, **strategy}
+        assert NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes() == weight_only
+        group["input_activations"]["dynamic"] = False
+        with pytest.raises(ValueError, match="W8 weights"):
+            NaiveKVCacheEstimator.from_hf_config(document, **opts)
+
+
+def test_vllm_mxfp8_routed_experts_keep_the_execution_width_reserve(tmp_path):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3")
+    raw.update(architectures=["DeepseekV2ForCausalLM"], quantization_config={"quant_method": "modelopt_mxfp8"})
+    opts = _missing_system_cache_options(tmp_path, tp_size=8, capacity=80 * _GIB)
+    opts.update(moe_tp_size=8, moe_ep_size=1, naive_kv_reservation=1)
+    with pytest.raises(ValueError, match="no KV budget"):
+        memory.estimate_num_gpu_blocks(_write_config(tmp_path, raw), "missing", "vllm", "0.32.0", **opts)
 
 
 def test_borrowed_gemma_and_gpt_neo_construct_before_vllm_dispatch(tmp_path):
@@ -3601,6 +3643,16 @@ def test_borrowed_gemma_and_gpt_neo_construct_before_vllm_dispatch(tmp_path):
     child.update(num_hidden_layers=30, vocab_size=262144, max_position_embeddings=131072)
     assert NaiveKVCacheEstimator.from_hf_config(wrapper, **opts).weight_bytes() == inherited.weight_bytes()
 
+    # The same registered OPT class uses all 12 attention heads when loaded as a bare model.
+    bare = {**child, "head_dim": 64, "global_head_dim": 64, "num_global_key_value_heads": 1, "attention_k_eq_v": True}
+    path = _write_config(tmp_path, bare)
+    assert _compiled_vllm_transfer_widths(path, "0.32.0") == (92_160, 92_160)
+    capacity = 4 * _GIB
+    args = _missing_system_cache_options(tmp_path, tp_size=1, capacity=capacity)
+    args.update(max_num_tokens=512, max_batch_size=1, memory_fraction_value=1.0, tolerance_fraction=0)
+    blocks = memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **args)
+    assert 0 < blocks <= capacity // (16 * 92_160)
+
     child.update(
         architectures=["MistralForCausalLM"],
         num_hidden_layers=12,
@@ -3614,6 +3666,7 @@ def test_borrowed_gemma_and_gpt_neo_construct_before_vllm_dispatch(tmp_path):
         attention_k_eq_v=True,
     )
     assert _compiled_vllm_transfer_widths(_write_config(tmp_path, wrapper), "0.32.0") == (36_864, 36_864)
+    assert _compiled_vllm_transfer_widths(_write_config(tmp_path, child), "0.32.0") == (36_864, 36_864)
     child.update(architectures=["LlamaForCausalLM"], use_bidirectional_attention="all")
     with pytest.raises(ValueError, match="no persistent vLLM KV"):
         _compiled_vllm_transfer_widths(_write_config(tmp_path, wrapper), "0.32.0")
@@ -4125,6 +4178,16 @@ def test_vllm_stops_at_a_registered_decoder_even_when_its_geometry_is_unknown():
 def test_bare_normalized_decoders_use_their_local_layers_and_experts(tmp_path):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    # Both registered choices use the generic estimate, even when the chosen class varies by release.
+    generic = {**_UNKNOWN_DECODER, "model_type": "falcon", "architectures": ["DoryForCausalLM", "BloomForCausalLM"]}
+    assert NaiveKVCacheEstimator.from_hf_config(generic, tp_size=1, pp_size=1).kv_bytes_per_token() == 1_024
+    nested = {
+        "text_config": _UNKNOWN_DECODER,
+        "model_type": "falcon",
+        "architectures": ["DoryForCausalLM", "OPTForCausalLM"],
+    }
+    assert NaiveKVCacheEstimator.from_hf_config(nested, tp_size=1, pp_size=1).kv_bytes_per_token() == 1_024
 
     path = _write_config(
         tmp_path, {"model_type": "llama", "architectures": ["LLaMAForCausalLM"], "num_key_value_heads": 8}
@@ -5549,19 +5612,24 @@ def test_gemma3_implicit_layer_pattern_matches_its_explicit_physical_pool(tmp_pa
     )
     # Transformers supplies a 256-element head and one global layer per six layers, totaling five global layers.
     budget = 101 * 34 * 65_536
-    for explicit in (False, True):
-        if explicit:
-            raw.update(
-                head_dim=256,
-                layer_types=["full_attention" if i % 6 == 0 else "sliding_attention" for i in range(1, 35)],
-            )
-        model = _write_config(tmp_path, {"architectures": ["Gemma3ForConditionalGeneration"], "text_config": raw})
-        estimator = NaiveKVCacheEstimator.from_model_path(model, tp_size=1, pp_size=1, allow_hf_config_download=False)
-        opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=estimator.weight_bytes() + budget)
-        assert (estimator.geometry["num_swa_layers"], estimator.geometry["num_global_layers"]) == (29, 5)
-        assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.33.0", **opts) == 97
-        with pytest.raises(ValueError, match="separate full and sliding pool sizes"):
-            memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
+    serialized = {
+        **raw,
+        "head_dim": 256,
+        "layer_types": ["full_attention" if i % 6 == 0 else "sliding_attention" for i in range(1, 35)],
+    }
+    model = _write_config(tmp_path, {**serialized, "architectures": ["Gemma3ForCausalLM"]})
+    estimator = NaiveKVCacheEstimator.from_model_path(model, tp_size=1, pp_size=1, allow_hf_config_download=False)
+    for text in (raw, serialized):
+        wrapped = {"architectures": ["Gemma3ForConditionalGeneration"], "text_config": text}
+        combined = NaiveKVCacheEstimator.from_hf_config(wrapped, tp_size=1, pp_size=1)
+        with pytest.raises(ValueError, match="resident weights for the vision tower"):
+            combined.weight_bytes()
+        assert combined.kv_bytes_per_token() == estimator.kv_bytes_per_token()
+        assert (combined.geometry["num_swa_layers"], combined.geometry["num_global_layers"]) == (29, 5)
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=estimator.weight_bytes() + budget)
+    assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.33.0", **opts) == 97
+    with pytest.raises(ValueError, match="separate full and sliding pool sizes"):
+        memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.20", **opts)
 
 
 @pytest.mark.parametrize("omit_defaults", [False, True])
