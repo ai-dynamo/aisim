@@ -2414,6 +2414,11 @@ def test_vllm_gemma_flat_and_per_layer_configs_need_the_effective_rope_mapping(t
                 estimate_kv_bytes_per_token(model, **options)
             with pytest.raises(ValueError, match="rope_parameters to be a mapping"):
                 _compiled_vllm_transfer_widths(model, version)
+        for kind in ("full_attention", "sliding_attention"):
+            rope = {**text["rope_parameters"], kind: None}
+            model = _write_config(tmp_path, document | {"text_config": child | {"rope_scaling": rope}})
+            with pytest.raises(ValueError, match=rf"rope_parameters\.{kind} to be a mapping"):
+                _compiled_vllm_transfer_widths(model, "0.32.0")
 
 
 def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
@@ -2541,7 +2546,8 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
         else:
             assert get_model(path, config, "vllm", database=database).get_kvcache_bytes_per_sequence(1) == 225_280
     # Only a collector-valid reduced measurement can qualify a stock image.
-    metadata.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": {}}))
+    gemm_table = directory / "gemm_perf.txt"
+    saved_gemm = gemm_table.rename(tmp_path / gemm_table.name)
     reduced = {"schema_version": 1, "provenance": "local", "runtime": runtime}
     pq.write_table(pa.table({"latency": [0.5]}), retained)
     for entry in ({}, {"status": "failed"}, {"status": "partial"}):
@@ -2565,6 +2571,7 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
         with pytest.raises(ValueError, match="runtime profile"):
             get_model(path, config, "vllm", database=database)
     # A malformed nonempty measurement must also prevent other stock tables from qualifying the cell.
+    saved_gemm.rename(gemm_table)
     metadata.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": table}))
     pq.write_table(pa.table({"latency": [0.5]}), retained)
     for invalid in (
@@ -2605,6 +2612,97 @@ def test_strict_catalog_refusal_precedes_naive_fallback(tmp_path, monkeypatch):
         memory.estimate_num_gpu_blocks("facebook/opt-125m", "test_h100", "vllm", "0.30.0", **options)
 
 
+def test_gemma4_v1_retained_table_uses_the_directory_runtime_and_physical_rows(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisim_core.sdk.models.gemma4 import _gemma4_collection_images
+
+    version = "0.30.0"
+    runtime = dict(
+        framework="vllm",
+        version=version,
+        image="vllm/vllm-openai:v0.30.0",
+        image_digest="sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
+    )
+    entry = dict(collector_ref="rev", collector_hash="h", case_plan_hash="p", collected_at="2026-01-01", rows=1)
+    name = "context_attention_perf"
+    sidecar = tmp_path / "collection_meta.yaml"
+    # The selected Parquet takes precedence over a retained legacy text file for the same table.
+    (tmp_path / f"{name}.txt").write_text("latency\n1\n")
+    parquet = tmp_path / f"{name}.parquet"
+    pq.write_table(pa.table({"latency": [1]}), parquet)
+    for status in ("complete", "partial"):
+        for change, table, expected in (
+            ({}, entry, [True]),
+            ({}, entry | {"rows": 0}, [False]),
+            ({}, entry | {"rows": 2}, [False]),
+            ({"framework": False}, entry, [False]),
+            ({"framework": "sglang"}, entry, []),
+            ({}, entry | {"runtime": {"framework": "sglang"}}, [False]),
+            ({}, entry | {"runtime": {"framework": False}}, [False]),
+            ({}, None, [False]),
+        ):
+            tables = {name: table | {"status": status}} if table is not None else {}
+            sidecar.write_text(json.dumps({"schema_version": 1, "runtime": runtime | change, "tables": tables}))
+            assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=False)) == expected
+    for tier, summary, expected in (
+        ({}, {"rows": 1}, [True]),
+        ({"provenance": "local"}, {"rows": 1}, [False]),
+        ({"provenance": "other"}, {"rows": 1}, [False]),
+        ({"provenance": "collected"}, {"rows": 1, "collected_at": "2026-01-01"}, [True]),
+    ):
+        tables = {name: {"status": "complete", **summary}}
+        sidecar.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": tables, **tier}))
+        assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=False)) == expected
+    sidecar.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": []}))
+    assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=False)) == [False]
+
+    sidecar.unlink()
+    assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=False)) == [False]
+    tables = {name: entry | {"status": "complete"}}
+    sidecar.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": tables}))
+    pq.write_table(pa.table({"latency": pa.array([], type=pa.int64())}), parquet)
+    assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=False)) == []
+    parquet.unlink()
+    assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=False)) == [True]
+
+
+def test_gemma4_v2_per_event_runtime_and_zero_rows(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from aisim_core.sdk.models.gemma4 import _gemma4_collection_images
+
+    version = "0.30.0"
+    runtime = dict(
+        framework="vllm",
+        version=version,
+        image="vllm/vllm-openai:v0.30.0",
+        image_digest="sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
+    )
+    custom = runtime | {"image": "custom/vllm"}
+    event = dict(
+        collector_ref="rev", collector_hash="h", case_plan_hash="p", collected_at="2026-01-01", status="partial"
+    )
+    name = "context_attention_perf"
+    for stock_rows, foreign_rows, merged_rows, retained_rows, expected in (
+        (1, 0, 1, 1, [True]),
+        (2, 0, 1, 1, [True]),
+        (0, 1, 1, 1, [False]),
+        (1, 0, 2, 1, [False]),
+        (1, 0, 2, 2, [False]),
+        (0, 0, 1, 1, [False]),
+    ):
+        pq.write_table(pa.table({"latency": range(retained_rows)}), tmp_path / f"{name}.parquet")
+        events = [event | {"rows": stock_rows, "runtime": runtime}, event | {"rows": foreign_rows}]
+        tables = {name: {"rows": merged_rows, "status": "partial", "collections": events}}
+        (tmp_path / "collection_meta.yaml").write_text(
+            json.dumps({"schema_version": 2, "runtime": custom, "tables": tables})
+        )
+        assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=False)) == expected
+
+
 @pytest.mark.parametrize(
     "version,manifest,previous",
     [
@@ -2621,7 +2719,7 @@ def test_strict_catalog_refusal_precedes_naive_fallback(tmp_path, monkeypatch):
     ],
 )
 def test_gemma4_frozen_sparse_measurements_bind_every_retained_row_to_the_runtime(
-    tmp_path, version, manifest, previous
+    tmp_path, version, manifest, previous, monkeypatch
 ):
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -2638,6 +2736,14 @@ def test_gemma4_frozen_sparse_measurements_bind_every_retained_row_to_the_runtim
     (tmp_path / "collection_meta.yaml").write_text(
         json.dumps({"schema_version": 1, "runtime": runtime, "tables": {name: event}})
     )
+    reads = []
+    read = pq.ParquetFile.read
+
+    def record_read(file, *args, **kwargs):
+        reads.append(kwargs.get("columns"))
+        return read(file, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "read", record_read)
     for data, qualifies in (
         ({"runtime_digest": [manifest, manifest]}, True),
         ({"runtime_digest": [previous, previous]}, False),
@@ -2648,6 +2754,9 @@ def test_gemma4_frozen_sparse_measurements_bind_every_retained_row_to_the_runtim
     ):
         pq.write_table(pa.table(data), tmp_path / f"{name}.parquet")
         assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=False)) == [qualifies]
+        scans = len(reads)
+        assert list(_gemma4_collection_images(tmp_path, version, "vllm", cache=True)) == [qualifies]
+        assert len(reads) == scans
 
 
 def test_gemma4_adapter_compares_each_ranks_cache_without_deployment_evidence(tmp_path):
@@ -3291,6 +3400,34 @@ def test_vllm_compressed_linear_weights_and_kv_have_independent_storage(tmp_path
             assert weights >= 15_232_150_528
             with pytest.raises(ValueError, match="no KV budget"):
                 memory.estimate_num_gpu_blocks(model, "missing", "vllm", version, **args)
+    # Released KV-only checkpoints can carry an attention group with activation scales and no weights.
+    groups["attention"] = {"targets": ["Qwen2Attention"], "weights": None, "input_activations": fp8}
+    model = _write_config(tmp_path, _onevision_qwen2_7b(child_dtype) | {"quantization_config": quant})
+    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (28_672, 28_672)
+    assert _estimate_model_weight_bytes(model, backend="vllm", backend_version="0.32.0") == weights
+    if quantize_linears:
+        group = groups["group_0"]
+        group["format"] = "dense"
+        model = _write_config(tmp_path, _onevision_qwen2_7b(child_dtype) | {"quantization_config": quant})
+        with pytest.raises(ValueError, match="W8 weights in 'dense'"):
+            memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **args)
+        group["format"] = "float-quantized"
+        quant["format"] = "dense"
+        model = _write_config(tmp_path, _onevision_qwen2_7b(child_dtype) | {"quantization_config": quant})
+        assert _estimate_model_weight_bytes(model, backend="vllm", backend_version="0.32.0") == weights
+        for order in ("group", "dynamic"):
+            groups["group_0"]["weights"]["actorder"] = order
+            model = _write_config(tmp_path, _onevision_qwen2_7b(child_dtype) | {"quantization_config": quant})
+            with pytest.raises(ValueError, match="activation ordering"):
+                memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **args)
+    else:
+        quant["quant_method"] = "COMPRESSED_TENSORS"
+        model = _write_config(tmp_path, _onevision_qwen2_7b(child_dtype) | {"compression_config": quant})
+        assert _compiled_vllm_transfer_widths(model, "0.32.0") == (28_672, 28_672)
+        groups["attention"]["targets"] = ["Linear"]
+        model = _write_config(tmp_path, _onevision_qwen2_7b(child_dtype) | {"compression_config": quant})
+        with pytest.raises(ValueError, match="weight scheme"):
+            _compiled_vllm_transfer_widths(model, "0.32.0")
 
 
 @pytest.mark.parametrize(
@@ -3306,6 +3443,49 @@ def test_vllm_encoder_only_decoder_has_no_persistent_transfer(tmp_path, architec
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend_version="0.32.0")
     with pytest.raises(ValueError, match="no persistent vLLM KV cache"):
         _compiled_vllm_transfer_widths(model, "0.32.0")
+
+
+@pytest.mark.parametrize("kind", ["apertus", "deepseek_v3"])
+def test_vllm_apertus_and_deepseek_encoder_attention_has_no_persistent_transfer(tmp_path, kind):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    if kind == "deepseek_v3":
+        child = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3")
+        child["architectures"] = ["DeepseekV2ForCausalLM"]
+    else:
+        child = dict(
+            model_type=kind,
+            architectures=["ApertusForCausalLM"],
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=32,
+            intermediate_size=14336,
+            vocab_size=131072,
+        )
+    parent = {"architectures": ["LlavaForConditionalGeneration"], "text_config": child}
+    child["is_causal"] = True
+    assert _compiled_vllm_transfer_widths(_write_config(tmp_path, parent), "0.32.0")[0] > 0
+    child["is_causal"] = False
+    with pytest.raises(ValueError, match="no persistent vLLM KV cache"):
+        _compiled_vllm_transfer_widths(_write_config(tmp_path, parent), "0.32.0")
+
+
+@pytest.mark.parametrize("key", ["quantization_config", "compression_config"])
+def test_vllm_opt_with_compressed_kv_and_unquantized_weights(tmp_path, key):
+    child = dict(model_type="opt", architectures=["OPTForCausalLM"], vocab_size=50272)
+    quant = {
+        "quant_method": "compressed-tensors",
+        "config_groups": {},
+        "format": "dense",
+        "kv_cache_scheme": {"type": "float", "num_bits": 8, "strategy": "tensor", "symmetric": True},
+    }
+    path = _write_config(
+        tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "text_config": child, key: quant}
+    )
+    assert _compiled_vllm_transfer_widths(path, "0.32.0") == (18_432, 18_432)
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=2 * _GIB)
+    assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) > 0
 
 
 @pytest.mark.parametrize(
@@ -3342,7 +3522,7 @@ def test_vllm_uses_the_parent_config_and_registered_language_model(
         assert _compiled_vllm_transfer_widths(model, version) == (expected, expected)
 
 
-@pytest.mark.parametrize("config_type", ["falcon", "gpt2"])
+@pytest.mark.parametrize("config_type", ["falcon", "gpt2", "gptj", "gpt-sw3", "deepseek_v3"])
 def test_vllm_opt_uses_its_head_count_with_foreign_config_aliases(tmp_path, config_type):
     child = dict(
         model_type=config_type,
@@ -3357,7 +3537,7 @@ def test_vllm_opt_uses_its_head_count_with_foreign_config_aliases(tmp_path, conf
         do_layer_norm_before=False,
         vocab_size=50272,
     )
-    if config_type == "gpt2":
+    if config_type in ("gpt2", "gptj", "gpt-sw3"):
         child.update(n_head=12, n_layer=12, n_embd=768, n_positions=2048)
     else:
         child.update(num_attention_heads=12, num_hidden_layers=12, hidden_size=768, max_position_embeddings=2048)
@@ -3377,6 +3557,9 @@ def test_qwen2_moe_config_dispatches_dense_weights_and_its_constructed_layer_typ
     path = _write_config(tmp_path, parent)
     with pytest.raises(ValueError, match="sliding attention for only some layers"):
         _compiled_vllm_transfer_widths(path, "0.32.0")
+    child["sliding_window"] = None
+    with pytest.raises(ValueError, match="sliding attention for only some layers"):
+        _compiled_vllm_transfer_widths(_write_config(tmp_path, parent), "0.32.0")
 
 
 @pytest.mark.parametrize(
@@ -3389,6 +3572,30 @@ def test_vllm_dense_class_can_use_another_transformers_config(tmp_path, kind, ar
         child["architectures"] = architectures
     path = _write_config(tmp_path, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": child})
     assert _compiled_vllm_transfer_widths(path, "0.32.0") == (width, width)
+
+
+def test_wrapped_gemma_config_uses_llama_projection_weights_and_default_head_dimension(tmp_path):
+    from aisim.generator.naive import _estimate_model_weight_bytes
+
+    child = dict(model_type="gemma", architectures=["LlamaForCausalLM"], hidden_act="silu")
+    for fields in ({}, {"head_dim": 256}):
+        path = _write_config(
+            tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "text_config": child | fields}
+        )
+        # GemmaConfig supplies 16 heads, 256 elements per head and 28 layers to Llama's projections.
+        assert _compiled_vllm_transfer_widths(path, "0.32.0") == (458_752, 458_752)
+        assert _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") >= 18_647_875_584
+
+
+def test_vllm_fp8_linear_weights_keep_parent_dtype_for_embeddings(tmp_path):
+    from aisim.generator.naive import _estimate_model_weight_bytes
+
+    document = _onevision_qwen2_7b("float8_e4m3fn")
+    document["quantization_config"] = {"quant_method": "fp8"}
+    document["text_config"].update(num_hidden_layers=1, hidden_size=4096, num_attention_heads=32)
+    path = _write_config(tmp_path, document)
+    # Both vocabulary matrices remain FP16 even when the serialized linear weights are FP8.
+    assert _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") > 2 * 152064 * 4096 * 2
 
 
 def test_dispatched_deepseek_counts_resident_weights_and_routed_layers(tmp_path):
@@ -3419,6 +3626,12 @@ def test_dispatched_deepseek_counts_resident_weights_and_routed_layers(tmp_path)
             == 74_893_717_504
         )
         assert metadata["is_moe"] is False
+    raw.update(first_k_dense_replace=60, quantization_config={"quant_method": "fp8"})
+    estimator = NaiveKVCacheEstimator.from_hf_config(
+        raw, backend="sglang", backend_version="0.5.23", tp_size=8, pp_size=1, moe_tp_size=8
+    )
+    assert estimator.geometry["num_routed_layers"] == 1
+    assert 0 < estimator.weight_bytes() < 14 * _GIB
 
 
 def test_sglang_llava_uses_its_pinned_transformers_causal_lm(tmp_path):

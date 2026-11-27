@@ -1150,6 +1150,18 @@ def gemma4_cache_shapes(
         rope = config.get("rope_scaling", config.get("rope_parameters"))
         if ("rope_scaling" in config or rope is not None) and not isinstance(rope, dict):
             raise ValueError("Gemma 4 vLLM attention requires rope_parameters to be a mapping")
+        if isinstance(rope, dict):
+            # Gemma forces the last layer to full attention. Each resident type selects its own
+            # RoPE mapping when present, otherwise vLLM copies the flat legacy mapping.
+            types = config.get("layer_types")
+            sliding = (
+                "sliding_attention" in types[:-1]
+                if isinstance(types, list) and types
+                else config.get("num_hidden_layers", 30) != 1
+            )
+            for kind in ("full_attention", "sliding_attention") if sliding else ("full_attention",):
+                if kind in rope and not isinstance(rope[kind], dict):
+                    raise ValueError(f"Gemma 4 vLLM attention requires rope_parameters.{kind} to be a mapping")
     heads = config.get("num_key_value_heads", 4)
     dim = config.get("head_dim", 256)
     if not (backend == "vllm" and has_per_layer_config):

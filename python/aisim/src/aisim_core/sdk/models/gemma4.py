@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import re
 from collections.abc import Iterator
 from dataclasses import replace
@@ -81,25 +82,33 @@ _GEMMA4_ADAPTER_IMAGES = {
 }
 
 
-def _has_table_rows(path: Path) -> bool:
+@lru_cache(maxsize=256)
+def _table_rows(path: Path, revision: tuple[int, ...]) -> int:
     if path.suffix == ".parquet":
         from pyarrow.parquet import read_metadata
 
-        return read_metadata(path).num_rows > 0
-    with path.open(encoding="utf-8") as stream:
-        lines = (line for line in stream if line.strip() and not line.lstrip().startswith("#"))
-        next(lines, None)  # CSV header
-        return next(lines, None) is not None
+        return read_metadata(path).num_rows
+    with path.open(encoding="utf-8", newline="") as stream:
+        rows = csv.reader(line for line in stream if line.strip() and not line.lstrip().startswith("#"))
+        next(rows, None)  # CSV header
+        return sum(1 for _ in rows)
 
 
 @lru_cache(maxsize=256)
-def _cached_table_rows(path: Path, revision: tuple[int, ...]) -> bool:
-    return _has_table_rows(path)
+def _frozen_table_evidence(path: Path, revision: tuple[int, ...]) -> tuple[int, str | None]:
+    from pyarrow.parquet import ParquetFile
+
+    retained = ParquetFile(path)
+    if "runtime_digest" in retained.schema_arrow.names:
+        digests = retained.read(columns=["runtime_digest"])["runtime_digest"].unique().to_pylist()
+        if len(digests) == 1 and isinstance(digests[0], str):
+            return retained.metadata.num_rows, digests[0]
+    return retained.metadata.num_rows, None
 
 
 def _valid_gemma4_v1_record(collection: dict, table: str, event: object, path: Path) -> bool:
     """Check the collector's published v1 forms before using a retained table as runtime evidence."""
-    if not isinstance(event, dict) or event.get("status") not in ("complete", "partial"):
+    if not isinstance(event, dict) or "runtime" in event or event.get("status") not in ("complete", "partial"):
         return False
     try:
         runtime = collection.get("runtime")
@@ -130,17 +139,13 @@ def _valid_gemma4_v1_record(collection: dict, table: str, event: object, path: P
                 return False
             # The catalog re-encodes Parquet after collection. Its logical rows retain the exact
             # runtime manifest, even when two releases have the same number of measurements.
-            from pyarrow.parquet import ParquetFile
-
             digest = event.get("data_sha256")
-            retained = ParquetFile(table_path)
             return (
                 isinstance(digest, str)
                 and re.fullmatch("[0-9a-f]{64}", digest) is not None
-                and retained.metadata.num_rows == event["rows"]
-                and "runtime_digest" in retained.schema_arrow.names
-                and retained.read(columns=["runtime_digest"])["runtime_digest"].unique().to_pylist()
-                == [runtime.get("image_digest")]
+                and isinstance(runtime.get("image_digest"), str)
+                and _frozen_table_evidence(table_path, perf_database._file_revision(table_path))
+                == (event["rows"], runtime["image_digest"])
             )
         if collection.get("provenance") is None and fields in (
             {"collector_ref", "rows", "status"},
@@ -156,7 +161,9 @@ def _valid_gemma4_v1_record(collection: dict, table: str, event: object, path: P
         if fields in ({"rows", "status"}, {"rows", "status", "collected_at"}):
             # Earlier measured rows/status summaries predate the provenance tier.
             perf_database._validate_non_negative_row_count(event["rows"], field=f"tables.{table}.rows", path=str(path))
-            return "collected_at" not in event or (
+            if "collected_at" not in event:
+                return collection.get("provenance") is None
+            return (
                 collection.get("provenance") in ("local", "collected")
                 and isinstance(event["collected_at"], str)
                 and bool(event["collected_at"].strip())
@@ -180,9 +187,9 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str, *, 
     """Yield whether each retained measurement of this framework used the pinned official image."""
     path = directory / perf_database.COLLECTION_META_MARKER
     digests = _GEMMA4_ADAPTER_IMAGES.get((version, framework))
-    if not digests or not path.is_file():
+    if not digests:
         return
-    collection = perf_database._load_collection_meta_yaml(str(path), cache=cache)
+    collection = perf_database._load_collection_meta_yaml(str(path), cache=cache) if path.is_file() else {}
     schema = collection.get("schema_version", 1)
     tier = collection.get("provenance")
     valid_header = (
@@ -192,43 +199,46 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str, *, 
     )
     tables = collection.get("tables")
     if not isinstance(tables, dict):
-        return
+        tables = {}
     files = {
-        item.stem
-        for item in directory.iterdir()
-        if item.suffix in (".parquet", ".txt") and item.is_file() and item.stat().st_size
+        Path(name).stem
+        for name in perf_database._version_dir_data_filenames(str(directory))
+        if name.endswith((".parquet", ".txt"))
     }
     repository = "vllm/vllm-openai-xpu" if framework == "vllm_xpu" else "vllm/vllm-openai"
     image = f"{repository}:v{version}"
-    for table in files & tables.keys():
-        data = tables[table]
-        v1 = schema == 1
-        # Schema v1 records one collection per table. In v2 an individual
-        # measurement can override the directory's runtime.
-        for event in [data] if v1 else data["collections"]:
-            runtime = (
-                event.get("runtime", collection.get("runtime"))
-                if isinstance(event, dict)
-                else collection.get("runtime")
-            )
-            if isinstance(runtime, dict) and runtime.get("framework") not in (None, framework):
-                continue
-            rows = event.get("rows") if isinstance(event, dict) else None
-            valid = valid_header and (not v1 or _valid_gemma4_v1_record(collection, table, event, path))
-            if v1 and (not valid or rows is None):
-                # Missing or malformed counts cannot hide a retained measurement. Empty files attest to nothing.
-                table_path = directory / f"{table}.parquet"
-                if not table_path.is_file():
-                    table_path = directory / f"{table}.txt"
-                rows = int(
-                    _cached_table_rows(table_path, perf_database._file_revision(table_path))
-                    if cache
-                    else _has_table_rows(table_path)
-                )
-            if type(rows) is not int or rows <= 0:
-                continue
-            if not valid or not isinstance(runtime, dict):
+    for table in files:
+        table_path = directory / f"{table}.parquet"
+        if not table_path.is_file():
+            table_path = directory / f"{table}.txt"
+        rows = _table_rows(table_path, perf_database._file_revision(table_path))
+        if not rows:
+            continue
+        # A table with physical measurements needs a record that accounts for them.
+        data = tables.get(table)
+        if not valid_header or not isinstance(data, dict) or data.get("rows") == 0:
+            yield False
+            continue
+        # A v2 summary and a full or frozen v1 record describe the finalized file. Reduced
+        # historical summaries establish row presence and can omit the count altogether.
+        if (schema == 2 or "collector_ref" in data or "data_sha256" in data) and data.get("rows") != rows:
+            yield False
+            continue
+        if schema == 1:
+            if not _valid_gemma4_v1_record(collection, table, data, path):
                 yield False
+                continue
+            runtimes = (collection["runtime"],)
+        else:
+            # v2 records the rows contributed by each event, including zero-row attempts.
+            # Contributions can overlap on merge, but must cover the retained measurements.
+            events = data["collections"]
+            if sum(event["rows"] for event in events) < rows:
+                yield False
+                continue
+            runtimes = (event.get("runtime", collection["runtime"]) for event in events if event["rows"])
+        for runtime in runtimes:
+            if runtime["framework"] != framework:
                 continue
             reference = runtime.get("image", "")
             reference = reference if isinstance(reference, str) else ""
@@ -354,7 +364,7 @@ def check_gemma4_adapter_runtime(
     try:
         if _has_stock_gemma4_collection(version, database, system, systems_paths):
             return
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, csv.Error) as error:
         if database is not None:
             raise UnverifiedGemmaRuntimeError(str(error)) from error
         raise

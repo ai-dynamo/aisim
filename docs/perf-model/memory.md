@@ -166,6 +166,7 @@ latent. Shared capacity also needs the runtime indexer allocation. Recurrent and
 other per-layer layouts require their runtime state or group measurements.
 Gemma 4 normalizes its final decoder layer to full attention even when an
 explicit list declares it sliding. On vLLM 0.28 through 0.31, supported Transformers versions can read different head counts from the same Gemma checkpoint. The SDK checks the collection image in the selected performance database when that changes a rank’s attention geometry. A direct `get_model` call can pass that database with `database=...`.
+To identify the Gemma runtime for that estimate, the SDK requires collection metadata for each nonempty table in the selected version. Schema 1 uses the directory’s runtime. Schema 2 can identify the runtime separately for each collection that contributed rows.
 
 DeepSeek V4 Flash and Pro expose 3,915 and 5,610 marginal compressed-cache bytes
 per token. Their runtime also reserves compressor state, live sliding and prefill
