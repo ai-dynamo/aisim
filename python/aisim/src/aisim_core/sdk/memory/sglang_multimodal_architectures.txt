@@ -9,7 +9,8 @@
 # https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/auto/modeling_auto.py
 # SGLang 0.5.x stock model entrypoints and declared multimodal classes by first and last patch.
 # transformers rows identify supported composite Transformers entrypoints.
-# compatible rows list additional exported modeling classes accepted as alternatives, grouped by suffix (- for none).
+# compatible rows group additional PyTorch model class exports by suffix (- for none).
+# SGLang requires is_backend_compatible() in 0.5.6.post2 through 0.5.8 and calls it only when present from 0.5.9.
 # https://github.com/huggingface/transformers/tree/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models
 multimodal 6 23 CLIPModel DeepseekOCRForCausalLM DeepseekVL2ForCausalLM DotsOCRForCausalLM DotsVLMForCausalLM
 multimodal 6 23 Gemma3ForConditionalGeneration Gemma3nForConditionalGeneration Glm4vForConditionalGeneration
@@ -239,14 +240,11 @@ compatible 6 23 PreTrainedModel Qwen2 Qwen2VL Qwen2_5Omni Qwen2_5_VL Qwen3 Qwen3
 compatible 6 23 PreTrainedModel Qwen3VL Qwen3VLMoe Sam2 Sam2Video SeedOss Siglip Siglip2 SmolLM3 SmolVLM Starcoder2
 compatible 6 23 PreTrainedModel T5Gemma VaultGemma ViT ViTMAE ViTMSN VideoLlava VideoMAE VipLlava Vivit Voxtral Yolos
 compatible 9 9 - AdaptiveEmbedding ModalEmbeddings QDQBertLayer
-compatible 9 9 Backbone TextNet
 compatible 9 9 Encoder GraniteSpeechCTC
 compatible 9 9 ForClassification MMBT
-compatible 9 9 ForImageClassification TextNet
 compatible 9 9 ForVision2Seq AutoModel
 compatible 9 9 Head AutoModelWithLM
-compatible 9 9 Model MMBT TextNet
-compatible 9 9 PreTrainedModel TextNet
+compatible 9 9 Model MMBT
 compatible 9 10 - FalconMambaCache MambaCache
 compatible 9 14 - ViTMAELayer
 compatible 9 23 - BertLayer BigBirdLayer CanineLayer ConvBertLayer EdgeTamVideoInferenceSession FNetLayer GLPNLayer
@@ -270,8 +268,8 @@ compatible 9 23 ForImageSegmentation AutoModel
 compatible 9 23 ForImageTextToText AutoModel
 compatible 9 23 ForImageToImage AutoModel
 compatible 9 23 ForInstanceSegmentation AutoModel
-compatible 9 23 ForKeypointDetection AutoModel SuperPoint
-compatible 9 23 ForKeypointMatching AutoModel SuperGlue
+compatible 9 23 ForKeypointDetection AutoModel
+compatible 9 23 ForKeypointMatching AutoModel
 compatible 9 23 ForMaskGeneration AutoModel
 compatible 9 23 ForMaskedImageModeling AutoModel
 compatible 9 23 ForMaskedLM AutoModel
@@ -296,8 +294,7 @@ compatible 9 23 ForVisualQuestionAnswering AutoModel
 compatible 9 23 ForZeroShotImageClassification AutoModel
 compatible 9 23 ForZeroShotObjectDetection AutoModel
 compatible 9 23 FormerLayer Ro
-compatible 9 23 Model Auto Dac Encodec Xcodec
-compatible 9 23 PreTrainedModel Dac Encodec SuperGlue SuperPoint Xcodec
+compatible 9 23 Model Auto
 compatible 10 15 ForConditionalGeneration GlmImage
 compatible 10 18 ForCausalLM GraniteMoeShared
 compatible 10 21 ForCausalLM ExaoneMoe
@@ -336,20 +333,19 @@ compatible 10 23 Model DistilBert Electra Ernie Ernie4_5_VLMoeText Ernie4_5_VLMo
 compatible 10 23 Model Ernie4_5_VLMoeVisionTransformerPretrained Ernie4_5_VL_Moe Ernie4_5_VL_MoeText
 compatible 10 23 Model Ernie4_5_VL_MoeVariableResolutionResampler Ernie4_5_VL_MoeVisionTransformerPretrained EuroBert
 compatible 10 23 Model ExaoneMoe Glm4MoeLite Glm4vMoeVision Glm4vVision GlmImageText GlmImageVision GlmMoeDsa GlmOcrText
-compatible 10 23 Model GlmOcrVision GraniteMoe GraniteMoeHybrid GraniteMoeShared HiggsAudioV2 HiggsAudioV2Tokenizer
-compatible 10 23 Model Jais2 JetMoe Lfm2Moe LwDetr MLCDVision MiniMaxM2 Ministral3 MobileBert ModernBert NanoChat Olmoe
-compatible 10 23 Model PPDocLayoutV2 PPDocLayoutV3 PaddleOCRText PaddleOCRVision PeAudioFrameLevel Phimoe Pixio Qwen2Moe
-compatible 10 23 Model RTDetr RTDetrV2 RoCBert Roberta RobertaPreLayerNorm Sam3Tracker Sam3TrackerVideo Sam3ViT
-compatible 10 23 Model Sam3Video Sam3Vision SolarOpen T5Gemma2 VideoLlama3Vision XLMRobertaXL Xmod Youtu
+compatible 10 23 Model GlmOcrVision GraniteMoe GraniteMoeHybrid GraniteMoeShared HiggsAudioV2 Jais2 JetMoe Lfm2Moe
+compatible 10 23 Model LwDetr MLCDVision MiniMaxM2 Ministral3 MobileBert ModernBert NanoChat Olmoe PPDocLayoutV2
+compatible 10 23 Model PPDocLayoutV3 PaddleOCRText PaddleOCRVision PeAudioFrameLevel Phimoe Pixio Qwen2Moe RTDetr
+compatible 10 23 Model RTDetrV2 RoCBert Roberta RobertaPreLayerNorm Sam3Tracker Sam3TrackerVideo Sam3ViT Sam3Video
+compatible 10 23 Model Sam3Vision SolarOpen T5Gemma2 VideoLlama3Vision XLMRobertaXL Xmod Youtu
 compatible 10 23 PreTrainedModel Afmoe Albert Bert BertGeneration Camembert ConditionalDetr Cwm DFine Data2VecText Dbrx
 compatible 10 23 PreTrainedModel DeformableDetr Detr DistilBert Electra Ernie Ernie4_5_VLMoe Ernie4_5_VL_Moe EuroBert
 compatible 10 23 PreTrainedModel ExaoneMoe FastVlm Glm46V Glm4MoeLite GlmImage GlmMoeDsa GlmOcr GraniteMoe
-compatible 10 23 PreTrainedModel GraniteMoeHybrid GraniteMoeShared HiggsAudioV2 HiggsAudioV2Tokenizer Jais2 JetMoe Lasr
-compatible 10 23 PreTrainedModel Lfm2Moe LightOnOcr LwDetr LwDetrViT MLCD MiniMaxM2 Ministral3 MobileBert ModernBert
-compatible 10 23 PreTrainedModel ModernVBert NanoChat Olmoe PPDocLayoutV2 PPDocLayoutV3 PaddleOCRVL Phimoe Pixio
-compatible 10 23 PreTrainedModel Qwen2Moe RTDetr RTDetrV2 RoCBert Roberta RobertaPreLayerNorm Sam3 Sam3Tracker
-compatible 10 23 PreTrainedModel Sam3TrackerVideo Sam3Video SolarOpen T5Gemma2 VideoLlama3 VoxtralRealtime XLMRoberta
-compatible 10 23 PreTrainedModel XLMRobertaXL Xmod Youtu
+compatible 10 23 PreTrainedModel GraniteMoeHybrid GraniteMoeShared HiggsAudioV2 Jais2 JetMoe Lasr Lfm2Moe LightOnOcr
+compatible 10 23 PreTrainedModel LwDetr LwDetrViT MLCD MiniMaxM2 Ministral3 MobileBert ModernBert ModernVBert NanoChat
+compatible 10 23 PreTrainedModel Olmoe PPDocLayoutV2 PPDocLayoutV3 PaddleOCRVL Phimoe Pixio Qwen2Moe RTDetr RTDetrV2
+compatible 10 23 PreTrainedModel RoCBert Roberta RobertaPreLayerNorm Sam3 Sam3Tracker Sam3TrackerVideo Sam3Video
+compatible 10 23 PreTrainedModel SolarOpen T5Gemma2 VideoLlama3 VoxtralRealtime XLMRoberta XLMRobertaXL Xmod Youtu
 compatible 11 23 - JinaEmbeddingsV3Layer PPOCRV5MobileRecEncoderWithSVTR PPOCRV5ServerRecEncoderWithSVTR
 compatible 11 23 ForCausalLM Mistral4
 compatible 11 23 ForConditionalGeneration PI0

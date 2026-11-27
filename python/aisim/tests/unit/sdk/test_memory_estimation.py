@@ -3649,6 +3649,18 @@ def test_idefics2_compares_constructed_mistral_dimensions_and_checks_all_alterna
         NaiveKVCacheEstimator.from_hf_config(
             {**root, "architectures": [*names, "Unregistered"], "text_config": explicit}, **options
         )
+    for name in ("TextNetPreTrainedModel", "SuperGlueForKeypointMatching", "EncodecModel"):
+        with pytest.raises(ValueError, match="compatible model class for every architecture"):
+            NaiveKVCacheEstimator.from_hf_config(
+                {**root, "architectures": [names[0], name], "text_config": explicit}, **options
+            )
+    # AutoModelForCausalLM has no compatibility method. SGLang began guarding the call in 0.5.9.
+    auto_model = {**root, "architectures": [names[0], "AutoModelForCausalLM"], "text_config": explicit}
+    if version == "0.5.6.post2":
+        with pytest.raises(ValueError, match="compatible model class for every architecture"):
+            NaiveKVCacheEstimator.from_hf_config(auto_model, **options)
+    else:
+        assert NaiveKVCacheEstimator.from_hf_config(auto_model, **options).kv_bytes_per_token() == 131_072
     if version in ("0.5.6.post2", "0.5.9"):
         for missing_or_wrong in (None, 32):
             with pytest.raises(ValueError, match="requires matching parent and decoder dimensions"):
