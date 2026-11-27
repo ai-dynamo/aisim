@@ -3515,7 +3515,11 @@ def test_vllm_implicit_and_partial_vision_towers():
     text = _synthetic_multimodal_w8()["text_config"]
     opts = dict(tp_size=1, pp_size=1, backend_version="0.32.0")
     qwen = {"model_type": "qwen2_vl", "architectures": ["Qwen2VLForConditionalGeneration"], "text_config": text}
-    for raw in (qwen, {**qwen, "vision_config": {}}):
+    for raw in (
+        qwen,
+        {**qwen, "vision_config": {}},
+        {**qwen, "architectures": ["UnknownNativeCheckpoint", *qwen["architectures"]]},
+    ):
         estimator = NaiveKVCacheEstimator.from_hf_config(raw, **opts)
         assert estimator.kv_bytes_per_token() == 1536
         with pytest.raises(ValueError, match="resident weights for the vision tower"):
@@ -3604,8 +3608,8 @@ def test_compressed_tensors_fused_shards_and_packed_activations():
         NaiveKVCacheEstimator.from_hf_config(document, **opts)
     group["output_activations"] = group["input_activations"]
     assert NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes() == weight_only
-    for strategy in ({}, {"strategy": "group"}):
-        group["input_activations"] = {"type": "int", "dynamic": True, "group_size": 128, **strategy}
+    for strategy in ({}, {"type": "int"}, {"strategy": "group"}, {"type": "INT", "strategy": "GROUP"}):
+        group["input_activations"] = {"dynamic": True, "group_size": 128, **strategy}
         assert NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes() == weight_only
         group["input_activations"]["dynamic"] = False
         with pytest.raises(ValueError, match="W8 weights"):
@@ -3621,6 +3625,35 @@ def test_vllm_mxfp8_routed_experts_keep_the_execution_width_reserve(tmp_path):
     opts.update(moe_tp_size=8, moe_ep_size=1, naive_kv_reservation=1)
     with pytest.raises(ValueError, match="no KV budget"):
         memory.estimate_num_gpu_blocks(_write_config(tmp_path, raw), "missing", "vllm", "0.32.0", **opts)
+
+
+def test_modelopt_mxfp8_uses_checkpoint_dtype_and_rank_local_projection_widths(tmp_path):
+    doc = _synthetic_multimodal_w8()
+    del doc["torch_dtype"]
+    quant = doc["quantization_config"] = {"quant_method": "modelopt_mxfp8"}
+    model = _write_config(tmp_path, doc)
+    opts = dict(tp_size=1, pp_size=1, backend_version="0.32.0")
+    for dtype in ("F16", "BF16"):
+        header = json.dumps({"embed.weight": {"dtype": dtype, "shape": [1], "data_offsets": [0, 2]}}).encode()
+        header += b" " * (-len(header) % 8)
+        (tmp_path / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + bytes(2))
+        if dtype == "F16":
+            with pytest.raises(ValueError, match="MXFP8 requires bfloat16"):
+                _compiled_vllm_transfer_widths(model, "0.32.0")
+        else:
+            assert _compiled_vllm_transfer_widths(model, "0.32.0") == (1536, 1536)
+    with pytest.raises(ValueError, match="checkpoint headers"):
+        NaiveKVCacheEstimator.from_hf_config(doc, **opts)
+    doc["torch_dtype"] = "bfloat16"
+    doc["text_config"].update(num_attention_heads=16, num_key_value_heads=8, intermediate_size=29_568)
+    assert NaiveKVCacheEstimator.from_hf_config(doc, **(opts | {"tp_size": 4})).weight_bytes() > 0
+    opts["tp_size"] = 8
+    for ignored in ([], ["*.self_attn.o_proj"], ["language_model.model.layers.0.mlp.down_proj"]):
+        quant["ignored_layers"] = ignored
+        with pytest.raises(ValueError, match="MXFP8.*32"):
+            NaiveKVCacheEstimator.from_hf_config(doc, **opts)
+    quant["ignored_layers"] = ["*.mlp.down_proj"]
+    assert NaiveKVCacheEstimator.from_hf_config(doc, **opts).weight_bytes() > 0
 
 
 def test_borrowed_gemma_and_gpt_neo_construct_before_vllm_dispatch(tmp_path):
@@ -3642,6 +3675,11 @@ def test_borrowed_gemma_and_gpt_neo_construct_before_vllm_dispatch(tmp_path):
     assert _compiled_vllm_transfer_widths(_write_config(tmp_path, wrapper), "0.32.0") == (92_160, 92_160)
     child.update(num_hidden_layers=30, vocab_size=262144, max_position_embeddings=131072)
     assert NaiveKVCacheEstimator.from_hf_config(wrapper, **opts).weight_bytes() == inherited.weight_bytes()
+    gemma3 = {**opt, "model_type": "gemma3_text"}
+    for raw in (gemma3, {**wrapper, "text_config": gemma3}):
+        assert _compiled_vllm_transfer_widths(_write_config(tmp_path, raw), "0.32.0") == (79_872, 79_872)
+    with pytest.raises(ValueError, match="OPTForCausalLM"):
+        NaiveKVCacheEstimator.from_hf_config({**opt, "model_type": "falcon"}, **opts)
 
     # The same registered OPT class uses all 12 attention heads when loaded as a bare model.
     bare = {**child, "head_dim": 64, "global_head_dim": 64, "num_global_key_value_heads": 1, "attention_k_eq_v": True}
@@ -5626,6 +5664,11 @@ def test_gemma3_implicit_layer_pattern_matches_its_explicit_physical_pool(tmp_pa
             combined.weight_bytes()
         assert combined.kv_bytes_per_token() == estimator.kv_bytes_per_token()
         assert (combined.geometry["num_swa_layers"], combined.geometry["num_global_layers"]) == (29, 5)
+        sglang = NaiveKVCacheEstimator.from_hf_config(
+            wrapped, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.23"
+        )
+        with pytest.raises(ValueError, match="resident weights for the vision tower"):
+            sglang.weight_bytes()
     opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=estimator.weight_bytes() + budget)
     assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.33.0", **opts) == 97
     with pytest.raises(ValueError, match="separate full and sliding pool sizes"):

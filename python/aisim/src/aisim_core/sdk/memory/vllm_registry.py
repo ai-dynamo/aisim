@@ -81,10 +81,13 @@ def is_known_transformers_config(model_type: str, version: str | None) -> bool:
 
 def is_registered_conditional_generator(name: str | None, version: str | None) -> bool:
     """A registered conditional generation wrapper can construct auxiliary modules from defaults."""
-    if not isinstance(name, str) or not name.endswith("ForConditionalGeneration"):
+    if not isinstance(name, str):
         return False
     release = _recorded_release(version)
-    return any(name in _registry(v).names["vllm"] for v in ((release,) if release is not None else _RELEASES))
+    return any(
+        (registered := _normalize(name, _registry(v).names["vllm"])) and registered.endswith("ForConditionalGeneration")
+        for v in ((release,) if release is not None else _RELEASES)
+    )
 
 
 # These registrations load the same decoder implementation under another name.
@@ -169,11 +172,16 @@ def select_wrapper_architecture(
     names: list[str], version: str | None, auto_map: object, wrappers: set[str]
 ) -> str | None:
     """Resolve a list containing a modeled wrapper while preserving generic nested configurations."""
-    if not names or not any(_normalize(name, wrappers) for name in names):
-        return names[0] if names else None
+    if not names:
+        return None
+    modeled = any(_normalize(name, wrappers) for name in names)
+    if not modeled and not any(is_registered_conditional_generator(name, version) for name in names):
+        return names[0]
     if version is not None and _recorded_release(version) is None:
+        if not modeled and len(names) > 1:
+            raise ValueError(f"vLLM requires a recorded backend release to select the wrapper in {names!r}")
         return names[0]
     selected = select_architecture(names, version, auto_map)
-    if selected not in wrappers:
+    if modeled and selected not in wrappers:
         raise ValueError(f"vLLM cannot derive the text decoder from the selected wrapper in {names!r}")
     return selected

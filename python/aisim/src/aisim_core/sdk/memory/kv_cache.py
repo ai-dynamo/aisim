@@ -54,6 +54,7 @@ import math
 import os
 import re
 from collections.abc import Callable, Collection
+from fnmatch import fnmatchcase
 from functools import cache, partial
 from importlib.resources import files
 from itertools import pairwise
@@ -269,6 +270,17 @@ _BORROWED_DECODER_DEFAULTS = {
         rms_norm_eps=1e-6,
         vocab_size=256000,
     ),
+    "gemma3_text": dict(
+        hidden_size=2304,
+        num_hidden_layers=26,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        head_dim=256,
+        intermediate_size=9216,
+        max_position_embeddings=131072,
+        rms_norm_eps=1e-6,
+        vocab_size=262208,
+    ),
 }
 
 
@@ -320,6 +332,12 @@ def _sglang_llava_causal_lm(kind: str, version: str | None) -> str | None:
     if len(choices) != 1:
         raise ValueError(f"SGLang's LLaVA decoder for {kind!r} depends on the backend release")
     return choices.pop()
+
+
+@cache
+def _sglang_multimodal_generators() -> frozenset[str]:
+    source = files(__package__).joinpath("sglang_multimodal_architectures.txt").read_text(encoding="utf-8")
+    return frozenset(name for name in source.splitlines() if not name.startswith("#"))
 
 
 def _uses_bare_decoder(config: dict, backend: str, version: str | None) -> bool:
@@ -483,13 +501,13 @@ def _select_text_decoder(
     if named == "OPTForCausalLM" and (native_dispatch or kind == "opt"):
         # These GPT configs expose their serialized dimensions under the canonical attributes read by OPT.
         gpt_defaults = {
-            "gpt2": (768, 12, 12, 1024),
-            "gpt-sw3": (768, 12, 12, 1024),
-            "gpt_bigcode": (768, 12, 12, 1024),
-            "gptj": (4096, 16, 28, 2048),
-            "gpt_neo": (2048, 16, 24, 2048),
-            "codegen": (4096, 16, 28, 2048),
-            "openai-gpt": (768, 12, 12, 512),
+            "gpt2": (768, 12, 12, 1024, 50257),
+            "gpt-sw3": (768, 12, 12, 1024, 50257),
+            "gpt_bigcode": (768, 12, 12, 1024, 50257),
+            "gptj": (4096, 16, 28, 2048, 50400),
+            "gpt_neo": (2048, 16, 24, 2048, 50257),
+            "codegen": (4096, 16, 28, 2048, 50400),
+            "openai-gpt": (768, 12, 12, 512, 40478),
         }
         if kind in gpt_defaults:
             attributes = ("hidden_size", "num_attention_heads", "num_hidden_layers", "max_position_embeddings")
@@ -498,8 +516,9 @@ def _select_text_decoder(
                 if kind == "gpt_neo"
                 else ("n_embd", "n_head", "n_layer", "n_positions")
             )
-            for field, alias, default in zip(attributes, aliases, gpt_defaults[kind], strict=True):
+            for field, alias, default in zip(attributes, aliases, gpt_defaults[kind][:-1], strict=True):
                 decoder.setdefault(field, decoder.get(alias, default))
+            decoder.setdefault("vocab_size", gpt_defaults[kind][-1])
             if kind == "gpt_neo":
                 schedule = decoder.get("attention_types")
                 if schedule is None:
@@ -531,6 +550,8 @@ def _select_text_decoder(
         ):
             raise ValueError("OPTForCausalLM requires its OPT decoder configuration")
         _apply_decoder_geometry_defaults(decoder, kind)
+        if any(decoder.get(field) is None for field in _DECODER_GEOMETRY_DEFAULTS["opt"]):
+            raise ValueError(f"OPTForCausalLM requires source config dimensions for model_type={kind!r}")
         heads = layout_integer(decoder.get("num_attention_heads"), "num_attention_heads")
         hidden = layout_integer(decoder.get("hidden_size"), "hidden_size")
         if hidden % heads:
@@ -798,17 +819,59 @@ def _vllm_fp8_linear_scale_bytes(quant: dict, geom: dict, tp: int) -> int:
     return 4 * sum(((out + block_n - 1) // block_n) * ((inp + block_k - 1) // block_k) for out, inp in matrices)
 
 
+def _check_modelopt_mxfp8_inputs(geom: dict, tp: int, ignored: list[str], prefix: str, opt: bool) -> None:
+    # KMxfp8Static groups the input of each quantized rank-local matrix into sets of 32.
+    hidden = layout_integer(geom["hidden"], "hidden_size")
+    inter = layout_integer(geom["inter"], "intermediate_size")
+    q = layout_integer(geom["num_attention_heads"], "num_attention_heads") * layout_integer(
+        geom["head_dim"], "head_dim"
+    )
+    blocks = (
+        ("self_attn.qkv_proj", hidden, ("q_proj", "k_proj", "v_proj")),
+        ("self_attn.out_proj" if opt else "self_attn.o_proj", q, ()),
+        ("fc1" if opt else "mlp.gate_up_proj", hidden, () if opt else ("gate_proj", "up_proj")),
+        ("fc2" if opt else "mlp.down_proj", inter, ()),
+    )
+    for module, width, shards in blocks:
+        row_parallel = module.endswith(("o_proj", "out_proj", "down_proj", "fc2"))
+        if width % (32 * (tp if row_parallel else 1)) == 0:
+            continue
+        if row_parallel and width % tp:
+            raise ValueError(f"vLLM {module} input width must be divisible by tensor parallel size")
+        for i in range(geom["layers"]):
+            name = f"{prefix}model.{'decoder.' if opt else ''}layers.{i}.{module}"
+            if any(pattern in name or fnmatchcase(name, pattern) for pattern in ignored):
+                continue
+            if shards and all(name.rsplit(".", 1)[0] + "." + shard in ignored for shard in shards):
+                continue
+            raise ValueError(f"vLLM ModelOpt MXFP8 requires {name} rank-local input width divisible by 32")
+
+
 def _compressed_tensor_strategy(args: dict) -> str:
     strategy = args.get("strategy")
-    if strategy is not None:
-        return strategy
     group_size = args.get("group_size")
+    if strategy is not None:
+        if not isinstance(strategy, str):
+            raise ValueError("compressed-tensors strategy must be a string")
+        strategy = strategy.lower()
+        if strategy in ("group", "tensor_group"):
+            layout_integer(group_size, "compressed-tensors group_size")
+        elif isinstance(group_size, int) and group_size > 0:
+            raise ValueError("compressed-tensors group_size requires a grouped strategy")
+        return strategy
     if group_size is None:
         return "tensor"
     if group_size == -1:
         return "channel"
     layout_integer(group_size, "compressed-tensors group_size")
     return "group"
+
+
+def _compressed_tensor_type(args: dict) -> str:
+    value = args.get("type", "int")
+    if not isinstance(value, str):
+        raise ValueError("compressed-tensors type must be a string")
+    return value.lower()
 
 
 def _vllm_weight_config(document: dict) -> dict | None:
@@ -1591,6 +1654,8 @@ class NaiveKVCacheEstimator:
             moe_tp_size=moe_tp_size,
             backend=backend,
             backend_version=backend_version,
+            checkpoint_dir=Path(model_path) if os.path.isdir(model_path) else None,
+            dtype_target=(system, systems_paths),
         )
 
         if backend == "vllm" and gemma4 and estimator.architecture not in _VLLM_DENSE_DECODERS:
@@ -1599,9 +1664,6 @@ class NaiveKVCacheEstimator:
             )
 
         if estimator._selected_decoder is not None:
-            estimator._vllm_dtype_target = (system, systems_paths)
-            if os.path.isdir(model_path):
-                estimator._checkpoint_dir = Path(model_path)
             if sidecar is not None and not estimator._vllm_native_decoder:
                 estimator._selected_decoder = attach_quantization_sidecar(estimator._selected_decoder, sidecar)
             raw = estimator._selected_decoder
@@ -1658,6 +1720,8 @@ class NaiveKVCacheEstimator:
         backend: str,
         backend_version: str | None,
         resolve_bare: bool = True,
+        checkpoint_dir: Path | None = None,
+        dtype_target: tuple[str | None, str | list[str] | None] = (None, None),
     ) -> NaiveKVCacheEstimator:
         if (
             backend == "vllm"
@@ -1791,6 +1855,8 @@ class NaiveKVCacheEstimator:
                     backend=backend,
                     backend_version=backend_version,
                     resolve_bare=False,
+                    checkpoint_dir=checkpoint_dir,
+                    dtype_target=dtype_target,
                 )
                 if (
                     raw_decoder.get("model_type") == "gemma4_text"
@@ -1822,8 +1888,13 @@ class NaiveKVCacheEstimator:
                     )
                 decoder._is_nested_decoder = key is not None
                 if key is not None:
-                    decoder._wrapper_config = {**hf_config, "architectures": [architecture]}
+                    decoder._wrapper_config = {
+                        **hf_config,
+                        "architectures": architectures if backend == "sglang" else [architecture],
+                    }
                 decoder._vllm_native_decoder = resolved_vllm_decoder
+                decoder._checkpoint_dir = checkpoint_dir
+                decoder._vllm_dtype_target = dtype_target
                 release = parse_support_matrix_version(backend_version)
                 if (
                     decoder._vllm_native_decoder
@@ -2064,11 +2135,9 @@ class NaiveKVCacheEstimator:
                     raise ValueError(f"unsupported ModelOpt quant_algo {algo!r}")
                 if method in ("modelopt-mxfp8", "mxfp8") and algo != "MXFP8":
                     raise ValueError("ModelOpt MXFP8 checkpoints require quant_algo MXFP8")
-                if (
-                    algo == "MXFP8"
-                    and dtype in ("float16", "fp16", "half")
-                    and model_type not in _VLLM_NO_FP16_MODEL_TYPES
-                ):
+                if algo == "MXFP8" and self._vllm_execution_dtype(
+                    needs_preferred=True, allow_fp16=model_type not in _VLLM_NO_FP16_MODEL_TYPES
+                ) not in ("bf16", "bfloat16"):
                     raise ValueError("vLLM ModelOpt MXFP8 requires bfloat16 execution")
                 self._quantized_weights = bool(algo)
                 ignored = section.get("exclude_modules", []) if "quantization" in quant else quant.get("ignore", [])
@@ -2076,6 +2145,18 @@ class NaiveKVCacheEstimator:
                     ignored = quant.get("ignored_layers", [])
                 if not isinstance(ignored, list) or not all(isinstance(target, str) for target in ignored):
                     raise ValueError("ModelOpt exclusions must be a list of module names")
+                if (
+                    algo == "MXFP8"
+                    and self.architecture in _VLLM_DENSE_DECODERS
+                    and not self.geometry.get("num_experts")
+                ):
+                    _check_modelopt_mxfp8_inputs(
+                        self.geometry,
+                        self.tp_size,
+                        ignored,
+                        "language_model." if self._is_nested_decoder else "",
+                        self.architecture == "OPTForCausalLM",
+                    )
                 # For mixed or potentially excluded linears retain the execution-width reserve.
                 if all(_outside_dense_decoder_projections(target.strip("*")) for target in ignored):
                     if algo == "FP8" and self.architecture in _VLLM_DENSE_DECODERS - {"OPTForCausalLM"}:
@@ -2119,6 +2200,7 @@ class NaiveKVCacheEstimator:
                     group = weight_groups[0]
                     weights = dict(group["weights"])
                     weights["strategy"] = _compressed_tensor_strategy(weights)
+                    weights["type"] = _compressed_tensor_type(weights)
                     ignored = quant.get("ignore", [])
                     if isinstance(ignored, list) and self.architecture != "OPTForCausalLM":
                         _check_fused_decoder_exclusions(
@@ -2128,7 +2210,7 @@ class NaiveKVCacheEstimator:
                         group["targets"] == ["Linear"]
                         and isinstance(ignored, list)
                         and all(_outside_dense_decoder_projections(target) for target in ignored)
-                        and weights.get("num_bits") == 8
+                        and weights.get("num_bits", 8) == 8
                         and weights.get("type") in ("float", "int")
                         and weights.get("symmetric", True)
                         and weights.get("strategy") in ("tensor", "channel", "block", "group")
@@ -2156,7 +2238,7 @@ class NaiveKVCacheEstimator:
                             and release >= Version("0.23.0rc2")
                             and all(
                                 isinstance(args, dict)
-                                and args.get("type") == "int"
+                                and _compressed_tensor_type(args) == "int"
                                 and args.get("num_bits", 8) == 8
                                 and _compressed_tensor_strategy(args) == "tensor"
                                 and not args.get("dynamic", False)
@@ -2167,7 +2249,7 @@ class NaiveKVCacheEstimator:
                             release is not None
                             and release >= Version("0.26.0rc1")
                             and isinstance(inputs, dict)
-                            and inputs.get("type") == "int"
+                            and _compressed_tensor_type(inputs) == "int"
                             and inputs.get("num_bits", 8) in (4, 8)
                             and _compressed_tensor_strategy(inputs) in ("token", "group")
                             and inputs.get("dynamic") is True
@@ -2736,7 +2818,7 @@ class NaiveKVCacheEstimator:
 
     def _local_vllm_model_dtype(self) -> str:
         """Resolve the floating weight dtype from local safetensors headers when the config omits it."""
-        problem = "explicit bfloat16 KV cache requires a resolved vLLM model dtype from config or checkpoint headers"
+        problem = "a resolved vLLM model dtype requires config or checkpoint headers"
         if self._checkpoint_dir is None:
             raise ValueError(problem)
         dtypes = set()
@@ -2772,6 +2854,22 @@ class NaiveKVCacheEstimator:
             return "float16"
         raise ValueError(problem)
 
+    def _vllm_execution_dtype(self, *, needs_preferred: bool = False, allow_fp16: bool = True) -> str:
+        dtype = self._vllm_model_dtype or self._local_vllm_model_dtype()
+        fp8 = dtype in _VLLM_FP8_WEIGHT_DTYPES.values()
+        if dtype in ("float16", "fp16", "half") and allow_fp16:
+            return dtype
+        if fp8 or dtype in ("float32", "fp32", "float", "float64", "double", "bfloat16", "bf16") or not allow_fp16:
+            spec = _config_only_system_spec(*self._vllm_dtype_target)
+            sm = spec.get("gpu", {}).get("sm_version")
+            if sm is not None:
+                return "bfloat16" if sm >= 80 else "float16"
+            if spec.get("gpu") and perf_database.is_xpu_system_spec(spec):
+                return "bfloat16"
+            if fp8 or dtype in ("float64", "double") or (needs_preferred and dtype not in ("bfloat16", "bf16")):
+                raise ValueError("resolving the preferred vLLM model dtype requires a deployment target")
+        return dtype
+
     def set_kvcache_quant_mode(self, mode: str) -> None:
         """Apply an explicit KV precision independently of the checkpoint's weight width."""
         if mode == "bfloat16" and self._vllm_sparse_auto_precision is not None:
@@ -2779,18 +2877,7 @@ class NaiveKVCacheEstimator:
             self.dtype_bytes, self._sparse_cache_needs_target = self._vllm_sparse_auto_precision
             return
         if mode == "bfloat16" and self._vllm_check_model_dtype:
-            dtype = self._vllm_model_dtype or self._local_vllm_model_dtype()
-            fp8 = dtype in _VLLM_FP8_WEIGHT_DTYPES.values()
-            if fp8 or dtype in ("float32", "fp32", "float", "float64", "double", "bfloat16", "bf16"):
-                # vLLM downcasts F32 and unsupported dtypes to the deployment's preferred dtype.
-                spec = _config_only_system_spec(*self._vllm_dtype_target)
-                sm = spec.get("gpu", {}).get("sm_version")
-                if sm is not None:
-                    dtype = "bfloat16" if sm >= 80 else "float16"
-                elif spec.get("gpu") and perf_database.is_xpu_system_spec(spec):
-                    dtype = "bfloat16"
-                elif fp8 or dtype in ("float64", "double"):
-                    raise ValueError("explicit bfloat16 KV cache requires the target's preferred vLLM model dtype")
+            dtype = self._vllm_execution_dtype()
             if dtype in ("float16", "fp16", "half"):
                 raise ValueError("explicit bfloat16 KV cache dtype disagrees with the vLLM float16 model dtype")
         if mode == "bfloat16" and self._vllm_packed_sparse:
@@ -2819,7 +2906,8 @@ class NaiveKVCacheEstimator:
         if decoder is None or self._wrapper_config is None:
             return decoder
         document = self._wrapper_config
-        wrapper = document["architectures"][0]
+        names = document.get("architectures") or [None]
+        wrapper = names[0]
         vision = document.get("vision_config")
         family = document.get("model_type") or _TEXT_CONFIG_DEFAULTS.get(wrapper, (None,))[0]
         llava = wrapper in _TEXT_CONFIG_DEFAULTS and wrapper.startswith("Llava")
@@ -2844,6 +2932,7 @@ class NaiveKVCacheEstimator:
                     self._cache_backend == "vllm"
                     and is_registered_conditional_generator(wrapper, str(self._cache_release))
                 )
+                and not (self._cache_backend == "sglang" and _sglang_multimodal_generators().intersection(names))
                 and not document.get("vision_tower")
                 and not document.get("mm_vision_tower")
                 and document.get("projector_config") is None
