@@ -12,15 +12,16 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `474614019`. It contains the omitted-MoE-pair
+The current code head is `0c331e377`. It contains the omitted-MoE-pair
 rejection, the single-dimension fallback resolution, the pre-database width
 gate, the FPE generator guard and the hardware-fact/AFD pins described below, on
 top of `0faa4f402e2b3fe6ab302921d08c39572941ac8a`, which merges `main` at
 `29104f537634779690aa6721b93b39c4204d13cb`. The commits after `0faa4f402`
 change code as well as this document: `372f2e7c2` adds the fallback resolution
 and the generator guard, `98ebca229` applies the omitted-pair rejection,
-`c543294ee` adds the hardware-fact and preflight pins, and `474614019` adds the
-search-space AFD pin. The commit after `474614019` changes only this document.
+`c543294ee` adds the hardware-fact and preflight pins, `474614019` adds the
+search-space AFD pin, and `0c331e377` keeps a dense checkpoint's omitted MoE
+width at `1`. The commit after `0c331e377` changes only this document.
 See [Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -50,11 +51,12 @@ feasible/infeasible status are meaningful.
 
 `0faa4f402e2b3fe6ab302921d08c39572941ac8a` is the reviewed commit and keeps
 the historical verification results recorded for it. The current code head is
-`474614019`: `372f2e7c2` adds the single-dimension fallback resolution, the
+`0c331e377`: `372f2e7c2` adds the single-dimension fallback resolution, the
 pre-database width gate and the FPE generator guard, `98ebca229` applies the
 config contract's omitted-MoE-pair rejection, `c543294ee` adds the
-hardware-fact and preflight pins, and `474614019` adds the search-space AFD pin.
-The commit after `474614019` changes only this document. Everything sits on
+hardware-fact and preflight pins, `474614019` adds the search-space AFD pin, and
+`0c331e377` keeps a dense checkpoint's omitted MoE width at `1`. The commit
+after `0c331e377` changes only this document. Everything sits on
 three merges of `main` on top of the reviewed
 commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
@@ -130,10 +132,10 @@ Both shapes of that default conflict with
 `tp_size * attention_dp_size * cp_size == moe_tp_size * moe_ep_size`:
 
 - Exactly one dimension omitted defeated the config's inference from the
-  attention width, so a valid request such as `tp_size=4` with
-  `moe_tp_size=2` became a width mismatch. `from_request` now leaves the single
-  omitted dimension unset and resolves it from the attention width, as every
-  other SDK path does.
+  attention width, so a valid routed request such as `tp_size=4` with
+  `moe_tp_size=2` became a width mismatch. For a routed checkpoint,
+  `from_request` now leaves the single omitted dimension unset and resolves it
+  from the attention width, as every other SDK path does.
 - An omitted pair became `1x1`, which is not a layout a MoE model can serve at
   `tp_size*dp*cp > 1` (`4 != 1` in the invariant above). The config contract
   deliberately refuses to invent a layout the caller did not request, so the
@@ -141,21 +143,37 @@ Both shapes of that default conflict with
   `estimate_kv_cache` and `KVCacheEstimator.from_request` raise
   `InvalidEngineConfigurationError` (`At least one of moe_tp_size or
   moe_ep_size must be set for MoE models.`) before the perf-database lookup and
-  before the naive fallback can price `1x1`. Dense checkpoints never read these
-  widths, so they keep placeholder widths, and `estimate_kv_cache` still
-  rejects an explicit `moe_ep_size>1` for dense Gemma 4 before the database
-  lookup.
+  before the naive fallback can price `1x1`.
 
-`test_estimate_kv_cache_infers_an_omitted_moe_dimension` pins the single-dim
-case, `test_estimate_kv_cache_rejects_an_omitted_moe_pair_like_the_config_contract`
+Dense checkpoints are the exception, because nothing reads the widths:
+`ModelConfig` skips the invariant and dense models build no expert ops. They
+keep the caller's explicit value and `1` for an omitted one, which is what
+direct construction accepts; inferring from the attention width would turn
+`tp_size=4, moe_tp_size=2` into `moe_ep_size=2` and reject a dense request the
+guard otherwise allows. `estimate_kv_cache` still rejects an explicit
+`moe_ep_size>1` for dense Gemma 4 before the database lookup.
+
+`test_estimate_kv_cache_infers_an_omitted_moe_dimension` pins the routed
+single-dim case, `test_estimate_kv_cache_rejects_an_omitted_moe_pair_like_the_config_contract`
 pins the rejection with the database and the fallback made unreachable,
-`test_from_request_rejects_an_omitted_moe_pair` pins the public classmethod, and
+`test_from_request_rejects_an_omitted_moe_pair` pins the public classmethod,
 `test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint`
-pins that a multi-GPU dense request still estimates natively. This changes
-production behavior for callers that passed one dimension or neither: the
-single-dimension request now estimates natively instead of failing the width
-check, and an omitted pair on a routed checkpoint now raises instead of
-reaching the naive fallback.
+pins that a multi-GPU dense request still estimates natively, and
+`test_estimate_kv_cache_keeps_one_for_a_dense_omitted_moe_ep_size` plus its
+fallback counterpart pin that a dense single-omitted width stays `1`. This
+changes production behavior for callers that passed one dimension or neither:
+the routed single-dimension request now estimates natively instead of failing
+the width check, and an omitted pair on a routed checkpoint now raises instead
+of reaching the naive fallback.
+
+The Rust entry point inherits the rejection. `estimate_aic_num_gpu_blocks`
+takes serde-defaulted `ParallelMapping` widths, so a routed checkpoint with both
+widths unset now surfaces the Python typed error as
+`KvCacheEstimateError::BadConfig { field: "engine" }` instead of a terminal
+`Unsupported` or a `1x1` estimate at `tp_size=1`. That is the same deliberate
+contract change: the caller must state the layout. `memory.rs` already maps
+`InvalidEngineConfigurationError` to `BadConfig` (`b761646c0`), which is what
+makes it non-fallback-safe; no Rust code changes here.
 
 ### Fallback MoE layout and the pre-database width gate
 
@@ -166,9 +184,9 @@ shards expert weights by `moe_tp_size * moe_ep_size`, while the native build
 inferred the omitted dimension from the attention width. A request with
 `tp_size=4, moe_tp_size=2` therefore priced `2x1` on the fallback and `2x2`
 natively, so the same request returned two different capacities depending on
-which path ran. Both paths now call `_resolve_moe_dimensions`, which applies the
-rule `ModelConfig.resolve_moe_parallelism` describes, and the fallback runs it
-after the native build fails.
+which path ran. Both paths now call `_resolve_moe_dimensions`, which applies that
+inference for a routed checkpoint and passes dense widths through unchanged, and
+the fallback runs it after the native build fails.
 
 `test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension`
 forces `perf_database.get_database` to fail at `tp_size=4` on the routed
@@ -189,7 +207,7 @@ keeps a well-formed dense checkpoint fallback-eligible.
 
 ### Verification at the current head
 
-Local run at `474614019` on macOS arm64, Python 3.13.18, with the native
+Local run at `0c331e377` on macOS arm64, Python 3.13.18, with the native
 extension rebuilt from this head's tree (`maturin build --release --locked`,
 the `pyproject.toml`
 `extension-module,jemalloc` features, and the wheel's
@@ -210,10 +228,33 @@ minutes.
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection from the 2026-11-18 command below (includes the omitted-MoE-pair and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `474614019` | 1,236 passed, 0 failed |
+| Targeted pytest selection (the twelve paths in the command below; includes the omitted-MoE-pair and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `0c331e377` | 1,238 passed, 0 failed |
 | `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `372f2e7c2` | 1,476 passed, 0 failed, 1 ignored |
 | `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2` | 5 passed; no skips |
 | `cargo fmt --all -- --check` | `372f2e7c2` | clean |
+
+The pytest row is this command, run from the repository root at
+`0c331e377`:
+
+```
+VIRTUAL_ENV=python/aisim/.venv PYTHONPATH=python/aisim/src \
+  python/aisim/.venv/bin/python -m pytest -c python/aisim/pytest.ini -p no:timeout -q \
+  python/aisim/tests/unit/sdk/test_memory_estimation.py \
+  python/aisim/tests/unit/sdk/models/test_model_config.py \
+  python/aisim/tests/unit/sdk/task_v2/test_task_config.py \
+  python/aisim/tests/unit/cli/test_disagg_moe_comm_resolution.py \
+  python/aisim/tests/unit/generator/test_gemma4_dense_enumeration.py \
+  python/aisim/tests/unit/support_matrix \
+  python/aisim/tests/unit/test_modern_recommend_context.py \
+  python/aisim/tests/unit/test_model_hw_gemma4_facts.py \
+  python/aisim/tests/unit/sdk/test_afd_composition.py \
+  python/aisim/tests/unit/sdk/test_moe_kernel_source_consumers.py \
+  python/aisim/tests/unit/sdk/test_utils.py \
+  python/aisim/tests/cross_package/test_core_version_contract.py
+```
+
+The separate 2026-11-18 run below is a different, nine-path selection and is
+kept as historical context for its own SHA.
 
 The perf-model lib total is higher than the 1,460 recorded at `b761646c0`
 because main added tests. These are local results. The commits after
@@ -516,6 +557,7 @@ Pinned by
 | `test_estimate_kv_cache_rejects_an_omitted_moe_pair_like_the_config_contract` | An omitted `moe_tp_size`/`moe_ep_size` pair at `tp_size=4` raises the config contract's error before the perf-DB lookup and before the naive fallback, neither of which may price a layout the engine refuses |
 | `test_from_request_rejects_an_omitted_moe_pair` | `KVCacheEstimator.from_request` applies the same rejection for callers that bypass `estimate_kv_cache` |
 | `test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint` | A multi-GPU dense Gemma 4 request with the pair omitted still estimates natively, because dense checkpoints do not read the MoE dims |
+| `test_estimate_kv_cache_keeps_one_for_a_dense_omitted_moe_ep_size` and `test_estimate_kv_cache_naive_fallback_keeps_one_for_a_dense_omitted_moe_ep_size` | A dense request at `tp_size=4, moe_tp_size=2` keeps `moe_ep_size=1` on both paths, matching the explicit layout instead of inferring `2` and failing the dense guard |
 | `test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension` | The same fallback infers `moe_ep_size=2` from `tp_size=4, moe_tp_size=2` and matches the explicit `2x2` capacity (1,867,790 versus 5,782,474 tokens before the fix) |
 | `test_estimate_kv_cache_rejects_a_moe_width_mismatch_before_the_database` | An invalid routed layout is rejected before both the perf-DB lookup and the naive fallback, neither of which may price it |
 | `test_dense_gemma4_static_estimate_skips_moe_comm_resolution` | Static CLI gate: no `resolve_model_config_moe_comm` call for dense Gemma 4 |
