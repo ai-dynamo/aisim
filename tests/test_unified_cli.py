@@ -2238,20 +2238,16 @@ def test_prediction_rollback_keeps_a_file_another_writer_put_in_place(tmp_path, 
 
     root = tmp_path / "out"
     root.mkdir()
-    real_dump = output_module.json.dump
 
-    def replace_then_fail(obj, fp, **kwargs):
+    def replace_then_fail(output, value, newline):
         # Another writer swaps in its own report while this call is serializing.
         (root / "prediction.json").unlink()
         (root / "prediction.json").write_text("replacement\n")
         raise RuntimeError("serialization failed")
 
-    monkeypatch.setattr(output_module.json, "dump", replace_then_fail)
-    try:
-        with pytest.raises(RuntimeError, match="serialization failed"):
-            output_module.write_prediction_report(root, {"a": 1}, exclusive=True)
-    finally:
-        monkeypatch.setattr(output_module.json, "dump", real_dump)
+    monkeypatch.setattr(output_module, "_write_with_compact_rows", replace_then_fail)
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        output_module.write_prediction_report(root, {"a": 1}, exclusive=True)
     assert (root / "prediction.json").read_text() == "replacement\n"
 
 
@@ -3329,10 +3325,49 @@ def test_streamed_prediction_outputs_match_one_shot_json(tmp_path, with_details)
     payload = {"summary": summary, "power_diagnostics": power, **({"details": details} if details else {})}
     assert stdout.getvalue() == json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
-    # prediction.json: old path was json.dumps(indent=2, sort_keys=True) + "\n".
+    # prediction.json: the document json.dumps(indent=2, sort_keys=True) wrote; only a row's whitespace differs.
     native = {**summary, "power_diagnostics": power, **({"details": details} if details else {})}
     path = write_prediction_report(tmp_path, native)
-    assert path.read_bytes() == (json.dumps(native, indent=2, sort_keys=True) + "\n").encode()
+    one_shot = json.dumps(native, indent=2, sort_keys=True)
+    assert json.dumps(json.loads(path.read_text()), indent=2, sort_keys=True) == one_shot
+
+
+def test_prediction_report_writes_each_request_row_on_one_compact_line(tmp_path) -> None:
+    rows = [{"uuid": "a\nb", "routing_history": [{"pool": "agg", "queue_wait_ms": 0.0}]}, {"b": math.inf, "a": "é"}]
+    details = {"sections": {"summary": {"metrics": {"per_request": rows[:1]}}}, "empty": {}}
+    path = write_prediction_report(tmp_path, {"z": [{"y": "\n"}], "per_request": rows, "details": details})
+    assert path.read_text() == (
+        "{\n"
+        '  "details": {\n'
+        '    "empty": {},\n'
+        '    "sections": {\n'
+        '      "summary": {\n'
+        '        "metrics": {\n'
+        '          "per_request": [\n'
+        '            {"routing_history":[{"pool":"agg","queue_wait_ms":0.0}],"uuid":"a\\nb"}\n'
+        "          ]\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  },\n"
+        '  "per_request": [\n'
+        '    {"routing_history":[{"pool":"agg","queue_wait_ms":0.0}],"uuid":"a\\nb"},\n'
+        '    {"a":"\\u00e9","b":Infinity}\n'
+        "  ],\n"
+        '  "z": [\n'
+        "    {\n"
+        '      "y": "\\n"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+    )
+
+
+def test_prediction_report_without_request_rows_matches_one_shot_json(tmp_path) -> None:
+    nested = {"per_request": {"not": "rows"}, "y": [1, {"x": "\n"}], "empty": {}, "numbered": {2: "b", 1: "a"}}
+    report = {"completed_requests": 0, "per_request": [], "z": nested}
+    path = write_prediction_report(tmp_path, report)
+    assert path.read_bytes() == (json.dumps(report, indent=2, sort_keys=True) + "\n").encode()
 
 
 def test_failed_prediction_report_leaves_no_file(tmp_path):

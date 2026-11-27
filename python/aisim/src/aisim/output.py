@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 _RECOMMENDATION_NAME = re.compile(r"^[0-9]{4}\.yaml$")
 _COMPACT_JSON = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
 _STRICT_COMPACT_JSON = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
+_INDENTED_JSON = json.JSONEncoder(indent=2, sort_keys=True)
 
 
 # Files a finished run leaves behind. Their presence means the directory holds
@@ -415,18 +416,44 @@ def _open_result(path: Path, *, exclusive: bool):
 
 def write_prediction_report(root: Path, report: dict[str, Any], *, exclusive: bool = False) -> Path:
     path = root / "prediction.json"
-    # json.dump writes the chunks json.dumps would join, so a large per-request
+    # The report is written in pieces, so a large per-request
     # report is never held as one string. A failed encoding leaves no report, as before.
     output = _open_result(path, exclusive=exclusive)
     identity = _file_identity(output)
     try:
         with output:
-            json.dump(report, output, indent=2, sort_keys=True)
+            _write_with_compact_rows(output, report, "\n")
             output.write("\n")
     except BaseException:
         _unlink_if_same(path, identity)
         raise
     return path
+
+
+def _write_with_compact_rows(output: TextIO, value: Any, newline: str) -> None:
+    """Write ``value`` as json.dump does with indent=2 and sorted keys, but each per-request row on one line.
+
+    json.dump encodes an indented document in Python, a chunk per token. A row goes through the C
+    encoder instead, as in requests.jsonl. ``newline`` is the line break at the depth of ``value``.
+    """
+
+    if not (isinstance(value, dict) and value and all(isinstance(key, str) for key in value)):
+        # Encoded JSON has no newline inside a string, so this only indents the value.
+        for chunk in _INDENTED_JSON.iterencode(value):
+            output.write(chunk.replace("\n", newline))
+        return
+    inner = newline + "  "
+    for index, key in enumerate(sorted(value)):
+        output.write(("," if index else "{") + inner + _INDENTED_JSON.encode(key) + ": ")
+        item = value[key]
+        if key == "per_request" and isinstance(item, list) and item:
+            for position, row in enumerate(item):
+                output.write(("," if position else "[") + inner + "  ")
+                output.write(_COMPACT_JSON.encode(row))
+            output.write(inner + "]")
+        else:
+            _write_with_compact_rows(output, item, inner)
+    output.write(newline + "}")
 
 
 def write_fpm_coverage(root: Path, coverage: dict[str, Any]) -> Path:
