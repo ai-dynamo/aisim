@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,7 @@ from scripts.e2e_accuracy.agentx_inputs import (
 )
 from scripts.e2e_accuracy.agentx_learned import LEARNED, OP_LEVEL, STEP_CAPTURES, score_steps
 from scripts.e2e_accuracy.agentx_learned import artifacts as learned_artifacts
+from scripts.e2e_accuracy.agentx_learned import supported as learned_supported
 from scripts.e2e_accuracy.agentx_metrics import request_metrics
 from scripts.e2e_accuracy.simulation_features import compare_speculation
 from scripts.e2e_accuracy.simulation_features import unavailable as unavailable_features
@@ -372,9 +374,9 @@ def public_report(payload, observations, category, boundary="complete_finite_coh
     )
 
 
-def performance_models(run):
-    """Op-based for every run; the learned FPM only where pinned step captures exist."""
-    return (OP_LEVEL, LEARNED) if run["model"] in STEP_CAPTURES else (OP_LEVEL,)
+def performance_models(run, learned=True):
+    """Op-based for every run; the learned FPM where pinned step captures exist and the wheel supports it."""
+    return (OP_LEVEL, LEARNED) if learned and run["model"] in STEP_CAPTURES else (OP_LEVEL,)
 
 
 def apply_performance_model(config, performance_model, artifact_path=None):
@@ -577,12 +579,14 @@ def campaign(args):
         run for index, run in enumerate(load_runs(args.inputs, catalog)) if index % args.shard_count == args.shard_index
     ]
     evaluated_driver = driver_digest()
-    workdir = args.output / "learned"
+    # Training inputs and models stay outside the sealed shard tree: the Hub cache holds symlinks.
+    workdir = args.learned_workdir or Path(tempfile.mkdtemp(prefix="agentx-learned-"))
+    learned = learned_supported()
     trained = {}
     results = []
     for run in selected:
-        for performance_model in performance_models(run):
-            if run["model"] not in trained:
+        for performance_model in performance_models(run, learned):
+            if learned and run["model"] not in trained:
                 trained[run["model"]] = learned_artifacts(run["model"], workdir)
             results.append(
                 run_one(
@@ -616,20 +620,24 @@ def campaign(args):
         if not args.preview or read(status) != {"measurement_campaign_status": "partial"}:
             raise ValueError("Partial measurement campaigns cannot publish")
         snapshot.update(read(status))
-    (args.output / f"shard-{args.shard_index}.json").write_bytes(canonical({"snapshot": snapshot, "runs": results}))
+    (args.output / f"shard-{args.shard_index}.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": learned, "runs": results})
+    )
 
 
 def qualify(args):
     catalog = validate_catalog(read(args.inputs / INDEX))
-    runs, snapshot = [], None
+    runs, snapshot, learned = [], None, None
     for index in range(args.shard_count):
         shard = read(args.shards / f"shard-{index}.json")
-        if snapshot is not None and snapshot != shard["snapshot"]:
+        if snapshot is not None and (snapshot != shard["snapshot"] or learned != shard["learned_fpm"]):
             raise ValueError("AgentX shards evaluated different revisions")
-        snapshot = shard["snapshot"]
+        snapshot, learned = shard["snapshot"], shard["learned_fpm"]
         runs.extend(shard["runs"])
+    if type(learned) is not bool:
+        raise ValueError("AgentX shards must record learned-FPM support")
     sources = {r["id"]: r for r in load_runs(args.inputs, catalog)}
-    expected = {(run["id"], model) for run in sources.values() for model in performance_models(run)}
+    expected = {(run["id"], model) for run in sources.values() for model in performance_models(run, learned)}
     keys = [result_key(r) for r in runs]
     if len(set(keys)) != len(keys) or set(keys) != expected:
         raise ValueError("Incomplete or duplicate AgentX cohort")
@@ -714,6 +722,9 @@ if __name__ == "__main__":
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shards", type=Path)
     parser.add_argument("--point-timeout", type=int, default=1200)
+    parser.add_argument(
+        "--learned-workdir", type=Path, help="Step-capture cache and trained models; outside --output (default: temp)"
+    )
     args = parser.parse_args()
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         parser.error("Invalid shard selection")

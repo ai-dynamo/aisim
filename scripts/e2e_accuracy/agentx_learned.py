@@ -187,6 +187,17 @@ def artifacts(model, workdir):
     }
 
 
+def supported():
+    """Whether the evaluated wheel can train and price a learned FPM; older release wheels cannot."""
+    try:
+        runtime_module("aisim_core.sdk.fpm_learned")
+    except ModuleNotFoundError as error:
+        if error.name not in {"aisim_core.sdk.fpm_learned", "aisimulate_core.sdk.fpm_learned"}:
+            raise
+        return False
+    return True
+
+
 def step_kind(fpm):
     s = fpm["scheduled_requests"]
     prefill, decode = s["num_prefill_requests"] > 0, s["num_decode_requests"] > 0
@@ -208,6 +219,20 @@ def _estimator(timing_config):
             del os.environ["AIC_ALLOW_UNLISTED_VERSIONS"]
         else:
             os.environ["AIC_ALLOW_UNLISTED_VERSIONS"] = previous
+
+
+def packed(fpm, width):
+    """Operation-level decode counters packed by verification width ``v``: ``B*v`` requests and ``B*v*s`` KV.
+
+    Captures record logical requests. The operation-level query does not apply the width itself; the
+    learned FPM and the shift detector keep the logical counts.
+    """
+    if width == 1 or step_kind(fpm) != "decode":
+        return fpm
+    s = dict(fpm["scheduled_requests"])
+    s["num_decode_requests"] *= width
+    s["sum_decode_kv_tokens"] *= width
+    return {**fpm, "scheduled_requests": s}
 
 
 def shifted_pairs(records, predict):
@@ -234,6 +259,11 @@ def score_steps(model, lanes, timing_config, workdir, reference_config=None):
     if spec is None:
         return None
     estimator = _estimator(timing_config)
+    if timing_config.get("speculation"):
+        raise ValueError("AgentX step scoring supports legacy nextn speculation only")
+    # Replay packs operation-level decode by the configured verification width; the learned FPM reads
+    # logical counts.
+    width = 1 if timing_config.get("estimation_mode") == LEARNED else int(timing_config.get("nextn") or 0) + 1
     reference = _estimator(reference_config) if spec["drop_unattributed"] else None
     errors = {"decode": [], "prefill": []}
     dropped = 0
@@ -249,7 +279,8 @@ def score_steps(model, lanes, timing_config, workdir, reference_config=None):
             kind, measured = step_kind(fpm), fpm["wall_time"] * 1e3
             if flag or kind is None or measured <= 0:
                 continue
-            errors[kind].append(abs(estimator.estimate_forward_pass_time_ms([fpm]) / measured - 1) * 100)
+            predicted = estimator.estimate_forward_pass_time_ms([packed(fpm, width)])
+            errors[kind].append(abs(predicted / measured - 1) * 100)
     if not any(errors.values()):
         return None
     return {

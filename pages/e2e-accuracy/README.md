@@ -745,13 +745,18 @@ unsupported outcomes; a release never borrows main's AgentX results.
 
 Each model has one entry per performance model: **Op-based** (light blue) and,
 where pinned step captures exist, **Learned FPM** (light orange). Entries are
-folded by default. Columns are SpecDec (the replay's effective speculation),
+folded by default. Columns are SpecDec (the replay's effective speculation;
+`None` only for a recorded disabled state, `Unrecorded` when evidence is missing),
 hardware/backend, performance model, CPU overhead (the replay's queued tokenizer
 and unqueued pre-first-token terms, one per line), then three grouped metrics:
 **Step error** (decode, prefill), **e2e error** (TPOT, TTFT) and **Per-request
 quantile error (p5–p95)** (TPOT, TTFT). Each group has an information popover.
-Concurrency pages are filtered by performance model (`perf=` in the URL) and show
-the point comparison plus an accuracy-metrics table.
+Concurrency pages are filtered by performance model (`perf=` in the URL; an
+omitted `perf` means Op-based, so older links keep their meaning) and show the
+point comparison plus an accuracy-metrics table. Learned rows retrain in a
+scratch directory outside the sealed shard tree (`--learned-workdir`, default a
+temporary directory). A wheel without the learned FPM publishes op-based entries
+only; each shard records `learned_fpm` and qualification expects exactly those.
 
 - All errors are unsigned percentages over uniquely matched requests.
   e2e error is `100 * abs(mean AISim / mean silicon - 1)` of request TTFT or TPOT.
@@ -766,7 +771,9 @@ the point comparison plus an accuracy-metrics table.
   held-out seed-7 step capture at the same lane count, ± std/√n. Runs publish
   `n`, `sum_ape` and `sum_sq_ape` so entries pool steps exactly. Both performance
   models price steps through `RustForwardPassPerfModel.best_available` with the
-  replay's compiled timing configuration. Mixed prefill+decode steps are not
+  replay's compiled timing configuration. Op-based decode steps are packed by
+  verification width `nextn + 1` (`B*v` requests, `B*v*s` KV tokens), as replay
+  packs them; the learned FPM reads logical counts. Mixed prefill+decode steps are not
   shown. SGLang 0.5.20 can record a step's device time on the adjacent record.
   GLM therefore drops each step whose `device_time_s_by_category` lacks its target
   forward (`extend` for prefill, `target_verify` for MTP decode) and the record

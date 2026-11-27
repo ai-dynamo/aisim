@@ -49,7 +49,9 @@ window.AgentX = (() => {
   }
   function specDec(run){
     const f=(run.simulation_features?.roles||[]).flatMap(r=>r.features).find(x=>x.id==="speculation");
-    const m=f?.parameters?.method;
+    // "None" only for a recorded disabled state; missing or failed evidence is unrecorded.
+    if(!f||!["enabled","disabled","not_applicable"].includes(f.state))return "Unrecorded";
+    const m=f.parameters?.method;
     if(!m||m==="off"||f.state!=="enabled")return "None";
     const d=f.parameters.draft_length;
     return `${esc(m.toUpperCase())}${d?`<small>${esc(d)} draft tokens</small>`:""}`;
@@ -303,7 +305,7 @@ window.AgentX = (() => {
       if(!params.has("campaign") && params.get("category")==="self_collected" && ["length","cache","repeat"].some(k=>params.has(k)) && loaded.data.runs.some(r=>r.category==="self_collected"&&r.boundary==="successful_profile_span")) {
         const archived=new URL(location.href);archived.searchParams.set("campaign","finite-v1");location.replace(archived);return;
       }
-      const runs=loaded.data.runs.filter(r=>r.category===params.get("category") && r.model===params.get("model") && r.lanes===Number(params.get("lanes")) && (!params.get("perf") || estimationOf(r)===params.get("perf")));
+      const runs=loaded.data.runs.filter(r=>r.category===params.get("category") && r.model===params.get("model") && r.lanes===Number(params.get("lanes")) && (estimationOf(r)||"op_level")===(params.get("perf")||"op_level"));
       if(!runs.length) throw new Error("This concurrency was not evaluated.");
       const first=runs[0];
       document.getElementById("point-title").textContent=`${first.model} · ${first.lanes} lane${first.lanes===1?"":"s"} · ${performanceModel([first],true)}`;
@@ -355,5 +357,5 @@ window.AgentX = (() => {
       await select();
     }catch(error){root.innerHTML=`<p role="alert">${esc(error.message)}</p>`;}
   }
-  return {load,detail,aggregate,performanceModel,requestAggregate,stepAggregate,featureChecklist,validateFeatureEvidence};
+  return {load,detail,aggregate,performanceModel,requestAggregate,stepAggregate,specDec,featureChecklist,validateFeatureEvidence};
 })();

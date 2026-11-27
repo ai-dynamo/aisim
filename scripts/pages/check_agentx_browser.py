@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import async_playwright, expect
 
@@ -365,7 +366,8 @@ async def check():
                 await expect(table.locator(".agentx-model .agentx-perf-model")).to_have_text(
                     ["Op-based", "Learned FPM", "Op-based"]
                 )
-                await expect(table.locator(".agentx-model td:nth-of-type(1)")).to_have_text(["None"] * 3)
+                # No simulation feature evidence: speculation is unrecorded, not off.
+                await expect(table.locator(".agentx-model td:nth-of-type(1)")).to_have_text(["Unrecorded"] * 3)
                 hardware = table.locator(".agentx-model td:nth-of-type(2)")
                 await expect(hardware.nth(0)).to_contain_text("B300 · sglang 0.5.20")
                 await expect(hardware.nth(0)).not_to_contain_text("sglang 0.5.21")
@@ -462,6 +464,19 @@ async def check():
                         "TTFT per-request quantile error, p5\u2013p95",
                     ]
                 )
+                await expect(metrics_table.locator('tr[data-metric="step-decode"] td')).to_have_text(
+                    ["22.00%", "± 0.42%", "24 steps"]
+                )
+                # Point links published before performance models existed omit perf: they mean op-based.
+                point_url = page.url
+                parts = urlsplit(point_url)
+                legacy = [(k, v) for k, v in parse_qsl(parts.query) if k != "perf"]
+                assert len(legacy) < len(parse_qsl(parts.query))
+                await page.goto(urlunsplit(parts._replace(query=urlencode(legacy))))
+                await expect(metrics_table.locator('tr[data-metric="step-decode"] td')).to_have_text(
+                    ["22.00%", "± 0.42%", "24 steps"]
+                )
+                await page.goto(point_url)
                 await expect(metrics_table.locator('tr[data-metric="step-decode"] td')).to_have_text(
                     ["22.00%", "± 0.42%", "24 steps"]
                 )

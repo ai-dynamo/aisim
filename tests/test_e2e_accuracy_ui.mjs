@@ -1378,3 +1378,13 @@ test("AgentX agreed metrics pool steps exactly and average request errors over r
   assert.equal(steps.prefill,null);
   assert.equal(steps.dropped,4);
 });
+
+test("AgentX SpecDec shows None only for a recorded disabled state", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const spec=feature=>{context.run=feature===undefined?{}:{simulation_features:{roles:[{features:[{id:"speculation",...feature}]}]}};return vm.runInContext("window.AgentX.specDec(run)",context);};
+  assert.equal(spec(undefined),"Unrecorded");
+  assert.equal(spec({state:"failed_to_record",parameters:{method:null}}),"Unrecorded");
+  assert.equal(spec({state:"disabled",parameters:{method:"off"}}),"None");
+  assert.match(spec({state:"enabled",parameters:{method:"mtp",draft_length:3}}),/^MTP<small>3 draft tokens/);
+});

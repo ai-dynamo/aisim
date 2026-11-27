@@ -166,6 +166,23 @@ def test_learned_models_run_only_where_step_captures_are_pinned(monkeypatch):
     monkeypatch.setattr(runner, "STEP_CAPTURES", agentx_learned.STEP_CAPTURES)
     assert performance_models({"model": "Qwen/Qwen3.5-397B-A17B"}) == ("op_level", "fpm_learned")
     assert performance_models({"model": "nvidia/GLM-5.3-NVFP4"}) == ("op_level",)
+    # Release wheels without the learned FPM still produce every op-based result.
+    assert performance_models({"model": "Qwen/Qwen3.5-397B-A17B"}, learned=False) == ("op_level",)
+
+
+def test_learned_support_follows_the_evaluated_wheel(monkeypatch):
+    def missing(name):
+        raise ModuleNotFoundError(name="aisimulate_core.sdk.fpm_learned")
+
+    monkeypatch.setattr(agentx_learned, "runtime_module", missing)
+    assert agentx_learned.supported() is False
+
+    def broken(name):
+        raise ModuleNotFoundError(name="sklearn")
+
+    monkeypatch.setattr(agentx_learned, "runtime_module", broken)
+    with pytest.raises(ModuleNotFoundError):
+        agentx_learned.supported()
 
 
 def test_learned_replay_is_frozen_and_never_falls_back():
@@ -266,10 +283,14 @@ def test_qualification_requires_every_performance_model(tmp_path, monkeypatch):
     snapshot.update(cohort_sha256=catalog["snapshot_id"], driver_sha256=driver_digest())
     args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
     for selected in ([op], [op, op], [learned, learned]):
-        (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": selected}))
+        (tmp_path / "shard-0.json").write_bytes(
+            canonical({"snapshot": snapshot, "learned_fpm": True, "runs": selected})
+        )
         with pytest.raises(ValueError):
             runner.qualify(args)
-    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [op, learned]}))
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": True, "runs": [op, learned]})
+    )
     runner.qualify(args)
     summary = json.loads((args.output / "summary.json").read_bytes())
     assert [r["detail_path"] for r in summary["runs"]] == [
@@ -280,6 +301,12 @@ def test_qualification_requires_every_performance_model(tmp_path, monkeypatch):
 
     files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
     assert len(validate_bundle(files)["runs"]) == 2
+    # A wheel without the learned FPM qualifies on op-based results alone, and only then.
+    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "learned_fpm": False, "runs": [op]}))
+    runner.qualify(Namespace(**{**vars(args), "output": tmp_path / "op-only"}))
+    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [op]}))
+    with pytest.raises(KeyError):
+        runner.qualify(Namespace(**{**vars(args), "output": tmp_path / "unrecorded"}))
 
 
 def test_sglang_hook_windows_follow_the_published_manifest(tmp_path, monkeypatch):
@@ -314,3 +341,29 @@ def test_shifted_pairs_flag_both_records_of_a_split_step():
     # Predicted 10 ms each: 0.2x next to 3x is one step split across two records; idle records never pair.
     assert agentx_learned.shifted_pairs(records, lambda r: 10.0) == [False, True, True, False, False]
     assert agentx_learned.shifted_pairs(records[:2], lambda r: 10.0) == [False, False]
+
+
+def test_operation_level_decode_is_packed_by_verification_width(tmp_path, monkeypatch):
+    step = fpm(decode=1, wall=0.01)
+    step["scheduled_requests"]["sum_decode_kv_tokens"] = 2584
+    prefill = fpm(prefill=1, wall=0.01)
+    seen = []
+
+    class Estimator:
+        def __init__(self, config):
+            self.config = config
+
+        def estimate_forward_pass_time_ms(self, metrics):
+            seen.append((self.config["estimation_mode"], metrics[0]["scheduled_requests"]))
+            return 10.0
+
+    monkeypatch.setattr(agentx_learned, "STEP_CAPTURES", {"m": {"drop_unattributed": False}})
+    monkeypatch.setattr(agentx_learned, "windows", lambda *args, **kwargs: iter([(8, [step, prefill])]))
+    monkeypatch.setattr(agentx_learned, "_estimator", Estimator)
+    op = {"estimation_mode": "op_level", "nextn": 3}
+    agentx_learned.score_steps("m", 8, op, tmp_path)
+    assert seen[0] == ("op_level", {"num_prefill_requests": 0, "num_decode_requests": 4, "sum_decode_kv_tokens": 10336})
+    assert seen[1][1] == prefill["scheduled_requests"]
+    seen.clear()
+    agentx_learned.score_steps("m", 8, {**op, "estimation_mode": "fpm_learned"}, tmp_path)
+    assert seen[0][1] == step["scheduled_requests"]  # The learned FPM reads logical requests.
