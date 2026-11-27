@@ -232,6 +232,8 @@ class Observer:
             if math.isfinite(step.wall_s) and step.wall_s > 0:
                 self.sample = step
                 if self.rank == 0:
+                    # Persist latency before attempting a power window, even if shutdown never runs.
+                    self.write_artifact({"sample": asdict(step), "steps": []}, unavailable("window_below_minimum"))
                     # Open NVML in the pass before the anchor: its stall stays out
                     # of the latency sample, the energy window and its step times.
                     self.prepare_energy()
@@ -317,7 +319,11 @@ class Observer:
         if leader["sample"] is None:
             return
         power = qualify(self.phase, leader, peer)
-        write_json(self.directory / "benchmark.json", artifact(self.context, self.settings, leader, power))
+        self.write_artifact(leader, power)
+        write_json(self.scope / "published.json", {"power": power})
+        self.published = True
+
+    def write_artifact(self, leader, power):
         write_json(
             self.directory / "collector-provenance.json",
             {
@@ -329,8 +335,7 @@ class Observer:
                 "runtime": {"backend": "trtllm", "backend_version": VERSION},
             },
         )
-        write_json(self.scope / "published.json", {"power": power})
-        self.published = True
+        write_json(self.directory / "benchmark.json", artifact(self.context, self.settings, leader, power))
 
 
 def qualify(phase, leader, peer):

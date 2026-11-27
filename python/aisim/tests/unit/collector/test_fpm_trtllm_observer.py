@@ -82,6 +82,7 @@ def run(
     phase="decode",
     setup_cost=0.0,
     setups=None,
+    shutdown=True,
 ):
     current = [0.0]
     readings = iter((1000, 621_000))
@@ -143,10 +144,11 @@ def run(
             assert executor._collect_scheduled_batch_stats(stats) is stats
             current[0] += 0.02
             assert executor._handle_responses() == ["response"]
-    for executor in reversed(ranks):
-        assert executor.shutdown() == "shutdown complete"
-        if not omit_peer:
-            assert executor.hooks == ["schedule", "snapshot", "complete"] * count + ["shutdown"]
+    if shutdown:
+        for executor in reversed(ranks):
+            assert executor.shutdown() == "shutdown complete"
+            if not omit_peer:
+                assert executor.hooks == ["schedule", "snapshot", "complete"] * count + ["shutdown"]
     return json.loads((tmp_path / "benchmark.json").read_text())["results"][0]["fpms"][0]
 
 
@@ -233,7 +235,11 @@ def test_shape_change_keeps_latency(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     ("options", "reason"),
-    [({"count": 6}, "window_below_minimum"), ({"omit_peer": True}, "rank_boundary_mismatch")],
+    [
+        ({"count": 6}, "window_below_minimum"),
+        ({"count": 6, "shutdown": False}, "window_below_minimum"),
+        ({"omit_peer": True}, "rank_boundary_mismatch"),
+    ],
 )
 def test_incomplete_window_keeps_latency(tmp_path, monkeypatch, options, reason):
     result = run(tmp_path, monkeypatch, **options)
