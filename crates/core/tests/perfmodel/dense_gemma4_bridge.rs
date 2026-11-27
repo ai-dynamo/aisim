@@ -229,6 +229,39 @@ fn dense_gemma4_capacity_rejects_instead_of_estimating_naively() {
 }
 
 #[test]
+fn routed_gemma4_omitted_moe_pair_maps_to_bad_config() {
+    if !sdk_available_or_skip() {
+        return;
+    }
+
+    // `ParallelMapping` serde-defaults the MoE widths, so a capacity request can
+    // omit them, and Replay's `estimate_aic_num_gpu_blocks` forwards the same
+    // `None`/`None` pair. At attention width four a routed checkpoint has no
+    // unique layout, so the Python estimator rejects the request. This pins that
+    // the rejection arrives as non-fallback `BadConfig` through the
+    // `estimate_kv_cache` bridge, not as a fallback-eligible `Unsupported`.
+    let mut request = kv_request(ROUTED_MODEL, 1);
+    request.engine.parallel.tp_size = 4;
+    request.engine.parallel.moe_tp_size = None;
+    request.engine.parallel.moe_ep_size = None;
+    request.options.allow_naive_fallback = true;
+
+    let error = estimate_kv_cache(request)
+        .err()
+        .expect("a routed checkpoint at tp=4 with both widths unset must not estimate");
+    assert!(
+        matches!(&error, KvCacheEstimateError::BadConfig { field, reason }
+            if field == "engine"
+                && reason.contains("At least one of moe_tp_size or moe_ep_size must be set")),
+        "the omitted-pair rejection must be non-fallback BadConfig, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("estimate_kv_cache:"),
+        "the diagnostic must come back through the capacity bridge, got {error}"
+    );
+}
+
+#[test]
 fn unsupported_capacity_keeps_the_fallback_eligible_variant() {
     if !sdk_available_or_skip() {
         return;
