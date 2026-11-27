@@ -82,6 +82,7 @@ def run(
     omit_peer=False,
     phase="decode",
     setup_cost=0.0,
+    read_cost=0.0,
     setups=None,
     shutdown=True,
     extra=None,
@@ -97,6 +98,7 @@ def run(
             setups.append(("setup", observer_steps()))
 
         def read():
+            current[0] += read_cost
             if setups is not None:
                 setups.append(("read", observer_steps()))
             if energy_failure in {"nvml_permission", "nvml_error"}:

@@ -127,6 +127,23 @@ def load_instrumentation(path: str | Path, expected_version: str | None = None) 
         canonical_json(manifest)
     except (OSError, UnicodeError, yaml.YAMLError, TypeError, RecursionError, ValueError) as error:
         raise ValueError(f"invalid instrumentation manifest: {error}") from error
+    if isinstance(manifest, dict) and manifest.get("schema_version") == "aisim-trtllm-fpm-observer/v1":
+        from .native_artifact import TRTLLM_RUNTIME_VERSION
+
+        names = ["sitecustomize.py", "observer.py", "runtime-source-sha256.json"]
+        if manifest != {
+            "schema_version": "aisim-trtllm-fpm-observer/v1",
+            "runtime": {
+                "framework": "trtllm",
+                "version": TRTLLM_RUNTIME_VERSION,
+                "source_revision": f"v{TRTLLM_RUNTIME_VERSION}",
+            },
+            "files": names,
+        } or expected_version not in (None, TRTLLM_RUNTIME_VERSION):
+            raise ValueError("invalid pinned TRT-LLM FPM observer manifest")
+        files = {name: sha256_bytes(contained_file(path.parent, name).read_bytes()) for name in names}
+        identity = sha256_bytes(canonical_json({"manifest": manifest, "files": files}).encode())
+        return InstrumentationBundle(path.parent, path, canonical_json(manifest), canonical_json(files), identity)
     required = {"schema_version", "runtime", "files", "worker_class", "scheduler_class", "observation_schema"}
     if (
         not isinstance(manifest, dict)
