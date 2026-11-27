@@ -83,13 +83,7 @@ def simulation_record(identity="agentx-446063", revision="a" * 40, dataset="b" *
     from scripts.e2e_accuracy.simulation_features import unavailable
 
     record = unavailable(
-        {
-            "benchmark_id": identity,
-            "evaluated_revision": revision,
-            "dataset_revision": dataset,
-        },
-        result(),
-        "disabled",
+        {"benchmark_id": identity, "evaluated_revision": revision, "dataset_revision": dataset}, result(), "disabled"
     )
     record.update(execution_mode="offline", configuration_sha256="c" * 64)
     record["roles"][0].update(backend_version="0.5.21", compiled_sha256="d" * 64)
@@ -133,13 +127,7 @@ def seal(files, snapshot=None):
 
 
 @pytest.mark.parametrize(
-    "corruption",
-    [
-        "later_identity",
-        "later_provenance",
-        "earlier_accounting",
-        "later_feature_parameters",
-    ],
+    "corruption", ["later_identity", "later_provenance", "earlier_accounting", "later_feature_parameters"]
 )
 def test_incomplete_silicon_evidence_cannot_hide_bundle_corruption(corruption):
     from test_benchmark_features import silicon_metadata
@@ -361,12 +349,7 @@ def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkey
     data.write_bytes(b"synthetic op-data")
     config = tmp_path / "config.json"
     config.write_bytes(
-        canonical(
-            {
-                "engine": {"backend": "vllm", "hardware": "B300"},
-                "prediction_database_version": "0.31.0",
-            }
-        )
+        canonical({"engine": {"backend": "vllm", "hardware": "B300"}, "prediction_database_version": "0.31.0"})
     )
     (tmp_path / "feature-context.json").write_text("{}")
     assert agentx_predict.predict(config, tmp_path) == {
@@ -875,14 +858,8 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
         indexed["speculation"].update(
             state="enabled",
             parameters=[
-                {
-                    "name": "method",
-                    "value": "unknown" if problem == "speculation_method" else "mtp",
-                },
-                {
-                    "name": "draft_length",
-                    "value": None if problem == "speculation_length" else 3,
-                },
+                {"name": "method", "value": "unknown" if problem == "speculation_method" else "mtp"},
+                {"name": "draft_length", "value": None if problem == "speculation_length" else 3},
             ],
         )
     elif problem == "disabled_speculation":
@@ -991,11 +968,7 @@ def test_publisher_keeps_qualified_artifact_when_another_receipt_is_incomplete(
         return (Path(__file__).resolve().parents[1] / args[-1].split(":", 1)[1]).read_bytes()
 
     monkeypatch.setattr(publisher, "api", api)
-    monkeypatch.setattr(
-        publisher,
-        "api_items",
-        lambda path, _: artifacts if path.endswith("/artifacts") else jobs,
-    )
+    monkeypatch.setattr(publisher, "api_items", lambda path, _: artifacts if path.endswith("/artifacts") else jobs)
     monkeypatch.setattr(publisher, "ancestor", lambda *args: True)
     monkeypatch.setattr(publisher.subprocess, "check_output", git)
     output = tmp_path / "published"
