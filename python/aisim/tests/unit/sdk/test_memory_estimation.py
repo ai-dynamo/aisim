@@ -3593,7 +3593,7 @@ def test_transformers_multimodal_fallback_uses_execution_precision_and_resident_
         "architectures": ["Idefics2ForConditionalGeneration"],
         "model_type": "idefics2",
         "torch_dtype": "float32",
-        "text_config": {"model_type": "mistral", "max_position_embeddings": 32768, "vocab_size": 32003},
+        "text_config": {"max_position_embeddings": 32768, "vocab_size": 32003},
         **vision,
     }
     model = _write_config(tmp_path, document)
@@ -3631,6 +3631,79 @@ def test_legacy_sglang_transformers_model_checks_the_parent_attention_shape():
         NaiveKVCacheEstimator.from_hf_config({**text, **parent, "head_dim": 128}, **options)
 
 
+@pytest.mark.parametrize("version", ["0.5.6.post2", "0.5.9", "0.5.10", "0.5.23"])
+def test_idefics2_compares_constructed_mistral_dimensions_and_checks_all_alternatives(version):
+    dimensions = dict(
+        vocab_size=32003, hidden_size=4096, num_hidden_layers=32, num_attention_heads=32, num_key_value_heads=8
+    )
+    names = ["Idefics2ForConditionalGeneration", "Idefics2PreTrainedModel"]
+    root = dict(model_type="idefics2", architectures=names, torch_dtype="float32", **dimensions)
+    options = dict(system="h100_sxm", backend="sglang", backend_version=version, tp_size=1, pp_size=1)
+    explicit = dict(model_type="mistral", **dimensions)
+    for text in ({"vocab_size": 32003}, explicit):
+        estimate = NaiveKVCacheEstimator.from_hf_config({**root, "text_config": text}, **options)
+        assert estimate.kv_bytes_per_token() == 131_072
+        with pytest.raises(ValueError, match="resident weights for the vision tower"):
+            estimate.weight_bytes()
+    with pytest.raises(ValueError, match="compatible model class for every architecture"):
+        NaiveKVCacheEstimator.from_hf_config(
+            {**root, "architectures": [*names, "Unregistered"], "text_config": explicit}, **options
+        )
+    if version in ("0.5.6.post2", "0.5.9"):
+        for missing_or_wrong in (None, 32):
+            with pytest.raises(ValueError, match="requires matching parent and decoder dimensions"):
+                NaiveKVCacheEstimator.from_hf_config(
+                    {**root, "text_config": explicit, "num_key_value_heads": missing_or_wrong}, **options
+                )
+        inherited = {
+            **root,
+            "vocab_size": 32000,
+            "num_key_value_heads": 32,
+            "text_config": {"num_key_value_heads": None},
+        }
+        assert NaiveKVCacheEstimator.from_hf_config(inherited, **options).kv_bytes_per_token() == 524_288
+
+
+def test_selected_native_qwen_models_use_the_constructed_child_for_decoder_layers(tmp_path):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    onevision = _onevision_qwen2_7b("bfloat16")
+    onevision["architectures"] = ["TrainingCheckpoint", "Qwen2ForCausalLM"]
+    onevision["text_config"].pop("model_type")
+    onevision["text_config"]["max_position_embeddings"] = 32768
+    internvl = dict(
+        architectures=onevision["architectures"],
+        model_type="internvl_chat",
+        torch_dtype="bfloat16",
+        llm_config=dict(
+            model_type="qwen2",
+            num_hidden_layers=36,
+            hidden_size=2048,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            intermediate_size=11008,
+            vocab_size=151674,
+            max_position_embeddings=32768,
+        ),
+    )
+    qwen3 = _load_pre_downloaded_hf_config("Qwen/Qwen3-VL-8B-Instruct")
+    text = qwen3["text_config"]
+    qwen3 = {
+        **qwen3,
+        "architectures": ["TrainingCheckpoint", "Qwen3ForCausalLM"],
+        "hidden_size": text["hidden_size"],
+        "vocab_size": text["vocab_size"],
+    }
+    for document, width in ((onevision, 57_344), (internvl, 36_864), (qwen3, 147_456)):
+        path = tmp_path / str(width)
+        path.mkdir()
+        assert _compiled_vllm_transfer_widths(_write_config(path, document), "0.32.0") == (width, width)
+    with pytest.raises(ValueError, match="matching parent and decoder head dimensions"):
+        _compiled_vllm_transfer_widths(
+            _write_config(tmp_path, {**qwen3, "vocab_size": text["vocab_size"] + 1}), "0.32.0"
+        )
+
+
 @pytest.mark.parametrize("alternatives", [[], ["LlavaOnevisionForConditionalGeneration"]])
 def test_selected_native_qwen2_reads_only_the_text_config(tmp_path, alternatives):
     parent = _onevision_qwen2_7b("float16")
@@ -3655,6 +3728,35 @@ def test_selected_native_qwen3_moe_reads_the_vl_text_config(tmp_path):
     for tail in ([], ["LlavaOnevisionForConditionalGeneration"]):
         parent = {**document, "architectures": ["TrainingCheckpoint", "Qwen3MoeForCausalLM", *tail]}
         assert _compiled_vllm_transfer_widths(_write_config(tmp_path, parent), "0.32.0") == (98_304, 98_304)
+
+
+@pytest.mark.parametrize(("size", "expected_width"), [("30B-A3B", 24_576), ("235B-A22B", 48_128)])
+def test_selected_qwen3_moe_requires_a_reserve_that_covers_rank_weights(tmp_path, size, expected_width):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config(f"Qwen/Qwen3-VL-{size}-Instruct")
+    parent = {**document, "architectures": ["TrainingCheckpoint", "Qwen3MoeForCausalLM"]}
+    options = dict(
+        system="h100_sxm", backend="vllm", backend_version="0.32.0", tp_size=8, pp_size=1, moe_tp_size=8, moe_ep_size=1
+    )
+    estimate = NaiveKVCacheEstimator.from_hf_config(parent, **options)
+    assert estimate.kv_bytes_per_token() == expected_width
+    path = _write_config(tmp_path, parent)
+    blocks = {
+        **_missing_system_cache_options(tmp_path, tp_size=8, capacity=80 * _GIB),
+        "moe_tp_size": 8,
+        "moe_ep_size": 1,
+    }
+    # The native 30B/TP8 tensors need at least 7,602,372,608 bytes, the 235B tensors 58,802,438,144.
+    if size == "30B-A3B":
+        assert estimate.weight_bytes() >= 7_602_372_608
+        assert memory.estimate_num_gpu_blocks(path, "h100_sxm", "vllm", "0.32.0", **blocks) > 0
+    else:
+        for fraction in (0.8, 1.0):
+            with pytest.raises(ValueError, match="measured rank-local resident weights"):
+                memory.estimate_num_gpu_blocks(
+                    path, "h100_sxm", "vllm", "0.32.0", **{**blocks, "naive_kv_reservation": fraction}
+                )
 
 
 def test_vllm_effective_quantizer_class_sidecar_and_modelopt_exclusions(tmp_path):

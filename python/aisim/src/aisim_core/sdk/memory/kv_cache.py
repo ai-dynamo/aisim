@@ -108,6 +108,7 @@ from aisim_core.sdk.models.base import _MODEL_REGISTRY, BaseModel
 from aisim_core.sdk.models.deepseek_v32 import _dsa_full_layer_fraction
 from aisim_core.sdk.models.gemma4 import UnverifiedGemmaRuntimeError, check_gemma4_adapter_runtime
 from aisim_core.sdk.models.helpers import (
+    _apply_model_quant_defaults,
     _infer_quant_modes_from_raw_config,
     resolve_sglang_mla_compute,
     resolve_trtllm_mla_compute,
@@ -159,7 +160,12 @@ _TEXT_CONFIG_DEFAULTS = {
     "LlavaNextVideoForConditionalGeneration": ("llava_next_video", "llama"),
     "LlavaOnevisionForConditionalGeneration": ("llava_onevision", "qwen2"),
 }
-_TEXT_DEFAULTS_BY_MODEL_TYPE = dict(_TEXT_CONFIG_DEFAULTS.values())
+_TEXT_DEFAULTS_BY_MODEL_TYPE = {
+    **dict(_TEXT_CONFIG_DEFAULTS.values()),
+    "idefics2": "mistral",
+    "idefics3": "llama",
+    "smolvlm": "llama",
+}
 
 _FIXED_LLAMA_WRAPPERS = {"Idefics3ForConditionalGeneration", "SmolVLMForConditionalGeneration"}
 _TEXT_WRAPPERS = _TEXT_CONFIG_DEFAULTS.keys() | _FIXED_LLAMA_WRAPPERS
@@ -377,12 +383,24 @@ def _sglang_wrapper(
         choices.add(native or names[0])
         if native is None:
             fallback = set(names) <= entries["transformers"] or (isinstance(auto_map, dict) and "AutoModel" in auto_map)
+            if not fallback and entries["transformers"].intersection(names):
+                # The loader checks every alternative before constructing its Transformers backend.
+                raise ValueError(
+                    "SGLang Transformers fallback requires a compatible model class for every architecture"
+                )
             needs_weights |= fallback or remote or bool(entries["multimodal"].intersection(names))
         else:
             fallback = native.startswith("Transformers")
             needs_weights |= native in entries["multimodal"] or native not in _TEXT_ONLY_DECODERS
         if fallback and "TransformersMultiModalForCausalLM" not in entries["native"]:
             # SGLang 0.5.6 through 0.5.9 constructs its generic attention layers and output head from the parent.
+            kind = decoder.get("model_type")
+            if isinstance(kind, str):
+                _apply_decoder_geometry_defaults(decoder, kind)
+            if kind == "mistral":
+                decoder.setdefault("vocab_size", 32000)
+                if decoder.get("num_key_value_heads") is None:
+                    decoder["num_key_value_heads"] = decoder["num_attention_heads"]
             dimensions = (
                 "vocab_size",
                 "hidden_size",
@@ -397,8 +415,7 @@ def _sglang_wrapper(
             size = layout_integer(document["hidden_size"], "hidden_size") // layout_integer(
                 document["num_attention_heads"], "num_attention_heads"
             )
-            default_head = _DECODER_HEAD_DEFAULTS.get(decoder.get("model_type"), (None, None))[0]
-            if document.get("head_dim", size) != decoder.get("head_dim", default_head or size):
+            if document.get("head_dim", size) != (decoder.get("head_dim") or size):
                 raise ValueError(
                     "sizing a legacy SGLang Transformers model requires matching parent and decoder head_dim"
                 )
@@ -648,8 +665,11 @@ def _select_text_decoder(
             if decoder.get("num_key_value_heads", 1) is None:
                 raise ValueError(f"{named} requires a valid num_key_value_heads")
         return kind, named
-    if native_dispatch and kind == "qwen3_vl_moe_text" and named == "Qwen3MoeForCausalLM":
-        # The Qwen3 MoE implementation reads the VL text config's attention and expert dimensions directly.
+    if native_dispatch and (kind, named) in (
+        ("qwen3_vl_text", "Qwen3ForCausalLM"),
+        ("qwen3_vl_moe_text", "Qwen3MoeForCausalLM"),
+    ):
+        # The native Qwen3 decoder layers read their VL text config's dimensions directly.
         return kind, named
     if native_dispatch and not selected and named:
         default = default_causal_lm(kind, backend_version)
@@ -1873,6 +1893,8 @@ class NaiveKVCacheEstimator:
                 parent_type = (
                     model_type if isinstance(model_type, str) else _TEXT_CONFIG_DEFAULTS.get(architecture, (None,))[0]
                 )
+                if key == "text_config" and parent_type in _TEXT_DEFAULTS_BY_MODEL_TYPE:
+                    raw_decoder.setdefault("model_type", _TEXT_DEFAULTS_BY_MODEL_TYPE[parent_type])
                 needs_wrapper_weights = False
                 transformers_wrapper = False
                 text_only = False
@@ -1888,16 +1910,19 @@ class NaiveKVCacheEstimator:
                     )
                     text_only = native_text is not None
                     if text_only:
-                        # These constructors read get_text_config() or vLLM's equivalent hf_text_config.
+                        # vLLM remaps llm_config to text_config before these constructors read get_text_config().
                         child_reader = architecture in ("Qwen2ForCausalLM", "Qwen3MoeForCausalLM")
-                        if architecture in ("MiMoForCausalLM", "MiMoV2FlashForCausalLM") and key == "text_config":
-                            # MiMo constructs its output head from the parent and its attention layers from the child.
-                            if any(hf_config.get(k) != raw_decoder.get(k) for k in ("vocab_size", "hidden_size")):
+                        if architecture in ("MiMoForCausalLM", "MiMoV2FlashForCausalLM", "Qwen3ForCausalLM"):
+                            # The output head reads the parent while the layers read its text config.
+                            if any(
+                                hf_config.get(k) is None or hf_config[k] != raw_decoder.get(k)
+                                for k in ("vocab_size", "hidden_size")
+                            ):
                                 raise ValueError(
-                                    "MiMo sizing requires matching parent and decoder head dimensions"
+                                    f"{architecture} sizing requires matching parent and decoder head dimensions"
                                 ) from error
                             child_reader = True
-                        if not child_reader or key != "text_config":
+                        if not child_reader:
                             raw_decoder = {k: v for k, v in hf_config.items() if k not in ("llm_config", "text_config")}
                         raw_decoder["architectures"] = [architecture]
                 elif key is not None and backend == "sglang":
@@ -3285,7 +3310,44 @@ class NaiveKVCacheEstimator:
                     resident += quantized * (expert_params * (1 - self.weight_dtype_bytes) + 4 * local_experts * scales)
                 return int(resident)
             expert_bytes = layers * expert_params * self.weight_dtype_bytes // pp
-            return non_expert_bytes + expert_bytes
+            resident = non_expert_bytes + expert_bytes
+            if (
+                self._vllm_native_decoder
+                and self.architecture == "Qwen3MoeForCausalLM"
+                and raw.get("model_type") == "qwen3_vl_moe_text"
+            ):
+                # Qualify the rough reserve against the same rank-local inventory as the bare native decoder.
+                problem = "Qwen3 MoE capacity requires measured rank-local resident weights"
+                if (
+                    self._quantized_weights
+                    or self.weight_dtype_bytes != 2
+                    or not raw.get("tie_word_embeddings", True)
+                    or raw.get("mlp_only_layers")
+                    or raw.get("decoder_sparse_step", 1) != 1
+                    or raw.get("shared_expert_intermediate_size")
+                    or raw.get("attention_bias")
+                    or vocab % max(64, tp)
+                    or tp != self.moe_tp_size * self.moe_ep_size
+                    or n_experts < tp
+                    or n_experts % self.moe_ep_size
+                    or moe_inter % self.moe_tp_size
+                ):
+                    raise ValueError(problem)
+                self._validate_attention_tp()
+                config = build_model_config(tp, pp, 1, self.moe_tp_size, self.moe_ep_size)
+                _apply_model_quant_defaults(config, raw, self.architecture, "vllm")
+                family = ARCHITECTURE_TO_MODEL_FAMILY[self.architecture]
+                info = {
+                    **_parse_hf_config_json({"max_position_embeddings": None, **raw}),
+                    "model_path": str(self._checkpoint_dir or ""),
+                    "model_family": family,
+                }
+                native = _MODEL_REGISTRY[family].create(info, config, "vllm")
+                # The native ops include the router and KV projections. Norms sit outside that inventory.
+                norms = 4 * (hidden + layers * (2 * hidden + 2 * geom["head_dim"]))
+                if resident < native.get_resident_weights_bytes() + norms:
+                    raise ValueError(problem)
+            return resident
         else:
             rank_vectors = 0
             if self._vllm_native_decoder and self.architecture in _VLLM_DENSE_DECODERS:

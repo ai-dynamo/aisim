@@ -8,7 +8,7 @@
 # https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90/python/sglang/srt/models
 # https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/auto/modeling_auto.py
 # SGLang 0.5.x stock model entrypoints and declared multimodal classes by first and last patch.
-# transformers rows are auto model classes with a composite text config and backend-compatible attention in the pinned HF wheel.
+# transformers rows are exported classes with a composite text config and backend-compatible attention in the pinned HF wheel.
 multimodal 6 23 CLIPModel DeepseekOCRForCausalLM DeepseekVL2ForCausalLM DotsOCRForCausalLM DotsVLMForCausalLM
 multimodal 6 23 Gemma3ForConditionalGeneration Gemma3nForConditionalGeneration Glm4vForConditionalGeneration
 multimodal 6 23 Glm4vMoeForConditionalGeneration Grok1AForCausalLM Grok1VForCausalLM
@@ -138,7 +138,8 @@ transformers 6 23 Blip2ForConditionalGeneration Blip2ForImageTextRetrieval Blip2
 transformers 6 23 Cohere2VisionModel Emu3ForCausalLM Emu3ForConditionalGeneration Emu3Model Emu3TextModel
 transformers 6 23 FuyuForCausalLM FuyuModel Gemma3ForSequenceClassification Gemma3Model Gemma3nModel Glm4vModel
 transformers 6 23 Glm4vMoeModel GotOcr2ForConditionalGeneration GotOcr2Model Idefics2ForConditionalGeneration
-transformers 6 23 Idefics2Model Idefics3ForConditionalGeneration Idefics3Model InstructBlipForConditionalGeneration
+transformers 6 23 Idefics2Model Idefics2PreTrainedModel Idefics3ForConditionalGeneration Idefics3Model
+transformers 6 23 InstructBlipForConditionalGeneration
 transformers 6 23 InstructBlipModel InstructBlipVideoForConditionalGeneration InstructBlipVideoModel
 transformers 6 23 InternVLForConditionalGeneration InternVLModel Kosmos2ForConditionalGeneration Kosmos2Model
 transformers 6 23 Kosmos2_5ForConditionalGeneration Kosmos2_5Model Lfm2VlModel Llama4TextModel Llama4VisionModel
