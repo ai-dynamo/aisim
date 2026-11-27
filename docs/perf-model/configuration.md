@@ -956,8 +956,10 @@ is not modeled), so it does not. Every aggregated worker whose engine runs
 attention DP above one also needs cross-rank aggregated. A regression store is
 ready with a usable fit and a learned store when the forest has it. It rejects
 a rank hosting the vision encoder, a speculation scheme other than MTP,
-`nextn > 0` or MTP for a learned model or a non-vLLM regression (SGLang's
-telemetry reports an MTP decode request's extend as 1), bounded decoder replay,
+`nextn > 0` or MTP for a non-vLLM regression (SGLang's telemetry reports an MTP
+decode request's extend as 1) or for a learned model whose artifact records a
+different training depth (see
+[learned MTP](fpm_ml/configuration.md#mtp-speculative-decoding)), bounded decoder replay,
 and an automatic selection that
 would fall back to an untrained regression. Replay also rejects such a role
 whose engine sets a `decode_speedup_ratio` other than 1: replay then prices
@@ -1635,7 +1637,7 @@ handled as follows:
 | `tp`, `pp`, `attention_dp`, `moe_tp_size` or `moe_ep_size` `unknown` | The role needs one explicit value for each unknown width, such as `parallelism: {preset: false, tensor: 1, pipeline: 1, attention_data: 1}`; known widths are still pinned. `tp * pp * attention_dp` must equal `deployment_limits.num_gpus` when known. |
 | `deployment_limits.max_kv_tokens` | Required. The role's KV capacity is fixed to that many tokens in whole `kv_block_size` blocks and KV memory is not searched; a different fixed capacity or a `memory_fraction` search is a conflict. |
 | `deployment_limits.max_num_batched_tokens`, `max_num_seqs` | Required. The role's `max_batched_tokens` and `max_sequences` domains keep only values at most the recorded limit; an empty domain is an error. |
-| `nextn > 0` or `speculation: {kind: mtp, params: {depth: N}}` | For a vLLM `fpm_regression` snapshot fitted with either spelling, the depth is pinned as for a native snapshot. Replay accepts only 1–5 draft tokens; larger MTP depths remain valid for cost prediction and snapshot restoration, but replay rejects them. Recommendation uses `engine.nextn` and requires `engine.nextn_accepted`; prediction also accepts `engine.speculation: {kind: mtp, params: {depth: N}, expected_accepted_tokens: A}` at the same depth. Rejected for other backends and for `fpm_learned`. |
+| `nextn > 0` or `speculation: {kind: mtp, params: {depth: N}}` | For a vLLM `fpm_regression` snapshot fitted with either spelling, the depth is pinned as for a native snapshot. Replay accepts only 1–5 draft tokens; larger MTP depths remain valid for cost prediction and snapshot restoration, but replay rejects them. Recommendation uses `engine.nextn` and requires `engine.nextn_accepted`; prediction also accepts `engine.speculation: {kind: mtp, params: {depth: N}, expected_accepted_tokens: A}` at the same depth. An `fpm_learned` snapshot is accepted on any backend; restoration requires its artifact's training depth (`metadata.nextn`) to equal N. Rejected for a regression on other backends. |
 
 A snapshot whose `backend_version` is unset (`null`) is rejected: save the
 deployed version or `"unknown"`. `deployment_limits.num_gpus` and

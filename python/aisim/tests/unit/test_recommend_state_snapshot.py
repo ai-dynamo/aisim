@@ -789,7 +789,7 @@ def test_an_aggregated_planner_regression_prices_prefill_decode_and_mixed_passes
         (
             "sglang-nextn",
             lambda raw, w: raw["engine"].update(backend="sglang"),
-            r"records nextn=1; only a vLLM fpm_regression model prices MTP rounds",
+            r"records nextn=1; only a vLLM fpm_regression model or an fpm_learned model prices MTP rounds",
         ),
         ("no-kv", lambda raw, w: None, r"does not record deployment_limits.max_kv_tokens"),
         ("no-limits", lambda raw, w: None, r"does not record deployment_limits.max_kv_tokens"),
@@ -811,17 +811,26 @@ def test_planner_snapshot_rules_fail_validation(planner_snapshots, name, edit, m
         _space(raw)
 
 
-def test_a_learned_snapshot_fitted_with_mtp_is_rejected_on_vllm():
-    # Replay prices nextn > 0 only with a vLLM fpm_regression model.
+@pytest.mark.parametrize("backend", ["vllm", "sglang"])
+def test_a_learned_snapshot_fitted_with_mtp_is_accepted(backend):
+    # A learned artifact trained on MTP rounds prices them; restoration checks its trained depth.
     summary = {
         "kind": "learned_frozen",
         "selected_estimation_mode": "fpm_learned",
         "readiness": {"stores": [{"workload_kind": "pure_decode", "ready": True}]},
-        "identity": {"backend": "vllm", "nextn": 1},
+        "identity": {
+            "backend": backend,
+            "nextn": 1,
+            "backend_version": "unknown",
+            "deployment_limits": {"max_kv_tokens": 8192, "max_num_batched_tokens": 8192, "max_num_seqs": 256},
+        },
     }
     snapshot = SnapshotRole(role="decode", path="snapshot", summary=summary, config={})
-    with pytest.raises(ValueError, match=r"records nextn=1; only a vLLM fpm_regression model prices MTP rounds"):
-        _validate_fitted(snapshot)
+    _validate_fitted(snapshot)
+    summary["selected_estimation_mode"] = "fpm_regression"
+    if backend != "vllm":
+        with pytest.raises(ValueError, match=r"records nextn=1; only a vLLM fpm_regression model or an fpm_learned"):
+            _validate_fitted(snapshot)
 
 
 def test_planner_snapshots_without_the_role_stores_are_rejected(planner_snapshots):

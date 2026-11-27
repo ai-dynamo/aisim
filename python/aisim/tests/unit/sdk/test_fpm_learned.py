@@ -742,6 +742,27 @@ def test_training_nextn_rejects_ambiguous_depths(iterations, nextn, match):
         fpm_learned.training_nextn(iterations, nextn)
 
 
+def _listed_decode(widths: list[int], *, steps: int | None = None) -> dict:
+    fpm = _mtp_fpm(len(widths), 100 * len(widths), 0.01, steps=steps)
+    fpm["scheduled_requests"]["extend_lengths"] = widths
+    fpm["scheduled_requests"]["past_kv_lengths"] = [100] * len(widths)
+    return fpm
+
+
+def test_training_nextn_requires_verify_widths_in_request_lists():
+    """Replay queries MTP decode at width nextn + 1; width-1 request lists describe a different query."""
+    # The stock SGLang decode hook lists extend 1 and omits the depth fields.
+    with pytest.raises(ValueError, match="every decode request in the per-request lists has extend length 1"):
+        fpm_learned.training_nextn([[_listed_decode([1, 1])]], nextn=3)
+    with pytest.raises(ValueError, match="replay queries decode requests at verify width 4"):
+        fpm_learned.training_nextn([[_listed_decode([1, 1], steps=3)]])
+    # Verify widths, including vLLM's shorter widths near limits, are accepted.
+    assert fpm_learned.training_nextn([[_listed_decode([4, 4], steps=3)], [_listed_decode([1, 2], steps=3)]]) == 3
+    assert fpm_learned.training_nextn([[_listed_decode([4, 2])]], nextn=3) == 3
+    # Depth 0 keeps width-1 decode lists.
+    assert fpm_learned.training_nextn([[_listed_decode([1, 1])]]) == 0
+
+
 def test_train_records_nextn_and_validate_checks_it():
     pytest.importorskip("sklearn")
     iterations = [[_mtp_fpm(n, 100 * n, 0.01 + 0.001 * n, steps=3)] for n in range(1, 31)]

@@ -822,7 +822,18 @@ impl ForwardPassPerfModelConfig {
                 }
             }
             // MTP (`nextn > 0` or an `mtp` scheme) is priced from measured
-            // rounds; construction checks the artifact's recorded depth.
+            // rounds; construction checks the artifact's recorded depth. The
+            // mixed composition's interpolation fallback cannot price MTP.
+            let speculative = self.nextn != 0
+                || self
+                    .speculation
+                    .as_ref()
+                    .is_some_and(|speculation| speculation.kind != "none");
+            if speculative && self.estimator_config.temporary_mixed_composition.is_some() {
+                return Err(invalid_config(
+                    "temporary_mixed_composition does not support speculative decoding",
+                ));
+            }
             if self
                 .speculation
                 .as_ref()
@@ -1266,7 +1277,13 @@ mod tests {
         }
         let mut speculative = companion;
         speculative.nextn = 1;
-        assert!(speculative.validate().is_err());
+        assert!(
+            speculative
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("temporary_mixed_composition does not support speculative decoding")
+        );
     }
 
     #[test]

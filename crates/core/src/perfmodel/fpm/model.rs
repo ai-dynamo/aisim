@@ -534,9 +534,14 @@ impl ForwardPassPerfModel {
             ));
         }
         // Path 1: only an ordinary STP FPM supplies the reference to scale.
-        let already_speculative = self.provenance.as_ref().is_some_and(|provenance| {
-            provenance.config.nextn != 0 || provenance.config.speculation.is_some()
-        });
+        // A learned artifact trained on MTP rounds is speculative whether or
+        // not it was built from a configuration (`from_learned` has none).
+        let trained_on_mtp = matches!(&self.mode,
+            ForwardPassPerfMode::Learned { learned, .. } if learned.trained_nextn() != 0);
+        let already_speculative = trained_on_mtp
+            || self.provenance.as_ref().is_some_and(|provenance| {
+                provenance.config.nextn != 0 || provenance.config.speculation.is_some()
+            });
         let native_is_stp_fpm = match &self.mode {
             ForwardPassPerfMode::Native { engine, .. } => engine.is_autoregressive_fpm(),
             _ => true,

@@ -347,9 +347,11 @@ def _validate_fitted(snapshot: SnapshotRole) -> None:
             f"replay prices every {_WORKER_TYPES[role]} iteration with it, so tune it with observed forward passes "
             "of that work before saving it"
         )
-    if snapshot.nextn > 0 and (identity["backend"] != "vllm" or mode != "fpm_regression"):
+    # A learned model prices MTP rounds at the depth its artifact was trained at; restoration checks that depth.
+    if snapshot.nextn > 0 and mode != "fpm_learned" and (identity["backend"] != "vllm" or mode != "fpm_regression"):
         raise ValueError(
-            f"{snapshot.describe()} records nextn={snapshot.nextn}; only a vLLM fpm_regression model prices MTP rounds"
+            f"{snapshot.describe()} records nextn={snapshot.nextn}; only a vLLM fpm_regression model or an "
+            "fpm_learned model prices MTP rounds"
         )
     if identity.get("backend_version") is None:
         raise ValueError(

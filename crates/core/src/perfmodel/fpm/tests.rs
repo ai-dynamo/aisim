@@ -2601,6 +2601,28 @@ fn learned_model_predicts_from_artifact_json() {
 }
 
 #[test]
+fn directly_loaded_mtp_learned_artifact_rejects_draft_length_scaling() {
+    // `from_learned` carries no configuration, so the guard must read the
+    // artifact's recorded depth: an MTP forest already measures the round.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&learned_decode_artifact_json()).unwrap();
+    value["metadata"]["nextn"] = 3.into();
+    let model = ForwardPassPerfModel::from_learned(&value.to_string(), Default::default()).unwrap();
+    let query = [decode_fpm(2, 1000, 0.0)];
+    assert!(
+        model
+            .estimate_forward_pass_time_ms(&query)
+            .unwrap()
+            .is_some()
+    );
+    let error = model
+        .estimate_speculative_forward_pass_time_ms(&query, 3)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires an ordinary STP FPM"), "{error}");
+}
+
+#[test]
 fn speculative_scaling_uses_stp_learned_predictions_without_mutating_tuning() {
     let model =
         ForwardPassPerfModel::from_learned(&learned_decode_artifact_json(), Default::default())

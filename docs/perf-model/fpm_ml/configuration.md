@@ -49,9 +49,12 @@ A learned artifact prices the steps it was trained on. Trained on MTP-on step
 captures, each decode step is a complete measured round (Option 2 in
 [whole-forward methods](../methods/whole-forward.md#consuming-a-measured-round)):
 target verification, sampling and draft work are already in the label, so no
-draft tail or STP scaling is added. Replay queries the artifact with each
-decode request's verify width `nextn + 1` as its extend length, as the SGLang
-step-capture hook records it.
+draft tail or STP scaling is added, and a query with `draft_length` is
+rejected, including for an artifact loaded directly with `from_learned`. Replay
+queries the artifact with each decode request's verify width as its extend
+length: `nextn + 1` on SGLang, as the SGLang step-capture hook records it, and
+each request's scheduled width on vLLM, which can be smaller at token or
+context limits. A temporary mixed composition does not support MTP.
 
 The artifact records the MTP draft depth of its training steps in
 `metadata.nextn`; an absent field means steps without speculative decoding
@@ -59,8 +62,12 @@ The artifact records the MTP draft depth of its training steps in
 speculative depth (`nextn`, or the MTP scheme's `depth`), so an artifact
 trained without MTP is never used for MTP, and an MTP artifact is never used
 for plain decode or another depth. The trainer writes `metadata.nextn` from the
-steps' `spec_num_steps`, or from `--nextn` for telemetry without that field
-(see [Train](learned-forward-pass-model.md#2-train)).
+steps' `spec_num_steps` (or `spec_num_draft_tokens - 1`), or from `--nextn`
+for telemetry without those fields (see
+[Train](learned-forward-pass-model.md#2-train)). At a depth above 0 it rejects
+captures whose per-request lists give every decode request an extend length of
+1, as the stock SGLang decode hook does: replay would query those requests at
+their verify width.
 
 ## Estimator namespaces
 

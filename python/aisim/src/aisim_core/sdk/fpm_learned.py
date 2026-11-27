@@ -974,8 +974,37 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
         (depth,) = recorded
         if nextn is not None and nextn != depth:
             raise ValueError(f"nextn={nextn} does not match the steps' recorded spec_num_steps={depth}")
-        return depth
-    return nextn or 0
+    else:
+        depth = nextn or 0
+    if depth > 0:
+        _require_verify_widths(iterations, depth)
+    return depth
+
+
+def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth: int) -> None:
+    """MTP replay queries each decode request at its verify width; per-request training lists must agree.
+
+    A capture whose decode-only steps all list extend 1 per request (the stock SGLang decode hook) describes
+    a different query than replay sends at width ``depth + 1``. vLLM may schedule a shorter width near token
+    or context limits, so only a capture with no decode request wider than 1 is rejected.
+    """
+    listed = False
+    for metrics_by_rank in iterations:
+        for fpm in metrics_by_rank:
+            sched = _sched(fpm)
+            if int(sched.get("num_prefill_requests", 0)) or not int(sched.get("num_decode_requests", 0)):
+                continue
+            pairs = _request_pairs(sched)
+            if pairs is None:
+                continue
+            if any(extend > 1 for extend, _ in pairs):
+                return
+            listed = True
+    if listed:
+        raise ValueError(
+            f"MTP depth {depth}: every decode request in the per-request lists has extend length 1, but replay "
+            f"queries decode requests at verify width {depth + 1}; capture with a hook that records verify widths"
+        )
 
 
 def train(
