@@ -91,8 +91,35 @@ class WorkerSettingsV1(_StrictModel):
     than resolved, unlike :meth:`~aisim_core.sdk.config.ModelConfig.resolve_moe_parallelism`
     and the KV estimator, which infer a single omitted width and resolve the
     width-one omission.
+
+    The packaged JSON schema cannot express the cross-field rule from the field
+    types alone, so the model publishes it as an ``allOf``: the pair must be two
+    positive integers, or both absent/null.
     """
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "allOf": [
+                {
+                    "anyOf": [
+                        {
+                            "required": ["moe_tp_size", "moe_ep_size"],
+                            "properties": {
+                                "moe_tp_size": {"type": "integer"},
+                                "moe_ep_size": {"type": "integer"},
+                            },
+                        },
+                        {
+                            "properties": {
+                                "moe_tp_size": {"type": "null"},
+                                "moe_ep_size": {"type": "null"},
+                            }
+                        },
+                    ]
+                }
+            ]
+        }
+    )
     replicas: int = Field(gt=0)
     gpus_per_replica: int = Field(gt=0)
     batch_size: int = Field(gt=0)
