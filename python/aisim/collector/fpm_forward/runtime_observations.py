@@ -17,6 +17,12 @@ Zero stride retains the unpacked, zero-offset, single-allocation storage rules.
 vLLM 0.32 places a group's layers in one backing buffer at
 ``offset + layer * layer_stride + block * block_stride``; vLLM 0.33 uses its
 separate audited hybrid mapping.
+
+The transfer bytes of a cache group follow a modified port of the region rule of
+the vLLM v0.33.0 NIXL connector (4ba787ec9959e566d3b587a796dff07673324da5),
+Copyright contributors to the vLLM project, Apache-2.0. The comment above
+``_transfer_shape_refusal`` names the source files, and THIRD_PARTY_NOTICES.md
+holds the entry.
 """
 
 from __future__ import annotations
@@ -33,8 +39,8 @@ from aisim.sdk.utils import _attach_inferred_quant_fields
 from aisim_core.fpm_profile import FpmResourceProfile
 from aisim_core.sdk.perf_database import load_system_spec
 
-from . import runtime_memory
-from .capabilities import checkpoint_fmha_quant_mode, has_checkpoint_fmha
+from . import runtime_evidence, runtime_memory
+from .capabilities import bfloat16_kv_cache, checkpoint_fmha_quant_mode, has_checkpoint_fmha
 from .config import PrefillSamplingProfile, collection_phases
 from .model_capability import load_model_config
 from .planner import BackendPolicy, FPMCell
@@ -45,6 +51,7 @@ from .runtime.fpm_memory_observer import (
     _WINDOW_SPECS,
     HYBRID_EVIDENCE_VERSION,
     MEMORY_SUPPORTED_VERSIONS,
+    NIXL_TRANSFER_SOURCE_HASHES,
     audited_release,
 )
 from .runtime_instrumentation import (
@@ -187,6 +194,8 @@ def _staged_checkpoint_fmha(root: Path, references: list[Any], launch: dict[str,
     the configuration comes from hash-bound copies. runtime_probe.stage_runtime_instrumentation writes model-config.json
     and each declared sidecar into every probe and collection phase, and the phase lists them with their digests. The
     collector's loader reads the copy and merges the hf_quant_config.json beside it, so that sidecar must be declared.
+    A staged hf_quant_config.json that the launch does not declare is refused on purpose: the probe stages only declared
+    sidecars, so such a file does not belong to the launch.
     """
     sources = _source_files(launch)
     staged: dict[str, list[tuple[Path, str]]] = {"model-config.json": [], "hf_quant_config.json": []}
@@ -298,7 +307,7 @@ def _validate_record(
 
     ``checkpoint_fmha`` is the checkpoint-native FMHA label of the phase's staged model configuration. It is None for
     a bfloat16 KV cache and for a KV-cache dtype without an AIC mode, whose FMHA precision is the observed compute
-    dtype.
+    dtype. A bfloat16 KV cache takes the label bfloat16.
     """
     if record.get("schema_version") != OBSERVATION_SCHEMA:
         raise ValueError("unsupported runtime observation schema")
@@ -378,6 +387,8 @@ def _validate_record(
         and model.get("config_format", "auto") not in ("auto", "hf")
     ):
         raise ValueError(f"loaded config format requires another source mapping: {model['config_format']}")
+    if kind == "worker" and runtime_memory._hybrid_evidence(record["cache"]):
+        runtime_evidence._check_hf_overrides(record)
     if not _matches_model_path(model.get("model"), launch):
         raise ValueError("observed model path differs from the selected deployment")
     revision = launch["identity"]["model_revision"]
@@ -388,6 +399,11 @@ def _validate_record(
     if checkpoint_fmha is None:
         if cell.fmha_quant_mode not in {"half", "bfloat16"} or observed != cell.fmha_quant_mode:
             raise ValueError("FMHA precision lacks a supported observed compute-dtype mapping")
+        if bfloat16_kv_cache(cell.kv_cache_dtype) and cell.fmha_quant_mode != "bfloat16":
+            raise ValueError(
+                f"FMHA precision {cell.fmha_quant_mode!r} differs from 'bfloat16', the collection label of KV-cache "
+                f"dtype {cell.kv_cache_dtype!r}"
+            )
     elif observed not in {"half", "bfloat16"}:
         raise ValueError("FMHA precision lacks a supported observed compute-dtype mapping")
     elif cell.fmha_quant_mode != checkpoint_fmha:
@@ -597,6 +613,20 @@ def _check_element_size(item_size: int, precision: str) -> None:
 # The element bytes of the vLLM 0.33.0 Mamba state dtypes. MambaStateDtypeCalculator gives every state the model
 # dtype, a MambaDType choice (config/cache.py:175) or float32 (model_executor/layers/mamba/mamba_utils.py:53-150).
 _STATE_DTYPE_BYTES = {"torch.float32": 4, "torch.float16": 2, "torch.bfloat16": 2}
+# The element bytes of the dtypes that an indexer spec may hold. vLLM views each layer in the dtype of its spec
+# (kv_cache_interface.py:467, :479-480), and both indexer caches only drop the head axis when they bind the view
+# (models/deepseek_v2.py:653-656, models/minimax_m3/common/indexer.py:141-143). A dtype outside the table gets no check.
+# The observer records the dtype of such a spec by its name (runtime/fpm_memory_observer.py, _spec_dtype), so a value
+# that is not a string is refused.
+_INDEXER_DTYPE_BYTES = {
+    "torch.uint8": 1,
+    "torch.int8": 1,
+    "torch.float8_e4m3fn": 1,
+    "torch.float8_e5m2": 1,
+    "torch.float16": 2,
+    "torch.bfloat16": 2,
+    "torch.float32": 4,
+}
 
 
 def _indexer(spec: dict[str, Any]) -> bool:
@@ -680,6 +710,10 @@ def _layer_views(
             raise ValueError(f"layer view lies outside the page of its layer: {name}")
         if group["kind"] == "attention" and not _indexer(spec):
             _check_element_size(item_size, precision)
+        elif _indexer(spec) and (
+            not isinstance(spec.get("dtype"), str) or _INDEXER_DTYPE_BYTES.get(spec["dtype"], item_size) != item_size
+        ):
+            raise ValueError("tensor element size contradicts cache dtype")
         intervals.append((start, start + within))
         dense += ratio * math.prod(shape[1:]) * item_size
         views.append((view, ratio, pages))
@@ -1190,7 +1224,10 @@ def _scheduler_hash_block_sizes(record: dict[str, Any]) -> list[Any]:
     kv_transfer_config. Otherwise several groups hash in prefix_match_unit tokens, or in the GCD of the block sizes of
     the groups that take part in prefix caching, or of every group when none does. Each of these cases gives one size.
     Each SlidingWindowMLASpec group takes part unless its spec replays a bounded window (kv_cache_interface.py:1015,
-    :1027-1029), which no record holds. With such groups, each choice of the groups that take part gives one size.
+    :1027-1029). The record does not hold which groups replay. The groups that replay share one window, their
+    sliding_window (core/sched/scheduler.py:302-313, kv_cache_interface.py:1031-1033), so the SlidingWindowMLASpec
+    groups that stay out have one sliding_window, and each such choice gives one size. A group whose record holds no
+    positive integer window may stay out with any window.
     """
     groups, settings = record["cache"]["groups"], record["resolved_config"]["cache_config"]
     blocks = [_positive(group["block_size_tokens"], "cache block size") for group in groups]
@@ -1210,13 +1247,24 @@ def _scheduler_hash_block_sizes(record: dict[str, Any]) -> list[Any]:
         for block, group in zip(blocks, groups, strict=True)
         if group["spec_type"] not in {*runtime_memory._NO_PREFIX_CACHING_SPECS, unknown}
     ]
-    # Start from the GCD of the blocks of the groups that surely take part, which is 0 without such a group. Each
-    # SlidingWindowMLASpec group may add its block to every GCD so far, so the set holds the GCD of every choice of
-    # those groups, and it never holds more values than there are distinct GCDs.
-    hashes = {math.gcd(*caching)}
-    for block, group in zip(blocks, groups, strict=True):
-        if group["spec_type"] == unknown:
-            hashes |= {math.gcd(value, block) for value in hashes}
+    # Each SlidingWindowMLASpec block with its window, None when the record holds no positive integer window.
+    sliding = [
+        (block, group.get("sliding_window"))
+        for block, group in zip(blocks, groups, strict=True)
+        if group["spec_type"] == unknown
+    ]
+    sliding = [(block, window if type(window) is int and window > 0 else None) for block, window in sliding]
+    hashes = set()
+    for out in {window for _, window in sliding if window is not None} or {None}:
+        # Start from the GCD of the blocks of the groups that surely take part, with the groups of another window,
+        # which is 0 without such a group. Each group that may stay out with window `out` may add its block to every
+        # GCD so far, so the set holds the GCD of every choice of those groups, and it never holds more values than
+        # there are distinct GCDs.
+        choices = {math.gcd(*caching, *(block for block, window in sliding if window not in (None, out)))}
+        for block, window in sliding:
+            if window in (None, out):
+                choices |= {math.gcd(value, block) for value in choices}
+        hashes |= choices
     # Without a group in prefix caching, vLLM hashes in the GCD of every block.
     return sorted({math.gcd(*blocks) if value == 0 else value for value in hashes})
 
@@ -1233,12 +1281,15 @@ def _scheduler_hash_block_size_fits(record: dict[str, Any]) -> bool:
     block size when a Mamba group has a larger block, else the scheduler block size. The scheduler record holds the
     groups that vLLM reads, in which a uniform group keeps only its first inner spec (:1110-1116).
 
-    A SlidingWindowMLASpec group may or may not take part, so one choice of the groups that take part must give the
-    recorded hash block size and meet both rules. With that hash block size, the alignment no longer depends on the
-    choice. So every group that takes part must pass the same test: the hash block size divides its block, and the
-    alignment is a multiple of its tokens per state. A SlidingWindowMLASpec group that passes it may take part whatever
-    the other groups do. Every such group keeps the GCD a multiple of the hash block size, so the choice with all of
-    them gives the smallest GCD.
+    A SlidingWindowMLASpec group takes part unless it replays a bounded window, which the record does not hold. The
+    groups that replay share one window, their sliding_window (core/sched/scheduler.py:302-313,
+    kv_cache_interface.py:1031-1033). So for one sliding_window, every such group with another window takes part, and
+    one choice of the groups with that window must give the recorded hash block size and meet both rules. A group
+    whose record holds no positive integer window may stay out with any window. With that hash block size, the
+    alignment no longer depends on the choice. So every group that takes part must pass the same test: the hash block
+    size divides its block, and the alignment is a multiple of its tokens per state. A group of that window that passes
+    it may take part whatever the other groups do. Every such group keeps the GCD a multiple of the hash block size, so
+    the choice with all of them gives the smallest GCD.
 
     With one group, vLLM raises when prefix_match_unit is neither None nor the block size times the decode context
     parallel size, a factor of 1 unless the spec is dcp_sharded (v1/core/kv_cache_utils.py:841-842), and prefix
@@ -1269,22 +1320,31 @@ def _scheduler_hash_block_size_fits(record: dict[str, Any]) -> bool:
         )
 
     unknown = _SPEC_MODULE + "SlidingWindowMLASpec"
-    caching = [
-        group for group in groups if group["spec_type"] not in {*runtime_memory._NO_PREFIX_CACHING_SPECS, unknown}
-    ]
-    sliding = [group["block_size_tokens"] for group in groups if group["spec_type"] == unknown and can_take_part(group)]
+    # Each SlidingWindowMLASpec group with its window, None when the record holds no positive integer window.
+    windows = [(group, group.get("sliding_window")) for group in groups if group["spec_type"] == unknown]
+    windows = [(group, window if type(window) is int and window > 0 else None) for group, window in windows]
     unit = settings.get("prefix_match_unit") is not None
-    if caching:
-        # The groups that surely take part meet both rules under every choice or under none. A unit is the hash block
-        # size of every choice. Without one, the smallest GCD must be the hash block size.
-        return all(can_take_part(group) for group in caching) and (
-            unit or math.gcd(*(group["block_size_tokens"] for group in caching), *sliding) == hash_block
-        )
-    # Otherwise some of those SlidingWindowMLASpec groups take part, or no group does and vLLM hashes every block.
     blocks = [group["block_size_tokens"] for group in groups]
-    if unit:
-        return bool(sliding) or all(block % hash_block == 0 for block in blocks)
-    return math.gcd(*sliding) == hash_block or math.gcd(*blocks) == hash_block
+
+    def fits(out: int | None) -> bool:
+        caching = [
+            group for group in groups if group["spec_type"] not in {*runtime_memory._NO_PREFIX_CACHING_SPECS, unknown}
+        ] + [group for group, window in windows if window not in (None, out)]
+        sliding = [
+            group["block_size_tokens"] for group, window in windows if window in (None, out) and can_take_part(group)
+        ]
+        if caching:
+            # The groups that surely take part meet both rules under every choice or under none. A unit is the hash
+            # block size of every choice. Without one, the smallest GCD must be the hash block size.
+            return all(can_take_part(group) for group in caching) and (
+                unit or math.gcd(*(group["block_size_tokens"] for group in caching), *sliding) == hash_block
+            )
+        # Otherwise some of the groups that may stay out take part, or no group does and vLLM hashes every block.
+        if unit:
+            return bool(sliding) or all(block % hash_block == 0 for block in blocks)
+        return math.gcd(*sliding) == hash_block or math.gcd(*blocks) == hash_block
+
+    return any(fits(out) for out in {window for _, window in windows if window is not None} or {None})
 
 
 def _phase_prefix_caching(
@@ -1310,6 +1370,24 @@ def _phase_prefix_caching(
     shared = (
         None if scheduled is None else {key: scheduled[key] for key in ("enable_prefix_caching", "mamba_cache_mode")}
     )
+    if scheduled is not None and scheduled["enable_prefix_caching"]:
+        # Under VLLM_BATCH_INVARIANT, an attention layer of the TRITON_MLA or FLASHINFER backend turns prefix caching
+        # off in the cache config of its own worker process (layers/attention/mla_attention.py:550-563,
+        # layers/attention/attention.py:373-388), and the engine core keeps it on. Only a well-formed worker block gets
+        # this text; every other shape of the worker evidence is left to _prefix_caching_settings.
+        for _, record in sorted(workers.items()):
+            value = record["cache"]["prefix_caching"]
+            if (
+                isinstance(value, dict)
+                and set(value) == {"enable_prefix_caching", "mamba_cache_mode"}
+                and value["enable_prefix_caching"] is False
+                and value["mamba_cache_mode"] in ("none", "align")
+            ):
+                raise ValueError(
+                    f"{phase} worker turned prefix caching off while its scheduler keeps it on; vLLM does this under "
+                    "VLLM_BATCH_INVARIANT with the TRITON_MLA or FLASHINFER backend; run the probe without that "
+                    "variable"
+                )
     for _, record in sorted(workers.items()):
         _same(_prefix_caching_settings(record["cache"], scheduler=False, hybrid=hybrid), shared, label)
     if scheduled is None:
@@ -1354,6 +1432,14 @@ def _phase_prefix_caching(
                 [resolved.get(name) for name in names]
             ):
                 raise ValueError("runtime prefix-caching evidence contradicts the resolved cache settings")
+        # The prefix-match unit is a launch argument that vLLM only reads afterwards (config/cache.py:203,
+        # engine/arg_utils.py:2324, v1/core/kv_cache_utils.py:846, :890, mamba/abstract.py:126-127), and each process
+        # gets a copy of one configuration, so a worker holds the unit of the scheduler of its DP rank.
+        for (dp, _), record in sorted(workers.items()):
+            if canonical_json(record["resolved_config"]["cache_config"].get("prefix_match_unit")) != canonical_json(
+                schedulers[dp]["resolved_config"]["cache_config"].get("prefix_match_unit")
+            ):
+                raise ValueError("runtime prefix-match unit differs between scheduler and worker")
         # A scheduler copies its own block size and hash block size into the evidence
         # (runtime/instrumentation/observer.py, _prefix_caching).
         sizes = ("block_size", "hash_block_size")
@@ -1425,9 +1511,7 @@ def _validate_startup_concurrency(record: dict[str, Any]) -> None:
         else:
             blocks += -(-context // group["block_size_tokens"])
     label = f"{record['phase']} scheduler of DP rank {record['dp_rank']}"
-    concurrency = cache.get("kv_cache_max_concurrency")
-    if isinstance(concurrency, bool) or not isinstance(concurrency, (int, float)) or not 0 < concurrency < math.inf:
-        raise ValueError(f"{label} lacks a positive kv_cache_max_concurrency")
+    concurrency = runtime_evidence.scheduler_concurrency(record, label)
     # vLLM keeps the quotient as a float. The tolerance covers its rounding, far below the change of one block.
     if not math.isclose(concurrency, cache["num_blocks"] / blocks, rel_tol=1e-9):
         raise ValueError(
@@ -1451,6 +1535,287 @@ def _mode_free(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 group["state"].pop("mamba_cache_mode", None)
                 group["state"].pop("startup_blocks_per_request", None)
     return result
+
+
+_TRANSFER_PHASE_REFUSAL = "the record comes from a probe phase without prefix caching"
+_TRANSFER_VALUES_DIFFER = "the worker records of the phases with prefix caching give different values"
+_TRANSFER_EVIDENCE_GAP = (
+    "the record lacks a field that the transfer rule reads, or holds a value that the import does not know"
+)
+_TRANSFER_HYBRID_REFUSAL = f"the record holds no hybrid cache evidence of vLLM {HYBRID_EVIDENCE_VERSION}"
+_TRANSFER_LAYOUT_REFUSAL = "the worker did not establish the DS convolution state layout required by NIXL"
+_TRANSFER_SOURCE_REFUSAL = "the worker lacks matching hashes for the audited vLLM 0.33.0 NIXL transfer sources"
+_TRANSFER_SPLIT_REFUSAL = "the NIXL DS convolution split is missing or contradicts the observed Mamba state"
+_RING_SPEC = _SPEC_MODULE + "CircularBufferSpec"
+_MLA_SPEC = _SPEC_MODULE + "MLAAttentionSpec"
+
+
+# The bytes that the NIXL connector of vLLM 0.33.0 (4ba787ec9959e566d3b587a796dff07673324da5) reads for one block
+# of each cache group on one TP rank, in a model with Mamba layers and a ring. A modified port of the region rule of
+# vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py (bw below):
+# https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+# - A ring model registers its layers in the order of the manager views (bw:1573-1580). vLLM builds these views in
+#   the order of the allocation plan (vllm/v1/worker/utils.py:598-627), which tensor_allocations of the record keeps.
+# - In storage of whole block rows (bw:1670-1672), each layer gives one region at the address of its page in block
+#   0, with the page as its length (bw:1646-1657 for a Mamba layer, bw:1716-1719 for every other layer).
+# - Layers at one address share one region. An MLA layer sets its length, and a layer of another group gives it
+#   the group ID -1 (bw:1747-1766). A Mamba layer marks an SSM region, and a ring layer a scratch region
+#   (bw:1774-1786). The connector then sorts the scratch regions (bw:1820).
+# - For one block, a ring group reads its scratch regions, every other attention group reads every region, and a
+#   Mamba group reads its state bytes in every SSM region (bw:237-278). The state bytes are the two state tensors
+#   without padding (vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py:155-156).
+# The pinned worker and connector source establish further properties of this layout. Storage of
+# whole block rows starts only with one kernel block for one manager block (bw:1611-1615, :1670-1672, :1720-1730),
+# because vLLM never splits the block of a group whose layers share block rows (vllm/v1/worker/utils.py:663-675).
+# A ring model accepts a tp_replicated state only in a group of one layer (bw:680-697). The connector asks for
+# another layout only for a model without MLA (vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:148-166).
+# The worker separately verifies DS convolution layout and calls the pinned connector's native split for its actual
+# Mamba specs (bw:699-720, ssm_conv_transfer_utils.py:127-208). The split must cover the observed state tensors.
+# benchmarks/evidence/nixl-pd-transfer-bytes-20261117 holds the measured bytes and the region table of a live run.
+def _transfer_shape_refusal(cache: dict[str, Any], runtime_version: str) -> str | None:
+    """The text of the first transfer-writer condition that the cache does not meet, or None when it meets them all.
+
+    After condition 1, layer specs or an allocation plan that lack a field of the rule give _TRANSFER_EVIDENCE_GAP,
+    which is the text of no condition. After condition 5, a Mamba state of an unknown data type gives it too.
+    """
+    if not _hybrid_record(cache, runtime_version):
+        return _TRANSFER_HYBRID_REFUSAL
+    layers = _transfer_layers(cache)
+    if isinstance(layers, str):
+        return layers
+    storages = cache.get("storages")
+    strides = {allocation["block_stride"] for allocation in cache["tensor_allocations"]}
+    if (
+        not isinstance(storages, list)
+        or len(storages) != 1
+        or not isinstance(storages[0], dict)
+        or len(strides) != 1
+        or not _nonnegative_int(cache.get("num_blocks"))
+        or storages[0].get("size_bytes") != cache["num_blocks"] * next(iter(strides))
+    ):
+        return "the cache is not one storage of whole block rows with one block stride"
+    groups = cache["groups"]
+    classes = [{group["layer_specs"][name]["spec_type"] for name in group["layer_names"]} for group in groups]
+    mamba = [group for group, kinds in zip(groups, classes, strict=True) if kinds == {_MAMBA_SPEC}]
+    if not mamba or {_RING_SPEC} not in classes:
+        return "the cache groups hold no Mamba group or no ring group"
+    if (
+        {_MLA_SPEC} not in classes
+        or any(kinds not in ({_MAMBA_SPEC}, {_RING_SPEC}, {_MLA_SPEC}) for kinds in classes)
+        or any(group.get("sliding_window") is not None for group in groups)
+    ):
+        return (
+            "the cache holds no MLA attention layer, a layer outside the Mamba and ring groups is no MLA attention "
+            "layer, or a group holds a sliding window"
+        )
+    tensors = [_state_tensors(group.get("state")) for group in mamba]
+    if (
+        any(len(group["layer_names"]) < 2 for group in mamba)
+        or any(tensor != tensors[0] for tensor in tensors)
+        or tensors[0] is None
+        or not all(isinstance(part, list) and len(part) == 2 for part in tensors[0])
+    ):
+        return "a Mamba group holds fewer than two layers, or the Mamba layers do not hold the same two state tensors"
+    state = mamba[0]["state"]
+    sizes = _state_sizes(state)
+    if sizes is None:
+        return _TRANSFER_EVIDENCE_GAP
+    if _record_prefix_caching(cache) is not True:
+        return _TRANSFER_PHASE_REFUSAL
+    evidence = cache.get("nixl_transfer")
+    if not isinstance(evidence, dict):
+        return _TRANSFER_LAYOUT_REFUSAL
+    if evidence.get("source_files") != NIXL_TRANSFER_SOURCE_HASHES:
+        return _TRANSFER_SOURCE_REFUSAL
+    if evidence.get("conv_state_layout") != "DS":
+        return _TRANSFER_LAYOUT_REFUSAL
+    if (
+        "error" in evidence
+        or canonical_json(evidence.get("conv_shape")) != canonical_json(state["shapes"][0])
+        or canonical_json(evidence.get("state_bytes")) != canonical_json(sizes)
+    ):
+        return _TRANSFER_SPLIT_REFUSAL
+    return None
+
+
+def _hybrid_record(cache: dict[str, Any], runtime_version: str) -> bool:
+    """Whether the record holds hybrid cache evidence of vLLM 0.33.0, which condition 1 requires."""
+    return runtime_version == HYBRID_EVIDENCE_VERSION and runtime_memory._hybrid_evidence(cache)
+
+
+def _record_prefix_caching(cache: dict[str, Any]) -> bool | None:
+    """Whether the worker record comes from a probe phase with prefix caching, or None when it does not say."""
+    phase = cache.get("prefix_caching")
+    value = phase.get("enable_prefix_caching") if isinstance(phase, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def _transfer_outcome(cache: dict[str, Any], runtime_version: str) -> list[int] | str:
+    """The transfer bytes of one worker record, or the text that explains their absence.
+
+    A record without the evidence of condition 1 gives its text first. Then a record of a phase without prefix caching
+    gives _TRANSFER_PHASE_REFUSAL before the other conditions, so that the merge of a role takes its value from the
+    phases with prefix caching alone.
+    """
+    if not _hybrid_record(cache, runtime_version):
+        return _TRANSFER_HYBRID_REFUSAL
+    if _record_prefix_caching(cache) is False:
+        return _TRANSFER_PHASE_REFUSAL
+    refusal = _transfer_shape_refusal(cache, runtime_version)
+    return refusal if refusal is not None else _region_table_bytes(_nixl_region_table(cache))
+
+
+def _nonnegative_int(value: Any) -> bool:
+    """Whether a record value is an integer of zero or more."""
+    return type(value) is int and value >= 0
+
+
+def _transfer_layers(cache: Any) -> dict[str, tuple[int, dict[str, Any]]] | str:
+    """The group index and the spec of each layer of a cache, or the refusal text for its layer specs or allocations."""
+    groups = cache.get("groups") if isinstance(cache, dict) else None
+    allocations = cache.get("tensor_allocations") if isinstance(cache, dict) else None
+    if not isinstance(groups, list) or not isinstance(allocations, list) or not allocations:
+        return _TRANSFER_EVIDENCE_GAP
+    layers: dict[str, tuple[int, dict[str, Any]]] = {}
+    for index, group in enumerate(groups):
+        specs = group.get("layer_specs") if isinstance(group, dict) else None
+        if not isinstance(specs, dict):
+            # A hybrid record holds the spec of every layer (runtime_memory._hybrid_evidence).
+            return _TRANSFER_HYBRID_REFUSAL
+        names = group.get("layer_names")
+        if not isinstance(names, list) or not names:
+            return _TRANSFER_EVIDENCE_GAP
+        for name in names:
+            if not isinstance(name, str):
+                return _TRANSFER_EVIDENCE_GAP
+            spec = specs.get(name)
+            if spec is None:
+                return _TRANSFER_HYBRID_REFUSAL
+            if (
+                not isinstance(spec, dict)
+                or not isinstance(spec.get("spec_type"), str)
+                or not _nonnegative_int(spec.get("page_size_bytes"))
+                or name in layers
+            ):
+                return _TRANSFER_EVIDENCE_GAP
+            layers[name] = (index, spec)
+    for allocation in allocations:
+        if (
+            not isinstance(allocation, dict)
+            or not all(_nonnegative_int(allocation.get(key)) for key in ("offset", "layer_stride", "block_stride"))
+            or not isinstance(allocation.get("layers"), list)
+            or any(not isinstance(name, str) for name in allocation["layers"])
+        ):
+            return _TRANSFER_EVIDENCE_GAP
+    return layers
+
+
+def _state_tensors(state: Any) -> tuple[Any, Any] | None:
+    """The shapes and the data types of the state tensors of a Mamba group, or None without a state."""
+    return (state.get("shapes"), state.get("dtypes")) if isinstance(state, dict) else None
+
+
+def _state_sizes(state: Any) -> list[int] | None:
+    """The bytes of each of the two state tensors of a Mamba group, or None without two known state tensors."""
+    shapes, dtypes = _state_tensors(state) or (None, None)
+    if (
+        not isinstance(shapes, list)
+        or not isinstance(dtypes, list)
+        or len(shapes) != 2
+        or len(dtypes) != 2
+        or any(not isinstance(shape, list) or not all(_nonnegative_int(size) for size in shape) for shape in shapes)
+        or any(not isinstance(dtype, str) or dtype not in _STATE_DTYPE_BYTES for dtype in dtypes)
+    ):
+        return None
+    return [math.prod(shape) * _STATE_DTYPE_BYTES[dtype] for shape, dtype in zip(shapes, dtypes, strict=True)]
+
+
+def _nixl_region_table(cache: dict[str, Any]) -> dict[str, Any]:
+    """The region table of the vLLM 0.33.0 NIXL connector for a ring model with Mamba layers in whole block rows.
+
+    For another cache the result is not the connector's table. It is empty without the layer specs or the allocation
+    plan, or without a Mamba group with two known state tensors.
+    """
+    layers = _transfer_layers(cache)
+    if isinstance(layers, str):
+        return {}
+    groups = cache["groups"]
+    mamba = [
+        group
+        for group in groups
+        if {group["layer_specs"][name]["spec_type"] for name in group["layer_names"]} == {_MAMBA_SPEC}
+    ]
+    sizes = _state_sizes(mamba[0].get("state")) if mamba else None
+    if sizes is None:
+        return {}
+    addresses: list[int] = []
+    lengths: list[int] = []
+    group_ids: list[int] = []
+    names: list[str] = []
+    ssm: list[int] = []
+    scratch: list[int] = []
+    for allocation in cache["tensor_allocations"]:
+        for position, name in enumerate(allocation["layers"]):
+            if name not in layers:  # The connector skips a layer without a spec (bw:1587-1594).
+                continue
+            group, spec = layers[name]
+            kind, page = spec["spec_type"], spec["page_size_bytes"]
+            address = allocation["offset"] + position * allocation["layer_stride"]
+            if address in addresses:
+                region = addresses.index(address)
+                if kind == _MLA_SPEC:
+                    lengths[region] = page
+                if group_ids[region] != group:
+                    group_ids[region] = -1
+            else:
+                region = len(addresses)
+                addresses.append(address)
+                lengths.append(page)
+                group_ids.append(group)
+                names.append(name)
+            marks = ssm if kind == _MAMBA_SPEC else scratch if kind == _RING_SPEC else None
+            if marks is not None and region not in marks:
+                marks.append(region)
+    return {
+        "num_regions": len(addresses),
+        "physical_blocks_per_logical": 1,
+        "group_spec_types": [
+            group["layer_specs"][group["layer_names"][0]]["spec_type"].removeprefix(_SPEC_MODULE) for group in groups
+        ],
+        "block_len_per_layer": lengths,
+        "region_group_ids": group_ids,
+        "region_names": names,
+        "ssm_region_indices": ssm,
+        "scratch_region_indices": sorted(scratch),
+        "mamba_ssm_size": sizes,
+    }
+
+
+def _region_table_bytes(table: dict[str, Any]) -> list[int]:
+    """The bytes that one block of each cache group reads from the regions of a region table."""
+    lengths = table.get("block_len_per_layer", [])
+    values = []
+    for kind in table.get("group_spec_types", []):
+        if kind == _MAMBA_SPEC.removeprefix(_SPEC_MODULE):
+            values.append(len(table["ssm_region_indices"]) * sum(table["mamba_ssm_size"]))
+        elif kind == _RING_SPEC.removeprefix(_SPEC_MODULE):
+            values.append(sum(lengths[region] for region in table["scratch_region_indices"]))
+        else:
+            values.append(sum(lengths))
+    return values
+
+
+def _merged_transfer_bytes(outcomes: list[list[int] | str]) -> list[int] | str:
+    """The transfer bytes of a role from the outcomes of its worker records, or the text that explains their absence."""
+    left = [outcome for outcome in outcomes if outcome != _TRANSFER_PHASE_REFUSAL]
+    if not left:
+        return _TRANSFER_PHASE_REFUSAL
+    texts = [outcome for outcome in left if isinstance(outcome, str)]
+    if texts:
+        return texts[0]
+    if any(outcome != left[0] for outcome in left):
+        return _TRANSFER_VALUES_DIFFER
+    return left[0]
 
 
 def _configuration(
@@ -1503,6 +1868,7 @@ def _configuration(
     capacities, artifacts, launch_artifacts, runtime_artifacts, import_bindings = [], [], [], [], []
     prefix_caching: dict[str, dict[str, Any] | None] = {}
     geometry_differences: list[str] = []
+    transfer_outcomes: list[list[int] | str] = []
     used_paths: set[str] = set()
     for phase in required_phases:
         result = phases[phase]
@@ -1602,6 +1968,7 @@ def _configuration(
                 runtime_memory._resolved_cache_dtype(worker["resolved_config"]),
                 release,
             )
+            transfer_outcomes.append(_transfer_outcome(worker["cache"], release))
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]
             ]
@@ -1639,6 +2006,18 @@ def _configuration(
         if prefix_caching[phase] is not None:
             for _, scheduler in sorted(schedulers.items()):
                 _validate_startup_concurrency(scheduler)
+            # The evidence checks of a vLLM 0.33.0 phase run after the checks above, so a refusal of one of those
+            # keeps its text.
+            runtime_evidence.validate_phase(phase, workers, schedulers, bundle.manifest["runtime"]["source_files"])
+    # The import of one phase writes the transfer bytes only for a phase with prefix caching. Another record gets no
+    # value, and the result gives the reason in its own key, outside the provenance and the profile.
+    transfer_bytes = _merged_transfer_bytes(transfer_outcomes)
+    # The writer never makes an import fail: values that do not cover each cache group once give no value.
+    if not isinstance(transfer_bytes, str) and len(transfer_bytes) != len(normalized):
+        transfer_bytes = _TRANSFER_EVIDENCE_GAP
+    if not isinstance(transfer_bytes, str):
+        for group, value in zip(normalized, transfer_bytes, strict=True):
+            group["transfer_bytes_per_block"] = value
     # The record holds the prefix-caching values of the role's first collection phase that this validation covers.
     record_phase = next(item for item in collection_phases(launch.get("worker_type")) if item in required_phases)
     # Only vLLM 0.33.0 evidence adds these keys. Its records carry prefix caching, which every
@@ -1701,7 +2080,10 @@ def _configuration(
         "and ranks, including padding and permanent reservations.",
     }
     FpmResourceProfile.model_validate(resources)
-    return {"status": "complete", "resources": resources, "diagnostics": [], "provenance": provenance}
+    result = {"status": "complete", "resources": resources, "diagnostics": [], "provenance": provenance}
+    if isinstance(transfer_bytes, str):
+        result["transfer_bytes_reason"] = transfer_bytes
+    return result
 
 
 def validate_observation_phase(

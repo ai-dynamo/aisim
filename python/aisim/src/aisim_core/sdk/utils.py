@@ -14,6 +14,7 @@
 import importlib.resources as pkg_resources
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -23,7 +24,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 import yaml
+from packaging.version import Version
 
+from aisim_core.decoder_config import layout_integer
 from aisim_core.sdk import common
 from aisim_core.sdk.common import (
     ARCHITECTURE_TO_MODEL_FAMILY,
@@ -894,6 +897,418 @@ def _parse_llama4_vision_config(
     )
 
 
+# Gemma4TextConfig defaults for attributes read globally by the vLLM decoder.
+# Its only per-layer reads are head_dim and num_key_value_heads.
+GEMMA4_DEFAULT_INTERMEDIATE_SIZE = 9216
+_GEMMA4_VLLM_GLOBAL_DEFAULTS = {
+    "hidden_size": 2304,
+    "intermediate_size": GEMMA4_DEFAULT_INTERMEDIATE_SIZE,
+    "num_hidden_layers": 30,
+    "num_attention_heads": 8,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "max_position_embeddings": 131_072,
+    "rms_norm_eps": 1e-6,
+    "attention_bias": False,
+    "attention_k_eq_v": False,
+    "sliding_window": 512,
+    "rope_parameters": {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10_000.0},
+        "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1_000_000.0},
+    },
+    "num_kv_shared_layers": 0,
+    "use_double_wide_mlp": False,
+    "num_experts": None,
+    "top_k_experts": None,
+    "moe_intermediate_size": None,
+    "vocab_size": 262_144,
+    "tie_word_embeddings": True,
+    "vocab_size_per_layer_input": 262_144,
+    "hidden_size_per_layer_input": 256,
+    "final_logit_softcapping": None,
+}
+
+# These Gemma4TextConfig fields also exist when omitted from the JSON. SGLang
+# rejects a surviving override of any of them before constructing its decoder.
+_GEMMA4_OTHER_DEFAULTS = {
+    "_auto_class": None,
+    "attribute_map": {},
+    "base_config_key": "",
+    "base_model_ep_plan": {
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+        "layers.*.router": "ep_router",
+        "layers.*.experts.gate_up_proj": "grouped_gemm",
+        "layers.*.experts.down_proj": "grouped_gemm",
+        "layers.*.experts": "moe_tp_experts",
+    },
+    "base_model_fsdp_plan": {
+        "embed_tokens": "free_full_weight",
+        "layers.*": "free_full_weight",
+        "norm": "keep_full_weight",
+    },
+    "base_model_tp_plan": {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
+        "layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+        "layers.*.experts.gate_up_proj": "packed_colwise",
+        "layers.*.experts.down_proj": "rowwise",
+        "layers.*.experts": "moe_tp_experts",
+    },
+    "per_layer_attributes": None,
+    "default_theta": 10000.0,
+    "has_no_defaults_at_init": False,
+    "is_heterogeneous": False,
+    "sub_configs": {},
+    # The inherited pipeline plan contains tuples. JSON arrays never compare equal to them.
+    "base_model_pp_plan": object(),
+    "model_type": "gemma4_text",
+    "architectures": None,
+    "transformers_version": None,
+    "return_dict": True,
+    "output_hidden_states": False,
+    "output_attentions": False,
+    "chunk_size_feed_forward": 0,
+    "is_encoder_decoder": False,
+    "problem_type": None,
+    "allow_global_per_layer_attribute_access": False,
+    "serialize_explicit_per_layer_config": False,
+    "keys_to_ignore_at_inference": ["past_key_values"],
+    "initializer_range": 0.02,
+    "use_cache": True,
+    "pad_token_id": 0,
+    "eos_token_id": 1,
+    "bos_token_id": 2,
+    "attention_dropout": 0.0,
+    "use_bidirectional_attention": None,
+    "enable_moe_block": False,
+}
+
+
+def _gemma4_global_labels_match(config: dict, name: str, value: object, count: int) -> bool:
+    labels = config.get("id2label")
+    if isinstance(labels, dict) and len(labels) == count:
+        if name == "label2id":
+            return value == config.get(name)
+        return value == {int(key): label for key, label in labels.items()}
+    if not isinstance(value, dict) or len(value) != count:
+        return False
+    # Compare with the generated label map without allocating one from an unchecked count.
+    if name == "id2label":
+        return all(value.get(i) == f"LABEL_{i}" for i in range(len(value)))
+    return all(value.get(f"LABEL_{i}") == i for i in range(len(value)))
+
+
+def _check_gemma4_layer_attributes(
+    config: dict,
+    layers: dict[int, dict],
+    types: list[str],
+    backend: str,
+    release: Version | None,
+    validate_inherited_attention: bool,
+    compare_adapter_readers: bool,
+) -> None:
+    # Transformers first removes overrides that equal the effective global attribute.
+    # SGLang flattens only attention geometry. vLLM leaves other overrides attached:
+    # a global read then raises unless the checkpoint explicitly permits that access.
+    defaults = {**_GEMMA4_OTHER_DEFAULTS, **_GEMMA4_VLLM_GLOBAL_DEFAULTS, **config, "layer_types": types}
+    # Transformers 5.17 introduced default_rope_type. vLLM 0.31 ships that reader,
+    # while compatible older wheels still lack the attribute. SGLang 0.5.22 pins 5.19.
+    if release is not None and (
+        (backend == "vllm" and release >= Version("0.31.0rc1") and not compare_adapter_readers)
+        or (backend == "sglang" and release >= Version("0.5.22"))
+    ):
+        defaults.setdefault("default_rope_type", "default")
+    if backend == "vllm" and release is not None and release < Version("0.28.0rc1"):
+        defaults["base_model_fsdp_plan"] = config.get("base_model_fsdp_plan")
+    # Gemma leaves the legacy keyword for PreTrainedConfig's rope_scaling property setter.
+    if "rope_scaling" in config:
+        defaults["rope_parameters"] = config["rope_scaling"]
+    elif defaults["rope_parameters"] is None:
+        defaults["rope_parameters"] = _GEMMA4_VLLM_GLOBAL_DEFAULTS["rope_parameters"]
+    if defaults["use_bidirectional_attention"] == "all":
+        defaults.setdefault("is_causal", False)
+        defaults["sliding_window"] = gemma4_sliding_window(config)
+    # PreTrainedConfig exposes these attributes after loading aliases and initializing label maps.
+    labels = config.get("id2label")
+    defaults.setdefault("num_labels", len(labels) if isinstance(labels, dict) else 2)
+    defaults["name_or_path"] = defaults["_name_or_path"] = config.get("_name_or_path", config.get("name_or_path", ""))
+    defaults["use_return_dict"] = defaults["return_dict"]
+    defaults["output_attentions"] = defaults["_output_attentions"] = config.get(
+        "_output_attentions", defaults["output_attentions"]
+    )
+    defaults["rope_scaling"] = defaults["rope_parameters"]
+    for setting in ("attn_implementation", "experts_implementation"):
+        value = config.get("_" + setting, config.get(setting))
+        if isinstance(value, dict):
+            value = value.get("")
+        defaults["_" + setting] = defaults["_" + setting + "_internal"] = value
+    # Serving converts a global dtype to a torch.dtype. A non-null layer value remains a JSON string.
+    dtype = config.get("dtype") or config.get("torch_dtype")
+    defaults["dtype"] = defaults["torch_dtype"] = None if dtype is None else object()
+
+    global_reads = (_GEMMA4_VLLM_GLOBAL_DEFAULTS.keys() - {"num_experts", "top_k_experts", "moe_intermediate_size"}) | {
+        "layer_types",
+        "attn_logit_softcapping",
+    }
+    if backend == "vllm" and release is not None and release < Version("0.28.0rc1"):
+        defaults.setdefault("global_head_dim", 512)
+        defaults.setdefault("num_global_key_value_heads", None)
+        global_reads.add("global_head_dim")
+        if defaults["attention_k_eq_v"]:
+            global_reads.add("num_global_key_value_heads")
+    else:
+        # From Transformers 5.15 the constructor consumes these legacy kwargs
+        # before attaching per_layer_config, so they cannot satisfy a sparse override.
+        defaults.pop("global_head_dim", None)
+        defaults.pop("num_global_key_value_heads", None)
+    if "sliding_attention" in types and "sliding_attention" not in (defaults["rope_parameters"] or {}):
+        global_reads.add("rope_local_base_freq")
+    expert_layer = False
+    if release is None or release < Version("0.32.0rc0"):
+        global_reads.add("enable_moe_block")
+        if not defaults["enable_moe_block"]:
+            global_reads.add("use_second_mlp_block")
+        expert_layer = defaults["enable_moe_block"] or config.get("use_second_mlp_block")
+    if release is None or release >= Version("0.32.0rc0"):
+        global_reads.add("num_experts")
+        expert_layer = expert_layer or defaults["num_experts"] is not None
+    if expert_layer:
+        global_reads.update(("num_experts", "top_k_experts", "moe_intermediate_size"))
+        # Older constructors evaluate the fallback argument to getattr eagerly.
+        if release is None or release < Version("0.31.0rc1"):
+            global_reads.add("expert_intermediate_size")
+    guarded = not config.get("allow_global_per_layer_attribute_access")
+    for index in range(len(types)):
+        fields = layers.get(index, {})
+        if (
+            (validate_inherited_attention or "attention_chunk_size" in fields or "sliding_window" in fields)
+            and fields.get("attention_chunk_size", config.get("attention_chunk_size")) is not None
+            and fields.get("sliding_window", defaults["sliding_window"]) is not None
+        ):
+            raise ValueError("Gemma 4 per_layer_config cannot combine attention_chunk_size and sliding_window")
+        skip = fields.get("skip", [])
+        if (
+            not isinstance(skip, list)
+            or not all(isinstance(name, str) for name in skip)
+            or (skip and backend == "sglang")
+        ):
+            raise ValueError("Gemma 4 per_layer_config contains an unsupported skip")
+        for name in fields.keys() - {"num_key_value_heads", "head_dim", "skip"}:
+            if name in ("id2label", "label2id"):
+                if _gemma4_global_labels_match(config, name, fields[name], defaults["num_labels"]):
+                    continue
+            elif name not in defaults:
+                # A custom attribute without a global value must be supplied on every layer.
+                if len(layers) != len(types) or any(name not in row for row in layers.values()):
+                    raise ValueError(f"Gemma 4 per_layer_config has no global {name}")
+            elif fields[name] == defaults[name]:
+                continue
+            if backend == "sglang" or (guarded and name in global_reads):
+                raise ValueError(f"{backend} cannot read Gemma 4 per_layer_config override for {name}")
+
+
+def gemma4_sliding_window(config: dict) -> int | None:
+    """Read the serialized Gemma 4 window as its text config constructor does."""
+    window = config.get("sliding_window", 512)
+    if config.get("use_bidirectional_attention") == "all":
+        return layout_integer(window, "sliding_window", minimum=0) // 2 + 1
+    return window
+
+
+def gemma4_cache_requires_release(config: dict, backend: str) -> bool:
+    """Identify Gemma cache fields whose serving semantics changed between releases."""
+    return "per_layer_config" in config or (
+        backend == "sglang"
+        and not config.get("attention_k_eq_v")
+        and config.get("num_global_key_value_heads") not in (None, config.get("num_key_value_heads", 4))
+    )
+
+
+def gemma4_cache_shapes(
+    config: dict,
+    backend: str | None = None,
+    backend_version: str | None = None,
+    *,
+    agreement_tp_size: int = 1,
+    compare_adapter_readers: bool = False,
+    validate_inherited_attention: bool = True,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return the (KV heads, head dimension) of the sliding and full attention pools."""
+
+    def same_rank_shape(first: tuple[int, int], second: tuple[int, int]) -> bool:
+        tp = layout_integer(agreement_tp_size, "tp_size")
+        return (
+            first[1] == second[1]
+            and config.get("num_attention_heads", 8) % tp == 0
+            and all(max(heads, tp) % min(heads, tp) == 0 for heads in (first[0], second[0]))
+            and max(1, first[0] // tp) == max(1, second[0] // tp)
+        )
+
+    has_per_layer_config = "per_layer_config" in config
+    if backend == "vllm":
+        types = config.get("layer_types")
+        sliding = (
+            "sliding_attention" in types[:-1]
+            if isinstance(types, list) and types
+            else config.get("num_hidden_layers", 30) != 1
+        )
+        # PreTrainedConfig applies the legacy setter after Gemma has supplied its RoPE defaults.
+        # Every vLLM attention layer reads the resulting mapping, including a flat checkpoint.
+        rope = config.get("rope_scaling", config.get("rope_parameters"))
+        if ("rope_scaling" in config or rope is not None) and not isinstance(rope, dict):
+            raise ValueError("Gemma 4 vLLM attention requires rope_parameters to be a mapping")
+        if isinstance(rope, dict):
+            # Gemma forces the last layer to full attention. Each resident type selects its own
+            # RoPE mapping when present, otherwise vLLM copies the flat legacy mapping.
+            for kind in ("full_attention", "sliding_attention") if sliding else ("full_attention",):
+                if (kind in rope and not isinstance(rope[kind], dict)) or (
+                    kind not in rope and any(key in rope for key in ("full_attention", "sliding_attention"))
+                ):
+                    raise ValueError(f"Gemma 4 vLLM attention requires rope_parameters.{kind} to be a mapping")
+                effective = rope.get(kind, rope)
+                if any(isinstance(value, dict) for value in effective.values()):
+                    raise ValueError(f"Gemma 4 vLLM attention requires flat rope_parameters for {kind}")
+    heads = config.get("num_key_value_heads", 4)
+    dim = config.get("head_dim", 256)
+    if not (backend == "vllm" and has_per_layer_config):
+        heads = heads or config.get("num_attention_heads")
+        if dim is None:
+            dim = config["hidden_size"] // layout_integer(config["num_attention_heads"], "num_attention_heads")
+    base = (layout_integer(heads, "num_key_value_heads"), layout_integer(dim, "head_dim"))
+    release = common.parse_support_matrix_version(backend_version)
+    if (
+        backend == "sglang"
+        and release is None
+        and not has_per_layer_config
+        and gemma4_cache_requires_release(config, backend)
+        and not same_rank_shape(
+            (layout_integer(config["num_global_key_value_heads"], "num_global_key_value_heads"), base[1]),
+            base,
+        )
+    ):
+        raise ValueError("Gemma 4 cache geometry requires the SGLang release or a runtime profile")
+    compare_flat_readers = compare_adapter_readers and (release is None or release < Version("0.32.0rc0"))
+    flat_sglang = backend == "sglang" and release is not None and release < Version("0.5.22")
+    flat_vllm = backend == "vllm" and release is not None and release < Version("0.28.0rc1")
+    # vLLM 0.27 still reads the global attributes, but its Transformers 5.14 pin
+    # rejects a global read when a per-layer override changes that attribute.
+    guarded_flat_read = (
+        flat_vllm and release >= Version("0.27.0rc1") and not config.get("allow_global_per_layer_attribute_access")
+    )
+    explicit_shapes = None
+    guarded_global_read = not config.get("allow_global_per_layer_attribute_access")
+    if (
+        has_per_layer_config
+        and backend in ("sglang", "vllm")
+        and not flat_sglang
+        and (not flat_vllm or guarded_flat_read)
+    ):
+        overrides = config["per_layer_config"]
+        if overrides is None:
+            overrides = {}
+        layers = layout_integer(config["num_hidden_layers"], "num_hidden_layers")
+        types = config.get("layer_types") or [
+            "sliding_attention" if (i + 1) % 6 else "full_attention" for i in range(layers)
+        ]
+        if not isinstance(overrides, dict) or len(types) != layers:
+            raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
+        by_layer = {}
+        for key, fields in overrides.items():
+            if (
+                not str(key).isascii()
+                or not str(key).isdecimal()
+                or not 0 <= int(key) < layers
+                or int(key) in by_layer
+                or not isinstance(fields, dict)
+            ):
+                raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
+            by_layer[int(key)] = fields
+        types = [*types[:-1], "full_attention"]
+        _check_gemma4_layer_attributes(
+            config, by_layer, types, backend, release, validate_inherited_attention, compare_adapter_readers
+        )
+        if compare_flat_readers and backend == "vllm":
+            # These adapters read KV heads per layer. A 5.14 config may still
+            # read head_dim globally while validating a heterogeneous configuration.
+            guarded_global_read = guarded_global_read and any(
+                fields.get("head_dim", base[1]) != base[1] for fields in by_layer.values()
+            )
+        shapes = {}
+        for i, kind in enumerate(types):
+            fields = by_layer.get(i, {})
+            shape = (
+                layout_integer(fields.get("num_key_value_heads", base[0]), "num_key_value_heads"),
+                layout_integer(fields.get("head_dim", base[1]), "head_dim"),
+            )
+            if guarded_flat_read and shape != base:
+                raise ValueError(f"vLLM {backend_version} cannot read global Gemma 4 heads with per-layer overrides")
+            first = shapes.setdefault(kind, shape)
+            if shape != first:
+                if backend != "vllm" or not same_rank_shape(first, shape):
+                    raise ValueError("AISim requires one Gemma 4 cache geometry per attention layer type")
+                if (release is None or compare_flat_readers) and guarded_global_read:
+                    raise ValueError("Gemma 4 per_layer_config requires the vLLM release or a runtime profile")
+        if not flat_vllm:
+            explicit_shapes = shapes
+    if explicit_shapes is None or release is None or compare_flat_readers:
+        use_flat_sglang_heads = backend == "sglang" and (flat_sglang or release is None)
+        full_heads = (
+            config.get("num_global_key_value_heads")
+            if use_flat_sglang_heads or config.get("attention_k_eq_v")
+            else None
+        )
+        if backend == "vllm" and has_per_layer_config:
+            if flat_vllm and release < Version("0.19.0"):
+                raise ValueError("this vLLM release has no Gemma 4 model")
+            if flat_vllm and config.get("global_head_dim", 512) is None:
+                raise ValueError(f"vLLM {backend_version} needs the flat Gemma 4 global_head_dim")
+            if flat_vllm and config.get("attention_k_eq_v") and full_heads is None:
+                raise ValueError(
+                    "tied Gemma 4 heads require flat num_global_key_value_heads or a per-layer vLLM release"
+                )
+        full_dim = config.get("global_head_dim", 512 if backend in ("sglang", "vllm") else dim)
+        full = (
+            layout_integer(heads if full_heads is None else full_heads, "num_global_key_value_heads"),
+            layout_integer(dim if full_dim is None else full_dim, "global_head_dim"),
+        )
+        # Release-free calls require agreement with the adapter that falls back to the base heads
+        # when an older Transformers config has no global KV head count.
+        if explicit_shapes is not None:
+            for legacy, layered in (
+                (base, explicit_shapes.get("sliding_attention", base)),
+                (full, explicit_shapes["full_attention"]),
+            ):
+                if legacy == layered:
+                    continue
+                # The 5.14 constructor may guard even the validation-time global head
+                # read. When global reads are allowed, compare each viable rank-local pool.
+                if not guarded_global_read and same_rank_shape(legacy, layered):
+                    continue
+                name = "SGLang" if backend == "sglang" else "vLLM"
+                raise ValueError(f"Gemma 4 per_layer_config requires the {name} release or a runtime profile")
+    else:
+        full = explicit_shapes["full_attention"]
+        base = explicit_shapes.get("sliding_attention", full)
+    if backend == "vllm":
+        tp = layout_integer(agreement_tp_size, "tp_size")
+        query_heads = layout_integer(config.get("num_attention_heads", 8), "num_attention_heads")
+        if query_heads % tp:
+            raise ValueError(f"Gemma 4 num_attention_heads {query_heads} must be divisible by tp_size {tp}")
+        for heads, _ in (base, full) if sliding else (full,):
+            if max(heads, tp) % min(heads, tp):
+                raise ValueError(f"Gemma 4 KV heads {heads} cannot shard or replicate evenly at tp_size {tp}")
+    if backend == "sglang" and config.get("v_head_dim") not in (None, 0, full[1]):
+        raise ValueError("asymmetric SGLang Gemma 4 key/value head dimensions require runtime cache geometry")
+    return base, full
+
+
 def _parse_hf_config_json(config: dict) -> dict:
     """
     Convert a HuggingFace config.json dictionary into model configuration parameters.
@@ -1307,6 +1722,8 @@ def _parse_hf_config_json(config: dict) -> dict:
         # Gemma 4 hybrid attention + dense-MLP-plus-MoE FFN. Layer kind per `layer_types`.
         # Q/K/V head_dim and KV-head count differ between SWA and global layers; global
         # layers may set attention_k_eq_v (no v_proj, V reuses K projection output).
+        if "intermediate_size" not in config:
+            inter_size = GEMMA4_DEFAULT_INTERMEDIATE_SIZE
         layer_types_raw = config.get("layer_types", [])
         if len(layer_types_raw) != layers:
             raise ValueError(f"Gemma 4 layer_types length {len(layer_types_raw)} != num_hidden_layers {layers}")
@@ -1314,14 +1731,7 @@ def _parse_hf_config_json(config: dict) -> dict:
             raise ValueError("Gemma 4 layer_types must contain only 'sliding_attention' or 'full_attention'")
         # Dense Gemma 4 variants (e.g. E2B/E4B/31B) leave the global-attention
         # head fields as null; fall back to the model-wide values in that case.
-        swa_num_kv = config["num_key_value_heads"]
-        swa_hd = config["head_dim"]
-        global_num_kv = config.get("num_global_key_value_heads")
-        if global_num_kv is None:
-            global_num_kv = swa_num_kv
-        global_hd = config.get("global_head_dim")
-        if global_hd is None:
-            global_hd = swa_hd
+        (swa_num_kv, swa_hd), (global_num_kv, global_hd) = gemma4_cache_shapes(config)
 
         gemma4_vision_config = None
         if vision_cfg is not None:
@@ -1394,12 +1804,12 @@ def _parse_hf_config_json(config: dict) -> dict:
                 standardize=bool(vision_cfg.get("standardize", False)),
             )
         extra_params = common.Gemma4MixConfig(
-            layer_types=tuple(layer_types_raw),
+            layer_types=(*layer_types_raw[:-1], "full_attention"),
             swa_num_kv_heads=swa_num_kv,
             swa_head_dim=swa_hd,
             global_num_kv_heads=global_num_kv,
             global_head_dim=global_hd,
-            sliding_window_size=config.get("sliding_window", 0),
+            sliding_window_size=gemma4_sliding_window(config) or 0,
             attention_k_eq_v=bool(config.get("attention_k_eq_v", False)),
             use_bidirectional_vision_attention=config.get("use_bidirectional_attention") == "vision",
             vision_config=gemma4_vision_config,
@@ -1453,6 +1863,7 @@ def _parse_hf_config_json(config: dict) -> dict:
         # rejects real checkpoints and silently sizes every sliding layer with the
         # global head count.
         other = config.get("attention_other_setting") or {}
+        n_kv = config.get("num_attention_groups") or n_kv
         swa_n_heads = int(other.get("num_attention_heads", 0) or 0)
         swa_hd_other = int(other.get("head_dim", 0) or 0)
         layer_types_raw = config.get("layer_types", [])
@@ -1864,6 +2275,59 @@ def _get_language_quantization_config(raw_config: dict) -> dict | None:
     return nested.get("quantization_config", {}) if isinstance(nested, dict) else {}
 
 
+def fp8_weight_block_shape(quantization: dict, *, sglang: bool, experts: bool = False) -> tuple[int, int]:
+    """Return the serialized FP8 weight block used by the selected backend."""
+    shape = quantization.get("weight_block_size", [128, 128])
+    if sglang and quantization.get("quant_method") == "mxfp8":
+        shape = [1, 32]  # SGLang's MXFP8 reader fixes both axes even when the checkpoint supplies another shape.
+    if not isinstance(shape, (list, tuple)) or len(shape) != 2 or any(type(n) is not int or n <= 0 for n in shape):
+        kind = "expert " if experts else ""
+        raise ValueError(f"weight_block_size must supply two positive integer {kind}block dimensions")
+    return shape[0], shape[1]
+
+
+def validate_fp8_moe_shard(
+    raw_config: dict,
+    intermediate_size: int,
+    moe_tp_size: int,
+    *,
+    sglang_tp_size: int | None = None,
+    vllm_version: str | None = None,
+    hidden_size: int | None = None,
+    sm_version: int | None = None,
+    quantized_experts: bool = True,
+) -> None:
+    """Check checkpoint blocks against the serving release and rank-local expert dimensions."""
+    shape = fp8_weight_block_shape(
+        _get_language_quantization_config(raw_config) or {}, sglang=sglang_tp_size is not None, experts=True
+    )
+    if not quantized_experts:
+        return
+    shard, remainder = divmod(intermediate_size, moe_tp_size)
+    if remainder:
+        raise ValueError(
+            f"Invalid quantized MoE configuration: moe_intermediate_size={intermediate_size} "
+            f"must be divisible by moe_tp_size={moe_tp_size}."
+        )
+    release = common.parse_support_matrix_version(vllm_version)
+    if (
+        release is not None
+        and release >= Version("0.29.0rc1")
+        and (sm_version is None or sm_version >= 89)
+        and hidden_size
+        and math.gcd(*shape, shard, hidden_size) >= 32
+    ):
+        return  # vLLM can split serialized block scales losslessly down to this common tile.
+    # The row-parallel down projection also shards its input across tensor-parallel ranks.
+    check_down = (sglang_tp_size or 1) > 1 or (release is not None and moe_tp_size > 1)
+    for block in shape if check_down else shape[:1]:
+        if shard % block:
+            raise ValueError(
+                f"Invalid quantized MoE configuration: (moe_intermediate_size={intermediate_size} / "
+                f"moe_tp_size={moe_tp_size}) % weight_block_size={block} != 0."
+            )
+
+
 def _infer_quantization_fields(raw_config: dict) -> dict[str, object]:
     """Infer quant_method, kv_cache_quant_method, and quant_dynamic from config."""
     quant_cfg = _get_language_quantization_config(raw_config)
@@ -1973,43 +2437,32 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
 
 
 @cache
-def _load_model_config_from_model_path(model_path: str) -> dict:
-    """
-    Get model configuration from model path.
-
-    The model_path can be:
-    1. A HuggingFace model path (e.g., "Qwen/Qwen3-32B")
-    2. A local directory path containing config.json
-
-    Args:
-        model_path: HuggingFace model path or local directory path
-
-    Returns:
-        dict: Raw model configuration dictionary
-
-    Raises:
-        ValueError: If the model config cannot be found
-        HuggingFaceDownloadError: If fetching from HuggingFace fails
-    """
-    # Check if it's a local path
+def _load_model_config_documents(model_path: str) -> tuple[dict, dict]:
+    """Load the timing parser's normalized metadata and the original checkpoint declaration together."""
     if os.path.isdir(model_path):
         config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
-        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
-
-    # Otherwise treat as HuggingFace path
-    if model_path in DefaultHFModels:
+        sidecar = _load_local_quant_config(model_path)
+    elif model_path in DefaultHFModels:
         config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
-        return _attach_inferred_quant_fields(
-            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
-        )
+        sidecar = _load_pre_downloaded_hf_quant_config(model_path)
+    else:
+        config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+        try:
+            sidecar = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
+        except Exception as exc:  # best-effort for optional quant config
+            logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
+            sidecar = None
+    checkpoint = {**config, "hf_quant_config": sidecar} if sidecar is not None else config
+    normalized = _attach_inferred_quant_fields(_attach_hf_quant_config(dict(config), sidecar))
+    return normalized, checkpoint
 
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
-    try:
-        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
-    except Exception as exc:  # best-effort for optional quant config
-        logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
-        hf_quant_config = None
-    return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+
+def _load_model_config_from_model_path(model_path: str) -> dict:
+    """Get normalized model metadata from a local directory, bundled config or Hugging Face."""
+    return _load_model_config_documents(model_path)[0]
+
+
+_load_model_config_from_model_path.cache_clear = _load_model_config_documents.cache_clear
 
 
 @cache

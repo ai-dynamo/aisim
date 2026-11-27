@@ -55,6 +55,16 @@ def _restore_root_logger():
     root.setLevel(level)
 
 
+@pytest.fixture(autouse=True)
+def _no_vllm_batch_invariant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run every test without VLLM_BATCH_INVARIANT in the environment.
+
+    Slurm passes the collector's setting into a vLLM probe. Tests that exercise its integer syntax and
+    runtime effects set the value explicitly.
+    """
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+
+
 @pytest.fixture
 def raw_data_coordinates(monkeypatch: pytest.MonkeyPatch) -> None:
     """Admit perf-data versions outside the queryable slots.

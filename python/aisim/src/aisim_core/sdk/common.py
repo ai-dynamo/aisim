@@ -11,7 +11,7 @@ from importlib import resources as pkg_resources
 
 from packaging.version import InvalidVersion, Version
 
-from aisim_core.decoder_config import LLM_CONFIG_WRAPPERS
+from aisim_core.decoder_config import LLM_CONFIG_WRAPPERS, TEXT_CONFIG_WRAPPERS
 from aisim_core.quantization import CommQuantMode as CommQuantMode
 from aisim_core.quantization import FMHAQuantMode as FMHAQuantMode
 from aisim_core.quantization import GEMMQuantMode as GEMMQuantMode
@@ -448,6 +448,15 @@ class DeepSeekV4Config:
 def indexer_cache_entry_bytes(index_head_dim: int) -> int:
     """Bytes per token in the FP8 indexer KV cache, including one scale per 128 values."""
     return index_head_dim + ((index_head_dim + 127) // 128) * 4
+
+
+def dsa_kv_cache_entry_bytes(kv_lora_rank: int, rope_dim: int, index_dim: int, kv_dtype_bytes: float) -> float:
+    """One DSA layer stores its latent, BF16 RoPE and scaled FP8 index key on each rank."""
+    return (
+        kv_lora_rank * kv_dtype_bytes
+        + rope_dim * GEMMQuantMode.bfloat16.value.memory
+        + indexer_cache_entry_bytes(index_dim)
+    )
 
 
 def deepseek_v4_indexer_cache_entry_bytes(index_head_dim: int) -> float:
@@ -927,26 +936,9 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
 # Multimodal architectures whose LLM config lives under a nested key (e.g. "text_config").
 # _parse_hf_config_json will flatten these before parsing.
 MULTIMODAL_TEXT_CONFIG_KEY = {
-    # FPM config intake reads these wrappers without importing the SDK, so the set lives in decoder_config.
+    # FPM config intake reads these wrappers without importing the SDK, so both sets live in decoder_config.
     **dict.fromkeys(LLM_CONFIG_WRAPPERS, "llm_config"),
-    "DeepseekV41ForCausalLM": "text_config",
-    "Glm5NextForConditionalGeneration": "text_config",
-    "KimiK25ForConditionalGeneration": "text_config",
-    "KimiK3ForConditionalGeneration": "text_config",
-    # Step-3.7/3.5-Flash ship a vision tower and nest the whole decoder under
-    # text_config; without this the parser reads the top level and rejects real
-    # checkpoints for having no num_hidden_layers.
-    "Step3p7ForConditionalGeneration": "text_config",
-    "Step3p7FlashForCausalLM": "text_config",
-    "Llama4ForConditionalGeneration": "text_config",
-    "Qwen3_5ForConditionalGeneration": "text_config",
-    "Qwen3_5MoeForConditionalGeneration": "text_config",
-    "Gemma4ForConditionalGeneration": "text_config",
-    "MuseGlimmerForConditionalGeneration": "text_config",
-    "Qwen3VLForConditionalGeneration": "text_config",
-    "Qwen3VLMoeForConditionalGeneration": "text_config",
-    "MiniMaxM3SparseForConditionalGeneration": "text_config",
-    "Mistral3ForConditionalGeneration": "text_config",
+    **dict.fromkeys(TEXT_CONFIG_WRAPPERS, "text_config"),
 }
 
 # Architectures whose speculative decoding is DSPARK-style: ``nextn`` is the

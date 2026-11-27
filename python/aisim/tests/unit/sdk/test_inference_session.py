@@ -198,7 +198,10 @@ def _build_mock_backend():
 def _patch_get_model(monkeypatch):
     """Replace ``models.get_model`` so no real model files are needed."""
 
-    def _fake_get_model(model_path, model_config, backend_name):
+    versions = []
+
+    def _fake_get_model(model_path, model_config, backend_name, database):
+        versions.append((backend_name, database.version))
         m = MagicMock()
         m._tp = model_config.tp_size
         m._pp = model_config.pp_size
@@ -209,6 +212,7 @@ def _patch_get_model(monkeypatch):
         "aisim.sdk.inference_session.models.get_model",
         _fake_get_model,
     )
+    return versions
 
 
 @pytest.fixture
@@ -225,9 +229,9 @@ def model_config():
 def disagg_session():
     """DisaggInferenceSession backed by mock backends / databases."""
     return DisaggInferenceSession(
-        prefill_database=MagicMock(),
+        prefill_database=MagicMock(version="0.5.21"),
         prefill_backend=_build_mock_backend(),
-        decode_database=MagicMock(),
+        decode_database=MagicMock(version="0.5.23"),
         decode_backend=_build_mock_backend(),
     )
 
@@ -435,7 +439,7 @@ class TestRequireSameTPFiltering:
                 f"require_same_tp=True but found mismatched rows:\n{mismatched[['(p)tp', '(d)tp']]}"
             )
 
-    def test_run_disagg_carries_per_ops_source(self, disagg_session, runtime_config, model_config):
+    def test_run_disagg_carries_per_ops_source(self, disagg_session, runtime_config, model_config, _patch_get_model):
         result = disagg_session.run_disagg(
             model_path="test-model",
             runtime_config=runtime_config,
@@ -447,6 +451,7 @@ class TestRequireSameTPFiltering:
             decode_num_worker=1,
         )
 
+        assert _patch_get_model == [("sglang", "0.5.21"), ("sglang", "0.5.23")]
         assert result.get_per_ops_source() == {
             "encoder": {"encoder_attention": "mixed"},
             "prefill": {"context_attention": "silicon"},

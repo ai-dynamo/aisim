@@ -68,6 +68,49 @@ def test_patch_release_gets_no_bundled_probe_observer(tmp_path):
         runtime_probe.probe_runtime(literal, output_dir=tmp_path / "execute", execute=True)
 
 
+def test_detected_versions_are_read_after_the_launch_sources_for_each_configuration(tmp_path):
+    import json
+
+    from collector.fpm_forward import runtime_probe
+
+    def missing(version):
+        return rf"^no bundled runtime observer for vLLM {version}; provide campaign-local --instrumentation$"
+
+    def launch(label, runtime=None):
+        identity = {"framework_version": label}
+        if runtime is not None:
+            identity["runtime_framework_version"] = runtime
+        return {"identity": identity}
+
+    one_version = "^bundled instrumentation selection requires one pinned runtime version$"
+    # The runtime version of the launch identity comes before a detected version.
+    with pytest.raises(ValueError, match=missing(r"0\.33\.1")):
+        runtime_probe.probe_runtime(
+            {"a": launch("0.33.1", "0.33.1")}, output_dir=tmp_path / "s1", detected_versions={"a": "0.33.2"}
+        )
+    # The bundle of the requested version comes before a detected version.
+    runtime_probe.probe_runtime({"a": launch("0.33.0")}, output_dir=tmp_path / "s2", detected_versions={"a": "0.33.1"})
+    saved = json.loads((tmp_path / "s2" / "probe-plan.json").read_text())
+    assert saved["bundle_sha256"] == bundled_instrumentation("0.33.0").sha256
+    # A preview reads a detected version too.
+    with pytest.raises(ValueError, match=missing(r"0\.33\.1")):
+        runtime_probe.probe_runtime(
+            {"a": launch("0.33.1")}, output_dir=tmp_path / "s3", detected_versions={"a": "0.33.1"}
+        )
+    # Each configuration reads its own detected version.
+    both = {"a": launch("0.33.1"), "b": launch("0.33.1")}
+    with pytest.raises(ValueError, match=missing(r"0\.33\.1")):
+        runtime_probe.probe_runtime(
+            both, output_dir=tmp_path / "s4", execute=True, detected_versions={"a": "0.33.1", "b": "0.33.1"}
+        )
+    # Two detected versions meet the one-version refusal before the bundle of the selected version is looked up.
+    other = {"a": launch("0.33.1"), "b": launch("0.33.2")}
+    with pytest.raises(ValueError, match=one_version):
+        runtime_probe.probe_runtime(
+            other, output_dir=tmp_path / "s5", execute=True, detected_versions={"a": "0.33.1", "b": "0.33.2"}
+        )
+
+
 @pytest.mark.parametrize("version", ["0.27.0", "0.28.0", "0.33.0"])
 def test_frozen_scheduler_export_preserves_native_benchmark_contract(tmp_path, monkeypatch, version):
     import importlib
@@ -288,8 +331,14 @@ def _v033_runtime(storage, layout, blocks):
         )
 
     if layout == "attention":
+        # A FullAttentionSpec has one token per state by default (kv_cache_interface.py:569).
         full = spec(
-            "FullAttentionSpec", block_size=16, page_size_bytes=4096, sliding_window=None, dtype="torch.bfloat16"
+            "FullAttentionSpec",
+            block_size=16,
+            page_size_bytes=4096,
+            sliding_window=None,
+            dtype="torch.bfloat16",
+            tokens_per_state=1,
         )
         groups = [group(["layer0"], full)]
         layers = {
@@ -607,8 +656,9 @@ def _fake_campaign(
     context = 1_048_576 if layout == "glm_tp4" else 4096
     config.model_config.max_model_len = context
     storage = _Storage(1024, blocks * page * (2 if packed else 1))
-    # The profiled allowance of the live GLM record.
-    available = 185_140_872_090 if layout == "glm_tp4" else storage.size + page
+    # The profiled allowance of the live GLM record. Otherwise the largest allowance that holds exactly the allocated
+    # blocks: vLLM sets the count of one worker to its allowance over the block bytes.
+    available = 185_140_872_090 if layout == "glm_tp4" else storage.size + page - 1
 
     class Tensor:
         def __init__(self, offset=0):
@@ -1486,7 +1536,11 @@ def test_v033_glm_records_import_complete(tmp_path, monkeypatch):
             assert [state["blocks_per_request"] for state in states] == [1] * 4
     result = validate_observations(tmp_path / "observations.json", {"worker": campaign.launch})["worker"]
     assert result["status"] == "complete", result["diagnostics"]
-    assert result["resources"]["cache_groups"] == glm_tp4_cache_groups()
+    expected = glm_tp4_cache_groups()
+    for group in expected:
+        del group["transfer_bytes_per_block"]
+    assert result["resources"]["cache_groups"] == expected
+    assert "source" in result["transfer_bytes_reason"]
     memory = result["resources"]["runtime_memory"]
     assert memory["kv_cache_bytes"] == 13_696 * 13_516_800
     assert (memory["enable_prefix_caching"], memory["mamba_cache_mode"], memory["hash_block_size_tokens"]) == (
@@ -1494,6 +1548,50 @@ def test_v033_glm_records_import_complete(tmp_path, monkeypatch):
         "align",
         2176,
     )
+
+
+@pytest.mark.parametrize("layout,patch_source", [("DS", False), ("SD", False), ("DS", True)])
+def test_v033_worker_checks_installed_nixl_source_and_native_state_split(tmp_path, monkeypatch, layout, patch_source):
+    import hashlib
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    campaign = _glm_campaign(tmp_path, monkeypatch)
+    observer = sys.modules["instrumentation.observer"]
+    source = "vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py"
+    path = campaign.site / source
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"test connector")
+    expected = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setattr(observer.legacy, "NIXL_TRANSFER_SOURCE_HASHES", {source: expected})
+    if patch_source:
+        path.write_bytes(b"patched test connector")
+    mamba_utils = ModuleType("vllm.model_executor.layers.mamba.mamba_utils")
+    mamba_utils.get_conv_state_layout = lambda: layout
+    monkeypatch.setitem(sys.modules, mamba_utils.__name__, mamba_utils)
+    split_utils = ModuleType("vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils")
+    spec = next(iter(campaign.cache.kv_cache_groups[0].kv_cache_spec.kv_cache_specs.values()))
+    spec.tp_replicated = False
+    if layout == "DS":
+        spec.shapes = ((6144, 3), (16, 128, 128))
+
+    def native_split(actual, tp):
+        assert layout == "DS" and not patch_source and actual is spec and tp == 1
+        return SimpleNamespace(local_conv_dim=6144, conv_rows=3, ssm_sizes=(36_864, 1_048_576))
+
+    split_utils.derive_mamba_conv_split = native_split
+    monkeypatch.setitem(sys.modules, split_utils.__name__, split_utils)
+    worker = next(record for record in campaign.run() if record["kind"] == "worker")
+    evidence = worker["cache"]["nixl_transfer"]
+    assert evidence["source_files"] == {source: hashlib.sha256(path.read_bytes()).hexdigest()}
+    if patch_source:
+        assert "conv_state_layout" not in evidence
+    else:
+        assert evidence["conv_state_layout"] == layout
+    if layout == "DS" and not patch_source:
+        assert (evidence["conv_shape"], evidence["state_bytes"]) == ([6144, 3], [36_864, 1_048_576])
+    else:
+        assert "state_bytes" not in evidence
 
 
 def test_v033_missing_mamba_startup_method_leaves_evidence_unresolved(tmp_path, monkeypatch):

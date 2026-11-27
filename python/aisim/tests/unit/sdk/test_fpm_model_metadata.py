@@ -4,7 +4,7 @@
 """The decoder key that FPM config intake, the FPM collector and the FPM profile check share.
 
 The file also pins the nested-decoder rule: a decoder that holds a decoder key is ambiguous. A decoder under the key
-must also be a nonempty object.
+must also be a nonempty object. A registered wrapper that holds only the other decoder key is refused too.
 """
 
 from __future__ import annotations
@@ -15,7 +15,13 @@ import sys
 
 import pytest
 
-from aisim_core.decoder_config import LLM_CONFIG_WRAPPERS, decoder_config_problem, nested_decoder_ambiguity
+from aisim_core.decoder_config import (
+    LLM_CONFIG_WRAPPERS,
+    TEXT_CONFIG_WRAPPERS,
+    decoder_config_problem,
+    nested_decoder_ambiguity,
+    wrapper_key_problem,
+)
 from aisim_core.sdk.common import MULTIMODAL_TEXT_CONFIG_KEY
 from aisim_core.sdk.fpm_model_metadata import decoder_config_key
 
@@ -87,11 +93,35 @@ def test_decoder_config_key(document, key):
     assert decoder_config_key(document) == key
 
 
+# The key of each registered wrapper, stated apart from the two sets that the registry is built from.
+_WRAPPER_KEYS = {
+    "DeepseekV41ForCausalLM": "text_config",
+    "Gemma4ForConditionalGeneration": "text_config",
+    "Glm5NextForConditionalGeneration": "text_config",
+    "KimiK25ForConditionalGeneration": "text_config",
+    "KimiK3ForConditionalGeneration": "text_config",
+    "Llama4ForConditionalGeneration": "text_config",
+    "MiniMaxM3SparseForConditionalGeneration": "text_config",
+    "Mistral3ForConditionalGeneration": "text_config",
+    "MuseGlimmerForConditionalGeneration": "text_config",
+    "NemotronH_Omni_Reasoning_V3": "llm_config",
+    "Qwen3VLForConditionalGeneration": "text_config",
+    "Qwen3VLMoeForConditionalGeneration": "text_config",
+    "Qwen3_5ForConditionalGeneration": "text_config",
+    "Qwen3_5MoeForConditionalGeneration": "text_config",
+    "Step3p7FlashForCausalLM": "text_config",
+    "Step3p7ForConditionalGeneration": "text_config",
+}
+
+
 def test_the_registry_maps_wrappers_only_to_keys_that_the_helper_orders():
     # The helper orders only these two keys, so a third key would go unseen. It reads the llm_config wrappers from
     # LLM_CONFIG_WRAPPERS, so the registry must map exactly those wrappers to llm_config.
     assert set(MULTIMODAL_TEXT_CONFIG_KEY.values()) <= {"text_config", "llm_config"}
     assert {name for name, key in MULTIMODAL_TEXT_CONFIG_KEY.items() if key == "llm_config"} == LLM_CONFIG_WRAPPERS
+    assert {name for name, key in MULTIMODAL_TEXT_CONFIG_KEY.items() if key == "text_config"} == TEXT_CONFIG_WRAPPERS
+    assert not LLM_CONFIG_WRAPPERS & TEXT_CONFIG_WRAPPERS
+    assert MULTIMODAL_TEXT_CONFIG_KEY == _WRAPPER_KEYS
 
 
 def test_the_decoder_key_of_a_registered_wrapper_loads_no_sdk_module():
@@ -105,6 +135,73 @@ def test_the_decoder_key_of_a_registered_wrapper_loads_no_sdk_module():
     )
     document = json.dumps({"architectures": [_VL], **_BOTH_KEYS})
     result = subprocess.run([sys.executable, "-c", probe, document], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+_QWEN = "Qwen3_5MoeForConditionalGeneration"
+
+
+@pytest.mark.parametrize(
+    ("document", "problem"),
+    [
+        (
+            {"architectures": [_VL], "text_config": _DECODER},
+            f"{_VL} keeps its text decoder under llm_config, but this config holds text_config and no llm_config",
+        ),
+        (
+            {"architectures": [_VL], "text_config": None},
+            f"{_VL} keeps its text decoder under llm_config, but this config holds text_config and no llm_config",
+        ),
+        (
+            {"architectures": [_QWEN], "llm_config": _DECODER},
+            f"{_QWEN} keeps its text decoder under text_config, but this config holds llm_config and no text_config",
+        ),
+        # A null or empty llm_config is not held, so the config of a text_config wrapper stays flat.
+        ({"architectures": [_QWEN], "llm_config": None}, None),
+        ({"architectures": [_QWEN], "llm_config": {}}, None),
+        ({"architectures": [_QWEN], "hidden_size": 16}, None),
+        ({"architectures": [_VL], **_BOTH_KEYS}, None),
+        ({"architectures": [_QWEN], **_BOTH_KEYS}, None),
+        ({"architectures": [_WRAPPER], "llm_config": _DECODER}, None),
+        ({"architectures": _VL, "text_config": _DECODER}, None),
+        ({"text_config": _DECODER}, None),
+        # The wrapper is the first architecture.
+        (
+            {"architectures": [_QWEN, _WRAPPER], "llm_config": _DECODER},
+            f"{_QWEN} keeps its text decoder under text_config, but this config holds llm_config and no text_config",
+        ),
+        ({"architectures": [_WRAPPER, _QWEN], "llm_config": _DECODER}, None),
+        # A first architecture that is no string names no wrapper.
+        ({"architectures": [{"name": _VL}], "text_config": _DECODER}, None),
+    ],
+)
+def test_wrapper_key_problem(document, problem):
+    assert wrapper_key_problem(document) == problem
+
+
+def test_every_registered_wrapper_refuses_the_other_decoder_key():
+    assert len(_WRAPPER_KEYS) == 16
+    for wrapper, own in _WRAPPER_KEYS.items():
+        other = "llm_config" if own == "text_config" else "text_config"
+        assert wrapper_key_problem({"architectures": [wrapper], other: _DECODER}) == (
+            f"{wrapper} keeps its text decoder under {own}, but this config holds {other} and no {own}"
+        )
+
+
+def test_the_wrapper_key_problem_of_a_registered_wrapper_loads_no_sdk_module():
+    # FPM config intake must stay usable in a process that does not import aisim_core.sdk.
+    probe = (
+        "import json, sys\n"
+        "from aisim_core.decoder_config import wrapper_key_problem\n"
+        "assert wrapper_key_problem(json.loads(sys.argv[1])) == sys.argv[2]\n"
+        "loaded = [name for name in sys.modules if name.startswith('aisim_core.sdk')]\n"
+        "assert not loaded, loaded\n"
+    )
+    document = json.dumps({"architectures": [_QWEN], "llm_config": _DECODER})
+    problem = f"{_QWEN} keeps its text decoder under text_config, but this config holds llm_config and no text_config"
+    result = subprocess.run(
+        [sys.executable, "-c", probe, document, problem], capture_output=True, text=True, timeout=15
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 

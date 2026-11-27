@@ -728,12 +728,22 @@ def compile_engine(
         and model_config.fmha_quant_mode == common.FMHAQuantMode.bfloat16
     ):
         resolve_trtllm_mla_compute(model_config, model_path, backend, load_system_spec(system, systems_path))
+    database = _maybe_load_database(
+        system,
+        backend,
+        literal_version,
+        systems_path,
+        database_mode,
+        shared_layer,
+        transfer_policy,
+        strict_provenance,
+    )
     if afd_pool_role is None:
-        model = get_model(model_path, model_config, backend)
+        model = get_model(model_path, model_config, backend, literal_version, database=database)
     else:
         from aisim_core.sdk.models.afd import build_afd_model
 
-        model = build_afd_model(model_path, model_config, backend, afd_pool_role)
+        model = build_afd_model(model_path, model_config, backend, afd_pool_role, literal_version)
     if deployment is not None and forward_model == "fpm":
         from aisim_core.sdk.fpm_identity import LEGACY_EXECUTION_IDENTITY
 
@@ -745,16 +755,6 @@ def compile_engine(
                 raise InvalidEngineConfigurationError(
                     "registered SOL construction does not preserve the requested FPM profile identity"
                 )
-    database = _maybe_load_database(
-        system,
-        backend,
-        literal_version,
-        systems_path,
-        database_mode,
-        shared_layer,
-        transfer_policy,
-        strict_provenance,
-    )
 
     spec_json = build_engine_spec_json(
         model,

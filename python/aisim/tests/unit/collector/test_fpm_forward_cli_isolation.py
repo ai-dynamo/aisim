@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from collector.fpm_forward.config import add_fpm_generator_arguments, reject_fpm_arguments_without_fpm
-from collector.fpm_forward.entry import _load_generator_overrides, resolve_inputs, run_resolved
+from collector.fpm_forward.entry import _load_generator_overrides, resolve_inputs, resolve_run_inputs, run_resolved
 
 pytestmark = pytest.mark.unit
 
@@ -309,6 +309,18 @@ def test_generator_arguments_without_fpm_op_fail_closed(tmp_path):
     assert "require --ops fpm_forward" in completed.stderr
     assert "--namespace" in completed.stderr
     assert "Traceback" not in completed.stderr
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_run_inputs_refuse_a_cell_limit_below_one_before_a_plan_is_resolved(monkeypatch, limit):
+    resolved = []
+    monkeypatch.setattr("collector.fpm_forward.entry.resolve_inputs", lambda *inputs: resolved.append(inputs) or "plan")
+    with pytest.raises(ValueError, match="^fpm_forward --limit must be a positive cell count$"):
+        resolve_run_inputs(SimpleNamespace(limit=limit, smoke=True), None)
+    assert resolved == []
+    # A limit of one cell is the smallest that resolves.
+    assert resolve_run_inputs(SimpleNamespace(limit=1, smoke=True), None) == "plan"
+    assert len(resolved) == 1
 
 
 def test_resolved_execution_preserves_runtime_failure(monkeypatch):

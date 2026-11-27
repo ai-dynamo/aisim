@@ -86,6 +86,24 @@ It is exported by both `aisim_core.sdk.models` and the legacy
 context-op identities through these callers, including `KVCacheEstimator.from_request()`,
 for inferred precision and explicit FP8 overrides.
 
+For Gemma 4, a numeric `backend_version` passed to `get_model()` selects the
+standard serving release. vLLM 0.28, 0.29, 0.30, and 0.31 test their CUDA
+builds with Transformers 5.15.0, 5.15.0, 5.16.1, and 5.17.0 respectively.
+Their Gemma adapters also support older Transformers installations that can
+read a serialized checkpoint differently. The three-argument SDK call requires
+the readers to agree. Config-only transfer and capacity estimates require the
+measured stock CUDA or XPU image for the selected system when those readers
+disagree on a rank's cache layout. Retained measurements identify the image
+through the runtime recorded on each event or inherited from its collection.
+The official XPU images install the Transformers version pinned in
+their release's test requirements. A runtime profile can supply the geometry
+of a custom deployment. The XPU 0.28 [Dockerfile](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/docker/Dockerfile.xpu)
+installs the [5.15.0 pin](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/requirements/test/xpu.txt).
+See the upstream CUDA pins for [0.28](https://github.com/vllm-project/vllm/blob/2cf0a6915ce544dc493a0990f2ea38d81601128a/requirements/test/cuda.in),
+[0.29](https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/requirements/test/cuda.in),
+[0.30](https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/requirements/test/cuda.in),
+and [0.31](https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/requirements/test/cuda.in).
+
 ### `create()` Classmethod
 
 Each model class has a `create(cls, model_info, model_config, backend_name)` classmethod that handles construction. Per-family construction details (MoE prefix args, post-construction hooks like `set_hybrid_config`) live inside `create()`, keeping `get_model()` itself generic.

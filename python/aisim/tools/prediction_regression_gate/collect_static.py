@@ -134,7 +134,7 @@ def collect_combo(combo: grid.Combo) -> tuple[grid.Combo, list[dict], float]:
                     model_config = _build_model_config(
                         tp, pp, adp, moe_tp, moe_ep, gemm_quant, None, None, moe_quant if is_moe else None, None
                     )
-                    model = get_model(model_name, model_config, combo.backend)
+                    model = get_model(model_name, model_config, combo.backend, database.version)
                     session = InferenceSession(model, database, backend)
                 except Exception as e:  # config invalid for this model/backend: whole block INVALID
                     build_err = e

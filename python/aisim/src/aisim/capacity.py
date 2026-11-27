@@ -573,6 +573,7 @@ def estimate_kv_bytes_per_token(
     system: str | None = None,
     backend: str = "vllm",
     backend_version: str | None = None,
+    systems_paths: list[str] | None = None,
     attention_dp_size: int = 1,
 ) -> int:
     """Derive per-rank KV bytes/token from the resolved Hugging Face config."""
@@ -606,30 +607,23 @@ def estimate_kv_bytes_per_token(
         moe_tp_size=moe_tp_size,
         moe_ep_size=moe_ep_size,
         allow_hf_config_download=True,
+        backend=backend,
+        backend_version=backend_version,
+        system=system,
+        systems_paths=systems_paths,
     )
     kvcache_quant_mode = _quant_mode_name("kvcache", kvcache_quant_mode)
     if getattr(estimator, "architecture", None) == "DeepseekV4ForCausalLM":
         # The dense formula prices every layer's full BF16 KV (88 KiB/token for V4 Flash). V4 stores
         # FP8 compressed KV (ratio 4 and 128 layers) plus the indexer K; its sliding-window rows are a
         # fixed per-request state, not token bytes. Replicated on every TP rank.
-        from aisim_core.sdk.memory.deepseek_v4 import deepseek_v4_state_cache
-        from aisim_core.sdk.models import _get_model_info
-
         if kvcache_quant_mode not in (None, "fp8"):
             raise ValueError("DeepSeek V4 stores fp8_ds_mla KV; use kvcache_quant_mode fp8")
-        geometry = _get_model_info(model_name)["extra_params"]
-        return int(deepseek_v4_state_cache(geometry, indexer_cache_dtype="auto")["kv_bytes_per_token"])
+        if kvcache_quant_mode is not None:
+            estimator.set_kvcache_quant_mode(kvcache_quant_mode)
+        return int(estimator.kv_bytes_per_token())
     if kvcache_quant_mode is not None:
-        from aisim_core.sdk.common import KVCacheQuantMode
-
-        # V4 is refused above; V4.1's compressed cache has no kv_lora_rank.
-        latent = estimator.geometry.get("kv_lora_rank") or estimator.architecture == "DeepseekV41ForCausalLM"
-        if kvcache_quant_mode == "nvfp4" and latent:
-            raise ValueError(f"{model_name}: an nvfp4 KV cache is modeled only for standard K/V attention")
-        try:
-            estimator.dtype_bytes = KVCacheQuantMode[kvcache_quant_mode].value.memory
-        except KeyError as exc:
-            raise ValueError(f"unsupported kvcache_quant_mode {kvcache_quant_mode!r}") from exc
+        estimator.set_kvcache_quant_mode(kvcache_quant_mode)
     value = estimator.kv_bytes_per_token()
     if value is None or value <= 0:
         raise ValueError(f"could not derive KV bytes per token for model {model_name!r}")
@@ -640,13 +634,15 @@ def estimate_kv_bytes_per_token(
 def resolve_model_context_length(model_name: str) -> int:
     """Resolve ``context_length: max`` from a local, cached, or HF config."""
 
-    from aisim_core.decoder_config import decoder_config_key, decoder_config_problem
+    from aisim_core.decoder_config import decoder_config_key, decoder_config_problem, wrapper_key_problem
     from aisim_core.sdk.memory import NaiveKVCacheEstimator
 
     # Both modules ship in the same distribution; reuse the canonical loader.
     config = NaiveKVCacheEstimator._load_config(model_name, allow_hf_config_download=True)
     if not isinstance(config, dict):
         raise ValueError(f"could not load Hugging Face config for {model_name!r}")
+    if (problem := wrapper_key_problem(config)) is not None:
+        raise ValueError(f"Hugging Face config for {model_name!r}: {problem}")
     key = decoder_config_key(config)
     decoder = config.get(key)
     if key is not None and (problem := decoder_config_problem(key, decoder)) is not None:

@@ -36,7 +36,16 @@ from typing import Any
 import yaml
 
 from aisim import quantization
-from aisim.fpm_cache_layout import cache_layout_markers, recognized_layer_types
+from aisim.fpm_cache_layout import (
+    LAYER_COUNT_FIELDS,
+    attn_type_list,
+    cache_layout_markers,
+    cache_window,
+    check_marker_layout_declarations,
+    layer_types,
+    layout_integer,
+    recognized_layer_types,
+)
 from aisim.fpm_profile import FpmCacheGroup, FpmModelProfile
 
 from .schema import SupportRequest
@@ -116,18 +125,6 @@ _INKLING_CACHE_SOURCE = (
     "vllm/models/inkling/nvidia/sconv_swa_attn.py"
 )
 
-_ARCHITECTURES = {
-    "llama": "LlamaForCausalLM",
-    "mistral": "MistralForCausalLM",
-    "mixtral": "MixtralForCausalLM",
-    "qwen2": "Qwen2ForCausalLM",
-    "qwen3": "Qwen3ForCausalLM",
-    "qwen3_moe": "Qwen3MoeForCausalLM",
-    "minimax_m2": "MiniMaxM2ForCausalLM",
-    "glm_moe_dsa": "GlmMoeDsaForCausalLM",
-    "deepseek_v3": "DeepseekV3ForCausalLM",
-    "deepseek_v32": "DeepseekV32ForCausalLM",
-}
 _DENSE = frozenset(("LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"))
 _FULL_ATTENTION = _DENSE | {"MixtralForCausalLM", "Qwen3MoeForCausalLM", "MiniMaxM2ForCausalLM"}
 # MLA/DSA decoders: intake asks for their cache accounting instead of leaving it to the runtime probe.
@@ -137,7 +134,7 @@ _EXPERT_ALIASES = ("num_local_experts", "n_routed_experts", "num_experts")
 _INT_ALIASES = {
     "hidden_size": ("hidden_size", "n_embd", "d_model"),
     "intermediate_size": ("intermediate_size",),
-    "num_hidden_layers": ("num_hidden_layers", "n_layer", "num_layers"),
+    "num_hidden_layers": LAYER_COUNT_FIELDS,
     "num_attention_heads": ("num_attention_heads", "n_head"),
     "num_key_value_heads": ("num_key_value_heads", "num_kv_heads"),
     "head_dim": ("head_dim",),
@@ -226,11 +223,7 @@ class _UnderivableWindowLayout(ValueError):
     """
 
 
-def _integer(value: Any, field: str, *, minimum: int = 1, maximum: int | None = None) -> int:
-    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
-        bound = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
-        raise ValueError(f"{field} must be an integer {bound}, not a boolean, float or numeric string")
-    return value
+_integer = layout_integer
 
 
 def _text(value: Any, field: str) -> str:
@@ -282,6 +275,8 @@ def _require_finite(value: Any, field: str) -> None:
 
 
 def _architecture(raw: Mapping[str, Any]) -> str | None:
+    from aisim_core.decoder_config import FPM_DECODER_ARCHITECTURES
+
     architectures = raw.get("architectures")
     architecture = None
     if architectures is not None:
@@ -289,7 +284,7 @@ def _architecture(raw: Mapping[str, Any]) -> str | None:
             raise ValueError("architectures must identify exactly one decoder architecture")
         architecture = _text(architectures[0], "architectures[0]")
     model_type = _text(raw["model_type"], "model_type") if "model_type" in raw else None
-    expected = _ARCHITECTURES.get(model_type)
+    expected = FPM_DECODER_ARCHITECTURES.get(model_type)
     if expected and architecture and expected != architecture:
         raise ValueError(f"model_type={model_type!r} conflicts with architectures={architecture!r}")
     return architecture or expected
@@ -356,33 +351,9 @@ def _validate_quantization(raw: Mapping[str, Any]) -> None:
         raise ValueError("quantization_config.kv_cache_scheme.dynamic must be a boolean")
 
 
-def _cache_window(raw: Mapping[str, Any]) -> int | None:
-    supplied = {
-        key: _integer(raw[key], key, minimum=0)
-        for key in ("sliding_window", "sliding_window_size")
-        if raw.get(key) is not None
-    }
-    if len(set(supplied.values())) > 1:
-        raise ValueError(f"conflicting sliding-window fields: {supplied}")
-    return next(iter(supplied.values()), None)
-
-
-def _layer_types(raw: Mapping[str, Any], layers: int | None) -> list[str]:
-    types = raw["layer_types"]
-    if not isinstance(types, list) or (layers is not None and len(types) != layers):
-        raise ValueError("layer_types must have one entry per num_hidden_layers")
-    if any(not isinstance(value, str) or not value.strip() for value in types):
-        raise ValueError("layer_types entries must be nonempty strings")
-    return types
-
-
-def _attn_type_list(raw: Mapping[str, Any], layers: int | None) -> list[int]:
-    values = raw["attn_type_list"]
-    if not isinstance(values, list) or (layers is not None and len(values) != layers):
-        raise ValueError("attn_type_list must have one entry per num_hidden_layers")
-    if any(type(value) is not int for value in values):
-        raise ValueError("attn_type_list entries must be integers")
-    return values
+_cache_window = cache_window
+_layer_types = layer_types
+_attn_type_list = attn_type_list
 
 
 def _runtime_layout(raw: Mapping[str, Any], architecture: str | None, named: str | None) -> tuple[str, ...]:
@@ -524,12 +495,7 @@ def _validate_layout(
     runtime = _runtime_layout(raw, architecture, named)
     if runtime:
         # The runtime probe measures this layout's cache geometry; intake only checks the config is well formed.
-        _cache_window(raw)
-        layers = _aliased_int(raw, "num_hidden_layers")
-        if "layer_types" in raw:
-            _layer_types(raw, layers)
-        if "attn_type_list" in raw:
-            _attn_type_list(raw, layers)
+        check_marker_layout_declarations(raw)
         return runtime
     sliding = _cache_layer_ids(raw, architecture, inkling=inkling)
     layers = _aliased_int(raw, "num_hidden_layers")
@@ -594,12 +560,14 @@ def _layout_notes(raw: Mapping[str, Any], architecture: str | None, runtime: tup
 
 
 def _validate_architecture(raw: Mapping[str, Any], architecture: str | None, experts: int | None) -> None:
+    from aisim_core.decoder_config import FPM_DECODER_ARCHITECTURES
+
     experts_per_token = raw.get("num_experts_per_tok")
     if experts and experts_per_token is not None and experts_per_token > experts:
         raise ValueError("num_experts_per_tok cannot exceed the routed expert count")
     if architecture in _DENSE and experts not in (None, 0):
         raise ValueError("num_experts conflicts with the declared dense architecture")
-    if architecture in set(_ARCHITECTURES.values()) - _DENSE and experts == 0:
+    if architecture in set(FPM_DECODER_ARCHITECTURES.values()) - _DENSE and experts == 0:
         raise ValueError("num_experts must be positive for the declared MoE architecture")
 
 
@@ -607,7 +575,7 @@ def load_model_config(path: str | Path) -> ModelConfig:
     """Load local config/ModelOpt metadata with separate byte-level provenance."""
     # Imported here, not at module level: tests/unit/test_fpm_config_imports.py and the repository-root
     # tests/test_resource_supervision.py fail when aisim_core.decoder_config loads before a config is read.
-    from aisim_core.decoder_config import decoder_config_key, nested_decoder_ambiguity
+    from aisim_core.decoder_config import decoder_config_key, nested_decoder_ambiguity, wrapper_key_problem
 
     path = Path(path).expanduser().absolute()
     payload = path.read_bytes()
@@ -624,6 +592,8 @@ def load_model_config(path: str | Path) -> ModelConfig:
             "for all components actually loaded by the worker; full multimodal latency is not modeled."
         )
     }
+    if (problem := wrapper_key_problem(document)) is not None:
+        raise ValueError(f"{problem}; supply a config.json that holds the text decoder under the wrapper's own key")
     decoder_key = decoder_config_key(document)
     if decoder_key is not None:
         decoder = document[decoder_key]
@@ -1710,8 +1680,9 @@ def _observation_mismatch(key: str, typed: Any, resources: Mapping[str, Any]) ->
     if resources.get(measured_key) is None:
         layout = f" for its {resources['cache_layout']} cache_layout" if resources.get("cache_layout") else ""
         return f"{claim}, but the runtime probe measured no {measured_key}{layout}; {remedy}"
-    # The probe import of a vLLM 0.33.0 record writes no transfer bytes, so a stated value has nothing to match. When
-    # the claim matches without them, only removing them from the override helps.
+    # The import writes transfer bytes only for the measured cache shape from a probe phase with prefix caching. Other
+    # evidence holds none, so a stated value has nothing to match. When the claim matches without them, only removing
+    # them from the override helps.
     if (
         key == "cache_groups"
         and any(group.get("transfer_bytes_per_block") is not None for group in typed)

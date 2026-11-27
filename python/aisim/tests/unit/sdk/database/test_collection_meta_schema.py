@@ -23,6 +23,31 @@ def _write_meta(tmp_path, document: dict):
     return path
 
 
+def test_parsed_sidecar_is_reused_until_the_selected_file_changes(tmp_path, monkeypatch):
+    document = {"schema_version": 1, "tables": {"gemm_perf": {"rows": 1}}}
+    path = _write_meta(tmp_path, document)
+    calls = []
+    original = yaml.safe_load
+
+    def load(stream):
+        calls.append(stream.name)
+        return original(stream)
+
+    monkeypatch.setattr(yaml, "safe_load", load)
+    first = _load_collection_meta_yaml(str(path), cache=True)
+    first["tables"]["gemm_perf"]["rows"] = 100
+    assert _load_collection_meta_yaml(str(path), cache=True) == document
+    assert calls == [str(path)]
+
+    other = tmp_path / "other"
+    other.mkdir()
+    replacement = _write_meta(other, {"schema_version": 1, "tables": {}})
+    assert _load_collection_meta_yaml(str(replacement), cache=True)["tables"] == {}
+    replacement.replace(path)
+    assert _load_collection_meta_yaml(str(path), cache=True)["tables"] == {}
+    assert calls == [str(path), str(replacement), str(path)]
+
+
 def _event(**overrides):
     event = {
         "collector_ref": "a" * 40,
@@ -57,6 +82,13 @@ def test_v2_rejects_collection_event_without_status(tmp_path):
 
     with pytest.raises(ValueError, match=r"gemm_perf\.collections\[0\].*status"):
         _load_collection_meta_yaml(str(path))
+
+
+@pytest.mark.parametrize("count", [-1, True, "1"])
+def test_v2_rejects_invalid_classified_failure_count(tmp_path, count):
+    document = _v2_document([_event(classified_failures=count)])
+    with pytest.raises(ValueError, match="classified_failures must be a non-negative integer"):
+        _load_collection_meta_yaml(str(_write_meta(tmp_path, document)))
 
 
 def test_v2_accepts_complete_multi_event_history(tmp_path):
@@ -173,7 +205,7 @@ def test_v2_writer_runtime_metadata_reaches_strict_database(tmp_path):
     tables = {
         "gemm_perf": append_collection_event(
             _event(rows=1, runtime=runtime),
-            _event(rows=1, runtime=runtime, case_plan_hash="sha256:" + "1" * 64),
+            _event(rows=1, runtime=runtime, case_plan_hash="sha256:" + "1" * 64, classified_failures=1),
             table="gemm_perf",
             merged_rows=2,
         )
@@ -183,6 +215,7 @@ def test_v2_writer_runtime_metadata_reaches_strict_database(tmp_path):
     document = _load_collection_meta_yaml(str(path))
     assert document["runtime"] == runtime
     assert all(event["runtime"] == runtime for event in document["tables"]["gemm_perf"]["collections"])
+    assert document["tables"]["gemm_perf"]["collections"][1]["classified_failures"] == 1
     database = get_database(
         "h100_sxm",
         "sglang",

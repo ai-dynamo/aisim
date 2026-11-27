@@ -576,12 +576,13 @@ class Glm53FlashPrefixSeedScheduler(native.InstrumentedScheduler):
                         f"GLM-5.3-Flash decode batch {point.batch_size} exceeds the producer limit {MAX_BATCH}"
                     )
                 # A repetition prefills each prompt beyond its cached seed, and it is accepted only if its first decode
-                # step holds every request. vLLM v0.33.0 schedules at most max_num_batched_tokens tokens in one step
-                # (scheduler.py:722, :1295, :1570-1571). The suffixes of two or more requests above that budget spread
+                # step holds every request. vLLM v0.33.0 schedules at most max_num_scheduled_tokens tokens in one step,
+                # and at most max_num_batched_tokens input tokens (scheduler.py:139-143, :719, :722, :1295, :1570-1571).
+                # The suffixes of two or more requests above the smaller of the two budgets spread
                 # over several steps, so every repetition is rejected: the cached prefix cannot grow beyond the seed.
                 # One request may prefill its suffix over several steps (scheduler.py:607-619): no other request can
                 # decode before it, and _bench_should_record_scheduled records no step with a prefill request.
-                budget = self.scheduler_config.max_num_batched_tokens
+                budget = min(self.max_num_scheduled_tokens, self.scheduler_config.max_num_batched_tokens)
                 prompts = [self._glm_decode_prompt(context) for context in contexts]
                 total = sum(prompt - self._glm_decode_seed(prompt, unit) for prompt in prompts)
                 if point.batch_size > 1 and total > budget:

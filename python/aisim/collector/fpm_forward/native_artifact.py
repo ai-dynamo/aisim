@@ -10,11 +10,19 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
+import secrets
+import stat
 import statistics
+from bisect import bisect_left
+from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 from aisim.fpm_contract import (
     FPM_BENCHMARK_RESULT_GLOB,
@@ -28,14 +36,26 @@ from aisim.fpm_contract import (
     FPM_POWER_WINDOW_REL_TOL,
 )
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
+from collector import glm53flash_attention_tokens
 from collector.glm53flash_runtime_identity import BASELINE_VERSIONS
 
-from .planner import FPMCell
+from .glm53flash_points import CHUNK_ALIGN, CONTEXT_HEADROOM, MAX_BATCH, MAX_CONTEXT, MAX_NEW
+from .planner import FPMCell, GlmProducerDigests
 from .types import KVWARM_STRATEGIES
+
+if TYPE_CHECKING:
+    from aisim_core.sdk.fpm_profile import FpmDeploymentProfile
 
 logger = logging.getLogger(__name__)
 
 COLLECTOR_PROVENANCE_FILENAME = "collector-provenance.json"
+# The record, beside cell.json and raw/ of a cell folder, of the producer files that the collecting run compared the
+# rank artifacts of the cell with.
+PRODUCER_RECEIPT_FILENAME = "producer-receipt.json"
+
+
+class _InvalidGlmMeasurement(ValueError):
+    """The retained GLM measurement contradicts its raw evidence."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,13 +251,15 @@ def select_native_measurements(collection: NativeCollection, *, cell_id: str) ->
     return selected
 
 
-def _validate_execution_provenance(cell: FPMCell, payload: dict[str, Any], path: Path) -> dict[str, Any] | None:
+def _validate_execution_provenance(
+    cell: FPMCell, payload: dict[str, Any], path: Path, *, producer_digests: dict[str, str] | None = None
+) -> dict[str, Any] | None:
     """Config-bound curves require engine evidence for execution and real input.
 
     The frozen cell selects the producer contract, never the artifact. The planner computes the cell's execution
     identity from the model configuration, and the cell ID and the plan hash cover it. A DeepSeek V4.1 cell accepts
     only the ``eager`` mode of its producer and a GLM-5.3-Flash cell only ``native_graph_policy``. A mode that no
-    contract audits is refused, never read as one of them.
+    contract audits is refused, never read as one of them. ``producer_digests`` goes to the GLM-5.3-Flash check.
     """
     if not cell.execution_identity[0]:
         return None
@@ -257,7 +279,7 @@ def _validate_execution_provenance(cell: FPMCell, payload: dict[str, Any], path:
             f"native execution identity cell expects execution mode {expected_mode!r}, found {mode!r}: {path}"
         )
     if mode == "native_graph_policy":
-        return _validate_glm_provenance(cell, payload, path)
+        return _validate_glm_provenance(cell, payload, path, producer_digests=producer_digests)
     expected = dict(zip(EXECUTION_COLUMNS, cell.execution_identity, strict=True))
     if payload.get("execution_identity") != expected:
         raise ValueError(f"native execution identity differs from the frozen V4.1 cell: {path}")
@@ -290,6 +312,10 @@ def _is_hex(value: object, digits: int) -> bool:
 
 
 _GLM_RUNTIME = Path(__file__).parent / "runtime" / "glm53flash"
+# The GLM producer aborts a point on its eleventh rejected repetition.
+_GLM_MAX_REJECTED_REPETITIONS = 10
+# The timing boundary that the GLM-5.3-Flash producer records in its rank artifacts and that its published rows carry.
+GLM_TIMING_BOUNDARY = "dynamo_vllm_instrumented_scheduler_fpm_wall_time"
 
 
 @functools.cache
@@ -300,7 +326,8 @@ def _glm_producer_record() -> dict[str, Any]:
     reader cannot import its constants. The reader keeps them here, and a test keeps them equal to the record that the
     producer writes. The vLLM version is the exact supported runtime. The two digests are those of the pin manifest and
     of the producer file that this collector ships and that a launch of this collector mounts; the producer computes
-    both the same way. A campaign of another producer revision is therefore refused.
+    both the same way. A receipt must match the producer files frozen before launch, or the independently pinned
+    pair for receipt-v1 campaigns that predate that plan field.
     """
     return {
         "instrumentation_revision": "54960177085413259859c88bd34ed0734d4c2ea9",
@@ -314,23 +341,929 @@ def _glm_producer_record() -> dict[str, Any]:
         ),
         "vllm_package_version": BASELINE_VERSIONS["vllm"],
         "reviewed_scheduler_api_revision": "4ba787ec9959e566d3b587a796dff07673324da5",
-        "runtime_source_manifest_sha256": hashlib.sha256(
-            (_GLM_RUNTIME / "runtime-source-sha256.json").read_bytes()
-        ).hexdigest(),
-        "overlay_sha256": hashlib.sha256((_GLM_RUNTIME / "glm53flash_prefix_scheduler.py").read_bytes()).hexdigest(),
+        **GlmProducerDigests.from_runtime(_GLM_RUNTIME)._asdict(),
+        # Version 1 names the shape of the context_policy record. Its rule is a lower bound: the runtime context is at
+        # least the measured context plus the producer's headroom. The reader only requires the number to be 1; nothing
+        # chooses a rule by it.
         "context_policy_version": 1,
         "warmup_repeats": 5,
         "measurement_repeats": 10,
     }
 
 
-def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path) -> dict[str, Any]:
+@functools.cache
+def _glm_input_record(generator_version: int) -> Mapping[str, Any] | None:
+    """The seeded input fields that the producer of ``generator_version`` writes, as a read-only mapping.
+
+    This collector can draw the stream of one version only, ``GENERATOR_VERSION`` of
+    collector/glm53flash_attention_tokens.py, and None is returned for any other version. The fields come in the order
+    in which the reader compares them. Every caller gets the one cached mapping, which no caller can change. The
+    producer draws ``MAX_CONTEXT + MAX_BATCH * REQUEST_STRIDE`` tokens with that generator, and records the digest of
+    their compact JSON list and the number of distinct tokens; this function draws the same stream once in a process.
+    A later generator version must keep the function of every version that a stored campaign names, or the reader
+    refuses that campaign with ``input_provenance.generator_version``.
+    """
+    seeded = glm53flash_attention_tokens
+    if generator_version != seeded.GENERATOR_VERSION:
+        return None
+    count = MAX_CONTEXT + MAX_BATCH * seeded.REQUEST_STRIDE
+    tokens = seeded.generate(seeded.SEED, count, seeded.VOCAB_LOW, seeded.VOCAB_HIGH)
+    record = {
+        "generator": seeded.GENERATOR,
+        "seed": seeded.SEED,
+        "count": count,
+        "vocab_low": seeded.VOCAB_LOW,
+        "vocab_high_exclusive": seeded.VOCAB_HIGH,
+        "tokenizer_json_sha256": seeded.TOKENIZER_JSON_SHA256,
+        "token_ids_sha256": hashlib.sha256(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest(),
+        "unique_token_count": len(set(tokens)),
+    }
+    return MappingProxyType(record)
+
+
+_PRODUCER_DIGEST_FIELDS = GlmProducerDigests._fields
+# PR #1005's receipt-v1 producer, before collector plans recorded the producer files.
+_LEGACY_GLM_RECEIPT_DIGESTS = GlmProducerDigests(
+    "8255d36806bfbcd757d0265eb507b2d8e3267a348acaafcba3be0226cfeebb10",
+    "848f0826e4984e573f457cfa4b3fa8277ca38152949f880c951243a97920a9de",
+)
+_PRODUCER_RECEIPT_SCHEMA = "aic_fpm_producer_receipt"
+
+
+def _glm_contract(cell: FPMCell) -> bool:
+    """Whether the cell's execution identity selects the GLM-5.3-Flash producer contract.
+
+    The rule of ``_validate_execution_provenance``: a configuration hash, and the Engram residency ``none``.
+    """
+    if not cell.execution_identity[0]:
+        return False
+    return dict(zip(EXECUTION_COLUMNS, cell.execution_identity, strict=True))["engram_residency"] == "none"
+
+
+def write_producer_receipt(cell: FPMCell, cell_dir: Path, *, plan_sha256: str, attempt_id: str) -> Path | None:
+    """Write the producer receipt of a cell whose rank artifacts passed the strict comparison of this checkout.
+
+    A new or recovered attempt without a receipt must match the running producer. Its digests must also match the
+    plan frozen before launch. Older plans used the receipt-v1 producer. Readers can validate both after an upgrade.
+    """
+    if not _glm_contract(cell):
+        return None
+    record = _glm_producer_record()
+    digests = {field: record[field] for field in _PRODUCER_DIGEST_FIELDS}
+    if digests != (cell.glm_producer_digests or _LEGACY_GLM_RECEIPT_DIGESTS)._asdict():
+        raise ValueError("GLM producer files differ from the producer expected for this collection plan")
+    receipt = {
+        "attempt_id": attempt_id,
+        "cell_id": cell.cell_id,
+        "plan_sha256": plan_sha256,
+        "producer": digests,
+        "schema_name": _PRODUCER_RECEIPT_SCHEMA,
+        "schema_version": 1,
+    }
+    path = cell_dir / PRODUCER_RECEIPT_FILENAME
+    temporary = cell_dir / f".{path.name}.{secrets.token_hex(16)}"
+    # Shared campaigns use the umask to grant read and group write access to these provenance identifiers and digests.
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 & ~stat.S_IWOTH)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def _producer_receipt(cell: FPMCell, raw_root: Path, *, plan_sha256: str, attempt_id: str) -> dict[str, str] | None:
+    """The two producer digests of the receipt in the cell folder of ``raw_root``, or None when it holds none.
+
+    A receipt that is no regular file, is malformed, or names another plan, cell or attempt is refused. The refusal
+    names the rule that the file breaks, or the binding that differs with its actual and expected value.
+    """
+    path = raw_root.parent / PRODUCER_RECEIPT_FILENAME
+    if not path.exists() and not path.is_symlink():
+        return None
+
+    def invalid(rule: str) -> ValueError:
+        return ValueError(f"invalid producer receipt: {rule}: {path}")
+
+    if path.is_symlink():
+        raise invalid("it must be a regular file, not a symbolic link")
+    if not path.is_file():
+        raise invalid("it must be a regular file")
+    try:
+        receipt = json.loads(path.read_text())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise invalid("it must be JSON text in UTF-8") from None
+    keys = ["attempt_id", "cell_id", "plan_sha256", "producer", "schema_name", "schema_version"]
+    if not isinstance(receipt, dict) or sorted(receipt) != keys:
+        raise invalid(f"it must be a JSON object with exactly the keys {keys}")
+    if receipt["schema_name"] != _PRODUCER_RECEIPT_SCHEMA:
+        raise invalid(f"schema_name must be {_PRODUCER_RECEIPT_SCHEMA!r}")
+    if type(receipt["schema_version"]) is not int or receipt["schema_version"] != 1:
+        raise invalid("schema_version must be the integer 1")
+    producer = receipt["producer"]
+    if not isinstance(producer, dict) or sorted(producer) != sorted(_PRODUCER_DIGEST_FIELDS):
+        raise invalid(f"producer must be a JSON object with exactly the keys {sorted(_PRODUCER_DIGEST_FIELDS)}")
+    for field in _PRODUCER_DIGEST_FIELDS:
+        if not _is_hex(producer[field], 64):
+            raise invalid(f"producer.{field} must be 64 lowercase hexadecimal characters")
+    for key, name, expected in (
+        ("plan_sha256", "plan", plan_sha256),
+        ("cell_id", "cell", cell.cell_id),
+        ("attempt_id", "attempt", attempt_id),
+    ):
+        if receipt[key] != expected:
+            raise ValueError(
+                f"producer receipt names another {name}: {key} actual={receipt[key]!r} expected={expected!r}: {path}"
+            )
+    expected = cell.glm_producer_digests or _LEGACY_GLM_RECEIPT_DIGESTS
+    if producer != expected._asdict():
+        raise invalid("producer digests differ from the producer expected for this collection plan")
+    return expected._asdict()
+
+
+_DISPATCH_FIELDS = ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
+
+
+def _valid_dispatch(receipt: object) -> bool:
+    if not isinstance(receipt, dict) or receipt.get("runtime_mode") not in ("NONE", "PIECEWISE", "FULL"):
+        return False
+    raw, padded, extra = (receipt.get(key) for key in ("num_unpadded_tokens", "num_padded_tokens", "num_paddings"))
+    return all(type(value) is int and value >= 0 for value in (raw, padded, extra)) and padded - raw == extra
+
+
+def _forward_interval(timing: object, wall_time: float) -> tuple[float | None, float]:
+    """Check the recorded interval in the clock domain of this rank."""
+    if not isinstance(timing, dict) or timing.get("basis") not in {"schedule_to_output", "inter_output"}:
+        raise ValueError("benchmark_sample has invalid timing basis")
+    start, end = timing.get("start_monotonic"), timing.get("end_monotonic")
+    if (
+        type(end) not in {int, float}
+        or not math.isfinite(end)
+        or (
+            start is not None
+            and (
+                type(start) not in {int, float}
+                or not math.isfinite(start)
+                or start > end
+                or not math.isclose(end - start, wall_time, rel_tol=1e-9, abs_tol=1e-9)
+            )
+        )
+    ):
+        raise ValueError("benchmark_sample contradicts its local timing interval")
+    return start, end
+
+
+def _observed_forward(sample: dict, wall_time: float, *, glm: bool, path: Path) -> tuple[str, dict, list[str]]:
+    """Validate one process-local timing interval and its recorded graph dispatch."""
+    reasons = []
+    timing, graph = sample.get("timing"), sample.get("cudagraph")
+    start, _ = _forward_interval(timing, wall_time)
+    if start is None:
+        if glm:
+            raise ValueError(
+                f"benchmark_sample.timing.start_monotonic of a GLM-5.3-Flash producer sample must be recorded: "
+                f"expected a number, found None: {path}"
+            )
+        reasons.append("sample timing start is unavailable")
+    if not isinstance(graph, dict) or graph.get("status") not in {"observed", "unavailable"}:
+        raise ValueError("benchmark_sample has invalid graph observation status")
+    if glm and graph["status"] != "observed":
+        raise ValueError(
+            "benchmark_sample.cudagraph.status of a GLM-5.3-Flash producer sample must be observed: "
+            f"expected 'observed', found {graph['status']!r}: {path}"
+        )
+    values = [graph.get(name) for name in _DISPATCH_FIELDS]
+    if graph["status"] == "unavailable":
+        if any(value is not None for value in values):
+            raise ValueError("unavailable graph observation contains observed values")
+        reasons.append("per-sample CUDA graph dispatch is unavailable")
+    elif not _valid_dispatch(graph):
+        raise ValueError("benchmark_sample has invalid observed graph dispatch or padding")
+    return timing["basis"], graph, reasons
+
+
+def _same_glm_dispatch(graph: dict, receipt: dict) -> bool:
+    return all(_same(graph.get(key), receipt.get(key)) for key in _DISPATCH_FIELDS)
+
+
+def _glm_scheduled_counts(stage: dict, path: Path) -> list[int]:
+    """The producer records every positive output, even when the graph receipt is unavailable."""
+    counts, receipts = stage.get("scheduled_token_counts"), stage.get("dispatches")
+    if not isinstance(counts, list) or any(type(count) is not int or count <= 0 for count in counts):
+        raise ValueError(f"invalid GLM scheduled token counts: {path}")
+    if not isinstance(receipts, list) or len(counts) != len(receipts):
+        raise ValueError(f"GLM scheduled token counts must align with dispatch receipts: {path}")
+    for count, receipt in zip(counts, receipts, strict=True):
+        if receipt is None:
+            continue
+        if not _valid_dispatch(receipt) or receipt["num_unpadded_tokens"] <= 0:
+            raise ValueError(f"invalid GLM preparation dispatch receipt or padding: {path}")
+        if count != receipt["num_unpadded_tokens"]:
+            raise ValueError(f"GLM dispatch contradicts its scheduled token count: {path}")
+    return counts
+
+
+def _glm_spec_lengths(specs: object, path: Path) -> list[list[int]]:
+    if not isinstance(specs, list) or any(
+        not isinstance(parts, list)
+        or not parts
+        or any(
+            not isinstance(part, list)
+            or len(part) != 2
+            or type(part[0]) is not int
+            or part[0] < 0
+            or type(part[1]) is not int
+            or part[1] <= 0
+            for part in parts
+        )
+        for parts in specs
+    ):
+        raise ValueError(f"invalid GLM per-request prompt specs: {path}")
+    return [[part[1] for part in parts] for parts in specs]
+
+
+def _glm_request_lengths(
+    record: dict,
+    point: dict,
+    seed: dict,
+    block: int | None,
+    path: Path,
+    balanced_decode: bool,
+    context_limit: int | None,
+) -> tuple[list[list[int]], list[int] | None]:
+    """Reconcile the per-slot lengths the producer writes before running the seed and repetitions."""
+    batch = point["batch_size"]
+    decode = point["point_type"] == "decode"
+    if batch > MAX_BATCH:
+        raise ValueError(f"GLM request batch exceeds the producer limit of {MAX_BATCH}: {path}")
+    if decode:
+        if point["total_kv_read_tokens"] < 3 * batch or (
+            context_limit and point["total_kv_read_tokens"] > batch * context_limit
+        ):
+            raise ValueError(f"GLM decode contexts exceed the producer's per-request limits: {path}")
+    elif (
+        not CHUNK_ALIGN * batch <= point["total_prefill_tokens"] <= MAX_NEW
+        or (context_limit and point["total_kv_read_tokens"] + point["total_prefill_tokens"] > batch * context_limit)
+        or point["total_prefill_tokens"] % CHUNK_ALIGN
+        or point["total_kv_read_tokens"] % (block or CHUNK_ALIGN)
+    ):
+        raise ValueError(f"GLM prefill point exceeds the producer's size or alignment limits: {path}")
+    rows = record.get("rows")
+    if not isinstance(rows, dict):
+        raise ValueError(f"invalid GLM per-request rows: {path}")
+
+    def lengths(value: object, minimum: int) -> list[int]:
+        if not isinstance(value, list) or len(value) != batch or any(type(n) is not int or n < minimum for n in value):
+            raise ValueError(f"invalid GLM per-request lengths: {path}")
+        return value
+
+    if decode:
+        contexts = lengths(rows.get("context"), 3)
+        prompts = lengths(rows.get("prompt"), 2)
+        if sum(contexts) != point["total_kv_read_tokens"] or prompts != [n - 1 for n in contexts]:
+            raise ValueError(f"GLM decode contexts disagree with the recorded prompts or point: {path}")
+        if context_limit and max(contexts) > context_limit:
+            raise ValueError(f"GLM request exceeds the producer's measured context limit: {path}")
+        if balanced_decode:
+            common, remainder = divmod(point["total_kv_read_tokens"], batch)
+            if contexts != [common + int(slot < remainder) for slot in range(batch)]:
+                raise ValueError(f"GLM decode prompts disagree with the producer's default context split: {path}")
+        if not _same(rows.get("measured_decode_step"), 2):
+            raise ValueError(f"GLM measured decode step must follow the first lockstep decode: {path}")
+        expected = [[n] for n in prompts]
+        seeds = [(n - 1) // block * block for n in prompts] if block is not None else None
+    else:
+        prefixes = lengths(rows.get("prefix"), 0)
+        fresh = lengths(rows.get("new"), 1)
+        if point.get("rows") is not None:
+            pairs = point["rows"]
+            if not isinstance(pairs, list) or any(not isinstance(pair, list) or len(pair) != 2 for pair in pairs):
+                raise ValueError(f"invalid GLM prefill point rows: {path}")
+            if lengths([p[0] for p in pairs], 1) != fresh or lengths([p[1] for p in pairs], 0) != prefixes:
+                raise ValueError(f"GLM request lengths disagree with the explicit prefill point rows: {path}")
+        if sum(prefixes) != point["total_kv_read_tokens"] or sum(fresh) != point["total_prefill_tokens"]:
+            raise ValueError(f"GLM prefill rows disagree with the point's prefix or new token totals: {path}")
+        if any(n % CHUNK_ALIGN for n in fresh) or any(p % (block or CHUNK_ALIGN) for p in prefixes):
+            raise ValueError(f"GLM prefill prompt specs violate the producer's request alignment: {path}")
+        if context_limit and any(n + p > context_limit for n, p in zip(fresh, prefixes, strict=True)):
+            raise ValueError(f"GLM request exceeds the producer's measured context limit: {path}")
+        seeds = prefixes
+        expected = [[prefix, n] if prefix else [n] for prefix, n in zip(prefixes, fresh, strict=True)]
+    if "lengths" in seed:
+        supplied = lengths(seed["lengths"], 0)
+        if seeds is not None and seeds != supplied:
+            raise ValueError(f"GLM seed lengths disagree with the recorded requests: {path}")
+        seeds = supplied
+    if seeds is not None and block is not None and any(n % block for n in seeds):
+        raise ValueError(f"GLM seed lengths must be aligned to the hash block: {path}")
+    if "specs" in seed:
+        segments = _glm_spec_lengths(seed["specs"], path)
+        if any(len(parts) != 1 for parts in segments) or (seeds is not None and segments != [[n] for n in seeds if n]):
+            raise ValueError(f"GLM seed prompt specs disagree with the seed lengths: {path}")
+    return expected, seeds
+
+
+def _glm_attempt_specs(
+    stage: dict,
+    point: dict,
+    expected: list[list[int]],
+    seed: dict,
+    seeds: list[int] | None,
+    path: Path,
+) -> None:
+    parts = stage.get("prompt_specs")
+    if _glm_spec_lengths(parts, path) != expected:
+        raise ValueError(f"GLM prompt specs disagree with the recorded per-request lengths: {path}")
+    salts = stage.get("salts")
+    if not isinstance(salts, list) or len(salts) != len(expected) or not all(isinstance(salt, str) for salt in salts):
+        raise ValueError(f"GLM cache salts do not match the recorded request slots: {path}")
+    if point["point_type"] == "prefill" and type(stage.get("attempt")) is int:
+        # Seeded requests retain their prefix and use a fresh suffix rotation on each attempt.
+        for segments in parts:
+            if len(segments) == 2:
+                (base, prefix), (suffix, _) = segments
+                if suffix != base + prefix + 1 + 7 * (stage["attempt"] + 1):
+                    raise ValueError(f"GLM prefill suffix rotation disagrees with its recorded attempt: {path}")
+    if seeds is not None:
+        slots = [i for i, n in enumerate(seeds) if n]
+        if "specs" in seed and any(
+            parts[slot][0][0] != seeded[0][0] for slot, seeded in zip(slots, seed["specs"], strict=True)
+        ):
+            raise ValueError(f"GLM prompt rotation disagrees with its seeded prefix: {path}")
+        if "request_ids" in seed:
+            ids = seed["request_ids"]
+            if not isinstance(ids, list) or len(ids) != len(slots):
+                raise ValueError(f"GLM cache salts do not match the seeded request slots: {path}")
+            for slot, request_id in zip(slots, ids, strict=True):
+                # The seed records its injected request ID, whose namespace also keys its cache salt.
+                prefix, separator, sequence = (
+                    request_id.rpartition("-seed-") if isinstance(request_id, str) else ("", "", "")
+                )
+                if (
+                    not separator
+                    or not sequence.isdecimal()
+                    or salts[slot] != f"{prefix}-p{point['benchmark_id']}-s{slot}"
+                ):
+                    raise ValueError(f"GLM cache salt disagrees with its seeded prefix: {path}")
+
+
+def _validate_glm_chunks(
+    stage: dict,
+    path: Path,
+    point: dict,
+    *,
+    counts: list[int] | None = None,
+    seed: bool = False,
+    expected: list[list[int]],
+    seeds: list[int] | None = None,
+    block: int | None = None,
+) -> list[tuple[int, int]]:
+    if "prefill_chunks" not in stage:
+        raise ValueError(f"native GLM-5.3-Flash completed stage lacks prefill_chunks: {path}")
+    chunks = stage["prefill_chunks"]
+    if not isinstance(chunks, list) or any(
+        not isinstance(step, list)
+        or not step
+        or any(
+            not isinstance(chunk, list)
+            or len(chunk) != 2
+            or type(chunk[0]) is not int
+            or chunk[0] < 0
+            or chunk[0] % CHUNK_ALIGN
+            or type(chunk[1]) is not int
+            or chunk[1] <= 0
+            for chunk in step
+        )
+        for step in chunks
+    ):
+        raise ValueError(f"native GLM-5.3-Flash prefill_chunks require aligned starts and positive lengths: {path}")
+
+    # The compact records omit request IDs and empty scheduler steps.
+    limits = sorted((seeds or []) if seed else (sum(parts) for parts in expected), reverse=True)
+    accepted_decode = point["point_type"] == "decode" and "repetition" in stage
+    chunk_totals = []
+    for step in chunks:
+        ends = sorted((start + tokens for start, tokens in step), reverse=True)
+        if len(step) > len(limits) or any(end > limit for end, limit in zip(ends, limits, strict=False)):
+            raise ValueError(f"native GLM-5.3-Flash prefill chunk exceeds the recorded prompt: {path}")
+        chunk_totals.append(sum(tokens for _, tokens in step))
+
+    minimums = chunk_totals.copy()
+    maximums = (
+        chunk_totals
+        if accepted_decode
+        else [total + point["batch_size"] - len(step) for total, step in zip(chunk_totals, chunks, strict=True)]
+    )
+    if point["point_type"] == "prefill" and "fpms" in stage:
+        # The producer records one FPM for every forward with prefill requests, including rejected attempts.
+        fpms = stage["fpms"]
+        if not isinstance(fpms, list) or len(fpms) != len(chunks):
+            raise ValueError(f"GLM prefill chunk steps must match the recorded prefill forwards: {path}")
+        for pos, (step, total, fpm) in enumerate(zip(chunks, chunk_totals, fpms, strict=True)):
+            scheduled = fpm.get("scheduled_requests") if isinstance(fpm, dict) else None
+            if not isinstance(scheduled, dict) or not all(
+                (
+                    _same(scheduled.get("num_prefill_requests"), len(step)),
+                    _same(scheduled.get("sum_prefill_kv_tokens"), sum(start for start, _ in step)),
+                    _same(scheduled.get("sum_prefill_tokens"), total),
+                )
+            ):
+                raise ValueError(
+                    f"GLM prefill chunks disagree with the prefix or new tokens read by that forward: {path}"
+                )
+            decodes = scheduled.get("num_decode_requests")
+            if type(decodes) is not int or not 0 <= decodes <= point["batch_size"] - len(step):
+                raise ValueError(f"GLM prefill forward has an invalid count of decode requests: {path}")
+            minimums[pos] = maximums[pos] = total + decodes
+
+    bounds = list(zip(minimums, maximums, strict=True))
+    # The caller removed both pure-decode outputs of an accepted decode attempt.
+    if (
+        counts is not None
+        and (point["point_type"] == "prefill" or "repetition" in stage)
+        and (
+            len(counts) != len(chunks)
+            or any(not low <= count <= high for count, (low, high) in zip(counts, bounds, strict=False))
+        )
+    ):
+        raise ValueError(f"native GLM-5.3-Flash prefill chunk contradicts the scheduled token counts: {path}")
+
+    if accepted_decode or "rejection_reason" in stage or seed:
+        # Offsets are anonymous. At each offset count how many ends could continue in a later step.
+        # A matching start can also be another request's cache hit at a completed prompt length.
+        ends: Counter[int] = Counter()
+        initial: Counter[int] = Counter()
+        continuations: Counter[int] = Counter()
+        for step in chunks:
+            starts = Counter(start for start, _ in step)
+            initial.update(starts - ends)
+            continuations.update(starts & ends)
+            ends -= starts
+            ends.update(start + count for start, count in step)
+        terminals = Counter(n for n in limits if n)
+        if not ends <= terminals <= ends + continuations:
+            raise ValueError(f"GLM preparation chunks must finish the prompts recorded for this stage: {path}")
+        initial.update(terminals - ends)
+        if seed and any(initial):
+            raise ValueError(f"GLM seed chunks must start each fresh prompt at zero and continue it: {path}")
+        if not seed and (
+            (block is not None and any(start % block for start in initial))
+            or (
+                seeds is not None
+                and any(
+                    start > available
+                    for start, available in zip(
+                        sorted(initial.elements(), reverse=True), sorted(seeds, reverse=True), strict=False
+                    )
+                )
+            )
+        ):
+            raise ValueError(f"GLM initial chunk exceeds or misaligns the available cached prefix: {path}")
+    elif point["point_type"] == "prefill" and "repetition" in stage:
+        requested = Counter((parts[-2] if len(parts) > 1 else 0, parts[-1]) for parts in expected)
+        if len(chunks) != 1 or Counter(tuple(part) for part in chunks[0]) != requested:
+            raise ValueError(f"GLM prefill chunks disagree with the recorded per-request prefix or new tokens: {path}")
+
+    return bounds
+
+
+def _glm_decode_context_possible(prompts: list[int], count: int, total: int, *, first_step: bool = False) -> bool:
+    """Each of these distinct requests reads its prompt length or that length plus one."""
+    advance = 0 if first_step else count
+    if not sum(prompts[:count]) <= total <= sum(prompts[-count:]) + advance:
+        return False
+    if count == len(prompts) or prompts[-1] - prompts[0] <= 1:
+        return True
+    if count == 1:
+        return any(prompt <= total <= prompt + advance for prompt in prompts)
+    # Match subset sums on two halves of the producer's at-most-32-request batch.
+    middle = len(prompts) // 2
+    for left_count in range(max(0, count - (len(prompts) - middle)), min(count, middle) + 1):
+        right = sorted(map(sum, combinations(prompts[middle:], count - left_count)))
+        for left in combinations(prompts[:middle], left_count):
+            remainder = total - sum(left)
+            position = bisect_left(right, remainder - advance)
+            if position < len(right) and right[position] <= remainder:
+                return True
+    return False
+
+
+def _validate_glm_rejected_outputs(
+    stage: dict,
+    path: Path,
+    point: dict,
+    counts: list[int],
+    chunks: list[tuple[int, int]],
+    specs: list[list[int]],
+) -> None:
+    """Match the producer's ordered FPMs and prefill chunks to the same positive scheduler outputs."""
+    events = []
+    decode = point["point_type"] == "decode"
+    prompts = sorted(sum(parts) for parts in specs) if decode else []
+    available_contexts = Counter(p + step for p in prompts for step in (0, 1))
+    remaining = 2 * point["batch_size"]
+    if decode and sum(counts) - sum(low for low, _ in chunks) != remaining:
+        raise ValueError(
+            f"GLM rejected decode must contain two decode tokens per request across all dispatches: {path}"
+        )
+    if not isinstance(stage.get("fpms"), list):
+        raise ValueError(f"invalid GLM rejected forwards: {path}")
+    for fpm in stage["fpms"]:
+        scheduled = fpm.get("scheduled_requests") if isinstance(fpm, dict) else None
+        if not isinstance(scheduled, dict):
+            raise ValueError(f"GLM rejected forward lacks its scheduled requests: {path}")
+        prefills, decodes, fresh = (
+            scheduled.get(k) for k in ("num_prefill_requests", "num_decode_requests", "sum_prefill_tokens")
+        )
+        if (
+            any(type(n) is not int or n < 0 for n in (prefills, decodes, fresh))
+            or not 0 < prefills + decodes <= point["batch_size"]
+            or (prefills == 0) != decode
+            or (fresh == 0) != decode
+        ):
+            raise ValueError(f"GLM rejected forward contradicts its recorded phase or scheduled requests: {path}")
+        remaining -= decodes
+        variance = "var_decode_kv_tokens" if decode else "var_prefill_length"
+        singleton = (decodes if decode else prefills) == 1
+        if (decode and remaining < 0) or (
+            singleton
+            and variance in scheduled
+            and (type(scheduled[variance]) not in (int, float) or scheduled[variance] != 0)
+        ):
+            raise ValueError(f"GLM rejected forward contradicts its request count or variance: {path}")
+        if decode:
+            # Each request gets two pure or mixed decode steps, reading p or p+1 cached tokens.
+            context = scheduled.get("sum_decode_kv_tokens")
+            if type(context) is not int or not _glm_decode_context_possible(prompts, decodes, context):
+                raise ValueError(f"GLM rejected decode context contradicts the recorded prompts: {path}")
+            if prompts[0] == prompts[-1]:
+                advanced = context - decodes * prompts[0]
+                available_contexts[prompts[0]] -= decodes - advanced
+                available_contexts[prompts[0] + 1] -= advanced
+            elif decodes == 1:
+                available_contexts[context] -= 1
+            elif decodes == len(prompts) and context in (sum(prompts), sum(prompts) + decodes):
+                offset = int(context != sum(prompts))
+                available_contexts.subtract(p + offset for p in prompts)
+            if any(value < 0 for value in available_contexts.values()):
+                raise ValueError(f"GLM rejected decode contexts contradict the remaining request steps: {path}")
+        tokens = fresh + decodes
+        sample = fpm.get("benchmark_sample")
+        graph = sample.get("cudagraph") if isinstance(sample, dict) else None
+        if graph is not None and (
+            not isinstance(graph, dict) or graph.get("status") not in ("observed", "unavailable")
+        ):
+            raise ValueError(f"invalid GLM rejected forward graph observation: {path}")
+        observed = graph if graph is not None and graph["status"] == "observed" else None
+        if graph is not None and observed is None and any(graph.get(key) is not None for key in _DISPATCH_FIELDS):
+            raise ValueError(f"GLM unavailable rejected forward dispatch contains observed values: {path}")
+        if observed is not None and (not _valid_dispatch(observed) or observed["num_unpadded_tokens"] != tokens):
+            raise ValueError(f"GLM rejected forward contradicts its dispatch or scheduled token count: {path}")
+        forward = sample.get("forward_index") if isinstance(sample, dict) else None
+        events.append((tokens, graph, forward))
+    receipts = stage["dispatches"]
+
+    def matches(event: int, output: int) -> bool:
+        if event >= len(events):
+            return False
+        tokens, graph, _ = events[event]
+        if counts[output] != tokens:
+            return False
+        # Before the first pure decode, every positive output was a prefill chunk.
+        # If those chunks spent every scheduled token, each request still reads its initial prompt.
+        if (
+            decode
+            and event == 0
+            and all(count == low for count, (low, _) in zip(counts[:output], chunks, strict=False))
+        ):
+            context = stage["fpms"][0]["scheduled_requests"]["sum_decode_kv_tokens"]
+            if not _glm_decode_context_possible(prompts, tokens, context, first_step=True):
+                return False
+        if graph is None:
+            return True
+        receipt = receipts[output]
+        if graph["status"] == "unavailable":
+            return receipt is None
+        return receipt is not None and _same_glm_dispatch(graph, receipt)
+
+    if not decode:
+        # A one-token prefill request has one FPM for every positive scheduler output.
+        indices = {forward - i for i, (_, _, forward) in enumerate(events) if type(forward) is int}
+        if (
+            len(events) != len(counts)
+            or any(not matches(i, i) for i in range(len(counts)))
+            or (len(indices) > 1 or any(start < 0 for start in indices))
+        ):
+            raise ValueError(f"GLM rejected prefill forward contradicts its dispatch: {path}")
+        return
+
+    # Each positive output is either a prefill/mixed step (one chunk list), or pure decode
+    # (one FPM). Equal token counts can make the ordering ambiguous, especially with a missing receipt.
+    positions = {(0, None)}
+    for output, count in enumerate(counts):
+        following = set()
+        for chunk, offset in positions:
+            event = output - chunk
+            if matches(event, output):
+                forward = events[event][2]
+                base = forward - output if type(forward) is int else offset
+                if (base is None or base >= 0) and (offset is None or base == offset):
+                    following.add((chunk, base))
+            if chunk < len(chunks) and chunks[chunk][0] <= count <= chunks[chunk][1]:
+                following.add((chunk + 1, offset))
+        positions = following
+    if len(counts) != len(chunks) + len(events) or not any(chunk == len(chunks) for chunk, _ in positions):
+        raise ValueError(
+            f"GLM rejected decode forwards or chunks contradict their dispatches or scheduled token counts: {path}"
+        )
+
+
+def _glm_rejection_reason(attempt: dict, point: dict) -> str | None:
+    """Replay the sealed scheduler's rejection of real-KV forwards in its original order."""
+    forwards = attempt["fpms"]
+    prefill = point["point_type"] == "prefill"
+    wanted = 1 if prefill else 2
+    if len(forwards) != wanted:
+        return f"recorded {len(forwards)} native FPMs, expected {wanted}"
+    last = forwards[-1]["scheduled_requests"]
+    if last.get("num_prefill_requests" if prefill else "num_decode_requests") != point["batch_size"]:
+        return "measured_batch_size_mismatch"
+    if prefill:
+        if last.get("sum_prefill_tokens") != point["total_prefill_tokens"]:
+            return "measured_prefill_tokens_mismatch"
+        if type(last.get("sum_prefill_kv_tokens")) is not int or last["sum_prefill_kv_tokens"] < 0:
+            raise ValueError("GLM rejected forward lacks its measured prefill KV token count")
+        if last["sum_prefill_kv_tokens"] != point["total_kv_read_tokens"]:
+            return "measured_kv_read_mismatch"
+        if last["num_decode_requests"]:
+            return "measured prefill step is mixed with decode"
+    else:
+        if type(last.get("sum_decode_kv_tokens")) is not int or last["sum_decode_kv_tokens"] < 0:
+            raise ValueError("GLM rejected forward lacks its measured decode context")
+        if last["sum_decode_kv_tokens"] != point["total_kv_read_tokens"]:
+            return "measured_decode_context_mismatch"
+        first = forwards[0]["scheduled_requests"]
+        if type(first.get("sum_decode_kv_tokens")) is not int or first["sum_decode_kv_tokens"] < 0:
+            raise ValueError("GLM rejected forward lacks its first decode context")
+        if (
+            first.get("num_decode_requests") != point["batch_size"]
+            or first.get("sum_decode_kv_tokens") != point["total_kv_read_tokens"] - point["batch_size"]
+        ):
+            return "first decode step is not the all-B lockstep step"
+    if any(receipt is None for receipt in attempt["dispatches"][-wanted:]):
+        return "missing actual graph dispatch receipt"
+    return None
+
+
+def _glm_discarded_forwards(
+    attempt: dict, point: dict, rank: object, path: Path
+) -> list[tuple[int, float, float | None]]:
+    """Collect each discarded model-runner output in its rank's sequence and monotonic clock."""
+    benchmark_id = point["benchmark_id"]
+    error = f"native GLM-5.3-Flash result lacks valid repetition_evidence for benchmark_id={benchmark_id}"
+    observations = []
+    for step, fpm in enumerate(attempt.get("fpms", [])):
+        sample = fpm.get("benchmark_sample")
+        if not (
+            isinstance(sample, dict)
+            and {"dp_rank", "counter_id", "wall_time"} <= fpm.keys()
+            and {"forward_index", "sample_index", "timing", "cudagraph"} <= sample.keys()
+            and isinstance(sample["timing"], dict)
+            and "start_monotonic" in sample["timing"]
+        ):
+            raise ValueError(f"{error}: discarded forward lacks its recorded identity or timing: {path}")
+        if (
+            not _same(fpm["dp_rank"], rank)
+            or not _same(fpm["counter_id"], benchmark_id)
+            or not _same(sample["sample_index"], step)
+            or type(sample["forward_index"]) is not int
+            or not isinstance(sample["cudagraph"], dict)
+        ):
+            raise ValueError(f"{error}: discarded forward disagrees with its rank, point or sample index: {path}")
+        wall = fpm["wall_time"]
+        if type(wall) not in (int, float) or not math.isfinite(wall) or wall < 0:
+            raise ValueError(f"{error}: discarded forward lacks a valid wall time: {path}")
+        timing = sample["timing"]
+        start, completion = _forward_interval(timing, wall)
+        if start is None and (timing["basis"] != "schedule_to_output" or wall != 0):
+            raise ValueError(f"{error}: discarded forward lacks the clock required by its measured interval: {path}")
+        if timing["basis"] == "inter_output" and (point["point_type"] == "prefill" or step == 0):
+            raise ValueError(f"{error}: discarded forward has an invalid timing basis for its phase or step: {path}")
+        observations.append((sample["forward_index"], completion, start if timing["basis"] == "inter_output" else None))
+    return observations
+
+
+def _validate_glm_repetitions(
+    record: dict[str, Any],
+    row: dict[str, Any],
+    rank: object,
+    producer: dict[str, Any],
+    path: Path,
+    previous: tuple[int, float] = (-1, -math.inf),
+    block: int | None = None,
+    *,
+    balanced_decode: bool = False,
+    context_limit: int | None = None,
+) -> tuple[int, float]:
+    """Verify the accepted forwards and match the measured forwards to the saved rank samples."""
+    point = row["point"]
+    repetitions = record.get("repetitions")
+    warmups, measured = producer["warmup_repeats"], producer["measurement_repeats"]
+    error = f"native GLM-5.3-Flash result lacks valid repetition_evidence for benchmark_id={point['benchmark_id']}"
+    if (
+        record.get("point_type") != point.get("point_type")
+        or not isinstance(repetitions, list)
+        or len(repetitions) != warmups + measured
+    ):
+        raise ValueError(f"{error}: expected {warmups} warmups and {measured} measurements: {path}")
+    retained = row.get("fpms")
+    measurement = (
+        retained[0].get("benchmark_measurement")
+        if isinstance(retained, list) and len(retained) == 1 and isinstance(retained[0], dict)
+        else None
+    )
+    raw = measurement.get("raw_fpms") if isinstance(measurement, dict) else None
+    if not isinstance(raw, list) or len(raw) != measured:
+        raise ValueError(f"{error}: expected {measured} saved raw samples: {path}")
+    scheduled = _expected_scheduled(point)
+    steps = [scheduled]
+    if point["point_type"] == "decode":
+        # The first decode advances every request by one token before the measured step.
+        steps.insert(0, {**scheduled, "sum_decode_kv_tokens": scheduled["sum_decode_kv_tokens"] - point["batch_size"]})
+    seed = record.get("seed", {})
+    if not isinstance(seed, dict):
+        raise ValueError(f"{error}: invalid prefix seed evidence: {path}")
+    expected_specs, seeds = _glm_request_lengths(record, point, seed, block, path, balanced_decode, context_limit)
+    # The writer skips the seed stage when no request has a prefix to seed.
+    if "prefill_chunks" in seed or "completed_unix_ns" in seed:
+        _validate_glm_chunks(seed, path, point, expected=expected_specs, seed=True, seeds=seeds)
+    rejected = record.get("rejected_repetitions", [])
+    if not isinstance(rejected, list) or any(not isinstance(attempt, dict) for attempt in rejected):
+        raise ValueError(f"{error}: invalid rejected repetitions: {path}")
+    discarded_forwards = {}
+    for attempt in rejected:
+        counts = _glm_scheduled_counts(attempt, path)
+        _glm_attempt_specs(attempt, point, expected_specs, seed, seeds, path)
+        chunks = _validate_glm_chunks(
+            attempt, path, point, counts=counts, expected=expected_specs, seeds=seeds, block=block
+        )
+        _validate_glm_rejected_outputs(attempt, path, point, counts, chunks, expected_specs)
+        attempt_id = attempt.get("attempt")
+        if type(attempt_id) is not int or attempt_id < 0 or attempt_id in discarded_forwards:
+            raise ValueError(f"{error}: invalid or duplicate rejected attempt ID: {path}")
+        if not isinstance(attempt.get("rejection_reason"), str) or not attempt["rejection_reason"].strip():
+            raise ValueError(f"{error}: discarded attempt lacks its rejection reason: {path}")
+        if attempt["rejection_reason"] != _glm_rejection_reason(attempt, point):
+            raise ValueError(f"{error}: the recorded forwards do not support the rejection reason: {path}")
+        discarded_forwards[attempt_id] = _glm_discarded_forwards(attempt, point, rank, path)
+    previous_forward, previous_output = previous
+    # The GLM scheduler drains the preceding attempt before starting the next one.
+    previous_attempt = -1
+    variance_field = "var_decode_kv_tokens" if point["point_type"] == "decode" else "var_prefill_length"
+    # The producer fixes each request length for the point. Advancing every decode by one preserves variance.
+    variance = statistics.pvariance(sum(parts) for parts in expected_specs)
+    for index, repetition in enumerate(repetitions):
+        role = "warmup" if index < warmups else "measurement"
+        if (
+            not isinstance(repetition, dict)
+            or not _same(repetition.get("repetition"), index)
+            or repetition.get("role") != role
+            or type(repetition.get("attempt")) is not int
+            or repetition["attempt"] <= previous_attempt
+            or repetition["attempt"] in discarded_forwards
+            or "rejection_reason" in repetition
+        ):
+            raise ValueError(f"{error}: invalid accepted {role} at repetition {index}: {path}")
+        for attempt_id in sorted(discarded_forwards):
+            if previous_attempt < attempt_id < repetition["attempt"]:
+                for forward, completion, prior_end in discarded_forwards[attempt_id]:
+                    if prior_end is not None and (
+                        prior_end < previous_output
+                        or (
+                            forward == previous_forward + 1
+                            and math.isfinite(previous_output)
+                            and prior_end != previous_output
+                        )
+                    ):
+                        raise ValueError(
+                            f"{error}: discarded inter-output interval disagrees with the preceding output: {path}"
+                        )
+                    if forward <= previous_forward:
+                        raise ValueError(f"{error}: repeated or unordered discarded forward: {path}")
+                    if completion < previous_output:
+                        raise ValueError(f"{error}: discarded completion precedes an earlier forward: {path}")
+                    previous_forward, previous_output = forward, completion
+        previous_attempt = repetition["attempt"]
+        fpms = repetition.get("fpms")
+        if not isinstance(fpms, list) or len(fpms) != len(steps):
+            raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
+        dispatches = repetition.get("dispatches")
+        if (
+            not isinstance(dispatches, list)
+            or len(dispatches) < len(steps)
+            or (point["point_type"] == "prefill" and len(dispatches) != len(steps))
+        ):
+            raise ValueError(f"{error}: missing dispatch receipt for {role} {index}: {path}")
+        # Earlier dispatches can build the prefix. Only the final ones are the forwards of this repetition.
+        receipts = dispatches[-len(steps) :]
+        counts = _glm_scheduled_counts(repetition, path)
+        chunk_counts = counts
+        if point["point_type"] == "decode":
+            chunk_counts = chunk_counts[: -len(steps)]
+            if not chunk_counts:
+                raise ValueError(f"{error}: seeded decode lacks a preparation dispatch for the uncached suffix: {path}")
+        _glm_attempt_specs(repetition, point, expected_specs, seed, seeds, path)
+        _validate_glm_chunks(
+            repetition, path, point, counts=chunk_counts, expected=expected_specs, seeds=seeds, block=block
+        )
+        for step, (fpm, expected) in enumerate(zip(fpms, steps, strict=True)):
+            if (
+                not isinstance(fpm, dict)
+                or not _same(fpm.get("dp_rank"), rank)
+                or not _same(fpm.get("counter_id"), point["benchmark_id"])
+                or type(fpm.get("wall_time")) not in {int, float}
+                or not math.isfinite(fpm["wall_time"])
+                or fpm["wall_time"] <= 0
+                or not isinstance(fpm.get("scheduled_requests"), dict)
+                or any(not _same(fpm["scheduled_requests"].get(key), value) for key, value in expected.items())
+            ):
+                raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
+            scheduled_requests = fpm["scheduled_requests"]
+            observed = scheduled_requests.get(variance_field)
+            if (
+                type(observed) not in (int, float)
+                or not math.isfinite(observed)
+                or observed < 0
+                or not math.isclose(observed, variance, rel_tol=1e-9, abs_tol=1e-9)
+            ):
+                raise ValueError(f"{error}: {variance_field} contradicts the recorded per-request lengths: {path}")
+            if index == len(repetitions) - 1 and step == len(steps) - 1:
+                retained_workload = retained[0]["scheduled_requests"]
+                if not _same(retained_workload.get(variance_field), observed):
+                    raise ValueError(f"{error}: retained {variance_field} differs from the final measurement: {path}")
+            sample = fpm.get("benchmark_sample")
+            forward = sample.get("forward_index") if isinstance(sample, dict) else None
+            if type(forward) is not int or forward <= previous_forward or not _same(sample.get("sample_index"), step):
+                raise ValueError(f"{error}: missing, repeated or unordered forward at repetition {index}: {path}")
+            if step == 0 and forward - previous_forward <= len(dispatches) - len(steps):
+                raise ValueError(f"{error}: forward indices do not account for the preparation dispatches: {path}")
+            if step and forward != previous_forward + 1:
+                raise ValueError(f"{error}: lockstep decode forwards must have consecutive indices: {path}")
+            if index >= warmups and step == len(steps) - 1:
+                position = index - warmups
+                expected_raw = {**fpm, "benchmark_sample": {**sample, "sample_index": position}}
+                if json.dumps(raw[position], sort_keys=True) != json.dumps(expected_raw, sort_keys=True):
+                    raise ValueError(f"{error}: measurement {position} differs from its saved raw sample: {path}")
+            basis, graph, _ = _observed_forward(sample, fpm["wall_time"], glm=True, path=path)
+            timing = sample["timing"]
+            if not step and timing["start_monotonic"] < previous_output:
+                raise ValueError(f"{error}: accepted forward starts before the preceding output: {path}")
+            if step and timing["start_monotonic"] != previous_output:
+                raise ValueError(f"{error}: inter-output interval must start at the preceding output: {path}")
+            previous_output = timing["end_monotonic"]
+            receipt = receipts[step]
+            if (
+                basis != ("schedule_to_output" if step == 0 else "inter_output")
+                or not isinstance(receipt, dict)
+                or not _same_glm_dispatch(graph, receipt)
+            ):
+                raise ValueError(f"{error}: invalid timing basis or dispatch receipt for {role} {index}: {path}")
+            # Only newly scheduled tokens reach the GPU. The first decode step and the steady step each
+            # schedule one token per request, independent of the amount of prefix KV they read.
+            tokens = expected["sum_prefill_tokens"] + expected["num_decode_requests"]
+            if graph["num_unpadded_tokens"] != tokens or (counts[step - len(steps)] != tokens):
+                raise ValueError(
+                    f"{error}: dispatch differs from the scheduled token count {tokens} for {role} {index}: {path}"
+                )
+            previous_forward = forward
+    # Attempt IDs include every rejection.
+    if previous_attempt + 1 - len(repetitions) > _GLM_MAX_REJECTED_REPETITIONS:
+        raise ValueError(
+            f"{error}: exceeds the producer limit of {_GLM_MAX_REJECTED_REPETITIONS} rejected repetitions: {path}"
+        )
+    if (
+        "rejected_repetitions" not in record
+        or previous_attempt != len(repetitions) + len(discarded_forwards) - 1
+        or any(attempt > previous_attempt for attempt in discarded_forwards)
+    ):
+        raise ValueError(f"{error}: the complete attempt history must end at the last accepted repetition: {path}")
+    return previous_forward, previous_output
+
+
+def _validate_glm_provenance(
+    cell: FPMCell, payload: dict[str, Any], path: Path, *, producer_digests: dict[str, str] | None = None
+) -> dict[str, Any]:
     """Require the evidence that the GLM-5.3-Flash vLLM producer writes beside its graph-timed measurements.
 
     The producer builds every prefix and decode state from seeded tokens through vLLM's own scheduler, repeats each
     point and keeps the evidence of the repetitions in a sidecar file next to the artifact. Its ``producer`` record
     must equal the record of the supported producer (``_glm_producer_record``). A refusal names the first item that is
-    absent or malformed. The caller has already checked that the rows are mappings with mapping points.
+    absent or malformed. ``producer_digests``, the two digests of the cell's producer receipt, replace the two digests
+    of that record. The digest of a row whose benchmark_id is an integer (and not a bool) must be that of the sidecar
+    line with that benchmark_id; a row with any other ID is left to the check of the row IDs. The seeded input must be
+    the record of a generator version that this collector can draw. The caller has already checked that
+    the rows are mappings with mapping points.
     """
 
     def lacks(field: str) -> ValueError:
@@ -343,6 +1276,8 @@ def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path)
         raise lacks("input_provenance")
     if not _same(evidence.get("source"), "seeded_tokens"):
         raise lacks("input_provenance.source")
+    if evidence.get("decode_contexts_sha256") is not None and not _is_hex(evidence["decode_contexts_sha256"], 64):
+        raise lacks("input_provenance.decode_contexts_sha256")
     for key in ("generator", "sampling"):
         if not isinstance(evidence.get(key), str) or not evidence[key]:
             raise lacks(f"input_provenance.{key}")
@@ -380,7 +1315,8 @@ def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path)
     if not _same(evidence.get("chunk_start_alignment"), 4):
         raise lacks("input_provenance.chunk_start_alignment")
 
-    # The sidecar is bound by its name, its digest and its record count, one record per measured point.
+    # The sidecar is bound by its name, its digest and its record count, one record per measured point, and each row
+    # whose benchmark_id is an integer by the digest of the line with that ID.
     sidecar = path.with_name(f"{path.stem}.repetitions.jsonl")
     manifest = evidence.get("repetition_evidence_manifest")
     raw = sidecar.read_bytes() if sidecar.is_file() else None
@@ -390,6 +1326,7 @@ def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path)
         or not _same(manifest.get("schema_version"), 1)
         or manifest.get("file") != sidecar.name
         or manifest.get("sha256") != hashlib.sha256(raw).hexdigest()
+        or type(manifest.get("records")) is not int
         or manifest.get("records") != len(raw.splitlines())
         or manifest.get("records") != len(payload["results"])
     ):
@@ -404,15 +1341,48 @@ def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path)
         ("method", "native_prefix_cache_real_seed"),
         ("state_protocol", "glm53flash_prefix_cache_real_seed_v1"),
     )
-    if any(not _same(kvwarm.get(key), value) for key, value in expected_kvwarm):
-        raise lacks("kvwarm")
-    if not _same(payload.get("timing_boundary"), "dynamo_vllm_instrumented_scheduler_fpm_wall_time"):
+    for key, value in expected_kvwarm:
+        if not _same(kvwarm.get(key), value):
+            raise lacks(f"kvwarm.{key}")
+    context_limit = kvwarm.get("max_context")
+    if context_limit is not None and (type(context_limit) is not int or not 0 < context_limit <= MAX_CONTEXT):
+        raise lacks("kvwarm.max_context")
+    for document in (evidence, payload):
+        policy = document.get("context_policy")
+        if isinstance(policy, dict) and "measured_context_limit" in policy:
+            measured_limit = policy["measured_context_limit"]
+            if (
+                type(measured_limit) is not int
+                or not 0 < measured_limit <= MAX_CONTEXT
+                or context_limit not in (None, measured_limit)
+            ):
+                raise lacks("context_policy.measured_context_limit")
+            context_limit = measured_limit
+            runtime = policy.get("runtime_context_length")
+            if "runtime_context_length" in policy and (
+                type(runtime) is not int or runtime < measured_limit + CONTEXT_HEADROOM
+            ):
+                raise lacks("context_policy.runtime_context_length")
+            if "native_admission_headroom" in policy and not _same(
+                policy["native_admission_headroom"], CONTEXT_HEADROOM
+            ):
+                raise lacks("context_policy.native_admission_headroom")
+    if not _same(payload.get("timing_boundary"), GLM_TIMING_BOUNDARY):
         raise lacks("timing_boundary")
     serving = payload.get("serving_config")
     serving = serving if isinstance(serving, dict) else {}
     for key, value in (("enable_prefix_caching", True), ("async_scheduling", False)):
         if not _same(serving.get(key), value):
             raise lacks(f"serving_config.{key}")
+    # The producer's point rules assume Mamba state in align mode, a scheduler block that is the hash block, and
+    # prefill chunks that the scheduler splits at block boundaries.
+    if not _same(serving.get("mamba_cache_mode"), "align"):
+        raise lacks("serving_config.mamba_cache_mode")
+    block = serving.get("block_size")
+    if type(block) is not int or block <= 0 or block % CHUNK_ALIGN or not _same(serving.get("hash_block_size"), block):
+        raise lacks("serving_config.block_size")
+    if serving.get("need_mamba_block_aligned_split") is not True:
+        raise lacks("serving_config.need_mamba_block_aligned_split")
     # The producer record must be the one that the supported producer writes, field by field and with the same JSON
     # types. A field that the record lacks or adds is refused too.
     producer = payload.get("producer")
@@ -420,13 +1390,23 @@ def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path)
         raise ValueError(
             f"native GLM-5.3-Flash result lacks valid producer: expected a mapping, found {producer!r}: {path}"
         )
-    expected_producer = _glm_producer_record()
+    expected_producer = {**_glm_producer_record(), **(producer_digests or {})}
     for key, value in expected_producer.items():
         if not _same(producer.get(key), value):
+            source = " (the value of the producer receipt of the cell)" if key in (producer_digests or {}) else ""
             raise ValueError(
-                f"native GLM-5.3-Flash result lacks valid producer.{key}: expected {value!r}, "
+                f"native GLM-5.3-Flash result lacks valid producer.{key}: expected {value!r}{source}, "
                 f"found {producer.get(key)!r}: {path}"
             )
+    if (
+        producer_digests is None
+        and cell.glm_producer_digests is not None
+        and any(producer[key] != value for key, value in cell.glm_producer_digests._asdict().items())
+    ):
+        raise lacks("producer digests of the frozen collection plan")
+    # Both receipt-v1 and plan-bound producers use this Dynamo 1.7 evidence format.
+    if "decode_contexts_sha256" not in evidence:
+        raise lacks("input_provenance.decode_contexts_sha256")
     added = sorted(set(producer) - set(expected_producer))
     if added:
         raise ValueError(
@@ -434,9 +1414,49 @@ def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path)
             f"found {producer[added[0]]!r}: {path}"
         )
 
+    # The producer hashes each sidecar line without its line break and stores the digest in the row of the point with
+    # the line's benchmark_id. The lines follow the order in which the points ran. A row whose benchmark_id is no
+    # integer is left to the check of the row IDs in validate_native_collection.
+    rows_by_id = {
+        row["point"]["benchmark_id"]: row for row in payload["results"] if type(row["point"].get("benchmark_id")) is int
+    }
+    rank = payload.get("dp")
+    rank = rank.get("rank") if isinstance(rank, dict) else None
+    line_digests: dict[int, str] = {}
+    previous = (-1, -math.inf)
+    for line in raw.splitlines():
+        try:
+            record = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise lacks("repetition_evidence") from None
+        benchmark_id = record.get("benchmark_id") if isinstance(record, dict) else None
+        if type(benchmark_id) is not int or benchmark_id in line_digests:
+            raise lacks("repetition_evidence")
+        line_digests[benchmark_id] = hashlib.sha256(line).hexdigest()
+        row = rows_by_id.get(benchmark_id)
+        if row is not None and row.get("repetition_evidence_sha256") == line_digests[benchmark_id]:
+            try:
+                previous = _validate_glm_repetitions(
+                    record,
+                    row,
+                    rank,
+                    expected_producer,
+                    path,
+                    previous,
+                    block,
+                    balanced_decode=(
+                        "decode_contexts_sha256" in evidence and evidence["decode_contexts_sha256"] is None
+                    ),
+                    context_limit=context_limit or MAX_CONTEXT,
+                )
+            except ValueError as error:
+                raise _InvalidGlmMeasurement(str(error)) from error
     for row in payload["results"]:
         point = row["point"]
         if not _is_hex(row.get("repetition_evidence_sha256"), 64):
+            raise lacks("repetition_evidence_sha256")
+        benchmark_id = point.get("benchmark_id")
+        if type(benchmark_id) is int and row["repetition_evidence_sha256"] != line_digests.get(benchmark_id):
             raise lacks("repetition_evidence_sha256")
         if point.get("point_type") == "decode":
             regime = "real_kv"
@@ -446,6 +1466,15 @@ def _validate_glm_provenance(cell: FPMCell, payload: dict[str, Any], path: Path)
             regime = "not_applicable"
         if row.get("kv_seed_regime") != regime:
             raise lacks("kv_seed_regime")
+
+    # The seeded input must be the one that the producer of the recorded generator version draws, field by field and
+    # with the same JSON types.
+    expected_input = _glm_input_record(evidence["generator_version"])
+    if expected_input is None:
+        raise lacks("input_provenance.generator_version")
+    for key, value in expected_input.items():
+        if not _same(evidence.get(key), value):
+            raise lacks(f"input_provenance.{key}")
     return evidence
 
 
@@ -548,11 +1577,21 @@ def _validate_token_streams(payload: dict[str, Any], path: Path) -> None:
 def _without_sidecar_names(evidence: dict[str, Any]) -> dict[str, Any]:
     """Input evidence without the file names of its sidecar manifests, which differ per rank.
 
-    The rest of each manifest, such as its digest and its record count, still has to agree across ranks.
+    Each rank's repetition file contains its own timings. Its digest is checked against its own artifact; the
+    seeded inputs, the record counts and the token-stream digest must agree across ranks.
     """
     sidecar_manifests = ("token_stream_manifest", "repetition_evidence_manifest")
+    for key in sidecar_manifests:
+        if key in evidence and not isinstance(evidence[key], dict):
+            raise ValueError(f"native input provenance {key} must be a mapping, found {evidence[key]!r}")
     return {
-        key: {name: item for name, item in value.items() if name != "file"} if key in sidecar_manifests else value
+        key: {
+            name: item
+            for name, item in value.items()
+            if name != "file" and not (key == "repetition_evidence_manifest" and name == "sha256")
+        }
+        if key in sidecar_manifests
+        else value
         for key, value in evidence.items()
     }
 
@@ -564,7 +1603,7 @@ def _validate_collector_provenance(
     *,
     expected_plan_sha256: str | None,
     expected_attempt_id: str | None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     pod_names = set()
     for path, _payload in rank_payloads:
         relative = path.relative_to(raw_root)
@@ -620,7 +1659,7 @@ def _validate_collector_provenance(
             raise ValueError(f"Collector provenance differs across pods: {path}")
 
     assert canonical is not None
-    return str(canonical["runtime"]["backend_version"]), str(canonical["attempt_id"])
+    return str(canonical["runtime"]["backend_version"]), str(canonical["attempt_id"]), str(canonical["plan_sha256"])
 
 
 def _require_int(point: dict[str, Any], key: str) -> int:
@@ -864,18 +1903,24 @@ def validate_native_collection(
     *,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
+    deployment: FpmDeploymentProfile | None = None,
 ) -> NativeCollection:
     """Validate a complete native rank set and return synchronized measurements."""
 
     rank_payloads = _rank_artifacts(raw_root)
     if not rank_payloads:
         raise ValueError(f"integrated runtime emitted no benchmark results for {cell.cell_id}")
-    backend_version, collector_attempt_id = _validate_collector_provenance(
+    backend_version, collector_attempt_id, collector_plan_sha256 = _validate_collector_provenance(
         cell,
         raw_root,
         rank_payloads,
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
+    )
+    producer_digests = (
+        _producer_receipt(cell, raw_root, plan_sha256=collector_plan_sha256, attempt_id=collector_attempt_id)
+        if _glm_contract(cell)
+        else None
     )
     expected_ranks = list(range(cell.topology.dp))
     seen_ranks: set[int] = set()
@@ -926,7 +1971,7 @@ def validate_native_collection(
             raise ValueError(f"native result is missing coverage/results/iteration_groups: {path}")
         if any(not isinstance(row, dict) or not isinstance(row.get("point"), dict) for row in rows):
             raise ValueError(f"native result has malformed result points: {path}")
-        evidence = _validate_execution_provenance(cell, payload, path)
+        evidence = _validate_execution_provenance(cell, payload, path, producer_digests=producer_digests)
         # The validation above has proven that the artifact's mode is the mode of the cell's contract.
         execution_mode = payload.get("execution_mode") if evidence is not None else None
         if execution_mode == "eager":
@@ -943,6 +1988,14 @@ def validate_native_collection(
             raise ValueError(f"native DP ranks disagree on input provenance: {path}")
         # One launch shares one scheduler configuration, so the ranks must agree on the checkpoint evidence of it.
         serving = payload.get("serving_config")
+        if execution_mode == "native_graph_policy" and deployment is not None:
+            memory = deployment.resources.runtime_memory
+            expected_block = memory.hash_block_size_tokens if memory is not None else None
+            if expected_block is not None and serving["hash_block_size"] != expected_block:
+                raise ValueError(
+                    f"native GLM-5.3-Flash serving_config.hash_block_size differs from the accepted deployment: "
+                    f"expected {expected_block}, found {serving['hash_block_size']}: {path}"
+                )
         checkpoint = (
             serving.get("mamba_prefill_checkpoint", _NO_CHECKPOINT_EVIDENCE)
             if isinstance(serving, dict)

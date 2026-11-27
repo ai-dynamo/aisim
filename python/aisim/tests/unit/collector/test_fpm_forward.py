@@ -1335,11 +1335,10 @@ def test_detected_layout_reads_the_layer_count_as_intake_does(tmp_path, layer_co
 
 
 def test_detected_layout_reads_every_layer_count_field_of_intake(tmp_path):
-    from aisim.support.config_profile import _INT_ALIASES
+    from aisim.fpm_cache_layout import LAYER_COUNT_FIELDS
     from aisim.support.config_profile import load_model_config as load_intake_config
 
-    # The collector copies intake's list of layer count fields; a field that intake adds must count here too.
-    for field in _INT_ALIASES["num_hidden_layers"]:
+    for field in LAYER_COUNT_FIELDS:
         directory = tmp_path / field
         directory.mkdir()
         path = _layer_config(directory, _GDN_LAYERS, {field: 3})
@@ -1782,6 +1781,99 @@ def test_malformed_llm_config_of_a_registered_wrapper_is_refused_as_config_intak
 
 
 @pytest.mark.parametrize(
+    ("wrapper", "held", "own"),
+    [
+        ("NemotronH_Omni_Reasoning_V3", "text_config", "llm_config"),
+        ("Qwen3_5MoeForConditionalGeneration", "llm_config", "text_config"),
+    ],
+    ids=["llm-wrapper", "text-wrapper"],
+)
+def test_registered_wrapper_with_only_the_other_decoder_key_is_refused_by_every_reader(tmp_path, wrapper, held, own):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+    from aisim_core.sdk.fpm_profile import _validate_checkpoint_architecture
+
+    # The registry names the key of this wrapper. The op-level parser reads the wrapper root when that key is missing,
+    # so a reader of the other key would see another decoder.
+    document = {"architectures": [wrapper], held: _packaged_config(_NEMOTRON_SUPER)}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    problem = f"{wrapper} keeps its text decoder under {own}, but this config holds {held} and no {own}"
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert (
+        str(intake.value) == f"{problem}; supply a config.json that holds the text decoder under the wrapper's own key"
+    )
+    with pytest.raises(ValueError) as effective:
+        _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
+    assert str(effective.value) == f"{problem}; supply one text decoder config"
+    with pytest.raises(ValueError) as collector:
+        _layout_capability(path, native=True)
+    assert str(collector.value) == f"{problem}; supply one text decoder config"
+    # Render reads the same view.
+    with pytest.raises(ValueError) as render:
+        load_model_config(str(path)).parsed_payload()
+    assert str(render.value) == f"{problem}; supply one text decoder config"
+    profile = SimpleNamespace(model=str(tmp_path), model_revision=None, architecture=wrapper)
+    with pytest.raises(ValueError) as check:
+        _validate_checkpoint_architecture(profile)
+    identity = f"{str(tmp_path)!r} at model_revision=None"
+    assert str(check.value) == (
+        f"FPM profile checkpoint config.json for {identity} has no single text decoder: {problem}"
+    )
+
+
+def test_registered_wrapper_with_only_the_other_decoder_key_is_refused_before_its_sidecar_is_read(tmp_path):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+
+    # The adjacent sidecar conflicts with the decoder under the other key. The collector names the wrapper, as config
+    # intake does, and not a conflict with a decoder that it does not read.
+    wrapper = "Qwen3_5MoeForConditionalGeneration"
+    quantization = {"quant_method": "fp8", "quant_algo": "fp8"}
+    decoder = {**_packaged_config(_NEMOTRON_SUPER), "quantization_config": quantization}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"architectures": [wrapper], "llm_config": decoder}))
+    sidecar = {"quantization": {"quant_algo": "NVFP4", "kv_cache_quant_algo": None}}
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps(sidecar))
+    problem = f"{wrapper} keeps its text decoder under text_config, but this config holds llm_config and no text_config"
+    with pytest.raises(ValueError) as collector:
+        _ = load_model_config(str(path)).effective_payload
+    assert str(collector.value) == f"{problem}; supply one text decoder config"
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert (
+        str(intake.value) == f"{problem}; supply a config.json that holds the text decoder under the wrapper's own key"
+    )
+
+
+def test_registered_wrapper_with_a_null_other_decoder_key_is_refused_before_the_key_is_read(tmp_path):
+    from aisim.support.config_profile import load_model_config as load_intake_config
+    from aisim_core.sdk.fpm_profile import _validate_checkpoint_architecture
+
+    # Each reader names the wrapper before it reads the decoder key, so the null text_config gets the wrapper text and
+    # not the text of a decoder key that holds no decoder.
+    wrapper = "NemotronH_Omni_Reasoning_V3"
+    document = {"architectures": [wrapper], "text_config": None}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    problem = f"{wrapper} keeps its text decoder under llm_config, but this config holds text_config and no llm_config"
+    with pytest.raises(ValueError) as intake:
+        load_intake_config(path)
+    assert (
+        str(intake.value) == f"{problem}; supply a config.json that holds the text decoder under the wrapper's own key"
+    )
+    with pytest.raises(ValueError) as effective:
+        _ = ResolvedModelConfig(document, source_kind="explicit", source_reference="test").effective_payload
+    assert str(effective.value) == f"{problem}; supply one text decoder config"
+    profile = SimpleNamespace(model=str(tmp_path), model_revision=None, architecture=wrapper)
+    with pytest.raises(ValueError) as check:
+        _validate_checkpoint_architecture(profile)
+    identity = f"{str(tmp_path)!r} at model_revision=None"
+    assert str(check.value) == (
+        f"FPM profile checkpoint config.json for {identity} has no single text decoder: {problem}"
+    )
+
+
+@pytest.mark.parametrize(
     "extra",
     [{}, {"llm_config": None}, {"llm_config": {}}, {"llm_config": []}, {"llm_config": "decoder"}],
     ids=["flat", "null-llm-config", "empty-llm-config", "list-llm-config", "string-llm-config"],
@@ -1801,6 +1893,145 @@ def test_flat_config_and_an_llm_config_that_is_no_decoder_load_in_the_collector_
         f"config.json cannot describe this cache layout ({_NEMOTRON_REASONS}). The native runtime measures every cell."
     )
     assert load_model_config(str(path)).parsed_payload()["raw_config"]["architectures"] == document["architectures"]
+
+
+def _gemma4_without_decoder_layers():
+    document = _packaged_config("google--gemma-4-26B-A4B")
+    del document["text_config"]["num_hidden_layers"]
+    del document["text_config"]["layer_types"]
+    return document
+
+
+@pytest.mark.parametrize(
+    ("document", "problem"),
+    [
+        (
+            {**_packaged_config("google--gemma-4-26B-A4B"), "vision_config": "x"},
+            "Gemma4ForConditionalGeneration: ValueError: Expected 'vision_config' to be a dict for "
+            "architecture Gemma4ForConditionalGeneration, got str",
+        ),
+        (
+            {**_packaged_config("meta-llama--Llama-4-Scout-17B-16E-Instruct"), "vision_config": {}},
+            "Llama4ForConditionalGeneration: ValueError: Llama 4 vision_config is missing required fields: "
+            "hidden_size, num_hidden_layers, num_attention_heads, num_channels, intermediate_size, image_size, "
+            "patch_size, pixel_shuffle_ratio, projector_input_dim, projector_output_dim, vision_output_dim",
+        ),
+        (
+            _gemma4_without_decoder_layers(),
+            "Gemma4ForConditionalGeneration: ValueError: Model config must define 'num_hidden_layers' or "
+            "a parseable layer pattern.",
+        ),
+    ],
+    ids=["gemma4-vision-field", "llama4-vision-field", "gemma4-decoder"],
+)
+def test_render_refuses_a_registered_wrapper_that_the_parser_refuses_with_the_parser_message(
+    tmp_path, document, problem
+):
+    # The parser reads the wrapper with its vision fields. In the two vision cases the decoder alone would parse, or
+    # fail for another field; in the third case the decoder alone fails for the same field.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError) as error:
+        load_model_config(str(path)).parsed_payload()
+    assert str(error.value) == f"the config parser refuses the HF config of the supported architecture {problem}"
+    assert type(error.value.__cause__) is ValueError
+
+
+def test_render_keeps_the_parse_of_a_valid_registered_wrapper_and_the_decoder_geometry_of_an_unknown_one(tmp_path):
+    (tmp_path / "registered").mkdir()
+    registered = tmp_path / "registered" / "config.json"
+    registered.write_text(json.dumps(_packaged_config("google--gemma-4-26B-A4B")))
+    parsed = load_model_config(str(registered)).parsed_payload()
+    # The values of the packaged text_config, read by the normalized parse.
+    assert (parsed["architecture"], parsed["layers"], parsed["hidden_size"], parsed["inter_size"]) == (
+        "Gemma4ForConditionalGeneration",
+        30,
+        2816,
+        2112,
+    )
+    assert (parsed["vocab"], parsed["num_experts"]) == (262144, 128)
+    decoder = {
+        "hidden_size": 256,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "intermediate_size": 1024,
+        "vocab_size": 1000,
+        "torch_dtype": "bfloat16",
+    }
+    (tmp_path / "unknown").mkdir()
+    unknown = tmp_path / "unknown" / "config.json"
+    unknown.write_text(
+        json.dumps(
+            {"architectures": ["UnknownWrapperForConditionalGeneration"], "hidden_size": 4096, "text_config": decoder}
+        )
+    )
+    bootstrap = load_model_config(str(unknown)).parsed_payload()
+    del bootstrap["raw_config"]
+    assert bootstrap == {
+        "architecture": "UnknownWrapperForConditionalGeneration",
+        "layers": 4,
+        "hidden_size": 256,
+        "inter_size": 1024,
+        "vocab": 1000,
+        "num_experts": 0,
+        "moe_inter_size": 1024,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "damage", "architecture", "cause"),
+    [
+        (
+            "google--gemma-4-26B-A4B",
+            lambda document: document["text_config"].pop("hidden_size"),
+            "Gemma4ForConditionalGeneration",
+            KeyError,
+        ),
+        (
+            "Qwen--Qwen3-VL-235B-A22B-Instruct",
+            lambda document: document.update(vision_config="x"),
+            "Qwen3VLMoeForConditionalGeneration",
+            TypeError,
+        ),
+    ],
+    ids=["missing-key", "wrong-type"],
+)
+def test_render_refuses_a_registered_architecture_for_each_error_class_of_the_parse(
+    tmp_path, name, damage, architecture, cause
+):
+    # The parser reports a missing key with a KeyError and a value of a wrong type with a TypeError. The render gives
+    # both the form of a ValueError of the parse: the type and the text of the parser's error after the prefix.
+    document = _packaged_config(name)
+    damage(document)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError) as error:
+        load_model_config(str(path)).parsed_payload()
+    assert type(error.value.__cause__) is cause
+    assert str(error.value) == (
+        f"the config parser refuses the HF config of the supported architecture {architecture}: {cause.__name__}: "
+        f"{error.value.__cause__}"
+    )
+
+
+def test_render_passes_on_a_parse_error_that_is_no_value_error_for_an_architecture_that_is_not_registered(tmp_path):
+    # The prefixed form is for a registered architecture. This config names no architecture, so the error of the
+    # parser passes out as it is.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"hidden_size": 16, "num_hidden_layers": 2}))
+    with pytest.raises(KeyError) as error:
+        load_model_config(str(path)).parsed_payload()
+    assert error.value.args == ("architectures",)
+
+
+def test_render_keeps_the_decoder_geometry_of_a_registered_wrapper_whose_decoder_names_another_class(tmp_path):
+    # The packaged Kimi-K3 wrapper is registered. Its decoder names a class of its own that is not, so the render reads
+    # the decoder under that class and keeps its geometry.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_packaged_config("moonshotai--Kimi-K3")))
+    parsed = load_model_config(str(path)).parsed_payload()
+    assert (parsed["architecture"], parsed["layers"], parsed["hidden_size"]) == ("KimiLinearForCausalLM", 93, 7168)
 
 
 def _detected_layout_plan(tmp_path, monkeypatch, generator_overrides):
@@ -3864,6 +4095,70 @@ def test_deepseek_v41_plan_keeps_its_eager_rule():
     assert {cell.input_text_sha256 for cell in plan.cells} == {hashlib.sha256(corpus.read_bytes()).hexdigest()}
     with pytest.raises(ValueError, match="DeepSeek V4.1 requires eager execution"):
         build()
+
+
+@pytest.mark.parametrize("architecture", ["DeepseekV41ForCausalLM", "Glm5NextForConditionalGeneration"])
+def test_plan_refuses_a_producer_architecture_whose_config_names_no_architecture(tmp_path, architecture):
+    # The producer contract of these models hangs on the execution identity, which comes from the architectures field
+    # of config.json. --model-architecture names the architecture, but it gives no identity.
+    if architecture == "Glm5NextForConditionalGeneration":
+        path = _mixed_attention_config(tmp_path, architecture, True)
+        config = json.loads(path.read_text())
+        points = tmp_path / "points.json"
+        points.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "prefill": [{"batch_size": 1, "total_prefill_tokens": 64, "total_kv_read_tokens": 0}],
+                    "decode": [{"batch_size": 1, "total_kv_read_tokens": 4096}],
+                }
+            )
+        )
+        overrides = {"fpm_benchmark_points_file": str(points)}
+    else:
+        path = tmp_path / "config.json"
+        config = json.loads((_MODEL_CONFIGS / "deepseek-ai--DeepSeek-V4.1-Flash_config.json").read_text())
+        overrides = {"fpm_enforce_eager": True}
+    del config["architectures"]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError) as error:
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(path),
+            system="b200_sxm",
+            selected_ops={"attention_context", "attention_generation"},
+            options=FPMCollectionOptions.from_args(_args(**overrides)),
+            model_architecture=architecture,
+            has_model_cases=False,
+            model_config_path=str(path),
+            collector_config={"aic_database_version": "0.27.0"},
+        )
+    assert str(error.value) == (
+        f"{architecture} FPM collection requires the architectures field in the checkpoint config.json: its execution "
+        "identity comes from that field, and --model-architecture does not replace it"
+    )
+
+
+def test_eager_refusal_comes_before_the_architectures_refusal(tmp_path):
+    # A GLM-5.3-Flash config without architectures and an eager request break both rules. The eager rule speaks first.
+    architecture = "Glm5NextForConditionalGeneration"
+    path = _mixed_attention_config(tmp_path, architecture, True)
+    config = json.loads(path.read_text())
+    del config["architectures"]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError) as error:
+        build_collection_plan(
+            backend="vllm",
+            model_path=str(path),
+            system="b200_sxm",
+            selected_ops={"attention_context", "attention_generation"},
+            options=FPMCollectionOptions.from_args(_args(fpm_enforce_eager=True)),
+            model_architecture=architecture,
+            has_model_cases=False,
+            model_config_path=str(path),
+            collector_config={"aic_database_version": "0.27.0"},
+        )
+    assert str(error.value) == "explicit eager FPM collection is currently qualified only for DeepSeek V4.1"
 
 
 @pytest.mark.parametrize("corruption", ["missing", "tampered", "fake", "seed", "path", "coverage"])

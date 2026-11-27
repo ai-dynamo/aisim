@@ -8,8 +8,7 @@ from aisim_core.sdk import common
 from aisim_core.sdk.models.base import BaseModel, register_model
 from aisim_core.sdk.models.blocks.moe import MoEBlockShape, build_moe_block_ops
 from aisim_core.sdk.models.blocks.vit import build_llama4_encoder_ops
-from aisim_core.sdk.models.helpers import mtp_scale_factor
-from aisim_core.sdk.utils import _get_language_quantization_config, _load_model_config_from_model_path
+from aisim_core.sdk.models.helpers import mtp_scale_factor, validate_model_fp8_moe_shard
 
 
 @register_model("HYBRIDMOE")
@@ -51,6 +50,7 @@ class HybridMoEModel(BaseModel):
             model_info["context"],
             model_config,
             backend_name=backend_name,
+            model_info=model_info,
         )
         hybrid_config = model_info["extra_params"]
         model.set_hybrid_config(hybrid_config)
@@ -67,7 +67,15 @@ class HybridMoEModel(BaseModel):
                 )
         return model
 
-    def __init__(self, topk: int, num_experts: int, moe_inter_size: int, *args, backend_name: str = "") -> None:
+    def __init__(
+        self,
+        topk: int,
+        num_experts: int,
+        moe_inter_size: int,
+        *args,
+        backend_name: str = "",
+        model_info: dict | None = None,
+    ) -> None:
         super().__init__(*args)
         self._backend_name = backend_name
         # Fused-only family: the MoE-block builder keys its large-EP emission
@@ -93,24 +101,9 @@ class HybridMoEModel(BaseModel):
         self._num_experts = num_experts
         self._moe_inter_size = moe_inter_size
         self._mtp_scale_factor = mtp_scale_factor(self._nextn, self._num_layers)
-        self._validate_fp8_block_quantized_moe_config()
+        validate_model_fp8_moe_shard(self, moe_inter_size, model_info)
         self._hybrid_config: common.HybridMoEConfig | None = None
         self._power_law_alpha = 1.01
-
-    def _validate_fp8_block_quantized_moe_config(self) -> None:
-        """Validate fp8_block MoE alignment: (moe_inter_size / moe_tp_size) % block_size == 0."""
-        if self.config.moe_quant_mode != common.MoEQuantMode.fp8_block:
-            return
-        raw_config = _load_model_config_from_model_path(self.model_path)
-        default_size = [128, 128]
-        weight_block_size = _get_language_quantization_config(raw_config).get("weight_block_size", default_size)[0]
-        moe_size_per_gpu = self._moe_inter_size // self.config.moe_tp_size
-        if (moe_size_per_gpu % weight_block_size) != 0:
-            raise ValueError(
-                f"Invalid quantized MoE configuration: "
-                f"(moe_intermediate_size={self._moe_inter_size} / moe_tp_size={self.config.moe_tp_size}) "
-                f"% weight_block_size={weight_block_size} != 0. "
-            )
 
     def set_hybrid_config(self, cfg: common.HybridMoEConfig) -> None:
         """Apply HybridMoEConfig and rebuild context/generation ops.

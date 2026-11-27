@@ -41,7 +41,9 @@ across versions or configurations.
 For native SDK estimates, `estimate_kv_cache`, `estimate_num_gpu_blocks`, and
 `KVCacheEstimator.from_request` resolve an omitted `backend_version` (or `None`)
 through the backend's `current` data alias for the requested system and data
-roots. Explicit version selectors are preserved. FPM profile estimates still
+roots. Config-only transfer sizing uses the named system’s authored slots for
+explicit aliases such as `previous`. Literal releases can size a checkpoint
+offline. FPM profile estimates still
 require the profile's literal backend version.
 
 For Mistral3's gated Pixtral encoder, the analytical activation estimate includes
@@ -85,6 +87,121 @@ they trust.
 Serialized Rust requests and estimates that omit the field remain compatible
 because deserialization defaults it to zero. See [Rust literal migration](../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals)
 for required source changes to request and memory-breakdown structs.
+
+A naive estimate reads the model's `config.json`. When the first entry
+of `architectures` is an architecture that AISim supports, the config must
+pass AISim's config parser. If the parser refuses it, the estimate fails
+with `the config parser refuses the HF config of the supported architecture
+<name>: <error type>: <parser message>`. A config of any other architecture
+is read from its raw keys. If such a config holds `text_config`, or an
+`llm_config` that is a nonempty object, the estimate reads the text decoder under that key,
+which `context_length: max` reads too. For such a config, the estimate
+refuses a `text_config` that is not a nonempty object, and a decoder that
+itself holds `text_config` or a nonempty `llm_config` object. It also refuses
+an `architectures` value that is not a list of strings. The generic raw-config
+path treats null, false, zero and empty values as an omitted architecture.
+For a recognized bare vLLM decoder that requires registry dispatch, omit
+`architectures` or set it to null to use the config default. An explicit
+empty list or another non-list value is rejected on that path.
+`bytes_per_token: auto` of a worker with `host_offload` or `hicache`, without
+an FPM profile and without `state_cache`, is a naive estimate and has the same
+refusals. So is `engine.kv_transfer.bytes_per_token: auto` of a disaggregated
+engine without an FPM profile and without `state_cache` on its prefill role.
+
+When this fallback selects a nested decoder, it uses the decoder's supported
+`model_type` if the optional `architectures` entry is absent. vLLM selects an
+explicit decoder class for LLaVA and InternVL and rejects an explicit empty
+class list. Its Idefics3 model constructs a Llama decoder directly. SGLang's
+LLaVA selects the decoder from the Transformers config class shipped with that
+SGLang release. Under automatic precision, its native LLaVA cache uses the text
+decoder's execution dtype. An FP32 Llama decoder runs in FP16 and a BF16
+decoder keeps BF16. In registered vLLM wrappers, unquantized decoder weights and
+automatic KV storage use the parent model's execution dtype. A compressed-tensors
+KV scheme changes the cache alone. For a dense Llama, Mistral, Qwen2 or Qwen3
+decoder on one pipeline stage, the estimator reduces its projection reserve
+when the only weight group uses a supported 8-bit scheme with the sole target
+`Linear`. Literal exclusions for the vision tower, multimodal projector,
+embeddings or output head still permit that reduction. The embeddings and
+output head use model precision. A decoder projection exclusion or an
+unresolved pattern keeps the model-precision reserve for the projections.
+For native vLLM FP8, those dense projections use one byte per weight even
+when the decoder runs in BF16. Each rank reserves FP32 scales for its local
+weight tiles, or per-projection scales for per-tensor quantization.
+Packed group-wise INT8 weights include one execution-dtype scale per group
+when groups of 32, 64 or 128 align with the projection shards and the scales
+partition across ranks. For block-FP8 DeepSeek
+experts, SGLang's estimate includes the resident expert shards and their scales.
+SGLang 0.5.9 keeps expert weights in FP8 even when the checkpoint lists the
+expert module as excluded. SGLang honors those exclusions from 0.5.10rc0.
+A selected encoder-only attention implementation has no persistent KV blocks
+to transfer.
+Automatic sizing uses each backend's checkpoint metadata. For example, the ModelOpt sidecar for
+Llama-3.1-70B-Instruct-FP8 selects a 20,480-byte FP8 cache per token at TP8.
+BF16 takes 40,960 bytes. An explicit `kvcache_quant_mode` selects the cache
+width. Uniform pipeline stages use their resident decoder layers. Uneven stages
+and stages with mixed attention layouts require the rank-local layout. Pipeline
+capacity for an unquantized dense Llama or Qwen decoder at TP1 reserves a full
+embedding or output head on the endpoint stage. Other pipeline layouts need
+the runtime's resident weight measurements. Speculative
+decoding capacity also needs the runtime draft weights and cache allocation.
+
+Marginal KV bytes describe the selected text decoder. Whole-rank capacity also reserves any resident encoder and projector. In the config-only fallback, LLaVA-family and Intern-S1 dense vision transformers use their declared patch, attention and feed-forward dimensions. The estimate reserves the full vision tower on each language rank as a conservative upper bound when encoder partitioning is unknown. A wrapper that declares an auxiliary encoder with an unrecognized layout requires measured resident weights for capacity. Its decoder can still supply the per-token transfer width.
+
+A registered vLLM or SGLang multimodal class can construct an encoder even when the checkpoint omits its configuration. For example, `InternVLChatModel` builds its default vision tower from a checkpoint containing only its language configuration. When the selected wrapper’s resident weights cannot be determined from the configuration, supply measured resident weights for whole-rank capacity. ModelOpt MXFP8 requires BF16 execution. For routed experts, the fallback reserves execution-width weights until the rank-local quantized matrices and their scales can be sized together.
+
+For the released Idefics2 checkpoint, the Transformers backend constructs a Mistral decoder and a vision encoder. With the checkpoint’s FP32 declaration, vLLM 0.32 uses BF16 on H100 and SGLang 0.5.23 uses FP16. Both allocate 131,072 KV bytes per token at TP1 for 32 layers, eight KV heads and a 128-element head. Whole-rank capacity also requires the encoder and connector weights, even when the checkpoint omits the vision configuration. When vLLM selects its native Qwen2 class from the checkpoint’s architecture list, the decoder reads `text_config` and allocates only its own weights.
+
+For a sliding-window decoder, the config-only shared pool estimate allows every
+scheduled token to be present in every attention layer. A prefill can occupy the
+retained window and its in-flight tokens at the same time. The runtime's
+concurrent steps and physical cache pages are needed to tighten that bound.
+The direct estimator's single-request retention curve caps each sliding layer
+at its window. For GPT-OSS-20B at TP1 with 96 MiB available, bf16 KV retains
+3,968 tokens after eviction. The 96 MiB budget holds 256 physical rows.
+vLLM reserves one null row. The two groups then fit 127 independently
+schedulable 16-token blocks (2,032 tokens).
+
+Groups with different KV widths can share a physical page size. Each independent
+scheduler block may open a page in every layer. For Gemma-4-26B at TP1/BF16, 32
+independent 16-token prompts use 120 MiB across 25 sliding and five global layers.
+vLLM reserves one additional 640 KiB row for its null block in the hybrid
+allocator. When the allocator mode is unknown, the estimate also covers the
+full-attention pool's null row. A 110 MiB config-only
+budget yields 29 independently schedulable 16-token blocks. The scalar API accepts
+`scheduler_block_size` to reserve that row once. Without a block size it allows
+room for a null row even if the caller chooses just one large scheduler block.
+When the fallback reads an unregistered wrapper’s nested decoder at TP greater
+than one, the scalar request must supply the actual `dcp_size`. At TP1 the
+only legal value is one. The block API passes its DCP setting explicitly.
+
+A selected decoder’s automatic KV precision follows the requested backend release. For a symmetric per-tensor FP8 compressed-tensors checkpoint, vLLM selects FP8 from 0.22.0 and SGLang from 0.5.19. Earlier releases keep the model dtype. For a 32-layer BF16 Llama decoder at TP8 with one 128-element KV head per rank, that changes the transfer from 16,384 to 8,192 bytes per token. A config-only deployment with an unknown release uses the model dtype for these checkpoints.
+
+For vLLM expert parallelism, the estimate prices the rank holding the most
+experts. For example, its three EP ranks hold 43, 43 and 42 of Qwen3-30B-A3B's
+128 experts. SGLang’s unpadded CUDA FP8 experts require the local gate and up projections to fit the checkpoint’s output tile. Its row-parallel down projection must also fit the input tile. For a 768-wide expert and a 32 × 128 weight block, TP2 fits both axes and TP8 leaves a 96-wide shard.
+SGLang prefill context parallelism replicates the dense MLA cache on each rank,
+including Kimi K2.5's DeepSeek language decoder. [vLLM expert placement](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/fused_moe/expert_map_manager.py), [SGLang Kimi K2.5 implementation](https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/models/kimi_k25.py)
+
+A selected sparse MLA decoder stores a latent, BF16 rotary keys, and a scaled
+FP8 index per layer. For GLM-5.3-NVFP4 with BF16 KV, each of 78 layers stores
+512 × 2 + 64 × 2 + 132 bytes, or 100,152 bytes per token across the decoder.
+With vLLM on Hopper, DeepSeek-V3.2 uses BF16 KV by default despite its FP8 weights. Its 61 layers transfer 78,324 bytes per token. When the automatic cache format depends on the GPU, the estimate requires its compute capability from the deployment's system data or an explicit KV precision. Quantized sparse MLA requires the selected backend's latent and indexer formats.
+For example, FlashMLA stores an extra four FP32 scales in a 512-element FP8
+latent. Shared capacity also needs the runtime indexer allocation. Recurrent and
+other per-layer layouts require their runtime state or group measurements.
+Gemma 4 normalizes its final decoder layer to full attention even when an
+explicit list declares it sliding. Each resident vLLM KV head count must shard
+or replicate evenly across the tensor-parallel ranks. Sliding layers default
+to 512 tokens. With bidirectional attention set to `all`, a serialized window
+of 1,024 becomes 513 tokens in the initialized model. On vLLM 0.28 through 0.31, supported Transformers versions can read different head counts from the same Gemma checkpoint. The SDK checks the collection image in the selected performance database when that changes a rank’s attention geometry. A direct `get_model` call can pass that database with `database=...`.
+To identify the Gemma runtime for that estimate, the SDK requires collection metadata for each nonempty table in the selected version. Schema 1 uses the directory’s runtime. Schema 2 can identify the runtime separately for each collection that contributed rows.
+
+DeepSeek V4 Flash and Pro expose 3,915 and 5,610 marginal compressed-cache bytes
+per token. Their runtime also reserves compressor state, live sliding and prefill
+pages, and a pool-wide null row. Config-only capacity estimation requires runtime
+group allocations for this layout. DeepSeek V4.1 has position-dependent compressed
+cache growth and requires native sequence geometry or a runtime profile. Native
+system estimates and measured FPM cache profiles use their respective memory models.
 
 ### FPM profile cache groups and byte budgets
 
@@ -264,7 +381,9 @@ read `transfer_bytes_per_block`.
   larger than `page_size_bytes`, because the connector reads a block in regions
   that layers of other groups can share. A hand-made profile may state it only
   for a group whose transfer size has been measured or identified by other
-  evidence for that group.
+  evidence for that group. The import of a vLLM 0.33.0 probe record writes it
+  only from a probe phase with prefix caching and only for the measured cache
+  shape, which the paragraphs below describe.
 
   To measure the full-attention value and the combined transfer size of the
   other groups, send two prompts of different length through a P/D pair, one at
@@ -278,37 +397,109 @@ read `transfer_bytes_per_block`.
   each of them moves one block, as a state group does. With multiple state
   groups, this determines only their combined transfer size.
 
-  Per-group values for models with several state groups are not supported by
-  this procedure or the current runtime probe. Leave `transfer_bytes_per_block`
-  unset for those groups until per-group transfer measurements, additional
-  runtime-observer evidence or another source, such as the regions that the
-  connector logs at start, read with the connector code, identifies the bytes
-  read for each group on one TP rank. Do not split the combined size evenly or
-  use the page sizes as substitutes.
+  This procedure does not give the value of each group for a model with
+  several state groups. For a cache outside the measured shape, for a record of
+  that shape from a probe phase without prefix caching, and for a profile of
+  vLLM 0.31.0 or 0.32.0 without evidence for each group, leave
+  `transfer_bytes_per_block` unset for those groups until per-group transfer
+  measurements, additional runtime-observer evidence or another source, such
+  as the regions that the connector logs at start, read with the connector
+  code, identifies the bytes read for each group on one TP rank. Do not split
+  the combined size evenly or use the page sizes as substitutes.
 
-  The probe import of a vLLM 0.33.0 record writes it for no group, because what
-  the P/D connector of vLLM 0.33.0 reads for a block depends on
-  facts that the record does not hold. The connector registers one
-  region per layer address and lets layers of different groups share a region.
-  In a model with Mamba layers, it reads a block of an attention group, other
-  than the ring, in every region. The length of a region of a layer that is not
-  a Mamba layer depends on the layout: the padded page divided by a
-  kernel-block ratio that the connector chooses at start, or the whole storage
-  row of a block. A Mamba layer moves its state without padding, and a
-  `tp_replicated` Mamba layer moves its whole page. The record holds neither the
-  ratio nor `tp_replicated`. See vLLM v0.33.0
-  [`base_worker.py:1744-1756`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1744-L1756),
-  [`:194-249`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L194-L249),
-  [`:1598-1603`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1598-L1603),
-  [`:1693-1719`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1693-L1719),
-  [`:1063-1082`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1063-L1082),
-  [`:2013-2033`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L2013-L2033)
+  The probe import computes the field from the worker records of a vLLM 0.33.0
+  probe, with the region rule of the connector. In the measured shape, the
+  connector registers one region for each distinct page address of a layer, in
+  the order of the allocation plan, and the length of a region is the page of
+  its layer. Layers of different groups can share a region, and an MLA layer
+  then sets its length.
+  For one block, the MLA attention group reads every region. Each ring group
+  reads every registered region that contains a ring layer. With multiple
+  ring groups, the connector counts the same regions once per group. A Mamba
+  group reads its state bytes without padding in every region of a Mamba layer.
+  See vLLM v0.33.0
+  [`base_worker.py:1744-1766`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1744-L1766),
+  [`:1774-1786`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1774-L1786),
+  [`:237-278`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L237-L278)
   and
-  [`:1774-1779`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1774-L1779).
-  A P/D model of a grouped profile for vLLM 0.33.0 needs these facts from the
-  runtime observer first. A claim in `resource_overrides.cache_groups` that
-  states this field is refused, because the probe evidence holds no value to
-  compare it with.
+  [`ssm_conv_transfer_utils.py:155-156`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L155-L156).
+
+  The import writes the field only for a record that meets all of these
+  conditions on the observed cache, phase and connector.
+
+  1. It is a vLLM 0.33.0 record with hybrid evidence.
+  2. One storage holds every block row, and every allocation uses the same
+     block stride.
+  3. The groups hold one or more Mamba groups and one or more ring groups.
+  4. The cache holds one or more MLA attention layers, every layer outside the
+     Mamba groups and the ring groups is such a layer, and no group holds a
+     sliding window.
+  5. Every Mamba group holds two or more layers, and all Mamba layers hold the
+     same two state tensors.
+  6. The record comes from a probe phase with prefix caching on.
+  7. The worker reports the installed source hashes of the audited vLLM 0.33.0
+     NIXL pull connector and its layout and state-split dependencies. Each
+     digest must match the pinned source.
+  8. The worker observes DS convolution state layout and the connector's
+     native split of its actual Mamba specs at the launch TP. The split's
+     dimensions and two byte counts must match the observed state tensors.
+     The audited release defaults to SD. Set `VLLM_SSM_CONV_STATE_LAYOUT=DS`
+     in the worker environment for a DS deployment.
+
+  A probe can hold two phases and several TP ranks. The import computes the
+  value from each worker record of each phase with prefix caching on, and a
+  record of a phase with prefix caching off does not change it. It writes the
+  value only when every record of a phase with prefix caching meets the
+  conditions and all of them give the same value. For every other record it
+  writes no value. A record without a value never makes an import incomplete,
+  and the result of a complete import names the reason in
+  `transfer_bytes_reason`. A record that does not meet condition 1 gives that
+  condition first. When the records meet condition 1 and every phase of the
+  import records prefix caching off, the reason is condition 6. Otherwise it is
+  the first condition that the record does not meet, a field of the rule that
+  the record lacks or holds in a form that the import does not know, or worker
+  records that give different values.
+
+  The pinned connector and worker code establish three further properties of this cache layout.
+
+  - The ratio between the manager block and the kernel block of the
+    connector. Storage of whole block rows starts only with a ratio of 1. vLLM
+    never splits the block of a group whose layers share block rows.
+  - The `tp_replicated` flag of a Mamba layer. A ring model accepts a
+    `tp_replicated` state only in a group of one layer. Every Mamba group of
+    the conditions holds two or more layers.
+  - The layout that the connector asks for, which follows `use_mla`. The
+    connector asks for another layout only for a model without MLA.
+
+  The connector orders the regions of a ring model by the manager views. vLLM
+  builds these views in the order of the allocation plan, which the record
+  holds. See vLLM v0.33.0
+  [`base_worker.py:1611-1615`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1611-L1615),
+  [`:1670-1672`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1670-L1672),
+  [`:1720-1730`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1720-L1730),
+  [`:680-697`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L680-L697),
+  [`:1573-1580`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py#L1573-L1580),
+  [`utils.py:598-627`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/utils.py#L598-L627),
+  [`:663-675`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/utils.py#L663-L675),
+  [`connector.py:148-166`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py#L148-L166),
+  [`ssm_conv_transfer_utils.py:127-136`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L127-L136)
+  and
+  [`:155-208`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/ssm_conv_transfer_utils.py#L155-L208).
+
+  The DS P/D run of GLM-5.3-Flash at TP 4 with an fp8 KV cache on GB300
+  measured 21,978,496 bytes per block per rank for the attention group, 92,288
+  for the ring and 9,768,960 for each KDA group. The independent archived
+  prefill probe recorded an SD convolution tensor of shape `[3, 6144]`.
+  Import preserves that probe's physical memory and prefix-cache evidence
+  and leaves transfer bytes unset. Its allocation dimensions yield the same
+  region lengths, but the pinned connector requires DS before registration.
+  For another launch meeting all eight conditions, import derives its values
+  from the launch's own records. The hardware measurements cover the DS
+  configuration in the [P/D evidence](../../benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md).
+
+  A claim in `resource_overrides.cache_groups` that states this field must
+  state the value of the import. If the probe evidence holds no value, the
+  claim is refused, because it has no value to compare with.
 
 Use `RustForwardPassPerfModel.estimate_cache_budget(config, budget)` with the
 same canonical `ForwardPassPerfModelConfig` used for timing. Rust exposes

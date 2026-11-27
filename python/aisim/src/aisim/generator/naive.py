@@ -25,6 +25,7 @@ import yaml
 
 from aisim.sdk import perf_database
 from aisim.sdk.utils import (
+    _load_model_config_documents,
     _load_model_config_from_model_path,
     _parse_hf_config_json,
     get_model_config_from_model_path,
@@ -184,7 +185,15 @@ def _get_system_config(system_name: str) -> dict[str, Any]:
     return result
 
 
-def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, Any] | None = None) -> int:
+def _estimate_model_weight_bytes(
+    model_path: str,
+    *,
+    backend: str = "vllm",
+    backend_version: str | None = None,
+    system: str | None = None,
+    systems_paths: str | list[str] | None = None,
+    model_metadata: dict[str, Any] | None = None,
+) -> int:
     """
     Estimate model weight size in bytes based on model config.
 
@@ -198,6 +207,10 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
 
     Args:
         model_path: HuggingFace model path or local path.
+        backend: Serving backend that selects the decoder.
+        backend_version: Serving backend release for config-only sizing.
+        system: Deployment target for checkpoint execution dtype.
+        systems_paths: Directories containing the target's system specification.
         model_metadata: Optional dictionary populated with the detected
             ``architecture`` and ``is_moe`` values from the same config used
             for sizing.
@@ -230,22 +243,33 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
 
     except ValueError as e:
         # The normalized AIC parser rejects architectures that AIC cannot model,
-        # but those are exactly the models that use naive config generation.
-        # Reuse the architecture-agnostic raw-config estimator so sizing remains
-        # available without weakening the native AIC support boundary.
+        # and those models use naive config generation. The raw-config estimator
+        # serves them. For an architecture that AIC models it raises with the
+        # parser's message, so an invalid config of a known model gets no size.
         from aisim.sdk.memory import NaiveKVCacheEstimator
 
         logger.info(
-            "Normalized model parsing failed for %s; using raw config for naive sizing.",
+            "Normalized model parsing failed for %s; trying the raw-config estimator.",
             model_path,
         )
         logger.debug("Normalized parser error for %s: %s", model_path, e)
         try:
-            estimator = NaiveKVCacheEstimator.from_hf_config(
-                raw_config,
+            options = dict(
+                backend=backend,
+                backend_version=backend_version,
                 tp_size=1,
                 pp_size=1,
+                system=system,
+                systems_paths=systems_paths,
             )
+            if backend == "vllm" and os.path.isdir(model_path):
+                # Local checkpoint metadata can change between generator requests.
+                estimator = NaiveKVCacheEstimator.from_model_path(model_path, allow_hf_config_download=True, **options)
+            else:
+                if backend == "vllm" and raw_config.get("hf_quant_config") is not None:
+                    # The timing parser normalizes legacy sidecars. Capacity needs the original class and exclusions.
+                    _, raw_config = _load_model_config_documents(model_path)
+                estimator = NaiveKVCacheEstimator.from_hf_config(raw_config, **options)
             weight_bytes = estimator.weight_bytes()
             if weight_bytes is None:
                 raise ValueError(
@@ -263,7 +287,7 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
                 num_experts = estimator.geometry.get("num_experts") or 0
                 model_metadata.update(
                     architecture=architecture,
-                    is_moe=bool(num_experts and num_experts > 1),
+                    is_moe=num_experts > 1 and estimator.geometry.get("num_routed_layers", 1) > 0,
                 )
             return weight_bytes
         except Exception as fallback_error:
@@ -402,6 +426,7 @@ def build_naive_generator_params(
     generator_overrides: dict[str, Any] | None = None,
     preserve_engine_limits: bool = False,
     model_config: dict[str, Any] | None = None,
+    backend_version: str | None = None,
 ) -> dict[str, Any]:
     """
     Build generator parameters for naive configuration generation.
@@ -419,6 +444,7 @@ def build_naive_generator_params(
         total_gpus: Total number of GPUs available.
         system_name: Name of the system (e.g., 'h200_sxm', 'gb200').
         backend_name: Name of the backend (e.g., 'trtllm', 'sglang', 'vllm').
+        backend_version: Serving backend release for config-only sizing.
         mode: Serving mode — ``"agg"`` (aggregated, single worker type) or
             ``"disagg"`` (disaggregated, separate prefill/decode workers).
         optimization_type: ``"throughput"`` or ``"latency"`` (or ``None``
@@ -458,7 +484,13 @@ def build_naive_generator_params(
     if model_config is not None:
         model_weight_bytes = _estimate_weight_bytes_from_config(model_config, model_name)
     else:
-        model_weight_bytes = _estimate_model_weight_bytes(model_name, model_metadata=model_metadata)
+        model_weight_bytes = _estimate_model_weight_bytes(
+            model_name,
+            backend=backend_name,
+            backend_version=backend_version,
+            system=system_name,
+            model_metadata=model_metadata,
+        )
 
     # Calculate minimum GPU count that fits the model
     min_gpus, fits, required_tp = _calculate_min_tp(

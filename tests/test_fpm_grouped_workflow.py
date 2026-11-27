@@ -5,10 +5,15 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import logging
 import os
+import random
+import re
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -1093,6 +1098,7 @@ def _prefix_search(profile, root, version):
     [
         ("no_evidence", "prefix_caching=false for cold replay"),
         ("probe_without_prefix_caching", "prefix_caching=false for cold replay"),
+        ("probe_without_hash_block", "prefix_caching=false for cold replay"),
         (
             "unmarked_group",
             "every cache group to declare prefix_cacheable; "
@@ -1129,6 +1135,8 @@ def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(grouped_case
         resources = deployment["resources"]
         if case == "probe_without_prefix_caching":
             resources["runtime_memory"].update(enable_prefix_caching=False, mamba_cache_mode="none")
+        elif case == "probe_without_hash_block":
+            del resources["runtime_memory"]["hash_block_size_tokens"]
         elif case == "unmarked_group":
             del resources["cache_groups"][1]["prefix_cacheable"]
         elif case == "convolution_group":
@@ -1160,6 +1168,21 @@ def test_grouped_prefix_caching_needs_vllm_evidence_with_align_mode(grouped_case
     if search is not None:
         with pytest.raises(ValidationError, match=error):
             SearchSpace.model_validate(search)
+
+
+def test_grouped_cold_replay_text_names_the_field_of_each_gate(grouped_case):
+    from aisim.sweeper.config import SearchSpace
+
+    profile, root = grouped_case
+    profile = _with_state_group(profile)  # no prefix-caching evidence
+    raw = _prediction(profile, root)
+    raw["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = True
+    # pydantic puts "Value error, " before the text of a ValueError and " [type=" after it.
+    text = "Value error, grouped FPM cache requires {}=false for cold replay [type="
+    with pytest.raises(ValidationError, match=re.escape(text.format("kv_cache.prefix_caching"))):
+        CorePredictionConfig.model_validate(raw)
+    with pytest.raises(ValidationError, match=re.escape(text.format("agg_enable_prefix_caching"))):
+        SearchSpace.model_validate(_prefix_search(profile, root, "0.25.1"))
 
 
 @pytest.mark.parametrize("version", ["0.31.0", "0.32.0", "0.33.0"])
@@ -1426,10 +1449,164 @@ def test_grouped_sweeper_checks_each_candidate_budget_before_replay(grouped_case
         build_backend_deployment(sample, backend_version="0.31.0")
 
 
-def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
+def _grouped_agg_sample(profile, root, budget):
+    from aisim.sweeper.config import SearchSpace
+    from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.sample import unroll_sample
+
+    search = SearchSpace.model_validate(
+        {**_prefix_search(profile, root, "0.31.0"), "agg_max_num_batched_tokens": [budget]}
+    )
+    return unroll_sample(
+        search_space=search,
+        selection={
+            "deployment_mode": "agg",
+            "backend": "vllm",
+            "agg_max_num_batched_tokens": budget,
+            "agg_max_num_seqs": 4,
+        },
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1),
+    )
+
+
+def test_grouped_sweeper_loads_the_profile_once_per_candidate(grouped_case, monkeypatch):
+    from aisim.sweeper import deploy
+    from aisim_core.fpm_profile import FpmModelProfile
+    from aisim_core.sdk.fpm_profile import load_fpm_profile as load
+
+    # Every name of the loader ends in this one validation, so the count sees a load through any of them.
+    loads = []
+    validate = FpmModelProfile.model_validate
+
+    def counted(cls, value, **kwargs):
+        loads.append(value)
+        return validate(value, **kwargs)
+
+    monkeypatch.setattr(FpmModelProfile, "model_validate", classmethod(counted))
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile))
+    sample = _grouped_agg_sample(profile, root, 128)
+    # The search validation that makes a sample loads the profile too, so the count starts after it.
+    loads.clear()
+    args = deploy.build_backend_deployment(sample, backend_version="0.31.0").agg_engine_args
+    # An aggregated rank with prefix caching reads the profile once.
+    assert len(loads) == 1
+    # A profile given as JSON text or as a loaded model builds the same rank as the dict that the search stores.
+    for value in (json.dumps(sample["fpm_profile"]), load(sample["fpm_profile"])):
+        assert (
+            deploy.build_backend_deployment({**sample, "fpm_profile": value}, backend_version="0.31.0").agg_engine_args
+            == args
+        )
+    # An aggregated rank without prefix caching never reads the profile. So it does not load it, and a profile that
+    # the loader refuses builds the same rank.
+    loads.clear()
+    off = {**sample, "agg_enable_prefix_caching": False}
+    off_args = deploy.build_backend_deployment(off, backend_version="0.31.0").agg_engine_args
+    refused = {**off, "fpm_profile": {**sample["fpm_profile"], "context_length": 0}}
+    assert deploy.build_backend_deployment(refused, backend_version="0.31.0").agg_engine_args == off_args
+    assert not loads
+
+
+def test_a_build_error_outside_the_prefix_caching_rules_stays_failed(grouped_case):
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper import deploy
+    from aisim.sweeper import search as search_module
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.replay import ForwardPassEstimatorSpec
+    from aisim.sweeper.result import ReasonCategory
+
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile))
+    sample = _grouped_agg_sample(profile, root, 128)
+    # The profile holds no deployment of vLLM 0.29.0. That is a fault of the inputs, not an engine setting.
+    with pytest.raises(ValueError, match="no matching FPM deployment profile") as error:
+        deploy.build_backend_deployment(sample, backend_version="0.29.0")
+    assert not isinstance(error.value, deploy.InfeasibleEngineSetting)
+    # A profile that the loader refuses is a fault of the inputs too.
+    refused = {**sample, "fpm_profile": {**sample["fpm_profile"], "context_length": 0}}
+    with pytest.raises(ValueError, match="context_length") as error:
+        deploy.build_backend_deployment(refused, backend_version="0.31.0")
+    assert not isinstance(error.value, deploy.InfeasibleEngineSetting)
+
+    class OtherVersion:
+        def resolve_candidate(self, sample):
+            config = {
+                "model": sample["model_name"],
+                "system": "h200_sxm",
+                "backend": "vllm",
+                "backend_version": "0.29.0",
+                "database_mode": "SILICON",
+                "estimation_mode": "fpm_interpolation",
+            }
+            return {"agg": ForwardPassEstimatorSpec(config=config)}
+
+    config = SmartSearchConfig(
+        search_space=_prefix_search(profile, root, "0.31.0"),
+        workload=Workload(isl=1152, osl=4, concurrency=1, request_count=2),
+    )
+    prepared, result = search_module._materialize_one(
+        {"deployment_mode": "agg", "backend": "vllm", "agg_max_num_batched_tokens": 128, "agg_max_num_seqs": 4},
+        ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=EngineReplayRunnerFactory(),
+        estimator_resolver=OtherVersion(),
+    )
+    assert prepared is None
+    assert (result.outcome, result.reason_category) == ("failed", ReasonCategory.CANDIDATE_MATERIALIZATION)
+    assert result.reason.startswith("candidate build failed: ValueError: no matching FPM deployment profile")
+
+
+def test_grouped_sweeper_marks_an_off_grid_budget_infeasible_with_a_short_reason(grouped_case, caplog):
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper import search as search_module
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+    from aisim.sweeper.result import ReasonCategory
+
+    profile, root = grouped_case
+    profile = _with_prefix_evidence(profile, hash_block=2176)
+    profile["architecture"] = "Glm5NextForConditionalGeneration"
+    # The search gate checks the largest budget, 8192. The 8190 candidate is refused when its rank is built.
+    config = SmartSearchConfig(
+        search_space={**_prefix_search(profile, root, "0.31.0"), "agg_max_num_batched_tokens": [8190, 8192]},
+        workload=Workload(isl=1152, osl=4, concurrency=1, request_count=2),
+    )
+
+    class NoEstimators:
+        # The synthetic checkpoint names another architecture, so the exact estimator cannot be built. The candidate
+        # takes the search's backend version, as a candidate without estimators does.
+        def resolve_candidate(self, sample):
+            return {}
+
+    prepared, result = search_module._materialize_one(
+        {"deployment_mode": "agg", "backend": "vllm", "agg_max_num_batched_tokens": 8190, "agg_max_num_seqs": 4},
+        ReplicaParallelConfig(ParallelShape(tp=2, dp=1, moe_tp=2, moe_ep=1), replicas=1),
+        config=config,
+        goal=config.goal,
+        providers={},
+        provider_plans={},
+        runner_factory=EngineReplayRunnerFactory(),
+        estimator_resolver=NoEstimators(),
+    )
+    assert prepared is None
+    assert (result.outcome, result.reason_category) == ("infeasible", ReasonCategory.BACKEND_TOPOLOGY)
+    assert result.reason == (
+        "candidate engine settings infeasible: GLM-5.3-Flash prefix caching requires prefix_match_unit and "
+        "max_batched_tokens that are multiples of 4"
+    )
+    assert "Sweeper candidate build failed" not in caplog.text
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
+def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None, *, worker_type=None, max_num_tokens=128):
     """Run `aisim onboard plan` for one grouped profile and return its stderr and its files, with tmp_path removed."""
     request = SupportRequest.model_validate(
         {
+            **({} if worker_type is None else {"worker_type": worker_type}),
             "identity": {
                 "model": profile["model"],
                 "model_revision": profile["model_revision"],
@@ -1447,7 +1624,7 @@ def _onboarding_plan(profile, tmp_path, capsys, version, runtime_version=None):
                 "context_length": 1024,
             },
             "workload": {"input_tokens": 512, "output_tokens": 4},
-            "collection": {"max_num_tokens": 128, "max_batch_size": 4},
+            "collection": {"max_num_tokens": max_num_tokens, "max_batch_size": 4},
             "fpm_profile": profile,
         }
     )
@@ -1473,11 +1650,11 @@ def _not_modeled(version):
 
 
 @reads_saved_config
-def test_grouped_plan_of_a_version_without_rules_keeps_its_files_and_prints_that_prefix_caching_is_not_modeled(
+def test_grouped_plan_of_a_version_without_rules_records_and_prints_that_prefix_caching_is_not_modeled(
     grouped_case, tmp_path, capsys
 ):
     # A hand-made profile of vLLM 0.30.0 records prefix caching on, but the rule table models vLLM 0.31.0, 0.32.0
-    # and 0.33.0 only. The plan stays cold, and only the command output says why, so a saved plan keeps its bytes.
+    # and 0.33.0 only. The plan stays cold, and the plan file and the command output say why.
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.30.0")
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.30.0")
@@ -1485,8 +1662,9 @@ def test_grouped_plan_of_a_version_without_rules_keeps_its_files_and_prints_that
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
-    # The plan files hold no note: plan.py:check_plan compares a saved plan with a new one byte for byte.
-    assert all(b"not modeled" not in content for content in files.values())
+    assert _plan_reason(files) == _not_modeled("0.30.0")
+    # The other plan files hold no note.
+    assert all(b"not modeled" not in content for name, content in files.items() if name != "support-plan.json")
 
 
 @reads_saved_config
@@ -1528,6 +1706,17 @@ def _label_differs(version, label):
         "grouped prefix-caching rules from the label, so the plan of this profile runs without prefix caching, "
         "although its runtime memory records prefix caching on."
     )
+
+
+@reads_saved_config
+def test_grouped_plan_of_evidence_without_rules_under_another_label_names_the_version_of_the_evidence(
+    grouped_case, tmp_path, capsys
+):
+    # Both notes hold for evidence of vLLM 0.30.0 under the label 0.31.0. The version without rules comes first.
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.31.0", runtime_version="0.30.0")
+    assert stderr.strip() == _plan_reason(files) == _not_modeled("0.30.0")
 
 
 @reads_saved_config
@@ -1587,7 +1776,7 @@ def _plan_cold_like_an_earlier_planner(monkeypatch):
     """Make `create_plan` of this module write the plan that AISim wrote before replay modeled grouped prefix caching.
 
     That planner gave every grouped profile `prefix_caching: false`. The planner plans cold when a deployment fails the
-    grouped prefix-caching requirements, so refusing them gives the same files.
+    grouped prefix-caching requirements, so refusing them and removing the recorded reason gives the same files.
     """
     import sys
 
@@ -1599,7 +1788,9 @@ def _plan_cold_like_an_earlier_planner(monkeypatch):
     def cold(*args, **kwargs):
         with monkeypatch.context() as patch:
             patch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
-            return original(*args, **kwargs)
+            result = original(*args, **kwargs)
+        _drop_cold_reason(Path(args[1]))
+        return result
 
     monkeypatch.setattr(module, "create_plan", cold)
     return original
@@ -1678,6 +1869,7 @@ def test_grouped_plan_saved_cold_refuses_any_other_change(
     _onboarding_plan(profile, tmp_path, capsys, version)
     monkeypatch.undo()
     plan = tmp_path / "collection"
+    _drop_cold_reason(plan)
     saved = json.loads((plan / "support-plan.json").read_text())
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         pilot = yaml.safe_load((plan / name).read_text())
@@ -1714,6 +1906,7 @@ def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(grouped_case, tmp_pa
     _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
     monkeypatch.undo()
     plan = tmp_path / "collection"
+    _drop_cold_reason(plan)
     request = SupportRequest.from_yaml(plan / "request.yaml")
     pilot = plan / "predict/pilot.yaml"
     before = pilot.read_bytes()
@@ -1734,21 +1927,452 @@ def test_a_grouped_vllm_0330_plan_saved_cold_still_verifies(grouped_case, tmp_pa
 
 @reads_saved_config
 @pytest.mark.parametrize("version", ["0.30.0", "0.25.1"])
-def test_a_version_without_rules_plans_the_same_bytes_under_the_earlier_planner(
+def test_a_version_without_rules_plans_the_files_of_the_earlier_planner_and_records_why(
     grouped_case, tmp_path, capsys, monkeypatch, version
 ):
-    # A version without grouped rules plans cold, so the planner and the earlier planner write the same plan.
+    # A version without grouped rules plans cold, as the earlier planner did for every grouped profile. The two plans
+    # differ only in the reason that the planner records, and the plan of the earlier planner still verifies.
     from aisim.support import plan as plan_module
 
     profile, _root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version=version)
-    _stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
+    assert stderr.strip() == _plan_reason(files) == _not_modeled(version)
     (tmp_path / "collection").rename(tmp_path / "planner")
-    monkeypatch.setattr(plan_module, "grouped_prefix_caching_requirements", _refuse_prefix_caching)
-    _stderr, earlier = _onboarding_plan(profile, tmp_path, capsys, version)
+    calls = []
+
+    def earlier_planner(*args):
+        # The earlier planner planned every grouped profile cold and recorded no reason.
+        calls.append(args)
+        return "an earlier planner"
+
+    monkeypatch.setattr(plan_module, "_grouped_cold_reason", earlier_planner)
+    _onboarding_plan(profile, tmp_path, capsys, version)
+    monkeypatch.undo()
+    assert calls
+    plan = tmp_path / "collection"
+    _drop_cold_reason(plan)
+    earlier = {
+        str(item.relative_to(plan)): item.read_bytes().replace(str(tmp_path).encode(), b"<tmp>")
+        for item in sorted(plan.rglob("*"))
+        if item.is_file()
+    }
+    planner = json.loads(files.pop("support-plan.json"))
+    assert planner["fpm"].pop("prefix_caching_reason") == _not_modeled(version)
+    assert planner == json.loads(earlier.pop("support-plan.json"))
     assert files == earlier
     worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
     assert worker["kv_cache"]["prefix_caching"] is False
+    plan_module.check_plan(SupportRequest.from_yaml(plan / "request.yaml"), plan)
+
+
+_COLD = "The plan of this profile runs without prefix caching: "
+
+
+def _plan_reason(files):
+    return json.loads(files["support-plan.json"])["fpm"].get("prefix_caching_reason")
+
+
+@reads_saved_config
+@pytest.mark.parametrize(
+    "case,text",
+    [
+        (
+            "unmarked_group",
+            "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
+            "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime "
+            "probe again for a profile that was imported before the import wrote this field",
+        ),
+        (
+            "convolution_group",
+            "grouped prefix caching does not support convolution cache groups; turn prefix caching off "
+            "to replay them cold",
+        ),
+        (
+            "state_without_align",
+            "grouped FPM cache prefix caching requires mamba_cache_mode=align for a prefix-cacheable state group",
+        ),
+    ],
+)
+def test_grouped_cold_plan_records_and_prints_its_reason(grouped_case, tmp_path, capsys, case, text):
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    for deployment in profile["deployments"]:
+        resources = deployment["resources"]
+        if case == "unmarked_group":
+            del resources["cache_groups"][1]["prefix_cacheable"]
+        elif case == "convolution_group":
+            resources["cache_groups"].append(dict(_CONVOLUTION_GROUP))
+        else:
+            resources["runtime_memory"]["mamba_cache_mode"] = "none"
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.31.0")
+    assert stderr.strip() == _plan_reason(files) == _COLD + text
+    worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
+    assert worker["kv_cache"]["prefix_caching"] is False
+
+
+@reads_saved_config
+@pytest.mark.parametrize("version,runtime_version", [("0.33.0", None), ("0.30.0", None), ("0.31.0", "0.33.0")])
+def test_grouped_plan_of_a_probe_without_prefix_caching_records_the_reason_and_prints_nothing(
+    grouped_case, tmp_path, capsys, version, runtime_version
+):
+    # The notes on the vLLM version of the evidence hold only for a probe that ran with prefix caching, so a version
+    # without rules and evidence under another label record the reason of the probe too.
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version=version)
+    for deployment in profile["deployments"]:
+        deployment["resources"]["runtime_memory"].update(enable_prefix_caching=False, mamba_cache_mode="none")
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, version, runtime_version)
+    assert "prefix caching" not in stderr
+    assert _plan_reason(files) == _COLD + "grouped FPM cache requires kv_cache.prefix_caching=false for cold replay"
+
+
+@reads_saved_config
+def test_grouped_warm_plan_records_no_reason(grouped_case, tmp_path, capsys):
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.31.0")
+    assert stderr.strip() == "" and _plan_reason(files) is None
+
+
+def _drop_cold_reason(plan):
+    """Give a saved plan the bytes that a planner wrote before plans recorded the reason of a cold replay."""
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    saved["fpm"].pop("prefix_caching_reason")
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+
+
+@reads_saved_config
+def test_grouped_plan_saved_before_the_reason_field_still_verifies(grouped_case, tmp_path, capsys, monkeypatch):
+    from aisim.support import collection_readiness, finalization, fpm
+    from aisim.support.plan import check_plan
+
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    for deployment in profile["deployments"]:
+        deployment["resources"]["runtime_memory"]["mamba_cache_mode"] = "none"
+    _onboarding_plan(profile, tmp_path, capsys, "0.31.0")
+    plan, config = tmp_path / "collection", tmp_path / "request.yaml"
+    _drop_cold_reason(plan)
+    before = (plan / "support-plan.json").read_bytes()
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    check_plan(request, plan)
+
+    def reached(*_args, **_kwargs):
+        raise ValueError("reached the step after the plan check")
+
+    monkeypatch.setattr(fpm, "_resolve_execution", reached)
+    monkeypatch.setattr(collection_readiness, "assess_readiness", reached)
+    monkeypatch.setattr(finalization, "_verify_collection", reached)
+    capsys.readouterr()
+    collect = ["onboard", "collect-fpm", "--config", str(config), "--output-dir", str(plan)]
+    finalize = ["onboard", "finalize", "--config", str(config), "--output-dir", str(plan)]
+    for command in (
+        collect,
+        [*collect, "--check-readiness"],
+        [*finalize, "--resolved-output-dir", str(tmp_path / "r")],
+    ):
+        with pytest.raises(SystemExit):
+            cli.main(command)
+        assert "reached the step after the plan check" in capsys.readouterr().err
+    assert (plan / "support-plan.json").read_bytes() == before
+    # A saved plan with another change is still refused.
+    (plan / "support-plan.json").write_bytes(before.replace(b'"status": "planned"', b'"status": "changed"'))
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        check_plan(request, plan)
+    (plan / "support-plan.json").write_bytes(before)
+    # `onboard plan --overwrite` writes the reason.
+    assert cli.main(["onboard", "plan", "--config", str(config), "--output-dir", str(plan), "--overwrite"]) == 0
+    assert json.loads((plan / "support-plan.json").read_text())["fpm"]["prefix_caching_reason"].startswith(_COLD)
+
+
+def _set_saved_reason(plan, value):
+    """Write a saved plan whose recorded reason is ``value``; every other byte is that of the planner."""
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    saved["fpm"]["prefix_caching_reason"] = value
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+
+
+def _unmarked_cold_plan(grouped_case, tmp_path, capsys):
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    for deployment in profile["deployments"]:
+        del deployment["resources"]["cache_groups"][1]["prefix_cacheable"]
+    _onboarding_plan(profile, tmp_path, capsys, "0.31.0")
+    plan = tmp_path / "collection"
+    return plan, SupportRequest.from_yaml(plan / "request.yaml")
+
+
+@reads_saved_config
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Two other wordings of this requirement, and any other text.
+        _COLD + "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
+        "set prefix_cacheable (true or false) on each cache group of the profile",
+        _COLD + "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
+        "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime "
+        "probe again for a profile that the import wrote",
+        "Another text.",
+        "",
+    ],
+)
+def test_grouped_cold_plan_verifies_with_the_reason_text_that_it_was_saved_with(
+    grouped_case, tmp_path, capsys, monkeypatch, text
+):
+    # The recorded reason explains why the plan is cold. The plan check compares the decision, not these words, so a
+    # later change of a requirement message does not refuse saved work.
+    from aisim.support import collection_readiness, finalization
+    from aisim.support.plan import check_plan
+
+    plan, request = _unmarked_cold_plan(grouped_case, tmp_path, capsys)
+    _set_saved_reason(plan, text)
+    before = (plan / "support-plan.json").read_bytes()
+    check_plan(request, plan)
+
+    def reached(*_args, **_kwargs):
+        raise ValueError("reached the step after the plan check")
+
+    monkeypatch.setattr(collection_readiness, "assess_readiness", reached)
+    monkeypatch.setattr(finalization, "_verify_collection", reached)
+    config = tmp_path / "request.yaml"
+    collect = ["onboard", "collect-fpm", "--config", str(config), "--output-dir", str(plan), "--check-readiness"]
+    finalize = ["onboard", "finalize", "--config", str(config), "--output-dir", str(plan)]
+    for command in (collect, [*finalize, "--resolved-output-dir", str(tmp_path / "r")]):
+        capsys.readouterr()
+        with pytest.raises(SystemExit):
+            cli.main(command)
+        assert "reached the step after the plan check" in capsys.readouterr().err
+    assert (plan / "support-plan.json").read_bytes() == before
+    # `onboard plan --overwrite` writes the text of the planner.
+    assert cli.main(["onboard", "plan", "--config", str(config), "--output-dir", str(plan), "--overwrite"]) == 0
+    saved = json.loads((plan / "support-plan.json").read_text())
+    assert saved["fpm"]["prefix_caching_reason"] == _COLD + _REFUSAL_TEXT["unmarked_group"]
+
+
+@reads_saved_config
+@pytest.mark.parametrize("value", [None, 0, 1.5, True, False, ["text"], {"text": "text"}])
+def test_grouped_cold_plan_with_a_recorded_reason_that_is_not_a_string_is_refused(
+    grouped_case, tmp_path, capsys, value
+):
+    from aisim.support.plan import check_plan
+
+    plan, request = _unmarked_cold_plan(grouped_case, tmp_path, capsys)
+    _set_saved_reason(plan, value)
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        check_plan(request, plan)
+
+
+@reads_saved_config
+@pytest.mark.parametrize("fpm", [["text"], "text", None])
+def test_grouped_cold_plan_whose_fpm_block_is_not_an_object_is_refused(grouped_case, tmp_path, capsys, fpm):
+    from aisim.support.plan import check_plan
+
+    plan, request = _unmarked_cold_plan(grouped_case, tmp_path, capsys)
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    if fpm is None:
+        del saved["fpm"]
+    else:
+        saved["fpm"] = fpm
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        check_plan(request, plan)
+
+
+@reads_saved_config
+@pytest.mark.parametrize("worker_type", [None, "decode"])
+def test_grouped_plan_saved_cold_with_its_reason_verifies_when_a_later_release_plans_it_warm(
+    grouped_case, tmp_path, capsys, monkeypatch, worker_type
+):
+    # A later release that models one more vLLM version plans this profile warm. A plan that was saved cold, with
+    # its reason or without it, keeps verifying until `onboard plan --overwrite` writes it again.
+    from aisim import _runtime
+    from aisim.config import engine
+    from aisim.support import plan as plan_module
+
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.30.0")
+    for deployment in profile["deployments"]:
+        if worker_type is not None:
+            deployment["worker_type"] = worker_type
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.30.0", worker_type=worker_type)
+    assert stderr.strip() == _plan_reason(files) == _not_modeled("0.30.0")
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    with_reason = (plan / "support-plan.json").read_bytes()
+    later = ("0.30.0", *engine.GROUPED_PREFIX_CACHING_VERSIONS)
+    monkeypatch.setattr(engine, "GROUPED_PREFIX_CACHING_VERSIONS", later)
+    monkeypatch.setattr(plan_module, "GROUPED_PREFIX_CACHING_VERSIONS", later)
+    validate_geometry = getattr(_runtime, "validate_grouped_prefix_geometry", None)
+
+    if validate_geometry is not None:
+
+        def validate_later_geometry(groups, hash_block, version):
+            return validate_geometry(groups, hash_block, "0.31.0" if version == "0.30.0" else version)
+
+        monkeypatch.setattr(_runtime, "validate_grouped_prefix_geometry", validate_later_geometry)
+    # The stand-in for the later release plans the profile warm.
+    current, documents = plan_module._plan_documents(request, plan)
+    assert "prefix_caching_reason" not in current["fpm"]
+    pilot = "worker.yaml" if worker_type else "predict/pilot.yaml"
+    worker = yaml.safe_load(documents[Path(pilot)])["engine"]["workers"][worker_type or "aggregated"]
+    assert worker["kv_cache"]["prefix_caching"] is True
+    plan_module.check_plan(request, plan)
+    _drop_cold_reason(plan)
+    plan_module.check_plan(request, plan)
+    # The pilots of the saved plan stay cold; a changed pilot is still refused.
+    (plan / "support-plan.json").write_bytes(with_reason)
+    pilot_bytes = (plan / pilot).read_bytes()
+    assert b"prefix_caching: false" in pilot_bytes
+    (plan / pilot).write_bytes(pilot_bytes.replace(b"prefix_caching: false", b"prefix_caching: true"))
+    with pytest.raises(ValueError, match="was modified or missing; choose a new output directory"):
+        plan_module.check_plan(request, plan)
+    (plan / pilot).write_bytes(pilot_bytes)
+    config = tmp_path / "request.yaml"
+    assert cli.main(["onboard", "plan", "--config", str(config), "--output-dir", str(plan), "--overwrite"]) == 0
+    assert "prefix_caching_reason" not in json.loads((plan / "support-plan.json").read_text())["fpm"]
+
+
+@reads_saved_config
+@pytest.mark.parametrize("reason", [None, "Another text."])
+def test_a_plan_of_a_warm_profile_whose_pilots_were_saved_cold_verifies_with_or_without_a_reason(
+    grouped_case, tmp_path, capsys, reason
+):
+    # Cold pilots for a profile that plans warm are the plan of an earlier planner, which the plan check accepts. Such
+    # a plan verifies without a recorded reason as an earlier planner wrote it, and with one as a planner that records
+    # its reason wrote it before replay modeled prefix caching for the profile; a reason on warm pilots is refused.
+    from aisim.support.plan import check_plan
+
+    profile, _root = grouped_case
+    _onboarding_plan(_with_prefix_evidence(_with_state_group(profile), version="0.31.0"), tmp_path, capsys, "0.31.0")
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    path = plan / "support-plan.json"
+    saved = json.loads(path.read_text())
+    if reason is not None:
+        saved["fpm"]["prefix_caching_reason"] = reason
+        path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+        with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+            check_plan(request, plan)
+    for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
+        pilot = yaml.safe_load((plan / name).read_text())
+        pilot["engine"]["workers"]["aggregated"]["kv_cache"]["prefix_caching"] = False
+        data = yaml.safe_dump(pilot, sort_keys=False).encode()
+        (plan / name).write_bytes(data)
+        saved["generated_files_sha256"][name] = hashlib.sha256(data).hexdigest()
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    check_plan(request, plan)
+
+
+def _leaves(value, path=()):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _leaves(item, (*path, key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _leaves(item, (*path, index))
+    else:
+        yield path, value
+
+
+def _edited(value):
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value + 1
+    if value is None:
+        return "edited"
+    return value + " edited"
+
+
+@reads_saved_config
+def test_grouped_cold_plan_with_another_reason_text_still_compares_every_other_field(grouped_case, tmp_path, capsys):
+    # Each edit of another field is refused with the same error whether the plan holds its own reason text or another.
+    from aisim.support.plan import check_plan
+
+    plan, request = _unmarked_cold_plan(grouped_case, tmp_path, capsys)
+    path = plan / "support-plan.json"
+    own = path.read_bytes()
+    check_plan(request, plan)
+    _set_saved_reason(plan, "Another text.")
+    check_plan(request, plan)
+    edits = 0
+    for location, value in _leaves(json.loads(own)):
+        if location == ("fpm", "prefix_caching_reason"):
+            continue
+        errors = []
+        for text in (None, "Another text."):
+            saved = json.loads(own)
+            if text is not None:
+                saved["fpm"]["prefix_caching_reason"] = text
+            parent = saved
+            for key in location[:-1]:
+                parent = parent[key]
+            parent[location[-1]] = _edited(value)
+            path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+            with pytest.raises(ValueError) as error:
+                check_plan(request, plan)
+            errors.append(str(error.value))
+        assert errors[0] == errors[1], location
+        edits += 1
+    path.write_bytes(own)
+    assert edits > 30
+
+
+@reads_saved_config
+@pytest.mark.parametrize("kind", ["warm", "linear", "no_profile"])
+def test_a_recorded_reason_on_a_plan_that_records_none_is_refused(grouped_case, tmp_path, capsys, kind):
+    from aisim.support.plan import check_plan
+
+    profile, _root = grouped_case
+    if kind == "warm":
+        _onboarding_plan(
+            _with_prefix_evidence(_with_state_group(profile), version="0.31.0"), tmp_path, capsys, "0.31.0"
+        )
+    elif kind == "linear":
+        _onboarding_plan(_mixed_profile(profile), tmp_path, capsys, "0.25.1")
+    else:
+        request = SupportRequest.model_validate(
+            {
+                "identity": {
+                    "model": "fictional/no-profile-model",
+                    "model_revision": "synthetic-v1",
+                    "model_kind": "moe",
+                    "framework_version": "0.31.0",
+                    "gpu": "h200_sxm",
+                    "interconnect": "nvswitch",
+                },
+                "search": {"tensor_parallel": 2, "moe_tensor_parallel": 2, "context_length": 1024},
+                "workload": {"input_tokens": 512, "output_tokens": 4},
+            }
+        )
+        create_plan(request, tmp_path / "collection")
+    plan = tmp_path / "collection"
+    request = SupportRequest.from_yaml(plan / "request.yaml")
+    check_plan(request, plan)
+    assert "prefix_caching_reason" not in json.loads((plan / "support-plan.json").read_text())["fpm"]
+    _set_saved_reason(plan, _COLD + "Another text.")
+    with pytest.raises(ValueError, match="support-plan.json was modified; choose a new output directory"):
+        check_plan(request, plan)
+
+
+# The texts of grouped_prefix_caching_requirements for the two refusals.
+_REFUSAL_TEXT = {
+    "unmarked_group": (
+        "grouped FPM cache prefix caching requires every cache group to declare prefix_cacheable; "
+        "set prefix_cacheable (true or false) on each cache group of a hand-made profile, or import the runtime probe "
+        "again for a profile that was imported before the import wrote this field"
+    ),
+    "non_cacheable_window": (
+        "kv_cache_groups with enable_prefix_caching=true do not model a sliding-window attention group with "
+        "prefix_cacheable=false; describe a ring buffer as a state group with blocks_per_request: 1 and "
+        "prefix_cacheable: false, and turn prefix caching off for a bounded replay window, which replay does not "
+        "model"
+    ),
+}
 
 
 @reads_saved_config
@@ -1775,9 +2399,69 @@ def test_the_marker_and_window_refusals_hold_on_each_version(grouped_case, tmp_p
         CorePredictionConfig.model_validate(_prefix_caching_prediction(profile, root, version))
     with pytest.raises(ValidationError, match=error):
         SearchSpace.model_validate(_prefix_search(profile, root, version))
-    stderr, _files = _onboarding_plan(profile, tmp_path, capsys, version)
-    assert "prefix caching" not in stderr
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, version)
+    assert stderr.strip() == _plan_reason(files) == _COLD + _REFUSAL_TEXT[case]
     assert _prefix_caching_of(tmp_path / "collection") == [False, False]
+
+
+@reads_saved_config
+@pytest.mark.parametrize(
+    "role,case,text",
+    [
+        ("prefill", "unmarked_group", _REFUSAL_TEXT["unmarked_group"]),
+        ("decode", "unmarked_group", _REFUSAL_TEXT["unmarked_group"]),
+        ("prefill", "non_cacheable_window", _REFUSAL_TEXT["non_cacheable_window"]),
+        ("decode", "non_cacheable_window", _REFUSAL_TEXT["non_cacheable_window"]),
+        # An explicit aggregated worker keeps the texts of an aggregated rank.
+        ("aggregated", "non_cacheable_window", _REFUSAL_TEXT["non_cacheable_window"]),
+        # A role of a profile that passes every requirement keeps prefix caching on.
+        ("prefill", "marked", None),
+        ("decode", "marked", None),
+    ],
+)
+def test_grouped_plan_of_one_worker_type_records_and_prints_its_reason_or_stays_warm(
+    grouped_case, tmp_path, capsys, role, case, text
+):
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.31.0")
+    for deployment in profile["deployments"]:
+        deployment["worker_type"] = role
+        groups = deployment["resources"]["cache_groups"]
+        if case == "unmarked_group":
+            del groups[1]["prefix_cacheable"]
+        elif case == "non_cacheable_window":
+            groups[1]["prefix_cacheable"] = False
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.31.0", worker_type=role)
+    pilot = "predict/pilot.yaml" if role == "aggregated" else "worker.yaml"
+    worker = yaml.safe_load(files[pilot])["engine"]["workers"][role]
+    if text is None:
+        assert stderr.strip() == "" and _plan_reason(files) is None
+        assert worker["kv_cache"]["prefix_caching"] is True
+        return
+    assert stderr.strip() == _plan_reason(files) == _COLD + text
+    assert worker["kv_cache"]["prefix_caching"] is False
+
+
+@reads_saved_config
+def test_grouped_glm_plan_with_a_token_budget_off_the_grid_records_and_prints_its_reason(
+    grouped_case, tmp_path, capsys
+):
+    # The GLM-5.3-Flash requirement reads the token budget of the plan, so the note must use the same budget.
+    profile, _root = grouped_case
+    profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
+    profile["architecture"] = "Glm5NextForConditionalGeneration"
+    (Path(profile["model"]) / "config.json").write_text(json.dumps({"architectures": [profile["architecture"]]}))
+    for deployment in profile["deployments"]:
+        deployment["resources"]["max_num_tokens"] = 126
+    stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.33.0", max_num_tokens=126)
+    assert (
+        stderr.strip()
+        == _plan_reason(files)
+        == _COLD
+        + ("GLM-5.3-Flash prefix caching requires prefix_match_unit and max_batched_tokens that are multiples of 4")
+    )
+    worker = yaml.safe_load(files["predict/pilot.yaml"])["engine"]["workers"]["aggregated"]
+    assert worker["kv_cache"]["prefix_caching"] is False
 
 
 @pytest.mark.parametrize("label,recorded", [("0.32.0", "0.33.0"), ("0.33.0", "0.32.0")])
@@ -1847,16 +2531,18 @@ def test_grouped_plan_with_recorded_evidence_of_another_version_is_cold(
 
 
 @reads_saved_config
-def test_grouped_vllm_0330_plan_with_an_unmarked_window_group_is_cold_without_a_note(grouped_case, tmp_path, capsys):
+def test_grouped_vllm_0330_plan_with_an_unmarked_window_group_is_cold_and_prints_the_missing_marker(
+    grouped_case, tmp_path, capsys
+):
     # The probe import writes no prefix_cacheable for a group with a SlidingWindowMLASpec layer. The version has
-    # rules and equals the label, so no note blames the version.
+    # rules and equals the label, so the note names the missing marker, not the version.
     profile, root = grouped_case
     profile = _with_prefix_evidence(_with_state_group(profile), version="0.33.0")
     for deployment in profile["deployments"]:
         window = next(group for group in deployment["resources"]["cache_groups"] if group.get("sliding_window"))
         del window["prefix_cacheable"]
     stderr, files = _onboarding_plan(profile, tmp_path, capsys, "0.33.0")
-    assert "prefix caching" not in stderr
+    assert stderr.strip() == _plan_reason(files) == _COLD + _REFUSAL_TEXT["unmarked_group"]
     for name in ("predict/pilot.yaml", "recommend/pilot.yaml"):
         worker = yaml.safe_load(files[name])["engine"]["workers"]["aggregated"]
         assert worker["kv_cache"]["prefix_caching"] is False
@@ -2025,3 +2711,185 @@ def test_glm_shaped_grouped_profile_replays_a_multi_turn_trace_with_hits(grouped
     # kept at 6,528 or below, so the grouped path reuses nothing.
     assert [row["reused_input_tokens"] for row in report["per_request"]] == [0, 8704, 10880, 0]
     assert report["prefix_cache_reused_ratio"] == pytest.approx((8704 + 10880) / (9000 + 13000 + 13100 + 8704))
+
+
+_EVIDENCE = Path(__file__).resolve().parents[1] / "benchmarks/evidence"
+_EVIDENCE_0320 = "nixl-pd-transfer-bytes-20261115"
+_EVIDENCE_0330 = "nixl-pd-transfer-bytes-20261117"
+
+
+def _evidence_versions(folder):
+    data = json.loads((_EVIDENCE / folder / "measurements.json").read_text())
+    assert data["schema"] == "nixl-pd-transfer-bytes/v2"
+    assert set(data["marks"]) == {"measured", "derived", "unmarked"}
+    return data["versions"]
+
+
+def _evidence_rows(block):
+    return block["rows"] if "rows" in block else [row for arm in block["arms"].values() for row in arm["rows"]]
+
+
+@pytest.mark.parametrize(
+    "folder,version,block_bytes,fixed_bytes",
+    [
+        (_EVIDENCE_0320, "0.31.0", 13_045_120, 52_120_960),
+        (_EVIDENCE_0320, "0.32.0", 21_978_496, 39_168_128),
+        (_EVIDENCE_0330, "0.33.0", 21_978_496, 39_168_128),
+    ],
+)
+def test_nixl_transfer_evidence_marks_every_number_and_keeps_every_row_on_the_line(
+    folder, version, block_bytes, fixed_bytes
+):
+    block = _evidence_versions(folder)[version]
+    sources = block["sources"]
+    assert set(sources) - {"region_sums"} == {"regions", "bytes_per_block", "formula", "rows"}
+    assert set(sources["bytes_per_block"]) == set(block["bytes_per_block"])
+    marks = [sources["regions"], sources["formula"], *sources["bytes_per_block"].values(), *sources["rows"].values()]
+    assert set(marks) <= {"measured", "derived"}
+    assert (block["bytes_per_block"]["attention"], sources["bytes_per_block"]["attention"]) == (block_bytes, "measured")
+    rows = _evidence_rows(block)
+    assert set().union(*rows) - {"prompt", "prompt_tokens"} == set(sources["rows"])
+    for row in rows:
+        assert row["bytes_per_rank"] == block_bytes * row["attention_blocks_moved"] + fixed_bytes
+
+
+def test_nixl_transfer_evidence_of_vllm_0310_and_0320_marks_the_split_as_derived():
+    split = {"attention": "measured", "ring": "derived", "kda_9_layers": "derived", "kda_8_layers": "derived"}
+    for version, block in _evidence_versions(_EVIDENCE_0320).items():
+        assert block["sources"]["bytes_per_block"] == split, version
+        assert block["sources"]["region_sums"] == "derived", version
+        rows = block["sources"]["rows"]
+        assert (rows["transferred_tokens"], rows["prefill_attention_blocks"]) == ("measured", "measured"), version
+
+
+def test_nixl_transfer_evidence_of_vllm_0330_measures_every_group():
+    block = _evidence_versions(_EVIDENCE_0330)["0.33.0"]
+    groups = {"attention": 21_978_496, "ring": 92_288, **{f"kda_group_{index}": 9_768_960 for index in range(4)}}
+    assert block["bytes_per_block"] == groups
+    assert set(block["sources"]["bytes_per_block"].values()) == {"measured"}
+    assert block["sources"]["rows"]["group_bytes"] == "measured"
+    rows = block["sources"]["rows"]
+    assert (rows["transferred_tokens"], rows["prefill_attention_blocks"]) == ("measured", "measured")
+    assert {name: len(arm["rows"]) for name, arm in block["arms"].items()} == {"A": 14, "B": 8, "C": 6}
+    for row in block["arms"]["C"]["rows"]:
+        assert row["group_bytes"] == {**groups, "attention": 21_978_496 * row["attention_blocks_moved"]}
+        assert sum(row["group_bytes"].values()) == row["bytes_per_rank"]
+
+
+def test_nixl_transfer_evidence_of_vllm_0330_repeats_the_rows_of_vllm_0320():
+    def key(row):
+        return (row["prompt_tokens"], row["attention_blocks_moved"], row["bytes_per_rank"], row["descriptors_per_rank"])
+
+    old = _evidence_versions(_EVIDENCE_0320)["0.32.0"]["rows"]
+    new = _evidence_versions(_EVIDENCE_0330)["0.33.0"]["arms"]["A"]["rows"]
+    assert [key(row) for row in new] == [key(row) for row in old]
+
+
+def test_nixl_transfer_evidence_of_vllm_0330_holds_the_region_table_of_the_live_connector():
+    table = json.loads((_EVIDENCE / _EVIDENCE_0330 / "region-table.json").read_text())
+    lengths, group_ids = table["block_len_per_layer"], table["region_group_ids"]
+    assert table["num_regions"] == len(lengths) == len(group_ids) == len(table["region_names"]) == 40
+    assert table["physical_blocks_per_logical"] == 1
+    assert lengths == [71_808] + [1_114_112] * 8 + [71_808] * 10 + [1_114_112] * 11 + [2_048] * 10
+    assert group_ids == [-1] * 9 + [4] * 21 + [5] * 10
+    assert table["ssm_region_indices"] == list(range(9))
+    assert table["scratch_region_indices"] == [0, *range(30, 40)]
+    assert table["mamba_ssm_size"] == [36_864, 1_048_576]
+    # The regions give the measured bytes of each group: an attention block reads every region, the ring its scratch
+    # regions, and a Mamba group the state bytes in every state region.
+    measured = _evidence_versions(_EVIDENCE_0330)["0.33.0"]["bytes_per_block"]
+    assert sum(lengths) == measured["attention"]
+    assert sum(lengths[index] for index in table["scratch_region_indices"]) == measured["ring"]
+    assert len(table["ssm_region_indices"]) * sum(table["mamba_ssm_size"]) == measured["kda_group_0"]
+
+
+def test_nixl_prompt_seeds_reproduce_each_recorded_token_prefix():
+    captures = _EVIDENCE / _EVIDENCE_0330 / "captures"
+    expected = {
+        (arm, request["label"], request["usage_prompt_tokens"])
+        for arm in "ABC"
+        for request in map(json.loads, (captures / f"requests-{arm.lower()}.jsonl").read_text().splitlines())
+    }
+    with (captures / "prompt-plans.csv").open() as stream:
+        for row in csv.DictReader(stream):
+            kind, length, repetition = row["request"].split("-")
+            assert int(length) == int(row["prompt_tokens"])
+            expected.remove((row["arm"], row["request"], int(length)))
+            assert (row["seed"], int(row["token_lo"]), int(row["token_hi"])) == ("18h", 1000, 150000)
+            seed = f"18h-hit-{length}" if kind == "hit" else f"18h-fresh-{length}-{int(repetition) - 1}"
+            rng = random.Random(seed)
+            assert [rng.randrange(1000, 150000) for _ in range(8)] == list(map(int, row["first_ids"].split()))
+    assert not expected
+
+
+def test_nixl_captures_reproduce_the_28_request_deltas_and_allocated_gpu_seconds():
+    captures = _EVIDENCE / _EVIDENCE_0330 / "captures"
+    provenance = json.loads((captures / "provenance.json").read_text())
+    for name, digest in provenance["files_sha256"].items():
+        assert hashlib.sha256((captures / name).read_bytes()).hexdigest() == digest
+    layout_lines = (captures / "ssm-conv-layout.txt").read_text().splitlines()
+    assert len(layout_lines) == 6
+    assert all(line.endswith("Setting SSM conv state layout to DS.") for line in layout_lines)
+    with (captures / "counter-samples.csv").open() as stream:
+        snapshots = {(row["arm"], row["request"], row["sample"]): row for row in csv.DictReader(stream)}
+    assert len(snapshots) == 56
+    accounting = provenance["gpu_accounting"]
+    gpus = accounting["gpus_in_allocation"]
+    assert gpus == 8
+    for arm, results in _evidence_versions(_EVIDENCE_0330)["0.33.0"]["arms"].items():
+        requests = [json.loads(line) for line in (captures / f"requests-{arm.lower()}.jsonl").read_text().splitlines()]
+        usage = accounting["arms"][arm]
+        assert usage["valid_requests"] == len(requests)
+        assert usage["wall_seconds"] == sum(usage["phase_wall_seconds"].values())
+        assert usage["allocated_gpu_seconds"] == usage["wall_seconds"] * gpus
+        for request, row in zip(requests, results["rows"], strict=True):
+            before, after = (snapshots.pop((arm, request["label"], stage)) for stage in ("before", "after"))
+            assert before["source_sha256"] != after["source_sha256"]
+            assert request["valid"] and request["usage_prompt_tokens"] == row["prompt_tokens"]
+            assert request["remote_num_tokens"] == row["transferred_tokens"]
+            assert request["remote_block_counts"][4] == row["prefill_attention_blocks"]
+            deltas = {}
+            for counter in ("nixl_bytes_transferred_count", "nixl_bytes_transferred_sum", "nixl_num_descriptors_sum"):
+                deltas[counter] = Decimal(after[counter]) - Decimal(before[counter])
+                assert deltas[counter] == request["decode_delta"][f"vllm:{counter}"]
+            assert deltas["nixl_bytes_transferred_count"] == 4
+            assert deltas["nixl_bytes_transferred_sum"] == 4 * row["bytes_per_rank"]
+            assert deltas["nixl_num_descriptors_sum"] == 4 * row["descriptors_per_rank"]
+    assert not snapshots
+    job = accounting["capture"]
+    assert job["state_at_capture"] == "RUNNING" and job["final_job_wall_seconds"] is None
+    assert job["allocated_gpu_seconds_at_capture"] == job["elapsed_at_capture_seconds"] * gpus
+
+
+def test_nixl_ds_connector_records_reproduce_every_group_on_the_four_decode_ranks():
+    directory = _EVIDENCE / _EVIDENCE_0330
+    captures = directory / "captures"
+    records = [
+        json.loads(line.split(" NIXL_BYTESPLIT ")[1])
+        for line in (captures / "connector-ranks.txt").read_text().splitlines()
+    ]
+    table = json.loads((directory / "region-table.json").read_text())
+    registrations = [record for record in records if record["kind"] == "registration"]
+    assert sorted(record["tp_rank"] for record in registrations) == list(range(4))
+    for registration in registrations:
+        assert registration["conv_offsets"] == [[0, 12_288], [12_288, 12_288], [24_576, 12_288]]
+        for key in table.keys() - {"source", "schema", "vllm_version"}:
+            assert registration[key] == table[key]
+    requests = [json.loads(line) for line in (captures / "requests-c.jsonl").read_text().splitlines()]
+    rows = _evidence_versions(_EVIDENCE_0330)["0.33.0"]["arms"]["C"]["rows"]
+    transfers = [record for record in records if record["kind"] == "transfer"]
+    assert len(transfers) == 4 * len(requests) == 24
+    for request, row in zip(requests, rows, strict=True):
+        prefix = "cmpl-" + request["proxy"]["request_id"] + "-"
+        ranks = [record for record in transfers if record["request_id"].startswith(prefix)]
+        assert sorted(record["tp_rank"] for record in ranks) == list(range(4))
+        for rank in ranks:
+            assert rank["concat_equal_in_order"] and rank["lengths_from"] == "src_blocks_data"
+            assert rank["bytes_total"] == row["bytes_per_rank"]
+            assert rank["descs_total"] == row["descriptors_per_rank"]
+            names = [*(f"kda_group_{i}" for i in range(4)), "attention", "ring"]
+            assert [group["group"] for group in rank["groups"]] == list(range(6))
+            for name, group in zip(names, rank["groups"], strict=True):
+                measured = sum(int(length) * count for length, count in group["lengths"].items())
+                assert sum(group["lengths"].values()) == group["descs"]
+                assert measured == group["bytes"] == row["group_bytes"][name]

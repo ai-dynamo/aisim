@@ -116,7 +116,7 @@ def validate_nextn(nextn: int | None) -> int:
     modeled by the upper prediction layer and therefore is intentionally not
     part of this helper or :class:`ModelConfig`.
     """
-    if nextn is not None and int(nextn) != nextn:
+    if isinstance(nextn, bool) or (nextn is not None and int(nextn) != nextn):
         raise ValueError(f"nextn ({nextn}) must be an integer draft length.")
     normalized = int(nextn or 0)
     if normalized < 0:

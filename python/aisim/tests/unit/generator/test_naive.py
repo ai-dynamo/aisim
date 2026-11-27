@@ -4,6 +4,7 @@
 """Unit tests for generator naive module — nvbug 5941223."""
 
 import json
+import logging
 import re
 from unittest.mock import patch
 
@@ -234,6 +235,61 @@ class TestEstimateModelWeightBytes:
 
         assert _estimate_model_weight_bytes(str(tmp_path)) == 153354240
 
+    def test_refuses_an_invalid_config_of_a_supported_architecture_with_the_parser_message(self, tmp_path):
+        (tmp_path / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"], "hidden_size": 128}))
+
+        with pytest.raises(RuntimeError) as error:
+            _estimate_model_weight_bytes(str(tmp_path))
+        assert str(error.value) == (
+            f"Could not estimate model size for {str(tmp_path)!r}: the config parser refuses the HF config of the "
+            "supported architecture LlamaForCausalLM: ValueError: Model config must define 'num_hidden_layers' or a "
+            "parseable layer pattern."
+        )
+
+    def test_logs_the_raw_config_estimator_as_the_step_after_a_failed_parse(self, tmp_path, caplog):
+        (tmp_path / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"], "hidden_size": 128}))
+
+        with caplog.at_level(logging.INFO, logger="aisim.generator.naive"), pytest.raises(RuntimeError):
+            _estimate_model_weight_bytes(str(tmp_path))
+        assert f"Normalized model parsing failed for {tmp_path}; trying the raw-config estimator." in caplog.messages
+
+    def test_sglang_generator_selects_its_own_mixed_attention_decoder(self, tmp_path):
+        from aisim.generator.api import generate_naive_config
+        from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+        raw = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
+        raw.update(use_sliding_window=True, max_window_layers=14)
+        raw.pop("layer_types", None)
+        raw.pop("sliding_window", None)
+        wrapper = {"architectures": ["LlavaForConditionalGeneration"], "text_config": raw}
+        (tmp_path / "config.json").write_text(json.dumps(wrapper))
+        result = generate_naive_config(str(tmp_path), 1, "h100_sxm", "sglang", backend_version="0.5.20")
+        assert result["parallelism"]["tp"] == 1
+        with pytest.raises(RuntimeError, match="vLLM Qwen3 does not support sliding attention"):
+            _estimate_model_weight_bytes(str(tmp_path), backend="vllm", backend_version="0.32.0")
+
+    def test_estimates_an_unknown_wrapper_from_its_decoder(self, tmp_path):
+        decoder = {
+            "hidden_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "intermediate_size": 1024,
+            "vocab_size": 1000,
+            "torch_dtype": "bfloat16",
+        }
+        wrapper = {
+            "architectures": ["UnknownWrapperForConditionalGeneration"],
+            "hidden_size": 4096,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 32,
+            "text_config": decoder,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(wrapper))
+
+        # 2 * 1,000 * 256 + 4 * (4 * 256**2 + 3 * 256 * 1,024) = 4,706,304 parameters at 2 bytes each.
+        assert _estimate_model_weight_bytes(str(tmp_path)) == 9_412_608
+
     @patch(
         "aisim.generator.naive._load_model_config_from_model_path",
         return_value=_UNSUPPORTED_GPT_NEOX_CONFIG,
@@ -241,6 +297,33 @@ class TestEstimateModelWeightBytes:
     def test_remote_unsupported_architecture_loads_config_once(self, mock_load_config):
         assert _estimate_model_weight_bytes("EleutherAI/pythia-70m") == 153354240
         mock_load_config.assert_called_once_with("EleutherAI/pythia-70m")
+
+    def test_remote_sidecar_and_root_are_reused_across_generations(self):
+        from aisim.sdk.memory import NaiveKVCacheEstimator
+        from aisim_core.sdk import utils
+
+        root = {
+            "architectures": ["LlavaForConditionalGeneration"],
+            "torch_dtype": "float16",
+            "text_config": {"model_type": "llama", "vocab_size": 2048},
+        }
+        sidecar = {"quant_method": "modelopt", "quantization": {"quant_algo": "FP8", "exclude_modules": ["*mlp*"]}}
+        utils._load_model_config_from_model_path.cache_clear()
+        with (
+            patch.object(utils, "_download_hf_config", return_value=root) as config_read,
+            patch.object(utils, "_download_hf_json", return_value=sidecar) as sidecar_read,
+            patch.object(
+                NaiveKVCacheEstimator, "from_model_path", side_effect=AssertionError("unexpected remote metadata read")
+            ),
+        ):
+            first = _estimate_model_weight_bytes("test/remote-sidecar", backend_version="0.32.0")
+            expected = NaiveKVCacheEstimator.from_hf_config(
+                {**root, "hf_quant_config": sidecar}, tp_size=1, pp_size=1, backend_version="0.32.0"
+            ).weight_bytes()
+            assert first == expected
+            assert _estimate_model_weight_bytes("test/remote-sidecar", backend_version="0.32.0") == first
+            config_read.assert_called_once_with("test/remote-sidecar")
+            sidecar_read.assert_called_once_with("test/remote-sidecar", "hf_quant_config.json", raise_on_404=False)
 
     @patch(
         "aisim.generator.naive._get_system_config",

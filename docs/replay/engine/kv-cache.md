@@ -48,7 +48,7 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 | `prefix_caching` | `true` | fixed | Keep completed prompt blocks for reuse by later requests. A grouped FPM cache can turn it on only under the conditions of [grouped caches](#other-cache-modes). |
 | `swa_prefix_tails` | `auto` | fixed | SGLang only. Sequence tails per attention-DP rank that keep their DeepSeek-V4 sliding-window KV; `null` turns it off. `auto` uses four per running request for a DeepSeek-V4 checkpoint and is off for other models. See [DeepSeek-V4 SWA prefix reuse](#deepseek-v4-swa-prefix-reuse). |
 | `decode_radix_cache` | `false` | fixed | SGLang `decode` only. Enables the decode worker's radix cache (`--disaggregation-decode-enable-radix-cache`); requires `prefix_caching: true` and no speculative decoding. See [SGLang decode radix cache](#sglang-decode-radix-cache). |
-| `bytes_per_token` | `auto` | fixed | KV bytes per token on one TP shard. `auto` derives it from the model, KV precision and this role's parallelism. |
+| `bytes_per_token` | `auto` | fixed | KV bytes per token on one TP shard. `auto` derives it from the model, KV precision and this role's parallelism. For a worker with `host_offload` or `hicache`, and without an FPM profile and without `state_cache`, it reads the model's `config.json` and fails for a config that the [naive estimate](../../perf-model/memory.md#kv-cache-capacity-reservation) refuses. |
 | `capacity.type` | `default` | fixed | `default` sizes G1 from GPU memory; `fixed` uses `blocks` or `bytes`. |
 | `capacity.memory_fraction` | vLLM/TensorRT-LLM `0.9`, SGLang `0.88` | Searchable; fixed by default | In `(0, 1]`. `default` capacity only. Same meaning as vLLM `gpu_memory_utilization`, SGLang `mem_fraction_static`, TensorRT-LLM `free_gpu_memory_fraction`. |
 | `capacity.cuda_graph_reserved_bytes` | `0` | predict only | Bytes held back from G1 for CUDA graphs. `default` capacity only. |
@@ -902,11 +902,14 @@ state = estimate_state_cache("moonshotai/Kimi-K3", tp_size=8, kvcache_quant_mode
 
 For DeepSeek V4, `state_cache: {}` follows vLLM's allocation. vLLM stores
 `fp8_ds_mla` KV and gives every cache group the same pool row, as wide as the
-widest group. A request holds one row per 256 tokens of compressed KV and
+widest group. Replay models one row per 256 tokens of compressed KV and
 indexer keys (`block_size` 256, `bytes_per_token` one row per 256 tokens), plus
 a 26-row state for its sliding-window groups (SWA KV and compressor states). For
 DeepSeek-V4-Flash, 1,002,240-byte rows give 3915 bytes per token and a
-26,058,240-byte state on every TP rank.
+26,058,240-byte state on every TP rank. The SDK can derive the marginal byte
+rate from the checkpoint. Its config-only capacity estimate requires runtime
+group allocations to account for live sliding-window and prefill pages and the
+pool-wide null row. [KV-cache capacity reservation](../../perf-model/memory.md#kv-cache-capacity-reservation)
 Leave `block_size` and `bytes_per_token` unset. Speculative decoding (`nextn`
 or `speculation`) widens each sliding window by the draft tokens, so one draft
 token gives 30 rows. These are modeling assumptions: 26 rows is vLLM's decode
@@ -1112,9 +1115,16 @@ sub-block matching without an explicit full-state scratch count.
   probe with the label `0.33.0` sets `prefix_caching: true` when the profile
   meets the conditions above, also when `onboard init --fpm-profile` reuses
   the profile. Under another label the plan sets `prefix_caching: false`.
-  When the probe ran with prefix caching and the version of the evidence has
-  no grouped rules or differs from the label, these commands print a note
-  that names that version and, when it has grouped rules, the label. A
+  A plan that sets `prefix_caching: false` for a grouped profile records the
+  reason in `fpm.prefix_caching_reason` of `support-plan.json`. When the probe
+  ran with prefix caching, these commands also print that text. For such a
+  probe, the text names the version of the evidence when that version has no
+  grouped rules or differs from the label, and with grouped rules it also names
+  the label. In every other case the text is that of the condition above that
+  failed. When the probe ran without prefix caching, the commands print
+  nothing. The
+  [onboarding guide](../../perf-model/fpm-self-service/implementation.md#run-the-generated-ordinary-configurations)
+  gives the texts and says how the commands check a saved plan. A
   prediction or recommendation that turns prefix caching on for a profile
   whose recorded version differs from its label is refused before replay.
   `onboard probe-runtime` keeps an explicit dataset label that differs from the
@@ -1127,7 +1137,22 @@ sub-block matching without an explicit full-state scratch count.
   imported before the version was recorded holds no `prefix_cacheable` marks
   either, because the import writes the marks and the version together, so
   its plan is cold and a prediction or recommendation with prefix caching is
-  refused. If you set the marks of such a profile by hand, also set
+  refused. When the marks are what the profile lacks, the reason of its cold
+  plan and the refusal name them and say to import the runtime probe again. Do
+  that: run `aisim onboard import-observations` again on the same observations,
+  into a fresh `--output-dir`.
+  The new import writes the marks and the version, and the
+  [migration guide](../../aic-backward-compatibility/migration.md#rust-resource-and-memory-literals)
+  gives the steps and their cost. Do not set the marks of an imported profile
+  by hand. The onboarding commands check the resources of a draft from the
+  runtime probe import against the record that the import saved. They refuse a
+  draft whose cache groups state a mark that the record does not state, with
+  `runtime cache geometry or settings changed; a compatible fresh probe is
+  required`. A new probe is not needed for the marks, because the new import of
+  the saved observations gives them. The import writes no mark for a group that
+  holds a `SlidingWindowMLASpec` layer, so the plan of a profile with such a
+  group stays cold. Only a hand-made profile sets `prefix_cacheable` itself, on
+  every cache group. If its evidence comes from a probe, also set
   `runtime_memory.runtime_framework_version` to the version that the probe ran
   on. With the marks and without the version, a label of `0.31.0` or `0.32.0`
   on vLLM 0.33.0 evidence can plan prefix caching on and passes these
@@ -1156,9 +1181,26 @@ sub-block matching without an explicit full-state scratch count.
   `prefill_checkpoint_blocks`. `max_model_len` is set, and the pool holds one prompt of
   `max_model_len` plus the state blocks of one request. `preemption_mode` is
   `lifo`, the default, which is vLLM's order: it preempts the last running
-  request. Planning runs only the
-  conditions above, so a profile that fails a native check plans prefix
-  caching on and is refused at replay. The native rank does not hold the
+  request. Planning, that is `aisim onboard plan` and `aisim onboard finalize`,
+  decides prefix caching by the conditions above only. It does not run the
+  startup checks of native replay. So a profile can meet the conditions above
+  and fail a startup check that they do not hold, for example one block per
+  request for every state group, the prefill checkpoint rules, the hash block
+  against the block of every prefix-cacheable group, or the capacity for one
+  prompt of `max_model_len` plus the state blocks of one request. Such a
+  profile plans prefix caching on, and its plan records no reason. Replay then
+  refuses the rank when it starts, with the text of the failed check, for
+  example `kv_cache_groups with vllm_version=0.33.0 require
+  prefill_checkpoint_blocks on every prefix-cacheable state group; set the
+  field (0 or 1) on each such group`. In a hand-made profile, correct what the
+  text names: `blocks_per_request` or the prefill checkpoint fields of the
+  group; the `block_size_tokens` of the group or
+  `runtime_memory.hash_block_size_tokens`, which the text calls
+  `prefix_match_unit`; and for the capacity `runtime_memory.kv_cache_bytes`.
+  The runtime probe import writes `blocks_per_request` of every state group and
+  the prefill checkpoint fields of every Mamba state group from the probe
+  record. A draft from the import holds these fields, and the onboarding
+  commands refuse a draft that lacks one. The native rank does not hold the
   Mamba cache mode, so native replay does not check align mode. It does not
   hold the profile's `runtime_framework_version` either: a replay spec or a
   native rank that you write by hand states `vllm_version` itself, and native

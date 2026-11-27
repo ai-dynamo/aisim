@@ -301,6 +301,7 @@ def _verify_collection(
     from collector.fpm_forward.database import (
         aggregate_cell,
         published_dense_synthetic_cells,
+        published_median_policy,
         validate_formal_database_commit,
     )
     from collector.fpm_forward.glm53flash_points import GLM_POINTS_ORIGIN, glm_plan_manifest
@@ -423,7 +424,8 @@ def _verify_collection(
     metadata = _inside(Path(database["metadata"]), root / "systems/data")
     if parquet.name != "fpm_forward_perf.parquet" or metadata != parquet.with_name("fpm_forward_perf.metadata.json"):
         raise ValueError("collector checkpoint does not reference a canonical formal FPM pair")
-    published = validate_formal_database_commit(parquet, metadata, frozen)
+    checkpoint_rows = database.get("cell_rows")
+    published = validate_formal_database_commit(parquet, metadata, frozen, expected_cell_rows=checkpoint_rows)
     dense_cells = published_dense_synthetic_cells(published)
     snapshots = {path: _digest(path.read_bytes()) for path in (checkpoint_path, collection_path, parquet, metadata)}
     rows, observations = [], []
@@ -465,7 +467,13 @@ def _verify_collection(
                 snapshots[path] = _digest(path.read_bytes())
         rows.extend(
             aggregate_cell(
-                frozen, cell, cell_dir, expected_attempt_id=attempt, dense_synthetic_kv=cell.cell_id in dense_cells
+                frozen,
+                cell,
+                cell_dir,
+                expected_attempt_id=attempt,
+                deployment=deployment,
+                dense_synthetic_kv=cell.cell_id in dense_cells,
+                median_policy=published_median_policy(published, cell, checkpoint_rows),
             )
         )
         if probe_manifest is None:
@@ -484,6 +492,7 @@ def _verify_collection(
                     expected_gpu_memory_utilization=request.collection.memory_fraction,
                     expected_model_revision=request.identity.model_revision,
                     expected_compilation_config=expected_graph,
+                    deployment=deployment,
                 )
             )
     runtime_compatibility = None

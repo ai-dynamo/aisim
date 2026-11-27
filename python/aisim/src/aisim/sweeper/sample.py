@@ -90,6 +90,16 @@ def _shape_fields(shape: ParallelShape) -> dict[str, Any]:
     }
 
 
+def sample_systems_paths(sample: dict[str, Any], role: str) -> list[str] | None:
+    """Return this role's system roots, including AFD timing settings saved on existing samples."""
+    settings = (sample.get("afd_worker_settings") or {}).get("aggregated" if role == "agg" else role) or {}
+    return (
+        (settings.get("timing") or {}).get("systems_paths")
+        or sample.get(f"{role}_systems_paths")
+        or sample.get("systems_paths")
+    )
+
+
 def _unroll_parallel(
     deployment_mode: str,
     parallel_config: ReplicaParallelConfig | DisaggParallelConfig | AFDTopology,
@@ -129,6 +139,10 @@ def unroll_sample(
         sample[key] = getattr(search_space, key)
     if search_space.systems_paths is not None:
         sample["systems_paths"] = search_space.systems_paths
+    for role in ("agg",) if mode == "agg" else ("prefill", "decode"):
+        paths = search_space.systems_paths_for(role)
+        if paths is not None and paths != search_space.systems_paths:
+            sample[f"{role}_systems_paths"] = paths
     if search_space.fpm_profile is not None:
         sample["fpm_profile"] = search_space.fpm_profile
 

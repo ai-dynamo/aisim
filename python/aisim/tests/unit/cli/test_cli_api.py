@@ -5,6 +5,7 @@
 Unit tests for CLI API functions.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -40,7 +41,9 @@ class TestCLIEstimateUnit:
         session.run_disagg.return_value = summary
         monkeypatch.setattr(inference_session, "InferenceSession", lambda *args, **kwargs: session)
         monkeypatch.setattr(inference_session, "DisaggInferenceSession", lambda *args, **kwargs: session)
-        monkeypatch.setattr(perf_database, "get_database_view", lambda *args, **kwargs: object())
+        monkeypatch.setattr(
+            perf_database, "get_database_view", lambda *args, **kwargs: SimpleNamespace(version="1.3.0")
+        )
         monkeypatch.setattr(backend_factory, "get_backend", lambda *args, **kwargs: object())
         monkeypatch.setattr(models, "get_model", lambda *args, **kwargs: object())
         monkeypatch.setattr(api, "resolve_context_fmha_by_data", lambda *args, **kwargs: None)
@@ -74,7 +77,7 @@ class TestCLIEstimateUnit:
         import aisim.sdk.inference_session as inference_session
 
         captured = {}
-        database = object()
+        database = SimpleNamespace(version="1.3.0")
 
         def fake_resolve(model_config, **kwargs):
             captured["resolver_config"] = model_config
@@ -85,7 +88,8 @@ class TestCLIEstimateUnit:
             }
             model_config.num_gpus_per_node = 4
 
-        def fake_get_model(_model_path, model_config, _backend_name):
+        def fake_get_model(_model_path, model_config, _backend_name, *, database):
+            assert database.version == "1.3.0"
             captured["built_config"] = model_config
             return object()
 

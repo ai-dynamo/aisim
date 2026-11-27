@@ -1575,9 +1575,8 @@ def _run_agg_estimate(
     _apply_nextn(model_config, nextn)
     # Agg workers run context attention → resolve fmha against the perf data
     # before building the model (mirrors the sweep/task_v2 path).
-    resolve_context_fmha_by_data(
-        model_config, model_path, load_database(system_name), backend_name, is_context_role=True
-    )
+    database = load_database(system_name)
+    resolve_context_fmha_by_data(model_config, model_path, database, backend_name, is_context_role=True)
     resolve_dsv4_moe_arch(model_config, model_path, system_name=system_name, backend_name=backend_name)
     resolve_nvfp4_for_system(model_config, system_name, model_path, backend_name=backend_name)
     runtime_config = RuntimeConfig(
@@ -1596,10 +1595,9 @@ def _run_agg_estimate(
         engine_step_backend=engine_step_backend,
     )
 
-    model = get_model(model_path, model_config, backend_name)
+    model = get_model(model_path, model_config, backend_name, database=database)
     if ctx_tokens is None:
         ctx_tokens = isl + BaseBackend._visual_context_tokens(model, runtime_config)
-    database = load_database(system_name)
     backend = get_backend(backend_name, system_name, system_spec=getattr(database, "system_spec", None))
     session = InferenceSession(model, database, backend)
     if speculation_config is not None:
@@ -1783,7 +1781,7 @@ def _run_static_estimate(
         engine_step_backend=engine_step_backend,
     )
 
-    model = get_model(model_path, model_config, backend_name)
+    model = get_model(model_path, model_config, backend_name, database=database)
     backend = get_backend(backend_name, system_name, system_spec=getattr(database, "system_spec", None))
     session = InferenceSession(model, database, backend)
     summary = session.run_static(

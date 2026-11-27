@@ -190,7 +190,12 @@ def post_sla(
             overwritten_model_config.moe_ep_size = moe_ep_size
             overwritten_model_config.attention_dp_size = dp_size
             overwritten_model_config.cp_size = cp_size
-            model = get_model(model_path=model_path, model_config=overwritten_model_config, backend_name=backend)
+            model = get_model(
+                model_path=model_path,
+                model_config=overwritten_model_config,
+                backend_name=backend,
+                database=database,
+            )
             sess = InferenceSession(model, database, backend_instance)
 
             for cc in cc_list:

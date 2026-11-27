@@ -160,6 +160,18 @@ def restore_systems_paths(previous: list[str] | None) -> None:
     _drop_systems_caches()
 
 
+def resolve_deployment_systems_paths(systems_path: str | list[str] | None) -> list[str]:
+    """Resolve explicit, process and environment roots in the same order as the worker."""
+    from aisim_core.sdk.rust_engine_step import _resolve_forward_pass_systems_paths
+
+    entries = (
+        [part.strip() for part in systems_path.split(",") if part.strip()]
+        if isinstance(systems_path, str)
+        else systems_path or []
+    )
+    return _resolve_forward_pass_systems_paths(tuple(entries), require_directories=False)
+
+
 def get_systems_paths() -> list[str]:
     global _SYSTEMS_PATHS
     if _SYSTEMS_PATHS is None:
@@ -222,6 +234,10 @@ def _version_sort_tuple(version_str: str) -> tuple:
 
 _QUERY_VERSIONS_BASENAME = "query_versions.yaml"
 _SLOT_ALIASES = ("current", "previous", "next")
+
+
+class StrictProvenanceError(ValueError):
+    """The requested collection failed its strict provenance checks."""
 
 
 class UnlistedQueryVersionError(ValueError):
@@ -369,7 +385,9 @@ def resolve_query_version(
     if version in _SLOT_ALIASES:
         resolved = slots.get(version)
         if resolved is None:
-            raise ValueError(f"{backend} on {system} has no {version!r} version; available slots: {slots}")
+            raise UnlistedQueryVersionError(
+                f"{backend} on {system} has no {version!r} version; available slots: {slots}"
+            )
         return resolved
     if version in slots.values() or allow_unlisted:
         return version
@@ -707,7 +725,30 @@ def _parse_reuse_yaml(path: str) -> dict:
     return {"entries": validated}
 
 
-def _load_collection_meta_yaml(path: str) -> dict:
+def _file_revision(path: str | os.PathLike) -> tuple[int, ...]:
+    stat = os.stat(path)
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _load_collection_meta_yaml(path: str, *, cache: bool = False) -> dict:
+    if not cache:
+        return _read_collection_meta_yaml(path)
+    # Admission and image qualification on a selected database share sidecars. Bind
+    # the parsed document to this file revision, including atomic replacements.
+    path = os.path.abspath(path)
+    try:
+        signature = _file_revision(path)
+    except OSError:
+        return _read_collection_meta_yaml(path)
+    return copy.deepcopy(_cached_collection_meta_yaml(path, signature))
+
+
+@functools.lru_cache(maxsize=256)
+def _cached_collection_meta_yaml(path: str, signature: tuple[int, ...]) -> dict:
+    return _read_collection_meta_yaml(path)
+
+
+def _read_collection_meta_yaml(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
@@ -737,7 +778,7 @@ _COLLECTION_EVENT_REQUIRED_KEYS = (
     "rows",
     "status",
 )
-_COLLECTION_EVENT_OPTIONAL_KEYS = ("source_campaign_rows", "source_campaign_status", "runtime")
+_COLLECTION_EVENT_OPTIONAL_KEYS = ("source_campaign_rows", "source_campaign_status", "classified_failures", "runtime")
 _COLLECTION_STATUSES = frozenset({"complete", "partial"})
 # Mirror the authored collection_meta runtime contract in collector.provenance
 # without making the installed core depend on the GPU collector package.
@@ -797,6 +838,10 @@ def _validate_collection_event(event: object, *, table: str, index: int, path: s
         if not isinstance(event[key], str) or not event[key].strip():
             raise ValueError(f"{path}: {field_path}.{key} must be a non-empty string")
     _validate_non_negative_row_count(event["rows"], field=f"{field_path}.rows", path=path)
+    if event.get("classified_failures") is not None:
+        _validate_non_negative_row_count(
+            event["classified_failures"], field=f"{field_path}.classified_failures", path=path
+        )
     if event["status"] not in _COLLECTION_STATUSES:
         raise ValueError(f"{path}: {field_path}.status must be 'complete' or 'partial'")
 
@@ -861,7 +906,9 @@ def _collection_meta_has_partial_table(meta: dict) -> bool:
     return bool(_collection_meta_partial_tables(meta))
 
 
-def _version_dir_state(version_path: str, *, data_dir: str | None = None) -> dict[str, object]:
+def _version_dir_state(
+    version_path: str, *, data_dir: str | None = None, cache_collection_meta: bool = False
+) -> dict[str, object]:
     """Consolidated per-version-dir marker state, yaml-first with legacy .txt fallback.
 
     - ``declared_reuse``: parsed ``reuse.yaml`` contents (design §6.3) when it has
@@ -896,7 +943,9 @@ def _version_dir_state(version_path: str, *, data_dir: str | None = None) -> dic
     meta_yaml_path = os.path.join(version_path, COLLECTION_META_MARKER)
     legacy_incomplete_path = os.path.join(version_path, INCOMPLETE_MARKER)
     if os.path.isfile(meta_yaml_path):
-        partial_tables = _collection_meta_partial_tables(_load_collection_meta_yaml(meta_yaml_path))
+        partial_tables = _collection_meta_partial_tables(
+            _load_collection_meta_yaml(meta_yaml_path, cache=cache_collection_meta)
+        )
     elif os.path.isfile(legacy_incomplete_path):
         _warn_legacy_marker_once(warn_scope, INCOMPLETE_MARKER, COLLECTION_META_MARKER)
         # INCOMPLETE.txt predates per-table provenance, so there is no safe way
@@ -1227,7 +1276,7 @@ def _check_strict_provenance_coverage(version_path: str, *, strict: bool, only_t
                 "cannot verify sidecar coverage (Collector V3 design §5/§7.4)"
             )
             if strict:
-                raise ValueError(message) from e
+                raise StrictProvenanceError(message) from e
             _warn_strict_provenance_once("unreadable-version-dir", version_path, message)
             return
         if not data_filenames:
@@ -1241,7 +1290,7 @@ def _check_strict_provenance_coverage(version_path: str, *, strict: bool, only_t
             "sidecar (Collector V3 design §5/§7.4)"
         )
         if strict:
-            raise ValueError(message)
+            raise StrictProvenanceError(message)
         _warn_strict_provenance_once("missing-sidecar", version_path, message)
         return
 
@@ -1249,7 +1298,7 @@ def _check_strict_provenance_coverage(version_path: str, *, strict: bool, only_t
         meta = _load_collection_meta_yaml(meta_path)
     except ValueError as e:
         if strict:
-            raise
+            raise StrictProvenanceError(str(e)) from e
         _warn_strict_provenance_once("malformed-sidecar", meta_path, str(e))
         return
 
@@ -1273,7 +1322,7 @@ def _check_strict_provenance_coverage(version_path: str, *, strict: bool, only_t
         "(Collector V3 design §5/§7.4)"
     )
     if strict:
-        raise ValueError(message)
+        raise StrictProvenanceError(message)
     _warn_strict_provenance_once("uncovered-table", meta_path, message)
 
 
@@ -1319,7 +1368,7 @@ def _check_strict_provenance_for_request(paths: list[str], backend: str, data_di
             declared_entries = _parse_reuse_yaml(reuse_path)["entries"]
         except ValueError as e:
             if strict:
-                raise
+                raise StrictProvenanceError(str(e)) from e
             _warn_strict_provenance_once("malformed-reuse", reuse_path, str(e))
             continue
         for entry in declared_entries:
@@ -1329,7 +1378,9 @@ def _check_strict_provenance_for_request(paths: list[str], backend: str, data_di
             _check_strict_provenance_coverage(os.path.dirname(donor_path), strict=strict, only_table=entry["table"])
 
 
-def _version_dir_unusable_for_request(version_path: str, data_dir: str, *, strict: bool) -> bool:
+def _version_dir_unusable_for_request(
+    version_path: str, data_dir: str, *, strict: bool, cache_collection_meta: bool = False
+) -> bool:
     """Return whether a request must reject the whole version directory.
 
     Structured ``collection_meta.yaml`` partial status is intentionally *not*
@@ -1347,10 +1398,12 @@ def _version_dir_unusable_for_request(version_path: str, data_dir: str, *, stric
     ``get_database`` request gate's incomplete-check.
     """
     try:
-        return bool(_version_dir_state(version_path, data_dir=data_dir)["unusable"])
+        return bool(
+            _version_dir_state(version_path, data_dir=data_dir, cache_collection_meta=cache_collection_meta)["unusable"]
+        )
     except ValueError as e:
         if strict:
-            raise
+            raise StrictProvenanceError(str(e)) from e
         _warn_strict_provenance_once("malformed-sidecar", version_path, str(e))
         return False
 

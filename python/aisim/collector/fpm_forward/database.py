@@ -14,7 +14,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -22,10 +22,20 @@ from aisim.fpm_contract import FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION,
 from aisim_core.decoder_config import decoder_config_key
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY
 
+from . import sglang_native_fpm
 from .capabilities import GENERIC_RUNTIME_TEMPLATE_ID
-from .measurement_evidence import extract_measurement_evidence
-from .native_artifact import NativeCollection, _rank_artifacts, select_native_measurements, validate_native_collection
+from .measurement_evidence import GLM_PRODUCER_PROTOCOL, extract_measurement_evidence
+from .native_artifact import (
+    GLM_TIMING_BOUNDARY,
+    NativeCollection,
+    _rank_artifacts,
+    select_native_measurements,
+    validate_native_collection,
+)
 from .planner import FPMCell, FPMCollectionPlan, backend_identity_columns
+
+if TYPE_CHECKING:
+    from aisim_core.sdk.fpm_profile import FpmDeploymentProfile
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +77,18 @@ _RUN_IDENTITY_FIELDS = (
 SINGLE_SAMPLE_MEASUREMENT_POLICY = "dynamo_native_single_sample_v1"
 # Schema-8 sidecar and row policy of runs measured with the power window.
 POWER_WINDOW_MEASUREMENT_POLICY = "dynamo_native_single_sample_power_window_v1"
+# Sidecar and row policy of the rows of a GLM-5.3-Flash producer cell: after its warm-ups, the producer measures each
+# point ten times and each row holds the upper median of the repetitions after the first
+# (measurement_evidence.GLM_PRODUCER_PROTOCOL). The FPM table loader of crates/core admits it for schema 7 and vLLM.
+VLLM_PREFIX_SEED_MEDIAN_POLICY = "vllm_native_fpm_prefix_seed_median_v1"
+_MEDIAN_PROTOCOLS = {
+    VLLM_PREFIX_SEED_MEDIAN_POLICY: ("vllm", GLM_PRODUCER_PROTOCOL["state_protocol"], GLM_TIMING_BOUNDARY),
+    "sglang_native_fpm_radix_seed_median_v1": (
+        "sglang",
+        sglang_native_fpm.STATE_PROTOCOL,
+        sglang_native_fpm.TIMING_BOUNDARY,
+    ),
+}
 
 
 def _dotted_get(payload: object, path: str) -> object:
@@ -213,6 +235,8 @@ def aggregate_cell(
     *,
     expected_attempt_id: str,
     dense_synthetic_kv: bool = True,
+    median_policy: bool = True,
+    deployment: FpmDeploymentProfile | None = None,
 ) -> list[dict[str, Any]]:
     """Validate native rank artifacts and take max-rank latency per grid point.
 
@@ -221,16 +245,21 @@ def aggregate_cell(
     A GLM-5.3-Flash producer artifact must also pass the rules of its
     measurement protocol and records, because its retained timing can move
     together with its totals, which native validation alone accepts.
+    A row of a GLM-5.3-Flash producer cell carries the vLLM median policy with
+    its counts, state protocol and timing boundary. Readers pass ``median_policy=False``
+    for a historical single-sample publication verified against the collector checkpoint.
     """
 
     if not expected_attempt_id:
         raise ValueError(f"cannot aggregate {cell.cell_id} without an expected Collector attempt identity")
     _validate_backend_markers(cell, cell_dir)
+    plan_deployment = plan.deployment_profile(cell) if getattr(plan, "fpm_profile", None) is not None else None
     collection = validate_native_collection(
         cell,
         cell_dir / "raw",
         expected_plan_sha256=plan.sha256,
         expected_attempt_id=expected_attempt_id,
+        deployment=deployment or plan_deployment,
     )
     if collection.execution_mode == "native_graph_policy":
         # Raises on a malformed or contradictory record. A gap that the reader reports, such as prompt hashes that
@@ -239,10 +268,9 @@ def aggregate_cell(
     runtime_version = getattr(plan, "runtime_backend_version", None)
     if runtime_version is not None and collection.backend_version != runtime_version:
         raise ValueError("observed backend version differs from the frozen runtime version")
-    deployment = plan.deployment_profile(cell) if getattr(plan, "fpm_profile", None) is not None else None
     backend_version = (
-        deployment.backend_version
-        if deployment is not None
+        plan_deployment.backend_version
+        if plan_deployment is not None
         else getattr(plan, "backend_version", None) or collection.backend_version
     )
     capability = plan.capability
@@ -272,6 +300,35 @@ def aggregate_cell(
     if powered and not getattr(plan.options, "measure_power", False):
         # An image-level DYN_BENCHMARK_POWER_WINDOW_S bypasses the plan's identity.
         raise ValueError(f"{cell.cell_id} wrote power-window artifacts under a plan without measure_power")
+    if powered and collection.execution_mode == "native_graph_policy":
+        # The median label holds no power, and the power-window label names a single sample: neither is true here.
+        raise ValueError(
+            f"{cell.cell_id} wrote power-window artifacts for a GLM-5.3-Flash producer cell, and no FPM measurement "
+            "policy describes the rows of such a cell with a power window"
+        )
+    if median_policy and collection.execution_mode == "native_graph_policy":
+        # The loader of the published pair reads a median row only with a global warm-up of the integer 0, so a pair
+        # that holds another value, a boolean or a float among them, cannot be read at all.
+        warmup = plan.options.warmup_iterations
+        if type(warmup) is not int or warmup != 0:
+            raise ValueError(
+                f"{cell.cell_id} is a GLM-5.3-Flash producer cell under a plan with warmup_iterations={warmup!r}, and "
+                f"its rows carry measurement_policy={VLLM_PREFIX_SEED_MEDIAN_POLICY!r}, which requires a global "
+                "warm-up of the integer 0"
+            )
+        policy_columns = {
+            "warmup_repeats": GLM_PRODUCER_PROTOCOL["warmup_repeats"],
+            "measurement_repeats": GLM_PRODUCER_PROTOCOL["measurement_repeats"],
+            "measurement_policy": VLLM_PREFIX_SEED_MEDIAN_POLICY,
+            "state_protocol": GLM_PRODUCER_PROTOCOL["state_protocol"],
+            "timing_boundary": GLM_TIMING_BOUNDARY,
+        }
+    else:
+        policy_columns = {
+            "warmup_repeats": 0,
+            "measurement_repeats": 1,
+            "measurement_policy": POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
+        }
 
     def _kv_seed_regime(point: dict[str, Any], phase: str, native_regime: str | None) -> str:
         if phase == "prefill" and (not cell.execution_identity[0] or int(point["total_kv_read_tokens"]) == 0):
@@ -366,9 +423,7 @@ def aggregate_cell(
                 # Power travels with the selected latency sample; never combined across samples.
                 **({"power_w": measurement.power_w} if powered else {}),
                 "global_warmup_iterations": plan.options.warmup_iterations,
-                "warmup_repeats": 0,
-                "measurement_repeats": 1,
-                "measurement_policy": POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
+                **policy_columns,
                 "model_support_level": capability.support_level,
                 "model_template_id": capability.template_id,
                 "model_template_version": capability.template_version,
@@ -426,6 +481,45 @@ def published_dense_synthetic_cells(metadata: dict[str, Any]) -> frozenset[str]:
     ):
         raise ValueError("FPM KV seed classification requires distinct nonempty cell IDs")
     return frozenset(cells)
+
+
+def published_median_policy(metadata: dict[str, Any], cell: FPMCell, checkpoint_rows: dict[str, str] | None) -> bool:
+    """Only a pre-digest cell with independently sealed single-sample rows can use the historical label."""
+    return (
+        cell.glm_producer_digests is not None
+        or metadata.get("measurement_policy") != SINGLE_SAMPLE_MEASUREMENT_POLICY
+        or not checkpoint_rows
+        or checkpoint_rows.get(cell.cell_id) != metadata["cell_rows"][cell.cell_id]
+    )
+
+
+def _validate_median_publication(metadata: dict[str, Any], rows: list[dict[str, Any]], backend: str) -> None:
+    """Enforce the native median contract before accepting or republishing a sealed pair."""
+    policy = metadata.get("measurement_policy")
+    if not isinstance(policy, str) or policy not in _MEDIAN_PROTOCOLS:
+        row_policies = (row.get("measurement_policy") for row in rows)
+        if any(isinstance(label, str) and label in _MEDIAN_PROTOCOLS for label in row_policies):
+            raise ValueError("FPM median rows must match the sidecar measurement_policy")
+        return
+    expected_backend, protocol, boundary = _MEDIAN_PROTOCOLS[policy]
+    schema = metadata.get("schema_version")
+    if type(schema) is not int or schema != 7 or metadata.get("backend") != backend or backend != expected_backend:
+        raise ValueError(f"FPM median sidecar measurement_policy={policy!r} requires schema 7 and {expected_backend}")
+    repeats = {key: GLM_PRODUCER_PROTOCOL[key] for key in ("warmup_repeats", "measurement_repeats")}
+    for key, expected in repeats.items():
+        if type(metadata.get(key)) is not int or metadata[key] != expected:
+            raise ValueError(f"FPM median sidecar {key} must be the integer {expected}")
+    counts = {"global_warmup_iterations": 0, **repeats}
+    for row in rows:
+        if row.get("measurement_policy") != policy or row.get("backend") != backend:
+            raise ValueError("FPM median rows must match the sidecar measurement_policy and backend")
+        if row.get("kv_seed_regime") == "fake_fallback":
+            raise ValueError("FPM median rows cannot use fake_fallback KV state")
+        if row.get("state_protocol") != protocol or row.get("timing_boundary") != boundary:
+            raise ValueError(f"FPM median rows must match the state protocol and timing boundary of {policy!r}")
+        for key, expected in counts.items():
+            if type(row.get(key)) is not int or row[key] != expected:
+                raise ValueError(f"FPM median row {key} must be the integer {expected}")
 
 
 def _validate_kv_seed_classification(metadata: dict[str, Any], rows: list[dict[str, Any]]) -> None:
@@ -525,6 +619,7 @@ def validate_formal_database_commit(
             f"parquet={parquet.metadata.num_rows}, metadata={row_count!r}"
         )
     rows = parquet.read().to_pylist()
+    _validate_median_publication(payload, rows, plan.backend)
     if payload["schema_version"] == 8:
         _validate_power_rows(rows)
     _validate_kv_seed_classification(payload, rows)
@@ -545,6 +640,12 @@ def validate_formal_database_commit(
         selected = grouped.get(cell.cell_id, [])
         if not selected:
             raise ValueError(f"committed FPM database does not cover required cell {cell.cell_id}")
+        if (
+            plan.backend == "vllm"
+            and cell.glm_producer_digests is not None
+            and payload.get("measurement_policy") != VLLM_PREFIX_SEED_MEDIAN_POLICY
+        ):
+            raise ValueError(f"committed FPM measurement_policy differs from the GLM producer cell: {cell.cell_id}")
         expected_identity = {
             "model_path": plan.model_path,
             "system": plan.system,
@@ -803,6 +904,7 @@ def write_formal_database(
                 )
             _validate_power_schema(committed, table.schema)
             existing_rows = table.to_pylist()
+            _validate_median_publication(committed, existing_rows, plan.backend)
             if committed.get("schema_version") == 8:
                 _validate_power_rows(existing_rows)
             _validate_kv_seed_classification(committed, existing_rows)
@@ -829,19 +931,17 @@ def write_formal_database(
                     existing_identity,
                     incoming_identity,
                 )
+        policies = {row.get("measurement_policy") for row in [*merged, *rows]}
+        median = next((policy for policy in _MEDIAN_PROTOCOLS if policy in policies), None)
         if skipped_cells:
             skipped_set = set(skipped_cells)
             rows = [row for row in rows if row.get("cell_id") not in skipped_set]
-            if not rows:
-                logger.warning(
-                    "fpm_forward: every incoming cell is already published under a different run "
-                    "identity; database left unchanged"
-                )
-                return parquet_path, metadata_path, tuple(skipped_cells)
+            # A median collection also requires its reused cells to follow the same protocol.
+            if not median:
+                policies = {row.get("measurement_policy") for row in [*merged, *rows]}
         # Schema 8 binds every row to the power-window policy, so one pair
         # cannot hold power-window and latency-only rows. Refuse the merge
         # before anything is written; the existing pair stays as committed.
-        policies = {row.get("measurement_policy") for row in [*merged, *rows]}
         powered = POWER_WINDOW_MEASUREMENT_POLICY in policies
         if powered and policies != {POWER_WINDOW_MEASUREMENT_POLICY}:
             raise ValueError(
@@ -849,6 +949,19 @@ def write_formal_database(
                 f"row to carry measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}. Publish to a clean "
                 f"destination, or collect every cell with the same --fpm-measure-power setting: {parquet_path}"
             )
+        # The loader reads the measurement policy of the sidecar, and the median policy binds every row to it.
+        if median and policies != {median}:
+            raise ValueError(
+                "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
+                f"measurement_policy, and {median!r} binds every row. Publish to a clean "
+                f"destination: {parquet_path}"
+            )
+        if not rows:
+            logger.warning(
+                "fpm_forward: every incoming cell is already published under a different run "
+                "identity; database left unchanged"
+            )
+            return parquet_path, metadata_path, tuple(skipped_cells)
         if powered:
             for row in [*merged, *rows]:
                 row.setdefault("power_w", None)
@@ -900,9 +1013,11 @@ def write_formal_database(
                 "schema_name": "aic_fpm_forward_perf",
                 "schema_version": 8 if powered else 7,
                 "coordinate_system": "iteration_totals_balanced_v1",
-                "measurement_policy": POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY,
-                "warmup_repeats": 0,
-                "measurement_repeats": 1,
+                "measurement_policy": (
+                    median or (POWER_WINDOW_MEASUREMENT_POLICY if powered else SINGLE_SAMPLE_MEASUREMENT_POLICY)
+                ),
+                "warmup_repeats": GLM_PRODUCER_PROTOCOL["warmup_repeats"] if median else 0,
+                "measurement_repeats": GLM_PRODUCER_PROTOCOL["measurement_repeats"] if median else 1,
                 "row_count": len(merged),
                 "parquet_sha256": _sha256(temporary),
                 "source_plan_sha256": sorted({str(row["source_plan_sha256"]) for row in merged}),
@@ -915,6 +1030,7 @@ def write_formal_database(
                 "backend": plan.backend,
                 "backend_version": version,
             }
+            _validate_median_publication(metadata, merged, plan.backend)
             dense_cells = sorted(
                 {
                     row["cell_id"]

@@ -333,7 +333,7 @@ def verify_collection_runtime_bindings(request: SupportRequest, bindings: list[d
     from collector.fpm_forward.runtime_instrumentation import contained_file, read_json
     from collector.fpm_forward.runtime_observations import validate_observation_phase
 
-    from .runtime import _resource_values, prefix_caching_evidence, runtime_probe_manifest
+    from .runtime import _resource_values, as_saved_resources, prefix_caching_evidence, runtime_probe_manifest
 
     source = _source(request)
     verified = _plans(request, bindings, source)
@@ -404,11 +404,20 @@ def verify_collection_runtime_bindings(request: SupportRequest, bindings: list[d
                     raise ValueError("runtime hardware across phases differs from the accepted probe")
             # The accepted record holds the prefix-caching settings and state block sizes of the role's first
             # phase, and this record holds those of the bound phase. Both leave the whole-record comparison: the
-            # raw groups above compared the block sizes, and the settings compare per phase below.
-            expected, actual = _resource_values(source["resources"]), _resource_values(result["resources"])
+            # raw groups above compared the block sizes, and the settings compare per phase below. Both records
+            # compare in the fields of the saved probe resources, so a session saved before transfer_bytes_per_block
+            # existed is compared without it. The import of one phase takes the transfer bytes only from a phase with
+            # prefix caching, so a bound phase without prefix caching leaves them out. A bound phase with prefix
+            # caching compares them, also when its import holds none.
+            saved = manifest["observed_resources"]
+            expected = as_saved_resources(saved, _resource_values(source["resources"]))
+            actual = as_saved_resources(saved, _resource_values(result["resources"]))
+            prefix_caching_evidence(expected)
+            cold = prefix_caching_evidence(actual).get("enable_prefix_caching") is False
             for values in (expected, actual):
-                prefix_caching_evidence(values)
                 for group in values["cache_groups"]:
+                    if cold:
+                        group.pop("transfer_bytes_per_block", None)
                     if group["kind"] == "state":
                         group.pop("block_size_tokens")
             expected["runtime_memory"].pop("kv_cache_bytes")

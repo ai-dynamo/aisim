@@ -113,7 +113,7 @@ not create a duplicate ledger row.
 | Status | When used |
 |---|---|
 | `feasible` | Replay succeeded, required metrics were present, and budget gates passed. |
-| `infeasible` | A modeled constraint such as GPU budget, KV capacity, or strict aggregate SLA rejected the candidate. |
+| `infeasible` | A modeled constraint such as GPU budget, KV capacity, or strict aggregate SLA rejected the candidate, or the FPM profile of the candidate cannot run one of its engine settings. |
 | `unsupported` | The runner does not support the backend/topology pair. |
 | `timed_out` | Replay exceeded `max_eval_seconds`. It remains infeasible to the optimizer, but is distinct in results. |
 | `failed` | Materialization, runner execution, or the runner/result contract failed. |
@@ -122,6 +122,11 @@ not create a duplicate ledger row.
 Stable reason categories are `gpu_budget`, `kv_capacity`, `sla_constraint`, `load_constraint`, `backend_topology`, `runtime_timeout`,
 `candidate_materialization`, `replay_runtime`, `runner_contract`, `invalid_metrics`, `no_samples`,
 `parallel_projection`, `adapter_constraint`, `resource_limit`, and `unknown`.
+
+`backend_topology` marks an `unsupported` backend/topology pair. It also marks an `infeasible`
+candidate whose FPM profile cannot run one of its engine settings with grouped prefix caching, such
+as a GLM-5.3-Flash candidate whose `max_num_batched_tokens` is not a multiple of 4. The reason of
+such a candidate is `candidate engine settings infeasible:` and then the requirement that failed.
 
 ## Provenance
 

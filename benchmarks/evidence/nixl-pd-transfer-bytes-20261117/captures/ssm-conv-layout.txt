@@ -1,0 +1,6 @@
+INFO 11-16 16:53:13 1824387 [vllm.model_executor.layers.mamba.mamba_utils:38] VLLM_SSM_CONV_STATE_LAYOUT env detected. Setting SSM conv state layout to DS.
+INFO 11-16 16:53:16 2011154 [vllm.model_executor.layers.mamba.mamba_utils:38] VLLM_SSM_CONV_STATE_LAYOUT env detected. Setting SSM conv state layout to DS.
+INFO 11-16 17:04:16 1853119 [vllm.model_executor.layers.mamba.mamba_utils:38] VLLM_SSM_CONV_STATE_LAYOUT env detected. Setting SSM conv state layout to DS.
+INFO 11-16 17:04:15 2039090 [vllm.model_executor.layers.mamba.mamba_utils:38] VLLM_SSM_CONV_STATE_LAYOUT env detected. Setting SSM conv state layout to DS.
+INFO 11-16 17:08:22 1941596 [vllm.model_executor.layers.mamba.mamba_utils:38] VLLM_SSM_CONV_STATE_LAYOUT env detected. Setting SSM conv state layout to DS.
+INFO 11-16 17:08:22 2047822 [vllm.model_executor.layers.mamba.mamba_utils:38] VLLM_SSM_CONV_STATE_LAYOUT env detected. Setting SSM conv state layout to DS.

@@ -213,10 +213,20 @@ def _resolve_execution(command: list[str]):
     except _INPUT_ERRORS as error:
         parser.error(str(error))
     if args.smoke and args.limit is None:
-        # Native smoke defaults to one cell. Onboarding must exercise decode
-        # and every selected backend/precision cell, regardless of ordering.
+        # A direct smoke runs one cell of each collected phase. Onboarding must
+        # exercise every selected backend/precision cell too, regardless of ordering.
         args.limit = len(resolved[0].cells)
     return args, resolved
+
+
+def _report_dropped_points(plan) -> None:
+    """Show how many candidates a generated list had and how many points each rule dropped.
+
+    Onboarding sets no log handler.
+    """
+    dropped = plan.options.benchmark_points_dropped_json
+    if dropped is not None:
+        print(f"Point list: candidates and dropped points by phase and rule: {dropped}", file=sys.stderr)
 
 
 def _checkpoint_root(root: Path, checkpoint_dir: str | Path | None) -> Path:
@@ -310,7 +320,7 @@ def run_fpm(
         if request.fpm_profile is not None:
             # A prediction profile can be valid for historical timings while
             # its precision is incompatible with a new native campaign.
-            _resolve_execution(command)
+            _report_dropped_points(_resolve_execution(command)[1][0])
         print(shlex.join(command))
         return 0
     check_plan(request, root)
@@ -334,6 +344,7 @@ def run_fpm(
             collector_available = True
             args, resolved = _resolve_execution(command)
             frozen = resolved[0]
+            _report_dropped_points(frozen)
             if not smoke:
                 before = assess_readiness(request, root, selected_checkpoint, expected_plan=frozen)
                 recovery_only = resume and resume_without_workers(frozen, selected_checkpoint / "fpm_forward.json")

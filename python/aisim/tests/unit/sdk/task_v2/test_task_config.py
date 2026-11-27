@@ -9,6 +9,7 @@ prefix discipline, and the build_* helpers.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -1843,17 +1844,58 @@ def _build_fake_summary(
     return s
 
 
+@pytest.mark.parametrize(("backend", "map_only"), [("sglang", False), ("vllm", False), ("vllm", True)])
+@pytest.mark.parametrize("version", ["previous", "current"])
+def test_gemma_sweep_and_single_point_use_the_selected_release(tmp_path, version, backend, map_only):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = document["text_config"]
+    results = []
+    for shape in ("released", "explicit"):
+        directory = tmp_path / shape
+        directory.mkdir()
+        if shape == "explicit":
+            text["per_layer_config"] = {
+                str(i): {"num_key_value_heads": text["num_global_key_value_heads"], "head_dim": text["global_head_dim"]}
+                for i, kind in enumerate(text["layer_types"])
+                if kind == "full_attention"
+            }
+            if map_only:
+                del text["global_head_dim"], text["num_global_key_value_heads"]
+        (directory / "config.json").write_text(json.dumps(document))
+        task = Task(
+            model_path=str(directory),
+            system_name="gb300",
+            backend_name=backend,
+            backend_version=version,
+            serving_mode="agg",
+            database_mode="SOL",
+            isl=128,
+            osl=8,
+            ttft=2000,
+            tpot=1000,
+            pareto_sweep=False,
+            total_gpus=1,
+        )
+        rows = task.run()
+        point = task.run_single_agg(tp=1, pp=1, dp=1, moe_tp=1, moe_ep=1, batch_size=1)
+        assert not rows.empty and point["ttft"] > 0 and point["tpot"] > 0
+        results.append(
+            (rows[["ttft", "tpot", "memory"]].values.tolist(), point["ttft"], point["tpot"], point["memory"])
+        )
+    assert results[0] == results[1]
+
+
 def test_run_single_agg_calls_predict_agg_worker_with_fixed_point(monkeypatch):
     """run_single_agg builds ModelConfig with given dims and calls predict_agg_worker once."""
-    from types import SimpleNamespace
-
     from aisim.sdk import predict
 
     captured: dict = {}
     loaded_spec = {"gpu": {"sm_version": 90}}
 
     def fake_get_database(*a, **kw):
-        return SimpleNamespace(system_spec=loaded_spec)
+        return SimpleNamespace(version="1.3.0", system_spec=loaded_spec)
 
     def fake_get_backend(name, system=None, system_spec=None):
         from unittest.mock import MagicMock
@@ -1861,7 +1903,8 @@ def test_run_single_agg_calls_predict_agg_worker_with_fixed_point(monkeypatch):
         captured["system_spec"] = system_spec
         return MagicMock(name=f"backend-{name}")
 
-    def fake_get_model(model_path, model_config, backend_name):
+    def fake_get_model(model_path, model_config, backend_name, database):
+        assert database.version == "1.3.0"
         captured["model_config"] = model_config
         from unittest.mock import MagicMock
 
@@ -2007,14 +2050,14 @@ def test_run_single_agg_raises_on_oom(monkeypatch):
     from aisim.sdk import predict
 
     def fake_get_database(*a, **kw):
-        return "db"
+        return SimpleNamespace(version="1.3.0")
 
     def fake_get_backend(name, system=None, system_spec=None):
         from unittest.mock import MagicMock
 
         return MagicMock()
 
-    def fake_get_model(model_path, model_config, backend_name):
+    def fake_get_model(model_path, model_config, backend_name, database):
         from unittest.mock import MagicMock
 
         return MagicMock()
@@ -2039,17 +2082,20 @@ def test_run_single_disagg_invokes_both_phases_and_rate_matches(monkeypatch):
 
     call_roles: list[str] = []
 
-    def fake_get_database(*a, **kw):
-        return "db"
+    model_versions = []
+
+    def fake_get_database(system, backend, version, **kw):
+        return SimpleNamespace(version={"previous": "1.3.0", "current": "1.4.0"}[version])
 
     def fake_get_backend(name, system=None, system_spec=None):
         from unittest.mock import MagicMock
 
         return MagicMock()
 
-    def fake_get_model(model_path, model_config, backend_name):
+    def fake_get_model(model_path, model_config, backend_name, database):
         from unittest.mock import MagicMock
 
+        model_versions.append(database.version)
         return MagicMock()
 
     # Build per-role summary dicts that satisfy _rate_match_dict's schema.
@@ -2103,8 +2149,10 @@ def test_run_single_disagg_invokes_both_phases_and_rate_matches(monkeypatch):
         serving_mode="disagg",
         prefill_model_path="deepseek-ai/DeepSeek-V3",
         prefill_system_name="h200_sxm",
+        prefill_backend_version="previous",
         decode_model_path="deepseek-ai/DeepSeek-V3",
         decode_system_name="h200_sxm",
+        decode_backend_version="current",
     )
     row = t.run_single_disagg(
         prefill_tp=4,
@@ -2117,6 +2165,7 @@ def test_run_single_disagg_invokes_both_phases_and_rate_matches(monkeypatch):
 
     # Both phases invoked
     assert call_roles == ["prefill", "decode"]
+    assert model_versions == ["1.3.0", "1.4.0"]
     # Rate-matched row has (p)/(d) prefixed columns plus encoder placeholders
     assert "(p)workers" in row and "(d)workers" in row
     assert row["(p)workers"] == 2

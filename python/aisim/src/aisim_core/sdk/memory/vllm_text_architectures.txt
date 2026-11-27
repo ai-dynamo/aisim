@@ -1,0 +1,947 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright the HuggingFace Team
+# SPDX-License-Identifier: Apache-2.0
+# Each row lists the source, vLLM minor releases, class suffix (- for none), and class prefixes.
+# vllm entries are stock registrations. hf entries can stop the Transformers lookup before native dispatch.
+# multimodal entries identify registered native and Transformers multimodal implementations.
+# other_multimodal entries are additional multimodal names from v0.7.0–v0.30.0 and v0.34.0, for unrecorded releases.
+# https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/registry.py
+# hf_incompatible entries exist in all eligible wheels, shadow AutoModel and decline the Transformers backend.
+# config entries are AutoConfig model types available in every eligible Transformers wheel.
+# Release-specific wheel inventories and source attribution are described in THIRD_PARTY_NOTICES.md.
+vllm 31/32 Model Medusa
+vllm 31/32/33 - ColQwen3 ColQwen3_5 Exaone4_5_MTP ExaoneMoeMTP HF_ColBERT HfMoondream InternS2MobiusMTP
+vllm 31/32/33 - Llama_Nemotron_Nano_VL MiniCPMO MiniCPMV MiniMaxM3MTP NVLM_D NemotronH_Nano_Omni_Reasoning_V3
+vllm 31/32/33 - NemotronH_Nano_VL_V2 NemotronH_Omni_Reasoning_V3 NemotronH_Super_Omni_Reasoning_V3 Ovis Ovis2_5
+vllm 31/32/33 - Qwen3ASRRealtimeGeneration Qwen3NextMTP Qwen3_5MTP Qwen3_5MoeMTP Qwen4ExpMTP Step3p5MTP Terratorch
+vllm 31/32/33 - VoxtralRealtimeGeneration
+vllm 31/32/33 ForActionPrediction OpenVLA
+vllm 31/32/33 ForBlockDiffusion DiffusionGemma
+vllm 31/32/33 ForCausalLM AXK1 Afmoe Apertus Arcee BailingMoe BailingMoeV2 BailingMoeV2_5 BailingMoeV3 Bloom Cohere
+vllm 31/32/33 ForCausalLM Cohere2 Cohere2Moe Cwm DFlashLaguna Dbrx DeciLM Deepseek DeepseekOCR DeepseekOCR2
+vllm 31/32/33 ForCausalLM DeepseekV2 DeepseekV3 DeepseekV32 DeepseekV4 DeepseekV41 DeepseekVLV2 Dots3Note DotsOCR
+vllm 31/32/33 ForCausalLM Eagle3DeepseekV2 Eagle3DeepseekV3 Eagle3Llama Eagle3MiniMaxM2 Eagle3Qwen2_5vl Eagle3Qwen3
+vllm 31/32/33 ForCausalLM Eagle3Qwen3vl EagleCohere EagleLlama EagleLlama4 EagleMiniCPM EagleMistral
+vllm 31/32/33 ForCausalLM EagleMistralLarge3 Ernie4_5 Ernie4_5_Moe Exaone Exaone4 ExaoneMoe Falcon FalconH1
+vllm 31/32/33 ForCausalLM FalconMamba FlexOlmo GLM4V GPTBigCode GPTJ GPTNeoX Gemma Gemma2 Gemma3 Gemma3n Gemma4 Glm
+vllm 31/32/33 ForCausalLM Glm4 Glm4Moe Glm4MoeLite Glm5Next GlmMoeDsa GptOss Granite GraniteMoe GraniteMoeHybrid
+vllm 31/32/33 ForCausalLM GraniteMoeSWA GraniteMoeShared GraniteSWA HCXVisionV2 HYV3 HYV4 HrmText HunYuanDenseV1
+vllm 31/32/33 ForCausalLM HunYuanMoEV1 HyperCLOVAX IQuestCoder IQuestLoopCoder Inkling InternLM2 InternLM3 Jais2
+vllm 31/32/33 ForCausalLM Jamba K2Horizon KimiLinear LLaMA Laguna Lfm2 Lfm2Moe Llama Llama4 LongcatFlash
+vllm 31/32/33 ForCausalLM LongcatFlashNgram Mamba Mamba2 Mellum MiMo MiMoV2 MiMoV2Flash MiMoV2Omni MiniCPM MiniCPM3
+vllm 31/32/33 ForCausalLM MiniMaxM2 MiniMaxM3Sparse Ministral3 Mistral MistralLarge3 Mixtral Molmo Moondream3
+vllm 31/32/33 ForCausalLM MoonshotKimia MuseGlimmer Nanbeige Nemotron NemotronH NemotronHPuzzle OPT Olmo Olmo2
+vllm 31/32/33 ForCausalLM Olmo3 OlmoHybrid Olmoe Orion Ovis2_6 Ovis2_6_Moe PanguEmbedded PanguProMoEV2
+vllm 31/32/33 ForCausalLM PanguUltraMoE Param2MoE PeagleLlama PeagleQwen3 Phi Phi3 Phi3V Phi4MM PhiMoE Plamo3 Qwen2
+vllm 31/32/33 ForCausalLM Qwen2Moe Qwen3 Qwen3Moe Qwen3Next Qwen3_5 Qwen3_5Moe Qwen4Exp Rnj1 SarvamMLA SarvamMoE
+vllm 31/32/33 ForCausalLM SeedOss SmolLM3 Solar StableLm Starcoder2 Step1 Step3Text Step3p5 TeleChat2 TeleChat3
+vllm 31/32/33 ForCausalLM TeleFLM Transformers TransformersMoE TransformersMultiModal TransformersMultiModalMoE
+vllm 31/32/33 ForCausalLM UnlimitedOCR VaultGemma Zamba2
+vllm 31/32/33 ForCausalLMEagle3 Llama
+vllm 31/32/33 ForCausalLMV Phi4
+vllm 31/32/33 ForConditionalGeneration Aria AudioFlamingo3 Bagel BailingMoeV3VL Bee Blip2 ChatGLM Cohere2Vision
+vllm 31/32/33 ForConditionalGeneration CohereAsr CohereCompass Cosmos3 Cosmos3Edge DeepseekV4 Eagle2_5_VL Emu3
+vllm 31/32/33 ForConditionalGeneration Ernie4_5_VLMoe Exaone4_5_ FireRedASR2 FunASR FunAudioChat Gemma3 Gemma3n
+vllm 31/32/33 ForConditionalGeneration Gemma4 Gemma4Unified Glm4v Glm4vMoe Glm5Next GlmAsr GlmOcr Granite4Vision
+vllm 31/32/33 ForConditionalGeneration GraniteSpeech GraniteSpeechPlus HunYuanVL Idefics3 Inkling InternS1
+vllm 31/32/33 ForConditionalGeneration InternS1Pro InternS2Mobius InternS2Preview InternVL Isaac KananaV Keye
+vllm 31/32/33 ForConditionalGeneration KeyeVL1_5 KimiK25 KimiK3 KimiVL Lfm2Vl LightOnOCR Llama4 Llava LlavaNext
+vllm 31/32/33 ForConditionalGeneration LlavaNextVideo LlavaOnevision LlavaOnevision2 MiniCPMV4_6 MiniMaxM3Sparse
+vllm 31/32/33 ForConditionalGeneration Mistral3 Molmo2 MossTranscribeDiarize MuseGlimmer NemotronParse OpenCUA
+vllm 31/32/33 ForConditionalGeneration OpenPanguVL PaddleOCRVL PaliGemma Pixtral QianfanOCR Qwen2Audio Qwen2VL
+vllm 31/32/33 ForConditionalGeneration Qwen2_5Omni Qwen2_5_VL Qwen3ASR Qwen3OmniMoe Qwen3VL Qwen3VLMoe Qwen3_5
+vllm 31/32/33 ForConditionalGeneration Qwen3_5Moe Qwen4Exp R SmolVLM Step3VL Step3p7 StepVL VibeVoiceAsr Voxtral
+vllm 31/32/33 ForConditionalGeneration Whisper
+vllm 31/32/33 ForMaskedLM Bert Roberta
+vllm 31/32/33 ForProcessRewardModel Qwen2
+vllm 31/32/33 ForRanking Jina JinaVL
+vllm 31/32/33 ForRetrieval ColModernVBert ColPali
+vllm 31/32/33 ForRewardModel InternLM2 Qwen2
+vllm 31/32/33 ForSequenceClassification Bert GPT2 GteNew Jamba LlamaBidirectional LlamaNemotronVL ModernBert
+vllm 31/32/33 ForSequenceClassification Roberta Transformers TransformersMoE TransformersMultiModal XLMRoberta
+vllm 31/32/33 ForTokenClassification Bert ModernBert OpenAIPrivacyFilter Qwen3ASRForcedAligner Roberta XLMRoberta
+vllm 31/32/33 Model BailingMoeV25MTP BailingMoeV3MTP Bert BertSpladeSparseEmbedding BgeM3Embedding CLIP ChatGLM
+vllm 31/32/33 Model ColBERTJinaRoberta ColBERTLfm2 ColBERTModernBert DFlash2Draft DFlashDraft
+vllm 31/32/33 Model DFlashMuseGlimmerAssistant DSparkDraft DSparkV41Draft DeepSeekMTP DeepSeekV4MTP DeepseekV32MTP
+vllm 31/32/33 Model DeepseekV3Bidirectional Dots3NoteMTP EagleDeepSeekMTP ErnieMTP ExtractHiddenStates GPT2LMHead
+vllm 31/32/33 Model Gemma2 Gemma3Text Gemma4DSpark Gemma4MTP Glm4MoeLiteMTP Glm4MoeMTP Glm5NextMTP GlmOcrMTP Gte
+vllm 31/32/33 Model GteNew H2OVLChat HYV3MTP HYV4MTP InklingMTP InternVLChat JinaEmbeddingsV5 K3DSpark KimiK3MTP
+vllm 31/32/33 Model LiLiCorrDraft Llama LlamaBidirectional LlamaNemotronVL LongCatFlashMTP MiDashengLM MiMoMTP
+vllm 31/32/33 Model MiMoV2MTP MiMoV2OmniMTP Mistral ModernBert MossAudio MuseGlimmerAssistant NemotronHMTP
+vllm 31/32/33 Model NomicBert OpenPanguMTP OpsColQwen3 PEagleDraft Qwen2 Qwen2_5Omni Qwen3DSpark Qwen3OmniDSpark
+vllm 31/32/33 Model Qwen3VLNemotronEmbed Roberta Siglip SkyworkR1VChat TransformersEmbedding
+vllm 31/32/33 Model TransformersMoEEmbedding TransformersMultiModalEmbedding Ultravox VoyageQwen3BidirectionalEmbed
+vllm 31/32/33 Model XLMRoberta
+vllm 32/33 ForCausalLM ExaoneMoE
+vllm 32/33 ForConditionalGeneration MiniCPMV4_7
+vllm 32/33 ForJointSchema ClefOmni
+vllm 32/33 Model EmbeddingGemma2
+vllm 33 - Alpamayo2Super Step5MTP
+vllm 33 ForCausalLM AliceAI Beam DomynEdge Dory Flint Kolibri1 RadioMBartPrefix Step5
+vllm 33 ForConditionalGeneration MiniCPMOcr MuseSpark Step5
+vllm 33 ForJointSchema ClefFlash
+vllm 33 ForMTP Transformers TransformersMoE
+vllm 33 ForRetrieval ColUltraVBert
+vllm 33 ForSequenceClassification D3
+vllm 33 Model DFlash2BeamDraft DFlashQwen3XPress Lfm2Bidirectional ModernVBert MuseSparkDSpark ParseAuxMTP
+vllm 33 Model Qwen3XPress
+multimodal 31/32/33 - ColQwen3 ColQwen3_5 HfMoondream Llama_Nemotron_Nano_VL MiniCPMO MiniCPMV NVLM_D
+multimodal 31/32/33 - NemotronH_Nano_Omni_Reasoning_V3 NemotronH_Nano_VL_V2 NemotronH_Omni_Reasoning_V3
+multimodal 31/32/33 - NemotronH_Super_Omni_Reasoning_V3 Ovis Ovis2_5 Qwen3ASRRealtimeGeneration Terratorch
+multimodal 31/32/33 - VoxtralRealtimeGeneration
+multimodal 31/32/33 ForActionPrediction OpenVLA
+multimodal 31/32/33 ForBlockDiffusion DiffusionGemma
+multimodal 31/32/33 ForCausalLM DeepseekOCR DeepseekOCR2 DeepseekV41 DeepseekVLV2 Dots3Note DotsOCR GLM4V
+multimodal 31/32/33 ForCausalLM HCXVisionV2 MiMoV2Omni Molmo Moondream3 MoonshotKimia MuseGlimmer Ovis2_6
+multimodal 31/32/33 ForCausalLM Ovis2_6_Moe Phi3V Phi4MM TransformersMultiModal TransformersMultiModalMoE
+multimodal 31/32/33 ForCausalLM UnlimitedOCR
+multimodal 31/32/33 ForCausalLMV Phi4
+multimodal 31/32/33 ForConditionalGeneration Aria AudioFlamingo3 Bagel BailingMoeV3VL Bee Blip2 Cohere2Vision
+multimodal 31/32/33 ForConditionalGeneration CohereAsr CohereCompass Cosmos3 Cosmos3Edge DeepseekV4 Eagle2_5_VL
+multimodal 31/32/33 ForConditionalGeneration Emu3 Ernie4_5_VLMoe Exaone4_5_ FireRedASR2 FunASR FunAudioChat
+multimodal 31/32/33 ForConditionalGeneration Gemma3 Gemma3n Gemma4 Gemma4Unified Glm4v Glm4vMoe Glm5Next GlmAsr
+multimodal 31/32/33 ForConditionalGeneration GlmOcr Granite4Vision GraniteSpeech GraniteSpeechPlus HunYuanVL
+multimodal 31/32/33 ForConditionalGeneration Idefics3 Inkling InternS1 InternS1Pro InternS2Mobius
+multimodal 31/32/33 ForConditionalGeneration InternS2Preview InternVL Isaac KananaV Keye KeyeVL1_5 KimiK25
+multimodal 31/32/33 ForConditionalGeneration KimiK3 KimiVL Lfm2Vl LightOnOCR Llama4 Llava LlavaNext
+multimodal 31/32/33 ForConditionalGeneration LlavaNextVideo LlavaOnevision LlavaOnevision2 MiniCPMV4_6
+multimodal 31/32/33 ForConditionalGeneration MiniMaxM3Sparse Mistral3 Molmo2 MossTranscribeDiarize MuseGlimmer
+multimodal 31/32/33 ForConditionalGeneration NemotronParse OpenCUA OpenPanguVL PaddleOCRVL PaliGemma Pixtral
+multimodal 31/32/33 ForConditionalGeneration QianfanOCR Qwen2Audio Qwen2VL Qwen2_5Omni Qwen2_5_VL Qwen3ASR
+multimodal 31/32/33 ForConditionalGeneration Qwen3OmniMoe Qwen3VL Qwen3VLMoe Qwen3_5 Qwen3_5Moe Qwen4Exp R
+multimodal 31/32/33 ForConditionalGeneration SmolVLM Step3VL Step3p7 StepVL VibeVoiceAsr Voxtral Whisper
+multimodal 31/32/33 ForRanking JinaVL
+multimodal 31/32/33 ForRetrieval ColModernVBert ColPali
+multimodal 31/32/33 ForSequenceClassification LlamaNemotronVL TransformersMultiModal
+multimodal 31/32/33 ForTokenClassification Qwen3ASRForcedAligner
+multimodal 31/32/33 Model CLIP H2OVLChat InternVLChat LlamaNemotronVL MiDashengLM MossAudio OpsColQwen3
+multimodal 31/32/33 Model Qwen2_5Omni Qwen3VLNemotronEmbed Siglip SkyworkR1VChat TransformersMultiModalEmbedding
+multimodal 31/32/33 Model Ultravox
+multimodal 32/33 ForConditionalGeneration MiniCPMV4_7
+multimodal 32/33 ForJointSchema ClefOmni
+multimodal 32/33 Model EmbeddingGemma2
+multimodal 33 - Alpamayo2Super
+multimodal 33 ForCausalLM RadioMBartPrefix
+multimodal 33 ForConditionalGeneration MiniCPMOcr MuseSpark Step5
+multimodal 33 ForJointSchema ClefFlash
+multimodal 33 ForRetrieval ColUltraVBert
+multimodal 33 Model ModernVBert
+other_multimodal * - Cheers VoxtralStreamingGeneration
+other_multimodal * ForCausalLM Fuyu Phi4Multimodal
+other_multimodal * ForConditionalGeneration AyaVision Canary Chameleon ChatGLM Cheers FireRedLID Florence2
+other_multimodal * ForConditionalGeneration KimiK31 Lfm3Audio Lfm3Vl Mantis MingV3ASR MiniMaxVL01 Mllama
+other_multimodal * ForConditionalGeneration MusicFlamingo Nemotron3_5Transcribe QwenVL Tarsier Tarsier2
+other_multimodal * Model ChatGLM QWenLMHead
+hf 31/32 Model ModernVBert
+hf_incompatible 31/32/33 - FastSpeech2ConformerHifiGan FastSpeech2ConformerWithHifiGan FlavaImageCodebook
+hf_incompatible 31/32/33 - ReformerModelWithLMHead SLANeXtSLAHead SLANetSLAHead SpeechT5HifiGan
+config 31/32/33 - afmoe aimv2 aimv2_text_model aimv2_vision_model albert align align_text_model align_vision_model
+config 31/32/33 - altclip altclip_text_model altclip_vision_model apertus arcee aria aria_text
+config 31/32/33 - audio-spectrogram-transformer audioflamingo3 audioflamingo3_encoder autoformer aya_vision bamba
+config 31/32/33 - bark bart beit bert bert-generation big_bird bigbird_pegasus biogpt bit bitnet blenderbot
+config 31/32/33 - blenderbot-small blip blip-2 blip_2_qformer blip_2_vision_model blip_text_model blip_vision_model
+config 31/32/33 - bloom blt blt_global_transformer blt_local_decoder blt_local_encoder blt_patcher bridgetower
+config 31/32/33 - bridgetower_text_model bridgetower_vision_model bros camembert canine chameleon chameleon_vqgan
+config 31/32/33 - chinese_clip chinese_clip_text_model chinese_clip_vision_model chmv2 clap clap_audio_model
+config 31/32/33 - clap_text_model clip clip_text_model clip_vision_model clipseg clipseg_text_model
+config 31/32/33 - clipseg_vision_model clvp clvp_decoder clvp_encoder codegen cohere cohere2 cohere2_moe
+config 31/32/33 - cohere2_vision cohere_asr colmodernvbert colpali colqwen2 conditional_detr convbert convnext
+config 31/32/33 - convnextv2 cpmant csm csm_depth_decoder_model ctrl cvt cwm d_fine dab-detr dac data2vec-audio
+config 31/32/33 - data2vec-text data2vec-vision dbrx deberta deberta-v2 decision_transformer deepseek_ocr2
+config 31/32/33 - deepseek_ocr2_encoder deepseek_ocr2_sam_vision_model deepseek_ocr2_text deepseek_ocr2_vision
+config 31/32/33 - deepseek_v2 deepseek_v3 deepseek_v4 deepseek_vl deepseek_vl_hybrid deformable_detr deimv2 deit
+config 31/32/33 - depth_anything depth_pro detr dia dia_decoder dia_encoder diffllama dinat dinov2
+config 31/32/33 - dinov2_with_registers dinov3_convnext dinov3_vit distilbert doge donut-swin dots1 dpr dpt edgetam
+config 31/32/33 - edgetam_video edgetam_vision_model efficientloftr efficientnet electra emu3 emu3_text_model
+config 31/32/33 - emu3_vqgan encodec encoder-decoder eomt eomt_dinov3 ernie ernie4_5 ernie4_5_moe ernie4_5_vl_moe
+config 31/32/33 - ernie4_5_vl_moe_text ernie4_5_vl_moe_vision esm eurobert evolla exaone4 exaone4_5
+config 31/32/33 - exaone4_5_vision exaone_moe falcon falcon_h1 falcon_mamba fast_vlm fastspeech2_conformer
+config 31/32/33 - fastspeech2_conformer_hifigan fastspeech2_conformer_with_hifigan flaubert flava flava_image_model
+config 31/32/33 - flava_multimodal_model flava_text_model flex_olmo florence2 florence_vision fnet focalnet fsmt
+config 31/32/33 - funnel fuyu gemma gemma2 gemma3 gemma3_text gemma3n gemma3n_audio gemma3n_text gemma3n_vision
+config 31/32/33 - gemma4 gemma4_assistant gemma4_audio gemma4_text gemma4_unified gemma4_unified_assistant
+config 31/32/33 - gemma4_unified_audio gemma4_unified_text gemma4_unified_vision gemma4_vision git git_vision_model
+config 31/32/33 - glm glm4 glm46v glm4_moe glm4_moe_lite glm4v glm4v_moe glm4v_moe_text glm4v_moe_vision glm4v_text
+config 31/32/33 - glm4v_vision glm_image glm_image_text glm_image_vision glm_image_vqmodel glm_moe_dsa glm_ocr
+config 31/32/33 - glm_ocr_text glm_ocr_vision glmasr glmasr_encoder glmga glpn got_ocr2 gpt-sw3 gpt2 gpt_bigcode
+config 31/32/33 - gpt_neo gpt_neox gpt_neox_japanese gpt_oss gptj granite granite4_vision granite4_vision_text
+config 31/32/33 - granite_speech granite_speech_encoder granite_speech_plus granite_speech_plus_encoder granitemoe
+config 31/32/33 - granitemoehybrid granitemoeshared grounding-dino groupvit groupvit_text_model
+config 31/32/33 - groupvit_vision_model helium hgnet_v2 hiera higgs_audio_v2 higgs_audio_v2_tokenizer hrm_text
+config 31/32/33 - hubert hunyuan_v1_dense hunyuan_v1_moe hy_v3 hyperclovax ibert idefics idefics2
+config 31/32/33 - idefics2_perceiver idefics2_vision idefics3 idefics3_vision idefics_perciever idefics_vision
+config 31/32/33 - ijepa imagegpt informer instructblip instructblip_qformer instructblip_vision_model
+config 31/32/33 - instructblipvideo instructblipvideo_qformer instructblipvideo_vision_model internvl
+config 31/32/33 - internvl_vision jais2 jamba janus janus_vision_model janus_vqgan jetmoe jina_embeddings_v3
+config 31/32/33 - kosmos-2 kosmos-2.5 kosmos_2_5_text_model kosmos_2_5_vision_model kosmos_2_text_model
+config 31/32/33 - kosmos_2_vision_model kyutai_speech_to_text laguna lasr_ctc lasr_encoder layoutlm layoutlmv2
+config 31/32/33 - layoutlmv3 layoutxlm led levit lfm2 lfm2_moe lfm2_vl lightglue lighton_ocr lilt llama llama4
+config 31/32/33 - llama4_text llama4_vision_model llava llava_next llava_next_video llava_onevision longcat_flash
+config 31/32/33 - longformer longt5 luke lw_detr lw_detr_vit lxmert m2m_100 mamba mamba2 marian markuplm
+config 31/32/33 - mask2former maskformer maskformer-swin mbart megatron-bert mellum metaclip_2
+config 31/32/33 - metaclip_2_text_model metaclip_2_vision_model mgp-str mimi minicpmv4_6 minicpmv4_6_vision minimax
+config 31/32/33 - minimax_m2 ministral ministral3 mistral mistral3 mistral4 mixtral mlcd mlcd_vision_model mllama
+config 31/32/33 - mllama_text_model mllama_vision_model mm-grounding-dino mobilebert mobilenet_v1 mobilenet_v2
+config 31/32/33 - mobilevit mobilevitv2 modernbert modernbert-decoder modernvbert moonshine moonshine_streaming
+config 31/32/33 - moonshine_streaming_encoder moshi moshi_depth mpnet mpt mra mt5 musicflamingo musicgen
+config 31/32/33 - musicgen_decoder musicgen_melody musicgen_melody_decoder mvp nanochat nemotron nemotron_h
+config 31/32/33 - nllb-moe nomic_bert nougat nystromformer olmo olmo2 olmo3 olmo_hybrid olmoe omdet-turbo oneformer
+config 31/32/33 - openai-gpt openai_privacy_filter opt ovis2 owlv2 owlv2_text_model owlv2_vision_model owlvit
+config 31/32/33 - owlvit_text_model owlvit_vision_model paddleocr_vl paddleocr_vl_text paddleocr_vl_vision
+config 31/32/33 - paligemma parakeet_ctc parakeet_encoder parakeet_tdt patchtsmixer patchtst pe_audio
+config 31/32/33 - pe_audio_encoder pe_audio_video pe_audio_video_encoder pe_video pe_video_encoder pegasus
+config 31/32/33 - pegasus_x perceiver perception_lm persimmon phi phi3 phi4_multimodal phi4_multimodal_audio
+config 31/32/33 - phi4_multimodal_vision phimoe pi0 pix2struct pix2struct_text_model pix2struct_vision_model pixio
+config 31/32/33 - pixtral plbart poolformer pop2piano pp_chart2table pp_doclayout_v2 pp_doclayout_v3 pp_formulanet
+config 31/32/33 - pp_lcnet pp_lcnet_v3 pp_lcnet_v4 pp_ocrv5_mobile_det pp_ocrv5_mobile_rec pp_ocrv5_server_det
+config 31/32/33 - pp_ocrv5_server_rec pp_ocrv6_medium_det pp_ocrv6_small_det pp_ocrv6_small_rec pp_ocrv6_tiny_rec
+config 31/32/33 - prompt_depth_anything prophetnet pvt pvt_v2 qianfan_ocr qianfan_ocr_vision qwen2 qwen2_5_omni
+config 31/32/33 - qwen2_5_omni_audio_encoder qwen2_5_omni_bigvgan qwen2_5_omni_dit qwen2_5_omni_talker
+config 31/32/33 - qwen2_5_omni_text qwen2_5_omni_thinker qwen2_5_omni_token2wav qwen2_5_omni_vision_encoder
+config 31/32/33 - qwen2_5_vl qwen2_5_vl_text qwen2_5_vl_vision qwen2_audio qwen2_audio_encoder qwen2_moe qwen2_vl
+config 31/32/33 - qwen2_vl_text qwen2_vl_vision qwen3 qwen3_5 qwen3_5_moe qwen3_5_moe_text qwen3_5_moe_vision
+config 31/32/33 - qwen3_5_text qwen3_5_vision qwen3_moe qwen3_next qwen3_omni_moe qwen3_omni_moe_audio_encoder
+config 31/32/33 - qwen3_omni_moe_talker_code_predictor qwen3_omni_moe_talker_text qwen3_omni_moe_text
+config 31/32/33 - qwen3_omni_moe_thinker qwen3_omni_moe_vision_encoder qwen3_vl qwen3_vl_moe qwen3_vl_moe_text
+config 31/32/33 - qwen3_vl_moe_vision qwen3_vl_text qwen3_vl_vision rag recurrent_gemma reformer regnet rembert
+config 31/32/33 - resnet rf_detr rf_detr_dinov2 roberta roberta-prelayernorm roc_bert roformer rt_detr
+config 31/32/33 - rt_detr_resnet rt_detr_v2 rwkv sam sam2 sam2_hiera_det_model sam2_video sam2_vision_model sam3
+config 31/32/33 - sam3_detr_decoder sam3_detr_encoder sam3_geometry_encoder sam3_lite_text
+config 31/32/33 - sam3_lite_text_detr_decoder sam3_lite_text_detr_encoder sam3_lite_text_geometry_encoder
+config 31/32/33 - sam3_lite_text_mask_decoder sam3_lite_text_text_model sam3_mask_decoder sam3_tracker
+config 31/32/33 - sam3_tracker_video sam3_video sam3_vision_model sam3_vit_model sam_hq sam_hq_vision_model
+config 31/32/33 - sam_vision_model sapiens2 sapiens2_head seamless_m4t seamless_m4t_v2 seed_oss segformer seggpt
+config 31/32/33 - sew sew-d shieldgemma2 siglip siglip2 siglip2_text_model siglip2_vision_model siglip_text_model
+config 31/32/33 - siglip_vision_model slanet slanext smollm3 smolvlm smolvlm_vision solar_open
+config 31/32/33 - speech-encoder-decoder speech_to_text speecht5 speecht5_hifigan splinter squeezebert stablelm
+config 31/32/33 - starcoder2 superglue superpoint swiftformer swin swin2sr swinv2 switch_transformers t5
+config 31/32/33 - t5_gemma_module t5gemma t5gemma2 t5gemma2_decoder t5gemma2_encoder t5gemma2_text
+config 31/32/33 - table-transformer tapas textnet time_series_transformer timesfm timesfm2_5 timesformer
+config 31/32/33 - timm_backbone timm_wrapper trocr tvp udop umt5 unispeech unispeech-sat univnet upernet uvdoc
+config 31/32/33 - uvdoc_backbone vaultgemma vibevoice_acoustic_tokenizer vibevoice_acoustic_tokenizer_decoder
+config 31/32/33 - vibevoice_acoustic_tokenizer_encoder vibevoice_asr video_llama_3 video_llama_3_vision video_llava
+config 31/32/33 - videomae videomt vilt vipllava vision-encoder-decoder vision-text-dual-encoder visual_bert vit
+config 31/32/33 - vit_mae vit_msn vitdet vitmatte vitpose vitpose_backbone vits vivit vjepa2 voxtral
+config 31/32/33 - voxtral_encoder voxtral_realtime voxtral_realtime_encoder voxtral_realtime_text wav2vec2
+config 31/32/33 - wav2vec2-bert wav2vec2-conformer wavlm whisper xclip xclip_text_model xclip_vision_model xcodec
+config 31/32/33 - xglm xlm xlm-roberta xlm-roberta-xl xlnet xlstm xmod yolos yoso youtu zamba zamba2 zoedepth
+hf 31/32/33 - Adafactor AddedToken AriaImageProcessorPil AsyncTextIteratorStreamer AttentionInterface
+hf 31/32/33 - AttentionMaskInterface AudioKwargs BatchEncoding BatchFeature BeitImageProcessorPil BertLayer
+hf 31/32/33 - BertTokenizerLegacy BigBirdLayer BitImageProcessorPil Blip2TextModelWithProjection
+hf 31/32/33 - Blip2VisionModelWithProjection BlipImageProcessorPil BltPatcher BridgeTowerImageProcessorPil
+hf 31/32/33 - CLIPImageProcessorPil CLIPTextModelWithProjection CLIPVisionModelWithProjection CONFIG_MAPPING
+hf 31/32/33 - CONFIG_NAME Cache CanineLayer ChameleonImageProcessorPil ChameleonVQVAE CharSpan
+hf 31/32/33 - ChineseCLIPImageProcessorPil ClapAudioModelWithProjection ClapTextModelWithProjection
+hf 31/32/33 - CohereCompassImageProcessorPil ConditionalDetrImageProcessorPil Conv1D ConvBertLayer
+hf 31/32/33 - ConvNextImageProcessorPil Cosmos3EdgeImageProcessorPil DPRPretrainedReader DPRReader
+hf 31/32/33 - DPTImageProcessorPil DataCollator DataCollatorWithFlattening DataCollatorWithPadding
+hf 31/32/33 - DeepseekOcr2ImageProcessorPil DeepseekVLHybridImageProcessorPil DeepseekVLImageProcessorPil
+hf 31/32/33 - DefaultDataCollator DefaultFlowCallback DeformableDetrImageProcessorPil DeiTImageProcessorPil
+hf 31/32/33 - DetrImageProcessorPil DonutImageProcessorPil DummyObject EarlyStoppingCallback
+hf 31/32/33 - EdgeTamVideoInferenceSession EfficientLoFTRImageProcessorPil EfficientNetImageProcessorPil Emu3VQVAE
+hf 31/32/33 - EntropyBoundSampler EomtImageProcessorPil EosTokenCriteria EpsilonLogitsWarper
+hf 31/32/33 - Ernie4_5_VLMoeImageProcessorPil Ernie4_5_VL_MoeImageProcessorPil EtaLogitsWarper EvalPrediction
+hf 31/32/33 - ExponentialDecayLengthPenalty FEATURE_EXTRACTOR_MAPPING FNetLayer FlavaImageProcessorPil
+hf 31/32/33 - FuyuImageProcessorPil GLPNImageProcessorPil GLPNLayer GPTNeoXJapaneseLayer GPTNeoXLayer
+hf 31/32/33 - Gemma3ImageProcessorPil Gemma4ImageProcessorPil Glm46VImageProcessorPil Glm4vImageProcessorPil
+hf 31/32/33 - Glm5NextImageProcessorPil GlmImageImageProcessorPil GlmImageVQVAE GlmgaImageProcessorPil
+hf 31/32/33 - GlueDataTrainingArguments GlueDataset GotOcr2ImageProcessorPil GradientCheckpointingLayer
+hf 31/32/33 - GroundingDinoImageProcessorPil HfArgumentParser HunYuanVLImageProcessorPil HunYuanVLVisionTransformer
+hf 31/32/33 - IMAGE_PROCESSOR_MAPPING Idefics2ImageProcessorPil Idefics3ImageProcessorPil Idefics3VisionTransformer
+hf 31/32/33 - IdeficsImageProcessorPil ImageGPTImageProcessorPil ImagesKwargs InputExample InputFeatures
+hf 31/32/33 - IntervalStrategy JanusImageProcessorPil JanusVQVAE JinaEmbeddingsV3Layer Kosmos2_5ImageProcessorPil
+hf 31/32/33 - LayoutLMv2ImageProcessorPil LayoutLMv2Layer LayoutLMv3ImageProcessorPil LevitImageProcessorPil
+hf 31/32/33 - LightGlueImageProcessorPil LlavaImageProcessorPil LlavaNextImageProcessorPil
+hf 31/32/33 - LlavaOnevisionImageProcessorPil LogitNormalization LogitsProcessorList LongformerSelfAttention
+hf 31/32/33 - LxmertXLayer MODEL_CARD_NAME MODEL_FOR_AUDIO_CLASSIFICATION_MAPPING
+hf 31/32/33 - MODEL_FOR_AUDIO_FRAME_CLASSIFICATION_MAPPING MODEL_FOR_AUDIO_TOKENIZATION_MAPPING
+hf 31/32/33 - MODEL_FOR_AUDIO_XVECTOR_MAPPING MODEL_FOR_BACKBONE_MAPPING MODEL_FOR_CAUSAL_IMAGE_MODELING_MAPPING
+hf 31/32/33 - MODEL_FOR_CAUSAL_LM_MAPPING MODEL_FOR_CTC_MAPPING MODEL_FOR_DEPTH_ESTIMATION_MAPPING
+hf 31/32/33 - MODEL_FOR_DOCUMENT_QUESTION_ANSWERING_MAPPING MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING
+hf 31/32/33 - MODEL_FOR_IMAGE_MAPPING MODEL_FOR_IMAGE_MATTING_MAPPING MODEL_FOR_IMAGE_SEGMENTATION_MAPPING
+hf 31/32/33 - MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING MODEL_FOR_IMAGE_TO_IMAGE_MAPPING
+hf 31/32/33 - MODEL_FOR_INSTANCE_SEGMENTATION_MAPPING MODEL_FOR_KEYPOINT_DETECTION_MAPPING
+hf 31/32/33 - MODEL_FOR_KEYPOINT_MATCHING_MAPPING MODEL_FOR_MASKED_IMAGE_MODELING_MAPPING
+hf 31/32/33 - MODEL_FOR_MASKED_LM_MAPPING MODEL_FOR_MASK_GENERATION_MAPPING MODEL_FOR_MULTIMODAL_LM_MAPPING
+hf 31/32/33 - MODEL_FOR_MULTIPLE_CHOICE_MAPPING MODEL_FOR_NEXT_SENTENCE_PREDICTION_MAPPING
+hf 31/32/33 - MODEL_FOR_NORMAL_ESTIMATION_MAPPING MODEL_FOR_OBJECT_DETECTION_MAPPING
+hf 31/32/33 - MODEL_FOR_POINTMAP_ESTIMATION_MAPPING MODEL_FOR_POSE_ESTIMATION_MAPPING MODEL_FOR_PRETRAINING_MAPPING
+hf 31/32/33 - MODEL_FOR_QUESTION_ANSWERING_MAPPING MODEL_FOR_RETRIEVAL_MAPPING MODEL_FOR_RNNT_MAPPING
+hf 31/32/33 - MODEL_FOR_SEMANTIC_SEGMENTATION_MAPPING MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
+hf 31/32/33 - MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING
+hf 31/32/33 - MODEL_FOR_TABLE_QUESTION_ANSWERING_MAPPING MODEL_FOR_TABLE_RECOGNITION_MAPPING MODEL_FOR_TDT_MAPPING
+hf 31/32/33 - MODEL_FOR_TEXT_ENCODING_MAPPING MODEL_FOR_TEXT_RECOGNITION_MAPPING
+hf 31/32/33 - MODEL_FOR_TEXT_TO_SPECTROGRAM_MAPPING MODEL_FOR_TEXT_TO_WAVEFORM_MAPPING
+hf 31/32/33 - MODEL_FOR_TIME_SERIES_CLASSIFICATION_MAPPING MODEL_FOR_TIME_SERIES_PREDICTION_MAPPING
+hf 31/32/33 - MODEL_FOR_TIME_SERIES_REGRESSION_MAPPING MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING
+hf 31/32/33 - MODEL_FOR_UNIVERSAL_SEGMENTATION_MAPPING MODEL_FOR_VIDEO_CLASSIFICATION_MAPPING
+hf 31/32/33 - MODEL_FOR_VISUAL_QUESTION_ANSWERING_MAPPING MODEL_FOR_ZERO_SHOT_IMAGE_CLASSIFICATION_MAPPING
+hf 31/32/33 - MODEL_FOR_ZERO_SHOT_OBJECT_DETECTION_MAPPING MODEL_MAPPING MPNetLayer MaxLengthCriteria
+hf 31/32/33 - MaxTimeCriteria MetaClip2TextModelWithProjection MetaClip2VisionModelWithProjection MinPLogitsWarper
+hf 31/32/33 - MiniCPMV4_6ImageProcessorPil MistralCommonBackend MllamaImageProcessorPil MobileBertLayer
+hf 31/32/33 - MobileNetV1ImageProcessorPil MobileNetV2ImageProcessorPil MobileViTImageProcessorPil MraLayer
+hf 31/32/33 - NllbMoeSparseMLP NllbMoeTop2Router NougatImageProcessorPil NystromformerLayer Ovis2ImageProcessorPil
+hf 31/32/33 - OwlViTImageProcessorPil Owlv2ImageProcessorPil PPChart2TableImageProcessorPil
+hf 31/32/33 - PPDocLayoutV2ReadingOrder PPOCRV5MobileRecEncoderWithSVTR PPOCRV5ServerRecEncoderWithSVTR
+hf 31/32/33 - PPOCRV6SmallRecEncoderWithSVTR PROCESSOR_MAPPING PaddleOCRVLImageProcessorPil
+hf 31/32/33 - PaddleOCRVisionTransformer PerceiverImageProcessorPil PerceiverLayer Pipeline
+hf 31/32/33 - Pix2StructImageProcessorPil PixtralImageProcessorPil PreTrainedTokenizerBase PrinterCallback
+hf 31/32/33 - ProcessingKwargs ProgressCallback PromptDepthAnythingImageProcessorPil PvtImageProcessorPil
+hf 31/32/33 - PythonBackend Qwen2RMSNorm Qwen2VLImageProcessorPil Qwen3OmniMoeCode2Wav
+hf 31/32/33 - Qwen3OmniMoeCode2WavDecoderBlock ROPE_INIT_FUNCTIONS RTDetrImageProcessorPil RagRetriever
+hf 31/32/33 - ReformerAttention ReformerLayer RemBertLayer RoCBertLayer SLOW_TO_FAST_CONVERTERS SPIECE_UNDERLINE
+hf 31/32/33 - Sam2VideoInferenceSession Sam3TrackerVideoInferenceSession Sam3VideoInferenceSession
+hf 31/32/33 - SamImageProcessorPil SchedulerType SeamlessM4TCodeHifiGan SeamlessM4THifiGan SegGptImageProcessorPil
+hf 31/32/33 - SegformerDecodeHead SegformerImageProcessorPil SegformerLayer SentencePieceBackend Seq2SeqTrainer
+hf 31/32/33 - Seq2SeqTrainingArguments Siglip2ImageProcessorPil SiglipImageProcessorPil SmolVLMImageProcessorPil
+hf 31/32/33 - SmolVLMVisionTransformer SplinterLayer SquadDataTrainingArguments SquadDataset SquadExample
+hf 31/32/33 - SquadFeatures SqueezeBertModule StableAndConfidentStoppingCriteria StopStringCriteria
+hf 31/32/33 - StoppingCriteria StoppingCriteriaList SuperGlueImageProcessorPil SuperPointImageProcessorPil
+hf 31/32/33 - Swin2SRImageProcessorPil SwitchTransformersSparseMLP SwitchTransformersTop1Router
+hf 31/32/33 - SynthIDTextWatermarkDetector TOKENIZER_MAPPING TemperatureLogitsWarper TensorType
+hf 31/32/33 - TextDiffusionStreamer TextIteratorStreamer TextKwargs TextNetImageProcessorPil TextStreamer TokenSpan
+hf 31/32/33 - TokenizersBackend TopKLogitsWarper TopPLogitsWarper TorchvisionBackend Trainer TrainerCallback
+hf 31/32/33 - TrainerControl TrainerState TrainingArguments TvpImageProcessorPil TypicalLogitsWarper UVDocBridge
+hf 31/32/33 - VIDEO_PROCESSOR_MAPPING ViTImageProcessorPil VideoLlama3ImageProcessorPil VideoMAEImageProcessorPil
+hf 31/32/33 - VideosKwargs ViltImageProcessorPil ViltLayer VisualBertLayer VitMatteImageProcessorPil
+hf 31/32/33 - VitPoseImageProcessorPil WEIGHTS_NAME WatermarkDetector Wav2Vec2ProcessorWithLM
+hf 31/32/33 - YolosImageProcessorPil YosoLayer ZOEDEPTH_PRETRAINED_CONFIG_ARCHIVE_MAP ZoeDepthImageProcessorPil
+hf 31/32/33 - add_end_docstrings add_start_docstrings apply_chunking_to_forward convert_and_export_with_cache
+hf 31/32/33 - convert_slow_tokenizer default_data_collator dynamic_rope_update enable_full_determinism
+hf 31/32/33 - get_constant_schedule get_constant_schedule_with_warmup get_cosine_schedule_with_warmup
+hf 31/32/33 - get_cosine_with_hard_restarts_schedule_with_warmup get_inverse_sqrt_schedule
+hf 31/32/33 - get_linear_schedule_with_warmup get_polynomial_decay_schedule_with_warmup get_scheduler get_values
+hf 31/32/33 - get_wsd_schedule glue_compute_metrics glue_convert_examples_to_features glue_output_modes
+hf 31/32/33 - glue_processors glue_tasks_num_labels is_apex_available is_av_available is_bitsandbytes_available
+hf 31/32/33 - is_clearml_available is_comet_available is_datasets_available is_dvclive_available is_faiss_available
+hf 31/32/33 - is_matplotlib_available is_mlx_available is_neptune_available is_optuna_available
+hf 31/32/33 - is_phonemizer_available is_psutil_available is_py3nvml_available is_pyctcdecode_available
+hf 31/32/33 - is_ray_available is_ray_tune_available is_sacremoses_available is_scipy_available
+hf 31/32/33 - is_sentencepiece_available is_sklearn_available is_speech_available is_swanlab_available
+hf 31/32/33 - is_tensorboard_available is_timm_available is_tokenizers_available is_torch_available
+hf 31/32/33 - is_torch_hpu_available is_torch_mlu_available is_torch_musa_available is_torch_neuroncore_available
+hf 31/32/33 - is_torch_npu_available is_torch_xla_available is_torch_xpu_available is_torchvision_available
+hf 31/32/33 - is_trackio_available is_vision_available is_wandb_available logging model_addition_debugger_context
+hf 31/32/33 - pipeline requires_backends set_seed squad_convert_examples_to_features torch_distributed_zero_first
+hf 31/32/33 - xnli_compute_metrics xnli_output_modes xnli_processors xnli_tasks_num_labels
+hf_incompatible 31/32/33 Backbone SLANeXt SLANet
+hf 31/32/33 Backbone Auto Beit Bit ConvNext ConvNextV2 DINOv3ConvNext DINOv3ViT Dinat Dinov2 Dinov2WithRegisters
+hf 31/32/33 Backbone Florence2Vision FocalNet HGNetV2 Hiera LwDetrViT PPLCNet PPLCNetV3 PPLCNetV4 Pixio PvtV2
+hf 31/32/33 Backbone RTDetrResNet ResNet RfDetrDinov2 Sapiens2 Swin Swinv2 TextNet Timm Tipsv2Vision UVDoc VitDet
+hf 31/32/33 Backbone VitPose
+hf 31/32/33 Cache Dynamic EncoderDecoder Quantized Static TorchExportableModuleWithStatic
+hf 31/32/33 Config AST AXK1 AXK2 Afmoe Aimv2 Aimv2Text Aimv2Vision Albert Align AlignText AlignVision AltCLIP
+hf 31/32/33 Config AltCLIPText AltCLIPVision Apertus Aqlm Arcee Aria AriaText AudioFlamingo3 AudioFlamingo3Encoder
+hf 31/32/33 Config Auto AutoRound Autoformer Awq AyaVision Bamba Bark BarkCoarse BarkFine BarkSemantic Bart
+hf 31/32/33 Config BayesianDetector Beit Bert BertGeneration BigBird BigBirdPegasus BioGpt Bit BitNet BitNetQuant
+hf 31/32/33 Config BitsAndBytes Blenderbot BlenderbotSmall Blip Blip2 Blip2Vision BlipText BlipVision Bloom Blt
+hf 31/32/33 Config BltGlobalTransformer BltLocalDecoder BltLocalEncoder BltPatcher BridgeTower BridgeTowerText
+hf 31/32/33 Config BridgeTowerVision Bros CHMv2 CLIP CLIPSeg CLIPSegText CLIPSegVision CLIPText CLIPVision CTRL
+hf 31/32/33 Config Camembert Canary CanaryDecoder Canine Chameleon ChameleonVQVAE ChineseCLIP ChineseCLIPText
+hf 31/32/33 Config ChineseCLIPVision Clap ClapAudio ClapText Clvp ClvpDecoder ClvpEncoder CodeGen Cohere Cohere2
+hf 31/32/33 Config Cohere2Moe Cohere2Vision CohereAsr CohereCompass CohereCompassText CohereCompassVision
+hf 31/32/33 Config ColModernVBert ColPali ColQwen2 Compile CompressedTensors ConditionalDetr ContinuousBatching
+hf 31/32/33 Config ConvBert ConvNext ConvNextV2 Cosmos3Edge Cosmos3EdgeText Cosmos3EdgeVision Cosmos3Omni CpmAnt
+hf 31/32/33 Config Csm CsmDepthDecoder Cvt Cwm DFine DINOv3ConvNext DINOv3ViT DPR DPT DabDetr Dac Data2VecAudio
+hf 31/32/33 Config Data2VecText Data2VecVision Dbrx Deberta DebertaV2 DecisionTransformer DeepseekOcr2
+hf 31/32/33 Config DeepseekOcr2SamVision DeepseekOcr2Text DeepseekOcr2Vision DeepseekOcr2VisionEncoder DeepseekV2
+hf 31/32/33 Config DeepseekV3 DeepseekV32 DeepseekV4 DeepseekVL DeepseekVLHybrid DeformableDetr DeiT Deimv2
+hf 31/32/33 Config DepthAnything DepthPro Detr Dia DiaDecoder DiaEncoder DiffLlama DiffusionGemma
+hf 31/32/33 Config DiffusionGemmaGeneration DiffusionGemmaText Dinat Dinov2 Dinov2WithRegisters DistilBert
+hf 31/32/33 Config Distributed Doge DonutSwin Dots1 EdgeTam EdgeTamMaskDecoder EdgeTamPromptEncoder EdgeTamVideo
+hf 31/32/33 Config EdgeTamVideoMaskDecoder EdgeTamVideoPromptEncoder EdgeTamVision Eetq EfficientLoFTR EfficientNet
+hf 31/32/33 Config Electra Emu3 Emu3Text Emu3VQVAE Encodec EncoderDecoder EntropyBoundSampler Eomt EomtDinov3 Ernie
+hf 31/32/33 Config Ernie4_5 Ernie4_5_Moe Ernie4_5_VLMoe Ernie4_5_VLMoeText Ernie4_5_VLMoeVision Ernie4_5_VL_Moe
+hf 31/32/33 Config Ernie4_5_VL_MoeText Ernie4_5_VL_MoeVision Esm EsmFold2 Esmc EuroBert Evolla Exaone4 Exaone4_5_
+hf 31/32/33 Config Exaone4_5_Vision ExaoneMoe FNet FPQuant FSMT Falcon FalconH1 FalconMamba FastSpeech2Conformer
+hf 31/32/33 Config FastSpeech2ConformerHifiGan FastSpeech2ConformerWithHifiGan FastVlm FbgemmFp8 FineGrainedFP8
+hf 31/32/33 Config Flaubert Flava FlavaImage FlavaImageCodebook FlavaMultimodal FlavaText FlexOlmo Florence2
+hf 31/32/33 Config Florence2Vision FocalNet FourOverSix FunAsrNano FunAsrNanoAdaptor FunAsrNanoEncoder Funnel Fuyu
+hf 31/32/33 Config GLPN GPT2 GPTBigCode GPTJ GPTNeo GPTNeoX GPTNeoXJapanese GPTQ Gemma Gemma2 Gemma3 Gemma3Text
+hf 31/32/33 Config Gemma3n Gemma3nAudio Gemma3nText Gemma3nVision Gemma4 Gemma4Assistant Gemma4Audio Gemma4Text
+hf 31/32/33 Config Gemma4Unified Gemma4UnifiedAssistant Gemma4UnifiedAudio Gemma4UnifiedText Gemma4UnifiedVision
+hf 31/32/33 Config Gemma4Vision GemmaQuantization Generation Gguf Git GitVision Glm Glm4 Glm46V Glm4Moe Glm4MoeLite
+hf 31/32/33 Config Glm4v Glm4vMoe Glm4vMoeText Glm4vMoeVision Glm4vText Glm4vVision Glm5Next Glm5NextText
+hf 31/32/33 Config Glm5NextVision GlmAsr GlmAsrEncoder GlmImage GlmImageText GlmImageVQVAE GlmImageVision GlmMoeDsa
+hf 31/32/33 Config GlmOcr GlmOcrText GlmOcrVision Glmga GotOcr2 GotOcr2Vision GptOss Granite Granite4Vision
+hf 31/32/33 Config Granite4VisionText GraniteMoe GraniteMoeHybrid GraniteMoeSWA GraniteMoeShared GraniteSWA
+hf 31/32/33 Config GraniteSpeech GraniteSpeech5CTC GraniteSpeech5Encoder GraniteSpeechEncoder GraniteSpeechPlus
+hf 31/32/33 Config GraniteSpeechPlusEncoder GroundingDino GroupViT GroupViTText GroupViTVision HGNetV2 HYV3 HYV4
+hf 31/32/33 Config Helium Hiera Higgs HiggsAudioV2 HiggsAudioV2Tokenizer Hqq HrmText Hubert HunYuanDenseV1
+hf 31/32/33 Config HunYuanMoEV1 HunYuanVL HunYuanVLText HunYuanVLVision HyperCLOVAX IBert IJepa Idefics Idefics2
+hf 31/32/33 Config Idefics2Perceiver Idefics2Vision Idefics3 Idefics3Vision IdeficsPerceiver IdeficsVision ImageGPT
+hf 31/32/33 Config Informer Inkling InklingAudio InklingText InklingVision InstructBlip InstructBlipVideo
+hf 31/32/33 Config InstructBlipVideoVision InstructBlipVision InternVL InternVLVision Jais2 Jamba Janus JanusVQVAE
+hf 31/32/33 Config JanusVision JetMoe JinaEmbeddingsV3 Kernel KimiLinear Kimi_K25 Kimi_K25Vision Kosmos2
+hf 31/32/33 Config Kosmos2Text Kosmos2Vision Kosmos2_5 Kosmos2_5Text Kosmos2_5Vision KyutaiSpeechToText LED Laguna
+hf 31/32/33 Config LasrCTC LasrEncoder LayoutLM LayoutLMv2 LayoutLMv3 LayoutXLM Levit Lfm2 Lfm2Moe Lfm2Vl LightGlue
+hf 31/32/33 Config LightOnOcr Lilt Llama Llama4 Llama4Text Llama4Vision Llava LlavaNext LlavaNextVideo
+hf 31/32/33 Config LlavaOnevision LongT5 LongcatFlash Longformer Luke LwDetr LwDetrViT Lxmert M2M100 MBart
+hf 31/32/33 Config MLCDVision MMGroundingDino MPNet MT5 Mamba Mamba2 Marian MarkupLM MegatronBert Mellum MetaClip2
+hf 31/32/33 Config MetaClip2Text MetaClip2Vision Metal Mgpstr MiMoV2Flash Mimi MiniCPM3 MiniCPMV4_6
+hf 31/32/33 Config MiniCPMV4_6Vision MiniMax MiniMaxM2 MiniMaxM3VL MiniMaxM3VLText MiniMaxM3VLVision Ministral
+hf 31/32/33 Config Ministral3 Mistral Mistral3 Mistral4 Mixtral Mllama MllamaText MllamaVision MobileBert
+hf 31/32/33 Config MobileNetV1 MobileNetV2 MobileViT MobileViTV2 ModernBert ModernBertDecoder ModernVBert Moonshine
+hf 31/32/33 Config MoonshineStreaming MoonshineStreamingEncoder Moshi MoshiDepth Mpt Mra MuseGlimmer
+hf 31/32/33 Config MuseGlimmerAssistant MuseGlimmerText MuseGlimmerVision MusicFlamingo Musicgen MusicgenDecoder
+hf 31/32/33 Config MusicgenMelody MusicgenMelodyDecoder Mvp Mxfp4 NVFP4 NanoChat Nemotron Nemotron3_5Asr
+hf 31/32/33 Config NemotronAsrStreaming NemotronAsrStreamingEncoder NemotronH NeoMME NeuCodec NllbMoe NomicBert
+hf 31/32/33 Config Nougat Nystromformer OPT Olmo Olmo2 Olmo3 OlmoHybrid Olmoe OmDetTurbo OpenAIGPT
+hf 31/32/33 Config OpenAIPrivacyFilter Ovis2 Ovis2Vision OwlViT OwlViTText OwlViTVision Owlv2 Owlv2Text Owlv2Vision
+hf 31/32/33 Config PI0 PLBart PPChart2Table PPDocLayoutV2 PPDocLayoutV3 PPLCNet PPLCNetV3 PPLCNetV4
+hf 31/32/33 Config PPOCRV5MobileDet PPOCRV5MobileRec PPOCRV5ServerDet PPOCRV5ServerRec PPOCRV6MediumDet
+hf 31/32/33 Config PPOCRV6SmallDet PPOCRV6SmallRec PPOCRV6TinyRec PaddleOCRText PaddleOCRVL PaddleOCRVision
+hf 31/32/33 Config PaliGemma ParakeetCTC ParakeetEncoder ParakeetRNNT ParakeetTDT PatchTSMixer PatchTST PeAudio
+hf 31/32/33 Config PeAudioEncoder PeAudioVideo PeAudioVideoEncoder PeVideo PeVideoEncoder Pegasus PegasusX
+hf 31/32/33 Config Perceiver PerceptionLM Persimmon Phi Phi3 Phi4Multimodal Phi4MultimodalAudio
+hf 31/32/33 Config Phi4MultimodalVision Phimoe Pix2Struct Pix2StructText Pix2StructVision Pixio PixtralVision
+hf 31/32/33 Config Pop2Piano PreTrained Pretrained PromptDepthAnything ProphetNet Pvt PvtV2 QianfanOCR
+hf 31/32/33 Config QianfanOCRVision Quanto Quark Qwen2 Qwen2Audio Qwen2AudioEncoder Qwen2Moe Qwen2VL Qwen2VLText
+hf 31/32/33 Config Qwen2VLVision Qwen2_5Omni Qwen2_5OmniAudioEncoder Qwen2_5OmniBigVGAN Qwen2_5OmniDiT
+hf 31/32/33 Config Qwen2_5OmniTalker Qwen2_5OmniText Qwen2_5OmniThinker Qwen2_5OmniToken2Wav
+hf 31/32/33 Config Qwen2_5OmniVisionEncoder Qwen2_5_VL Qwen2_5_VLText Qwen2_5_VLVision Qwen3 Qwen3ASR
+hf 31/32/33 Config Qwen3ASREncoder Qwen3Moe Qwen3Next Qwen3OmniMoe Qwen3OmniMoeAudioEncoder Qwen3OmniMoeTalker
+hf 31/32/33 Config Qwen3OmniMoeTalkerCodePredictor Qwen3OmniMoeTalkerText Qwen3OmniMoeText Qwen3OmniMoeThinker
+hf 31/32/33 Config Qwen3OmniMoeVisionEncoder Qwen3VL Qwen3VLMoe Qwen3VLMoeText Qwen3VLMoeVision Qwen3VLText
+hf 31/32/33 Config Qwen3VLVision Qwen3_5 Qwen3_5Moe Qwen3_5MoeText Qwen3_5MoeVision Qwen3_5Text Qwen3_5Vision
+hf 31/32/33 Config Qwen4Exp Qwen4ExpText Qwen4ExpVision RTDetr RTDetrResNet RTDetrV2 Radio Rag RecurrentGemma
+hf 31/32/33 Config Reformer RegNet RemBert ResNet RfDetr RfDetrDinov2 RoCBert Roberta RobertaPreLayerNorm Rwkv SEW
+hf 31/32/33 Config SEWD SLANeXt SLANet Sam Sam2 Sam2HieraDet Sam2MaskDecoder Sam2PromptEncoder Sam2Video
+hf 31/32/33 Config Sam2VideoMaskDecoder Sam2VideoPromptEncoder Sam2Vision Sam3 Sam3DETRDecoder Sam3DETREncoder
+hf 31/32/33 Config Sam3GeometryEncoder Sam3LiteText Sam3LiteTextDETRDecoder Sam3LiteTextDETREncoder
+hf 31/32/33 Config Sam3LiteTextGeometryEncoder Sam3LiteTextMaskDecoder Sam3LiteTextText Sam3MaskDecoder Sam3Tracker
+hf 31/32/33 Config Sam3TrackerMaskDecoder Sam3TrackerPromptEncoder Sam3TrackerVideo Sam3TrackerVideoMaskDecoder
+hf 31/32/33 Config Sam3TrackerVideoPromptEncoder Sam3ViT Sam3Video Sam3Vision SamHQ SamHQMaskDecoder
+hf 31/32/33 Config SamHQPromptEncoder SamHQVision SamMaskDecoder SamPromptEncoder SamVision Sapiens2 Sapiens2Head
+hf 31/32/33 Config SeamlessM4T SeamlessM4Tv2 SeedOss SegGpt Segformer ShieldGemma2 Siglip Siglip2 Siglip2Text
+hf 31/32/33 Config Siglip2Vision SiglipText SiglipVision Sinq SmolLM3 SmolVLM SmolVLMVision SolarOpen SpQR
+hf 31/32/33 Config Speech2Text SpeechEncoderDecoder SpeechT5 SpeechT5HifiGan Splinter SqueezeBert StableLm
+hf 31/32/33 Config Starcoder2 Step3p7 Step3p7Text Step3p7Vision SuperGlue SuperPoint Swin Swin2SR Swinv2
+hf 31/32/33 Config SwitchTransformers SynthIDTextWatermarking T5 T5Gemma T5Gemma2 T5Gemma2Decoder T5Gemma2Encoder
+hf 31/32/33 Config T5Gemma2Text T5GemmaModule TableTransformer Tapas TextNet TimeSeriesTransformer TimesFm
+hf 31/32/33 Config TimesFm2_5 Timesformer TimmBackbone TimmWrapper Tipsv2 Tipsv2Dpt Tipsv2Text Tipsv2Vision TorchAo
+hf 31/32/33 Config TrOCR Tvp UMT5 UVDoc UVDocBackbone Udop UniSpeech UniSpeechSat UnivNet UperNet VJEPA2 VaultGemma
+hf 31/32/33 Config ViT ViTMAE ViTMSN VibeVoice VibeVoiceAcousticTokenizer VibeVoiceAcousticTokenizerDecoder
+hf 31/32/33 Config VibeVoiceAcousticTokenizerEncoder VibeVoiceAsr VibeVoiceDiffusionHead VideoLlama3
+hf 31/32/33 Config VideoLlama3Vision VideoLlava VideoMAE VideoPrism VideoPrismText VideoPrismVision Videomt Vilt
+hf 31/32/33 Config VipLlava VisionEncoderDecoder VisionTextDualEncoder VisualBert VitDet VitMatte VitPose
+hf 31/32/33 Config VitPoseBackbone Vits Vivit Voxtral VoxtralEncoder VoxtralRealtime VoxtralRealtimeEncoder
+hf 31/32/33 Config VoxtralRealtimeText Vptq Watermarking Wav2Vec2 Wav2Vec2Bert Wav2Vec2Conformer WavLM Whisper
+hf 31/32/33 Config XCLIP XCLIPText XCLIPVision XGLM XLM XLMRoberta XLMRobertaXL XLNet Xcodec Xcodec2 Xmod Yolos
+hf 31/32/33 Config Yoso Youtu Zamba Zamba2 Zaya ZoeDepth xLSTM
+hf_incompatible 31/32/33 Decoder Clvp ProphetNet
+hf 31/32/33 Decoder BertGeneration
+hf_incompatible 31/32/33 Encoder Clvp ProphetNet
+hf 31/32/33 Encoder AudioFlamingo3 BertGeneration DPRContext DPRPretrainedContext DPRPretrainedQuestion DPRQuestion
+hf 31/32/33 Encoder FunAsrNano Gemma3nAudio GlmAsr GraniteSpeech5 GraniteSpeechCTC GraniteSpeechPlusCTC Lasr Lxmert
+hf 31/32/33 Encoder LxmertVisualFeature NemotronAsrStreaming Parakeet PeAudio PeAudioVideo PeVideo Qwen2Audio
+hf 31/32/33 Encoder Qwen3ASR T5Gemma2 Voxtral VoxtralRealtime
+hf 31/32/33 FeatureExtractor AST Auto Clap Clvp CohereAsr Dac Dia Encodec FunAsrNano Gemma3nAudio Gemma4Audio
+hf 31/32/33 FeatureExtractor Gemma4UnifiedAudio GraniteSpeech GraniteSpeech5 Inkling KyutaiSpeechToText Lasr
+hf 31/32/33 FeatureExtractor MarkupLM MusicgenMelody NemotronAsrStreaming NeuCodec Parakeet PeAudio Phi4Multimodal
+hf 31/32/33 FeatureExtractor Pop2Piano Qwen3ASR SeamlessM4T Sequence Speech2Text SpeechT5 UnivNet
+hf 31/32/33 FeatureExtractor VibeVoiceAcousticTokenizer VoxtralRealtime Wav2Vec2 Whisper Xcodec2
+hf 31/32/33 ForAudioClassification AST AutoModel Whisper
+hf_incompatible 31/32/33 ForAudioFrameClassification WavLM
+hf 31/32/33 ForAudioFrameClassification AutoModel Data2VecAudio UniSpeechSat Wav2Vec2 Wav2Vec2Bert
+hf 31/32/33 ForAudioFrameClassification Wav2Vec2Conformer
+hf 31/32/33 ForAudioTokenization AutoModel
+hf 31/32/33 ForAudioXVector AutoModel
+hf_incompatible 31/32/33 ForCTC SEWD WavLM
+hf 31/32/33 ForCTC AutoModel Data2VecAudio GraniteSpeech5 Hubert Lasr Parakeet SEW UniSpeech UniSpeechSat Wav2Vec2
+hf 31/32/33 ForCTC Wav2Vec2Bert Wav2Vec2Conformer
+hf_incompatible 31/32/33 ForCausalImageModeling ImageGPT
+hf_incompatible 31/32/33 ForCausalLM BigBird Clvp CodeGen CpmAnt GPTNeo GPTNeoXJapanese MegatronBert Mpt Mvp
+hf_incompatible 31/32/33 ForCausalLM ProphetNet RemBert RoFormer Rwkv TrOCR XGLM
+hf 31/32/33 ForCausalLM AXK2 AriaText AutoModel Bamba Bart BigBirdPegasus BioGpt BitNet Blenderbot BlenderbotSmall
+hf 31/32/33 ForCausalLM Blt Camembert CohereCompass CsmDepthDecoder Data2VecText DiffLlama Doge Dots1 Electra Emu3
+hf 31/32/33 ForCausalLM Ernie Fuyu Gemma4Assistant Gemma4Unified Gemma4UnifiedAssistant Git Helium JetMoe MBart
+hf 31/32/33 ForCausalLM Marian MiniMax MiniMaxM3VL Ministral Mistral4 Mllama ModernBertDecoder Moshi Musicgen
+hf 31/32/33 ForCausalLM MusicgenMelody NanoChat PLBart Pegasus Persimmon Phi4Multimodal Phimoe RecurrentGemma
+hf 31/32/33 ForCausalLM RoCBert Roberta RobertaPreLayerNorm SolarOpen Whisper XLMRoberta XLMRobertaXL Xmod Youtu
+hf 31/32/33 ForCausalLM Zamba Zaya xLSTM
+hf 31/32/33 ForClassification PatchTST
+hf_incompatible 31/32/33 ForConditionalGeneration Blip ClvpModel FSMT LED Mvp ProphetNet
+hf 31/32/33 ForConditionalGeneration AyaVision Bart BigBirdPegasus Blenderbot BlenderbotSmall Canary Chameleon
+hf 31/32/33 ForConditionalGeneration Cosmos3Omni Csm DeepseekOcr2 DeepseekVL DeepseekVLHybrid Dia Ernie4_5_VL_Moe
+hf 31/32/33 ForConditionalGeneration FastVlm Florence2 FunAsrNano Glm46V GlmImage GotOcr2 HiggsAudioV2 Idefics2
+hf 31/32/33 ForConditionalGeneration InstructBlip InstructBlipVideo Janus Kimi_K25 Kosmos2 Kosmos2_5
+hf 31/32/33 ForConditionalGeneration KyutaiSpeechToText LightOnOcr LongT5 M2M100 MBart MT5 Mllama Moonshine
+hf 31/32/33 ForConditionalGeneration MoonshineStreaming Moshi MusicFlamingo Musicgen MusicgenMelody NllbMoe Ovis2
+hf 31/32/33 ForConditionalGeneration PI0 PLBart PPFormulaNet Pegasus PegasusX PerceptionLM Pix2Struct Pop2Piano
+hf 31/32/33 ForConditionalGeneration Qwen2_5OmniPreTrainedModel Qwen2_5OmniTalker Qwen2_5OmniThinker
+hf 31/32/33 ForConditionalGeneration Qwen3OmniMoePreTrainedModel Qwen3OmniMoeTalker
+hf 31/32/33 ForConditionalGeneration Qwen3OmniMoeTalkerCodePredictorModel Qwen3OmniMoeThinker SeamlessM4TTextToUnit
+hf 31/32/33 ForConditionalGeneration Speech2Text SwitchTransformers T5 T5Gemma T5Gemma2 UMT5 Udop VibeVoice
+hf 31/32/33 ForConditionalGeneration VideoLlama3 VideoLlava VipLlava VoxtralRealtime
+hf 31/32/33 ForContrastiveLearning BridgeTower
+hf 31/32/33 ForDensePrediction Tipsv2Dpt
+hf_incompatible 31/32/33 ForDepthEstimation GLPN ZoeDepth
+hf 31/32/33 ForDepthEstimation AutoModel CHMv2 DPT DepthAnything DepthPro PromptDepthAnything Tipsv2Dpt
+hf 31/32/33 ForDocumentQuestionAnswering AutoModel
+hf_incompatible 31/32/33 ForEntityClassification Luke
+hf_incompatible 31/32/33 ForEntityPairClassification Luke
+hf_incompatible 31/32/33 ForEntitySpanClassification Luke
+hf 31/32/33 ForGeneration RagSequence RagToken
+hf_incompatible 31/32/33 ForImageAndTextRetrieval Vilt
+hf 31/32/33 ForImageAndTextRetrieval BridgeTower
+hf_incompatible 31/32/33 ForImageClassification Cvt Data2VecVision Dinat DonutSwin Hiera ImageGPT Levit MobileViT
+hf_incompatible 31/32/33 ForImageClassification MobileViTV2 Pvt PvtV2 SwiftFormer Swinv2
+hf 31/32/33 ForImageClassification AutoModel Beit Bit CLIP ConvNext ConvNextV2 DeiT Dinov2 Dinov2WithRegisters
+hf 31/32/33 ForImageClassification EfficientNet FocalNet HGNetV2 IJepa MetaClip2 MobileNetV1 MobileNetV2 PPLCNet
+hf 31/32/33 ForImageClassification PoolFormer RegNet ResNet Segformer ShieldGemma2 Siglip Siglip2 Swin TextNet
+hf 31/32/33 ForImageClassification TimmWrapper ViT ViTMSN
+hf_incompatible 31/32/33 ForImageClassificationConvProcessing Perceiver
+hf_incompatible 31/32/33 ForImageClassificationFourier Perceiver
+hf_incompatible 31/32/33 ForImageClassificationLearned Perceiver
+hf_incompatible 31/32/33 ForImageClassificationWithTeacher Levit
+hf 31/32/33 ForImageClassificationWithTeacher DeiT
+hf 31/32/33 ForImageMatting AutoModel Sapiens2 VitMatte
+hf_incompatible 31/32/33 ForImageSegmentation SegGpt
+hf 31/32/33 ForImageSegmentation AutoModel CLIPSeg
+hf_incompatible 31/32/33 ForImageSuperResolution Swin2SR
+hf_incompatible 31/32/33 ForImageTextRetrieval Blip
+hf 31/32/33 ForImageTextRetrieval Blip2
+hf 31/32/33 ForImageTextToText AutoModel
+hf 31/32/33 ForImageToImage AutoModel
+hf_incompatible 31/32/33 ForImagesAndTextClassification Vilt
+hf 31/32/33 ForInstanceSegmentation AutoModel MaskFormer RfDetr
+hf 31/32/33 ForKeypointDetection AutoModel SuperPoint
+hf_incompatible 31/32/33 ForKeypointMatching SuperGlue
+hf 31/32/33 ForKeypointMatching AutoModel EfficientLoFTR LightGlue
+hf 31/32/33 ForLanguageModeling DataCollator
+hf 31/32/33 ForMaskGeneration AutoModel
+hf_incompatible 31/32/33 ForMaskedImageModeling Swinv2
+hf 31/32/33 ForMaskedImageModeling AutoModel Beit DeiT FocalNet Swin ViT
+hf_incompatible 31/32/33 ForMaskedLM BigBird ConvBert Deberta DebertaV2 Funnel IBert Longformer Luke MPNet
+hf_incompatible 31/32/33 ForMaskedLM MegatronBert Mra Nystromformer Perceiver Reformer RemBert RoFormer SqueezeBert
+hf_incompatible 31/32/33 ForMaskedLM Tapas Vilt Yoso
+hf 31/32/33 ForMaskedLM Albert AutoModel BridgeTower Camembert Data2VecText DistilBert Electra Ernie Esm Esmc
+hf 31/32/33 ForMaskedLM EuroBert FNet JinaEmbeddingsV3 LayoutLM MobileBert ModernBert ModernVBert NeoMME NomicBert
+hf 31/32/33 ForMaskedLM RoCBert RobertaPreLayerNorm XLMRoberta XLMRobertaXL Xmod
+hf_incompatible 31/32/33 ForMultimodalAutoencoding Perceiver
+hf 31/32/33 ForMultimodalLM AutoModel
+hf_incompatible 31/32/33 ForMultipleChoice BigBird Canine ConvBert DebertaV2 Flaubert Funnel IBert Longformer Luke
+hf_incompatible 31/32/33 ForMultipleChoice MPNet MegatronBert Mra Nystromformer RemBert RoFormer SqueezeBert
+hf_incompatible 31/32/33 ForMultipleChoice VisualBert XLM XLNet Yoso
+hf 31/32/33 ForMultipleChoice Albert AutoModel Bert Camembert Data2VecText DataCollator DistilBert Electra Ernie
+hf 31/32/33 ForMultipleChoice FNet MobileBert ModernBert RoCBert Roberta RobertaPreLayerNorm XLMRoberta
+hf 31/32/33 ForMultipleChoice XLMRobertaXL Xmod
+hf_incompatible 31/32/33 ForNextSentencePrediction MegatronBert
+hf 31/32/33 ForNextSentencePrediction AutoModel Bert Ernie FNet MobileBert
+hf 31/32/33 ForNormalEstimation AutoModel Sapiens2 Tipsv2Dpt
+hf_incompatible 31/32/33 ForObjectDetection DabDetr GroundingDino MMGroundingDino OmDetTurbo TableTransformer
+hf 31/32/33 ForObjectDetection AutoModel ConditionalDetr DFine DeformableDetr Deimv2 Detr LwDetr OwlViT Owlv2
+hf 31/32/33 ForObjectDetection PPDocLayoutV2 PPDocLayoutV3 PPOCRV5MobileDet PPOCRV5ServerDet PPOCRV6MediumDet
+hf 31/32/33 ForObjectDetection PPOCRV6SmallDet RTDetr RTDetrV2 RfDetr Yolos
+hf_incompatible 31/32/33 ForOpticalFlow Perceiver
+hf 31/32/33 ForPermutationLanguageModeling DataCollator
+hf 31/32/33 ForPointmapEstimation AutoModel Sapiens2
+hf 31/32/33 ForPoseEstimation AutoModel Sapiens2 VitPose
+hf_incompatible 31/32/33 ForPreTraining BigBird Flava Funnel Hiera Lxmert MegatronBert VisualBert
+hf 31/32/33 ForPreTraining Albert AutoModel Bert Electra Ernie FNet MobileBert RoCBert Splinter UniSpeech
+hf 31/32/33 ForPreTraining UniSpeechSat ViTMAE VideoMAE Wav2Vec2 Wav2Vec2Conformer
+hf_incompatible 31/32/33 ForPrediction Autoformer
+hf 31/32/33 ForPrediction Informer PatchTSMixer PatchTST TimeSeriesTransformer TimesFm2_5Model TimesFmModel
+hf 31/32/33 ForPretraining PatchTSMixer PatchTST
+hf_incompatible 31/32/33 ForProteinFolding Esm
+hf 31/32/33 ForProteinText2Text Evolla
+hf_incompatible 31/32/33 ForQuestionAnswering BigBird Blip Bloom Canine ConvBert Deberta DebertaV2 Falcon Flaubert
+hf_incompatible 31/32/33 ForQuestionAnswering Funnel GPTJ GPTNeo IBert LED LayoutLMv2 LayoutLMv3 Lilt Longformer
+hf_incompatible 31/32/33 ForQuestionAnswering Luke Lxmert MPNet MegatronBert Mpt Mra Mvp Nystromformer Reformer
+hf_incompatible 31/32/33 ForQuestionAnswering RemBert RoFormer SqueezeBert Tapas Vilt VisualBert XLM XLNet Yoso
+hf 31/32/33 ForQuestionAnswering Albert Arcee AutoModel Bart Bert BigBirdPegasus Camembert Data2VecText DiffLlama
+hf 31/32/33 ForQuestionAnswering DistilBert Electra Ernie Exaone4 FNet GPT2 GPTNeoX JinaEmbeddingsV3 LayoutLM Llama
+hf 31/32/33 ForQuestionAnswering MBart MT5 MarkupLM MiniMax Ministral Ministral3 Mistral Mixtral MobileBert
+hf 31/32/33 ForQuestionAnswering ModernBert Nemotron OPT Qwen2 Qwen2Moe Qwen3 Qwen3Moe Qwen3Next RoCBert Roberta
+hf 31/32/33 ForQuestionAnswering RobertaPreLayerNorm SeedOss SmolLM3 Splinter T5 UMT5 XLMRoberta XLMRobertaXL Xmod
+hf_incompatible 31/32/33 ForQuestionAnsweringSimple Flaubert XLM XLNet
+hf 31/32/33 ForRNNT AutoModel Nemotron3_5Asr NemotronAsrStreaming Parakeet
+hf_incompatible 31/32/33 ForRegionToPhraseAlignment VisualBert
+hf 31/32/33 ForRegression PatchTSMixer PatchTST
+hf 31/32/33 ForRetrieval ColQwen2 NeoMME
+hf 31/32/33 ForSOP DataCollator
+hf_incompatible 31/32/33 ForSceneTextRecognition Mgpstr
+hf 31/32/33 ForSegmentation ConditionalDetr Detr
+hf_incompatible 31/32/33 ForSemanticSegmentation Data2VecVision MobileViT MobileViTV2
+hf 31/32/33 ForSemanticSegmentation AutoModel Beit DPT MobileNetV2 Sapiens2 Segformer Tipsv2Dpt UperNet
+hf 31/32/33 ForSeq2Seq DataCollator
+hf 31/32/33 ForSeq2SeqLM AutoModel
+hf_incompatible 31/32/33 ForSequenceClassification BigBird Bloom Canine ConvBert Deberta DebertaV2 Falcon Flaubert
+hf_incompatible 31/32/33 ForSequenceClassification Funnel GPTJ GPTNeo IBert LayoutLMv2 LayoutLMv3 Lilt Longformer
+hf_incompatible 31/32/33 ForSequenceClassification Luke MPNet MegatronBert Mpt Mra Mvp Nystromformer OpenAIGPT
+hf_incompatible 31/32/33 ForSequenceClassification Perceiver Reformer RemBert RoFormer SEWD SqueezeBert Tapas WavLM
+hf_incompatible 31/32/33 ForSequenceClassification XLM XLNet Yoso
+hf 31/32/33 ForSequenceClassification AXK1 AXK2 Albert Arcee AutoModel Bart BigBirdPegasus BioGpt CTRL Camembert
+hf 31/32/33 ForSequenceClassification CohereCompassText Data2VecAudio Data2VecText DeepseekV2 DeepseekV3 DiffLlama
+hf 31/32/33 ForSequenceClassification DistilBert Doge Electra Ernie Esm Esmc EuroBert Exaone4 FNet GPTBigCode
+hf 31/32/33 ForSequenceClassification GPTNeoX Gemma Gemma2 Gemma3 Gemma3Text Glm Glm4 GptOss Helium Hubert
+hf 31/32/33 ForSequenceClassification HunYuanDenseV1 HunYuanMoEV1 JetMoe JinaEmbeddingsV3 LayoutLM Llama MBart MT5
+hf 31/32/33 ForSequenceClassification MarkupLM MiniCPM3 MiniMax Ministral Ministral3 Mistral Mistral4 Mixtral
+hf 31/32/33 ForSequenceClassification MobileBert ModernBertDecoder ModernVBert Nemotron NomicBert OPT Olmo Olmo2
+hf 31/32/33 ForSequenceClassification Olmo3 PLBart Persimmon Phi Phi3 Phimoe Qwen2 Qwen2Moe Qwen3 Qwen3Moe
+hf 31/32/33 ForSequenceClassification Qwen3Next Qwen3_5 Qwen3_5Text RoCBert RobertaPreLayerNorm SEW SeedOss SmolLM3
+hf 31/32/33 ForSequenceClassification StableLm Starcoder2 T5 T5Gemma T5Gemma2 UMT5 UniSpeech UniSpeechSat Wav2Vec2
+hf 31/32/33 ForSequenceClassification Wav2Vec2Bert Wav2Vec2Conformer XLMRobertaXL Xmod Zamba Zamba2
+hf 31/32/33 ForSpeechSeq2Seq AutoModel
+hf_incompatible 31/32/33 ForSpeechToSpeech SpeechT5
+hf 31/32/33 ForSpeechToSpeech SeamlessM4T SeamlessM4Tv2
+hf_incompatible 31/32/33 ForSpeechToText SpeechT5
+hf 31/32/33 ForSpeechToText SeamlessM4T SeamlessM4Tv2
+hf 31/32/33 ForTDT AutoModel Parakeet
+hf 31/32/33 ForTableQuestionAnswering AutoModel
+hf_incompatible 31/32/33 ForTableRecognition SLANeXt SLANet
+hf 31/32/33 ForTableRecognition AutoModel
+hf 31/32/33 ForTextEncoding AutoModel
+hf 31/32/33 ForTextRecognition AutoModel PPOCRV5MobileRec PPOCRV5ServerRec PPOCRV6SmallRec PPOCRV6TinyRec
+hf 31/32/33 ForTextToSpectrogram AutoModel
+hf_incompatible 31/32/33 ForTextToSpeech SpeechT5
+hf 31/32/33 ForTextToSpeech SeamlessM4T SeamlessM4Tv2
+hf 31/32/33 ForTextToText SeamlessM4T SeamlessM4Tv2
+hf 31/32/33 ForTextToWaveform AutoModel
+hf 31/32/33 ForTimeSeriesClassification PatchTSMixer
+hf 31/32/33 ForTimeSeriesPrediction AutoModel
+hf_incompatible 31/32/33 ForTokenClassification BigBird Bloom Bros BrosSpadeEE BrosSpadeEL Canine ConvBert Deberta
+hf_incompatible 31/32/33 ForTokenClassification DebertaV2 Falcon Flaubert Funnel GPTNeo IBert LayoutLMv2 LayoutLMv3
+hf_incompatible 31/32/33 ForTokenClassification Lilt Longformer Luke MPNet MegatronBert Mpt Mra Nystromformer
+hf_incompatible 31/32/33 ForTokenClassification RemBert RoFormer SqueezeBert Vilt XLM XLNet Yoso
+hf 31/32/33 ForTokenClassification AXK1 AXK2 Albert Apertus Arcee AutoModel BioGpt Camembert Data2VecText
+hf 31/32/33 ForTokenClassification DataCollator DeepseekV3 DiffLlama DistilBert Electra Ernie Esm Esmc EuroBert
+hf 31/32/33 ForTokenClassification Exaone4 FNet GPT2 GPTBigCode GPTNeoX Gemma Gemma2 Glm Glm4 GptOss Helium
+hf 31/32/33 ForTokenClassification JinaEmbeddingsV3 LayoutLM Llama MT5 MarkupLM MiniMax Ministral Ministral3
+hf 31/32/33 ForTokenClassification Mistral Mistral4 Mixtral MobileBert ModernVBert Nemotron NomicBert Persimmon Phi
+hf 31/32/33 ForTokenClassification Phi3 Qwen2 Qwen2Moe Qwen3 Qwen3ASR Qwen3Moe Qwen3Next Qwen3_5 RoCBert
+hf 31/32/33 ForTokenClassification RobertaPreLayerNorm SeedOss SmolLM3 StableLm Starcoder2 T5 T5Gemma T5Gemma2 UMT5
+hf 31/32/33 ForTokenClassification XLMRobertaXL Xmod
+hf_incompatible 31/32/33 ForUniversalSegmentation Mask2Former OneFormer
+hf 31/32/33 ForUniversalSegmentation AutoModel Eomt EomtDinov3 Videomt
+hf_incompatible 31/32/33 ForVideoClassification Timesformer
+hf 31/32/33 ForVideoClassification AutoModel VJEPA2 VideoMAE VideoPrism Vivit
+hf_incompatible 31/32/33 ForVideoGrounding Tvp
+hf 31/32/33 ForVisionText2Text Idefics
+hf 31/32/33 ForVisualQuestionAnswering AutoModel
+hf_incompatible 31/32/33 ForVisualReasoning VisualBert
+hf 31/32/33 ForWholeWordMask DataCollator
+hf_incompatible 31/32/33 ForXVector WavLM
+hf 31/32/33 ForXVector Data2VecAudio UniSpeechSat Wav2Vec2 Wav2Vec2Bert Wav2Vec2Conformer
+hf 31/32/33 ForZeroShotImageClassification AutoModel
+hf 31/32/33 ForZeroShotObjectDetection AutoModel
+hf 31/32/33 Format CsvPipelineData JsonPipelineData PipedPipelineData PipelineData
+hf 31/32/33 FormerConfig Blip2Q InstructBlipQ InstructBlipVideoQ Mask Mask2 One Pool Ro Swift
+hf 31/32/33 FormerDetrConfig Mask
+hf 31/32/33 FormerDetrPreTrainedModel Mask
+hf 31/32/33 FormerImageProcessor Mask Mask2 One Pool
+hf 31/32/33 FormerImageProcessorPil Mask Mask2 One Pool
+hf 31/32/33 FormerLayer Ro
+hf_incompatible 31/32/33 FormerModel Mask2 One Ro Swift
+hf 31/32/33 FormerModel Blip2Q InstructBlipQ InstructBlipVideoQ Mask Pool
+hf_incompatible 31/32/33 FormerPreTrainedModel Mask2 One Ro Swift
+hf 31/32/33 FormerPreTrainedModel Mask Pool
+hf 31/32/33 FormerProcessor One
+hf 31/32/33 FormerSwinBackbone Mask
+hf 31/32/33 FormerSwinConfig Mask
+hf_incompatible 31/32/33 FormerSwinModel Mask
+hf_incompatible 31/32/33 FormerSwinPreTrainedModel Mask
+hf 31/32/33 FormerTokenizer Ro
+hf 31/32/33 FormerTokenizerFast Ro
+hf 31/32/33 FormulaNetConfig PP
+hf 31/32/33 FormulaNetImageProcessor PP
+hf 31/32/33 FormulaNetModel PP
+hf 31/32/33 FormulaNetPreTrainedModel PP
+hf 31/32/33 FormulaNetProcessor PP
+hf 31/32/33 FormulaNetTextConfig PP
+hf 31/32/33 FormulaNetTextModel PP
+hf 31/32/33 FormulaNetVisionConfig PP
+hf 31/32/33 FormulaNetVisionModel PP
+hf 31/32/33 ImageProcessor Aria Auto Base Beit Bit Blip BridgeTower CHMv2 CLIP Chameleon ChineseCLIP Cohere2Vision
+hf 31/32/33 ImageProcessor CohereCompass ConditionalDetr ConvNext Cosmos3Edge DINOv3ViT DPT DeepseekOcr2 DeepseekVL
+hf 31/32/33 ImageProcessor DeepseekVLHybrid DeformableDetr DeiT DepthPro Detr Donut EfficientLoFTR EfficientNet
+hf 31/32/33 ImageProcessor Emu3 Eomt Ernie4_5_VLMoe Ernie4_5_VL_Moe Flava Fuyu GLPN Gemma3 Gemma4 Gemma4Unified Glm
+hf 31/32/33 ImageProcessor Glm46V Glm4v Glm5Next GlmImage Glmga GotOcr2 GroundingDino HunYuanVL Idefics Idefics2
+hf 31/32/33 ImageProcessor Idefics3 ImageGPT Inkling Janus Kimi_K25 Kosmos2_5 LayoutLMv2 LayoutLMv3 Levit Lfm2Vl
+hf 31/32/33 ImageProcessor LightGlue Llama4 Llava LlavaNext LlavaOnevision MiniCPMV4_6 MiniMaxM3VL Mllama
+hf 31/32/33 ImageProcessor MobileNetV1 MobileNetV2 MobileViT MuseGlimmer NeoMME Nougat Ovis2 OwlViT Owlv2 PI0
+hf 31/32/33 ImageProcessor PPChart2Table PPDocLayoutV2 PPDocLayoutV3 PPLCNet PPOCRV5ServerDet PPOCRV5ServerRec
+hf 31/32/33 ImageProcessor PPOCRV6SmallRec PaddleOCRVL Perceiver PerceptionLM Phi4Multimodal Pix2Struct Pixtral
+hf 31/32/33 ImageProcessor PromptDepthAnything Pvt Qwen2VL RTDetr RfDetr SLANeXt Sam Sam2 Sam3 Sapiens2 SegGpt
+hf 31/32/33 ImageProcessor Segformer Siglip Siglip2 SmolVLM Step3p7 SuperGlue SuperPoint Swin2SR TextNet
+hf 31/32/33 ImageProcessor TimmWrapper Tipsv2 Tipsv2Dpt Tvp UVDoc ViT VideoLlama3 VideoLlava VideoMAE Vilt VitMatte
+hf 31/32/33 ImageProcessor VitPose Vivit Yolos ZoeDepth
+hf 31/32/33 Mixin DiffusionGemmaGeneration FeatureExtraction Generation ImageFeatureExtraction ImageProcessing
+hf 31/32/33 Mixin Processor
+hf_incompatible 31/32/33 Model Autoformer Bark BarkCausal BarkCoarse BarkFine BarkSemantic BigBird Blip
+hf_incompatible 31/32/33 Model BlipTextLMHead BlipVision Bloom Bros Canine Clvp CodeGen ConvBert CpmAnt Cvt DabDetr
+hf_incompatible 31/32/33 Model Data2VecVision Deberta DebertaV2 Dinat DonutSwin FSMT Falcon FastSpeech2Conformer
+hf_incompatible 31/32/33 Model Flaubert FlaubertWithLMHead Flava FlavaImage FlavaMultimodal FlavaText Funnel
+hf_incompatible 31/32/33 Model FunnelBase GLPN GPTJ GPTNeo GPTNeoXJapanese GroundingDino GroupViT GroupViTText
+hf_incompatible 31/32/33 Model GroupViTVision Hiera IBert ImageGPT LED LayoutLMv2 LayoutLMv3 Levit Lilt Longformer
+hf_incompatible 31/32/33 Model Luke Lxmert MMGroundingDino MPNet MegatronBert Mgpstr MobileViT MobileViTV2 Mpt Mra
+hf_incompatible 31/32/33 Model Mvp Nystromformer OpenAIGPT OpenAIGPTDoubleHeads OpenAIGPTLMHead Perceiver
+hf_incompatible 31/32/33 Model PretrainedFSMT ProphetNet Pvt PvtV2 Reformer RemBert Rwkv SEWD SegGpt SpeechT5
+hf_incompatible 31/32/33 Model SqueezeBert Swin2SR Swinv2 TableTransformer Tapas Timesformer Tvp Vilt VisualBert
+hf_incompatible 31/32/33 Model VitDet Vits WavLM XGLM XLM XLMWithLMHead XLNet XLNetLMHead Yoso
+config 31/32/33 Model Evolla
+hf 31/32/33 Model AST AXK1 AXK2 Afmoe Aimv2 Aimv2Text Aimv2Vision Albert Align AlignText AlignVision AltCLIP
+hf 31/32/33 Model AltCLIPText AltCLIPVision Apertus Arcee Aria AriaText AudioFlamingo3 Auto AyaVision Bamba Bart
+hf 31/32/33 Model BayesianDetector Beit BertLMHead BigBirdPegasus BioGpt Bit BitNet Blenderbot BlenderbotSmall
+hf 31/32/33 Model Blip2 Blip2Vision BlipText Blt BridgeTower CLIPSeg CLIPSegText CLIPSegVision CLIPText CLIPVision
+hf 31/32/33 Model CTRL CTRLLMHead Camembert Canary Chameleon ChineseCLIP ChineseCLIPText ChineseCLIPVision Clap
+hf 31/32/33 Model ClapAudio ClapText Cohere Cohere2 Cohere2Moe Cohere2Vision CohereAsr CohereCompass
+hf 31/32/33 Model CohereCompassText CohereCompassVision ConditionalDetr ConvNext ConvNextV2 Cosmos3Edge
+hf 31/32/33 Model Cosmos3EdgeText Cosmos3EdgeVision Cosmos3Omni CsmBackbone CsmDepthDecoder Cwm DFine
+hf 31/32/33 Model DINOv3ConvNext DINOv3ViT DPT Dac Data2VecAudio Data2VecText Dbrx DecisionTransformer
+hf 31/32/33 Model DecisionTransformerGPT2 DeepseekOcr2 DeepseekOcr2Text DeepseekOcr2Vision DeepseekV2 DeepseekV3
+hf 31/32/33 Model DeepseekV32 DeepseekV4 DeepseekVL DeepseekVLHybrid DeformableDetr DeiT Deimv2 DepthPro Detr Dia
+hf 31/32/33 Model DiffLlama DiffusionGemma DiffusionGemmaDecoder DiffusionGemmaEncoder DiffusionGemmaEncoderText
+hf 31/32/33 Model Dinov2 Dinov2WithRegisters DistilBert Doge Dots1 EdgeTam EdgeTamVideo EdgeTamVision
+hf 31/32/33 Model EfficientLoFTR EfficientNet Electra Emu3 Emu3Text Encodec EncoderDecoder Ernie Ernie4_5
+hf 31/32/33 Model Ernie4_5_Moe Ernie4_5_VLMoe Ernie4_5_VLMoeText Ernie4_5_VLMoeVariableResolutionResampler
+hf 31/32/33 Model Ernie4_5_VL_Moe Ernie4_5_VL_MoeText Ernie4_5_VL_MoeVariableResolutionResampler Esm EsmFold2 Esmc
+hf 31/32/33 Model EuroBert Evolla Exaone4 Exaone4_5_ Exaone4_5_Vision ExaoneMoe FNet FalconH1 FalconMamba FastVlm
+hf 31/32/33 Model FlexOlmo Florence2 FocalNet FunAsrNano Fuyu GPT2 GPT2DoubleHeads GPTBigCode GPTNeoX Gemma Gemma3
+hf 31/32/33 Model Gemma3n Gemma3nText Gemma4 Gemma4Audio Gemma4Text Gemma4Unified Gemma4UnifiedText Gemma4Vision
+hf 31/32/33 Model Git GitVision Glm Glm4 Glm46V Glm4Moe Glm4MoeLite Glm4v Glm4vMoe Glm4vMoeText Glm4vMoeVision
+hf 31/32/33 Model Glm4vText Glm4vVision Glm5Next Glm5NextText Glm5NextVision GlmAsr GlmImage GlmImageText
+hf 31/32/33 Model GlmImageVision GlmMoeDsa GlmOcr GlmOcrText GlmOcrVision GotOcr2 GptOss Granite Granite4Vision
+hf 31/32/33 Model Granite4VisionText GraniteMoe GraniteMoeHybrid GraniteMoeSWA GraniteMoeShared GraniteSWA
+hf 31/32/33 Model GraniteSpeech GraniteSpeechPlus HYV3 HYV4 Helium HiggsAudioV2 HiggsAudioV2Tokenizer HrmText
+hf 31/32/33 Model Hubert HunYuanDenseV1 HunYuanMoEV1 HunYuanVL HunYuanVLText HyperCLOVAX IJepa Idefics Idefics2
+hf 31/32/33 Model Idefics3 Informer Inkling InklingAudio InklingText InklingVision InstructBlip InstructBlipVideo
+hf 31/32/33 Model InstructBlipVideoVision InstructBlipVision InternVL InternVLVision Jais2 Jamba Janus JanusVision
+hf 31/32/33 Model JetMoe JinaEmbeddingsV3 KimiLinear Kimi_K25 Kimi_K25Vision Kosmos2 Kosmos2_5 KyutaiSpeechToText
+hf 31/32/33 Model Laguna LayoutLM Lfm2 Lfm2Moe Lfm2Vl LightOnOcr Llama4Text Llama4Vision Llava LlavaNext
+hf 31/32/33 Model LlavaNextVideo LlavaOnevision LongT5 LongT5Encoder LongcatFlash LwDetr M2M100 MBart MLCDVision
+hf 31/32/33 Model MT5 MT5Encoder Mamba Mamba2 Marian MarianMT MarkupLM Mellum MetaClip2 MetaClip2Text
+hf 31/32/33 Model MetaClip2Vision MiMoV2Flash Mimi MiniCPM3 MiniCPMV4_6 MiniMax MiniMaxM2 MiniMaxM3VL
+hf 31/32/33 Model MiniMaxM3VLText MiniMaxM3VLVision Ministral Ministral3 Mistral3 Mistral4 Mixtral Mllama
+hf 31/32/33 Model MllamaText MllamaVision MobileBert MobileNetV1 MobileNetV2 ModernBertDecoder Moonshine
+hf 31/32/33 Model MoonshineStreaming Moshi MuseGlimmer MuseGlimmerText MuseGlimmerVision MusicFlamingo Musicgen
+hf 31/32/33 Model MusicgenMelody NanoChat Nemotron NemotronH NeoMME NeuCodec NllbMoe OPT Olmo Olmo2 Olmo3
+hf 31/32/33 Model OlmoHybrid Olmoe OpenAIPrivacyFilter Ovis2 OwlViT OwlViTText OwlViTVision Owlv2 Owlv2Text
+hf 31/32/33 Model Owlv2Vision PI0 PLBart PPDocLayoutV2 PPDocLayoutV3 PPOCRV5MobileDet PPOCRV5MobileRec
+hf 31/32/33 Model PPOCRV5ServerDet PPOCRV5ServerRec PPOCRV6MediumDet PPOCRV6SmallDet PPOCRV6SmallRec PPOCRV6TinyRec
+hf 31/32/33 Model PaddleOCRText PaddleOCRVL PaddleOCRVision PaliGemma PatchTSMixer PatchTST PeAudio
+hf 31/32/33 Model PeAudioFrameLevel PeAudioVideo PeVideo Pegasus PegasusX PerceptionLM Persimmon Phi Phi3
+hf 31/32/33 Model Phi4Multimodal Phi4MultimodalAudio Phi4MultimodalVision Phimoe Pix2StructText Pix2StructVision
+hf 31/32/33 Model Pixio PixtralVision PreTrained PretrainedBart QianfanOCR QianfanOCRVision Qwen2Audio Qwen2Moe
+hf 31/32/33 Model Qwen2VL Qwen2VLText Qwen2_5OmniTalker Qwen2_5OmniThinkerText Qwen2_5OmniToken2Wav
+hf 31/32/33 Model Qwen2_5OmniToken2WavBigVGAN Qwen2_5OmniToken2WavDiT Qwen2_5_VL Qwen2_5_VLText Qwen3 Qwen3ASR
+hf 31/32/33 Model Qwen3Moe Qwen3Next Qwen3OmniMoeCode2WavTransformer Qwen3OmniMoeTalker
+hf 31/32/33 Model Qwen3OmniMoeTalkerCodePredictor Qwen3OmniMoeThinkerText Qwen3VL Qwen3VLMoe Qwen3VLMoeText
+hf 31/32/33 Model Qwen3VLMoeVision Qwen3VLText Qwen3VLVision Qwen3_5 Qwen3_5Moe Qwen3_5MoeText Qwen3_5MoeVision
+hf 31/32/33 Model Qwen3_5Text Qwen3_5Vision Qwen4Exp Qwen4ExpText Qwen4ExpVision RTDetr RTDetrV2 Radio Rag
+hf 31/32/33 Model RecurrentGemma RegNet ResNet RfDetr RoCBert RobertaPreLayerNorm SEW Sam Sam2 Sam2HieraDet
+hf 31/32/33 Model Sam2Video Sam2Vision Sam3 Sam3LiteText Sam3LiteTextText Sam3Tracker Sam3TrackerVideo Sam3ViT
+hf 31/32/33 Model Sam3Video Sam3Vision SamHQ SamHQVision SamVision Sapiens2 SeamlessM4T SeamlessM4TTextToUnit
+hf 31/32/33 Model SeamlessM4Tv2 SeedOss Segformer Siglip2 Siglip2Text Siglip2Vision SiglipText SiglipVision SmolLM3
+hf 31/32/33 Model SmolVLM SolarOpen Speech2Text SpeechEncoderDecoder Splinter StableLm Starcoder2 Step3p7
+hf 31/32/33 Model Step3p7Text Step3p7Vision Swin SwitchTransformers SwitchTransformersEncoder T5 T5Encoder T5Gemma
+hf 31/32/33 Model T5Gemma2 T5GemmaEncoder TextNet TimeSeriesTransformer TimesFm TimesFm2_5 TimmWrapper Tipsv2
+hf 31/32/33 Model Tipsv2Text Tipsv2Vision UMT5 UMT5Encoder UVDoc Udop UdopEncoder UniSpeech UniSpeechSat UnivNet
+hf 31/32/33 Model VJEPA2 VaultGemma ViT ViTMAE ViTMSN VibeVoice VibeVoiceAcousticTokenizer
+hf 31/32/33 Model VibeVoiceAcousticTokenizerDecoder VibeVoiceAcousticTokenizerEncoder VibeVoiceAsr VideoLlama3
+hf 31/32/33 Model VideoLlama3Vision VideoLlava VideoMAE VideoPrismClip VideoPrismText VideoPrismVideo
+hf 31/32/33 Model VideoPrismVision VipLlava VisionEncoderDecoder VisionTextDualEncoder Vivit Voxtral
+hf 31/32/33 Model VoxtralRealtime Wav2Vec2 Wav2Vec2Bert Wav2Vec2Conformer Whisper XCLIP XCLIPText XCLIPVision
+hf 31/32/33 Model XLMRobertaXL Xcodec Xcodec2 Xmod Yolos Youtu Zamba Zamba2 Zaya xLSTM
+hf 31/32/33 Output DPRReader DiffusionGemmaGeneration Nemotron3_5AsrRNNT NemotronAsrStreamingEncoderModel
+hf 31/32/33 Output NemotronAsrStreamingRNNT Sam3VideoSegmentation
+hf 31/32/33 Pipeline AnyToAny AudioClassification AutomaticSpeechRecognition DepthEstimation
+hf 31/32/33 Pipeline DocumentQuestionAnswering FeatureExtraction FillMask ImageClassification
+hf 31/32/33 Pipeline ImageFeatureExtraction ImageSegmentation ImageTextToText KeypointMatching MaskGeneration Ner
+hf 31/32/33 Pipeline ObjectDetection TableQuestionAnswering TextClassification TextGeneration TextToAudio
+hf 31/32/33 Pipeline TokenClassification VideoClassification ZeroShotAudioClassification ZeroShotClassification
+hf 31/32/33 Pipeline ZeroShotImageClassification ZeroShotObjectDetection
+hf_incompatible 31/32/33 PreTrainedModel Autoformer Bark BigBird Blip BlipText Bloom Bros Canine Clvp CodeGen
+hf_incompatible 31/32/33 PreTrainedModel ConvBert CpmAnt Cvt DabDetr Data2VecVision Deberta DebertaV2 Dinat
+hf_incompatible 31/32/33 PreTrainedModel DonutSwin Falcon FastSpeech2Conformer Flaubert Flava Funnel GLPN GPTJ
+hf_incompatible 31/32/33 PreTrainedModel GPTNeo GPTNeoXJapanese GroundingDino GroupViT Hiera IBert ImageGPT LED
+hf_incompatible 31/32/33 PreTrainedModel LayoutLMv2 LayoutLMv3 Levit Lilt Longformer Luke Lxmert MMGroundingDino
+hf_incompatible 31/32/33 PreTrainedModel MPNet MegatronBert Mgpstr MobileViT MobileViTV2 Mpt Mra Mvp Nystromformer
+hf_incompatible 31/32/33 PreTrainedModel OmDetTurbo OpenAIGPT Perceiver ProphetNet Pvt PvtV2 Reformer RemBert Rwkv
+hf_incompatible 31/32/33 PreTrainedModel SEWD SLANeXt SLANet SegGpt SpeechT5 SqueezeBert SuperGlue Swin2SR Swinv2
+hf_incompatible 31/32/33 PreTrainedModel TableTransformer Tapas Timesformer TrOCR Tvp Vilt VisualBert VitDet Vits
+hf_incompatible 31/32/33 PreTrainedModel WavLM XGLM XLM XLNet Yoso ZoeDepth
+hf 31/32/33 PreTrainedModel AST AXK1 AXK2 Afmoe Aimv2 Albert Align AltCLIP Apertus Arcee Aria AriaText
+hf 31/32/33 PreTrainedModel AudioFlamingo3 AyaVision Bamba Bart Beit Bert BertGeneration BigBirdPegasus BioGpt Bit
+hf 31/32/33 PreTrainedModel BitNet Blenderbot BlenderbotSmall Blip2 Blt BridgeTower CHMv2 CLIP CLIPSeg CTRL
+hf 31/32/33 PreTrainedModel Camembert Canary Chameleon ChineseCLIP Clap Cohere Cohere2 Cohere2Moe Cohere2Vision
+hf 31/32/33 PreTrainedModel CohereAsr CohereCompass ColModernVBert ColPali ColQwen2 ConditionalDetr ConvNext
+hf 31/32/33 PreTrainedModel ConvNextV2 Cosmos3Edge Cosmos3Omni Csm Cwm DFine DINOv3ConvNext DINOv3ViT DPR DPT Dac
+hf 31/32/33 PreTrainedModel Data2VecAudio Data2VecText Dbrx DecisionTransformer DecisionTransformerGPT2
+hf 31/32/33 PreTrainedModel DeepseekOcr2 DeepseekOcr2Text DeepseekV2 DeepseekV3 DeepseekV32 DeepseekV4 DeepseekVL
+hf 31/32/33 PreTrainedModel DeepseekVLHybrid DeformableDetr DeiT Deimv2 DepthAnything DepthPro Detr Dia DiffLlama
+hf 31/32/33 PreTrainedModel DiffusionGemma Dinov2 Dinov2WithRegisters DistilBert Doge Dots1 EdgeTam EdgeTamVideo
+hf 31/32/33 PreTrainedModel EfficientLoFTR EfficientNet Electra Emu3 Encodec Eomt EomtDinov3 Ernie Ernie4_5
+hf 31/32/33 PreTrainedModel Ernie4_5_Moe Ernie4_5_VLMoe Ernie4_5_VL_Moe Esm EsmFold EsmFold2 Esmc EuroBert Evolla
+hf 31/32/33 PreTrainedModel Exaone4 Exaone4_5_ ExaoneMoe FNet FalconH1 FalconMamba FastVlm FlexOlmo Florence2
+hf 31/32/33 PreTrainedModel Florence2Vision FocalNet FunAsrNano Fuyu GPT2 GPTBigCode GPTNeoX Gemma Gemma2 Gemma3
+hf 31/32/33 PreTrainedModel Gemma3n Gemma4 Gemma4Assistant Gemma4Unified Gemma4UnifiedAssistant Git Glm Glm4 Glm46V
+hf 31/32/33 PreTrainedModel Glm4Moe Glm4MoeLite Glm4v Glm4vMoe Glm5Next GlmAsr GlmImage GlmMoeDsa GlmOcr GotOcr2
+hf 31/32/33 PreTrainedModel GptOss Granite Granite4Vision GraniteMoe GraniteMoeHybrid GraniteMoeSWA
+hf 31/32/33 PreTrainedModel GraniteMoeShared GraniteSWA GraniteSpeech GraniteSpeech5 GraniteSpeechPlus HGNetV2 HYV3
+hf 31/32/33 PreTrainedModel HYV4 Helium HiggsAudioV2 HiggsAudioV2Tokenizer HrmText Hubert HunYuanDenseV1
+hf 31/32/33 PreTrainedModel HunYuanMoEV1 HunYuanVL HyperCLOVAX IJepa Idefics Idefics2 Idefics3 Informer Inkling
+hf 31/32/33 PreTrainedModel InstructBlip InstructBlipVideo InternVL InternVLVision Jais2 Jamba Janus JetMoe
+hf 31/32/33 PreTrainedModel JinaEmbeddingsV3 KimiLinear Kimi_K25 Kosmos2 Kosmos2_5 KyutaiSpeechToText Laguna Lasr
+hf 31/32/33 PreTrainedModel LayoutLM Lfm2 Lfm2Moe Lfm2Vl LightGlue LightOnOcr Llama Llama4 Llava LlavaNext
+hf 31/32/33 PreTrainedModel LlavaNextVideo LlavaOnevision LongT5 LongcatFlash LwDetr LwDetrViT M2M100 MBart MLCD
+hf 31/32/33 PreTrainedModel MT5 Mamba Mamba2 Marian MarkupLM Mellum MetaClip2 MiMoV2Flash Mimi MiniCPM3 MiniCPMV4_6
+hf 31/32/33 PreTrainedModel MiniMax MiniMaxM2 MiniMaxM3VL Ministral Ministral3 Mistral Mistral3 Mistral4 Mixtral
+hf 31/32/33 PreTrainedModel Mllama MobileBert MobileNetV1 MobileNetV2 ModernBert ModernBertDecoder ModernVBert
+hf 31/32/33 PreTrainedModel Moonshine MoonshineStreaming Moshi MuseGlimmer MuseGlimmerAssistant MusicFlamingo
+hf 31/32/33 PreTrainedModel Musicgen MusicgenMelody NanoChat Nemotron Nemotron3_5Asr NemotronAsrStreaming NemotronH
+hf 31/32/33 PreTrainedModel NeoMME NeuCodec NllbMoe NomicBert OPT Olmo Olmo2 Olmo3 OlmoHybrid Olmoe
+hf 31/32/33 PreTrainedModel OpenAIPrivacyFilter Ovis2 OwlViT Owlv2 PI0 PLBart PPDocLayoutV2 PPDocLayoutV3 PPLCNet
+hf 31/32/33 PreTrainedModel PPLCNetV3 PPLCNetV4 PPOCRV5MobileDet PPOCRV5MobileRec PPOCRV5ServerDet PPOCRV5ServerRec
+hf 31/32/33 PreTrainedModel PPOCRV6MediumDet PPOCRV6SmallDet PPOCRV6SmallRec PPOCRV6TinyRec PaddleOCRVL PaliGemma
+hf 31/32/33 PreTrainedModel Parakeet PatchTSMixer PatchTST Pegasus PegasusX PerceptionLM Persimmon Phi Phi3
+hf 31/32/33 PreTrainedModel Phi4Multimodal Phi4MultimodalAudio Phi4MultimodalVision Phimoe Pix2Struct Pixio Pixtral
+hf 31/32/33 PreTrainedModel Pop2Piano PromptDepthAnything QianfanOCR QianfanOCRVision Qwen2 Qwen2Audio Qwen2Moe
+hf 31/32/33 PreTrainedModel Qwen2VL Qwen2_5Omni Qwen2_5_VL Qwen3 Qwen3ASR Qwen3Moe Qwen3Next Qwen3OmniMoe
+hf 31/32/33 PreTrainedModel Qwen3OmniMoeThinkerText Qwen3VL Qwen3VLMoe Qwen3_5 Qwen3_5Moe Qwen4Exp RTDetr
+hf 31/32/33 PreTrainedModel RTDetrResNet RTDetrV2 Radio Rag RecurrentGemma RegNet ResNet RfDetr RfDetrDinov2
+hf 31/32/33 PreTrainedModel RoCBert Roberta RobertaPreLayerNorm SEW Sam Sam2 Sam2Video Sam3 Sam3LiteText
+hf 31/32/33 PreTrainedModel Sam3Tracker Sam3TrackerVideo Sam3Video SamHQ Sapiens2 SeamlessM4T SeamlessM4Tv2 SeedOss
+hf 31/32/33 PreTrainedModel Segformer Siglip Siglip2 SmolLM3 SmolVLM SolarOpen Speech2Text Splinter StableLm
+hf 31/32/33 PreTrainedModel Starcoder2 Step3p7 SuperPoint Swin SwitchTransformers T5 T5Gemma T5Gemma2 TextNet
+hf 31/32/33 PreTrainedModel TimeSeriesTransformer TimesFm TimesFm2_5 TimmWrapper Tipsv2 Tipsv2Dpt Tipsv2Text
+hf 31/32/33 PreTrainedModel Tipsv2Vision UMT5 UVDoc Udop UniSpeech UniSpeechSat UperNet VJEPA2 VaultGemma ViT
+hf 31/32/33 PreTrainedModel ViTMAE ViTMSN VibeVoice VibeVoiceAcousticTokenizer VibeVoiceAsr VideoLlama3 VideoLlava
+hf 31/32/33 PreTrainedModel VideoMAE VideoPrism Videomt VipLlava VitMatte VitPose VitPoseBackbone Vivit Voxtral
+hf 31/32/33 PreTrainedModel VoxtralRealtime Wav2Vec2 Wav2Vec2Bert Wav2Vec2Conformer Whisper XCLIP XLMRoberta
+hf 31/32/33 PreTrainedModel XLMRobertaXL Xcodec Xcodec2 Xmod Yolos Youtu Zamba Zamba2 Zaya xLSTM
+hf 31/32/33 PretrainedModel Bart Ernie4_5_VLMoeVisionTransformer Ernie4_5_VL_MoeVisionTransformer
+hf 31/32/33 Processor Align AltCLIP AlternatingCodebooksLogits Aria AudioFlamingo3 Auto AutoVideo AyaVision Bark
+hf 31/32/33 Processor BaseVideo Blip Blip2 BridgeTower Bros CLIP CLIPSeg Canary Chameleon ChineseCLIP Clap
+hf 31/32/33 Processor ClassifierFreeGuidanceLogits Clvp Cohere2Vision CohereAsr CohereCompass CohereCompassVideo
+hf 31/32/33 Processor ColModernVBert ColPali ColQwen2 Cosmos3Edge Cosmos3EdgeVideo Csm Data DeepseekOcr2 DeepseekVL
+hf 31/32/33 Processor DeepseekVLHybrid Dia Donut Emu3 EncoderNoRepeatNGramLogits EncoderRepetitionPenaltyLogits
+hf 31/32/33 Processor Ernie4_5_VLMoe Ernie4_5_VLMoeVideo Evolla Exaone4_5_ Flava Florence2 ForcedBOSTokenLogits
+hf 31/32/33 Processor ForcedEOSTokenLogits FunAsrNano Fuyu Gemma3 Gemma3n Gemma4 Gemma4Unified Gemma4UnifiedVideo
+hf 31/32/33 Processor Gemma4Video Git Glm46V Glm46VVideo Glm4v Glm4vVideo Glm5Next Glm5NextVideo GlmAsr GlmgaVideo
+hf 31/32/33 Processor GotOcr2 Granite4Vision GraniteSpeech GraniteSpeech5 GroundingDino HiggsAudioV2 HunYuanVL
+hf 31/32/33 Processor Idefics Idefics2 Idefics3 InfNanRemoveLogits Inkling InstructBlip InstructBlipVideo
+hf 31/32/33 Processor InstructBlipVideoVideo InternVL InternVLVideo Janus Kimi_K25 Kimi_K25Video Kosmos2 Kosmos2_5
+hf 31/32/33 Processor KyutaiSpeechToText Lasr LayoutLMv2 LayoutLMv3 LayoutXLM Lfm2Vl LightOnOcr
+hf 31/32/33 Processor LinearTemperatureScheduleLogits Llama4 Llava LlavaNext LlavaNextVideo LlavaNextVideoVideo
+hf 31/32/33 Processor LlavaOnevision LlavaOnevisionVideo Logits MarkupLM Mgpstr MinLengthLogits
+hf 31/32/33 Processor MinNewTokensLengthLogits MiniCPMV4_6 MiniCPMV4_6Video MiniMaxM3VL MiniMaxM3VLVideo Mllama
+hf 31/32/33 Processor MoonshineStreaming MuseGlimmer MuseGlimmerVideo MusicFlamingo Musicgen MusicgenMelody
+hf 31/32/33 Processor Nemotron3_5Asr NemotronAsrStreaming NeoMME NoBadWordsLogits NoRepeatNGramLogits Nougat
+hf 31/32/33 Processor OmDetTurbo Ovis2 OwlViT Owlv2 PI0 PPChart2Table PaddleOCRVL PaliGemma Parakeet PeAudio
+hf 31/32/33 Processor PeAudioVideo PeVideo PeVideoVideo PerceptionLM PerceptionLMVideo Phi4Multimodal Pix2Struct
+hf 31/32/33 Processor Pixtral Pop2Piano PrefixConstrainedLogits QianfanOCR Qwen2Audio Qwen2VL Qwen2VLVideo
+hf 31/32/33 Processor Qwen2_5Omni Qwen2_5_VL Qwen3ASR Qwen3OmniMoe Qwen3VL Qwen3VLVideo RepetitionPenaltyLogits Sam
+hf 31/32/33 Processor Sam2 Sam2Video Sam2VideoVideo Sam3 Sam3Tracker Sam3TrackerVideo Sam3Video SamHQ SeamlessM4T
+hf 31/32/33 Processor SequenceBiasLogits ShieldGemma2 Siglip Siglip2 SingleSentenceClassification SmolVLM
+hf 31/32/33 Processor SmolVLMVideo Speech2Text SpeechT5 SquadV1 SquadV2 Step3p7 SuppressTokensAtBeginLogits
+hf 31/32/33 Processor SuppressTokensLogits SynthIDTextWatermarkLogits TimesformerVideo Tipsv2 TrOCR Tvp Udop
+hf 31/32/33 Processor UnbatchedClassifierFreeGuidanceLogits VJEPA2Video VibeVoice VibeVoiceAsr VideoLlama3
+hf 31/32/33 Processor VideoLlama3Video VideoLlava VideoLlavaVideo VideoMAEVideo VideoPrism VideomtVideo Vilt
+hf 31/32/33 Processor VisionTextDualEncoder VivitVideo Voxtral VoxtralRealtime WatermarkLogits Wav2Vec2
+hf 31/32/33 Processor Wav2Vec2Bert Whisper WhisperTimeStampLogits XCLIP
+hf 31/32/33 Tokenizer Albert Auto Bart Barthez Bartpho Basic Bert BertGeneration BertJapanese Bertweet BigBird
+hf 31/32/33 Tokenizer BioGpt Blenderbot BlenderbotSmall ByT5 CLIP CTRL Camembert Canine Character Clvp CodeGen
+hf 31/32/33 Tokenizer CodeLlama Cohere ConvBert Cpm CpmAnt DPRContextEncoder DPRQuestionEncoder DPRReader Deberta
+hf 31/32/33 Tokenizer DebertaV2 Dia DistilBert Esm Esmc FNet FSMT FastSpeech2Conformer Flaubert Funnel GPT2 GPTNeoX
+hf 31/32/33 Tokenizer GPTNeoXJapanese GPTSw3 Gemma Herbert Lasr LayoutLMv2 LayoutLMv3 LayoutXLM Llama Luke M2M100
+hf 31/32/33 Tokenizer MBart MBart50 MLuke MPNet Marian MarkupLM Mecab Mgpstr MobileBert MyT5 Nllb Nougat OpenAIGPT
+hf 31/32/33 Tokenizer PLBart Parakeet Pegasus Perceiver Phobert Pop2Piano PreTrained ProphetNet Qwen2 Qwen3_5 Rag
+hf 31/32/33 Tokenizer Reformer RemBert RoCBert Roberta SeamlessM4T Siglip Siglip2 Speech2Text SpeechT5 Splinter
+hf 31/32/33 Tokenizer SqueezeBert T5 Tapas Tipsv2 Udop VideoPrism Vits Wav2Vec2CTC Wav2Vec2PhonemeCTC Whisper
+hf 31/32/33 Tokenizer Wordpiece XGLM XLM XLMRoberta XLNet
+hf 31/32/33 TokenizerFast Bart CodeLlama Cpm DPRContextEncoder DPRQuestionEncoder DPRReader DistilBert FNet
+hf 31/32/33 TokenizerFast LayoutLMv3 Llama MarkupLM MobileBert PreTrained Roberta SqueezeBert
+config 32/33 - axk1 axk2 cohere_compass cohere_compass_text cohere_compass_vision cosmos3_edge cosmos3_edge_text
+config 32/33 - cosmos3_edge_vision cosmos3_omni deepseek_v32 diffusion_gemma diffusion_gemma_text esmc esmfold2
+config 32/33 - glm5_next glm5_next_text glm5_next_vision granite_speech5_ctc granite_speech5_encoder granite_swa
+config 32/33 - granitemoe_swa hunyuan_vl hunyuan_vl_text hunyuan_vl_vision inkling_audio inkling_mm_model
+config 32/33 - inkling_text inkling_vision kimi_k25 kimi_k25_vision mimo_v2_flash minicpm3 minimax_m3_vl
+config 32/33 - minimax_m3_vl_text minimax_m3_vl_vision muse_glimmer muse_glimmer_assistant muse_glimmer_text
+config 32/33 - muse_glimmer_vision nemotron3_5_asr nemotron_asr_streaming nemotron_asr_streaming_encoder
+config 32/33 - parakeet_rnnt qwen3_asr qwen3_asr_encoder qwen4_exp qwen4_exp_text qwen4_exp_vision radio step3p5
+config 32/33 - step3p5_vision step3p7 tipsv2 tipsv2_dpt tipsv2_text_model tipsv2_vision_model videoprism
+config 32/33 - videoprism_text_model videoprism_vision_model xcodec2 zaya
+hf 32/33 Cache Nemotron3DiarizationSpeaker
+hf 32/33 Config EmbeddingGemma2 EmbeddingGemma2Text Gte HyperCLOVAXVisionV2 MiniCPMV4_7 MiniCPMV4_7Vision
+hf 32/33 Config Nemotron3Diarization Nemotron3DiarizationAudio Nemotron3DiarizationHead
+hf 32/33 Config Nemotron3DiarizationStreaming NemotronH_Omni_Reasoning_V3_
+hf 32/33 ForAudioFrameClassification Nemotron3Diarization
+hf 32/33 ForConditionalGeneration HyperCLOVAXVisionV2
+hf 32/33 ForMaskedLM Gte
+hf 32/33 ForSequenceClassification Gte
+hf 32/33 ForTokenClassification Gte
+hf 32/33 ImageProcessor NemotronH_Omni_Reasoning_V3
+hf 32/33 Model EmbeddingGemma2Text HyperCLOVAXVisionV2 MiniCPMV4_7 MiniCPMV4_7Vision Nemotron3Diarization
+hf 32/33 Model Nemotron3DiarizationAudio
+hf 32/33 Output Nemotron3Diarization
+hf 32/33 PreTrainedModel EmbeddingGemma2 Gte HyperCLOVAXVisionV2 MiniCPMV4_7 MiniCPMV4_7Vision Nemotron3Diarization
+hf 32/33 PreTrainedModel NemotronH_Omni_Reasoning_V3
+hf 32/33 PretrainedModel Qwen2_5_VisionTransformer
+hf 32/33 Processor EmbeddingGemma2 EmbeddingGemma2Video HyperCLOVAXVisionV2 MiniCPMV4_7 Nemotron3Diarization
+hf 32/33 Processor NemotronH_Omni_Reasoning_V3 NemotronH_Omni_Reasoning_V3Video
+hf 33 - Molmo2Adapter
+hf 33 Config BailingHybrid Beam Kolibri1 Molmo2 Molmo2Adapter Molmo2Text Molmo2Vision MossTranscribeDiarize
+hf 33 Config MossTranscribeDiarizeAudio MuseSpark MuseSparkAudio MuseSparkText MuseSparkVision PPChart2TableVision
+hf 33 Config PPDocLayoutV4 SLANeXtVision Ultrabert UnlimitedOcr UnlimitedOcrSamVision UnlimitedOcrText
+hf 33 Config UnlimitedOcrVision UnlimitedOcrVisionEncoder
+hf 33 FeatureExtractor MossTranscribeDiarize MuseSpark
+hf 33 ForCausalLM BailingHybrid
+hf 33 ForConditionalGeneration UnlimitedOcr
+hf 33 ForMaskedLM Ultrabert
+hf 33 ForObjectDetection PPDocLayoutV4
+hf 33 ForQuestionAnswering Ultrabert
+hf 33 ForSequenceClassification Ultrabert
+hf 33 ForTokenClassification Ultrabert
+hf 33 ImageProcessor Molmo2 PPDocLayoutV4 UnlimitedOcr
+hf 33 Model BailingHybrid Beam Kolibri1 Molmo2 Molmo2Text Molmo2Vision MossTranscribeDiarize
+hf 33 Model MossTranscribeDiarizeAudio MuseSpark MuseSparkAudio MuseSparkText MuseSparkVision PPDocLayoutV4
+hf 33 Model Ultrabert UnlimitedOcr UnlimitedOcrText UnlimitedOcrVision
+hf 33 PreTrainedModel BailingHybrid Beam Kolibri1 Molmo2 MossTranscribeDiarize MuseSpark PPDocLayoutV4 Ultrabert
+hf 33 PreTrainedModel UnlimitedOcr UnlimitedOcrText
+hf 33 Processor Molmo2 Molmo2Video MossTranscribeDiarize MuseSpark UnlimitedOcr
+# Causal LM entries map model_type=class_prefix to the default generation class in all eligible Transformers wheels.
+causal 31/32/33 - bert-generation=BertGenerationDecoder reformer=ReformerModelWithLMHead
+causal 31/32/33 ForCausalLM afmoe=Afmoe apertus=Apertus arcee=Arcee aria_text=AriaText bamba=Bamba bart=Bart
+causal 31/32/33 ForCausalLM big_bird=BigBird bigbird_pegasus=BigBirdPegasus biogpt=BioGpt bitnet=BitNet
+causal 31/32/33 ForCausalLM blenderbot=Blenderbot blenderbot-small=BlenderbotSmall bloom=Bloom blt=Blt
+causal 31/32/33 ForCausalLM camembert=Camembert codegen=CodeGen cohere=Cohere cohere2=Cohere2 cohere2_moe=Cohere2Moe
+causal 31/32/33 ForCausalLM cpmant=CpmAnt cwm=Cwm data2vec-text=Data2VecText dbrx=Dbrx deepseek_v2=DeepseekV2
+causal 31/32/33 ForCausalLM deepseek_v3=DeepseekV3 deepseek_v4=DeepseekV4 diffllama=DiffLlama doge=Doge dots1=Dots1
+causal 31/32/33 ForCausalLM electra=Electra emu3=Emu3 ernie=Ernie ernie4_5=Ernie4_5 ernie4_5_moe=Ernie4_5_Moe
+causal 31/32/33 ForCausalLM exaone4=Exaone4 exaone_moe=ExaoneMoe falcon=Falcon falcon_h1=FalconH1
+causal 31/32/33 ForCausalLM falcon_mamba=FalconMamba flex_olmo=FlexOlmo fuyu=Fuyu gemma=Gemma gemma2=Gemma2
+causal 31/32/33 ForCausalLM gemma3_text=Gemma3 gemma3n_text=Gemma3n gemma4_assistant=Gemma4Assistant gemma4_text=Gemma4
+causal 31/32/33 ForCausalLM gemma4_unified_assistant=Gemma4UnifiedAssistant gemma4_unified_text=Gemma4Unified git=Git
+causal 31/32/33 ForCausalLM glm=Glm glm4=Glm4 glm4_moe=Glm4Moe glm4_moe_lite=Glm4MoeLite glm_moe_dsa=GlmMoeDsa
+causal 31/32/33 ForCausalLM gpt_bigcode=GPTBigCode gpt_neo=GPTNeo gpt_neox=GPTNeoX gpt_neox_japanese=GPTNeoXJapanese
+causal 31/32/33 ForCausalLM gpt_oss=GptOss gptj=GPTJ granite=Granite granitemoe=GraniteMoe
+causal 31/32/33 ForCausalLM granitemoehybrid=GraniteMoeHybrid granitemoeshared=GraniteMoeShared helium=Helium
+causal 31/32/33 ForCausalLM hrm_text=HrmText hunyuan_v1_dense=HunYuanDenseV1 hunyuan_v1_moe=HunYuanMoEV1 hy_v3=HYV3
+causal 31/32/33 ForCausalLM hyperclovax=HyperCLOVAX jais2=Jais2 jamba=Jamba jetmoe=JetMoe laguna=Laguna lfm2=Lfm2
+causal 31/32/33 ForCausalLM lfm2_moe=Lfm2Moe llama=Llama llama4=Llama4 llama4_text=Llama4 longcat_flash=LongcatFlash
+causal 31/32/33 ForCausalLM mamba=Mamba mamba2=Mamba2 marian=Marian mbart=MBart megatron-bert=MegatronBert
+causal 31/32/33 ForCausalLM mellum=Mellum minimax=MiniMax minimax_m2=MiniMaxM2 ministral=Ministral
+causal 31/32/33 ForCausalLM ministral3=Ministral3 mistral=Mistral mixtral=Mixtral mllama=Mllama
+causal 31/32/33 ForCausalLM modernbert-decoder=ModernBertDecoder moshi=Moshi mpt=Mpt musicgen=Musicgen
+causal 31/32/33 ForCausalLM musicgen_melody=MusicgenMelody mvp=Mvp nanochat=NanoChat nemotron=Nemotron
+causal 31/32/33 ForCausalLM nemotron_h=NemotronH olmo=Olmo olmo2=Olmo2 olmo3=Olmo3 olmo_hybrid=OlmoHybrid olmoe=Olmoe
+causal 31/32/33 ForCausalLM opt=OPT pegasus=Pegasus persimmon=Persimmon phi=Phi phi3=Phi3
+causal 31/32/33 ForCausalLM phi4_multimodal=Phi4Multimodal phimoe=Phimoe plbart=PLBart prophetnet=ProphetNet
+causal 31/32/33 ForCausalLM qwen2=Qwen2 qwen2_moe=Qwen2Moe qwen3=Qwen3 qwen3_5=Qwen3_5 qwen3_5_moe=Qwen3_5Moe
+causal 31/32/33 ForCausalLM qwen3_5_moe_text=Qwen3_5Moe qwen3_5_text=Qwen3_5 qwen3_moe=Qwen3Moe qwen3_next=Qwen3Next
+causal 31/32/33 ForCausalLM recurrent_gemma=RecurrentGemma rembert=RemBert roberta=Roberta
+causal 31/32/33 ForCausalLM roberta-prelayernorm=RobertaPreLayerNorm roc_bert=RoCBert roformer=RoFormer rwkv=Rwkv
+causal 31/32/33 ForCausalLM seed_oss=SeedOss smollm3=SmolLM3 solar_open=SolarOpen stablelm=StableLm
+causal 31/32/33 ForCausalLM starcoder2=Starcoder2 trocr=TrOCR vaultgemma=VaultGemma whisper=Whisper xglm=XGLM
+causal 31/32/33 ForCausalLM xlm-roberta=XLMRoberta xlm-roberta-xl=XLMRobertaXL xlstm=xLSTM xmod=Xmod youtu=Youtu
+causal 31/32/33 ForCausalLM zamba=Zamba zamba2=Zamba2
+causal 31/32/33 ForConditionalGeneration gemma3=Gemma3 gemma3n=Gemma3n gemma4=Gemma4 gemma4_unified=Gemma4Unified
+causal 31/32/33 ForConditionalGeneration got_ocr2=GotOcr2
+causal 31/32/33 LMHeadModel bert=Bert ctrl=CTRL gpt-sw3=GPT2 gpt2=GPT2 openai-gpt=OpenAIGPT xlm=XLMWith xlnet=XLNet
+causal 32/33 ForCausalLM axk1=AXK1 axk2=AXK2 cohere_compass_text=CohereCompass deepseek_v32=DeepseekV32
+causal 32/33 ForCausalLM granite_swa=GraniteSWA granitemoe_swa=GraniteMoeSWA inkling_text=Inkling
+causal 32/33 ForCausalLM mimo_v2_flash=MiMoV2Flash minicpm3=MiniCPM3 minimax_m3_vl_text=MiniMaxM3VL qwen4_exp=Qwen4Exp
+causal 32/33 ForCausalLM qwen4_exp_text=Qwen4Exp zaya=Zaya

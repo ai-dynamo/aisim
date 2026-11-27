@@ -372,10 +372,61 @@ def test_context_length_max_reads_the_decoder_that_fpm_intake_reads(tmp_path, do
             },
             "ambiguous nested llm_config in text_config",
         ),
+        (
+            {
+                "architectures": ["NemotronH_Omni_Reasoning_V3"],
+                "max_position_embeddings": 4096,
+                "llm_config": None,
+                "text_config": {"max_position_embeddings": 32768},
+            },
+            "llm_config must be a nonempty object describing one text decoder",
+        ),
+        (
+            {
+                "architectures": ["NemotronH_Omni_Reasoning_V3"],
+                "llm_config": None,
+                "text_config": {"max_position_embeddings": 32768},
+            },
+            "llm_config must be a nonempty object describing one text decoder",
+        ),
     ],
-    ids=["null-llm-config-of-a-registered-wrapper", "null-text-config", "text-config-nesting-llm-config"],
+    ids=[
+        "null-llm-config-of-a-registered-wrapper",
+        "null-text-config",
+        "text-config-nesting-llm-config",
+        "malformed-llm-config-beside-a-text-config-with-a-wrapper-limit",
+        "malformed-llm-config-beside-a-text-config-without-a-wrapper-limit",
+    ],
 )
 def test_context_length_max_refuses_a_malformed_or_nested_decoder(tmp_path, document, problem):
     (tmp_path / "config.json").write_text(json.dumps(document))
     with pytest.raises(ValueError, match=re.escape(f"Hugging Face config for {str(tmp_path)!r}: {problem}")):
         aic.resolve_model_context_length(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "document,problem",
+    [
+        (
+            {"architectures": ["NemotronH_Omni_Reasoning_V3"], "text_config": {"max_position_embeddings": 32768}},
+            "NemotronH_Omni_Reasoning_V3 keeps its text decoder under llm_config, "
+            "but this config holds text_config and no llm_config",
+        ),
+        (
+            {"architectures": ["Qwen3_5MoeForConditionalGeneration"], "llm_config": {"max_position_embeddings": 32768}},
+            "Qwen3_5MoeForConditionalGeneration keeps its text decoder under text_config, "
+            "but this config holds llm_config and no text_config",
+        ),
+        (
+            {"architectures": ["NemotronH_Omni_Reasoning_V3"], "text_config": None},
+            "NemotronH_Omni_Reasoning_V3 keeps its text decoder under llm_config, "
+            "but this config holds text_config and no llm_config",
+        ),
+    ],
+    ids=["llm-wrapper", "text-wrapper", "llm-wrapper-with-a-null-text-config"],
+)
+def test_context_length_max_refuses_a_registered_wrapper_with_only_the_other_decoder_key(tmp_path, document, problem):
+    (tmp_path / "config.json").write_text(json.dumps(document))
+    with pytest.raises(ValueError) as refusal:
+        aic.resolve_model_context_length(str(tmp_path))
+    assert str(refusal.value) == f"Hugging Face config for {str(tmp_path)!r}: {problem}"

@@ -591,13 +591,14 @@ def sweep_agg(
                 point_model_config,
                 model_path,
                 backend_name,
-                getattr(database, "version", None),
+                database.version,
                 getattr(database, "system_spec", {}),
             )
             model = get_model(
                 model_path=model_path,
                 model_config=point_model_config,
                 backend_name=backend_name,
+                database=database,
             )
 
             runtime_configs_to_evaluate: list[config.RuntimeConfig] = []
@@ -766,10 +767,15 @@ def _get_disagg_worker_candidates(
                     point_mc,
                     model_path,
                     backend_name,
-                    getattr(database, "version", None),
+                    database.version,
                     getattr(database, "system_spec", {}),
                 )
-            model = get_model(model_path=model_path, model_config=point_mc, backend_name=backend_name)
+            model = get_model(
+                model_path=model_path,
+                model_config=point_mc,
+                backend_name=backend_name,
+                database=database,
+            )
 
             for b in b_list:
                 point_rt = dataclasses.replace(runtime_config, batch_size=b)

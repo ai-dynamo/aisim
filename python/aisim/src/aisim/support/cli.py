@@ -201,6 +201,11 @@ def add_support_parser(subparsers: Any) -> None:
         help="vLLM capture limit for this role; aggregated applies it to both launches. "
         "Requires runtime prefill policy.",
     )
+    init.add_argument(
+        "--warmup-iterations",
+        type=int,
+        help="Global warm-up iterations of the collector (collector default: 5). A GLM-5.3-Flash collection needs 0.",
+    )
     init.add_argument("--ttft-ms", type=float, help="Synthetic validation TTFT target in ms (default: 1000).")
     init.add_argument("--tpot-ms", type=float, help="Synthetic validation TPOT target in ms (default: 100).")
     init.add_argument(
@@ -408,6 +413,7 @@ _CORRECTION_PROMPTS = {
         lambda value: [int(x) for x in value.split()],
     ),
     "max_cudagraph_capture_size": ("CUDA graph capture limit for this role", int),
+    "warmup_iterations": ("Collector warm-up iterations", int),
     "framework": ("Runtime (vllm)", str),
     "tokenizer_revision": ("Pinned tokenizer revision", str),
     "chat_template_revision": ("Pinned chat-template revision", str),
@@ -625,6 +631,8 @@ def _review_config_profile(
         settings = request.collection_settings()
         print(f"  Runtime context limit: {request.search.context_length} tokens per request.")
         print(f"  Collection: {json.dumps(settings, sort_keys=True)}")
+        if request.collection.warmup_iterations is not None:
+            print(f"  Collector warm-up iterations: {request.collection.warmup_iterations}")
         print("  AISim launches and manages benchmark workers when collection is executed.")
         print("  vLLM loads the model and allocates caches; Dynamo self-benchmark generates and measures the grid.")
         print("  AISim supplies runtime limits and collection policies; no HTTP server is needed beforehand.")
@@ -1361,6 +1369,8 @@ def _init(args: argparse.Namespace) -> int:
         f"{request.parallel_preset} {request.parallelism()}; runtime context {request.search.context_length} tokens."
     )
     print("Collection settings: " + json.dumps(request.collection_settings(), sort_keys=True))
+    if request.collection.warmup_iterations is not None:
+        print(f"Collector warm-up iterations: {request.collection.warmup_iterations}")
     print(f"Collection GPUs required: {request.worker_gpus} for one selected worker; availability is unchecked.")
     if args.model_config:
         print(

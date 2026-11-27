@@ -25,7 +25,7 @@ from aisim.config.engine import KvCachePredictionConfig
 from aisim.recommend import _candidate_prediction, recommendation_to_sweeper
 from aisim.runner import EngineReplayRunnerFactory
 from aisim.sweeper.deploy import build_backend_deployment
-from aisim.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
+from aisim.sweeper.parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
 from aisim.sweeper.replay import ReplayOutputRequirements, ReplaySpec, RunnerCapabilities
 from aisim.sweeper.sample import unroll_sample
 
@@ -437,6 +437,8 @@ def test_agentic_g2_public_config_preserves_role_scopes_through_native_payload(
 def test_prediction_host_offload_auto_geometry_uses_aggregated_shape(
     monkeypatch,
 ) -> None:
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
+
     engine = _prediction_engine()
     engine["workers"]["aggregated"]["parallelism"]["tensor"] = 4
     engine["workers"]["aggregated"]["kv_cache"]["host_offload"] = _host_offload()
@@ -459,9 +461,48 @@ def test_prediction_host_offload_auto_geometry_uses_aggregated_shape(
             "pp_size": 1,
             "moe_tp_size": 1,
             "moe_ep_size": 1,
+            "backend": "vllm",
+            "backend_version": None,
+            "system": "h200_sxm",
+            "systems_paths": None,
             "kvcache_quant_mode": None,
         }
     ]
+
+
+def test_fixed_timing_host_offload_compiles_without_an_op_dataset(monkeypatch):
+    monkeypatch.delenv("AICONFIGURATOR_SYSTEMS_PATH", raising=False)
+
+    def unexpected_catalog():
+        pytest.fail("fixed timing and dense cache geometry do not use the performance catalog")
+
+    monkeypatch.setattr("aisim_core.sdk.perf_database.get_systems_paths", unexpected_catalog)
+    monkeypatch.setattr("aisim_core.data.default_systems.default_systems_path", unexpected_catalog)
+    engine = _prediction_engine()
+    engine.update(model="Qwen/Qwen3-0.6B", backend_version="0.32.0")
+    engine["workers"]["aggregated"]["kv_cache"].update(bytes_per_token="auto", host_offload=_host_offload())
+    deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
+    assert deployment.agg_engine_args["kv_cache_bytes_per_token"] == 114_688
+
+    worker = engine["workers"]["aggregated"]
+    worker["parallelism"]["preset"] = False
+    config = CoreRecommendationConfig.model_validate(
+        {"engine": engine, "optimization": {"constraints": {"max_candidate_gpus": 1}}}
+    )
+    sample = unroll_sample(
+        search_space=recommendation_to_sweeper(config).search_space,
+        selection={
+            "backend": "vllm",
+            "deployment_mode": "agg",
+            "agg_max_num_batched_tokens": 8192,
+            "agg_max_num_seqs": 4,
+        },
+        parallel_config=ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1),
+    )
+    assert (
+        build_backend_deployment(sample, backend_version="0.32.0").agg_engine_args["kv_cache_bytes_per_token"]
+        == 114_688
+    )
 
 
 def test_prediction_auto_transfer_geometry_uses_prefill_source_shape(
@@ -571,6 +612,94 @@ def test_recommendation_carries_fixed_host_descriptor_without_search_dimension()
     assert space.agg_kv_bytes_per_token == 131_072
     assert space.agg_native_host_offload == _host_offload()
     assert "host" not in space.engine_float_ranges
+
+
+@pytest.mark.parametrize(
+    ("feature", "valid_shared", "override_role", "can_size", "root_source"),
+    [
+        ("transfer", True, None, True, "explicit"),
+        ("transfer", False, "prefill", True, "explicit"),
+        ("transfer", True, "prefill", False, "explicit"),
+        ("transfer", True, "decode", True, "explicit"),
+        ("aggregated", False, "aggregated", True, "explicit"),
+        ("prefill", True, "prefill", False, "explicit"),
+        ("decode", False, "decode", True, "explicit"),
+        ("transfer", True, None, True, "environment"),
+        ("transfer", False, None, False, "environment"),
+        ("transfer", False, None, True, "default"),
+    ],
+)
+def test_recommendation_and_prediction_use_the_same_worker_roots_for_auto_kv(
+    tmp_path, monkeypatch, feature, valid_shared, override_role, can_size, root_source
+):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("zai-org/GLM-5-FP8")
+    (tmp_path / "config.json").write_text(json.dumps({**raw, "architectures": ["LocalMultimodal"], "text_config": raw}))
+    hopper, empty = tmp_path / "hopper", tmp_path / "empty"
+    hopper.mkdir()
+    empty.mkdir()
+    (hopper / "h200_sxm.yaml").write_text("gpu: {sm_version: 90}\n")
+    mode = "aggregated" if feature == "aggregated" else "disaggregated"
+    engine = _prediction_engine(mode=mode)
+    engine.update(model=str(tmp_path), backend_version="0.33.0")
+    shared = str(hopper if valid_shared else empty)
+    if root_source == "explicit":
+        engine["systems_paths"] = [shared]
+    else:
+        monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", shared)
+        if root_source == "default":
+            engine["systems_paths"] = ["default"]
+    for role, worker in engine["workers"].items():
+        worker["parallelism"]["tensor"] = 1
+        worker["timing"] = {"type": "default"}
+        if role == override_role:
+            worker["timing"]["systems_paths"] = [str(empty if valid_shared else hopper)]
+    if feature == "transfer":
+        engine["kv_transfer"] = {"bytes_per_token": "auto", "bandwidth_gb_per_second": 80}
+    else:
+        engine["workers"][feature]["kv_cache"].update(bytes_per_token="auto", host_offload=_host_offload())
+    prediction = CorePredictionConfig.model_validate({"engine": engine})
+    for worker in engine["workers"].values():
+        worker["parallelism"] = {"preset": False, **worker["parallelism"]}
+    config = CoreRecommendationConfig.model_validate(
+        {"engine": engine, "optimization": {"constraints": {"max_candidate_gpus": 2}}}
+    )
+    space = recommendation_to_sweeper(config).search_space
+    selection = {"backend": "vllm", "deployment_mode": "agg" if mode == "aggregated" else "disagg"}
+    for role in engine["workers"]:
+        prefix = "agg" if role == "aggregated" else role
+        selection.update({f"{prefix}_max_num_batched_tokens": 8192, f"{prefix}_max_num_seqs": 4})
+    rank = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), replicas=1)
+    sample = unroll_sample(
+        search_space=space,
+        selection=selection,
+        parallel_config=rank if mode == "aggregated" else DisaggParallelConfig(rank, rank),
+    )
+    source = engine["workers"]["prefill" if feature == "transfer" else feature]
+    paths = source["timing"].get("systems_paths", engine.get("systems_paths", [shared]))
+    if can_size and root_source != "default":
+        assert (
+            estimate_kv_bytes_per_token(
+                str(tmp_path), tp_size=1, pp_size=1, backend_version="0.33.0", system="h200_sxm", systems_paths=paths
+            )
+            == 100_152
+        )
+    for compile_deployment in (
+        lambda: prediction_to_replay_spec(prediction).backend_deployment,
+        lambda: build_backend_deployment(sample, backend_version="0.33.0"),
+    ):
+        if not can_size:
+            with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
+                compile_deployment()
+        elif feature == "transfer":
+            deployment = compile_deployment()
+            assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == 100_152
+            assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == 100_152
+        else:
+            role = "agg" if feature == "aggregated" else feature
+            assert getattr(compile_deployment(), f"{role}_engine_args")["kv_cache_bytes_per_token"] == 100_152
 
 
 def test_recommendation_materializes_concrete_host_offload_prediction() -> None:

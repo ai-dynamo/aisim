@@ -233,7 +233,7 @@ def _shared_copy(op, inter, hidden, count):
     return type(op)(*args, **kwargs)
 
 
-def build_afd_model(model_path, config, backend, role):
+def build_afd_model(model_path, config, backend, role, backend_version=None):
     from aisim_core.sdk.models import get_model
 
     if role not in ("a", "f") or backend != "sglang":
@@ -255,7 +255,7 @@ def build_afd_model(model_path, config, backend, role):
         moe_ep_size=reference_tp,
         moe_comm_backend=None,
     )
-    model = get_model(model_path, reference_cfg, backend)
+    model = get_model(model_path, reference_cfg, backend, backend_version)
     if role == "a" and hasattr(model, "_resolve_dims"):
         dimensions = model._resolve_dims(reference_tp)
         for key, value in dimensions.items():

@@ -558,8 +558,9 @@ def evaluate_interpolation_holdout(
         "measurement_noise": "not_separated_from_interpolation_error",
         "reference_measurement_policy": metadata["measurement_policy"],
         "limitations": [
-            "Each reference is the original single-sample formal-table measurement; separate subset "
-            "repeatability evidence does not remove measurement noise from these errors.",
+            "Each reference is the original formal-table measurement, taken under the policy that "
+            "reference_measurement_policy names; separate subset repeatability evidence does not remove measurement "
+            "noise from these errors.",
             "The bounded representative holdout is not a statistical confidence bound or full-domain accuracy claim.",
             "When available, boundary retention uses native expected point modes and resolved graph configuration, "
             "not observed per-call dispatch.",

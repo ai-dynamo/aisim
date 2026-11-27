@@ -72,6 +72,7 @@ def test_pre_rename_plan_is_verified_and_previewed_without_rewriting(tmp_path, c
     # Keep the real saved-plan checks while isolating collector model preflight.
     def resolve(command):
         assert "--plan-only" in command
+        return None, (SimpleNamespace(options=SimpleNamespace(benchmark_points_dropped_json=None)), {})
 
     monkeypatch.setattr(fpm, "_resolve_execution", resolve)
 
@@ -913,18 +914,36 @@ def test_preview_is_shell_safe_and_does_not_create_outputs_or_import_collector(t
     assert not root.exists()
 
 
-def _mock_collector_execution(monkeypatch, calls):
+def _mock_collector_execution(monkeypatch, calls, *, dropped=None):
     from collector.fpm_forward import cli, entry
 
     from aisim.support import collection_readiness, fpm
 
     def resolve(command):
         calls.append(command[3:])
-        return cli._parser().parse_args(command[3:]), (SimpleNamespace(cells=(), sha256="a" * 64), {})
+        return cli._parser().parse_args(command[3:]), (
+            SimpleNamespace(cells=(), sha256="a" * 64, options=SimpleNamespace(benchmark_points_dropped_json=dropped)),
+            {},
+        )
 
     monkeypatch.setattr(fpm, "_resolve_execution", resolve)
     monkeypatch.setattr(entry, "run_resolved", lambda *_: [{"error_message": "synthetic collection failure"}])
     monkeypatch.setattr(collection_readiness, "assess_readiness", lambda *a, **k: {"ready_for_full_collection": True})
+
+
+def test_execution_shows_the_dropped_points_of_a_generated_list(tmp_path, monkeypatch, capsys):
+    dropped = '{"decode":{"candidates":2,"token_budget":1},"prefill":{"candidates":3,"mamba_align_split":0}}'
+    calls = []
+    _mock_collector_execution(monkeypatch, calls, dropped=dropped)
+    request = _request()
+    create_plan(request, tmp_path)
+    capsys.readouterr()
+    assert run_fpm(request, execute=True, output_dir=tmp_path, smoke=True) == 1
+    assert len(calls) == 1
+    error = capsys.readouterr().err
+    assert "Point list: candidates and dropped points by phase and rule: " + dropped in error.splitlines()
+    # The run reached the collector stub: its failure is the reported error.
+    assert "synthetic collection failure" in error
 
 
 def test_execute_delegates_only_for_matching_plan(tmp_path, monkeypatch):

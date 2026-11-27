@@ -13,8 +13,8 @@ from aisim_core.sdk.models.helpers import (
     large_ep_gpus_per_node,
     mtp_scale_factor,
     power_law_distribution,
+    validate_model_fp8_moe_shard,
 )
-from aisim_core.sdk.utils import _get_language_quantization_config, _load_model_config_from_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class MOEModel(BaseModel):
             model_config,
         )
         extra_params = model_info["extra_params"]
-        return cls(*moe_args, *base_args, extra_params, backend_name=backend_name)
+        return cls(*moe_args, *base_args, extra_params, backend_name=backend_name, model_info=model_info)
 
     # gpt-oss alternates banded (window 128) and global attention, half the
     # layers each. The timing path already models this (see the
@@ -97,7 +97,15 @@ class MOEModel(BaseModel):
             return super().get_kvcache_max_tokens(kv_budget_bytes)
         return self._binary_search_kvcache_max_tokens(kv_budget_bytes)
 
-    def __init__(self, topk: int, num_experts: int, moe_inter_size: int, *args, backend_name: str = "") -> None:
+    def __init__(
+        self,
+        topk: int,
+        num_experts: int,
+        moe_inter_size: int,
+        *args,
+        backend_name: str = "",
+        model_info: dict | None = None,
+    ) -> None:
         super().__init__(*args)
 
         self._backend_name = backend_name
@@ -131,7 +139,7 @@ class MOEModel(BaseModel):
         self._moe_inter_size = moe_inter_size
 
         # Validate quantized MoE block size alignment
-        self._validate_fp8_block_quantized_moe_config()
+        validate_model_fp8_moe_shard(self, moe_inter_size, model_info)
 
         self._power_law_alpha = 1.2
 
@@ -353,32 +361,3 @@ class MOEModel(BaseModel):
         pp_scale_factor = pp_size - 1
         self.context_ops.append(ops.P2P("context_p2p", pp_scale_factor, h, pp_size, seq_split=cp))
         self.generation_ops.append(ops.P2P("generation_p2p", pp_scale_factor * self._mtp_scale_factor, h, pp_size))
-
-    def _validate_fp8_block_quantized_moe_config(self) -> None:
-        """
-        Validate that quantized MoE configuration satisfies block size constraints.
-
-        For fp8_block quantized MoE models, the constraint is:
-        (moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0
-
-        This ensures proper alignment for quantized weight blocks.
-        """
-        # Only validate for fp8_block quantization
-        if self.config.moe_quant_mode != common.MoEQuantMode.fp8_block:
-            return
-
-        # Load raw model config to get block size
-        raw_config = _load_model_config_from_model_path(self.model_path)
-
-        # Get weight_block_size from quantization_config (default to [128, 128])
-        default_size = [128, 128]
-        weight_block_size = _get_language_quantization_config(raw_config).get("weight_block_size", default_size)[0]
-
-        # Check alignment
-        moe_size_per_gpu = self._moe_inter_size // self.config.moe_tp_size
-        if (moe_size_per_gpu % weight_block_size) != 0:
-            raise ValueError(
-                f"Invalid quantized MoE configuration: "
-                f"(moe_intermediate_size={self._moe_inter_size} / moe_tp_size={self.config.moe_tp_size}) "
-                f"% weight_block_size={weight_block_size} != 0. "
-            )

@@ -17,7 +17,13 @@ import math
 from pathlib import Path
 from typing import Any
 
-from .native_artifact import NativeCollection, _rank_artifacts, select_native_measurements
+from .native_artifact import (
+    NativeCollection,
+    _expected_scheduled,
+    _observed_forward,
+    _rank_artifacts,
+    select_native_measurements,
+)
 
 _UNOBSERVED = [
     "sampled_continuation_token_ids",
@@ -100,7 +106,8 @@ def _validate_protocol(protocol: Any, *, glm: bool, path: Path) -> None:
 
     ``glm`` is true when the frozen cell selects the GLM-5.3-Flash producer contract. That protocol must then hold the
     producer's record, its seeded token content and Dynamo's execution evidence contract exactly, with the same JSON
-    types (5.0 is not 5). The protocol of any other cell must not carry a producer record.
+    types (5.0 is not 5), and a global warm-up count of 0. The protocol of any other cell must not carry a producer
+    record.
     """
     if not isinstance(protocol, dict):
         raise ValueError("measurement_protocol must be a mapping")
@@ -153,6 +160,13 @@ def _validate_protocol(protocol: Any, *, glm: bool, path: Path) -> None:
         or not all(type(preparation.get(key)) is bool for key in ("prefill_real_seed", "decode_real_kv_warmup"))
     ):
         raise ValueError("measurement_protocol has malformed preparation settings")
+    # The producer's _bench_init (runtime/glm53flash/glm53flash_prefix_scheduler.py), which the scheduler's constructor
+    # calls, refuses a global warm-up: the producer runs five warm-up repetitions of each point instead.
+    if glm and preparation["warmup_iterations"] != 0:
+        raise ValueError(
+            "measurement_protocol.preparation.warmup_iterations must be 0 for the GLM-5.3-Flash producer: "
+            f"expected 0, found {preparation['warmup_iterations']!r}: {path}"
+        )
 
 
 def _validate_prompts(prompts: Any) -> bool:
@@ -265,6 +279,18 @@ def _read_measurement(
             "benchmark_measurement does not hold the producer's ten measured repetitions with their "
             "adjacent_upper_median estimate"
         )
+    if glm:
+        # Each of the producer's ten raw samples is the retained FPM of one repetition of the same point, so each holds
+        # the point's workload. Only the producer's records hold that: the raw samples of Dynamo's own
+        # adjacent_upper_median estimate are adjacent decode steps of one launch, whose KV total grows from step to
+        # step.
+        expected = _expected_scheduled(row["point"])
+        for index, sample in enumerate(measurement["raw_fpms"]):
+            scheduled = sample.get("scheduled_requests")
+            if not isinstance(scheduled, dict) or any(
+                type(scheduled.get(key)) is not int or scheduled[key] != value for key, value in expected.items()
+            ):
+                raise ValueError(f"benchmark_measurement raw sample {index} does not hold the workload of its point")
     return measurement, [] if recorded else [f"rank {rank}: injected prompt hashes unavailable"]
 
 
@@ -348,6 +374,10 @@ def _warmup_history(payload: dict[str, Any], protocol: dict[str, Any] | None, *,
             or not _integer(record.get("completed_points_before"))
         ):
             raise ValueError("malformed warmup_evidence record")
+        if glm and record["kind"] == "global":
+            raise ValueError(
+                f"GLM-5.3-Flash requires zero global warmup iterations but contains a global warmup record: {path}"
+            )
         start, end = record.get("forward_index_start"), record.get("forward_index_end")
         count = record.get("observed_forward_count")
         if (
@@ -397,56 +427,13 @@ def _observed_execution(measurement, fpm, history, prefixes, previous_forward, *
         ):
             raise ValueError("benchmark_sample has invalid sample or process-local forward index")
         previous_forward = sample["forward_index"]
-        timing, graph = sample.get("timing"), sample.get("cudagraph")
-        if not isinstance(timing, dict) or timing.get("basis") not in {"schedule_to_output", "inter_output"}:
-            raise ValueError("benchmark_sample has invalid timing basis")
-        start, end = timing.get("start_monotonic"), timing.get("end_monotonic")
-        if (
-            type(end) not in {int, float}
-            or not math.isfinite(end)
-            or (
-                start is not None
-                and (
-                    type(start) not in {int, float}
-                    or not math.isfinite(start)
-                    or start > end
-                    or not math.isclose(end - start, raw["wall_time"], rel_tol=1e-9, abs_tol=1e-9)
-                )
-            )
-        ):
-            raise ValueError("benchmark_sample contradicts its local timing interval")
-        if start is None:
-            if glm:
-                raise ValueError(
-                    f"benchmark_sample.timing.start_monotonic of a GLM-5.3-Flash producer sample must be recorded: "
-                    f"expected a number, found None: {path}"
-                )
-            reasons.append("sample timing start is unavailable")
-        if not isinstance(graph, dict) or graph.get("status") not in {"observed", "unavailable"}:
-            raise ValueError("benchmark_sample has invalid graph observation status")
-        if glm and graph["status"] != "observed":
-            raise ValueError(
-                "benchmark_sample.cudagraph.status of a GLM-5.3-Flash producer sample must be observed: "
-                f"expected 'observed', found {graph['status']!r}: {path}"
-            )
-        values = [
-            graph.get(name) for name in ("runtime_mode", "num_unpadded_tokens", "num_padded_tokens", "num_paddings")
-        ]
-        if graph["status"] == "unavailable":
-            if any(value is not None for value in values):
-                raise ValueError("unavailable graph observation contains observed values")
-            reasons.append("per-sample CUDA graph dispatch is unavailable")
-        elif (
-            values[0] not in {"NONE", "PIECEWISE", "FULL"}
-            or not all(_integer(value) for value in values[1:])
-            or values[2] - values[1] != values[3]
-        ):
-            raise ValueError("benchmark_sample has invalid observed graph dispatch or padding")
+        basis, graph, missing = _observed_forward(sample, raw["wall_time"], glm=glm, path=path)
+        reasons.extend(missing)
         observed.append(
             {
                 "sample_index": index,
                 "forward_index": previous_forward,
-                "timing_basis": timing["basis"],
+                "timing_basis": basis,
                 "cudagraph": graph,
             }
         )

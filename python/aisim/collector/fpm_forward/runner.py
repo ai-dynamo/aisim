@@ -57,7 +57,14 @@ from .glm53flash_points import (
     glm_measured_context,
     glm_smoke_subset,
 )
-from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
+from .measurement_evidence import extract_measurement_evidence
+from .native_artifact import (
+    COLLECTOR_PROVENANCE_FILENAME,
+    PRODUCER_RECEIPT_FILENAME,
+    _InvalidGlmMeasurement,
+    validate_native_collection,
+    write_producer_receipt,
+)
 from .planner import FPMCell, FPMCollectionPlan
 from .runtime.fpm_memory_observer import (
     EXECUTION_SUPPORTED_VERSIONS,
@@ -75,6 +82,8 @@ READINESS_TIMEOUT_ENV = "FPM_READINESS_TIMEOUT_SECONDS"
 # that makes runtime/preflight.py require a power-capable self-benchmark.
 POWER_WINDOW_ENV = "DYN_BENCHMARK_POWER_WINDOW_S"
 POWER_WINDOW_REQUIRED_ENV = "FPM_POWER_WINDOW_REQUIRED"
+# Slurm may pass the collector's vLLM batch-invariant setting into the step.
+BATCH_INVARIANT_ENV = "VLLM_BATCH_INVARIANT"
 DEFAULT_READINESS_TIMEOUT_SECONDS = 900
 # KV warm-up dominates a decode cell's wall clock (~80 min for a tep4 decode
 # sweep on MiniMax M2.7); one hour would kill the engine mid-warm-up. 10800
@@ -150,6 +159,8 @@ REMOTE_WORKDIR = "/tmp/fpm-bench"
 _MEMORY_OBSERVER_FILES = ("fpm_memory_observer.py", "fpm_memory_worker.py", "fpm_memory_scheduler.py")
 # The source-pinned runtime adapters under runtime/, by model architecture.
 _ADAPTER_DIRS = {"DeepseekV41ForCausalLM": "dsv41", GLM_ARCHITECTURE: "glm53flash"}
+# The name of each adapter in messages.
+_ADAPTER_NAMES = {"dsv41": "V4.1", "glm53flash": "GLM-5.3-Flash"}
 
 
 def _observe_runtime_memory(plan: FPMCollectionPlan, cell: FPMCell) -> bool:
@@ -1263,7 +1274,7 @@ def _adapter_python_path(architecture: str | None, resolved_env: dict[str, dict[
         python_path = json.loads(paths_file.read_text())["python_path"]
     else:
         python_path = configured.get("value")
-    model = "V4.1" if adapter == "dsv41" else "GLM-5.3-Flash"
+    model = _ADAPTER_NAMES[adapter]
     if not isinstance(python_path, str) or not python_path:
         raise ValueError(f"{model} PYTHONPATH must name explicit absolute runtime paths")
     paths = python_path.split(":")
@@ -1583,6 +1594,20 @@ def _cell_generator_overrides(
     # DYN_BENCHMARK_POWER_WINDOW_S as the flag.
     if {POWER_WINDOW_ENV, POWER_WINDOW_REQUIRED_ENV} & set(resolved_env):
         raise ValueError("the power window must be supplied through --fpm-measure-power")
+    # vLLM 0.33.0 parses this as bool(int(value)) (vllm/envs.py:638). Probes use automatic attention dispatch;
+    # import checks whether the selected backend actually disabled prefix caching in a worker.
+    if (
+        probe_sampling is not None
+        and getattr(plan.options, "executor", "kubernetes") == "slurm"
+        and getattr(plan, "runtime_backend_version", None) == "0.33.0"
+        and (value := _command_env().get(BATCH_INVARIANT_ENV)) is not None
+    ):
+        try:
+            int(value)
+        except ValueError as error:
+            raise ValueError(
+                f"vLLM 0.33.0 requires an integer {BATCH_INVARIANT_ENV}; Slurm would pass {value!r}"
+            ) from error
     # The V4.1 real-KV and GLM-5.3-Flash prefix-seed adapters run their pinned
     # pre-power Dynamo overlay, which has no power window (AISIM-1973 P2).
     pinned_adapter = any(
@@ -1862,6 +1887,7 @@ def _runtime_collection_summary(
     *,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
+    plan: FPMCollectionPlan | None = None,
 ) -> dict[str, Any]:
     """Return auditable unique-axis counts from a validated native grid."""
 
@@ -1870,7 +1896,13 @@ def _runtime_collection_summary(
         raw_root,
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
+        deployment=plan.deployment_profile(cell) if getattr(plan, "fpm_profile", None) is not None else None,
     )
+    if collection.execution_mode == "native_graph_policy":
+        try:
+            extract_measurement_evidence(raw_root, collection)
+        except ValueError as error:
+            raise _InvalidGlmMeasurement(str(error)) from error
     points = tuple(measurement.point for measurement in collection.points)
     summary = {
         "measured_point_count": len(points),
@@ -2006,8 +2038,15 @@ def _recover_completed_attempt(
 ) -> dict[str, Any] | None:
     """Recover a non-passed checkpoint cell whose salvaged artifacts are complete.
 
-    Recovery only flips identity fields; the passed-entry refresh loop that
-    follows in ``run_collection`` owns the metadata of every passed record.
+    Recovery flips identity fields of the checkpoint entry; the passed-entry
+    refresh loop that follows in ``run_collection`` owns the metadata of every
+    passed record. The one file that recovery writes is the producer receipt
+    of a GLM-5.3-Flash cell folder that holds none: the validation then
+    compared the artifacts with the producer files of this checkout. A
+    receipt that exists has just passed that validation for this plan, cell
+    and attempt, and its digests are the ones that the comparison used, so
+    recovery keeps it. A receipt that the validation refuses leaves the cell
+    unrecovered.
     Entries carrying ``cleanup_error`` are never recovered, whatever their
     status: their Kubernetes teardown was not verified, and only a rerun
     re-applies and re-deletes the leaked resource. ``running`` entries carry
@@ -2027,6 +2066,7 @@ def _recover_completed_attempt(
             cell,
             cell_dir / "raw",
             expected_plan_sha256=plan.sha256,
+            plan=plan,
             expected_attempt_id=attempt_id,
         )
     except (OSError, TypeError, ValueError) as error:
@@ -2062,6 +2102,19 @@ def _recover_completed_attempt(
                 error,
             )
             return None
+
+    receipt = cell_dir / PRODUCER_RECEIPT_FILENAME
+    try:
+        if not receipt.exists() and not receipt.is_symlink():
+            write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id=attempt_id)
+    except OSError as error:
+        logger.info(
+            "FPM cell %s (status=%s) is not recoverable from local artifacts: %s",
+            cell.cell_id,
+            status,
+            error,
+        )
+        return None
 
     recovered = dict(entry)
     original_error = {key: recovered.pop(key) for key in ("error_type", "error") if key in recovered}
@@ -2192,12 +2245,12 @@ def _run_collection_impl(
     root = Path(artifact_root).expanduser().resolve() / plan.sha256[:16]
     if smoke:
         root /= "smoke"
-    root.mkdir(parents=True, exist_ok=True)
-    _atomic_json(root / "collection-plan.json", plan.to_dict())
-    _atomic_json(root / "generator-overrides.json", with_kv_warmup_defaults(generator_overrides))
     checkpoint_name = "fpm_forward_smoke.json" if smoke else "fpm_forward.json"
     checkpoint_path = Path(checkpoint_dir).expanduser().resolve() / checkpoint_name
     checkpoint = _load_checkpoint(checkpoint_path, plan, resume)
+    root.mkdir(parents=True, exist_ok=True)
+    _atomic_json(root / "collection-plan.json", plan.to_dict())
+    _atomic_json(root / "generator-overrides.json", with_kv_warmup_defaults(generator_overrides))
     instrumentation = getattr(plan, "runtime_instrumentation", None)
     observation_attempt_id = None
     if instrumentation is not None:
@@ -2246,7 +2299,20 @@ def _run_collection_impl(
     runtime_exec = Path(__file__).resolve().parent / "runtime" / "fpm_exec.sh"
     runtime_preflight = Path(__file__).resolve().parent / "runtime" / "preflight.py"
     adapter = _ADAPTER_DIRS.get(getattr(getattr(plan, "capability", None), "architecture", None))
-    target_cells = plan.cells[: (cell_limit or (1 if smoke else len(plan.cells)))]
+    # A limit of 0 is no limit.
+    if cell_limit:
+        target_cells = plan.cells[:cell_limit]
+    elif smoke:
+        # The first cell of each phase that the plan collects.
+        first_cells: dict[str, FPMCell] = {}
+        for cell in plan.cells:
+            first_cells.setdefault(cell.workload_kind, cell)
+        target_cells = tuple(first_cells.values())
+    else:
+        target_cells = plan.cells
+
+    def all_target_cells_passed() -> bool:
+        return all(checkpoint["cells"].get(cell.cell_id, {}).get("status") == "passed" for cell in target_cells)
 
     formal_database_terminal = False
     database_entry = checkpoint.get("database")
@@ -2280,10 +2346,21 @@ def _run_collection_impl(
             logger.info("Validated completed FPM database; resume has no publication work")
 
     checkpoint_changed = False
-    # Recovery costs zero cluster time, so it runs on every resume: it only
-    # acknowledges strictly validated, attempt-matched artifacts that already
-    # exist on disk. Rerunning (--resume-retry-failed) remains the only path
-    # that schedules cluster work.
+    # Recovery starts no workload, so it runs on every resume: it acknowledges
+    # only strictly validated, attempt-matched artifacts that already exist on
+    # disk. For an entry with status running it first stops the
+    # abandoned workload on the cluster and waits until it is gone; a failed
+    # teardown leaves the cell unrecovered. For a recovered GLM-5.3-Flash cell
+    # whose folder holds no producer receipt it writes one; a cell of another
+    # model gets none. When the plan holds runtime instrumentation, it archives
+    # the observations of each recovered cell (a copy of the cell folder and
+    # the index runtime-observations.json). After the loop it writes the
+    # checkpoint if it recovered a cell. Only a rerun schedules cluster work.
+    # A plain resume reruns a cell that has no entry, or that is interrupted
+    # or running and was not recovered; --resume-retry-failed also reruns a
+    # cell that is failed and was not recovered, or whose cleanup failed. A
+    # cell whose observation archive fails becomes failed and is not rerun in
+    # the same resume.
     if resume:
         for cell in target_cells:
             entry = checkpoint["cells"].get(cell.cell_id)
@@ -2327,10 +2404,9 @@ def _run_collection_impl(
                 smoke=smoke,
             )
         # This refresh only polishes checkpoint metadata for cells whose
-        # results were already validated and published; raw artifacts that
-        # are no longer readable (disk reclaimed, resume from a different
-        # working directory) must not abort the whole resume and never
-        # demote the cell's passed status.
+        # results were already validated. An unavailable raw file can be due
+        # to disk reclamation. A retained measurement that contradicts its
+        # samples needs a new attempt if the cell still awaits publication.
         try:
             metadata = {
                 "total_gpus": cell.topology.total_gpus,
@@ -2344,10 +2420,16 @@ def _run_collection_impl(
                     cell,
                     root / "cells" / cell.cell_id / "raw",
                     expected_plan_sha256=plan.sha256,
+                    plan=plan,
                     expected_attempt_id=_required_attempt_id(entry, cell.cell_id),
                 )
             )
         except (OSError, TypeError, ValueError) as error:
+            if isinstance(error, _InvalidGlmMeasurement) and not formal_database_terminal:
+                # Older runners could pass a cell whose retained samples cannot be published.
+                entry.update(status="failed", error_type=type(error).__name__, error=str(error))
+                checkpoint_changed = True
+                continue
             logger.warning(
                 "Skipping metadata refresh for passed FPM cell %s: %s",
                 cell.cell_id,
@@ -2358,6 +2440,10 @@ def _run_collection_impl(
             if entry.get(key) != value:
                 entry[key] = value
                 checkpoint_changed = True
+    # Older checkpoints can already contain a passed smoke summary for a failed cell.
+    if smoke and "smoke" in checkpoint and not all_target_cells_passed():
+        del checkpoint["smoke"]
+        checkpoint_changed = True
     if checkpoint_changed:
         _atomic_json(checkpoint_path, checkpoint)
 
@@ -2411,6 +2497,13 @@ def _run_collection_impl(
         if instrumentation is not None and previous.get("attempt_id") and not archive_observations(cell, previous):
             _atomic_json(checkpoint_path, checkpoint)
             continue
+        # A producer receipt vouches only for the attempt that wrote it. Invalidate it
+        # before discarding that attempt's evidence, including when unlink fails.
+        receipt = cell_dir / PRODUCER_RECEIPT_FILENAME
+        try:
+            receipt.unlink(missing_ok=True)
+        except OSError as error:
+            raise OSError(f"Cannot remove {receipt}. Please move the stale receipt aside before retrying") from error
         for stale_dir in (cell_dir / "raw", cell_dir / "logs"):
             if stale_dir.exists():
                 shutil.rmtree(stale_dir)
@@ -2501,8 +2594,9 @@ def _run_collection_impl(
                     ],
                     *instrumentation_files,
                     *_stage_points_file(plan, cell_dir, cell=cell, smoke=smoke),
-                    # Only V4.1 reads the shared input text. A GLM-5.3-Flash probe runs without the producer.
+                    # Only V4.1 reads the shared input text.
                     *([runtime_preflight.parent / "fpm_text.txt"] if adapter == "dsv41" else []),
+                    # A GLM-5.3-Flash probe runs without the producer, so only a collection stages its adapter files.
                     *(
                         sorted(p for p in (runtime_preflight.parent / adapter).iterdir() if p.is_file())
                         if adapter == "dsv41" or _glm_collection(plan)
@@ -2540,8 +2634,10 @@ def _run_collection_impl(
                 cell,
                 cell_dir / "raw",
                 expected_plan_sha256=plan.sha256,
+                plan=plan,
                 expected_attempt_id=attempt_id,
             )
+            write_producer_receipt(cell, cell_dir, plan_sha256=plan.sha256, attempt_id=attempt_id)
             checkpoint["cells"][cell.cell_id] = {
                 **base_record,
                 "status": "passed",
@@ -2627,7 +2723,7 @@ def _run_collection_impl(
     )
     if formal_database_terminal:
         return errors
-    all_passed = all(checkpoint["cells"].get(cell.cell_id, {}).get("status") == "passed" for cell in target_cells)
+    all_passed = all_target_cells_passed()
     if not publish_database:
         if not all_passed and not errors:
             errors.append(

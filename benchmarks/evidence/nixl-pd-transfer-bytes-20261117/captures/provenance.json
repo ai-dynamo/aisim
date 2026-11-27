@@ -1,0 +1,120 @@
+{
+  "runtime": {
+    "vllm": "0.33.0",
+    "vllm_git_revision": "4ba787ec9959e566d3b587a796dff07673324da5",
+    "nixl": "1.5.0",
+    "container": "vllm/vllm-openai:v0.33.0",
+    "container_arm64_digest": "sha256:e3481489818d3e563cae517b84ab959cc8b69f85a9fbb771c189140131ffc65c",
+    "checkpoint": "zai-org/GLM-5.3-Flash",
+    "checkpoint_revision": "04c4e9e",
+    "enroot_image_sha256": "351df767142e2b99411fe7c1798b36429ef1309e05b25a5280714adf5554aef4",
+    "observed_ssm_conv_state_layout": "DS"
+  },
+  "kit_sha256": {
+    "job.sbatch": "afcc31e6063b788a2cf91eb57adb1bb8e8772048f090ea9083a750e12c21112c",
+    "node.sh": "ed698b711efeef1bdb3fee9a2fbbf7bf84e7eaddbe8b7b506a9ed23d5e3a584a",
+    "proxy.py": "8b2d8bc433eb29c26d664e87a631f5faab2bc518ac1f981f6a6dc91caca7f713",
+    "measure.py": "20f75acdece41e52ab0ff02da6720d2c99ac1adc5c85c0708afdf296c1d2b92d",
+    "make_provenance.py": "a17295c928efb3c90b89e1c77d29dd69e1e073b7ffa82be0281405c2a59ab05a",
+    "logging-nixl-debug.json": "c88bb7f68296b6bf3482ed2c1f7efe75cf259c3394d04e5b424443c81048673b",
+    "predictions.json": "4232833652adcc221960ad88a1e4cfb59ca1c9500d45c844df39ee9dfe77f192",
+    "compare.py": "ceb6a94d8a6f9473e9f64ba534e4a0581bbd9e510363e5090d0d86d4981f1e8d",
+    "hook/sitecustomize.py": "402e262b16fc67a1b8341a49682ea5b3090c3c25ec595d1b5d194d599187657e",
+    "hook/nixl_bytesplit.py": "67a3709ccd5d9fe2126701600247fc672dc1e6a8a2d9d4101445efc6e841f1ad"
+  },
+  "files_sha256": {
+    "connector-ranks.txt": "c865eed4c0c10070483d987799e2312b68f09303ead156f3dd88e4c92513e11a",
+    "counter-samples.csv": "02fcf90e7ab209e06b75a97fc4833c121920db91fa8fe652adc31fb6927870c8",
+    "prompt-plans.csv": "9e47044badae1b3c4641bae75ee46c734e1222ecfda78b6f31a697f97e1379a0",
+    "requests-a.jsonl": "bc1f53e646cebe1d9de2002b3a2f3258e3d3c0f3185175681f026aa310f54a24",
+    "requests-b.jsonl": "abebb24ea5c2fa224a45a6f32ec3f935586a1a61a90aa0797234ea36aa75cfce",
+    "requests-c.jsonl": "aead4e88f167eaa0fd3680eb8d9374189ddf9ff51cd3c1228ca06e95b2d99af1",
+    "ssm-conv-layout.txt": "71769fdff493951f80fecb40e1d7afb5b96446e2c11d836d36298ccc0fc527ff"
+  },
+  "source_files_sha256": {
+    "arm-A/logs/prefill-step.log": "9e4f3157ddd42bafd9b2a072d51d28fde97bd4b05feeae50e0f96887821e8069",
+    "arm-A/logs/decode-step.log": "d773c2e937862aab9a907129b9e77f7b6df8d712bd9f667977b2704f190a570d",
+    "arm-A/logs/measure.log": "731c2be0699563764f0ddefa80382166d916ae8aabd0af01aa12dc019b74d734",
+    "arm-A/provenance.json": "6b7193c7cc1db50b0828864946dc678a5e386b9c3a17d9ae116a9ed988566123",
+    "arm-B/logs/prefill-step.log": "5cec54cf4b8be0e2d97a4dd693f6eba0c92c76366fb5f737cd6e0234174d4fe4",
+    "arm-B/logs/decode-step.log": "b5f7d15c7e2b64a2a2ab763c11ec128a83d83fa8823df354989de903beac3b72",
+    "arm-B/logs/measure.log": "3ee4fa1a8878994424e135af98df929912655ffac42922e8f9d3f23504003e33",
+    "arm-B/provenance.json": "aeac4e5d2e1c29afd6b9f4d166c59b59b3c16e3457bbf884d5b0ac4525a0ce82",
+    "arm-C/logs/prefill-step.log": "8c51346613b3a5cf076b39c6951732353a6ea530289cd45051c1c79932b1e486",
+    "arm-C/logs/decode-step.log": "be3374c1e24978b58248c60c850b2a83fedc8dad2a5b08739eb5739068461814",
+    "arm-C/logs/measure.log": "259224e62e6006bdde95c4a3eb918b2318d65aff869ed1caf96e65c440c08724",
+    "arm-C/provenance.json": "c8860d70eb2819be978a2aa0507956fdf7cf69ed5d24d0588c4be6e2f70161ec",
+    "arm-A/logs/prefill-server.log": "bbc7d379af37db392dde49858eff58390806bc3cdf8aee8355c5985c30b3492d",
+    "arm-A/logs/decode-server.log": "22043635af3ca287652ebb72154679443d0e0af38f3aeec21c75267a9308f7fe",
+    "arm-B/logs/prefill-server.log": "3fedde2e08afa1990af4c39d780e14342527b7b010c696264c716d30a4dbcda4",
+    "arm-B/logs/decode-server.log": "3a1139d31e28d5804993ca87e5b590531e8fd49473dc7ebba10afba7e26fd5f8",
+    "arm-C/logs/prefill-server.log": "ee1fe0ffac9692393401265bc435e97d0eb49b2ee3ffddf3f339911904f4ee76",
+    "arm-C/logs/decode-server.log": "bd52236646edc74562bd72e9db6c5be7e5165e669b4ff672c4a1f5132e7cd7bf",
+    "sacct.txt": "cf657ab5c346c4a39bd648e75dfe408af76fe5567d4e4ba3a59f5222df4bd0ab",
+    "arm-A/measure/plan.json": "a9b7fceabcce194c287ba99f053f808a0e15719ece159caf216020c1f19faf31",
+    "arm-B/measure/plan.json": "db8810878b5529a5f0a8c47c8f5f2159e6f1ac6affefd1bf92a41024b26d093b",
+    "arm-C/measure/plan.json": "e0857635bae61b3e2f9046da5fef27ec9ffc64ad34443dc2609f2ed0d24878c3"
+  },
+  "gpu_accounting": {
+    "gpu_type": "NVIDIA GB300",
+    "gpus_in_allocation": 8,
+    "gpus_per_server": 4,
+    "capture": {
+      "slurm_job": 1995489,
+      "elapsed_at_capture_seconds": 1218,
+      "state_at_capture": "RUNNING",
+      "final_job_wall_seconds": null,
+      "allocated_gpu_seconds_at_capture": 9744
+    },
+    "arms": {
+      "A": {
+        "valid_requests": 14,
+        "invalid_requests": 0,
+        "wall_seconds": 675,
+        "allocated_gpu_seconds": 5400,
+        "step_gpu_seconds": 5400,
+        "phase_wall_seconds": {
+          "setup_load_and_engine_warmup": 592,
+          "measurement": 62,
+          "server_teardown": 5,
+          "step_start_and_exit_overhead": 16
+        },
+        "engine_warmup_seconds_separate": null,
+        "driver_warmup_requests": 0,
+        "arm_retries_in_this_job": 0
+      },
+      "B": {
+        "valid_requests": 8,
+        "invalid_requests": 0,
+        "wall_seconds": 243,
+        "allocated_gpu_seconds": 1944,
+        "step_gpu_seconds": 1936,
+        "phase_wall_seconds": {
+          "setup_load_and_engine_warmup": 196,
+          "measurement": 24,
+          "server_teardown": 7,
+          "step_start_and_exit_overhead": 16
+        },
+        "engine_warmup_seconds_separate": null,
+        "driver_warmup_requests": 0,
+        "arm_retries_in_this_job": 0
+      },
+      "C": {
+        "valid_requests": 6,
+        "invalid_requests": 0,
+        "wall_seconds": 275,
+        "allocated_gpu_seconds": 2200,
+        "step_gpu_seconds": 2196,
+        "phase_wall_seconds": {
+          "setup_load_and_engine_warmup": 236,
+          "measurement": 17,
+          "server_teardown": 5,
+          "step_start_and_exit_overhead": 17
+        },
+        "engine_warmup_seconds_separate": null,
+        "driver_warmup_requests": 0,
+        "arm_retries_in_this_job": 0
+      }
+    }
+  }
+}

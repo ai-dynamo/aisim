@@ -161,10 +161,11 @@ def _execution_status(frozen: dict[str, Any]) -> str:
 def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, Path, list[dict[str, Any]]]:
     """Verify formal publication against every native row before qualification."""
     import pyarrow.parquet as pq
-    from collector.fpm_forward.config import PrefillSamplingProfile
+    from collector.fpm_forward.config import FPM_WARMUP_ITERATIONS, PrefillSamplingProfile
     from collector.fpm_forward.database import (
         aggregate_cell,
         published_dense_synthetic_cells,
+        published_median_policy,
         validate_formal_database_commit,
     )
     from collector.fpm_forward.planner import backend_identity_columns
@@ -203,6 +204,7 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
         max_cudagraph_capture_size=request.collection.max_prefill_cudagraph_size,
         cudagraph_policy=request.collection.prefill_cudagraph_policy,
     )
+    warmup = request.collection.warmup_iterations
     if (
         plan.options.vllm_max_model_len != request.search.context_length
         or plan.options.max_num_batched_tokens != scheduler["max_batched_tokens"]
@@ -220,6 +222,7 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
             else None
         )
         or plan.options.max_cudagraph_capture_size != request.collection.max_cudagraph_capture_size
+        or plan.options.warmup_iterations != (FPM_WARMUP_ITERATIONS if warmup is None else warmup)
     ):
         raise ValueError("source collection runtime limits differ from the reviewed onboarding settings")
     deployment = request.profile_deployment()
@@ -239,7 +242,8 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
     parquet, metadata = (Path(database[name]).resolve() for name in ("parquet", "metadata"))
     if any(not path.is_relative_to(root / "systems/data") for path in (parquet, metadata)):
         raise ValueError("formal data must belong to this source campaign")
-    published = validate_formal_database_commit(parquet, metadata, plan)
+    checkpoint_rows = database.get("cell_rows")
+    published = validate_formal_database_commit(parquet, metadata, plan, expected_cell_rows=checkpoint_rows)
     dense_cells = published_dense_synthetic_cells(published)
     rows = []
     for cell in plan.cells:
@@ -263,6 +267,7 @@ def _collection_source(request: SupportRequest, root: Path) -> tuple[Any, Path, 
                 campaign / "cells" / cell.cell_id,
                 expected_attempt_id=entry["attempt_id"],
                 dense_synthetic_kv=cell.cell_id in dense_cells,
+                median_policy=published_median_policy(published, cell, checkpoint_rows),
             )
         )
     canonical = lambda row: json.dumps(row, sort_keys=True, allow_nan=False)

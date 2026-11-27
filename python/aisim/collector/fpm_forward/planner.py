@@ -18,7 +18,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 
 from aisim.fpm_cache_layout import cache_layout_markers
 from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS, LEGACY_EXECUTION_IDENTITY, execution_identity
@@ -38,7 +38,13 @@ from .config import (
     semantic_generator_overrides,
     with_kv_warmup_defaults,
 )
-from .glm53flash_points import GLM_ARCHITECTURE, GLM_POINTS_ORIGIN, glm_plan_manifest
+from .glm53flash_points import (
+    GLM_ARCHITECTURE,
+    GLM_POINTS_ORIGIN,
+    glm_plan_manifest,
+    validate_glm_layout,
+    validate_glm_limits,
+)
 from .memory_admission import TopologyMemoryDecision, filter_memory_infeasible_topologies
 from .runtime.fpm_memory_observer import MEMORY_SUPPORTED_VERSIONS, audited_release
 from .topology import enumerate_fpm_topologies, topology_strategy
@@ -493,6 +499,18 @@ def _backend_policies(
     )
 
 
+class GlmProducerDigests(NamedTuple):
+    runtime_source_manifest_sha256: str
+    overlay_sha256: str
+
+    @classmethod
+    def from_runtime(cls, directory: Path = Path(__file__).parent / "runtime/glm53flash") -> GlmProducerDigests:
+        return cls(
+            hashlib.sha256((directory / "runtime-source-sha256.json").read_bytes()).hexdigest(),
+            hashlib.sha256((directory / "glm53flash_prefix_scheduler.py").read_bytes()).hexdigest(),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class FPMCell:
     cell_id: str
@@ -509,9 +527,11 @@ class FPMCell:
     fmha_resolution: str | None = None
     execution_identity: tuple[str, ...] = LEGACY_EXECUTION_IDENTITY
     input_text_sha256: str = ""
+    glm_producer_digests: GlmProducerDigests | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
+            **({"glm_producer_digests": self.glm_producer_digests._asdict()} if self.glm_producer_digests else {}),
             "cell_id": self.cell_id,
             "execution_identity": dict(zip(EXECUTION_COLUMNS, self.execution_identity, strict=True)),
             "input_text_sha256": self.input_text_sha256,
@@ -825,10 +845,15 @@ def build_collection_plan(
     # Eager timing and the shared text corpus belong to DeepSeek V4.1 alone. GLM-5.3-Flash also has an execution
     # identity, but its producer requires the runtime's CUDA graph policy and seeds its own tokens.
     eager_required = capability.architecture == "DeepseekV41ForCausalLM"
-    if eager_required and not options.enforce_eager:
-        raise ValueError("V4.1 FPM collection currently requires --fpm-enforce-eager; graph timing is not qualified")
     if options.enforce_eager and not eager_required:
         raise ValueError("explicit eager FPM collection is currently qualified only for DeepSeek V4.1")
+    # The producer contract of these two models hangs on the execution identity, which comes from the architectures
+    # field of config.json. Without it the identity is the legacy one, and the reader would skip the contract.
+    if capability.architecture in {"DeepseekV41ForCausalLM", GLM_ARCHITECTURE} and execution[0] == "":
+        raise ValueError(
+            f"{capability.architecture} FPM collection requires the architectures field in the checkpoint "
+            "config.json: its execution identity comes from that field, and --model-architecture does not replace it"
+        )
     input_text_sha256 = (
         hashlib.sha256((Path(__file__).parent / "runtime" / "fpm_text.txt").read_bytes()).hexdigest()
         if eager_required
@@ -957,8 +982,10 @@ def build_collection_plan(
             system,
             details,
         )
+    glm_producer_digests = GlmProducerDigests.from_runtime() if capability.architecture == GLM_ARCHITECTURE else None
     cells = tuple(
         FPMCell(
+            glm_producer_digests=glm_producer_digests,
             cell_id=_cell_id(
                 backend=backend,
                 model_path=model_path,
@@ -991,6 +1018,25 @@ def build_collection_plan(
         if (topology, kv_cache_dtype) in runnable_dtype_pairs
         for policy in policies
     )
+    if capability.architecture == GLM_ARCHITECTURE:
+        # The producer refuses these limits, runtime versions and layouts when the engine starts. The limits and the
+        # layouts are read for the topologies that keep cells after memory admission, and for their deployments, since
+        # only those launch.
+        kept = {cell.topology for cell in cells}
+        validate_glm_limits(
+            options,
+            [
+                deployment
+                for topology, deployment in zip(candidate_topologies, deployments, strict=True)
+                if topology in kept
+            ]
+            if profile is not None
+            else (),
+        )
+        validate_glm_layout(
+            [topology for topology in candidate_topologies if topology in kept],
+            _glm_runtime_version(runtime_backend_version, runtime_instrumentation, runtime_launch),
+        )
     revision = _git_revision()
     canonical = {
         "backend": backend,
@@ -1075,6 +1121,38 @@ def build_collection_plan(
         runtime_backend_version=runtime_backend_version,
         backend_version=backend_version,
     )
+
+
+def _glm_runtime_version(
+    runtime_backend_version: str | None,
+    runtime_instrumentation,
+    runtime_launch: dict[str, Any] | None,
+) -> str | None:
+    """The vLLM version of the runtime that a GLM-5.3-Flash plan runs on, or None when the version rule must not speak.
+
+    The plan runs on its observed version, or else on the runtime version of the instrumentation bundle that it stages;
+    the runner stops an attempt whose installed vLLM differs from it. The deployment's backend_version is a data label
+    and the version that its runtime memory records is that of the probe, so neither is read. Without a probe launch the
+    bundle gives no version. A bundle that does not load, or whose version differs from the observed one, gives no
+    version either. The planner refuses each of these three plans below with the text of the bundle, so the version
+    rule speaks only where no such text does. A launch without a bundle gives no version for the same reason.
+    """
+    if (runtime_instrumentation is None) != (runtime_launch is None):
+        return None
+    if runtime_instrumentation is None:
+        return runtime_backend_version
+    bundle = runtime_instrumentation
+    if isinstance(bundle, (str, Path)):
+        from .runtime_instrumentation import load_instrumentation
+
+        try:
+            bundle = load_instrumentation(bundle)
+        except ValueError:
+            return None
+    version = bundle.manifest["runtime"]["version"]
+    if runtime_backend_version is not None and runtime_backend_version != version:
+        return None
+    return version
 
 
 def _validate_profile_identities(

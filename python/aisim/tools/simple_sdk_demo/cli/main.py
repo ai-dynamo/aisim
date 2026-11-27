@@ -173,7 +173,7 @@ def main(args):
         ttft=args.ttft,
         tpot=args.tpot,
     )
-    model = get_model(args.model, model_config, args.backend)
+    model = get_model(args.model, model_config, args.backend, database.version)
     backend = get_backend(args.backend)
     session = InferenceSession(model, database, backend)
 

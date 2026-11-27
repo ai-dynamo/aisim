@@ -1,11 +1,16 @@
 {
-  "schema": "nixl-pd-transfer-bytes/v1",
+  "schema": "nixl-pd-transfer-bytes/v2",
   "model": "zai-org/GLM-5.3-Flash",
   "checkpoint_revision": "04c4e9e",
   "gpu": "NVIDIA GB300",
   "tensor_parallel_size": 4,
   "block_size_tokens": 2176,
   "bytes": "bytes for one TP rank, the mean of the decode server's 4 transfers of one request",
+  "marks": {
+    "measured": "read from a counter, a log line, the reply of the prefill server or the group log of the run, or the difference of two such readings",
+    "derived": "computed from measured values by a rule that the README states, or read from the vLLM source",
+    "unmarked": "the setup fields, the quoted log line and the request inputs prompt_tokens and prompt"
+  },
   "versions": {
     "0.31.0": {
       "image": "vllm/vllm-openai:v0.31.0",
@@ -30,6 +35,24 @@
         "kda_block": "9 state regions * (36,864 + 1,048,576) = 9,768,960"
       },
       "formula": "13045120 * attention_blocks_moved + 52120960",
+      "sources": {
+        "regions": "measured",
+        "bytes_per_block": {
+          "attention": "measured",
+          "ring": "derived",
+          "kda_9_layers": "derived",
+          "kda_8_layers": "derived"
+        },
+        "region_sums": "derived",
+        "formula": "derived",
+        "rows": {
+          "transferred_tokens": "measured",
+          "prefill_attention_blocks": "measured",
+          "attention_blocks_moved": "derived",
+          "bytes_per_rank": "measured",
+          "descriptors_per_rank": "measured"
+        }
+      },
       "rows": [
         {
           "prompt_tokens": 1000,
@@ -182,6 +205,24 @@
         "kda_block": "9 state regions * (36,864 + 1,048,576) = 9,768,960"
       },
       "formula": "21978496 * attention_blocks_moved + 39168128",
+      "sources": {
+        "regions": "measured",
+        "bytes_per_block": {
+          "attention": "measured",
+          "ring": "derived",
+          "kda_9_layers": "derived",
+          "kda_8_layers": "derived"
+        },
+        "region_sums": "derived",
+        "formula": "derived",
+        "rows": {
+          "transferred_tokens": "measured",
+          "prefill_attention_blocks": "measured",
+          "attention_blocks_moved": "derived",
+          "bytes_per_rank": "measured",
+          "descriptors_per_rank": "measured"
+        }
+      },
       "rows": [
         {
           "prompt_tokens": 1000,

@@ -65,11 +65,12 @@ def test_aic_core_system_spec_contract(monkeypatch):
             "node": {"num_gpus_per_node": 8},
         },
     )
-    monkeypatch.setattr(
-        mh_mod,
-        "_estimate_model_weight_bytes",
-        lambda model: 123,
-    )
+
+    def estimate_weights(model, *, backend):
+        assert (model, backend) == ("model", "trtllm")
+        return 123
+
+    monkeypatch.setattr(mh_mod, "_estimate_model_weight_bytes", estimate_weights)
 
     mh = resolve_model_hardware("model", "hardware", backend="trtllm")
 
