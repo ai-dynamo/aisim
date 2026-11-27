@@ -20,7 +20,8 @@ REQUEST_FIELDS = ("extend_lengths", "past_kv_lengths")
 
 #: name -> (annotation, default value or default factory), in encoding order.
 STEP_FIELDS: dict[str, tuple[Any, Any]] = {
-    # Active speculative configuration of the worker (0 when speculation is off).
+    # Speculative configuration of the step (0 when speculation is off): the
+    # forward's own verify width when the result carries it, else the live config.
     "spec_num_steps": (int, 0),
     "spec_num_draft_tokens": (int, 0),
     # Tokens committed per request by a speculative decode step, bonus token
@@ -31,7 +32,8 @@ STEP_FIELDS: dict[str, tuple[Any, Any]] = {
     # same intervals as ``wall_time`` when the producer times on the device.
     "device_time_s_by_category": (dict[str, float], dict),
     # Host monotonic clock (seconds, per worker process) when the scheduler
-    # started building this batch, and when this record was emitted.
+    # started building this batch (0.0 on SGLang 0.5.23+, which has no
+    # ``fpm_start_time``), and when this record was emitted.
     "host_scheduled_at_s": (float, 0.0),
     "host_emitted_at_s": (float, 0.0),
 }

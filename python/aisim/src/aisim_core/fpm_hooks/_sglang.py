@@ -50,6 +50,7 @@ _STEP_CONTEXT = "_aisim_fpm_step_context"
 _DEVICE_TIME = "_aisim_fpm_device_time_by_category"
 _TIMER_HOOKED = "_aisim_fpm_category_reporter"
 _SNAPSHOT_PAIRS = "_aisim_fpm_snapshot_pairs"
+_PRESETTLE = "_aisim_fpm_presettle"
 _TIMING_TOTALS = "_aisim_fpm_device_time_by_category"
 
 
@@ -103,6 +104,10 @@ def accept_lengths(result, num_requests: int) -> list[int] | None:
         values = [int(c) + bonus for c in correct]
     if len(values) != num_requests:
         return None
+    # A row that finished or was retracted before this result settled commits nothing.
+    presettle = getattr(result, _PRESETTLE, None)
+    if presettle is not None and len(presettle) == num_requests:
+        values = [0 if skipped else v for v, (_, skipped) in zip(values, presettle, strict=True)]
     # A grammar can stop a request's run early; SGLang then commits only the retained tokens.
     retained = getattr(result, "grammar_retained_tokens", None)
     if retained is not None and len(retained) == num_requests:
@@ -148,6 +153,10 @@ def step_fields(reporter, batch, num_requests: int) -> dict[str, Any]:
         step["spec_num_draft_tokens"] = int(spec.get("num_draft_tokens", 0) or 0)
     width = _result_verify_width(result)
     if width:
+        # The adaptive controller may already have switched the live config; it only
+        # runs chains (topk 1, width = steps + 1), so take the steps from this forward too.
+        if step.get("spec_num_draft_tokens") == step.get("spec_num_steps", 0) + 1:
+            step["spec_num_steps"] = width - 1
         step["spec_num_draft_tokens"] = width
     accepted = accept_lengths(result, num_requests)
     if accepted is not None:
@@ -172,6 +181,10 @@ def fill_decode_seq_lens(batch, context) -> bool:
     if mode is None or not mode.is_decode() or getattr(batch, "seq_lens_cpu", 0) is not None:
         return False
     reqs = list(getattr(batch, "reqs", None) or [])
+    presettle = getattr(context[0], _PRESETTLE, None) if context is not None else None
+    if presettle is not None and len(presettle) == len(reqs):
+        batch.seq_lens_cpu = [past for past, _ in presettle]
+        return True
     committed = accept_lengths(context[0], len(reqs)) if context is not None else None
     committed = committed or [1] * len(reqs)
     # Only speculative decode leaves seq_lens_cpu unset; skip the pending token if SGLang says otherwise.
@@ -289,6 +302,46 @@ def _wrap_spec_snapshot(owner: type) -> None:
 
     wrapped_snapshot.__wrapped__ = snapshot  # type: ignore[attr-defined]
     owner.snapshot_spec_decode_metrics = wrapped_snapshot
+
+
+def record_presettle(batch, result) -> None:
+    """Keep each row's KV prefix and whether SGLang will skip settling it, before the result settles.
+
+    ``req.seqlen - 1`` excludes the pending bonus token; a row that finished or
+    was retracted while this forward was in flight commits nothing.
+    """
+    rows = []
+    for req in getattr(batch, "reqs", None) or []:
+        finished = getattr(req, "finished", None)
+        skipped = bool(getattr(req, "is_retracted", False) or (finished() if callable(finished) else False))
+        rows.append((max(int(req.seqlen) - 1, 0), skipped))
+    setattr(result, _PRESETTLE, rows)
+
+
+def patch_sglang_batch_result_processor(module: ModuleType) -> bool:
+    """Record pre-settlement row state for speculative decode results. Returns ``True`` when applied."""
+    owner = next(
+        (obj for obj in vars(module).values() if isinstance(obj, type) and "_resolve_spec_v2_tokens" in vars(obj)),
+        None,
+    )
+    if owner is None:
+        logger.info("fpm_hooks: SGLang batch_result_processor has no _resolve_spec_v2_tokens; no pre-settle state")
+        return False
+    resolve = vars(owner)["_resolve_spec_v2_tokens"]
+    if getattr(resolve, _PATCHED, False):
+        return False
+
+    def wrapped_resolve(self, result, batch, *args, **kwargs):
+        try:
+            record_presettle(batch, result)
+        except Exception:
+            logger.debug("fpm_hooks: pre-settle state unavailable", exc_info=True)
+        return resolve(self, result, batch, *args, **kwargs)
+
+    setattr(wrapped_resolve, _PATCHED, True)
+    wrapped_resolve.__wrapped__ = resolve  # type: ignore[attr-defined]
+    owner._resolve_spec_v2_tokens = wrapped_resolve
+    return True
 
 
 def patch_fpm_timing(timing_cls: type) -> bool:

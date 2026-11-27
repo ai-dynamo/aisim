@@ -673,3 +673,61 @@ def test_sglang_0523_hook_uses_result_snapshot_and_per_result_device_time(fake_s
     m = mixin.published[-1].scheduled_requests
     assert m.past_kv_lengths == [10] and m.extend_lengths == [4]
     assert m.device_time_s_by_category == pytest.approx({"decode": 0.002})
+
+
+def _fake_result_processor():
+    module = types.ModuleType("sglang.srt.managers.scheduler_components.batch_result_processor")
+
+    class BatchResultProcessor:
+        """Mirrors SGLang's spec-v2 settlement: skipped rows commit nothing, the others append accept_lens."""
+
+        def _resolve_spec_v2_tokens(self, result, batch):
+            for req, n in zip(batch.reqs, result.accept_lens, strict=True):
+                if not (req.is_retracted or req.finished()):
+                    req.seqlen += n
+
+    module.BatchResultProcessor = BatchResultProcessor
+    return module
+
+
+class _SpecReq(_Req):
+    def __init__(self, seqlen, done=False):
+        super().__init__(seqlen=seqlen)
+        self.is_retracted = False
+        self._done = done
+
+    def finished(self):
+        return self._done
+
+
+def test_sglang_rows_finished_before_settlement_commit_nothing(fake_sglang):
+    """Overlap: a request finished in the preceding batch while this verify was in flight."""
+    _, reporter = fake_sglang
+    sglang.patch_sglang_metrics_reporter(reporter)
+    processor = _fake_result_processor()
+    assert sglang.patch_sglang_batch_result_processor(processor) is True
+    assert sglang.patch_sglang_batch_result_processor(processor) is False  # idempotent
+    mixin = reporter.SchedulerMetricsReporter(spec=(3, 4))
+    # KV prefixes 99 and 50, each with one pending bonus token
+    batch = types.SimpleNamespace(
+        forward_mode=_Mode("decode"), reqs=[_SpecReq(100, done=True), _SpecReq(51)], seq_lens_cpu=None
+    )
+    result = types.SimpleNamespace(accept_lens=_Lens([3, 3]))
+    processor.BatchResultProcessor()._resolve_spec_v2_tokens(result, batch)
+    mixin.forward_pass_device_timer.finish(0.02, "target_verify")
+    mixin._emit_forward_pass_metrics(batch, result)
+    m = mixin.published[-1][1]
+    assert m.spec_accept_lengths == [0, 3]
+    assert m.past_kv_lengths == [99, 50] and m.sum_decode_kv_tokens == 149
+
+
+def test_sglang_spec_steps_follow_the_forward_result_width(fake_sglang):
+    """The adaptive controller switched the live config (3 steps) after this forward ran 2."""
+    _, reporter = fake_sglang
+    sglang.patch_sglang_metrics_reporter(reporter)
+    mixin = reporter.SchedulerMetricsReporter(spec=(3, 4))
+    batch = types.SimpleNamespace(forward_mode=_Mode("decode"), reqs=[_Req(seqlen=11)], seq_lens_cpu=[10])
+    mixin.forward_pass_device_timer.finish(0.02, "target_verify")
+    mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(speculative_num_draft_tokens=3, accept_lens=None))
+    m = mixin.published[-1][1]
+    assert (m.spec_num_steps, m.spec_num_draft_tokens) == (2, 3) and m.extend_lengths == [3]

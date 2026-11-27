@@ -46,13 +46,14 @@ from collections.abc import Callable
 from types import ModuleType
 
 from ._dynamo_vllm import patch_dynamo_vllm_instrumented_scheduler
-from ._sglang import patch_sglang_metrics_reporter
+from ._sglang import patch_sglang_batch_result_processor, patch_sglang_metrics_reporter
 
 __all__ = [
     "TARGETS",
     "hook_path",
     "install",
     "patch_dynamo_vllm_instrumented_scheduler",
+    "patch_sglang_batch_result_processor",
     "patch_sglang_metrics_reporter",
 ]
 
@@ -61,6 +62,7 @@ logger = logging.getLogger("aisim.fpm_hooks")
 #: module name -> patch function applied right after that module is executed
 TARGETS: dict[str, Callable[[ModuleType], None]] = {
     "sglang.srt.managers.scheduler_components.metrics_reporter": patch_sglang_metrics_reporter,
+    "sglang.srt.managers.scheduler_components.batch_result_processor": patch_sglang_batch_result_processor,
     "dynamo.vllm.instrumented_scheduler": patch_dynamo_vllm_instrumented_scheduler,
 }
 

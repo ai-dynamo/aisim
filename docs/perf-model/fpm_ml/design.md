@@ -161,10 +161,12 @@ base, the two lists are added at runtime inside the engine process by
 ### Recording without Dynamo
 
 A plain SGLang server publishes FPM on `{--forward-pass-metrics-ipc-name}.{dp_rank}`
-and stores nothing. To record it, run one recorder per capture run next to the server:
+and stores nothing. Launch it through the hooks so the records carry the per-request
+lists and step diagnostics (a plain `python -m sglang.launch_server` publishes stock
+aggregates only), then run one recorder per capture run next to the server:
 
 ```bash
-python -m sglang.launch_server ... --enable-forward-pass-metrics \
+python -m aisim_core.fpm_hooks sglang.launch_server -- ... --enable-forward-pass-metrics \
   --forward-pass-metrics-ipc-name ipc:///tmp/fpm-run1
 python -m aisim_core.fpm_hooks record --endpoint ipc:///tmp/fpm-run1.0 --output run1/fpm.jsonl
 ```
@@ -172,8 +174,10 @@ python -m aisim_core.fpm_hooks record --endpoint ipc:///tmp/fpm-run1.0 --output 
 Each JSON line holds the publisher `sequence`, the receive time (Unix and monotonic)
 and the payload under `fpm`, decoded without a type so the hook fields survive (item
 6 above). Split tiers afterwards by receive time. On exit (SIGINT, SIGTERM or
-`--duration`), `fpm.jsonl.summary.json` gives the message count and any sequence gaps,
-which are messages dropped by the publisher.
+`--duration`), `fpm.jsonl.summary.json` gives the message count and any gaps between
+received sequence numbers. SGLang numbers records after dequeuing them, so records it
+drops on publisher queue overflow leave no gap: zero gaps does not prove that no record
+was lost.
 
 ### Step diagnostics (SGLang)
 
@@ -186,10 +190,10 @@ defaults.
 
 | Field | Meaning |
 | --- | --- |
-| `spec_num_steps`, `spec_num_draft_tokens` | Active speculative configuration of the worker (`_active_spec_config_snapshot`); 0 when speculation is off. |
-| `spec_accept_lengths[i]` | Tokens committed by request *i* in a speculative decode step, bonus token included (`result.accept_lens`). Read only when already on the CPU, so the hook adds no device synchronization; empty otherwise. |
+| `spec_num_steps`, `spec_num_draft_tokens` | Speculative configuration of the step; 0 when speculation is off. When the result carries its verify width (`result.speculative_num_draft_tokens`, SGLang 0.5.23+), both come from that forward (steps = width - 1 for the chain configurations the adaptive controller runs); otherwise from the live `_active_spec_config_snapshot`, which the adaptive controller may already have switched. |
+| `spec_accept_lengths[i]` | Tokens committed by request *i* in a speculative decode step, bonus token included (`result.accept_lens`, or the grammar-retained run). 0 for a row that finished or was retracted while the forward was in flight, which SGLang does not settle. Read only when already on the CPU, so the hook adds no device synchronization; empty otherwise. |
 | `device_time_s_by_category` | Seconds of device time per DeviceTimer category (`decode`, `extend`, `target_verify`, `eagle_draft`, `eagle_draft_extend`, ...). On SGLang 0.5.23+ the hook sums the intervals of the record's own batch result, so the categories add up to `wall_time` minus any gaps between intervals. Before 0.5.23 it adds one DeviceTimer reporter and drains it at each record, covering the same intervals as `wall_time`. |
-| `host_scheduled_at_s` | Host monotonic time when the scheduler started building the batch (`batch.fpm_start_time`). |
+| `host_scheduled_at_s` | Host monotonic time when the scheduler started building the batch (`batch.fpm_start_time`). Unavailable on SGLang 0.5.23+, which removed `fpm_start_time`; the field stays 0.0 there. |
 | `host_emitted_at_s` | Host monotonic time when the record was emitted. Consecutive differences give the step period on the host clock; the gap to the summed device time is exposed CPU time. Under the overlap scheduler they also show where a record merged two forwards. |
 
 Host times are per worker process and only comparable within one capture.
