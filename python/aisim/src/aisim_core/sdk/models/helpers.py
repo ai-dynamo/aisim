@@ -21,13 +21,17 @@ from typing import TYPE_CHECKING, Optional
 from aisim_core.sdk import common, config
 from aisim_core.sdk.utils import (
     _get_language_quantization_config,
+    _load_model_config_from_model_path,
     _normalize_quant_algo,
     get_model_config_from_model_path,
     parse_compressed_tensors_quant,
+    validate_fp8_moe_shard,
 )
 
 if TYPE_CHECKING:
     from aisim_core.sdk.models.blocks.moe import MoEBlockShape
+    from aisim_core.sdk.models.hybrid_moe import HybridMoEModel
+    from aisim_core.sdk.models.moe import MOEModel
 
 logger = logging.getLogger(__name__)
 
@@ -470,6 +474,25 @@ def power_law_distribution(base: str, alpha: float, *, eplb_suffix: bool = False
     if base != "power_law":
         return base
     return f"{base}_{alpha}_eplb" if eplb_suffix else f"{base}_{alpha}"
+
+
+def validate_model_fp8_moe_shard(
+    model: MOEModel | HybridMoEModel, intermediate_size: int, model_info: dict | None
+) -> None:
+    """Validate native expert blocks with the database and release selected by get_model."""
+    if model.config.moe_quant_mode != common.MoEQuantMode.fp8_block:
+        return
+    info = model_info or {}
+    vllm_version = info.get("backend_version") if model._backend_name == "vllm" else None
+    database = info.get("database") if vllm_version else None
+    validate_fp8_moe_shard(
+        info.get("raw_config") or _load_model_config_from_model_path(model.model_path),
+        intermediate_size,
+        model.config.moe_tp_size,
+        vllm_version=vllm_version,
+        hidden_size=model._hidden_size,
+        sm_version=database.system_spec.get("gpu", {}).get("sm_version") if database is not None else None,
+    )
 
 
 def large_ep_gpus_per_node(model_config: config.ModelConfig) -> int:

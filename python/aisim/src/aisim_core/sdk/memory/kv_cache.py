@@ -103,7 +103,7 @@ from aisim_core.sdk.memory.vllm_registry import (
     select_wrapper_architecture,
     wrapper_runtime,
 )
-from aisim_core.sdk.models import get_model
+from aisim_core.sdk.models import HybridMoEModel, MOEModel, get_model
 from aisim_core.sdk.models.base import _MODEL_REGISTRY, BaseModel
 from aisim_core.sdk.models.deepseek_v32 import _dsa_full_layer_fraction
 from aisim_core.sdk.models.gemma4 import UnverifiedGemmaRuntimeError, check_gemma4_adapter_runtime
@@ -127,6 +127,7 @@ from aisim_core.sdk.utils import (
     fp8_weight_block_shape,
     gemma4_cache_requires_release,
     gemma4_cache_shapes,
+    gemma4_sliding_window,
     validate_fp8_moe_shard,
 )
 
@@ -733,10 +734,12 @@ def _config_only_backend_version(
         return None
     try:
         roots = perf_database.resolve_deployment_systems_paths(systems_path)
-        slots = perf_database.get_version_slots(system, backend, systems_paths=roots) or {}
-        if requested is None and not slots:
-            return perf_database.get_latest_database_version(system, backend, systems_paths=roots)
-        return slots.get(requested or "current")
+        if requested is not None:
+            return perf_database.resolve_query_version(system, backend, requested, systems_paths=roots)
+        slots = perf_database.get_version_slots(system, backend, systems_paths=roots)
+        if slots:
+            return slots["current"]
+        return perf_database.get_latest_database_version(system, backend, systems_paths=roots)
     except MissingDataError:
         return None
 
@@ -2053,7 +2056,7 @@ class NaiveKVCacheEstimator:
                     and raw_decoder.get("use_bidirectional_attention") == "all"
                 ):
                     # The layer-map reader above consumes the original serialized window.
-                    window = layout_integer(raw_decoder["sliding_window"], "sliding_window") // 2 + 1
+                    window = gemma4_sliding_window(raw_decoder)
                     decoder.geometry["sliding_window"] = raw_decoder["sliding_window"] = window
                 if not resolved_vllm_decoder and hf_config.get("hf_quant_config") is not None:
                     raw_decoder = attach_quantization_sidecar(raw_decoder, hf_config["hf_quant_config"])
@@ -2285,8 +2288,10 @@ class NaiveKVCacheEstimator:
             else:
                 mode = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
         model_dtype_bytes = self.weight_dtype_bytes
-        if self._transformers_wrapper and (backend == "vllm" or model_dtype_bytes == 4):
-            # vLLM uses its supported GPU dtype; SGLang downcasts FP32 to FP16 or BF16.
+        if (self._transformers_wrapper and backend == "vllm") or (
+            backend == "sglang" and self._is_nested_decoder and model_dtype_bytes == 4
+        ):
+            # SGLang resolves dtype=auto on its text config before selecting the KV cache dtype.
             model_dtype_bytes = 2
         self._quantized_weights = bool(
             raw.get("quantization_config") or raw.get("hf_quant_config") or raw.get("quant_algo")
@@ -4050,8 +4055,10 @@ def estimate_kv_cache(
                 )
             ):
                 raise ValueError("SGLang block-quantized FP8 weights require dynamic activations") from exc
-            sdk_tiles = hasattr(model_class, "_validate_fp8_block_quantized_moe_config") or (
-                model_class is None and "weight_block_size" in quant
+            sdk_tiles = (
+                issubclass(model_class, (MOEModel, HybridMoEModel))
+                if model_class is not None
+                else "weight_block_size" in quant
             )
             check_tiles = sglang_fp8 or (
                 sdk_tiles
@@ -4133,9 +4140,11 @@ def estimate_kv_cache(
                     expert_tp,
                     sglang_tp_size=max(tp_size * attention_dp_size, expert_tp) if backend == "sglang" else None,
                     quantized_experts=quantized_experts,
-                    vllm_refine_hidden_size=(
-                        naive.geometry["hidden"]
-                        if backend == "vllm" and release is not None and release >= Version("0.29.0rc1")
+                    vllm_version=version if backend == "vllm" else None,
+                    hidden_size=naive.geometry["hidden"],
+                    sm_version=(
+                        _config_only_system_spec(system, systems_path).get("gpu", {}).get("sm_version")
+                        if backend == "vllm"
                         else None
                     ),
                 )

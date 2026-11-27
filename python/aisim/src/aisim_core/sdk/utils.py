@@ -1034,7 +1034,7 @@ def _check_gemma4_layer_attributes(
         defaults["rope_parameters"] = _GEMMA4_VLLM_GLOBAL_DEFAULTS["rope_parameters"]
     if defaults["use_bidirectional_attention"] == "all":
         defaults.setdefault("is_causal", False)
-        defaults["sliding_window"] = layout_integer(defaults["sliding_window"], "sliding_window") // 2 + 1
+        defaults["sliding_window"] = gemma4_sliding_window(config)
     # PreTrainedConfig exposes these attributes after loading aliases and initializing label maps.
     labels = config.get("id2label")
     defaults.setdefault("num_labels", len(labels) if isinstance(labels, dict) else 2)
@@ -1114,6 +1114,14 @@ def _check_gemma4_layer_attributes(
                 raise ValueError(f"{backend} cannot read Gemma 4 per_layer_config override for {name}")
 
 
+def gemma4_sliding_window(config: dict) -> int | None:
+    """Read the serialized Gemma 4 window as its text config constructor does."""
+    window = config.get("sliding_window", 512)
+    if config.get("use_bidirectional_attention") == "all":
+        return layout_integer(window, "sliding_window") // 2 + 1
+    return window
+
+
 def gemma4_cache_requires_release(config: dict, backend: str) -> bool:
     """Identify Gemma cache fields whose serving semantics changed between releases."""
     return "per_layer_config" in config or (
@@ -1145,6 +1153,12 @@ def gemma4_cache_shapes(
 
     has_per_layer_config = "per_layer_config" in config
     if backend == "vllm":
+        types = config.get("layer_types")
+        sliding = (
+            "sliding_attention" in types[:-1]
+            if isinstance(types, list) and types
+            else config.get("num_hidden_layers", 30) != 1
+        )
         # PreTrainedConfig applies the legacy setter after Gemma has supplied its RoPE defaults.
         # Every vLLM attention layer reads the resulting mapping, including a flat checkpoint.
         rope = config.get("rope_scaling", config.get("rope_parameters"))
@@ -1153,12 +1167,6 @@ def gemma4_cache_shapes(
         if isinstance(rope, dict):
             # Gemma forces the last layer to full attention. Each resident type selects its own
             # RoPE mapping when present, otherwise vLLM copies the flat legacy mapping.
-            types = config.get("layer_types")
-            sliding = (
-                "sliding_attention" in types[:-1]
-                if isinstance(types, list) and types
-                else config.get("num_hidden_layers", 30) != 1
-            )
             for kind in ("full_attention", "sliding_attention") if sliding else ("full_attention",):
                 if (kind in rope and not isinstance(rope[kind], dict)) or (
                     kind not in rope and any(key in rope for key in ("full_attention", "sliding_attention"))
@@ -1288,6 +1296,14 @@ def gemma4_cache_shapes(
     else:
         full = explicit_shapes["full_attention"]
         base = explicit_shapes.get("sliding_attention", full)
+    if backend == "vllm":
+        tp = layout_integer(agreement_tp_size, "tp_size")
+        query_heads = layout_integer(config.get("num_attention_heads", 8), "num_attention_heads")
+        if query_heads % tp:
+            raise ValueError(f"Gemma 4 num_attention_heads {query_heads} must be divisible by tp_size {tp}")
+        for heads, _ in (base, full) if sliding else (full,):
+            if max(heads, tp) % min(heads, tp):
+                raise ValueError(f"Gemma 4 KV heads {heads} cannot shard or replicate evenly at tp_size {tp}")
     if backend == "sglang" and config.get("v_head_dim") not in (None, 0, full[1]):
         raise ValueError("asymmetric SGLang Gemma 4 key/value head dimensions require runtime cache geometry")
     return base, full
@@ -1793,7 +1809,7 @@ def _parse_hf_config_json(config: dict) -> dict:
             swa_head_dim=swa_hd,
             global_num_kv_heads=global_num_kv,
             global_head_dim=global_hd,
-            sliding_window_size=config.get("sliding_window", 0),
+            sliding_window_size=gemma4_sliding_window(config) or 0,
             attention_k_eq_v=bool(config.get("attention_k_eq_v", False)),
             use_bidirectional_vision_attention=config.get("use_bidirectional_attention") == "vision",
             vision_config=gemma4_vision_config,
@@ -2276,20 +2292,29 @@ def validate_fp8_moe_shard(
     moe_tp_size: int,
     *,
     sglang_tp_size: int | None = None,
-    vllm_refine_hidden_size: int | None = None,
+    vllm_version: str | None = None,
+    hidden_size: int | None = None,
+    sm_version: int | None = None,
     quantized_experts: bool = True,
 ) -> None:
-    """Check the checkpoint blocks partitioned by the gate/up and SGLang down projections."""
+    """Check checkpoint blocks against the serving release and rank-local expert dimensions."""
     shape = fp8_weight_block_shape(
         _get_language_quantization_config(raw_config) or {}, sglang=sglang_tp_size is not None, experts=True
     )
     if not quantized_experts:
         return
     shard = intermediate_size // moe_tp_size
-    if vllm_refine_hidden_size and math.gcd(*shape, shard, vllm_refine_hidden_size) >= 32:
+    release = common.parse_support_matrix_version(vllm_version)
+    if (
+        release is not None
+        and release >= Version("0.29.0rc1")
+        and (sm_version is None or sm_version >= 89)
+        and hidden_size
+        and math.gcd(*shape, shard, hidden_size) >= 32
+    ):
         return  # vLLM can split serialized block scales losslessly down to this common tile.
     # The row-parallel down projection also shards its input across tensor-parallel ranks.
-    check_down = (sglang_tp_size or 1) > 1 or (vllm_refine_hidden_size and moe_tp_size > 1)
+    check_down = (sglang_tp_size or 1) > 1 or (release is not None and moe_tp_size > 1)
     for block in shape if check_down else shape[:1]:
         if shard % block:
             raise ValueError(

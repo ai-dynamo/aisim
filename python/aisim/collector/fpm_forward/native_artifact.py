@@ -1013,56 +1013,40 @@ def _glm_rejection_reason(attempt: dict, point: dict) -> str | None:
 
 
 def _glm_discarded_forwards(
-    attempt: dict, point: dict, rank: object, current_overlay: bool, path: Path
-) -> list[tuple[int | None, float | None, float | None]]:
+    attempt: dict, point: dict, rank: object, path: Path
+) -> list[tuple[int, float, float | None]]:
     """Collect each discarded model-runner output in its rank's sequence and monotonic clock."""
     benchmark_id = point["benchmark_id"]
     error = f"native GLM-5.3-Flash result lacks valid repetition_evidence for benchmark_id={benchmark_id}"
     observations = []
     for step, fpm in enumerate(attempt.get("fpms", [])):
         sample = fpm.get("benchmark_sample")
-        if sample is None and not current_overlay:
-            sample = {}
-        if not isinstance(sample, dict) or (
-            current_overlay
-            and not (
-                {"dp_rank", "counter_id", "wall_time"} <= fpm.keys()
-                and {"forward_index", "sample_index", "timing", "cudagraph"} <= sample.keys()
-                and isinstance(sample["timing"], dict)
-                and "start_monotonic" in sample["timing"]
-            )
+        if not (
+            isinstance(sample, dict)
+            and {"dp_rank", "counter_id", "wall_time"} <= fpm.keys()
+            and {"forward_index", "sample_index", "timing", "cudagraph"} <= sample.keys()
+            and isinstance(sample["timing"], dict)
+            and "start_monotonic" in sample["timing"]
         ):
             raise ValueError(f"{error}: discarded forward lacks its recorded identity or timing: {path}")
         if (
-            ("dp_rank" in fpm and not _same(fpm["dp_rank"], rank))
-            or ("counter_id" in fpm and not _same(fpm["counter_id"], benchmark_id))
-            or ("sample_index" in sample and not _same(sample["sample_index"], step))
-            or ("forward_index" in sample and type(sample["forward_index"]) is not int)
-            or (current_overlay and not isinstance(sample["cudagraph"], dict))
+            not _same(fpm["dp_rank"], rank)
+            or not _same(fpm["counter_id"], benchmark_id)
+            or not _same(sample["sample_index"], step)
+            or type(sample["forward_index"]) is not int
+            or not isinstance(sample["cudagraph"], dict)
         ):
             raise ValueError(f"{error}: discarded forward disagrees with its rank, point or sample index: {path}")
-        completion = previous_completion = None
-        if "timing" in sample:
-            wall = fpm.get("wall_time")
-            if type(wall) not in (int, float) or not math.isfinite(wall) or wall < 0:
-                raise ValueError(f"{error}: discarded forward lacks a valid wall time: {path}")
-            timing = sample["timing"]
-            start, completion = _forward_interval(timing, wall)
-            if timing["basis"] == "inter_output":
-                previous_completion = start
-            if current_overlay and start is None and (timing["basis"] != "schedule_to_output" or wall != 0):
-                raise ValueError(
-                    f"{error}: discarded forward lacks the clock required by its measured interval: {path}"
-                )
-            if (
-                current_overlay
-                and timing["basis"] == "inter_output"
-                and (point["point_type"] == "prefill" or step == 0)
-            ):
-                raise ValueError(
-                    f"{error}: discarded forward has an invalid timing basis for its phase or step: {path}"
-                )
-        observations.append((sample.get("forward_index"), completion, previous_completion))
+        wall = fpm["wall_time"]
+        if type(wall) not in (int, float) or not math.isfinite(wall) or wall < 0:
+            raise ValueError(f"{error}: discarded forward lacks a valid wall time: {path}")
+        timing = sample["timing"]
+        start, completion = _forward_interval(timing, wall)
+        if start is None and (timing["basis"] != "schedule_to_output" or wall != 0):
+            raise ValueError(f"{error}: discarded forward lacks the clock required by its measured interval: {path}")
+        if timing["basis"] == "inter_output" and (point["point_type"] == "prefill" or step == 0):
+            raise ValueError(f"{error}: discarded forward has an invalid timing basis for its phase or step: {path}")
+        observations.append((sample["forward_index"], completion, start if timing["basis"] == "inter_output" else None))
     return observations
 
 
@@ -1113,7 +1097,6 @@ def _validate_glm_repetitions(
     rejected = record.get("rejected_repetitions", [])
     if not isinstance(rejected, list) or any(not isinstance(attempt, dict) for attempt in rejected):
         raise ValueError(f"{error}: invalid rejected repetitions: {path}")
-    current_overlay = producer.get("overlay_sha256") == _glm_producer_record()["overlay_sha256"]
     discarded_forwards = {}
     for attempt in rejected:
         counts = _glm_scheduled_counts(attempt, path)
@@ -1129,7 +1112,7 @@ def _validate_glm_repetitions(
             raise ValueError(f"{error}: discarded attempt lacks its rejection reason: {path}")
         if attempt["rejection_reason"] != _glm_rejection_reason(attempt, point):
             raise ValueError(f"{error}: the recorded forwards do not support the rejection reason: {path}")
-        discarded_forwards[attempt_id] = _glm_discarded_forwards(attempt, point, rank, current_overlay, path)
+        discarded_forwards[attempt_id] = _glm_discarded_forwards(attempt, point, rank, path)
     previous_forward, previous_output = previous
     # An asynchronously scheduled attempt may start before a discarded output finishes.
     # Completion times still follow the process-local forward indices across all attempts.
@@ -1164,14 +1147,11 @@ def _validate_glm_repetitions(
                         raise ValueError(
                             f"{error}: discarded inter-output interval disagrees with the preceding output: {path}"
                         )
-                    if forward is not None:
-                        if forward <= previous_forward:
-                            raise ValueError(f"{error}: repeated or unordered discarded forward: {path}")
-                        previous_forward = forward
-                    if completion is not None:
-                        if completion < last_completion:
-                            raise ValueError(f"{error}: discarded completion precedes an earlier forward: {path}")
-                        last_completion = completion
+                    if forward <= previous_forward:
+                        raise ValueError(f"{error}: repeated or unordered discarded forward: {path}")
+                    if completion < last_completion:
+                        raise ValueError(f"{error}: discarded completion precedes an earlier forward: {path}")
+                    previous_forward, last_completion = forward, completion
         previous_attempt = repetition["attempt"]
         fpms = repetition.get("fpms")
         if not isinstance(fpms, list) or len(fpms) != len(steps):
@@ -1189,10 +1169,7 @@ def _validate_glm_repetitions(
         chunk_counts = counts
         if point["point_type"] == "decode":
             chunk_counts = chunk_counts[: -len(steps)]
-            if not chunk_counts and (
-                current_overlay
-                or (seeds is not None and sum(seeds) < point["total_kv_read_tokens"] - point["batch_size"])
-            ):
+            if not chunk_counts:
                 raise ValueError(f"{error}: seeded decode lacks a preparation dispatch for the uncached suffix: {path}")
         _glm_attempt_specs(repetition, point, expected_specs, seed, seeds, path)
         _validate_glm_chunks(
@@ -1211,23 +1188,18 @@ def _validate_glm_repetitions(
             ):
                 raise ValueError(f"{error}: missing or invalid forward for {role} {index}: {path}")
             scheduled_requests = fpm["scheduled_requests"]
-            if current_overlay or variance_field in scheduled_requests:
-                observed = scheduled_requests.get(variance_field)
-                if (
-                    type(observed) not in (int, float)
-                    or not math.isfinite(observed)
-                    or observed < 0
-                    or not math.isclose(observed, variance, rel_tol=1e-9, abs_tol=1e-9)
-                ):
-                    raise ValueError(f"{error}: {variance_field} contradicts the recorded per-request lengths: {path}")
-                if index == len(repetitions) - 1 and step == len(steps) - 1:
-                    retained_workload = retained[0]["scheduled_requests"]
-                    if (current_overlay or variance_field in retained_workload) and not _same(
-                        retained_workload.get(variance_field), observed
-                    ):
-                        raise ValueError(
-                            f"{error}: retained {variance_field} differs from the final measurement: {path}"
-                        )
+            observed = scheduled_requests.get(variance_field)
+            if (
+                type(observed) not in (int, float)
+                or not math.isfinite(observed)
+                or observed < 0
+                or not math.isclose(observed, variance, rel_tol=1e-9, abs_tol=1e-9)
+            ):
+                raise ValueError(f"{error}: {variance_field} contradicts the recorded per-request lengths: {path}")
+            if index == len(repetitions) - 1 and step == len(steps) - 1:
+                retained_workload = retained[0]["scheduled_requests"]
+                if not _same(retained_workload.get(variance_field), observed):
+                    raise ValueError(f"{error}: retained {variance_field} differs from the final measurement: {path}")
             sample = fpm.get("benchmark_sample")
             forward = sample.get("forward_index") if isinstance(sample, dict) else None
             if type(forward) is not int or forward <= previous_forward or not _same(sample.get("sample_index"), step):
@@ -1266,13 +1238,14 @@ def _validate_glm_repetitions(
                     f"{error}: dispatch differs from the scheduled token count {tokens} for {role} {index}: {path}"
                 )
             previous_forward = forward
-    # Attempt IDs include every rejection, even on older records that omit the rejected attempts.
+    # Attempt IDs include every rejection.
     if previous_attempt + 1 - len(repetitions) > _GLM_MAX_REJECTED_REPETITIONS:
         raise ValueError(
             f"{error}: exceeds the producer limit of {_GLM_MAX_REJECTED_REPETITIONS} rejected repetitions: {path}"
         )
-    if (current_overlay or "rejected_repetitions" in record) and (
-        previous_attempt != len(repetitions) + len(discarded_forwards) - 1
+    if (
+        "rejected_repetitions" not in record
+        or previous_attempt != len(repetitions) + len(discarded_forwards) - 1
         or any(attempt > previous_attempt for attempt in discarded_forwards)
     ):
         raise ValueError(f"{error}: the complete attempt history must end at the last accepted repetition: {path}")
@@ -1419,11 +1392,6 @@ def _validate_glm_provenance(
             f"native GLM-5.3-Flash result lacks valid producer: expected a mapping, found {producer!r}: {path}"
         )
     expected_producer = {**_glm_producer_record(), **(producer_digests or {})}
-    if (
-        expected_producer["overlay_sha256"] == _glm_producer_record()["overlay_sha256"]
-        and "decode_contexts_sha256" not in evidence
-    ):
-        raise lacks("input_provenance.decode_contexts_sha256")
     for key, value in expected_producer.items():
         if not _same(producer.get(key), value):
             source = " (the value of the producer receipt of the cell)" if key in (producer_digests or {}) else ""
@@ -1437,6 +1405,9 @@ def _validate_glm_provenance(
         and any(producer[key] != value for key, value in cell.glm_producer_digests._asdict().items())
     ):
         raise lacks("producer digests of the frozen collection plan")
+    # Both receipt-v1 and plan-bound producers use this Dynamo 1.7 evidence format.
+    if "decode_contexts_sha256" not in evidence:
+        raise lacks("input_provenance.decode_contexts_sha256")
     added = sorted(set(producer) - set(expected_producer))
     if added:
         raise ValueError(

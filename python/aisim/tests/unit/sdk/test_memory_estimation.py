@@ -1905,7 +1905,7 @@ def test_vllm_padding_uses_the_requested_version_and_a_bound_for_unverified_vers
         scheduler_block_size=16,
     )
     # 0.14 allocates three 11-layer groups. 0.33 allocates two 15-layer groups.
-    for version, count in [("0.14.0", 123), ("0.33.0", 136), ("current", 123)]:
+    for version, count in [("0.14.0", 123), ("0.33.0", 136), (None, 123)]:
         args = (model, "missing", "vllm", version)
         assert memory.estimate_num_gpu_blocks(*args, **opts) == count
         assert memory.estimate_kv_cache(*args, **opts)["total_kv_size_tokens"] == count * 16
@@ -2196,6 +2196,56 @@ def test_sglang_gemma4_uses_the_layer_shapes_of_its_release(tmp_path, registered
     _write_config(tmp_path, document if registered else {"text_config": raw})
     with pytest.raises(ValueError, match="one Gemma 4 cache geometry"):
         estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.23")
+
+
+@pytest.mark.parametrize("kind", ["sliding_attention", "full_attention"])
+@pytest.mark.parametrize("kv_heads", [2, 6, 8])
+def test_native_gemma4_partitions_each_active_pool_at_tp4(tmp_path, kind, kv_heads):
+    from aisim_core.sdk.config_builders import build_model_config
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = document["text_config"]
+    text["num_attention_heads"] = 24
+    text["per_layer_config"] = {
+        str(i): {"num_key_value_heads": kv_heads} for i, layer in enumerate(text["layer_types"]) if layer == kind
+    }
+    path = _write_config(tmp_path, document)
+    config = build_model_config(tp_size=4, pp_size=1, attention_dp_size=1, moe_tp_size=4, moe_ep_size=1)
+    if kv_heads == 6:
+        with pytest.raises(ValueError, match="KV heads"):
+            get_model(path, config, "vllm", "0.33.0")
+    else:
+        # With an explicit per-layer map, both pool types inherit head_dim=256.
+        active = text["layer_types"].count(kind)
+        rank_heads = max(1, kv_heads // 4)
+        expected = (active * rank_heads + (30 - active) * 2) * 256 * 2 * 2
+        assert get_model(path, config, "vllm", "0.33.0").get_kvcache_bytes_per_sequence(1) == expected
+
+
+@pytest.mark.parametrize(
+    ("attention", "serialized", "window"),
+    [("all", 1024, 513), ("vision", 1024, 1024), (None, None, 512), ("all", None, 257)],
+)
+def test_native_gemma4_capacity_uses_the_initialized_window(tmp_path, attention, serialized, window):
+    from aisim_core.sdk.config_builders import build_model_config
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = document["text_config"]
+    text["use_bidirectional_attention"] = attention
+    if serialized is None:
+        del text["sliding_window"]
+    path = _write_config(tmp_path, document)
+    config = build_model_config(tp_size=4, pp_size=1, attention_dp_size=1, moe_tp_size=4, moe_ep_size=1)
+    native = get_model(path, config, "vllm", "0.33.0")
+    # 25 sliding layers have 2 local heads of width 256. Five full layers have 1 of width 512.
+    for tokens in (1, 1024, 2048):
+        expected = (25 * 2 * 256 * min(window, tokens) + 5 * 512 * tokens) * 2 * 2
+        assert native.get_kvcache_bytes_per_sequence(tokens) == expected
+        assert native.get_kvcache_max_tokens(expected) == tokens
 
 
 def test_registered_gemma4_flat_and_per_layer_release_selection(tmp_path):
@@ -3318,7 +3368,52 @@ def test_vllm_dispatches_the_first_available_text_decoder(tmp_path, classes, exp
     assert _compiled_vllm_transfer_widths(path, "0.32.0") == (expected, expected)
 
 
-def _compiled_vllm_transfer_widths(path, version, *, kvcache_quant_mode=None):
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_native_sglang_llava_uses_execution_dtype_for_both_transfer_workers(tmp_path, dtype):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config import CorePredictionConfig
+
+    # LLaVA 1.5 7B selects Llama's default 32 layers and 32 KV heads of width 128.
+    text = {"architectures": ["LlamaForCausalLM"], "model_type": "llama", "torch_dtype": dtype, "vocab_size": 32064}
+    path = _write_config(
+        tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "model_type": "llava", "text_config": text}
+    )
+    worker = {
+        "parallelism": {"tensor": 1},
+        "timing": {"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
+        "kv_cache": {"capacity": {"type": "fixed", "blocks": 256}},
+    }
+    engine = dict(
+        model=path,
+        mode="disaggregated",
+        hardware="h100_sxm",
+        backend="sglang",
+        backend_version="0.5.23",
+        context_length=4096,
+        workers={"prefill": worker, "decode": worker},
+        kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50},
+    )
+    for mode, width in ((None, 524_288), ("fp8", 262_144), ("bfloat16", 524_288)):
+        if mode:
+            worker["timing"] = {"type": "default"}
+        engine["kvcache_quant_mode"] = mode
+        deployment = prediction_to_replay_spec(
+            CorePredictionConfig.model_validate({"engine": engine})
+        ).backend_deployment
+        assert [
+            deployment.prefill_engine_args["kv_transfer_bytes_per_token"],
+            deployment.decode_engine_args["kv_transfer_bytes_per_token"],
+        ] == [width, width]
+        assert (
+            estimate_kv_bytes_per_token(
+                path, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.23", kvcache_quant_mode=mode
+            )
+            == width
+        )
+
+
+def _compiled_vllm_transfer_widths(path, version, *, kvcache_quant_mode=None, hardware="gb300", transfer_bytes="auto"):
     from aisim.compiler import prediction_to_replay_spec
     from aisim.config import CorePredictionConfig
 
@@ -3332,18 +3427,74 @@ def _compiled_vllm_transfer_widths(path, version, *, kvcache_quant_mode=None):
     engine = dict(
         model=path,
         mode="disaggregated",
-        hardware="gb300",
+        hardware=hardware,
         backend="vllm",
         backend_version=version,
         kvcache_quant_mode=kvcache_quant_mode,
         context_length=4096,
         workers={"prefill": worker, "decode": worker},
-        kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50},
+        kv_transfer={"bytes_per_token": transfer_bytes, "bandwidth_gb_per_second": 50},
     )
     deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
     return deployment.prefill_engine_args["kv_transfer_bytes_per_token"], deployment.decode_engine_args[
         "kv_transfer_bytes_per_token"
     ]
+
+
+@pytest.mark.parametrize(
+    ("system", "available", "unavailable"),
+    [("b60", "current", "next"), ("a100_sxm", "0.14.0", "previous")],
+)
+def test_llava_transfer_width_uses_the_named_system_release(tmp_path, monkeypatch, system, available, unavailable):
+    from importlib import resources
+
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.perf_database import UnlistedQueryVersionError
+
+    # Use the shipped slot definitions even when there are no downloaded timing tables.
+    root = tmp_path / "systems"
+    (root / "data" / system / "vllm" / ("0.28.0" if system == "b60" else "0.14.0")).mkdir(parents=True)
+    catalog = resources.files("aisim_core").joinpath("systems")
+    for filename in (f"{system}.yaml", "query_versions.yaml"):
+        (root / filename).write_bytes(catalog.joinpath(filename).read_bytes())
+    monkeypatch.setenv("AICONFIGURATOR_SYSTEMS_PATH", str(root))
+
+    # LLaVA 1.5 7B's published config leaves Vicuna's head and layer counts at their Llama defaults.
+    path = _write_config(
+        tmp_path,
+        {
+            "architectures": ["LlavaForConditionalGeneration"],
+            "model_type": "llava",
+            "torch_dtype": "float16",
+            "text_config": {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "torch_dtype": "float16",
+                "vocab_size": 32064,
+            },
+        },
+    )
+    scalar = dict(tp_size=1, pp_size=1, backend="vllm", system=system)
+    assert estimate_kv_bytes_per_token(path, backend_version=available, **scalar) == 524_288
+    assert _compiled_vllm_transfer_widths(path, available, hardware=system) == (524_288, 524_288)
+    with pytest.raises(UnlistedQueryVersionError, match=f"has no '{unavailable}' version"):
+        estimate_kv_bytes_per_token(path, backend_version=unavailable, **scalar)
+    with pytest.raises(UnlistedQueryVersionError, match=f"has no '{unavailable}' version"):
+        _compiled_vllm_transfer_widths(path, unavailable, hardware=system)
+    assert _compiled_vllm_transfer_widths(path, unavailable, hardware=system, transfer_bytes=1024) == (1024, 1024)
+
+
+def test_transfer_alias_requires_slots_at_an_estimate_only_system(tmp_path):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    path = _write_config(tmp_path, {"text_config": {"model_type": "llama", "torch_dtype": "float16"}})
+    root = tmp_path / "estimate-only"
+    root.mkdir()
+    (root / "custom.yaml").write_text("data_dir: data/custom\n")
+    options = dict(tp_size=1, pp_size=1, system="custom", systems_paths=[str(root)])
+    with pytest.raises(ValueError, match="no queryable versions defined.*cannot resolve alias 'current'"):
+        estimate_kv_bytes_per_token(path, backend_version="current", **options)
+    assert estimate_kv_bytes_per_token(path, backend_version="0.28.0", **options) == 524_288
 
 
 def _onevision_qwen2_7b(child_dtype):
@@ -4002,6 +4153,18 @@ def test_naive_generator_resolves_mxfp8_on_its_target(tmp_path):
     assert _estimate_model_weight_bytes(model, backend_version="0.32.0", system="h100_sxm") == expected
     with pytest.raises(RuntimeError, match="requires a deployment target"):
         _estimate_model_weight_bytes(model, backend_version="0.32.0")
+
+
+def test_profiling_weight_estimate_receives_the_target_system(mocker):
+    from aisim.generator import enumerate as profiling
+
+    weights = mocker.spy(profiling, "_estimate_model_weight_bytes")
+    prefill, decode, fits, required_tp = profiling.enumerate_profiling_configs(
+        "Qwen/Qwen3-235B-A22B", "h100_sxm", "vllm", backend_version="0.28.0", total_gpus=1
+    )
+    assert (prefill, decode, fits) == ([], [], False)
+    assert required_tp > 1
+    assert weights.call_args.kwargs["system"] == "h100_sxm"
 
 
 def test_borrowed_gemma_and_gpt_neo_construct_before_vllm_dispatch(tmp_path):
@@ -4920,6 +5083,25 @@ def test_sglang_pool_heads_and_vllm_float_cache_use_the_serving_config(tmp_path)
         estimate_kv_bytes_per_token(model, **width)
 
 
+@pytest.mark.parametrize(("checkpoint", "tp"), [("Qwen/Qwen3-30B-A3B-FP8", 8), ("XiaomiMiMo/MiMo-V2-Flash", 32)])
+def test_native_vllm_fp8_expert_shards_follow_the_release_and_gpu(checkpoint, tp):
+    from aisim_core.sdk.config_builders import build_model_config
+    from aisim_core.sdk.models import get_model
+
+    # The shipped checkpoints have 96-wide and 64-wide expert shards at these TP sizes.
+    for version, sm, supported in (("0.28.0", 90, False), ("0.33.0", 90, True), ("0.33.0", 80, False)):
+        db = SimpleNamespace(backend="vllm", version=version, system_spec={"gpu": {"sm_version": sm}})
+        config = build_model_config(tp_size=tp, pp_size=1, attention_dp_size=1, moe_tp_size=tp, moe_ep_size=1)
+        if supported:
+            assert get_model(checkpoint, config, "vllm", database=db).get_kvcache_bytes_per_sequence(1) > 0
+            assert get_model(checkpoint, config, "vllm", version).get_kvcache_bytes_per_sequence(1) > 0
+        else:
+            with pytest.raises(ValueError, match="weight_block_size=128"):
+                get_model(checkpoint, config, "vllm", database=db)
+    aligned = build_model_config(tp_size=2, pp_size=1, attention_dp_size=1, moe_tp_size=2, moe_ep_size=1)
+    assert get_model(checkpoint, aligned, "vllm", "0.28.0").get_kvcache_bytes_per_sequence(1) > 0
+
+
 def test_fp8_expert_tiles_follow_implicit_vllm_tp_and_the_qwen_vl_expert_module(tmp_path):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
@@ -5286,7 +5468,7 @@ def test_sparse_auto_transfer_with_missing_gpu_uses_only_hardware_independent_de
     for target in ({}, {"system": "gb200", "systems_paths": [str(tmp_path)]}):
         args = dict(tp_size=8, pp_size=1, **target)
         assert estimate_kv_bytes_per_token(model, **args, backend_version="0.23.0") == 100_152
-        for version in ("0.24.0rc1", "0.33.0", "current"):
+        for version in ("0.24.0rc1", "0.33.0", None):
             with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
                 estimate_kv_bytes_per_token(model, **args, backend_version=version)
         assert estimate_kv_bytes_per_token(model, **args, kvcache_quant_mode="bfloat16") == 100_152
@@ -5972,7 +6154,7 @@ def test_auto_cache_precision_uses_the_hardware_version_slot(tmp_path, monkeypat
         return {"current": "0.22.0", "previous": "0.20.0"}
 
     monkeypatch.setattr(perf_database, "get_version_slots", slots)
-    for selector, width in ((None, 8_192), ("current", 8_192), ("previous", 16_384), ("next", 16_384)):
+    for selector, width in ((None, 8_192), ("current", 8_192), ("previous", 16_384)):
         assert (
             estimate_kv_bytes_per_token(
                 model,

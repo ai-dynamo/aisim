@@ -84,7 +84,13 @@ class Qwen3VLMoEModel(MOEModel):
             model_config,
             model_info["extra_params"],
         )
-        return cls(*moe_args, *base_args, encoder_config=model_info["extra_params"], backend_name=backend_name)
+        return cls(
+            *moe_args,
+            *base_args,
+            encoder_config=model_info["extra_params"],
+            backend_name=backend_name,
+            model_info=model_info,
+        )
 
     def __init__(
         self,
@@ -94,8 +100,9 @@ class Qwen3VLMoEModel(MOEModel):
         *args,
         encoder_config: common.VisionEncoderConfig,
         backend_name: str = "",
+        model_info: dict | None = None,
     ) -> None:
-        super().__init__(topk, num_experts, moe_inter_size, *args, backend_name=backend_name)
+        super().__init__(topk, num_experts, moe_inter_size, *args, backend_name=backend_name, model_info=model_info)
 
         if encoder_config is None:
             return

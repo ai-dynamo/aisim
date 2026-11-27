@@ -41,7 +41,9 @@ across versions or configurations.
 For native SDK estimates, `estimate_kv_cache`, `estimate_num_gpu_blocks`, and
 `KVCacheEstimator.from_request` resolve an omitted `backend_version` (or `None`)
 through the backend's `current` data alias for the requested system and data
-roots. Explicit version selectors are preserved. FPM profile estimates still
+roots. Config-only transfer sizing uses the named system’s authored slots for
+explicit aliases such as `previous`. Literal releases can size a checkpoint
+offline. FPM profile estimates still
 require the profile's literal backend version.
 
 For Mistral3's gated Pixtral encoder, the analytical activation estimate includes
@@ -111,7 +113,9 @@ When this fallback selects a nested decoder, it uses the decoder's supported
 explicit decoder class for LLaVA and InternVL and rejects an explicit empty
 class list. Its Idefics3 model constructs a Llama decoder directly. SGLang's
 LLaVA selects the decoder from the Transformers config class shipped with that
-SGLang release. In registered vLLM wrappers, unquantized decoder weights and
+SGLang release. Under automatic precision, its native LLaVA cache uses the text
+decoder's execution dtype. An FP32 Llama decoder runs in FP16 and a BF16
+decoder keeps BF16. In registered vLLM wrappers, unquantized decoder weights and
 automatic KV storage use the parent model's execution dtype. A compressed-tensors
 KV scheme changes the cache alone. For a dense Llama, Mistral, Qwen2 or Qwen3
 decoder on one pipeline stage, the estimator reduces its projection reserve
@@ -186,7 +190,10 @@ For example, FlashMLA stores an extra four FP32 scales in a 512-element FP8
 latent. Shared capacity also needs the runtime indexer allocation. Recurrent and
 other per-layer layouts require their runtime state or group measurements.
 Gemma 4 normalizes its final decoder layer to full attention even when an
-explicit list declares it sliding. On vLLM 0.28 through 0.31, supported Transformers versions can read different head counts from the same Gemma checkpoint. The SDK checks the collection image in the selected performance database when that changes a rank’s attention geometry. A direct `get_model` call can pass that database with `database=...`.
+explicit list declares it sliding. Each resident vLLM KV head count must shard
+or replicate evenly across the tensor-parallel ranks. Sliding layers default
+to 512 tokens. With bidirectional attention set to `all`, a serialized window
+of 1,024 becomes 513 tokens in the initialized model. On vLLM 0.28 through 0.31, supported Transformers versions can read different head counts from the same Gemma checkpoint. The SDK checks the collection image in the selected performance database when that changes a rank’s attention geometry. A direct `get_model` call can pass that database with `database=...`.
 To identify the Gemma runtime for that estimate, the SDK requires collection metadata for each nonempty table in the selected version. Schema 1 uses the directory’s runtime. Schema 2 can identify the runtime separately for each collection that contributed rows.
 
 DeepSeek V4 Flash and Pro expose 3,915 and 5,610 marginal compressed-cache bytes

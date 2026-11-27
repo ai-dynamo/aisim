@@ -2110,6 +2110,23 @@ def test_recovery_keeps_the_receipt_that_its_validation_read(tmp_path, monkeypat
         native_artifact._glm_producer_record.cache_clear()
 
 
+@pytest.mark.parametrize("status", ["failed", "passed"])
+def test_resume_refuses_a_glm_cell_with_an_unpublishable_median(tmp_path, status):
+    from . import test_fpm_glm53flash_native_collection as nc
+
+    plan, cell, cell_dir, artifacts, checkpoints = _glm_cell_to_recover(tmp_path, status=status)
+    payload = nc.glm_native_payload("prefill", points=[nc.PREFILL_COLD, nc.PREFILL_CACHED])
+    nc._glm_producer_shape(tmp_path, "median")("prefill", payload)
+    nc.write_glm_rank(cell_dir / "raw/node0000", payload)
+    with pytest.raises(ValueError, match="reduction disagrees with retained timing"):
+        fpm_runner._runtime_collection_summary(cell, cell_dir / "raw", expected_attempt_id="attempt-1", plan=plan)
+    errors = _resume_one_cell(plan, artifacts, checkpoints)
+    assert [error["classification"] for error in errors] == ["campaign_incomplete"]
+    entry = json.loads((checkpoints / "fpm_forward_smoke.json").read_bytes())["cells"][cell.cell_id]
+    assert entry["status"] == "failed"
+    assert not (cell_dir / "producer-receipt.json").exists()
+
+
 def test_recovery_of_a_cell_without_a_receipt_writes_the_digests_of_the_recovering_checkout(tmp_path, monkeypatch):
     from collector.fpm_forward.native_artifact import validate_native_collection
 
@@ -2179,6 +2196,20 @@ def test_recovery_leaves_a_cell_with_a_refused_receipt_unrecovered(tmp_path, mon
     # Recovery neither accepts the receipt nor replaces it: the file stays as evidence until a new attempt removes it.
     assert (cell_dir / "producer-receipt.json").read_bytes() == planted
     assert f"FPM cell {cell.cell_id} (status=failed) is not recoverable from local artifacts: {refusal}" in caplog.text
+
+
+def test_retry_preserves_raw_and_log_evidence_when_the_receipt_cannot_be_replaced(tmp_path):
+    plan, cell, cell_dir, _, _ = _glm_cell_to_recover(tmp_path, status="failed")
+    (cell_dir / "producer-receipt.json").mkdir()
+    artifact = cell_dir / "raw/node0000/benchmark.json"
+    prior = artifact.read_bytes()
+    log = cell_dir / "logs/collector.log"
+    log.parent.mkdir()
+    log.write_text("previous attempt")
+    with pytest.raises(OSError, match="move the stale receipt aside"):
+        _rerun_smoke(tmp_path, plan, retry_failed=True)
+    assert artifact.read_bytes() == prior
+    assert log.read_text() == "previous attempt"
 
 
 def _no_space(*_args, **_kwargs):

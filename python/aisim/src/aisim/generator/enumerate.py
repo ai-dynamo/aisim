@@ -427,7 +427,9 @@ def enumerate_profiling_configs(
 
     is_moe = check_is_moe(model_path)
     backend_enum = common.BackendName(backend)
-    model_weight_bytes = _estimate_model_weight_bytes(model_path, backend=backend, backend_version=backend_version)
+    model_weight_bytes = _estimate_model_weight_bytes(
+        model_path, backend=backend, backend_version=backend_version, system=system
+    )
 
     # Auto-enable wideEP for MoE models that are large relative to the node.
     # Small MoE models (node VRAM >= 2x model weight) fit comfortably on a

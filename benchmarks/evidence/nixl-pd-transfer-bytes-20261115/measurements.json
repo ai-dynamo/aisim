@@ -44,7 +44,7 @@
           "kda_8_layers": "derived"
         },
         "region_sums": "derived",
-        "formula": "measured",
+        "formula": "derived",
         "rows": {
           "transferred_tokens": "measured",
           "prefill_attention_blocks": "measured",
@@ -214,7 +214,7 @@
           "kda_8_layers": "derived"
         },
         "region_sums": "derived",
-        "formula": "measured",
+        "formula": "derived",
         "rows": {
           "transferred_tokens": "measured",
           "prefill_attention_blocks": "measured",

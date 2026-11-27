@@ -57,6 +57,7 @@ from .glm53flash_points import (
     glm_measured_context,
     glm_smoke_subset,
 )
+from .measurement_evidence import extract_measurement_evidence
 from .native_artifact import (
     COLLECTOR_PROVENANCE_FILENAME,
     PRODUCER_RECEIPT_FILENAME,
@@ -1879,6 +1880,10 @@ def _validate_runtime_collection(
     )["measured_point_count"]
 
 
+class _InvalidGlmMeasurement(ValueError):
+    """The retained GLM measurement contradicts its raw evidence."""
+
+
 def _runtime_collection_summary(
     cell: FPMCell,
     raw_root: Path,
@@ -1896,6 +1901,11 @@ def _runtime_collection_summary(
         expected_attempt_id=expected_attempt_id,
         deployment=plan.deployment_profile(cell) if getattr(plan, "fpm_profile", None) is not None else None,
     )
+    if collection.execution_mode == "native_graph_policy":
+        try:
+            extract_measurement_evidence(raw_root, collection)
+        except ValueError as error:
+            raise _InvalidGlmMeasurement(str(error)) from error
     points = tuple(measurement.point for measurement in collection.points)
     summary = {
         "measured_point_count": len(points),
@@ -2394,10 +2404,9 @@ def _run_collection_impl(
                 smoke=smoke,
             )
         # This refresh only polishes checkpoint metadata for cells whose
-        # results were already validated and published; raw artifacts that
-        # are no longer readable (disk reclaimed, resume from a different
-        # working directory) must not abort the whole resume and never
-        # demote the cell's passed status.
+        # results were already validated. An unavailable raw file can be due
+        # to disk reclamation. A retained measurement that contradicts its
+        # samples needs a new attempt if the cell still awaits publication.
         try:
             metadata = {
                 "total_gpus": cell.topology.total_gpus,
@@ -2416,6 +2425,11 @@ def _run_collection_impl(
                 )
             )
         except (OSError, TypeError, ValueError) as error:
+            if isinstance(error, _InvalidGlmMeasurement) and not formal_database_terminal:
+                # Older runners could pass a cell whose retained median cannot be published.
+                entry.update(status="failed", error_type=type(error).__name__, error=str(error))
+                checkpoint_changed = True
+                continue
             logger.warning(
                 "Skipping metadata refresh for passed FPM cell %s: %s",
                 cell.cell_id,
@@ -2479,11 +2493,16 @@ def _run_collection_impl(
         if instrumentation is not None and previous.get("attempt_id") and not archive_observations(cell, previous):
             _atomic_json(checkpoint_path, checkpoint)
             continue
+        # A producer receipt vouches only for the attempt that wrote it. Invalidate it
+        # before discarding that attempt's evidence, including when unlink fails.
+        receipt = cell_dir / PRODUCER_RECEIPT_FILENAME
+        try:
+            receipt.unlink(missing_ok=True)
+        except OSError as error:
+            raise OSError(f"Cannot remove {receipt}. Please move the stale receipt aside before retrying") from error
         for stale_dir in (cell_dir / "raw", cell_dir / "logs"):
             if stale_dir.exists():
                 shutil.rmtree(stale_dir)
-        # A producer receipt vouches only for the artifacts of the attempt that wrote it.
-        (cell_dir / PRODUCER_RECEIPT_FILENAME).unlink(missing_ok=True)
         _atomic_json(cell_dir / "cell.json", cell.to_dict())
         cell_started = time.monotonic()
         # Collector-side phase segmentation for the run manifest (R16 §3):

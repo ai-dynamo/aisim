@@ -918,25 +918,6 @@ def write_formal_database(
                 f"existing FPM database runtime version mismatch: actual={sorted(existing_versions)!r} "
                 f"expected={version!r}"
             )
-        # Schema 8 binds every row to the power-window policy, so one pair
-        # cannot hold power-window and latency-only rows. Refuse the merge
-        # before anything is written; the existing pair stays as committed.
-        policies = {row.get("measurement_policy") for row in [*merged, *rows]}
-        powered = POWER_WINDOW_MEASUREMENT_POLICY in policies
-        if powered and policies != {POWER_WINDOW_MEASUREMENT_POLICY}:
-            raise ValueError(
-                "cannot mix power-window and latency-only FPM rows in one database: schema 8 requires every "
-                f"row to carry measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}. Publish to a clean "
-                f"destination, or collect every cell with the same --fpm-measure-power setting: {parquet_path}"
-            )
-        # The loader reads the measurement policy of the sidecar, and the median policy binds every row to it.
-        median = next((policy for policy in _MEDIAN_PROTOCOLS if policy in policies), None)
-        if median and policies != {median}:
-            raise ValueError(
-                "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
-                f"measurement_policy, and {median!r} binds every row. Publish to a clean "
-                f"destination: {parquet_path}"
-            )
         existing_identities = _run_identities_by_cell(merged, source="existing")
         skipped_cells: list[str] = []
         for cell_id, incoming_identity in sorted(incoming_identities.items()):
@@ -950,15 +931,37 @@ def write_formal_database(
                     existing_identity,
                     incoming_identity,
                 )
+        policies = {row.get("measurement_policy") for row in [*merged, *rows]}
+        median = next((policy for policy in _MEDIAN_PROTOCOLS if policy in policies), None)
         if skipped_cells:
             skipped_set = set(skipped_cells)
             rows = [row for row in rows if row.get("cell_id") not in skipped_set]
-            if not rows:
-                logger.warning(
-                    "fpm_forward: every incoming cell is already published under a different run "
-                    "identity; database left unchanged"
-                )
-                return parquet_path, metadata_path, tuple(skipped_cells)
+            # A median collection also requires its reused cells to follow the same protocol.
+            if not median:
+                policies = {row.get("measurement_policy") for row in [*merged, *rows]}
+        # Schema 8 binds every row to the power-window policy, so one pair
+        # cannot hold power-window and latency-only rows. Refuse the merge
+        # before anything is written; the existing pair stays as committed.
+        powered = POWER_WINDOW_MEASUREMENT_POLICY in policies
+        if powered and policies != {POWER_WINDOW_MEASUREMENT_POLICY}:
+            raise ValueError(
+                "cannot mix power-window and latency-only FPM rows in one database: schema 8 requires every "
+                f"row to carry measurement_policy={POWER_WINDOW_MEASUREMENT_POLICY!r}. Publish to a clean "
+                f"destination, or collect every cell with the same --fpm-measure-power setting: {parquet_path}"
+            )
+        # The loader reads the measurement policy of the sidecar, and the median policy binds every row to it.
+        if median and policies != {median}:
+            raise ValueError(
+                "cannot mix GLM-5.3-Flash producer rows and other FPM rows in one database: the sidecar holds one "
+                f"measurement_policy, and {median!r} binds every row. Publish to a clean "
+                f"destination: {parquet_path}"
+            )
+        if not rows:
+            logger.warning(
+                "fpm_forward: every incoming cell is already published under a different run "
+                "identity; database left unchanged"
+            )
+            return parquet_path, metadata_path, tuple(skipped_cells)
         if powered:
             for row in [*merged, *rows]:
                 row.setdefault("power_w", None)

@@ -240,9 +240,12 @@ warm-up history, of the timing start and of the CUDA graph dispatch need
 measurement evidence version 2, the default, which publication uses. The
 other checks of the protocol and of the raw samples also run at version 1.
 
-When a GLM-5.3-Flash cell passes, the collector writes `producer-receipt.json`
-in the cell folder with its plan hash, cell ID, attempt ID and the two verified
-file digests. Recovery, readiness, repeatability, publication, finalization and
+Before the collector marks a GLM-5.3-Flash attempt as passed or recovers it on
+resume, it checks its retained timing against the same raw-sample reduction
+used for publication. An unpublished cell marked passed by an older runner
+becomes eligible for `--resume-retry-failed` if its measurements contradict
+the retained evidence. A passing cell receives `producer-receipt.json` with
+its plan hash, cell ID, attempt ID and the two verified file digests. Recovery, readiness, repeatability, publication, finalization and
 serving validation check the receipt against the original plan. Plans from
 the receipt-v1 producer in PR #1005 predate the plan's `glm_producer_digests`
 field. The reader checks their receipts against that revision's two known

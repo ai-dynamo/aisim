@@ -405,6 +405,7 @@ def write_glm_rank(directory: Path, payload: dict) -> Path:
             "point_type": point["point_type"],
             "rows": rows,
             "repetitions": repetitions,
+            "rejected_repetitions": [],
         }
         lines.append(json.dumps(record, sort_keys=True, separators=(",", ":")).encode())
     for row, line in zip(payload["results"], lines, strict=True):
@@ -609,6 +610,7 @@ def test_glm_collection_requires_all_ten_saved_raw_samples_for_each_point(tmp_pa
 
     cell = glm_cell("decode")
     payload = glm_native_payload("decode", points=DECODE_POINTS)
+    _glm_producer_shape(tmp_path)("decode", payload)
     record = payload["results"][-1]["fpms"][0]["benchmark_measurement"]
     if count is None:
         del record["raw_fpms"]
@@ -2489,6 +2491,26 @@ def test_glm_publication_refuses_a_producer_record_whose_retained_median_moved(t
     assert "benchmark_measurement reduction disagrees with retained timing" in str(error.value)
 
 
+def test_glm_measurement_refuses_a_recorded_global_warmup(tmp_path):
+    def add_global_warmup(payload):
+        payload["warmup_evidence"]["records"].append(
+            {
+                "kind": "global",
+                "status": "completed",
+                "completed_points_before": 0,
+                "forward_index_start": 0,
+                "forward_index_end": 1,
+                "observed_forward_count": 1,
+                "validation": {"status": "not_performed"},
+            }
+        )
+        for row, group in zip(payload["results"], payload["iteration_groups"], strict=True):
+            for item in (row, group["rank_results"][0]):
+                item["fpms"][0]["benchmark_measurement"]["preparation"]["warmup_records_before"] = 1
+
+    assert "global warmup record" in _publication_refusal(tmp_path, "prefill", add_global_warmup)
+
+
 def _publication_refusal(tmp_path, phase, tamper) -> str:
     """Verify publication refuses the artifact and return the measurement reader's diagnosis.
 
@@ -3639,6 +3661,36 @@ def test_campaign_with_receipts_is_read_after_the_producer_files_change(tmp_path
         receipt.unlink()
         with pytest.raises(ValueError, match=r"lacks valid producer\.overlay_sha256"):
             _validate(tmp_path / "prefill", cell)
+    finally:
+        native_artifact._glm_producer_record.cache_clear()
+
+
+@pytest.mark.parametrize("legacy_plan", [False, True])
+def test_receipted_glm_variance_is_required_before_and_after_overlay_upgrade(tmp_path, monkeypatch, legacy_plan):
+    from .test_fpm_runner import _later_producer_revision
+
+    cell = glm_cell("prefill")
+    if legacy_plan:
+        cell = replace(cell, glm_producer_digests=None)
+    payload = glm_native_payload("prefill", points=[PREFILL_COLD])
+    _glm_producer_shape(tmp_path)("prefill", payload)
+    artifact = write_glm_rank(_pod(tmp_path, cell), payload)
+    native_artifact.write_producer_receipt(cell, tmp_path, plan_sha256=PLAN_SHA256, attempt_id=ATTEMPT_ID)
+
+    def drop_variance(record):
+        for stage in record["repetitions"]:
+            for fpm in stage["fpms"]:
+                del fpm["scheduled_requests"]["var_prefill_length"]
+        for row in (payload["results"][0], payload["iteration_groups"][0]["rank_results"][0]):
+            retained = row["fpms"][0]
+            for fpm in (retained, *retained["benchmark_measurement"]["raw_fpms"]):
+                fpm["scheduled_requests"].pop("var_prefill_length", None)
+
+    _check_altered_repetition(tmp_path, cell, payload, artifact, drop_variance, "var_prefill_length")
+    try:
+        _later_producer_revision(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="var_prefill_length"):
+            database.aggregate_cell(_glm_plan(), cell, tmp_path, expected_attempt_id=ATTEMPT_ID)
     finally:
         native_artifact._glm_producer_record.cache_clear()
 

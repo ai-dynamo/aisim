@@ -374,6 +374,10 @@ def _warmup_history(payload: dict[str, Any], protocol: dict[str, Any] | None, *,
             or not _integer(record.get("completed_points_before"))
         ):
             raise ValueError("malformed warmup_evidence record")
+        if glm and record["kind"] == "global":
+            raise ValueError(
+                f"GLM-5.3-Flash requires zero global warmup iterations but contains a global warmup record: {path}"
+            )
         start, end = record.get("forward_index_start"), record.get("forward_index_end")
         count = record.get("observed_forward_count")
         if (

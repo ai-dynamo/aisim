@@ -689,6 +689,23 @@ def _sealed(metadata, parquet):
     return metadata.read_bytes(), parquet.read_bytes()
 
 
+@pytest.mark.parametrize("first_power", [False, True], ids=["latency-first", "power-first"])
+def test_first_publisher_keeps_an_existing_cell_across_power_settings(tmp_path, first_power):
+    root = tmp_path / "systems"
+    latency = _tp2_decode(tmp_path / "latency", schema_version=2, plan_sha256="latency-plan")
+    power = _tp2_decode(tmp_path / "power", plan_sha256="power-plan")
+    first, second = (power, latency) if first_power else (latency, power)
+    plan, cell, cell_dir = first
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    parquet, metadata, _ = write_formal_database(plan, rows, systems_root=root)
+    sealed = _sealed(metadata, parquet)
+
+    plan, cell, cell_dir = second
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    assert write_formal_database(plan, rows, systems_root=root) == (parquet, metadata, (cell.cell_id,))
+    assert _sealed(metadata, parquet) == sealed
+
+
 @pytest.mark.parametrize("existing_schema", [6, 7])
 def test_powered_run_cannot_merge_into_a_latency_only_pair(tmp_path, existing_schema):
     systems_root = tmp_path / "systems"
