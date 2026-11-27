@@ -35,7 +35,7 @@ pub(crate) enum OpList {
 pub(crate) struct OpMemo {
     /// Each op's field by list and index, computed once from the lists.
     fields: [Box<[Option<MemoField>]>; 2],
-    /// Up to four recent (batch size, token count) shapes, addressed by op index.
+    /// One row per (batch size, token count) shape, addressed by op index.
     decode_rows: Memo<(u32, u32), DecodeRow>,
     /// Keyed by list, index and field value ([`Self::key`]).
     results: Memo<u64, PerformanceResult>,
@@ -54,7 +54,8 @@ impl OpMemo {
         Self {
             fields: [fields(context_ops), fields(generation_ops)],
             results: Memo::flat(capacity).verifying_hits(),
-            decode_rows: Memo::flat(4),
+            // One row per decode batch size up to the default `max_sequences`, about 136 B per op.
+            decode_rows: Memo::flat(256),
             // One entry per generation stage and token count, about 1.5 KB each.
             stage_children: Memo::flat(4096).verifying_hits(),
         }
@@ -825,6 +826,15 @@ mod tests {
     use crate::perf_database::energy_test_fixtures::{
         Col, write_energy_systems_root, write_parquet,
     };
+
+    #[test]
+    fn decode_rows_keep_256_batch_sizes() {
+        let op = Op::Gemm(GemmOp::new("gemm", 1024, 1024, GemmQuantMode::Bfloat16));
+        let memo = OpMemo::new(16, &[], std::slice::from_ref(&op));
+        let row = |batch| memo.decode_row(&generation_op_runtime(batch, 1, 512, 1.0, 0, None));
+        let rows: Vec<_> = (1..=256).map(row).collect();
+        assert!(Arc::ptr_eq(&rows[0], &row(1)));
+    }
 
     #[test]
     fn dsv41_stage_memo_preserves_first_child_error_and_omits_failed_children() {
