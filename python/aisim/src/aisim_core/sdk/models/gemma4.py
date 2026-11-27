@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from dataclasses import replace
 from functools import lru_cache
@@ -21,11 +22,12 @@ from aisim_core.sdk.utils import gemma4_cache_shapes
 
 # Official release index (first) and its Linux platform manifest digests for the vLLM
 # releases with supported Transformers readers that disagree on a Gemma configuration.
+# Pin the image index, then the amd64 and (for CUDA) arm64 manifests, in that order.
 _GEMMA4_ADAPTER_IMAGES = {
     ("0.28.0", "vllm"): (
         "sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14",
-        "sha256:2a7cde230b59f3ce6cab33dd245ba6bee41aa87b38c9fe84f966ff24016813ce",
         "sha256:2286e8533ca8b6bc777594bae30524f1426ba46ca21797524e06df6a94b06635",
+        "sha256:2a7cde230b59f3ce6cab33dd245ba6bee41aa87b38c9fe84f966ff24016813ce",
     ),
     ("0.28.0", "vllm_xpu"): (
         "sha256:4756b66a077627133cee653b551f6f5eaa1b9a981b5eea13edd33fcd3b0d3ca3",
@@ -33,8 +35,8 @@ _GEMMA4_ADAPTER_IMAGES = {
     ),
     ("0.29.0", "vllm"): (
         "sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1",
-        "sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a",
         "sha256:082ca6f035279109041ffd3fe0695cb568b29bc580b35c4f297a66a08b216c1b",
+        "sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a",
     ),
     ("0.29.0", "vllm_xpu"): (
         "sha256:96db42e248d48760a4937eb3d04c4878b39d13a9814efea95d510393e097a901",
@@ -42,8 +44,8 @@ _GEMMA4_ADAPTER_IMAGES = {
     ),
     ("0.30.0", "vllm"): (
         "sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
-        "sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
         "sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40",
+        "sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
     ),
     ("0.30.0", "vllm_xpu"): (
         "sha256:fc0e112afb64e3a06fe8daff34652435822a629412f38efce8f0f67a46636b8d",
@@ -51,8 +53,8 @@ _GEMMA4_ADAPTER_IMAGES = {
     ),
     ("0.31.0", "vllm"): (
         "sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3",
-        "sha256:3f7dd5b777d34d1724456ce71f87385dca288c3bb23029ab27dee358f5d2b971",
         "sha256:a4a4c0437bf7240089da5f08aa370c4aee17ae5290f7a3b468825ee26c4c3a6b",
+        "sha256:3f7dd5b777d34d1724456ce71f87385dca288c3bb23029ab27dee358f5d2b971",
     ),
     ("0.31.0", "vllm_xpu"): (
         "sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7",
@@ -95,6 +97,85 @@ def _cached_table_rows(path: Path, revision: tuple[int, ...]) -> bool:
     return _has_table_rows(path)
 
 
+def _valid_gemma4_v1_record(collection: dict, table: str, event: object, path: Path) -> bool:
+    """Check the collector's published v1 forms before using a retained table as runtime evidence."""
+    if not isinstance(event, dict) or event.get("status") not in ("complete", "partial"):
+        return False
+    try:
+        runtime = collection.get("runtime")
+        fields = event.keys()
+        # The frozen sparse-attention collector records a concrete platform with its image manifest.
+        frozen = (
+            collection.get("provenance") is None
+            and table == "glm53_attention_module_perf"
+            and event.get("collector") == "collector.vllm.glm53flash_attention_runner"
+            and isinstance(runtime, dict)
+            and ("image_arch" not in runtime or runtime["image_arch"] in ("amd64", "arm64"))
+        )
+        perf_database._validate_collection_runtime(
+            {k: v for k, v in runtime.items() if k != "image_arch"} if frozen else runtime,
+            field="runtime",
+            path=str(path),
+        )
+        if frozen:
+            digests = _GEMMA4_ADAPTER_IMAGES.get((runtime["version"], runtime["framework"]), ())
+            platform = {"amd64": 1, "arm64": 2}.get(runtime.get("image_arch"))
+            perf_database._validate_non_negative_row_count(
+                event.get("rows"), field=f"tables.{table}.rows", path=str(path)
+            )
+            table_path = path.parent / f"{table}.parquet"
+            if not table_path.is_file() or (
+                platform is not None and (len(digests) <= platform or runtime.get("image_digest") != digests[platform])
+            ):
+                return False
+            # The catalog re-encodes Parquet after collection. Its logical rows retain the exact
+            # runtime manifest, even when two releases have the same number of measurements.
+            from pyarrow.parquet import ParquetFile
+
+            digest = event.get("data_sha256")
+            retained = ParquetFile(table_path)
+            return (
+                isinstance(digest, str)
+                and re.fullmatch("[0-9a-f]{64}", digest) is not None
+                and retained.metadata.num_rows == event["rows"]
+                and "runtime_digest" in retained.schema_arrow.names
+                and retained.read(columns=["runtime_digest"])["runtime_digest"].unique().to_pylist()
+                == [runtime.get("image_digest")]
+            )
+        if collection.get("provenance") is None and fields in (
+            {"collector_ref", "rows", "status"},
+            {"collector_ref", "collector_hash", "case_plan_hash", "rows", "status"},
+        ):
+            # The published B60 v1 tables recorded the collector identity before collected_at was required.
+            perf_database._validate_non_negative_row_count(event["rows"], field=f"tables.{table}.rows", path=str(path))
+            return all(isinstance(event[k], str) and event[k].strip() for k in fields - {"rows", "status"})
+        if "schema_version" not in collection and fields != {"rows", "status"}:
+            return False
+        if fields == {"status"}:
+            return collection.get("provenance") in ("local", "collected")
+        if fields in ({"rows", "status"}, {"rows", "status", "collected_at"}):
+            # Earlier measured rows/status summaries predate the provenance tier.
+            perf_database._validate_non_negative_row_count(event["rows"], field=f"tables.{table}.rows", path=str(path))
+            return "collected_at" not in event or (
+                collection.get("provenance") in ("local", "collected")
+                and isinstance(event["collected_at"], str)
+                and bool(event["collected_at"].strip())
+            )
+        required = perf_database._COLLECTION_EVENT_REQUIRED_KEYS
+        if fields - {*required, "classified_failures"}:
+            return False
+        if event.get("classified_failures") is not None:
+            perf_database._validate_non_negative_row_count(
+                event["classified_failures"], field="classified_failures", path=str(path)
+            )
+        perf_database._validate_collection_event(
+            {k: event[k] for k in required if k in event}, table=table, index=0, path=str(path)
+        )
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _gemma4_collection_images(directory: Path, version: str, framework: str, *, cache: bool) -> Iterator[bool]:
     """Yield whether each retained measurement of this framework used the pinned official image."""
     path = directory / perf_database.COLLECTION_META_MARKER
@@ -102,6 +183,13 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str, *, 
     if not digests or not path.is_file():
         return
     collection = perf_database._load_collection_meta_yaml(str(path), cache=cache)
+    schema = collection.get("schema_version", 1)
+    tier = collection.get("provenance")
+    valid_header = (
+        type(schema) is int
+        and not (collection.keys() - {"schema_version", "provenance", "runtime", "tables"})
+        and (tier is None or (isinstance(tier, str) and bool(tier.strip())))
+    )
     tables = collection.get("tables")
     if not isinstance(tables, dict):
         return
@@ -114,34 +202,39 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str, *, 
     image = f"{repository}:v{version}"
     for table in files & tables.keys():
         data = tables[table]
-        if not isinstance(data, dict):
-            continue
+        v1 = schema == 1
         # Schema v1 records one collection per table. In v2 an individual
         # measurement can override the directory's runtime.
-        for event in data.get("collections", [data]):
-            runtime = event.get("runtime", collection.get("runtime"))
-            if not isinstance(runtime, dict):
+        for event in [data] if v1 else data["collections"]:
+            runtime = (
+                event.get("runtime", collection.get("runtime"))
+                if isinstance(event, dict)
+                else collection.get("runtime")
+            )
+            if isinstance(runtime, dict) and runtime.get("framework") not in (None, framework):
                 continue
-            rows = event.get("rows")
-            if (
-                collection.get("schema_version") == 1
-                and collection.get("provenance") in ("local", "collected")
-                and set(event) == {"status"}
-                and event["status"] in ("complete", "partial")
-            ):
-                # A valid reduced record omits its count. Read the retained table once per revision.
-                path = directory / f"{table}.parquet"
-                if not path.is_file():
-                    path = directory / f"{table}.txt"
+            rows = event.get("rows") if isinstance(event, dict) else None
+            valid = valid_header and (not v1 or _valid_gemma4_v1_record(collection, table, event, path))
+            if v1 and (not valid or rows is None):
+                # Missing or malformed counts cannot hide a retained measurement. Empty files attest to nothing.
+                table_path = directory / f"{table}.parquet"
+                if not table_path.is_file():
+                    table_path = directory / f"{table}.txt"
                 rows = int(
-                    _cached_table_rows(path, perf_database._file_revision(path)) if cache else _has_table_rows(path)
+                    _cached_table_rows(table_path, perf_database._file_revision(table_path))
+                    if cache
+                    else _has_table_rows(table_path)
                 )
             if type(rows) is not int or rows <= 0:
                 continue
-            if runtime.get("framework") != framework:
+            if not valid or not isinstance(runtime, dict):
+                yield False
                 continue
             reference = runtime.get("image", "")
-            reference = reference.removeprefix("docker.io/") if isinstance(reference, str) else ""
+            reference = reference if isinstance(reference, str) else ""
+            registry, _, rest = reference.partition("/")
+            if registry in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+                reference = rest
             name, _, embedded_digest = reference.partition("@")
             digest = runtime.get("image_digest", embedded_digest)
             yield (

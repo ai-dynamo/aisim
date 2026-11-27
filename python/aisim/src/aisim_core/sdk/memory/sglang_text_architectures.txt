@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright the HuggingFace Team
+# SPDX-License-Identifier: Apache-2.0
+# SGLang 0.5.x patch ranges with the same Transformers config-class to causal-LM mapping.
+# Columns: first patch, last patch, model_type=class pairs from the pinned Transformers packages.
+6 9 mega=MegaForCausalLM open-llama=OpenLlamaForCausalLM qdqbert=QDQBertLMHeadModel
+6 9 speech_to_text_2=Speech2Text2ForCausalLM transfo-xl=TransfoXLLMHeadModel
+6 9 xlm-prophetnet=XLMProphetNetForCausalLM
+6 10 code_llama=LlamaForCausalLM
+6 23 apertus=ApertusForCausalLM arcee=ArceeForCausalLM aria_text=AriaTextForCausalLM bamba=BambaForCausalLM
+6 23 bart=BartForCausalLM bert=BertLMHeadModel bert-generation=BertGenerationDecoder big_bird=BigBirdForCausalLM
+6 23 bigbird_pegasus=BigBirdPegasusForCausalLM biogpt=BioGptForCausalLM bitnet=BitNetForCausalLM
+6 23 blenderbot=BlenderbotForCausalLM blenderbot-small=BlenderbotSmallForCausalLM bloom=BloomForCausalLM
+6 23 blt=BltForCausalLM camembert=CamembertForCausalLM codegen=CodeGenForCausalLM cohere=CohereForCausalLM
+6 23 cohere2=Cohere2ForCausalLM cpmant=CpmAntForCausalLM ctrl=CTRLLMHeadModel
+6 23 data2vec-text=Data2VecTextForCausalLM dbrx=DbrxForCausalLM deepseek_v2=DeepseekV2ForCausalLM
+6 23 deepseek_v3=DeepseekV3ForCausalLM diffllama=DiffLlamaForCausalLM doge=DogeForCausalLM dots1=Dots1ForCausalLM
+6 23 electra=ElectraForCausalLM emu3=Emu3ForCausalLM ernie=ErnieForCausalLM ernie4_5=Ernie4_5ForCausalLM
+6 23 ernie4_5_moe=Ernie4_5_MoeForCausalLM exaone4=Exaone4ForCausalLM falcon=FalconForCausalLM
+6 23 falcon_h1=FalconH1ForCausalLM falcon_mamba=FalconMambaForCausalLM flex_olmo=FlexOlmoForCausalLM
+6 23 fuyu=FuyuForCausalLM gemma=GemmaForCausalLM gemma2=Gemma2ForCausalLM gemma3=Gemma3ForConditionalGeneration
+6 23 gemma3_text=Gemma3ForCausalLM gemma3n=Gemma3nForConditionalGeneration gemma3n_text=Gemma3nForCausalLM
+6 23 git=GitForCausalLM glm=GlmForCausalLM glm4=Glm4ForCausalLM glm4_moe=Glm4MoeForCausalLM
+6 23 got_ocr2=GotOcr2ForConditionalGeneration gpt-sw3=GPT2LMHeadModel gpt2=GPT2LMHeadModel
+6 23 gpt_bigcode=GPTBigCodeForCausalLM gpt_neo=GPTNeoForCausalLM gpt_neox=GPTNeoXForCausalLM
+6 23 gpt_neox_japanese=GPTNeoXJapaneseForCausalLM gpt_oss=GptOssForCausalLM gptj=GPTJForCausalLM
+6 23 granite=GraniteForCausalLM granitemoe=GraniteMoeForCausalLM granitemoehybrid=GraniteMoeHybridForCausalLM
+6 23 granitemoeshared=GraniteMoeSharedForCausalLM helium=HeliumForCausalLM
+6 23 hunyuan_v1_dense=HunYuanDenseV1ForCausalLM hunyuan_v1_moe=HunYuanMoEV1ForCausalLM jamba=JambaForCausalLM
+6 23 jetmoe=JetMoeForCausalLM lfm2=Lfm2ForCausalLM llama=LlamaForCausalLM llama4=Llama4ForCausalLM
+6 23 llama4_text=Llama4ForCausalLM longcat_flash=LongcatFlashForCausalLM mamba=MambaForCausalLM
+6 23 mamba2=Mamba2ForCausalLM marian=MarianForCausalLM mbart=MBartForCausalLM
+6 23 megatron-bert=MegatronBertForCausalLM minimax=MiniMaxForCausalLM ministral=MinistralForCausalLM
+6 23 mistral=MistralForCausalLM mixtral=MixtralForCausalLM mllama=MllamaForCausalLM
+6 23 modernbert-decoder=ModernBertDecoderForCausalLM moshi=MoshiForCausalLM mpt=MptForCausalLM
+6 23 musicgen=MusicgenForCausalLM musicgen_melody=MusicgenMelodyForCausalLM mvp=MvpForCausalLM
+6 23 nemotron=NemotronForCausalLM olmo=OlmoForCausalLM olmo2=Olmo2ForCausalLM olmo3=Olmo3ForCausalLM
+6 23 olmoe=OlmoeForCausalLM openai-gpt=OpenAIGPTLMHeadModel opt=OPTForCausalLM pegasus=PegasusForCausalLM
+6 23 persimmon=PersimmonForCausalLM phi=PhiForCausalLM phi3=Phi3ForCausalLM
+6 23 phi4_multimodal=Phi4MultimodalForCausalLM phimoe=PhimoeForCausalLM plbart=PLBartForCausalLM
+6 23 prophetnet=ProphetNetForCausalLM qwen2=Qwen2ForCausalLM qwen2_moe=Qwen2MoeForCausalLM qwen3=Qwen3ForCausalLM
+6 23 qwen3_moe=Qwen3MoeForCausalLM qwen3_next=Qwen3NextForCausalLM recurrent_gemma=RecurrentGemmaForCausalLM
+6 23 reformer=ReformerModelWithLMHead rembert=RemBertForCausalLM roberta=RobertaForCausalLM
+6 23 roberta-prelayernorm=RobertaPreLayerNormForCausalLM roc_bert=RoCBertForCausalLM roformer=RoFormerForCausalLM
+6 23 rwkv=RwkvForCausalLM seed_oss=SeedOssForCausalLM smollm3=SmolLM3ForCausalLM stablelm=StableLmForCausalLM
+6 23 starcoder2=Starcoder2ForCausalLM trocr=TrOCRForCausalLM vaultgemma=VaultGemmaForCausalLM
+6 23 whisper=WhisperForCausalLM xglm=XGLMForCausalLM xlm=XLMWithLMHeadModel xlm-roberta=XLMRobertaForCausalLM
+6 23 xlm-roberta-xl=XLMRobertaXLForCausalLM xlnet=XLNetLMHeadModel xlstm=xLSTMForCausalLM xmod=XmodForCausalLM
+6 23 zamba=ZambaForCausalLM zamba2=Zamba2ForCausalLM
+10 23 afmoe=AfmoeForCausalLM cwm=CwmForCausalLM exaone_moe=ExaoneMoeForCausalLM
+10 23 glm4_moe_lite=Glm4MoeLiteForCausalLM glm_moe_dsa=GlmMoeDsaForCausalLM jais2=Jais2ForCausalLM
+10 23 lfm2_moe=Lfm2MoeForCausalLM minimax_m2=MiniMaxM2ForCausalLM ministral3=Ministral3ForCausalLM
+10 23 nanochat=NanoChatForCausalLM nemotron_h=NemotronHForCausalLM olmo_hybrid=OlmoHybridForCausalLM
+10 23 qwen3_5=Qwen3_5ForCausalLM qwen3_5_moe=Qwen3_5MoeForCausalLM qwen3_5_moe_text=Qwen3_5MoeForCausalLM
+10 23 qwen3_5_text=Qwen3_5ForCausalLM solar_open=SolarOpenForCausalLM youtu=YoutuForCausalLM
+11 23 gemma4=Gemma4ForConditionalGeneration gemma4_text=Gemma4ForCausalLM hy_v3=HYV3ForCausalLM
+13 23 deepseek_v4=DeepseekV4ForCausalLM gemma4_assistant=Gemma4AssistantForCausalLM laguna=LagunaForCausalLM
+15 23 cohere2_moe=Cohere2MoeForCausalLM deepseek_v32=DeepseekV32ForCausalLM
+15 23 gemma4_unified=Gemma4UnifiedForConditionalGeneration
+15 23 gemma4_unified_assistant=Gemma4UnifiedAssistantForCausalLM gemma4_unified_text=Gemma4UnifiedForCausalLM
+15 23 hrm_text=HrmTextForCausalLM hyperclovax=HyperCLOVAXForCausalLM mellum=MellumForCausalLM
+15 23 minimax_m3_vl_text=MiniMaxM3VLForCausalLM
+22 23 axk1=AXK1ForCausalLM axk2=AXK2ForCausalLM cohere_compass_text=CohereCompassForCausalLM
+22 23 granite_swa=GraniteSWAForCausalLM granitemoe_swa=GraniteMoeSWAForCausalLM hy_v4=HYV4ForCausalLM
+22 23 inkling_text=InklingForCausalLM kimi_linear=KimiLinearForCausalLM mimo_v2_flash=MiMoV2FlashForCausalLM
+22 23 minicpm3=MiniCPM3ForCausalLM qwen4_exp=Qwen4ExpForCausalLM qwen4_exp_text=Qwen4ExpForCausalLM
+22 23 zaya=ZayaForCausalLM

@@ -273,7 +273,7 @@ def _estimate_model_weight_bytes(
                 num_experts = estimator.geometry.get("num_experts") or 0
                 model_metadata.update(
                     architecture=architecture,
-                    is_moe=bool(num_experts and num_experts > 1),
+                    is_moe=num_experts > 1 and estimator.geometry.get("num_routed_layers", 1) > 0,
                 )
             return weight_bytes
         except Exception as fallback_error:

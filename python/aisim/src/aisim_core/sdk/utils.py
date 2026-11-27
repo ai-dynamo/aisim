@@ -1144,6 +1144,12 @@ def gemma4_cache_shapes(
         )
 
     has_per_layer_config = "per_layer_config" in config
+    if backend == "vllm":
+        # PreTrainedConfig applies the legacy setter after Gemma has supplied its RoPE defaults.
+        # Every vLLM attention layer reads the resulting mapping, including a flat checkpoint.
+        rope = config.get("rope_scaling", config.get("rope_parameters"))
+        if ("rope_scaling" in config or rope is not None) and not isinstance(rope, dict):
+            raise ValueError("Gemma 4 vLLM attention requires rope_parameters to be a mapping")
     heads = config.get("num_key_value_heads", 4)
     dim = config.get("head_dim", 256)
     if not (backend == "vllm" and has_per_layer_config):

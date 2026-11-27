@@ -161,6 +161,7 @@ include = [
     # Ship estimator models and profiles with their canonical implementation.
     "src/aisim_core/sdk/**/*.md",
     "src/aisim_core/sdk/memory/vllm_text_architectures.txt",
+    "src/aisim_core/sdk/memory/sglang_text_architectures.txt",
     "src/aisim_core/data/schema_snapshots/*.json",
     "src/aisim_core/data/names_registry.json",
     "src/aisim_core/data/dataset_files/*.md",

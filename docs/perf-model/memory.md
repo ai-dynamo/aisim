@@ -96,8 +96,11 @@ is read from its raw keys. If such a config holds `text_config`, or an
 which `context_length: max` reads too. For such a config, the estimate
 refuses a `text_config` that is not a nonempty object, and a decoder that
 itself holds `text_config` or a nonempty `llm_config` object. It also refuses
-an `architectures` value that is not a list of strings, except a null, false,
-zero or empty value, which it reads as no architecture.
+an `architectures` value that is not a list of strings. The generic raw-config
+path treats null, false, zero and empty values as an omitted architecture.
+For a recognized bare vLLM decoder that requires registry dispatch, omit
+`architectures` or set it to null to use the config default. An explicit
+empty list or another non-list value is rejected on that path.
 `bytes_per_token: auto` of a worker with `host_offload` or `hicache`, without
 an FPM profile and without `state_cache`, is a naive estimate and has the same
 refusals. So is `engine.kv_transfer.bytes_per_token: auto` of a disaggregated
@@ -107,8 +110,13 @@ When this fallback selects a nested decoder, it uses the decoder's supported
 `model_type` if the optional `architectures` entry is absent. vLLM selects an
 explicit decoder class for LLaVA and InternVL and rejects an explicit empty
 class list. Its Idefics3 model constructs a Llama decoder directly. SGLang's
-LLaVA selects the decoder from its Transformers config class. Automatic sizing
-uses each backend's checkpoint metadata. For example, the ModelOpt sidecar for
+LLaVA selects the decoder from the Transformers config class shipped with that
+SGLang release. In registered vLLM wrappers, unquantized decoder weights and
+automatic KV storage use the parent model's execution dtype. A compressed-tensors
+KV scheme changes the cache alone. A separate 8-bit weight scheme targeting all
+decoder linear layers reduces their resident weight estimate. A selected
+encoder-only attention implementation has no persistent KV blocks to transfer.
+Automatic sizing uses each backend's checkpoint metadata. For example, the ModelOpt sidecar for
 Llama-3.1-70B-Instruct-FP8 selects a 20,480-byte FP8 cache per token at TP8.
 BF16 takes 40,960 bytes. An explicit `kvcache_quant_mode` selects the cache
 width. Uniform pipeline stages use their resident decoder layers. Uneven stages

@@ -53,7 +53,8 @@ import json
 import math
 import os
 from collections.abc import Callable, Collection
-from functools import partial
+from functools import cache, partial
+from importlib.resources import files
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,14 @@ _SELECTED_DECODER_ARCHITECTURES = {
     "qwen2_moe": "Qwen2MoeForCausalLM",
     "step3p5": "Step3p5ForCausalLM",
     "step3p7": "Step3p5ForCausalLM",
+}
+
+_VLLM_DENSE_DECODERS = {
+    "LlamaForCausalLM",
+    "MistralForCausalLM",
+    "Qwen2ForCausalLM",
+    "Qwen3ForCausalLM",
+    "OPTForCausalLM",
 }
 
 _TEXT_CONFIG_DEFAULTS = {
@@ -222,6 +231,29 @@ _BORROWED_DECODER_DEFAULTS = {
         rms_norm_eps=1e-5,
         vocab_size=32064,
     ),
+    "ministral3": dict(
+        hidden_size=4096,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        num_hidden_layers=34,
+        intermediate_size=14336,
+        hidden_act="silu",
+        rms_norm_eps=1e-5,
+        max_position_embeddings=262144,
+        vocab_size=131072,
+    ),
+    "qwen2_moe": dict(
+        hidden_size=2048,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        num_hidden_layers=24,
+        intermediate_size=5632,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        max_position_embeddings=32768,
+        vocab_size=151936,
+    ),
     "gemma": dict(
         hidden_size=3072,
         num_hidden_layers=28,
@@ -255,6 +287,37 @@ def _apply_decoder_geometry_defaults(decoder: dict, constructor: str | None) -> 
         decoder.setdefault("num_key_value_heads", kv_heads)
 
 
+@cache
+def _sglang_causal_lms() -> dict[int, dict[str, str]]:
+    releases: dict[int, dict[str, str]] = {}
+    with files(__package__).joinpath("sglang_text_architectures.txt").open(encoding="utf-8") as source:
+        for line in source:
+            if line.startswith("#"):
+                continue
+            first, last, *pairs = line.split()
+            mapping = dict(pair.split("=", 1) for pair in pairs)
+            for patch in range(int(first), int(last) + 1):
+                releases.setdefault(patch, {}).update(mapping)
+    return releases
+
+
+def _sglang_llava_causal_lm(kind: str, version: str | None) -> str | None:
+    # LLaVA maps the concrete Transformers config class to AutoModelForCausalLM under SGLang's own dependency pin.
+    release = parse_support_matrix_version(version)
+    mappings = _sglang_causal_lms()
+    if (
+        release is not None
+        and release.release[:2] == (0, 5)
+        and not release.is_prerelease
+        and release.micro in mappings
+    ):
+        return mappings[release.micro].get(kind)
+    choices = {mapping.get(kind) for mapping in mappings.values()}
+    if len(choices) != 1:
+        raise ValueError(f"SGLang's LLaVA decoder for {kind!r} depends on the backend release")
+    return choices.pop()
+
+
 def _select_text_decoder(
     decoder: dict,
     key: str | None,
@@ -265,6 +328,7 @@ def _select_text_decoder(
 ) -> tuple[str | None, str | None]:
     """Resolve the Transformers config class and the model class selected by its serving wrapper."""
     registered_submodel = key == "text_config" and parent in _TEXT_CONFIG_DEFAULTS
+    sglang_llava = key == "text_config" and backend == "sglang" and parent == "LlavaForConditionalGeneration"
     fixed_llama = key == "text_config" and parent in _FIXED_LLAMA_WRAPPERS
     kind = decoder.get("model_type")
     if registered_submodel or fixed_llama:
@@ -274,7 +338,7 @@ def _select_text_decoder(
         kind = decoder.setdefault("model_type", default_kind)
         if not isinstance(kind, str):
             raise ValueError(f"{key}.model_type must be a string")
-        if not is_known_transformers_config(kind, backend_version):
+        if not sglang_llava and not is_known_transformers_config(kind, backend_version):
             raise ValueError(f"{key}.model_type={kind!r} does not identify an available Transformers config")
     elif kind is not None and not isinstance(kind, str):
         raise ValueError(f"{key}.model_type must be a string")
@@ -286,9 +350,8 @@ def _select_text_decoder(
     dynamic = registered_submodel and backend == "vllm"
     native_dispatch = backend == "vllm" and (registered_submodel or key is None)
     classes = decoder.get("architectures")
-    if key == "text_config" and backend == "sglang" and parent == "LlavaForConditionalGeneration":
-        # SGLang selects by the Transformers config class and ignores the checkpoint label.
-        causal = default_causal_lm(kind, None)
+    if sglang_llava:
+        causal = _sglang_llava_causal_lm(kind, backend_version)
         if causal is None:
             raise ValueError(f"SGLang has no causal LM for {key}.model_type={kind!r}")
         classes = decoder["architectures"] = [causal]
@@ -320,7 +383,11 @@ def _select_text_decoder(
         decoder["architectures"] = [named]
     elif native_dispatch:
         named = selected
-    if native_dispatch and named in ("Qwen2ForCausalLM", "OPTForCausalLM") and kind in _BORROWED_DECODER_DEFAULTS:
+    if (
+        native_dispatch
+        and named in ("LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM", "OPTForCausalLM")
+        and kind in _BORROWED_DECODER_DEFAULTS
+    ):
         for field, default in _BORROWED_DECODER_DEFAULTS[kind].items():
             decoder.setdefault(field, default)
         if kind == "phi3" and decoder.get("num_key_value_heads") is None:
@@ -344,8 +411,8 @@ def _select_text_decoder(
         hidden = layout_integer(decoder.get("hidden_size"), "hidden_size")
         heads = layout_integer(decoder.get("num_attention_heads"), "num_attention_heads")
         decoder["head_dim"] = hidden // heads
-        if kind not in ("qwen2", "qwen3"):
-            # Only the Qwen constructors derive layer_types from this flag.
+        if kind not in ("qwen2", "qwen3", "qwen2_moe"):
+            # Only these Qwen constructors derive layer_types from this flag.
             decoder.pop("use_sliding_window", None)
         return kind, named
     if kind is None and named:
@@ -362,6 +429,15 @@ def _select_text_decoder(
         named = named or "OPTForCausalLM"
         decoder["architectures"] = [named]
     if named == "OPTForCausalLM" and (native_dispatch or kind == "opt"):
+        if kind == "gpt2":
+            # GPT2Config maps its serialized fields to the canonical attributes read by OPT.
+            for field, alias, default in (
+                ("hidden_size", "n_embd", 768),
+                ("num_attention_heads", "n_head", 12),
+                ("num_hidden_layers", "n_layer", 12),
+                ("max_position_embeddings", "n_positions", 1024),
+            ):
+                decoder[field] = decoder.get(field, decoder.get(alias, default))
         # OPT uses full multi-head attention and its own FFN fields even when a
         # different Transformers config provides the actual constructor arguments.
         needed = (
@@ -383,18 +459,23 @@ def _select_text_decoder(
             raise ValueError("OPT hidden size must be divisible by its attention head count")
         decoder.update(num_key_value_heads=heads, head_dim=hidden // heads, intermediate_size=decoder["ffn_dim"])
         return kind, named
-    if not selected and native_dispatch and named and named != default_causal_lm(kind, backend_version):
-        raise ValueError(f"model_type={kind!r} conflicts with architectures={named!r}")
+    if native_dispatch and named in ("LlamaForCausalLM", "MistralForCausalLM") and named != selected:
+        if kind not in ("llama", "mistral", "qwen2", "qwen3"):
+            required = ("hidden_size", "num_attention_heads", "num_hidden_layers", "intermediate_size", "rms_norm_eps")
+            if any(decoder.get(field) is None for field in required) or decoder.get("hidden_act") != "silu":
+                raise ValueError(f"{named} requires its decoder configuration for model_type={kind!r}")
+            if decoder.get("num_key_value_heads", 1) is None:
+                raise ValueError(f"{named} requires a valid num_key_value_heads")
+        return kind, named
+    if native_dispatch and not selected and named:
+        default = default_causal_lm(kind, backend_version)
+        if not default or named != select_architecture([default], backend_version, None):
+            raise ValueError(f"model_type={kind!r} conflicts with architectures={named!r}")
+        return kind, named
     if not named or not selected or named == selected:
         return kind, selected
     if selected == "Step3p5ForCausalLM" and ARCHITECTURE_TO_MODEL_FAMILY.get(named) == "STEP3P7":
         return kind, selected
-    if (
-        native_dispatch
-        and kind in ("llama", "mistral", "qwen2", "qwen3")
-        and named in ("LlamaForCausalLM", "MistralForCausalLM")
-    ):
-        return kind, named
     if native_dispatch and kind == "deepseek_v3" and named == "DeepseekV2ForCausalLM":
         # DeepseekV3ForCausalLM inherits the V2 implementation without overriding it.
         return kind, named
@@ -565,6 +646,18 @@ def _validate_sglang_dense_fp8(
             )
 
 
+def _vllm_weight_config(document: dict) -> dict | None:
+    # ModelArchConfigConvertor checks the parent's two serialized spellings before the text config.
+    for config in (document, document.get("text_config")):
+        if isinstance(config, dict):
+            for key in ("quantization_config", "compression_config"):
+                if (quant := config.get(key)) is not None:
+                    if not isinstance(quant, dict):
+                        raise ValueError(f"vLLM {key} must be a JSON object")
+                    return quant
+    return None
+
+
 def _automatic_decoder_kv_mode(
     document: dict, raw: dict, backend: str, backend_version: str | None
 ) -> KVCacheQuantMode | None:
@@ -572,7 +665,6 @@ def _automatic_decoder_kv_mode(
     if backend not in ("vllm", "sglang"):
         return None
     root_quant = document.get("quantization_config")
-    text_quant = (document.get("text_config") or {}).get("quantization_config")
     sidecar = raw.get("hf_quant_config")
     # SGLang checks inline metadata before opening a sidecar. vLLM's automatic ModelOpt
     # cache dtype reads the root HF config, where its loader installs a sidecar if needed.
@@ -581,7 +673,7 @@ def _automatic_decoder_kv_mode(
         quant = sidecar
     if quant is None and backend == "vllm":
         # The vLLM attention layer also reads the selected compressed-tensors object's KV scheme.
-        quant = text_quant or document.get("compression_config")
+        quant = _vllm_weight_config(document)
         if not isinstance(quant, dict) or quant.get("quant_method") not in ("compressed-tensors", "compressed_tensors"):
             return None
     if not isinstance(quant, dict):
@@ -1232,6 +1324,7 @@ class NaiveKVCacheEstimator:
         self.architecture: str | None = None
         self.dtype_bytes = dtype_bytes  # KV precision, fractional for NVFP4
         self.weight_dtype_bytes = dtype_bytes
+        self._embedding_dtype_bytes = dtype_bytes
         self.tp_size = validate_parallel_size("tp_size", tp_size)
         self.pp_size = validate_parallel_size("pp_size", pp_size)
         self.moe_ep_size = validate_parallel_size("moe_ep_size", moe_ep_size)
@@ -1246,6 +1339,7 @@ class NaiveKVCacheEstimator:
         self._sparse_cache_needs_target = False
         self._cache_backend: str | None = None
         self._cache_release: Version | None = None
+        self._vllm_native_decoder = False
         self._vllm_check_model_dtype = False
         self._vllm_model_dtype: str | None = None
         self._vllm_dtype_target: tuple[str | None, str | list[str] | None] = (None, None)
@@ -1290,7 +1384,17 @@ class NaiveKVCacheEstimator:
             architecture == "Gemma4ForConditionalGeneration" or decoder.get("model_type") == "gemma4_text"
         )
         if isinstance(decoder, dict) and (
-            (key is not None and architecture not in ARCHITECTURE_TO_MODEL_FAMILY)
+            (
+                architecture not in ARCHITECTURE_TO_MODEL_FAMILY
+                and (
+                    key is not None
+                    or (
+                        backend == "vllm"
+                        and isinstance(decoder.get("model_type"), str)
+                        and decoder["model_type"] in _DECODER_GEOMETRY_DEFAULTS
+                    )
+                )
+            )
             or (backend in ("sglang", "vllm") and gemma4 and gemma4_cache_requires_release(decoder, backend))
         ):
             backend_version = _config_only_backend_version(system, backend, backend_version, systems_paths)
@@ -1418,9 +1522,19 @@ class NaiveKVCacheEstimator:
                 selected_type, selected = _select_text_decoder(
                     raw_decoder, key, architecture, parent_type, backend, backend_version
                 )
+                resolved_vllm_decoder = backend == "vllm" and (
+                    (key == "text_config" and architecture in _TEXT_WRAPPERS)
+                    or (
+                        key is None
+                        and selected is not None
+                        and (not architecture or selected == (raw_decoder.get("architectures") or [None])[0])
+                    )
+                )
                 constructor = "deepseek_v3" if selected_type == "kimi_k2" else selected_type
                 _apply_decoder_geometry_defaults(raw_decoder, constructor)
-                if selected_type in _DECODER_HEAD_DEFAULTS:
+                if selected_type in _DECODER_HEAD_DEFAULTS or (
+                    resolved_vllm_decoder and selected in _VLLM_DENSE_DECODERS
+                ):
                     # These projection classes read the canonical field, while SGLang sizes its pool separately.
                     canonical = raw_decoder.get("num_key_value_heads") or raw_decoder.get("num_attention_heads")
                     pool_heads = next(
@@ -1437,7 +1551,11 @@ class NaiveKVCacheEstimator:
                             ) from error
                     for alias in ("attention_head_dim", "num_kv_heads", "n_head_kv", "n_kv_heads", "multi_query"):
                         raw_decoder.pop(alias, None)
-                if constructor in _DECODER_EXPERT_DEFAULTS:
+                if resolved_vllm_decoder and selected in _VLLM_DENSE_DECODERS:
+                    # Dense implementations build no expert matrices, even when dispatched from an MoE config.
+                    for field in ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"):
+                        raw_decoder.pop(field, None)
+                elif constructor in _DECODER_EXPERT_DEFAULTS:
                     field, alias, default, width, default_width = _DECODER_EXPERT_DEFAULTS[constructor]
                     count = raw_decoder.get(alias, raw_decoder.get(field, default))
                     for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts"):
@@ -1497,7 +1615,7 @@ class NaiveKVCacheEstimator:
                     if quant is not None:
                         raw_decoder = {**raw_decoder, "quantization_config": quant}
                 if (
-                    backend == "vllm"
+                    (backend == "vllm" or (backend == "sglang" and (key is None or architecture in _TEXT_WRAPPERS)))
                     and constructor == "deepseek_v3"
                     and selected in ("DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM")
                 ):
@@ -1505,6 +1623,21 @@ class NaiveKVCacheEstimator:
                         _deepseek_routed_layers(raw_decoder, decoder.geometry["layers"])
                     )
                 decoder._is_nested_decoder = key is not None
+                decoder._vllm_native_decoder = resolved_vllm_decoder
+                if (
+                    decoder._vllm_native_decoder
+                    and selected
+                    in (
+                        "LlamaForCausalLM",
+                        "MistralForCausalLM",
+                        "Qwen2ForCausalLM",
+                        "Qwen3ForCausalLM",
+                        "Gemma3ForCausalLM",
+                    )
+                    and not raw_decoder.get("is_causal", True)
+                ):
+                    # These native layers construct EncoderOnlyAttention, whose get_kv_cache_spec returns None.
+                    decoder._scalar_cache_problem = f"{selected} with is_causal=False has no persistent vLLM KV cache"
                 decoder._selected_decoder = _attach_inferred_quant_fields(dict(raw_decoder))
                 decoder._resolve_nested_cache(raw_decoder, architecture, backend, backend_version)
                 decoder._set_checkpoint_cache_precision(decoder._selected_decoder, backend, backend_version, hf_config)
@@ -1683,7 +1816,38 @@ class NaiveKVCacheEstimator:
                     mode = mode or KVCacheQuantMode.fp8
             else:
                 mode = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
-        self.dtype_bytes = mode.value.memory if mode is not None else self.weight_dtype_bytes
+        model_dtype_bytes = self.weight_dtype_bytes
+        if self._vllm_native_decoder:
+            # with_hf_config retains the parent's execution dtype. On supported GPU targets vLLM
+            # keeps FP16/BF16 or casts to the preferred one, including for FP32 and FP8 inputs.
+            model_dtype_bytes = 2
+            # A cache scheme alone does not quantize any linear weights. The compressed-tensors
+            # target map prices weights independently; reserve model dtype for mixed or unknown targets.
+            quant = _vllm_weight_config(parent or raw)
+            if quant is None:
+                quant = raw.get("hf_quant_config") or {}
+            self.weight_dtype_bytes = model_dtype_bytes
+            self._embedding_dtype_bytes = model_dtype_bytes
+            method = str(quant.get("quant_method", "")).lower().replace("_", "-")
+            if method == "compressed-tensors":
+                groups = quant.get("config_groups") or {}
+                if self.pp_size == 1 and self.architecture in _VLLM_DENSE_DECODERS and len(groups) == 1:
+                    group = next(iter(groups.values())) if isinstance(groups, dict) else None
+                    weights = group.get("weights") if isinstance(group, dict) else None
+                    if (
+                        isinstance(weights, dict)
+                        and group.get("targets") == ["Linear"]
+                        and quant.get("ignore", []) in ([], ["lm_head"])
+                        and weights.get("num_bits") == 8
+                        and weights.get("type") in ("float", "int")
+                        and not weights.get("dynamic", False)
+                    ):
+                        self.weight_dtype_bytes = 1
+            elif raw.get("quant_algo") and (
+                not method.startswith("modelopt") or (quant.get("quantization") or quant).get("quant_algo")
+            ):
+                self.weight_dtype_bytes = self._embedding_dtype_bytes = self._dtype_bytes(raw)
+        self.dtype_bytes = mode.value.memory if mode is not None else model_dtype_bytes
         if (
             backend == "vllm"
             and self.architecture == "DeepseekV32ForCausalLM"
@@ -1691,7 +1855,7 @@ class NaiveKVCacheEstimator:
         ):
             # The model rewrites an explicit BF16 *after* automatic checkpoint precision was resolved.
             self._vllm_sparse_auto_precision = (
-                KVCacheQuantMode.fp8.value.memory if self._vllm_packed_sparse else self.weight_dtype_bytes,
+                KVCacheQuantMode.fp8.value.memory if self._vllm_packed_sparse else model_dtype_bytes,
                 unknown_gpu and (release is None or release >= Version("0.24.0rc1")),
             )
 
@@ -1889,7 +2053,7 @@ class NaiveKVCacheEstimator:
         gpt_oss = hf_config.get("model_type") == "gpt_oss" or (parsed and parsed["architecture"] == "GptOssForCausalLM")
         enabled = hf_config.get("use_sliding_window")
         qwen_sliding = enabled is True and (
-            hf_config.get("model_type") in ("qwen2", "qwen3")
+            hf_config.get("model_type") in ("qwen2", "qwen3", "qwen2_moe")
             or (hf_config.get("architectures") or [None])[0] in ("Qwen2ForCausalLM", "Qwen3ForCausalLM")
         )
         if qwen_sliding and "sliding_window" not in hf_config:
@@ -1916,8 +2080,15 @@ class NaiveKVCacheEstimator:
         elif qwen_sliding and hf_config.get("layer_types") is None and num_layers:
             # Qwen2Config and Qwen3Config mark layers at and after max_window_layers as sliding.
             full = layout_integer(hf_config.get("max_window_layers", 28), "max_window_layers", minimum=0)
-            num_global = min(num_layers, full) if enabled else num_layers
-            num_swa = num_layers - num_global
+            if not enabled:
+                num_swa, num_global = 0, num_layers
+            elif hf_config.get("model_type") == "qwen2_moe":
+                # Qwen2MoeConfig uses even-indexed layers strictly before max_window_layers.
+                num_swa = (min(num_layers, full) + 1) // 2
+                num_global = num_layers - num_swa
+            else:
+                num_global = min(num_layers, full)
+                num_swa = num_layers - num_global
         elif gpt_oss and hf_config.get("layer_types") is None and num_layers:
             # GptOssConfig defaults even-numbered layers to sliding and odd-numbered layers to full attention.
             num_swa = (num_layers + 1) // 2
@@ -2349,8 +2520,14 @@ class NaiveKVCacheEstimator:
             expert_params = local_experts * 3 * hidden * moe_inter // self.moe_tp_size
             non_expert_params = embed_params + layers * attn_params_per_layer
             non_expert_bytes = non_expert_params * self.weight_dtype_bytes // (tp * pp)
-            if "num_routed_layers" in geom and self._selected_decoder is not None:
-                raw = self._selected_decoder
+            raw = self._selected_decoder
+            # Quantized SGLang checkpoints use the existing packed-weight approximation. Unquantized
+            # matrices and entirely dense stacks can be priced directly from their resident layers.
+            if (
+                "num_routed_layers" in geom
+                and raw is not None
+                and (self._cache_backend != "sglang" or not geom["num_routed_layers"] or not raw.get("quant_algo"))
+            ):
                 routed = geom["num_routed_layers"]
                 shared = raw.get("n_shared_experts", 1)
                 shared = 0 if shared is None else layout_integer(shared, "n_shared_experts", minimum=0)
@@ -2376,8 +2553,8 @@ class NaiveKVCacheEstimator:
             return non_expert_bytes + expert_bytes
         else:
             ffn_params_per_layer = 3 * hidden * inter
-            total_params = embed_params + layers * (attn_params_per_layer + ffn_params_per_layer)
-            return (total_params * self.weight_dtype_bytes) // (tp * pp)
+            layer_params = layers * (attn_params_per_layer + ffn_params_per_layer)
+            return (embed_params * self._embedding_dtype_bytes + layer_params * self.weight_dtype_bytes) // (tp * pp)
 
     # --------------------------- byte budget -> tokens ---------------------------- #
 
