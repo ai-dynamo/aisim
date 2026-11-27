@@ -673,6 +673,32 @@ mod tests {
     }
 
     #[test]
+    fn destination_reserved_preserves_historical_json() {
+        let handoff_id = HandoffId::new(Uuid::from_u128(1));
+        let mut historical = serde_json::json!({
+            "DestinationReserved": { "handoff_id": handoff_id, "transferable_prompt_tokens": 0 }
+        });
+        let fact = |full_local_hit| HandoffFact::DestinationReserved {
+            handoff_id,
+            transferable_prompt_tokens: 0,
+            full_local_hit,
+        };
+        for full_local_hit in [false, true] {
+            if full_local_hit {
+                historical["DestinationReserved"]["full_local_hit"] = true.into();
+            }
+            assert_eq!(
+                serde_json::to_value(fact(full_local_hit)).unwrap(),
+                historical
+            );
+            assert_eq!(
+                serde_json::from_value::<HandoffFact>(historical.clone()).unwrap(),
+                fact(full_local_hit)
+            );
+        }
+    }
+
+    #[test]
     fn missing_or_zero_bandwidth_uses_configured_fallback() {
         let missing = HandoffTransferTiming {
             mode: TransferTimingMode::DestinationMissing,

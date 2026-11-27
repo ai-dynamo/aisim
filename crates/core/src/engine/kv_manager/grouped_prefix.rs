@@ -1399,7 +1399,9 @@ impl GroupedPrefixCoordinator {
         prompt: usize,
         loaded_tokens: usize,
     ) -> usize {
-        if request.prefix_hash_at(loaded_tokens).is_none() {
+        // Keep the modeled one-token load behavior: it transfers the whole
+        // prompt and only counts the copy once activation publishes it.
+        if loaded_tokens >= prompt || request.prefix_hash_at(loaded_tokens).is_none() {
             return 0;
         }
         self.rules
@@ -1772,7 +1774,6 @@ impl GroupedPrefixCoordinator {
         prompt: usize,
         computed: usize,
         tokens: usize,
-        cap_window: bool,
     ) -> usize {
         let rules = &self.rules;
         rules
@@ -1790,9 +1791,7 @@ impl GroupedPrefixCoordinator {
                         },
                     ) => {
                         let mut required = tokens.div_ceil(block);
-                        if let GroupRuleKind::SlidingWindow { window } = rule.kind
-                            && cap_window
-                        {
+                        if let GroupRuleKind::SlidingWindow { window } = rule.kind {
                             required = required.min(window_admission_blocks(
                                 window,
                                 block,

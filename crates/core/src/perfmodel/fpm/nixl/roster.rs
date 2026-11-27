@@ -568,7 +568,7 @@ fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError>
                         .ok_or_else(capacity_conflict)?;
                     let page =
                         super::positive(&spec["page_size_bytes"]).ok_or_else(capacity_conflict)?;
-                    if interval.1 > u128::from(start) + u128::from(page) {
+                    if page > stride || interval.1 > u128::from(start) + u128::from(page) {
                         return Err(capacity_conflict());
                     }
                     intervals.push(interval);
@@ -2249,6 +2249,14 @@ mod tests {
                 "offset {second}"
             );
         }
+        // Both views fit in page 0, but the next block begins at byte 92.
+        let mut packed = worker.clone();
+        packed["layer_tensors"]["s"] = json!([view(0), view(92)]);
+        packed["tensor_allocations"][0]["block_stride"] = json!(92);
+        for tensor in packed["layer_tensors"]["s"].as_array_mut().unwrap() {
+            tensor["stride_bytes"][0] = json!(92);
+        }
+        assert!(check_tensor_blocks(&packed, &groups).is_err());
         let mut record = json!({"cache":worker,"raw_cache_config":{"tensor_allocations":[{
             "size":9600,"layers":["s"],"offset":0,"block_stride":96,"layer_stride":96}]}});
         check_raw_geometry(&record, &groups).unwrap();

@@ -73,9 +73,10 @@ block included. When the prefill stops one token short, the transferred prompt
 leaves out the last prompt token, as the [request flow](#handoff) shows.
 `fixed_bytes` holds one block of each state group and the window blocks of
 each group with a `sliding_window`. Such a group moves only the blocks of the
-transferred prompt inside the window of the next token. The decode worker also
-reserves room for the first forward. When a full transfer recomputes the last
-prompt token, that forward can need an earlier window page. With `T` transferred
+transferred prompt inside the window of the next token. A held load's
+reservation follows the window admission cap. Its first forward can need
+an additional window page, including an earlier page when a full transfer
+recomputes the last prompt token. With `T` transferred
 tokens, the connector moves
 `cdiv(T, block) - floor(max(0, T - window + 1) / block)` blocks. `block` is the
 group's own `block_size_tokens`. The bytes of one block come from the profile's
@@ -119,6 +120,14 @@ Replay checks the saved fields and rank coverage offline, including cells whose
 workers have no recorded backend or layout. Reordering the workers preserves
 their receipt. Older archives support the structural checks their recorded
 coordinates and counts permit.
+
+On vLLM 0.33.0, indexed import compares each Mamba view with the recorded
+state tensor packing. Detached raw and compact finalization records can
+admit an in-page gap between disjoint views. For example, moving the second
+view four bytes forward while keeping both views inside their page and
+allocation passes those offline checks. Indexed import rejects this change
+when the recorded state tensors specify adjacent views.
+
 For known non-MLA GPU caches, the decode worker checks the physical KV layout.
 When a probe omits the layout name, recorded layer and tensor byte strides narrow
 the possible layouts. The ordinary attention views that identify their axes must

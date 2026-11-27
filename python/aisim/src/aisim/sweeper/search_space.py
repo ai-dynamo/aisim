@@ -504,8 +504,8 @@ def _heterogeneous_disagg_configs(
     return configs
 
 
-def _captured_scheduler_domains(space, mode, candidates):
-    """Group topologies by the rank-local scheduler settings their measured cache requires."""
+def _fpm_scheduler_domains(space, mode, candidates):
+    """Intersect each selected deployment's measured scheduler settings or declared limits with the search domain."""
     from aisim.fpm_profile import load_fpm_profile
 
     if space.fpm_profile is None or not candidates:
@@ -528,35 +528,49 @@ def _captured_scheduler_domains(space, mode, candidates):
             moe_ep_size=shape.moe_ep,
         )
         resources = deployment.resources
-        if resources.cache_layout != "grouped" or resources.runtime_memory is None:
-            return ()
-        return (
-            (f"{role}_max_num_batched_tokens", resources.max_num_tokens),
-            (f"{role}_max_num_seqs", resources.max_batch_size),
+        measured = resources.runtime_memory is not None
+        return tuple(
+            (name, range(limit if measured else 1, limit + 1), measured)
+            for name, limit in (
+                (f"{role}_max_num_batched_tokens", resources.max_num_tokens),
+                (f"{role}_max_num_seqs", resources.max_batch_size),
+            )
         )
 
     groups = {}
-    mismatch = None
     for candidate in candidates:
         settings = tuple(item for role in roles for item in limits(role, _parallel_role(candidate, role).shape))
-        for name, recorded in settings:
-            bounds = space.engine_integer_log_ranges.get(name)
-            allowed = bounds[0] <= recorded <= bounds[1] if bounds else recorded in getattr(space, name)
-            if not allowed:
-                mismatch = f"grouped runtime memory requires the exact recorded {name}={recorded} in the search domain"
-                break
-        else:
-            groups.setdefault(settings, []).append(candidate)
-    if not groups:
-        raise NoViableParallelConfig(mismatch)
+        groups.setdefault(settings, []).append(candidate)
     result = []
-    for settings, candidates in groups.items():
-        pins = dict(settings)
-        updates = {name: [value] for name, value in settings}
-        updates["engine_integer_log_ranges"] = {
-            k: v for k, v in space.engine_integer_log_ranges.items() if k not in pins
-        }
-        result.append((space.model_copy(update=updates), candidates, pins))
+    mismatch = None
+    for settings, topologies in groups.items():
+        updates = {}
+        ranges = dict(space.engine_integer_log_ranges)
+        allowed = {}
+        for name, envelope, measured in settings:
+            if name in ranges:
+                low, high = ranges[name]
+                options = range(max(low, envelope.start), min(high + 1, envelope.stop))
+                if options:
+                    ranges[name] = [options.start, options[-1]]
+                    updates[name] = [options.start]
+            else:
+                options = tuple(n for n in getattr(space, name) if n in envelope)
+                updates[name] = list(options)
+            if not options:
+                limit = envelope.stop - 1
+                requirement = (
+                    "runtime memory requires the exact recorded" if measured else "resource envelope permits at most"
+                )
+                mismatch = f"{requirement} {name}={limit} in the search domain"
+                break
+            allowed[name] = options
+        else:
+            result.append(
+                (space.model_copy(update={**updates, "engine_integer_log_ranges": ranges}), topologies, allowed)
+            )
+    if not result:
+        raise NoViableParallelConfig(mismatch)
     return result
 
 
@@ -916,7 +930,7 @@ def enumerate_branches(
             continue
         candidate_configs = profile_configs if profile_configs is not None else pinned
         try:
-            scheduler_domains = _captured_scheduler_domains(ss, deployment_mode, candidate_configs)
+            scheduler_domains = _fpm_scheduler_domains(ss, deployment_mode, candidate_configs)
         except NoViableParallelConfig as error:
             if len(deployment_modes) == 1 or pinned is not None or custom_by_role:
                 raise
@@ -1050,21 +1064,27 @@ def enumerate_branches(
             float_ranges[name] = (float(bounds[0]), float(bounds[1]))
             if name in ss.engine_log_ranges:
                 log_float_ranges.add(name)
+        supported_domains = [
+            allowed
+            for _, topologies, allowed in scheduler_domains
+            if topologies and any(c in support for c in topologies)
+        ]
+        for name, choices in knob_choices.items():
+            if supported_domains and name in supported_domains[0] and name not in ss.engine_integer_log_ranges:
+                knob_choices[name] = [n for n in choices if any(n in domain[name] for domain in supported_domains)]
         for name, bounds in ss.engine_integer_log_ranges.items():
             if name.split("_", 1)[0] not in active_roles:
                 continue
             knob_choices.pop(name, None)
-            integer_ranges[name] = (int(bounds[0]), int(bounds[1]))
-            log_integer_ranges.add(name)
-        captured = [pins for _, configs, pins in scheduler_domains if configs and any(c in support for c in configs)]
-        if captured:
-            for name in set.intersection(*(set(pins) for pins in captured)):
-                choices = {pins[name] for pins in captured}
-                knob_choices[name] = (
-                    sorted(choices) if name in integer_ranges else [n for n in knob_choices[name] if n in choices]
-                )
-                integer_ranges.pop(name, None)
-                log_integer_ranges.discard(name)
+            sampled = [domain[name] for domain in supported_domains if name in domain]
+            if sampled and all(len(values) == 1 for values in sampled):
+                knob_choices[name] = sorted({values[0] for values in sampled})
+                log_discrete_choices.add(name)
+            else:
+                if sampled:
+                    bounds = (min(values[0] for values in sampled), max(values[-1] for values in sampled))
+                integer_ranges[name] = (int(bounds[0]), int(bounds[1]))
+                log_integer_ranges.add(name)
         if config.workload.load_choices is not None:
             knob_choices["traffic_load"] = list(config.workload.load_choices)
         elif config.workload.load_range is not None:

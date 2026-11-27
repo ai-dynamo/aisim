@@ -3714,48 +3714,58 @@ fn grouped_destination_in_byte_mode_gives_back_the_need_of_a_dropped_load() {
 }
 
 #[test]
-fn grouped_destination_keeps_room_for_its_first_window_allocation() {
-    // The admission cap is four window blocks. Opening block five on the first
-    // decode pass takes a real page in both modes, plus a new state in block mode.
+fn grouped_destination_caps_the_first_pass_need_of_a_window_group() {
+    // vLLM 0.33.0 with a 16-token window, 16-token blocks and five
+    // usable pages. Both layouts pass the native startup capacity check.
+    // The held load's window is capped at three blocks with a 16-token
+    // budget and four with a 32-token budget, null blocks included. It has
+    // reached that cap. Its next forward still needs another window page.
     let mut groups = window_transfer_groups();
     groups[1].prefill_checkpoint_blocks = Some(0);
-    let mut args = prefix_core(groups, 500, 32, 16, "0.33.0").args;
-    args.worker_type = WorkerType::Decode;
-    let block = VllmCore::new(args);
-    let byte = pd_core(window_transfer_groups(), 500, 32, WorkerType::Decode, None);
-    for (mut core, need, second_prompt) in [(block, 2, 65), (byte, 100, 66)] {
+    let mut block = prefix_core(groups.clone(), 500, 16, 16, "0.33.0").args;
+    block.worker_type = WorkerType::Decode;
+    block.max_model_len = Some(64);
+    let mut byte = pd_core(groups, 500, 32, WorkerType::Decode, None).args;
+    byte.vllm_version = Some("0.33.0".to_owned());
+    byte.max_model_len = Some(80);
+    for (args, first_prompt, second_prompt, need, held) in
+        [(block, 49, 49, 1, 4), (byte, 65, 66, 0, 5)]
+    {
+        let mut core = VllmCore::new(args);
         let first = HandoffId::new(Uuid::from_u128(1781));
-        let second = HandoffId::new(Uuid::from_u128(1783));
         assert_eq!(
-            reserve_grouped(&mut core, first, pd_request(1780, 65, 2)),
+            reserve_grouped(&mut core, first, pd_request(1780, first_prompt, 2)),
             Some(0)
         );
         assert_eq!(core.kv_manager.grouped_inflight_need(), need);
+        let second = HandoffId::new(Uuid::from_u128(1783));
         let request = DirectRequest {
             tokens: (1_000..1_000 + second_prompt).collect(),
             ..pd_request(1782, 0, 2)
         };
-        assert_eq!(reserve_grouped(&mut core, second, request), None);
+        assert_eq!(reserve_grouped(&mut core, second, request), Some(0));
+        // Then the first load cannot run its first pass, as in vLLM. In block
+        // mode each first pass needs a window block and a state block, and 1
+        // block is free. In byte mode the first load needs a window page, and
+        // no byte is free. A waiting request does not preempt, and the
+        // waiting loop stops at the first request that does not fit (V33
+        // `vllm/v1/core/sched/scheduler.py:1454-1461`). So neither load runs,
+        // and with no request running the rank stops.
         activate(&mut core, first);
-        let mut now = 0.0;
-        let mut completed = Vec::new();
-        for _ in 0..12 {
-            let pass = async_step(&mut core, &mut now);
-            completed.extend(
-                pass.output_signals
-                    .iter()
-                    .filter(|o| o.completed)
-                    .map(|o| o.uuid.as_u128()),
-            );
-            if reserved_units(&core.retry_pending_destinations(), second).is_some() {
-                activate(&mut core, second);
-            }
-            if core.is_drained() {
-                break;
-            }
+        activate(&mut core, second);
+        let mut trace = TraceCollector::default();
+        let mut step = 0;
+        for _ in 0..3 {
+            assert_eq!(step_pd(&mut core, &mut trace, &mut step), 0);
         }
-        assert_eq!(completed, [1780, 1782]);
-        assert!(core.is_drained());
+        assert!(core.state.running.is_empty());
+        for id in [1780, 1782] {
+            assert_eq!(
+                core.state.requests[&Uuid::from_u128(id)].status,
+                RequestStatus::Waiting
+            );
+        }
+        assert_eq!(grouped_pool(&core).active_blocks(), held);
     }
 }
 
@@ -4262,7 +4272,7 @@ fn grouped_decode_one_token_load_takes_the_copy_of_its_state_in_its_first_pass()
                 Some(1),
                 "{label}"
             );
-            assert_eq!(core.kv_manager.grouped_inflight_need(), copy, "{label}");
+            assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{label}");
             activate(&mut core, handoff_id);
             // One attention block and one state block.
             assert_eq!(block_pool(&core).active_blocks(), 2, "{label}");
@@ -4286,42 +4296,97 @@ fn grouped_decode_one_token_load_takes_the_copy_of_its_state_in_its_first_pass()
 
 #[test]
 fn grouped_decode_one_token_loads_wait_for_the_block_of_the_copy() {
-    // v0.31 publishes the one-token partial state. The first decode pass needs
-    // one writable copy in addition to its two loaded blocks.
-    for batches in [1, 2] {
-        for pages in [4, 5, 6] {
-            let mut core = one_token_load_core("0.31.0", 1, pages, batches);
+    // vLLM 0.31.0 at a hash block of 1 token. Two loads of one token are
+    // reserved before either is activated: each holds 2 blocks, and each
+    // needs one more block for the copy of its state in its first step.
+    // On 6 pages both run in pass 0 with 6 blocks. On 5 pages only the first
+    // one fits its copy; the second one runs after the first one ended. On
+    // 4 pages no block is free, so neither runs: vLLM stops its waiting loop
+    // at a request that it cannot allocate (V31 `sched:1223-1230`).
+    // The peak of pass 0 counts each copy. With one batch vLLM frees each
+    // copy at the end of the pass (V31 `sched:1434-1442`), so after the pass
+    // every load holds its attention block and its state block. With two
+    // batches a decode worker defers that free until it processes the step
+    // that runs the copies (V31 `sched:175-181`, `:2712-2721`,
+    // `:1987-1989`), so vLLM still holds 6 and 5 blocks after pass 0 on 6
+    // and 5 pages. Replay does not model the deferred free and releases the
+    // copies at the end of the pass, so the two-batch rows give replay's
+    // count. With v0.33.0 a one-token prompt publishes no partial state,
+    // so both requests fit in the first pass on four pages.
+    for max_concurrent_batches in [1, 2] {
+        for (version, pages, first_pass, peak, copies) in [
+            ("0.31.0", 6, vec![1001u128, 1002], 6, 2u64),
+            ("0.31.0", 5, vec![1001], 5, 2),
+            ("0.31.0", 4, vec![], 4, 2),
+            ("0.33.0", 4, vec![1001, 1002], 4, 0),
+        ] {
+            let label = format!("{version} {max_concurrent_batches} {pages}");
+            let mut groups = full_and_state_transfer_groups();
+            for group in &mut groups {
+                group.block_size_tokens = 4;
+            }
+            if version == "0.33.0" {
+                groups[1].prefill_checkpoint_blocks = Some(0);
+            }
+            let mut args = prefix_core(groups, pages * 100, 8, 1, version).args;
+            args.worker_type = WorkerType::Decode;
+            args.max_model_len = Some(4);
+            args.max_concurrent_batches = max_concurrent_batches;
+            let mut core = VllmCore::new(args);
             let a = HandoffId::new(Uuid::from_u128(2001));
             let b = HandoffId::new(Uuid::from_u128(2002));
             assert_eq!(
                 reserve_grouped(&mut core, a, one_token_load(1001, 7)),
-                Some(1)
+                Some(1),
+                "{label}"
             );
-            let both = reserve_grouped(&mut core, b, one_token_load(1002, 9)).is_some();
-            assert_eq!(both, pages == 6);
+            assert_eq!(
+                reserve_grouped(&mut core, b, one_token_load(1002, 9)),
+                Some(1),
+                "{label}"
+            );
             activate(&mut core, a);
-            if both {
-                activate(&mut core, b);
-            }
+            activate(&mut core, b);
+            assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
+            assert_eq!(core.kv_manager.grouped_inflight_need(), copies, "{label}");
             let mut now = 0.0;
-            let mut completed = Vec::new();
-            for _ in 0..12 {
-                let pass = async_step(&mut core, &mut now);
-                completed.extend(
-                    pass.output_signals
+            block_pool(&core).reset_peak_active_blocks();
+            let pass = async_step(&mut core, &mut now);
+            let outputs: Vec<u128> = pass
+                .output_signals
+                .iter()
+                .map(|output| output.uuid.as_u128())
+                .collect();
+            assert_eq!(outputs, first_pass, "{label}");
+            assert_eq!(block_pool(&core).peak_active_blocks(), peak, "{label}");
+            assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
+            assert_eq!(
+                core.kv_manager.grouped_inflight_need(),
+                copies.saturating_sub(first_pass.len() as u64),
+                "{label}"
+            );
+            assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0, "{label}");
+            if first_pass.is_empty() {
+                // Nothing changes in the next passes either.
+                for _ in 0..3 {
+                    let pass = async_step(&mut core, &mut now);
+                    assert!(pass.output_signals.is_empty(), "{label}");
+                }
+                assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
+            } else {
+                let mut completed = 0;
+                for _ in 0..8 {
+                    let pass = async_step(&mut core, &mut now);
+                    assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0, "{label}");
+                    completed += pass
+                        .output_signals
                         .iter()
-                        .filter(|o| o.completed)
-                        .map(|o| o.uuid.as_u128()),
-                );
-                if reserved_units(&core.retry_pending_destinations(), b).is_some() {
-                    activate(&mut core, b);
+                        .filter(|output| output.completed)
+                        .count();
                 }
-                if core.is_drained() {
-                    break;
-                }
+                assert_eq!(completed, 2, "{label}");
+                assert_eq!(block_pool(&core).active_blocks(), 0, "{label}");
             }
-            assert_eq!(completed, [1001, 1002], "{batches} {pages}");
-            assert!(core.is_drained());
         }
     }
 }

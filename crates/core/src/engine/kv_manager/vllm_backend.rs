@@ -2196,10 +2196,12 @@ impl VllmKvManager {
     /// from the reservation on. vLLM counts that block only once the load
     /// has finished and the state is cached (V32 `sched:3155-3157`,
     /// `single:1732-1739`, V31 `sched:3083-3085`, `single:1770-1777`). So
-    /// The whole-prompt check caps windows at their admission size (V32
-    /// `single:213-235`, V31 `:216-238`). Later loads must leave space for
-    /// each earlier load's actual first allocation, including window pages
-    /// past that admission cap.
+    /// vLLM admits a load where replay makes it wait. The count of the
+    /// prefills in flight caps a window group at its admission blocks, so it
+    /// can leave out the window block that a first pass opens (V32
+    /// `vllm/v1/core/single_type_kv_cache_manager.py:213-235`, V31
+    /// `:216-238`). So, as in vLLM, a load admitted past the cap can wait for
+    /// its first pass, and with no request running the rank stops.
     /// Byte mode charges the projected bytes. Block mode pins the hit blocks
     /// of the local prefix that vLLM's connector path takes, when the mode
     /// reuses the resident prefix (`find_destination_hit`). Only the
@@ -2284,10 +2286,19 @@ impl VllmKvManager {
                     coordinator.kept_full_attention_tokens(&hit) / block
                 });
                 let mut grouped_lease = GroupedLease::default();
-                // Other loads must leave room for this first forward, including its
-                // uncapped window pages and any copy of the state activation publishes.
+                // What the load still needs for its whole prompt, as vLLM's
+                // `_request_remaining_blocks` counts it (V31
+                // `sched:3003-3017`, V32 `sched:3060-3076`), with the
+                // admission cap of a window group (V31 `single:216-229`, V32
+                // `single:213-226`). Grouped replay has no speculative tokens.
+                // Activation publishes a loaded partial state before the
+                // first pass, which then takes a block for its copy. vLLM
+                // counts that block only once the load has finished (see
+                // the comment of this function). Replay counts it from the
+                // reservation on, a known difference from vLLM. Activation
+                // counts the same need again.
                 grouped_lease.first_pass_need =
-                    (coordinator.remaining_blocks(&block_lease, prompt, transfer, prompt, false)
+                    (coordinator.remaining_blocks(&block_lease, prompt, transfer, prompt)
                         + state_copy) as u64;
                 grouped_lease.block_lease = Some(block_lease);
                 (
@@ -2307,9 +2318,10 @@ impl VllmKvManager {
                 };
                 // A full load still recomputes the final prompt token. Its forward may
                 // read one more page of each window than the load itself holds.
-                let Some(forward_bytes) = grouped.required_bytes(computed, prompt) else {
+                let Some(forward_bytes) = grouped.required_bytes(computed, transfer) else {
                     return VllmAcquire::CapacityExhausted;
                 };
+                let recompute_bytes = forward_bytes.saturating_sub(load_bytes);
                 let prompt_bytes = destination_admission_bytes(
                     grouped.groups(),
                     grouped.fixed_request_bytes(),
@@ -2317,8 +2329,7 @@ impl VllmKvManager {
                     prompt,
                     limits,
                 );
-                if prompt_bytes > free
-                    || transfer == prompt && forward_bytes > free
+                if prompt_bytes.max(forward_bytes) > free
                     || load_bytes
                         .saturating_add(self.grouped_inflight_need)
                         .saturating_add(local_prefill_need)
@@ -2334,7 +2345,9 @@ impl VllmKvManager {
                     grouped_lease.expect("a successful allocation sets the lease");
                 // The same count in bytes, where a state group holds its
                 // fixed blocks already.
-                grouped_lease.first_pass_need = forward_bytes.saturating_sub(load_bytes);
+                grouped_lease.first_pass_need =
+                    remaining_bytes(grouped.groups(), transfer, prompt, limits)
+                        .saturating_add(recompute_bytes);
                 (grouped_lease, None, full_blocks, false)
             }
         };
@@ -2375,7 +2388,6 @@ impl VllmKvManager {
                     lease.prompt_tokens.max(tokens.saturating_sub(1)),
                     lease.allocated_tokens,
                     tokens,
-                    true,
                 ) as u64
             }),
             None => {
@@ -2713,8 +2725,7 @@ impl VllmKvManager {
             // vLLM counts what the load still needs again at each test, and
             // a state published here inside its running block adds the block
             // of its copy (V31 `single:1770-1777`, V32 `single:1732-1739`).
-            let need =
-                coordinator.remaining_blocks(&block_lease, prompt, transfer, prompt, false) as u64;
+            let need = coordinator.remaining_blocks(&block_lease, prompt, transfer, prompt) as u64;
             let grouped_lease = lease.grouped.as_mut().expect("grouped lease present");
             self.grouped_inflight_need =
                 self.grouped_inflight_need - grouped_lease.first_pass_need + need;

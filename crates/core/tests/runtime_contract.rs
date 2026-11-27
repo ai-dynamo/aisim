@@ -2301,6 +2301,15 @@ fn grouped_destination_keeps_room_for_a_first_pass_in_byte_mode_too() {
 
 #[test]
 fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops() {
+    check_window_group_stop_threshold(false, 27);
+}
+
+#[test]
+fn grouped_destination_in_block_mode_with_a_window_group_stops_where_vllm_stops() {
+    check_window_group_stop_threshold(true, 28);
+}
+
+fn check_window_group_stop_threshold(prefix_caching: bool, stalled_pages: u64) {
     // Full attention, a window of 33 tokens and a state group of one block per
     // request, 16-token blocks and 100-byte pages, max_model_len 240, one
     // batch of 32 tokens and prefix caching off, so the window cap is
@@ -2333,10 +2342,9 @@ fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops()
     // - 28 pages: both loads are reserved and the first step of the first
     //   request fits. The first request is preempted once, and the second
     //   request ends first.
-    // The rows of 26 and 27 pages and the reservation of both loads at 28 pages
-    // are derived from these rules, the same at v0.31.0, v0.32.0 and v0.33.0.
-    // Replay gives the rest of the row of 28 pages: the first request is
-    // preempted once, and the second request ends first.
+    // With prefix caching on, the first forward also opens a state block.
+    // The tagged EngineCore schedulers reproduce the same three outcomes
+    // at 27, 28 and 29 pages respectively on each of these releases.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let spec = |pages: u64| {
             let requests = ["first", "second"]
@@ -2348,7 +2356,7 @@ fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops()
                     request
                 })
                 .collect();
-            let mut spec = small_grouped_pd_spec(requests, pages, None);
+            let mut spec = small_grouped_pd_spec(requests, pages, prefix_caching.then_some(240));
             spec.topology = ReplayTopology::Disaggregated {
                 prefill: WorkerPoolSpec {
                     initial_workers: 1,
@@ -2378,53 +2386,109 @@ fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops()
             spec
         };
 
-        let report = Replayer::new(spec(26), ReplayEngineFactory::new())
+        let report = Replayer::new(spec(stalled_pages - 1), ReplayEngineFactory::new())
             .unwrap()
             .run()
             .unwrap();
-        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{version} prefix caching {prefix_caching}"
+        );
         let (first, second) = (record(&report, "first"), record(&report, "second"));
         assert_eq!(
             second.destination_reserved_ms,
             Some(first.terminal_time_ms),
-            "{version}"
+            "{version} prefix caching {prefix_caching}"
         );
         assert_eq!(
             (first.readmission_count, second.readmission_count),
             (0, 0),
-            "{version}"
+            "{version} prefix caching {prefix_caching}"
         );
 
-        let error = Replayer::new(spec(27), ReplayEngineFactory::new())
+        let error = Replayer::new(spec(stalled_pages), ReplayEngineFactory::new())
             .unwrap()
             .run()
             .unwrap_err();
         assert_eq!(
             error.to_string(),
             "replay invariant violated: offline disagg replay encountered an effect-free zero-duration pass with 2 in-flight requests remaining",
-            "{version}"
+            "{version} prefix caching {prefix_caching}"
         );
 
-        let report = Replayer::new(spec(28), ReplayEngineFactory::new())
+        let report = Replayer::new(spec(stalled_pages + 1), ReplayEngineFactory::new())
             .unwrap()
             .run()
             .unwrap();
-        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{version} prefix caching {prefix_caching}"
+        );
         let (first, second) = (record(&report, "first"), record(&report, "second"));
-        assert!(first.destination_reserved_ms.is_some(), "{version}");
+        assert!(
+            first.destination_reserved_ms.is_some(),
+            "{version} prefix caching {prefix_caching}"
+        );
         assert_eq!(
             first.destination_reserved_ms, second.destination_reserved_ms,
-            "{version}"
+            "{version} prefix caching {prefix_caching}"
         );
         assert_eq!(
             (first.readmission_count, second.readmission_count),
             (1, 0),
-            "{version}"
+            "{version} prefix caching {prefix_caching}"
         );
         assert!(
             second.terminal_time_ms < first.terminal_time_ms,
-            "{version}"
+            "{version} prefix caching {prefix_caching}"
         );
+    }
+}
+
+#[test]
+fn grouped_window_and_state_loads_can_stall_without_full_attention() {
+    // These v0.33 layouts meet the native startup requirement. The two
+    // waiting first forwards cannot release each other's window/state pages.
+    for (pages, prefix_caching, prompts, budget, max_len) in [
+        (5, false, [65, 66], 32, 80),
+        (6, false, [65, 66], 32, 80),
+        (5, true, [49, 49], 16, 64),
+    ] {
+        let requests = ["first", "second"]
+            .into_iter()
+            .zip(prompts)
+            .zip([0u32, 1_000])
+            .map(|((id, length), start)| {
+                let mut request = request(id, 0.0, length, 2);
+                request.input_token_ids = Some((start..start + length as u32).collect());
+                request
+            })
+            .collect();
+        let mut spec = small_grouped_pd_spec(requests, pages, prefix_caching.then_some(max_len));
+        let rank = &mut spec.engine["rank"];
+        rank["vllm_version"] = "0.33.0".into();
+        rank["max_model_len"] = max_len.into();
+        rank["max_num_batched_tokens"] = budget.into();
+        rank["async_scheduling"] = false.into();
+        rank["kv_cache_groups"][0]["name"] = "window".into();
+        rank["kv_cache_groups"][0]["sliding_window"] = 16.into();
+        rank["kv_cache_groups"][1]["prefill_checkpoint_blocks"] = 0.into();
+        let mut prefill = rank.clone();
+        prefill["max_num_batched_tokens"] = 256.into();
+        prefill["kv_cache_capacity_bytes"] = 6400.into();
+        spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+        let result = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run();
+        if pages == 5 {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "replay invariant violated: offline disagg replay encountered an effect-free zero-duration pass with 2 in-flight requests remaining",
+                "prefix caching {prefix_caching}"
+            );
+        } else {
+            assert_eq!(result.unwrap().request_counts.completed_requests, 2);
+        }
     }
 }
 

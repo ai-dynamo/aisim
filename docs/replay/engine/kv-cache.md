@@ -1655,12 +1655,34 @@ sub-block matching without an explicit full-state scratch count.
   more block for the copy that its next step takes. With a hash block smaller
   than the state block, that is the case when the transferred tokens end at
   the prompt's partial tail, its last hash boundary, which vLLM caches when the
-  load completes. Replay counts this copy from reservation onward, including
-  a one-token vLLM 0.31.0 prompt whose state is cached at token one. The
-  whole-prompt check caps a sliding-window or convolution group at its
-  admission limit. Later loads must also leave room for the earlier load's
-  first real forward, including any window pages beyond that limit. The
-  earlier request can then run and release its pages for the next load.
+  load completes. For a prompt of more than one token in block mode, replay
+  counts the partial-state copy from reservation onward, both for the
+  request itself and for later transfers. vLLM starts counting it after
+  the load finishes.
+
+  For a held load, vLLM 0.31.0, 0.32.0 and 0.33.0 cap the count of a
+  sliding-window or `convolution` group at the admission limit. The first
+  forward can require another window page beyond that limit. When multiple
+  transfers have reserved the pool and every first forward needs more free
+  pages, the decode scheduler can return empty steps until a client aborts
+  a request. For example, two distinct 161-token prompts with 40 output
+  tokens each finish prefill together. The decode worker has 16-token
+  blocks, a 33-token window, one full-attention group, one state group, a
+  240-token model limit and a 32-token batch budget. With prefix caching
+  off, both requests finish with 26 usable pages, stall with 27 and finish
+  after one preemption with 28.
+  With prefix caching on, the same three outcomes occur at 27, 28 and 29
+  pages. Offline replay stops when there is no future event and reports
+  `offline disagg replay encountered an effect-free zero-duration pass`
+  with the number of requests still in flight.
+
+  A similar stall occurs in vLLM 0.31.0 with one full-attention group, one
+  Mamba group, four-token blocks and a one-token hash block. Two one-token
+  requests reserve all four usable pages before either transfer finishes.
+  Each first forward needs a new page to copy the state that activation
+  published. Five usable pages let the requests finish in sequence and
+  six let both start together. On vLLM 0.33.0 both finish with four pages
+  because the last token is outside the partial-state cache boundary.
   Before a decode worker accepts a transferred request, it also checks the
   first step after the load, from the transferred tokens to the whole
   prompt, without the admission cap. When that step needs more than the
@@ -1872,9 +1894,10 @@ sub-block matching without an explicit full-state scratch count.
     running request and the free blocks equal its transferred blocks, vLLM
     reserves it, and the running request preempts itself to free a block.
     Replay reserves the transferred request only when a block for the copy
-    is free too, so reservation times and preemption counts differ. A
-    prompt of one token is the exception: there replay counts as vLLM does
-    and stops, as the paragraph on the two tests says.
+    is free too, so reservation times and preemption counts differ. For a
+    one-token prompt, replay follows the tagged scheduler's activation-time
+    charge. The four-page vLLM 0.31.0 stall and the vLLM 0.33.0 completion
+    are described with the admission tests above.
   - vLLM 0.31.0, 0.32.0 and 0.33.0 put a preempted request at the front of
     their waiting queue. The waiting loop takes the requests of that queue
     in order and ends at the first request that does not fit, so vLLM

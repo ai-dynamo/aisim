@@ -20,6 +20,17 @@ class InfeasibleKVCapacity(ValueError):
     """A candidate's selected shape and batching leave no usable KV capacity."""
 
 
+def validate_scheduler_envelope(resources, sample: dict[str, Any], role: str) -> None:
+    """Reject an incompatible trial before materializing its deployment or pricing its KV load."""
+    try:
+        resources.validate_envelope(
+            max_num_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
+            max_batch_size=int(sample[f"{role}_max_num_seqs"]),
+        )
+    except ValueError as error:
+        raise InfeasibleKVCapacity(str(error)) from error
+
+
 @dataclass(frozen=True)
 class KVLoadResolution:
     """The requested normalized load and the concrete closed-loop concurrency."""
@@ -192,6 +203,8 @@ def _role_grouped_capacity(
         moe_tp_size=shape.moe_tp,
         moe_ep_size=shape.moe_ep,
     )
+    if role != "agg" or deployment.resources.cache_layout == "grouped":
+        validate_scheduler_envelope(deployment.resources, sample, role)
     if deployment.resources.cache_layout != "grouped":
         return None
     if sample.get(f"{role}_num_gpu_blocks") is not None:

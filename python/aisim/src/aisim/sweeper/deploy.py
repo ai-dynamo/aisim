@@ -130,7 +130,16 @@ def _engine_args_payload(
     if context_length is not None:
         payload["max_model_len"] = int(context_length)
     if sample.get("fpm_profile") is not None and (role != "agg" or payload["enable_prefix_caching"]):
-        _add_grouped_prefix_caching(payload, sample, role, backend_version=backend_version, fpm_profile=fpm_profile)
+        from .kv_load import validate_scheduler_envelope
+
+        profile = fpm_profile()
+        deployment = _profile_deployment(sample, role, backend_version=backend_version, profile=profile)
+        if deployment.resources.cache_layout == "grouped":
+            _add_grouped_prefix_caching(payload, sample, role, backend_version, profile, deployment)
+        if role != "agg" or (
+            deployment.resources.cache_layout == "grouped" and deployment.resources.runtime_memory is not None
+        ):
+            validate_scheduler_envelope(deployment.resources, sample, role)
     if moe_tp * moe_ep > 1:
         payload["aic_moe_tp_size"] = moe_tp
         payload["aic_moe_ep_size"] = moe_ep
@@ -206,7 +215,11 @@ def _engine_args_payload(
     if (
         transfer_geometry == "auto"
         and role in {"prefill", "decode"}
-        and _grouped_deployment(sample, "prefill", backend_version=backend_version, fpm_profile=fpm_profile) is not None
+        and sample.get("fpm_profile") is not None
+        and _profile_deployment(
+            sample, "prefill", backend_version=backend_version, profile=fpm_profile()
+        ).resources.cache_layout
+        == "grouped"
     ):
         # A grouped prefill rank derives its transfer payload from its cache groups, as in the compiler.
         transfer_geometry = None
@@ -248,16 +261,10 @@ def _profile_loader(sample: dict[str, Any]):
     return profile
 
 
-def _grouped_deployment(sample: dict[str, Any], role: str, *, backend_version: str, fpm_profile):
-    """The FPM profile and the grouped deployment of a candidate's role, or None for a role with a linear cache."""
-    if sample.get("fpm_profile") is None:
-        return None
-    profile = fpm_profile()
-    # A profile without grouped deployments keeps its candidate path as it was.
-    if all(deployment.resources.cache_layout != "grouped" for deployment in profile.deployments):
-        return None
+def _profile_deployment(sample: dict[str, Any], role: str, *, backend_version: str, profile):
+    """Select the role's captured or declared deployment at the trial's parallel shape."""
     prefix = _role_prefix(role)
-    deployment = profile.select(
+    return profile.select(
         model=str(sample["model_name"]),
         system=_role_hardware_sku(sample, role),
         backend=str(sample["backend"]),
@@ -269,22 +276,12 @@ def _grouped_deployment(sample: dict[str, Any], role: str, *, backend_version: s
         moe_tp_size=int(sample[f"{prefix}moe_tp"]),
         moe_ep_size=int(sample[f"{prefix}moe_ep"]),
     )
-    return (profile, deployment) if deployment.resources.cache_layout == "grouped" else None
 
 
-def _add_grouped_prefix_caching(
-    payload: dict[str, Any], sample: dict[str, Any], role: str, *, backend_version: str, fpm_profile
-) -> None:
-    """Give a grouped FPM rank the keys that the Rust gate needs, after the shared check.
-
-    A prefill or decode rank reads the transfer rules of its vLLM version, also with prefix caching off.
-    """
+def _add_grouped_prefix_caching(payload, sample, role, backend_version, profile, deployment) -> None:
+    """Give a grouped FPM rank the keys needed by the native prefix and transfer rules."""
     from ..config.engine import grouped_prefix_caching_requirements
 
-    grouped = _grouped_deployment(sample, role, backend_version=backend_version, fpm_profile=fpm_profile)
-    if grouped is None:
-        return
-    profile, deployment = grouped
     payload["vllm_version"] = deployment.backend_version
     # Cold ranks also size their pool with the profile context unless the search overrides it.
     payload.setdefault("max_model_len", profile.context_length)
@@ -298,18 +295,6 @@ def _add_grouped_prefix_caching(
             field=f"{role}_enable_prefix_caching",
             pd_rank=role != "agg",
         )
-    if deployment.resources.runtime_memory is not None:
-        # Different topologies in one study may capture different scheduler settings.
-        # Check the selected shape before creating a replay with another shape's values.
-        from .kv_load import InfeasibleKVCapacity
-
-        try:
-            deployment.resources.validate_envelope(
-                max_num_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
-                max_batch_size=int(sample[f"{role}_max_num_seqs"]),
-            )
-        except ValueError as error:
-            raise InfeasibleKVCapacity(str(error)) from error
 
 
 def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:

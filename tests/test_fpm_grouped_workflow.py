@@ -2844,6 +2844,107 @@ def test_grouped_search_intersects_each_captured_scheduler_domain(grouped_case, 
         branches()
 
 
+@pytest.mark.parametrize("linear", [False, True], ids=["declared-grouped", "measured-linear"])
+def test_mixed_fpm_scheduler_domains_preserve_each_valid_shape(grouped_case, linear):
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.search_space import enumerate_branches
+
+    original, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(original))
+    if linear:
+        profile = _mixed_profile(profile)
+        profile["deployments"][0]["resources"]["max_num_tokens"] = 96
+    else:
+        declared = _with_transfer_markers(original)["deployments"][1]["resources"]
+        declared["max_num_tokens"] = 96
+        profile["deployments"][1]["resources"] = declared
+    raw = _pd_search(profile, root)
+    for role in ("prefill", "decode"):
+        raw[f"{role}_max_num_batched_tokens"] = [64, 96, 128, 256]
+    config = SmartSearchConfig(
+        search_space=raw,
+        workload=Workload(isl=32, osl=3, concurrency=1, request_count=2),
+    )
+    (branch,) = enumerate_branches(config, max_seq_len=512)
+    assert {c.prefill.shape.tp for c in branch.parallel_configs} == {1, 2}
+    for role in ("prefill", "decode"):
+        assert branch.knob_choices[f"{role}_max_num_batched_tokens"] == (
+            [96, 128] if linear else [64, 96, 128]
+        )
+
+
+@pytest.mark.parametrize("relative_load", [False, True], ids=["fixed", "kv-relative"])
+def test_selected_scheduler_envelope_precedes_kv_load_materialization(
+    grouped_case, relative_load
+):
+    from unittest.mock import Mock
+
+    from aisim.runner import EngineReplayRunnerFactory
+    from aisim.sweeper.forward_pass_estimator import ForwardPassEstimatorResolver
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.search import _materialize_one
+    from aisim.sweeper.search_space import enumerate_branches
+
+    profile, root = grouped_case
+    profile = _with_transfer_markers(_with_prefix_evidence(profile))
+    profile["deployments"][1]["resources"].update(max_num_tokens=96, max_batch_size=8)
+    raw = {**_pd_search(profile, root), "context_length": 512}
+    # Insertion order also controls a seeded random sampler's dimension order.
+    ranges = {
+        f"{role}_{field}": bounds
+        for role in ("decode", "prefill")
+        for field, bounds in (
+            ("max_num_seqs", [2, 16]),
+            ("max_num_batched_tokens", [64, 256]),
+        )
+    }
+    raw["engine_integer_log_ranges"] = ranges
+    workload = Workload(
+        isl=32,
+        osl=3,
+        request_count=2,
+        **({"kv_load_ratio": 0.5} if relative_load else {"concurrency": 1}),
+    )
+    config = SmartSearchConfig(search_space=raw, workload=workload)
+    (branch,) = enumerate_branches(config, max_seq_len=512)
+    # This synthetic profile supplies cache geometry without timing tables.
+    resolver = Mock(spec=ForwardPassEstimatorResolver)
+    resolver.resolve_candidate.return_value = {}
+
+    assert [name for name in branch.knob_choices if name in ranges] == list(ranges)
+    assert ranges.keys() <= branch.log_discrete_choices
+    for candidate in {c.prefill.shape.tp: c for c in branch.parallel_configs}.values():
+        tokens, seqs = (96, 8) if candidate.prefill.shape.tp == 1 else (128, 4)
+        for compatible in [True, False]:
+            selection = {"deployment_mode": "disagg", "backend": "vllm"}
+            for role in ("prefill", "decode"):
+                selection[f"{role}_max_num_batched_tokens"] = tokens
+                selection[f"{role}_max_num_seqs"] = seqs
+            if not compatible:
+                selection["decode_max_num_seqs"] = 12 - seqs
+            if relative_load:
+                selection["kv_load_ratio"] = 0.5
+            candidate_result, failure = _materialize_one(
+                selection,
+                candidate,
+                config=config,
+                goal=config.goal,
+                providers={},
+                provider_plans={},
+                runner_factory=EngineReplayRunnerFactory(),
+                estimator_resolver=resolver,
+            )
+            if compatible:
+                assert failure is None, failure
+                assert candidate_result is not None
+            else:
+                assert candidate_result is None
+                assert (failure.outcome, failure.reason_category.value) == (
+                    "infeasible",
+                    "kv_capacity",
+                )
+
+
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):
     from aisim.sweeper.config import SmartSearchConfig
     from aisim.sweeper.search_space import enumerate_branches

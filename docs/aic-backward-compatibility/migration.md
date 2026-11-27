@@ -749,6 +749,32 @@ explains the retained workload routing and feature mathematics.
   `model_dtype` as `None`. Serialized records that omit these fields still deserialize, and
   `None` is not serialized.
 
+### Rust P/D reservation events
+
+Rust callers constructing `aisim_core::engine::LifecycleEvent::DestinationReserved` or `aisim_core::replay::HandoffFact::DestinationReserved` must supply the new `full_local_hit` field. Use `false` for existing producers unless the destination confirms that its local cache covers the entire transfer, including the state and window groups. Propagate the value when translating a lifecycle event into a handoff fact. In `destination_missing` mode a complete hit skips the payload and still notifies the source.
+
+```rust
+let event = LifecycleEvent::DestinationReserved {
+    handoff_id,
+    request_id,
+    transferable_prompt_tokens,
+    full_local_hit: false,
+};
+if let LifecycleEvent::DestinationReserved {
+    handoff_id, transferable_prompt_tokens, full_local_hit, ..
+} = event {
+    let fact = HandoffFact::DestinationReserved {
+        handoff_id, transferable_prompt_tokens, full_local_hit,
+    };
+    // Consumers that only need the token count can ignore the other fields.
+    if let HandoffFact::DestinationReserved { transferable_prompt_tokens, .. } = fact {
+        record_tokens(transferable_prompt_tokens);
+    }
+}
+```
+
+Exhaustive field patterns for either variant must bind `full_local_hit` or include `..`. Existing serialized `HandoffFact` records that omit the field deserialize as `false`. Writers omit `false` and serialize `true` explicitly.
+
 ### Rust AgentX snapshot options
 
 The snapshot-import extension changes the public Rust

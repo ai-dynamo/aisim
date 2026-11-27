@@ -886,7 +886,7 @@ Intake and import refuse three pairs: `cache_groups` with
 The vLLM probe always reports a grouped cache. Without a matching
 `cache_layout: linear` or `kv_bytes_per_token` claim, the imported profile is
 grouped, and the [limits of grouped profiles](#create-the-request) apply to it:
-the cache stays in HBM, and the plan enables prefix reuse when the profile meets the grouped prefix-caching requirements. Grouped P/D also requires matching prefill and decode deployments and connector-measured `transfer_bytes_per_block` for each group. Probe import alone supplies no connector byte counts. A matching linear claim gives a linear profile as described below.
+the cache stays in HBM, and the plan enables prefix reuse when the profile meets the grouped prefix-caching requirements. Grouped P/D also requires matching prefill and decode deployments and evidence for each group’s `transfer_bytes_per_block`. Use per-group connector measurements or identify the bytes in the connector’s region table. The GLM example uses the registered regions and connector code to split measured transfer totals. Probe import alone supplies no connector byte counts. A matching linear claim gives a linear profile as described below.
 Import checks each kind of claim against the measured groups:
 
 - A `cache_groups` claim must have the same groups as the measurement: the same

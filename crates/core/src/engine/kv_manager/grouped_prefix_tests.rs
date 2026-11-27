@@ -1789,7 +1789,7 @@ fn remaining_blocks_follow_vllm_for_every_group_kind() {
         let mut lease = coordinator.new_lease();
         assert!(coordinator.allocate(pool, &mut lease, 10_000, 0, 4_352, 0, None));
         assert_eq!(
-            coordinator.remaining_blocks(&lease, 10_000, 4_352, 10_000, true),
+            coordinator.remaining_blocks(&lease, 10_000, 4_352, 10_000),
             expected
         );
     }
@@ -1810,10 +1810,7 @@ fn remaining_blocks_follow_vllm_for_every_group_kind() {
         let pool = kv.block_pool_mut().unwrap();
         let mut lease = coordinator.new_lease();
         assert!(coordinator.allocate(pool, &mut lease, 65, 0, 64, 0, None));
-        assert_eq!(
-            coordinator.remaining_blocks(&lease, 65, 64, 65, true),
-            expected
-        );
+        assert_eq!(coordinator.remaining_blocks(&lease, 65, 64, 65), expected);
     }
 }
 
@@ -1841,7 +1838,7 @@ fn remaining_blocks_count_the_producer_copy_that_is_still_to_come() {
         );
         let mut block_lease = coordinator.new_lease();
         assert_eq!(
-            coordinator.remaining_blocks(&block_lease, 50, 0, 50, true),
+            coordinator.remaining_blocks(&block_lease, 50, 0, 50),
             2,
             "{version:?}"
         );
@@ -1853,7 +1850,7 @@ fn remaining_blocks_count_the_producer_copy_that_is_still_to_come() {
             "{version:?}"
         );
         assert_eq!(
-            coordinator.remaining_blocks(&block_lease, 50, 48, 50, true),
+            coordinator.remaining_blocks(&block_lease, 50, 48, 50),
             1,
             "{version:?}"
         );
@@ -1861,7 +1858,7 @@ fn remaining_blocks_count_the_producer_copy_that_is_still_to_come() {
         assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 48, None));
         assert_eq!(pool.active_blocks(), 3, "{version:?}");
         assert_eq!(
-            coordinator.remaining_blocks(&block_lease, 50, 50, 50, true),
+            coordinator.remaining_blocks(&block_lease, 50, 50, 50),
             0,
             "{version:?}"
         );
