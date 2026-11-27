@@ -3481,7 +3481,9 @@ def test_matching_receipt_and_artifact_cannot_replace_the_frozen_producer(tmp_pa
         _validate(tmp_path, cell)
 
 
-@pytest.mark.parametrize(("mask", "mode"), [(0o022, 0o644), (0o002, 0o664), (0o077, 0o600)])
+@pytest.mark.parametrize(
+    ("mask", "mode"), [(0o000, 0o664), (0o002, 0o664), (0o022, 0o644), (0o044, 0o620), (0o077, 0o600)]
+)
 def test_producer_receipt_respects_the_campaign_umask(tmp_path, mask, mode):
     cell = glm_cell("prefill")
 

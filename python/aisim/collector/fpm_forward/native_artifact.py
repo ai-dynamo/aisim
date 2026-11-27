@@ -13,6 +13,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import statistics
 from bisect import bisect_left
 from collections import Counter
@@ -417,8 +418,8 @@ def write_producer_receipt(cell: FPMCell, cell_dir: Path, *, plan_sha256: str, a
     }
     path = cell_dir / PRODUCER_RECEIPT_FILENAME
     temporary = cell_dir / f".{path.name}.{secrets.token_hex(16)}"
-    # The receipt follows the campaign's umask, like the other cell metadata.
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    # Shared campaigns use the umask to grant read and group write access to these provenance identifiers and digests.
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 & ~stat.S_IWOTH)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
