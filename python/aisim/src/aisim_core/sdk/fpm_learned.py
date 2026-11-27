@@ -920,6 +920,14 @@ def _write_training_checkpoint(
             raise
 
 
+# The Rust artifact loader reads metadata.nextn as a u32.
+_MAX_NEXTN = 2**32 - 1
+
+
+def _is_nextn(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and 0 <= value <= _MAX_NEXTN
+
+
 def _telemetry_count(sched: dict[str, Any], key: str, index: int) -> int | None:
     """A capture-hook count field: absent, or a non-negative integer (integral floats from JSON allowed)."""
     value = sched.get(key)
@@ -943,8 +951,8 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
     match a recorded depth. Without either, the steps ran without speculative
     decoding (depth 0).
     """
-    if nextn is not None and (isinstance(nextn, bool) or not isinstance(nextn, int) or nextn < 0):
-        raise ValueError(f"nextn must be a non-negative integer, got {nextn!r}")
+    if nextn is not None and not _is_nextn(nextn):
+        raise ValueError(f"nextn must be an integer in [0, {_MAX_NEXTN}], got {nextn!r}")
     recorded: set[int] = set()
     unrecorded = False
     for index, metrics_by_rank in enumerate(iterations):
@@ -976,20 +984,21 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
             raise ValueError(f"nextn={nextn} does not match the steps' recorded spec_num_steps={depth}")
     else:
         depth = nextn or 0
-    if depth > 0:
-        _require_verify_widths(iterations, depth)
+    _require_verify_widths(iterations, depth, full=bool(recorded))
     return depth
 
 
-def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth: int) -> None:
-    """MTP replay queries each decode request at its verify width; per-request training lists must agree.
+def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth: int, *, full: bool) -> None:
+    """Per-request decode widths must match the query replay sends at ``depth``.
 
-    A capture whose decode-only steps all list extend 1 per request (the stock SGLang decode hook) describes
-    a different query than replay sends at width ``depth + 1``. vLLM may schedule a shorter width near token
-    or context limits, so only a capture with no decode request wider than 1 is rejected.
+    Replay queries each decode request at its verify width: ``depth + 1``, or 1 without speculation. Each
+    decode-only step's listed extend lengths are checked against it. Steps that record the capture hook's
+    depth fields (SGLang, ``full``) must list the full width. vLLM may schedule a shorter width near token or
+    context limits, so other MTP captures may list 1 to ``depth + 1`` but need at least one request wider
+    than 1; the stock SGLang decode hook lists 1 for every request. Aggregate-only captures carry no widths.
     """
-    listed = False
-    for metrics_by_rank in iterations:
+    widest = None
+    for index, metrics_by_rank in enumerate(iterations):
         for fpm in metrics_by_rank:
             sched = _sched(fpm)
             if int(sched.get("num_prefill_requests", 0)) or not int(sched.get("num_decode_requests", 0)):
@@ -997,10 +1006,17 @@ def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth
             pairs = _request_pairs(sched)
             if pairs is None:
                 continue
-            if any(extend > 1 for extend, _ in pairs):
-                return
-            listed = True
-    if listed:
+            widths = [extend for extend, _ in pairs]
+            low = depth + 1 if full else 1
+            bad = [width for width in widths if not low <= width <= depth + 1]
+            if bad:
+                expected = f"{depth + 1}" if low == depth + 1 else f"1 to {depth + 1}"
+                raise ValueError(
+                    f"iteration {index}: decode request extend lengths {bad} contradict MTP depth {depth}, which "
+                    f"replay queries at verify width {expected}; record or pass the depth the steps ran at"
+                )
+            widest = max(widths) if widest is None else max(widest, *widths)
+    if depth > 0 and widest == 1:
         raise ValueError(
             f"MTP depth {depth}: every decode request in the per-request lists has extend length 1, but replay "
             f"queries decode requests at verify width {depth + 1}; capture with a hook that records verify widths"
@@ -1187,8 +1203,8 @@ def validate_artifact(artifact: dict[str, Any]) -> None:
     _reject_duplicate_features(features)
     metadata = artifact.get("metadata") or {}
     recorded_nextn = metadata.get("nextn", 0) if isinstance(metadata, dict) else 0
-    if isinstance(recorded_nextn, bool) or not isinstance(recorded_nextn, int) or recorded_nextn < 0:
-        raise ValueError(f"metadata.nextn {recorded_nextn!r} is not a non-negative integer")
+    if not _is_nextn(recorded_nextn):
+        raise ValueError(f"metadata.nextn {recorded_nextn!r} is not an integer in [0, {_MAX_NEXTN}]")
     stores = artifact.get("stores")
     if not isinstance(stores, dict) or not stores:
         raise ValueError("artifact stores must be a non-empty mapping")

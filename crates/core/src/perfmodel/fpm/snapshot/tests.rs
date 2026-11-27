@@ -1565,6 +1565,47 @@ fn frozen_forest_fixed_corrections_round_trip() {
     );
 }
 
+// Normalizing a speculation scheme runs the Python SDK's validator.
+#[cfg(feature = "embed-python")]
+#[test]
+fn learned_mtp_snapshot_restores_for_either_spelling_of_its_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact = dir.path().join("forest.json");
+    let mut forest: serde_json::Value =
+        serde_json::from_str(&forest_artifact(AGG, None, None)).unwrap();
+    forest["metadata"]["nextn"] = 3.into();
+    std::fs::write(&artifact, forest.to_string()).unwrap();
+    let mtp = |depth: u32| {
+        Some(
+            serde_json::from_value(serde_json::json!({"kind": "mtp", "params": {"depth": depth}}))
+                .unwrap(),
+        )
+    };
+    for (nextn, speculation) in [(3, None), (0, mtp(3))] {
+        let mut config = learned_frozen_config(AGG, &artifact, CorrectionMode::Fixed);
+        config.nextn = nextn;
+        config.speculation = speculation;
+        let saved = best(config)
+            .unwrap()
+            .save_state_snapshot(
+                dir.path().join(format!("snap-{nextn}")),
+                &StateSnapshotOptions::default(),
+            )
+            .unwrap();
+        // The other spelling of depth 3 restores; another depth does not.
+        let mut legacy = saved.clone();
+        (legacy.nextn, legacy.speculation) = (3, None);
+        let mut scheme = saved.clone();
+        (scheme.nextn, scheme.speculation) = (0, mtp(3));
+        best(legacy).unwrap();
+        best(scheme).unwrap();
+        let mut deeper = saved;
+        (deeper.nextn, deeper.speculation) = (0, mtp(2));
+        let error = best(deeper).err().unwrap().to_string();
+        assert!(error.contains("pinned identity at nextn"), "{error}");
+    }
+}
+
 /// A real one-feature training checkpoint (constant seed forest fitted to two
 /// rows), extended from the causal-selector test fixture.
 fn training_checkpoint(

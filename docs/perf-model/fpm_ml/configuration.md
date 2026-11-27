@@ -64,10 +64,14 @@ trained without MTP is never used for MTP, and an MTP artifact is never used
 for plain decode or another depth. The trainer writes `metadata.nextn` from the
 steps' `spec_num_steps` (or `spec_num_draft_tokens - 1`), or from `--nextn`
 for telemetry without those fields (see
-[Train](learned-forward-pass-model.md#2-train)). At a depth above 0 it rejects
-captures whose per-request lists give every decode request an extend length of
-1, as the stock SGLang decode hook does: replay would query those requests at
-their verify width.
+[Train](learned-forward-pass-model.md#2-train)). It checks each decode-only
+step's per-request extend lengths against that depth, since replay queries a
+decode request at its verify width: 1 without MTP; exactly `nextn + 1` for
+steps that record the hook's depth fields (SGLang); and 1 to `nextn + 1` for
+other MTP steps (vLLM), of which at least one request must be wider than 1. The
+stock SGLang decode hook lists 1 for every request, so its MTP captures are
+rejected. Aggregate-only captures carry no widths. `nextn` must fit in the
+loader's `u32`.
 
 ## Estimator namespaces
 

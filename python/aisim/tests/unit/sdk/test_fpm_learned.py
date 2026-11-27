@@ -731,7 +731,7 @@ def test_training_nextn_reads_the_capture_hook_depth():
         ([[_mtp_fpm(1, 50, 0.01, steps=3)]], 2, "does not match the steps' recorded spec_num_steps=3"),
         ([[_mtp_fpm(1, 50, 0.01, steps=3, draft_tokens=8)]], None, "only chain MTP drafts"),
         ([[_mtp_fpm(1, 50, 0.01, steps=0, draft_tokens=8)]], None, "only chain MTP drafts"),
-        ([[_decode_fpm(1, 50, 0.01)]], -1, "non-negative integer"),
+        ([[_decode_fpm(1, 50, 0.01)]], -1, "nextn must be an integer"),
         ([[_mtp_fpm(1, 50, 0.01, steps=3.9, draft_tokens=4.9)]], None, "spec_num_steps must be a non-negative integer"),
         ([[_mtp_fpm(1, 50, 0.01, steps=True, draft_tokens=2)]], None, "spec_num_steps must be a non-negative integer"),
         ([[_mtp_fpm(1, 50, 0.01, steps=3, draft_tokens=-1)]], None, "spec_num_draft_tokens must be a non-negative"),
@@ -750,17 +750,31 @@ def _listed_decode(widths: list[int], *, steps: int | None = None) -> dict:
 
 
 def test_training_nextn_requires_verify_widths_in_request_lists():
-    """Replay queries MTP decode at width nextn + 1; width-1 request lists describe a different query."""
+    """Replay queries decode at width nextn + 1 (1 without MTP); listed decode widths must agree."""
     # The stock SGLang decode hook lists extend 1 and omits the depth fields.
     with pytest.raises(ValueError, match="every decode request in the per-request lists has extend length 1"):
         fpm_learned.training_nextn([[_listed_decode([1, 1])]], nextn=3)
-    with pytest.raises(ValueError, match="replay queries decode requests at verify width 4"):
-        fpm_learned.training_nextn([[_listed_decode([1, 1], steps=3)]])
-    # Verify widths, including vLLM's shorter widths near limits, are accepted.
-    assert fpm_learned.training_nextn([[_listed_decode([4, 4], steps=3)], [_listed_decode([1, 2], steps=3)]]) == 3
-    assert fpm_learned.training_nextn([[_listed_decode([4, 2])]], nextn=3) == 3
-    # Depth 0 keeps width-1 decode lists.
+    # The capture hook's depth fields mark SGLang steps, which verify the full width.
+    assert fpm_learned.training_nextn([[_listed_decode([4, 4], steps=3)]]) == 3
+    with pytest.raises(ValueError, match=r"extend lengths \[1, 2\] contradict MTP depth 3.*verify width 4;"):
+        fpm_learned.training_nextn([[_listed_decode([4, 4], steps=3)], [_listed_decode([1, 2], steps=3)]])
+    # vLLM may verify fewer tokens near limits, but never more than nextn + 1.
+    assert fpm_learned.training_nextn([[_listed_decode([4, 2])], [_listed_decode([1, 1])]], nextn=3) == 3
+    with pytest.raises(ValueError, match=r"extend lengths \[5\] contradict MTP depth 3.*verify width 1 to 4;"):
+        fpm_learned.training_nextn([[_listed_decode([4, 5])]], nextn=3)
+    # Without MTP, decode requests verify one token: wider lists are unlabeled speculative rounds.
     assert fpm_learned.training_nextn([[_listed_decode([1, 1])]]) == 0
+    for nextn in (None, 0):
+        with pytest.raises(ValueError, match=r"extend lengths \[4, 4\] contradict MTP depth 0"):
+            fpm_learned.training_nextn([[_listed_decode([4, 4])]], nextn)
+    # Aggregate-only captures carry no widths.
+    assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]], nextn=3) == 3
+
+
+def test_nextn_must_fit_the_rust_loader_u32():
+    # validate_artifact applies the same range (test_train_records_nextn_and_validate_checks_it).
+    with pytest.raises(ValueError, match=r"nextn must be an integer in \[0, 4294967295\]"):
+        fpm_learned.training_nextn([[_decode_fpm(1, 50, 0.01)]], 2**32)
 
 
 def test_train_records_nextn_and_validate_checks_it():
@@ -777,6 +791,7 @@ def test_train_records_nextn_and_validate_checks_it():
     )
     with pytest.raises(ValueError, match="metadata cannot set nextn"):
         fpm_learned.train(iterations, "decode", max_iter=5, metadata={"nextn": 0})
-    artifact["metadata"]["nextn"] = -1
-    with pytest.raises(ValueError, match="metadata.nextn -1 is not a non-negative integer"):
-        fpm_learned.validate_artifact(artifact)
+    for bad in (-1, 2**32):
+        artifact["metadata"]["nextn"] = bad
+        with pytest.raises(ValueError, match=rf"metadata.nextn {bad} is not an integer in \[0, 4294967295\]"):
+            fpm_learned.validate_artifact(artifact)

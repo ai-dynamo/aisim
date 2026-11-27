@@ -114,17 +114,17 @@ class SnapshotRole:
 
     @property
     def mtp_scheme(self) -> bool:
-        """Whether a vLLM regression was fitted with an MTP scheme, which it prices as the ``nextn`` of its depth."""
+        """Whether a vLLM regression or a learned model was fitted with an MTP scheme, priced as the ``nextn``
+        of its depth."""
 
-        return (
-            (self.identity.get("speculation") or {}).get("kind") == "mtp"
-            and self.identity["backend"] == "vllm"
-            and self.summary["selected_estimation_mode"] == "fpm_regression"
+        mode = self.summary["selected_estimation_mode"]
+        return (self.identity.get("speculation") or {}).get("kind") == "mtp" and (
+            mode == "fpm_learned" or (self.identity["backend"] == "vllm" and mode == "fpm_regression")
         )
 
     @property
     def nextn(self) -> int:
-        """The draft depth replay pins: ``nextn``, or the depth of the MTP scheme a vLLM regression was fitted with."""
+        """The draft depth replay pins: ``nextn``, or the depth of the MTP scheme the model was fitted with."""
 
         if self.mtp_scheme:
             return int(self.identity["speculation"]["params"]["depth"])

@@ -411,21 +411,23 @@ fn check_identity(
     Ok(())
 }
 
-/// A regression fitted at `nextn` N also restores for an MTP scheme of depth
-/// N, and one fitted with the scheme for `nextn` N, so identities compare with
-/// the scheme as its depth. Replay's draft-width limit applies when replay
-/// times the role, not here.
+/// A regression or learned model fitted at `nextn` N also restores for an MTP
+/// scheme of depth N, and one fitted with the scheme for `nextn` N, so
+/// identities compare with the scheme as its depth. Replay's draft-width limit
+/// applies when replay times the role, not here.
 fn mtp_as_nextn(mut config: ForwardPassPerfModelConfig) -> ForwardPassPerfModelConfig {
-    if config.estimation_mode == EstimationMode::FpmRegression
-        && let Some(depth) = config
-            .speculation
-            .as_ref()
-            .filter(|speculation| speculation.kind == "mtp")
-            // The SDK accepts integer-valued JSON floats and preserves their
-            // spelling. All u32 depths are exactly representable as f64.
-            .and_then(|speculation| speculation.params.get("depth")?.as_f64())
-            .filter(|depth| depth.fract() == 0.0 && (1.0..=f64::from(u32::MAX)).contains(depth))
-            .map(|depth| depth as u32)
+    if matches!(
+        config.estimation_mode,
+        EstimationMode::FpmRegression | EstimationMode::FpmLearned
+    ) && let Some(depth) = config
+        .speculation
+        .as_ref()
+        .filter(|speculation| speculation.kind == "mtp")
+        // The SDK accepts integer-valued JSON floats and preserves their
+        // spelling. All u32 depths are exactly representable as f64.
+        .and_then(|speculation| speculation.params.get("depth")?.as_f64())
+        .filter(|depth| depth.fract() == 0.0 && (1.0..=f64::from(u32::MAX)).contains(depth))
+        .map(|depth| depth as u32)
     {
         config.nextn = depth;
         config.speculation = None;

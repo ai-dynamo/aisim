@@ -200,6 +200,8 @@ python -m aisim_core.sdk.fpm_learned train \
   (`spec_num_draft_tokens = spec_num_steps + 1`) across active steps. For
   telemetry without these fields, declare the depth with `--nextn N`; the
   default is 0 (no speculative decoding). Train one artifact per depth.
+  Decode-only per-request extend lengths must match the verify width replay
+  queries at that depth (see the linked section).
 - `--join-ranks` defaults to `none`: every record is one iteration.
   `counter` keys records by `(worker_id, counter_id)` and rejects repeated
   keys, but refuses records from more than one `dp_rank` per key. Dynamo's
