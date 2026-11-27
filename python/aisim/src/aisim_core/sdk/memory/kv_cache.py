@@ -52,6 +52,7 @@ import enum
 import json
 import math
 import os
+import re
 from collections.abc import Callable, Collection
 from functools import cache, partial
 from importlib.resources import files
@@ -393,6 +394,36 @@ def _select_text_decoder(
             decoder.setdefault(field, default)
         if kind == "phi3" and decoder.get("num_key_value_heads") is None:
             decoder["num_key_value_heads"] = decoder["num_attention_heads"]
+    if native_dispatch and kind == "gemma4_text" and named in _VLLM_DENSE_DECODERS:
+        # Construct the source config before the selected attention class reads its attributes.
+        for field, default in (
+            ("hidden_size", 2304),
+            ("num_hidden_layers", 30),
+            ("num_attention_heads", 8),
+            ("intermediate_size", GEMMA4_DEFAULT_INTERMEDIATE_SIZE),
+            ("max_position_embeddings", 131072),
+            ("vocab_size", 262144),
+            ("rms_norm_eps", 1e-6),
+            ("head_dim", 256),
+            ("num_key_value_heads", 4),
+        ):
+            decoder.setdefault(field, default)
+        if decoder.get("use_bidirectional_attention") == "all":
+            decoder["is_causal"] = False
+        if named != "OPTForCausalLM" and decoder.get("layer_types") is None:
+            layers = layout_integer(decoder["num_hidden_layers"], "num_hidden_layers")
+            decoder["layer_types"] = [
+                "full_attention" if (i + 1) % 6 == 0 or i == layers - 1 else "sliding_attention" for i in range(layers)
+            ]
+        if named != "OPTForCausalLM":
+            decoder.setdefault("sliding_window", 512)
+            # Use the dispatched projection geometry, including the ordinary KV heads, below.
+            decoder["model_type"] = {
+                "LlamaForCausalLM": "llama",
+                "MistralForCausalLM": "mistral",
+                "Qwen2ForCausalLM": "qwen2",
+                "Qwen3ForCausalLM": "qwen3",
+            }[named]
     if native_dispatch and named == "Qwen2ForCausalLM":
         # Qwen2 derives the QKV projection width even if the config declares head_dim.
         if kind not in ("llama", "mistral", "qwen2", "qwen3"):
@@ -449,6 +480,22 @@ def _select_text_decoder(
             )
             for field, alias, default in zip(attributes, aliases, gpt_defaults[kind], strict=True):
                 decoder.setdefault(field, decoder.get(alias, default))
+            if kind == "gpt_neo":
+                schedule = decoder.get("attention_types")
+                if schedule is None:
+                    schedule = [[["global", "local"], 12]]
+                if (
+                    not isinstance(schedule, (list, tuple))
+                    or any(
+                        not isinstance(item, (list, tuple))
+                        or len(item) != 2
+                        or not isinstance(item[0], (list, tuple))
+                        or type(item[1]) is not int
+                        for item in schedule
+                    )
+                    or sum(len(types) * max(0, repeats) for types, repeats in schedule) != decoder["num_hidden_layers"]
+                ):
+                    raise ValueError("GPT-Neo attention_types must expand to num_layers entries")
         # OPT uses full multi-head attention and its own FFN fields even when a
         # different Transformers config provides the actual constructor arguments.
         needed = (
@@ -579,6 +626,8 @@ def _sglang_skips_modules(
     if release >= Version("0.5.10rc0"):
         bare = {name.removeprefix("model.") for name in names}
         names = bare | {"model." + name for name in bare}
+    elif module.endswith(".experts"):
+        return False  # Earlier FusedMoE constructors always select Fp8MoEMethod.
     dotted = release >= Version("0.5.11")
     strip_trailing = release >= Version("0.5.13")
 
@@ -683,6 +732,52 @@ def _outside_dense_decoder_projections(target: object) -> bool:
     )
 
 
+def _check_fused_decoder_exclusions(ignored: list, layers: int, prefix: str) -> None:
+    """All logical shards of a compressed-tensors fused projection must agree."""
+    targets = [target for target in ignored if not _outside_dense_decoder_projections(target)]
+    if not targets:
+        return
+    if not all(isinstance(target, str) for target in targets):
+        raise ValueError("compressed-tensors ignore must contain module names or regular expressions")
+    exact = {target for target in targets if not target.startswith("re:")}
+    patterns = [re.compile(target[3:]) for target in targets if target.startswith("re:")]
+
+    def matches(name: str) -> bool:
+        return name in exact or any(pattern.match(name) for pattern in patterns)
+
+    for i in range(layers):
+        for module, fused, shards in (
+            ("self_attn", "qkv_proj", ("q_proj", "k_proj", "v_proj")),
+            ("mlp", "gate_up_proj", ("gate_proj", "up_proj")),
+        ):
+            base = f"{prefix}model.layers.{i}.{module}."
+            if not matches(base + fused):
+                skipped = [matches(base + shard) for shard in shards]
+                if any(skipped) and not all(skipped):
+                    raise ValueError(f"vLLM requires the same quantization scheme for all shards of {base}{fused}")
+
+
+def _vllm_fp8_linear_scale_bytes(quant: dict, geom: dict, tp: int) -> int:
+    """Scale storage for one layer of rank-local QKV, output, gate/up and down projections."""
+    hidden, inter = geom["hidden"], geom["inter"]
+    if inter % tp:
+        raise ValueError("vLLM dense intermediate_size must be divisible by the tensor parallel size")
+    if quant.get("weight_block_size") is None:
+        # Seven logical weights each have a per-tensor FP32 scale. Static inputs have another seven.
+        return 7 * 4 * (2 if quant["activation_scheme"] == "static" else 1)
+
+    block_n, block_k = fp8_weight_block_shape(quant, sglang=False)
+    dim = layout_integer(geom["head_dim"], "head_dim")
+    q = layout_integer(geom["num_attention_heads"], "num_attention_heads") // tp * dim
+    kv = max(1, layout_integer(geom["num_kv_heads"], "num_key_value_heads") // tp) * dim
+    ffn = inter // tp
+    # Column-parallel fused shards must start at tile boundaries. TP also splits each row-parallel input.
+    if q % block_n or kv % block_n or ffn % block_n or (tp > 1 and (q % block_k or ffn % block_k)):
+        raise ValueError("vLLM FP8 projection shards must align with the checkpoint weight_block_size")
+    matrices = ((q + 2 * kv, hidden), (hidden, q), (2 * ffn, hidden), (hidden, ffn))
+    return 4 * sum(((out + block_n - 1) // block_n) * ((inp + block_k - 1) // block_k) for out, inp in matrices)
+
+
 def _vllm_weight_config(document: dict) -> dict | None:
     # get_quant_config loads the checkpoint's settings after ModelArchConfigConvertor chooses the quantizer class.
     text = document.get("text_config")
@@ -699,6 +794,8 @@ def _vllm_weight_config(document: dict) -> dict | None:
                 loaded = str(quant.get("quant_method", "")).lower().replace("_", "-")
                 if selected and loaded and selected != loaded:
                     raise ValueError("vLLM selects a different quantizer from the text checkpoint settings")
+                if selected and not loaded:
+                    return {**quant, "quant_method": selected}
             return quant
     return None
 
@@ -1370,7 +1467,8 @@ class NaiveKVCacheEstimator:
         self.architecture: str | None = None
         self.dtype_bytes = dtype_bytes  # KV precision, fractional for NVFP4
         self.weight_dtype_bytes = dtype_bytes
-        self._weight_scale_group_size: int | None = None
+        self._weight_scale_group: tuple[int, int] | None = None
+        self._vllm_fp8_linear: dict | None = None
         self._embedding_dtype_bytes = dtype_bytes
         self._quantized_weights = False
         self.tp_size = validate_parallel_size("tp_size", tp_size)
@@ -1380,6 +1478,7 @@ class NaiveKVCacheEstimator:
         self._v4_cache_mode: KVCacheQuantMode | None = None
         self._selected_decoder: dict | None = None
         self._is_nested_decoder = False
+        self._wrapper_config: dict | None = None
         self._sglang_layer_prefix = "model.layers.{}."
         self._scalar_cache_problem: str | None = None
         self._nested_index_head_dim: int | None = None
@@ -1446,6 +1545,25 @@ class NaiveKVCacheEstimator:
             or (backend in ("sglang", "vllm") and gemma4 and gemma4_cache_requires_release(decoder, backend))
         ):
             backend_version = _config_only_backend_version(system, backend, backend_version, systems_paths)
+        # vLLM installs an adjacent checkpoint declaration into an empty root before class or child dispatch.
+        sidecar = None
+        if architecture not in ARCHITECTURE_TO_MODEL_FAMILY and (
+            key is not None
+            or (
+                isinstance(decoder, dict)
+                and isinstance(decoder.get("model_type"), str)
+                and decoder["model_type"] in _DECODER_GEOMETRY_DEFAULTS
+            )
+        ):
+            if backend != "vllm" or hf_config.get("quantization_config") is None:
+                if os.path.isdir(model_path):
+                    sidecar = _load_local_quant_config(model_path)
+                elif model_path in DefaultHFModels:
+                    sidecar = _load_pre_downloaded_hf_quant_config(model_path)
+                elif allow_hf_config_download:
+                    sidecar = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
+            if backend == "vllm" and sidecar is not None:
+                hf_config = {**hf_config, "quantization_config": sidecar}
         estimator = cls._from_resolved_hf_config(
             hf_config,
             tp_size=tp_size,
@@ -1463,19 +1581,14 @@ class NaiveKVCacheEstimator:
 
         if estimator._selected_decoder is not None:
             estimator._vllm_dtype_target = (system, systems_paths)
-            # Load the adjacent sidecar for this exact config, including a replaced file in a local checkpoint.
-            sidecar = None
             if os.path.isdir(model_path):
                 estimator._checkpoint_dir = Path(model_path)
-                sidecar = _load_local_quant_config(model_path)
-            elif model_path in DefaultHFModels:
-                sidecar = _load_pre_downloaded_hf_quant_config(model_path)
-            elif allow_hf_config_download:
-                sidecar = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
-            if sidecar is not None:
+            if sidecar is not None and not estimator._vllm_native_decoder:
                 estimator._selected_decoder = attach_quantization_sidecar(estimator._selected_decoder, sidecar)
             raw = estimator._selected_decoder
-            if sidecar is not None or (system is not None and estimator._nested_index_head_dim is not None):
+            if (sidecar is not None and not estimator._vllm_native_decoder) or (
+                system is not None and estimator._nested_index_head_dim is not None
+            ):
                 target = _config_only_system_spec(system, systems_paths) if estimator._nested_index_head_dim else {}
                 estimator._set_checkpoint_cache_precision(raw, backend, backend_version, hf_config, system_spec=target)
         elif "deepseek_v4" in estimator.geometry:
@@ -1527,6 +1640,12 @@ class NaiveKVCacheEstimator:
         backend_version: str | None,
         resolve_bare: bool = True,
     ) -> NaiveKVCacheEstimator:
+        if (
+            backend == "vllm"
+            and hf_config.get("quantization_config") is None
+            and hf_config.get("hf_quant_config") is not None
+        ):
+            hf_config = {**hf_config, "quantization_config": hf_config["hf_quant_config"]}
         architectures = hf_config.get("architectures") or []
         if not isinstance(architectures, list) or not all(isinstance(name, str) for name in architectures):
             raise ValueError(f"HF config architectures must be a list of strings, got {architectures!r}")
@@ -1632,7 +1751,7 @@ class NaiveKVCacheEstimator:
                         raw_decoder["sliding_window"] = (
                             layout_integer(raw_decoder["sliding_window"], "sliding_window") // 2 + 1
                         )
-                if selected_type == "gemma4_text":
+                if raw_decoder.get("model_type") == "gemma4_text":
                     raw_decoder.setdefault("global_head_dim", 512)
                     raw_decoder.setdefault("sliding_window", 512)
                 if not raw_decoder.get("architectures") and selected_type in (
@@ -1655,11 +1774,14 @@ class NaiveKVCacheEstimator:
                     backend_version=backend_version,
                     resolve_bare=False,
                 )
-                if selected_type == "gemma4_text" and raw_decoder.get("use_bidirectional_attention") == "all":
+                if (
+                    raw_decoder.get("model_type") == "gemma4_text"
+                    and raw_decoder.get("use_bidirectional_attention") == "all"
+                ):
                     # The layer-map reader above consumes the original serialized window.
                     window = layout_integer(raw_decoder["sliding_window"], "sliding_window") // 2 + 1
                     decoder.geometry["sliding_window"] = raw_decoder["sliding_window"] = window
-                if hf_config.get("hf_quant_config") is not None:
+                if not resolved_vllm_decoder and hf_config.get("hf_quant_config") is not None:
                     raw_decoder = attach_quantization_sidecar(raw_decoder, hf_config["hf_quant_config"])
                 # The family supplies deployment capabilities. Ordinary raw geometry does not require a
                 # complete native timing config (for example max_position_embeddings).
@@ -1681,6 +1803,8 @@ class NaiveKVCacheEstimator:
                         _deepseek_routed_layers(raw_decoder, decoder.geometry["layers"])
                     )
                 decoder._is_nested_decoder = key is not None
+                if key is not None:
+                    decoder._wrapper_config = {**hf_config, "architectures": [architecture]}
                 decoder._vllm_native_decoder = resolved_vllm_decoder
                 release = parse_support_matrix_version(backend_version)
                 if (
@@ -1897,17 +2021,46 @@ class NaiveKVCacheEstimator:
                 quant = raw.get("hf_quant_config") or {}
             self.weight_dtype_bytes = model_dtype_bytes
             self._embedding_dtype_bytes = model_dtype_bytes
-            self._weight_scale_group_size = None
+            self._weight_scale_group = None
+            self._vllm_fp8_linear = None
             method = str(quant.get("quant_method", "")).lower().replace("_", "-")
             self._quantized_weights = bool(quant or raw.get("quant_algo"))
-            if method.startswith("modelopt") or "quantization" in quant:
+            if method.startswith("modelopt") or method == "mxfp8" or "quantization" in quant:
                 section = quant.get("quantization", quant)
                 if not isinstance(section, dict):
                     raise ValueError("ModelOpt quantization must be a mapping")
-                self._quantized_weights = bool(section.get("quant_algo"))
-                if method.startswith("modelopt") and not self._quantized_weights:
+                algo = str(section.get("quant_algo") or "").upper()
+                if not algo and method in ("modelopt-mxfp8", "mxfp8") and "quantization" not in quant:
+                    algo = "MXFP8"
+                if method.startswith("modelopt") and not algo:
                     raise ValueError("ModelOpt checkpoint is missing quant_algo")
-            if method == "compressed-tensors":
+                if algo and algo not in {
+                    "FP8",
+                    "FP8_PER_CHANNEL_PER_TOKEN",
+                    "FP8_PB_WO",
+                    "MXFP8",
+                    "NVFP4",
+                    "W4A16_NVFP4",
+                    "MIXED_PRECISION",
+                }:
+                    raise ValueError(f"unsupported ModelOpt quant_algo {algo!r}")
+                if method in ("modelopt-mxfp8", "mxfp8") and algo != "MXFP8":
+                    raise ValueError("ModelOpt MXFP8 checkpoints require quant_algo MXFP8")
+                self._quantized_weights = bool(algo)
+                ignored = section.get("exclude_modules", []) if "quantization" in quant else quant.get("ignore", [])
+                if method in ("modelopt-mxfp8", "mxfp8") and not section.get("quant_algo"):
+                    ignored = quant.get("ignored_layers", [])
+                if not isinstance(ignored, list) or not all(isinstance(target, str) for target in ignored):
+                    raise ValueError("ModelOpt exclusions must be a list of module names")
+                # For mixed or potentially excluded linears retain the execution-width reserve.
+                if all(_outside_dense_decoder_projections(target.strip("*")) for target in ignored):
+                    if algo == "FP8" and self.architecture in _VLLM_DENSE_DECODERS - {"OPTForCausalLM"}:
+                        self.weight_dtype_bytes = 1
+                        self._vllm_fp8_linear = {"activation_scheme": "static"}
+                    elif algo == "MXFP8":
+                        self.weight_dtype_bytes = 1
+                        self._weight_scale_group = (32, 1)  # E8M0 scale per group of MXFP8 weights.
+            elif method == "compressed-tensors":
                 groups = quant.get("config_groups", {})
                 if not isinstance(groups, dict):
                     raise ValueError("compressed-tensors config_groups must be a mapping")
@@ -1935,8 +2088,21 @@ class NaiveKVCacheEstimator:
                 self._quantized_weights = bool(weight_groups)
                 if self.pp_size == 1 and self.architecture in _VLLM_DENSE_DECODERS and len(weight_groups) == 1:
                     group = weight_groups[0]
-                    weights = group["weights"]
+                    weights = dict(group["weights"])
+                    group_size = weights.get("group_size")
+                    if weights.get("strategy") is None:
+                        if group_size is None:
+                            weights["strategy"] = "tensor"
+                        elif group_size == -1:
+                            weights["strategy"] = "channel"
+                        else:
+                            layout_integer(group_size, "compressed-tensors group_size")
+                            weights["strategy"] = "group"
                     ignored = quant.get("ignore", [])
+                    if isinstance(ignored, list) and self.architecture != "OPTForCausalLM":
+                        _check_fused_decoder_exclusions(
+                            ignored, self.geometry["layers"], "language_model." if self._is_nested_decoder else ""
+                        )
                     if (
                         group["targets"] == ["Linear"]
                         and isinstance(ignored, list)
@@ -1963,12 +2129,34 @@ class NaiveKVCacheEstimator:
                         packed_format = (
                             root_format if release is not None and release < Version("0.10.2rc1") else group_format
                         )
+                        inputs, outputs = group.get("input_activations"), group.get("output_activations")
+                        static_int8_io = (
+                            release is not None
+                            and release >= Version("0.23.0rc2")
+                            and all(
+                                isinstance(args, dict)
+                                and args.get("type") == "int"
+                                and args.get("num_bits", 8) == 8
+                                and args.get("strategy", "tensor") == "tensor"
+                                and not args.get("dynamic", False)
+                                for args in (inputs, outputs)
+                            )
+                        )
+                        packed_dynamic = (
+                            release is not None
+                            and release >= Version("0.26.0rc1")
+                            and isinstance(inputs, dict)
+                            and inputs.get("type") == "int"
+                            and inputs.get("num_bits", 8) in (4, 8)
+                            and inputs.get("strategy") in ("token", "group")
+                            and inputs.get("dynamic") is True
+                            and inputs.get("symmetric", True)
+                        )
                         packed = (
                             packed_format == "pack-quantized"
                             and weights["strategy"] in ("channel", "group")
-                            and (weights["type"] == "int" or group.get("input_activations") is None)
+                            and (inputs is None or (weights["type"] == "int" and (static_int8_io or packed_dynamic)))
                         )
-                        inputs = group.get("input_activations")
                         if activation_format and weights["type"] == "int" and not packed:
                             # For W8A8, vLLM supports static per-tensor or dynamic per-token activations.
                             if not isinstance(inputs, dict) or not inputs:
@@ -2001,14 +2189,24 @@ class NaiveKVCacheEstimator:
                                 and all((hidden, inter, heads, dim))
                                 and not (hidden % size or inter % sharded or heads * dim % sharded)
                             ):
-                                self._weight_scale_group_size = size
+                                self._weight_scale_group = (size, model_dtype_bytes)
                                 self.weight_dtype_bytes = 1
             elif method == "fp8":
                 if quant.get("activation_scheme") not in ("dynamic", "static"):
                     raise ValueError("vLLM FP8 checkpoints require a static or dynamic activation_scheme")
+                if quant.get("weight_block_size") is not None:
+                    fp8_weight_block_shape(quant, sglang=False)
+                    if quant["activation_scheme"] != "dynamic":
+                        raise ValueError("vLLM block-quantized FP8 weights require dynamic activations")
                 ignored = quant.get("ignored_layers") or quant.get("modules_to_not_convert") or []
                 if isinstance(ignored, list) and all(_outside_dense_decoder_projections(target) for target in ignored):
-                    self.weight_dtype_bytes = self._dtype_bytes(raw)
+                    if self.architecture in _VLLM_DENSE_DECODERS and not self.geometry.get("num_experts"):
+                        self.weight_dtype_bytes = (
+                            1  # Fp8LinearMethod allocates FP8 weights for BF16 and FP16 execution.
+                        )
+                        self._vllm_fp8_linear = quant
+                    else:
+                        self.weight_dtype_bytes = self._dtype_bytes(raw)
             elif self._quantized_weights and raw.get("quant_algo"):
                 self.weight_dtype_bytes = self._dtype_bytes(raw)
         self.dtype_bytes = mode.value.memory if mode is not None else model_dtype_bytes
@@ -2598,6 +2796,87 @@ class NaiveKVCacheEstimator:
             raise ValueError(f"unsupported kvcache_quant_mode {mode!r}") from error
 
     def weight_bytes(self) -> int | None:
+        """Estimate the whole rank's resident decoder and colocated auxiliary weights."""
+        decoder = self._decoder_weight_bytes()
+        if decoder is None or self._wrapper_config is None:
+            return decoder
+        document = self._wrapper_config
+        wrapper = document["architectures"][0]
+        vision = document.get("vision_config")
+        family = document.get("model_type") or _TEXT_CONFIG_DEFAULTS.get(wrapper, (None,))[0]
+        llava = wrapper in _TEXT_CONFIG_DEFAULTS and wrapper.startswith("Llava")
+        intern = wrapper in _TEXT_CONFIG_DEFAULTS and wrapper.startswith("Intern")
+        clip = family in ("llava", "llava_next", "llava_next_video")
+        if any(document.get(key) is not None for key in ("audio_config", "encoder_config", "audio_tower")):
+            raise ValueError("whole-rank capacity requires resident weights for the wrapper's auxiliary encoder")
+        if vision is None:
+            if family == "llava_onevision":
+                vision = dict(
+                    hidden_size=1152, intermediate_size=4304, num_hidden_layers=26, image_size=384, patch_size=14
+                )
+            elif clip:
+                vision = dict(
+                    hidden_size=1024, intermediate_size=4096, num_hidden_layers=24, image_size=336, patch_size=14
+                )
+            elif family == "internvl":
+                vision = dict(
+                    model_type="internvl_vision",
+                    hidden_size=1024,
+                    intermediate_size=4096,
+                    num_hidden_layers=24,
+                    image_size=448,
+                    patch_size=14,
+                )
+            elif (
+                wrapper not in _TEXT_WRAPPERS
+                and not document.get("vision_tower")
+                and not document.get("mm_vision_tower")
+                and document.get("projector_config") is None
+                and document.get("mm_projector_type") is None
+            ):
+                return decoder
+        if not isinstance(vision, dict) or not (
+            (
+                llava
+                and vision.get("model_type", "clip_vision_model" if clip else "siglip_vision_model")
+                in ("siglip_vision_model", "clip_vision_model")
+            )
+            or (intern and vision.get("model_type") in ("interns1_vision", "internvl_vision"))
+        ):
+            raise ValueError("whole-rank capacity requires resident weights for the vision tower and projector")
+
+        # Reserve the entire ViT and connector on a rank. This bounds replicated or sharded encoder
+        # execution without assuming text TP also partitions either the vision tower or the projector.
+        def pair(value: object, field: str) -> tuple[int, int]:
+            if type(value) is int:
+                value = (value, value)
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise ValueError(f"vision_config.{field} requires two spatial dimensions")
+            return layout_integer(value[0], field), layout_integer(value[1], field)
+
+        hidden = layout_integer(vision.get("hidden_size", 768 if llava else None), "vision hidden_size")
+        inter = layout_integer(vision.get("intermediate_size", 3072 if llava else None), "vision intermediate_size")
+        layers = layout_integer(vision.get("num_hidden_layers", 12 if llava else None), "vision num_hidden_layers")
+        channels = layout_integer(vision.get("num_channels", 3), "vision num_channels")
+        ih, iw = pair(vision.get("image_size", 224 if llava else None), "image_size")
+        patch_default = 32 if vision.get("model_type") == "clip_vision_model" else 16
+        ph, pw = pair(vision.get("patch_size", patch_default if llava else None), "patch_size")
+        text = self.geometry["hidden"]
+        features = document.get("vision_feature_layer")
+        projector_in = hidden * (len(features) if llava and isinstance(features, list) else 1)
+        if intern:
+            ratio = document.get("downsample_ratio", 0.5)
+            if type(ratio) not in (float, int) or not 0 < ratio <= 1 or not (1 / ratio).is_integer():
+                raise ValueError("vision projector requires an inverse-integer downsample_ratio")
+            projector_in *= int(1 / ratio) ** 2
+        # Q/K/V/O and two MLP weights per block, patch embeddings, learned positions and both projector matrices.
+        matrices = layers * (4 * hidden**2 + 2 * hidden * inter) + channels * ph * pw * hidden
+        matrices += ((ih // ph) * (iw // pw) + 1) * hidden + (projector_in + text) * text
+        # Reserve projection biases, norms, layer scales, special embeddings and connector norms at FP32.
+        vectors = layers * (13 * hidden + inter) + 8 * hidden + 2 * projector_in + 3 * text
+        return decoder + max(2, self._embedding_dtype_bytes) * matrices + 4 * vectors
+
+    def _decoder_weight_bytes(self) -> int | None:
         """Rough per-rank weight estimate (bytes) from the geometry, or ``None``.
 
         Coarse param count (embeddings + per-layer attention + dense/MoE FFN), times
@@ -2711,14 +2990,10 @@ class NaiveKVCacheEstimator:
                 vectors = hidden + layers * (2 * hidden + q_rank + kv_rank) + routed * n_experts * (hidden + 1)
                 resident = embeddings + matrices * self.weight_dtype_bytes + 4 * vectors
                 quant = raw.get("quantization_config") or {}
-                if (
-                    self._cache_backend == "sglang"
-                    and quant.get("quant_method") == "fp8"
-                    and quant.get("weight_block_size")
-                ):
-                    if quant.get("activation_scheme") != "dynamic":
-                        raise ValueError("SGLang block-quantized FP8 weights require dynamic activations")
-                    block_n, block_k = fp8_weight_block_shape(quant, sglang=True, experts=True)
+                if self._cache_backend == "sglang" and quant.get("quant_method") == "fp8":
+                    activation = quant.get("activation_scheme")
+                    if activation not in ("dynamic", "static"):
+                        raise ValueError("SGLang FP8 experts require a static or dynamic activation_scheme")
                     ignored = quant.get("ignored_layers", quant.get("modules_to_not_convert"))
                     if ignored is None:
                         ignored = []
@@ -2738,13 +3013,20 @@ class NaiveKVCacheEstimator:
                         )
                     shard = moe_inter // self.moe_tp_size
                     # w13 has two (shard, hidden) matrices and w2 has one (hidden, shard) matrix per local expert.
-                    scales = 2 * math.ceil(shard / block_n) * math.ceil(hidden / block_k)
-                    scales += math.ceil(hidden / block_n) * math.ceil(shard / block_k)
+                    if quant.get("weight_block_size") is None:
+                        scales = 3 + (2 if activation == "static" else 0)
+                    else:
+                        if activation != "dynamic":
+                            raise ValueError("SGLang block-quantized FP8 weights require dynamic activations")
+                        block_n, block_k = fp8_weight_block_shape(quant, sglang=True, experts=True)
+                        scales = 2 * math.ceil(shard / block_n) * math.ceil(hidden / block_k)
+                        scales += math.ceil(hidden / block_n) * math.ceil(shard / block_k)
                     resident += quantized * (expert_params * (1 - self.weight_dtype_bytes) + 4 * local_experts * scales)
                 return int(resident)
             expert_bytes = layers * expert_params * self.weight_dtype_bytes // pp
             return non_expert_bytes + expert_bytes
         else:
+            rank_vectors = 0
             if self._vllm_native_decoder and self.architecture in _VLLM_DENSE_DECODERS:
                 # Keep the existing coarse reservation as a floor. Wide queries and
                 # replicated KV heads can exceed four square matrices on a rank.
@@ -2752,14 +3034,33 @@ class NaiveKVCacheEstimator:
                 if heads and kv_heads and dim:
                     self._validate_attention_tp()
                     qkv_output = 2 * hidden * dim * (heads // tp + max(1, kv_heads // tp))
-                    attn_params_per_layer = max(attn_params_per_layer, qkv_output * tp)
+                    if self._wrapper_config and self._wrapper_config["architectures"][0] in _TEXT_CONFIG_DEFAULTS:
+                        # The language decoder's rank-local Q/K/V/O matrices are known. Charge their actual
+                        # size alongside the vision tower and allow FP32 norms, linear biases and channel scales.
+                        if inter % tp:
+                            raise ValueError(
+                                "vLLM dense intermediate_size must be divisible by the tensor parallel size"
+                            )
+                        attn_params_per_layer = qkv_output * tp
+                        output_rows = dim * (heads // tp + 2 * max(1, kv_heads // tp)) + 2 * hidden + 2 * inter // tp
+                        rank_vectors = 4 * (hidden + layers * (2 * output_rows + 4 * hidden + 2 * dim))
+                        padded_vocab = -(-vocab // 64) * 64
+                        embed_params = 2 * (-(-padded_vocab // tp)) * tp * hidden
+                    else:
+                        attn_params_per_layer = max(attn_params_per_layer, qkv_output * tp)
             ffn_params_per_layer = 3 * hidden * inter
             layer_params = layers * (attn_params_per_layer + ffn_params_per_layer)
             weights = embed_params * self._embedding_dtype_bytes + layer_params * self.weight_dtype_bytes
-            if self._weight_scale_group_size:
-                # WNA16 stores one scale at the execution dtype per group of input features in each output row.
-                weights += -(-layer_params // self._weight_scale_group_size) * self._embedding_dtype_bytes
-            return weights // (tp * pp)
+            if self._weight_scale_group:
+                size, scale_bytes = self._weight_scale_group
+                weights += -(-layer_params // size) * scale_bytes
+            if self._vllm_fp8_linear is not None:
+                return (
+                    rank_vectors
+                    + weights // (tp * pp)
+                    + (layers // pp) * _vllm_fp8_linear_scale_bytes(self._vllm_fp8_linear, geom, tp)
+                )
+            return rank_vectors + weights // (tp * pp)
 
     # --------------------------- byte budget -> tokens ---------------------------- #
 
@@ -3460,8 +3761,7 @@ def estimate_kv_cache(
                         naive._sglang_layer_prefix,
                         dense_layers,
                     )
-                if module is not None and release is not None and release >= Version("0.5.10rc0"):
-                    # SGLang can select an unquantized FusedMoE for its routed layers.
+                if module is not None and release is not None:
                     quantized_experts = not _sglang_skips_modules(ignored, routed, release, module)
             if mxfp8:
                 if release is None or release < Version("0.5.9"):

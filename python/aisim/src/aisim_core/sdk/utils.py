@@ -1164,6 +1164,9 @@ def gemma4_cache_shapes(
                     kind not in rope and any(key in rope for key in ("full_attention", "sliding_attention"))
                 ):
                     raise ValueError(f"Gemma 4 vLLM attention requires rope_parameters.{kind} to be a mapping")
+                effective = rope.get(kind, rope)
+                if any(isinstance(value, dict) for value in effective.values()):
+                    raise ValueError(f"Gemma 4 vLLM attention requires flat rope_parameters for {kind}")
     heads = config.get("num_key_value_heads", 4)
     dim = config.get("head_dim", 256)
     if not (backend == "vllm" and has_per_layer_config):

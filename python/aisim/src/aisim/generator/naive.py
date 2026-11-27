@@ -249,13 +249,13 @@ def _estimate_model_weight_bytes(
         )
         logger.debug("Normalized parser error for %s: %s", model_path, e)
         try:
-            estimator = NaiveKVCacheEstimator.from_hf_config(
-                raw_config,
-                backend=backend,
-                backend_version=backend_version,
-                tp_size=1,
-                pp_size=1,
-            )
+            options = dict(backend=backend, backend_version=backend_version, tp_size=1, pp_size=1)
+            if backend == "vllm" and (os.path.isdir(model_path) or raw_config.get("hf_quant_config") is not None):
+                # The SDK timing parser normalizes legacy sidecars to a scalar quantization method.
+                # Capacity needs the original checkpoint's class, exclusions and inline precedence.
+                estimator = NaiveKVCacheEstimator.from_model_path(model_path, allow_hf_config_download=True, **options)
+            else:
+                estimator = NaiveKVCacheEstimator.from_hf_config(raw_config, **options)
             weight_bytes = estimator.weight_bytes()
             if weight_bytes is None:
                 raise ValueError(

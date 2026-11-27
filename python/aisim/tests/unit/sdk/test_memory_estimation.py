@@ -2412,6 +2412,10 @@ def test_vllm_gemma_flat_and_per_layer_configs_need_the_effective_rope_mapping(t
                 flat = {"rope_type": "default", "rope_theta": 10_000.0}
                 model = _write_config(tmp_path, document | {"text_config": child | {"rope_scaling": flat}})
                 assert _compiled_vllm_transfer_widths(model, version) == (width, width)
+            nested = {"default": {"rope_type": "default", "rope_theta": 10000}}
+            model = _write_config(tmp_path, document | {"text_config": child | {"rope_scaling": nested}})
+            with pytest.raises(ValueError, match="flat rope_parameters"):
+                _compiled_vllm_transfer_widths(model, version)
             model = _write_config(tmp_path, document | {"text_config": child | {"rope_scaling": None}})
             with pytest.raises(ValueError, match="rope_parameters to be a mapping"):
                 estimate_kv_bytes_per_token(model, **options)
@@ -2937,7 +2941,11 @@ def test_selected_decoder_uses_only_the_fields_needed_by_the_estimate(tmp_path):
     wrapper = {"architectures": ["LlavaForConditionalGeneration"], "model_type": "llava", "text_config": text}
     path = _write_config(tmp_path, wrapper)
     assert estimate_kv_bytes_per_token(path, tp_size=1, pp_size=1) == 114_688
-    assert _estimate_model_weight_bytes(path) == 1_385_693_184
+    # Qwen3 projects 16 query heads and eight KV heads of width 128 from a 1,024-wide hidden state.
+    attention = 2 * 1024 * 128 * (16 + 8)
+    text_weights = 2 * (2 * 151936 * 1024 + 28 * (attention + 3 * 1024 * 3072))
+    # The default CLIP tower adds 23 resident layers on vLLM, plus the patch embeddings and connector.
+    assert _estimate_model_weight_bytes(path) >= text_weights + 23 * 2 * (4 * 1024**2 + 2 * 1024 * 4096)
 
     del text["vocab_size"]
     other = tmp_path / "without-vocab"
@@ -3025,7 +3033,7 @@ def test_selected_qwen2_uses_its_default_ffn_to_size_an_eight_gib_cache(tmp_path
     for dimensions in ({}, {"intermediate_size": 22_016}):
         wrapper = {"architectures": ["LlavaForConditionalGeneration"], "text_config": text | dimensions}
         model = _write_config(tmp_path, wrapper)
-        assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.23", **opts) == 2522
+        assert memory.estimate_num_gpu_blocks(model, "missing", "sglang", "0.5.23", **opts) == 1448
 
 
 @pytest.mark.parametrize(
@@ -3053,7 +3061,10 @@ def test_multimodal_default_qwen2_constructor_sizes_weights(tmp_path, wrapper_cl
     del opts["naive_kv_reservation"]
     for fields in ({}, {"model_type": "qwen2"}, {"model_type": "qwen2", "intermediate_size": 22_016}):
         path = _write_config(tmp_path, wrapper | {"text_config": text | fields})
-        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) == 3073
+        # Both wrappers retain the vision tower while their bare decoder below reserves only language weights.
+        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) == (
+            46 if model_type == "llava_onevision" else 789
+        )
     path = _write_config(tmp_path, text | {"model_type": "qwen2"})
     assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) == 3073
     path = _write_config(tmp_path, wrapper | {"text_config": text | {"model_type": None}})
@@ -3353,55 +3364,55 @@ def _onevision_qwen2_7b(child_dtype):
     }
 
 
-def _onevision_fp8_weights():
-    # nm-testing/llava-onevision-qwen2-7b-ov-hf-FP8-dynamic, config.json at
-    # 674147caa388d820100eb2b8916262abe0d1e814. Each of the 26 SigLIP layers has six excluded linears.
-    document = _onevision_qwen2_7b("bfloat16")
-    document["text_config"]["vocab_size"] = 152128
-    vision_linears = (
-        "self_attn.q_proj",
-        "self_attn.k_proj",
-        "self_attn.v_proj",
-        "self_attn.out_proj",
-        "mlp.fc1",
-        "mlp.fc2",
-    )
-    document["quantization_config"] = {
-        "quant_method": "compressed-tensors",
-        "format": "float-quantized",
-        "config_groups": {
-            "group_0": {
-                "targets": ["Linear"],
-                "weights": {"num_bits": 8, "type": "float", "strategy": "channel", "dynamic": False, "symmetric": True},
-                "input_activations": {
-                    "num_bits": 8,
-                    "type": "float",
-                    "strategy": "token",
-                    "dynamic": True,
-                    "symmetric": True,
-                },
-            }
+def _synthetic_multimodal_w8():
+    return {
+        "architectures": ["LlavaOnevisionForConditionalGeneration"],
+        "model_type": "llava_onevision",
+        "torch_dtype": "float16",
+        "text_config": dict(
+            model_type="qwen2",
+            hidden_size=768,
+            intermediate_size=1536,
+            num_hidden_layers=3,
+            num_attention_heads=12,
+            num_key_value_heads=2,
+            vocab_size=2048,
+        ),
+        "vision_config": dict(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            intermediate_size=192,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=64,
+            patch_size=8,
+        ),
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized",
+            "config_groups": {
+                "projection": {
+                    "targets": ["Linear"],
+                    "weights": {"type": "float", "num_bits": 8, "strategy": "channel"},
+                    "input_activations": {"type": "float", "num_bits": 8, "strategy": "token", "dynamic": True},
+                }
+            },
+            "ignore": ["vision_tower.output", "multi_modal_projector.linear_2", "language_model.lm_head"],
         },
-        "ignore": [
-            f"vision_tower.vision_model.encoder.layers.{i}.{module}" for i in range(26) for module in vision_linears
-        ]
-        + ["multi_modal_projector.linear_1", "multi_modal_projector.linear_2", "language_model.lm_head"],
     }
-    return document
 
 
 def test_vllm_onevision_fp8_decoder_projection_coverage(tmp_path):
-    document = _onevision_fp8_weights()
+    document = _synthetic_multimodal_w8()
     quant = document["quantization_config"]
-    args = _missing_system_cache_options(tmp_path, tp_size=1, capacity=12 * _GIB)
+    args = _missing_system_cache_options(tmp_path, tp_size=1, capacity=32 * 2**20)
     args.update(
         max_num_tokens=512, max_batch_size=1, memory_fraction_value=1, naive_kv_reservation=0.8, tolerance_fraction=0
     )
     model = _write_config(tmp_path, document)
-    # The checkpoint has a weight_scale for each of the 28 * 7 decoder projections.
-    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (57_344, 57_344)
-    assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **args) == 3104
-    for target in ("language_model.model.layers.27.self_attn.o_proj", r"re:.*\.mlp\.down_proj$"):
+    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (1536, 1536)
+    assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **args) == 352
+    for target in ("language_model.model.layers.2.self_attn.o_proj", r"re:.*\.mlp\.down_proj$"):
         quant["ignore"].append(target)
         model = _write_config(tmp_path, document)
         with pytest.raises(ValueError, match="no KV budget"):
@@ -3415,34 +3426,34 @@ def test_vllm_onevision_fp8_decoder_projection_coverage(tmp_path):
         "format": "dense",
     }
     model = _write_config(tmp_path, document)
-    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (57_344, 57_344)
+    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (1536, 1536)
     with pytest.raises(ValueError, match="no KV budget"):
         memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **args)
 
 
 def test_vllm_onevision_w8_group_scales_and_activation_scheme():
-    document = _onevision_fp8_weights()
+    document = _synthetic_multimodal_w8()
     quant = document["quantization_config"]
-    group = quant["config_groups"]["group_0"]
+    group = quant["config_groups"]["projection"]
     options = dict(backend="vllm", backend_version="0.32.0", tp_size=1, pp_size=1)
     quant["format"] = "pack-quantized"
     group["weights"].update(type="int", strategy="group", group_size=128)
     group["input_activations"] = None
-    matrix_weights = 28 * (4 * 3584**2 + 3 * 3584 * 18944)
-    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 9_322_758_144 + 2 * (
+    matrix_weights = 3 * (2 * 768 * 64 * (12 + 2) + 3 * 768 * 1536)
+    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 22_708_352 + 2 * (
         matrix_weights // 128
     )
     group["weights"]["group_size"] = 16
-    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 16_464_609_280
+    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 37_453_952
     quant["format"] = "int-quantized"
     group["weights"].update(strategy="channel", group_size=None)
     group["input_activations"] = {"num_bits": 8, "type": "int", "strategy": "token", "dynamic": True}
-    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 9_322_758_144
+    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 22_708_352
     group["input_activations"]["strategy"] = "tensor"
     with pytest.raises(ValueError, match="W8 weights"):
         NaiveKVCacheEstimator.from_hf_config(document, **options)
     group["input_activations"] = {"type": "int"}
-    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 9_322_758_144
+    assert NaiveKVCacheEstimator.from_hf_config(document, **options).weight_bytes() == 22_708_352
 
 
 @pytest.mark.parametrize(
@@ -3458,15 +3469,14 @@ def test_vllm_onevision_w8_group_scales_and_activation_scheme():
 def test_vllm_per_group_weight_formats(tmp_path, version, group_activations, group_packed_weights):
     from aisim.generator.naive import _estimate_model_weight_bytes
 
-    document = _onevision_fp8_weights()
+    document = _synthetic_multimodal_w8()
     quant = document["quantization_config"]
-    group = quant["config_groups"]["group_0"]
+    group = quant["config_groups"]["projection"]
     for supported_format, per_group in (
         ("float-quantized", group_activations),
         ("pack-quantized", group_packed_weights),
     ):
         if supported_format == "pack-quantized":
-            # nm-testing/TinyLlama-1.1B-Chat-v1.0-W8A16-G128-compressed (b307a916) stores channel INT8 weights.
             group["weights"]["type"] = "int"
             group["input_activations"] = None
         for root, override, supported in (
@@ -3479,10 +3489,141 @@ def test_vllm_per_group_weight_formats(tmp_path, version, group_activations, gro
             checkpoint.mkdir()
             model = _write_config(checkpoint, document)
             if supported:
-                assert _estimate_model_weight_bytes(model, backend="vllm", backend_version=version) == 9_322_758_144
+                assert _estimate_model_weight_bytes(model, backend="vllm", backend_version=version) == 22_708_352
             else:
                 with pytest.raises(RuntimeError, match="W8 weights"):
                     _estimate_model_weight_bytes(model, backend="vllm", backend_version=version)
+
+
+def test_auxiliary_weights_are_separate_from_marginal_decoder_kv(tmp_path):
+    from aisim.generator.naive import _estimate_model_weight_bytes
+
+    source = _synthetic_multimodal_w8()
+    text = {**source["text_config"], "quantization_config": source["quantization_config"]}
+    unknown = {**source, "architectures": ["UnknownVisionWrapper"], "model_type": "unknown"}
+    neither = {k: v for k, v in unknown.items() if k != "vision_config"}
+    opts = dict(tp_size=1, pp_size=1, backend_version="0.32.0")
+    for document in (source, text, unknown, neither):
+        assert NaiveKVCacheEstimator.from_hf_config(document, **opts).kv_bytes_per_token() == 1536
+    assert NaiveKVCacheEstimator.from_hf_config(text, **opts).weight_bytes() > 0
+    assert NaiveKVCacheEstimator.from_hf_config(neither, **opts).weight_bytes() > 0
+    with pytest.raises(RuntimeError, match="resident weights for the vision tower and projector"):
+        _estimate_model_weight_bytes(_write_config(tmp_path, unknown), backend_version="0.32.0")
+
+
+def test_vllm_effective_quantizer_class_sidecar_and_modelopt_exclusions(tmp_path):
+    from pathlib import Path
+
+    from aisim.generator.naive import _estimate_model_weight_bytes
+
+    document = _synthetic_multimodal_w8()
+    document["text_config"]["torch_dtype"] = "float8_e4m3fn"
+    settings = document.pop("quantization_config")
+    settings.pop("quant_method")
+    settings["kv_cache_scheme"] = dict(type="float", num_bits=8, strategy="tensor", symmetric=True)
+    document["text_config"]["quantization_config"] = settings
+    document["compression_config"] = {"quant_method": "compressed-tensors"}
+    model = _write_config(tmp_path, document)
+    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (768, 768)
+    mixed = {"quant_method": "modelopt", "quant_algo": "FP8", "ignore": ["*mlp*", "*lm_head*"]}
+    assert _estimate_model_weight_bytes(model, backend_version="0.32.0") == 22_708_352
+    adjacent = Path(model) / "hf_quant_config.json"
+    adjacent.write_text(json.dumps(mixed))
+    assert _compiled_vllm_transfer_widths(model, "0.32.0") == (1536, 1536)
+    weights = _estimate_model_weight_bytes(model, backend_version="0.32.0")
+    inline_dir = tmp_path / "inline"
+    inline_dir.mkdir()
+    inline = _write_config(inline_dir, {**document, "quantization_config": mixed})
+    assert _estimate_model_weight_bytes(inline, backend_version="0.32.0") == weights == 37_453_952
+    opts = dict(backend_version="0.32.0", tp_size=1, pp_size=1)
+    complete = {**mixed, "ignore": []}
+    assert (
+        NaiveKVCacheEstimator.from_hf_config({**document, "quantization_config": complete}, **opts).weight_bytes()
+        < weights
+    )
+    mx = [
+        NaiveKVCacheEstimator.from_hf_config(
+            {**document, "quantization_config": {"quant_method": method}}, **opts
+        ).weight_bytes()
+        for method in ("modelopt_mxfp8", "mxfp8")
+    ]
+    assert mx[0] == mx[1] < weights
+    with pytest.raises(ValueError, match="quant_algo"):
+        NaiveKVCacheEstimator.from_hf_config(
+            {**document, "quantization_config": {**complete, "quant_algo": "unknown"}}, **opts
+        )
+
+
+def test_compressed_tensors_fused_shards_and_packed_activations():
+    document = _synthetic_multimodal_w8()
+    quant = document["quantization_config"]
+    opts = dict(tp_size=1, pp_size=1, backend_version="0.32.0")
+    base = "language_model.model.layers.1.self_attn."
+    quant["ignore"].append(base + "q_proj")
+    with pytest.raises(ValueError, match="same quantization scheme"):
+        NaiveKVCacheEstimator.from_hf_config(document, **opts)
+    quant["ignore"].extend([base + "k_proj", base + "v_proj"])
+    assert NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes() == 37_453_952
+    quant["ignore"] = []
+    quant["format"] = "pack-quantized"
+    group = quant["config_groups"]["projection"]
+    group["weights"] = {"type": "int", "num_bits": 8, "group_size": 128}
+    group["input_activations"] = None
+    inferred = NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes()
+    group["weights"]["strategy"] = "group"
+    assert NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes() == inferred
+    group["weights"] = dict(type="int", strategy="channel", num_bits=8)
+    weight_only = NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes()
+    group["input_activations"] = {"type": "int", "num_bits": 8, "strategy": "tensor", "dynamic": False}
+    with pytest.raises(ValueError, match="W8 weights"):
+        NaiveKVCacheEstimator.from_hf_config(document, **opts)
+    group["output_activations"] = group["input_activations"]
+    assert NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes() == weight_only
+
+
+def test_borrowed_gemma_and_gpt_neo_construct_before_vllm_dispatch(tmp_path):
+    opt = dict(
+        architectures=["OPTForCausalLM"],
+        hidden_size=768,
+        num_attention_heads=12,
+        ffn_dim=3072,
+        enable_bias=True,
+        word_embed_proj_dim=768,
+        activation_function="relu",
+        layer_norm_elementwise_affine=True,
+        do_layer_norm_before=False,
+    )
+    child = {**opt, "model_type": "gemma4_text", "allow_global_per_layer_attribute_access": True}
+    wrapper = {"architectures": ["LlavaForConditionalGeneration"], "model_type": "llava", "text_config": child}
+    opts = dict(backend_version="0.32.0", tp_size=1, pp_size=1)
+    inherited = NaiveKVCacheEstimator.from_hf_config(wrapper, **opts)
+    assert _compiled_vllm_transfer_widths(_write_config(tmp_path, wrapper), "0.32.0") == (92_160, 92_160)
+    child.update(num_hidden_layers=30, vocab_size=262144, max_position_embeddings=131072)
+    assert NaiveKVCacheEstimator.from_hf_config(wrapper, **opts).weight_bytes() == inherited.weight_bytes()
+
+    child.update(
+        architectures=["MistralForCausalLM"],
+        num_hidden_layers=12,
+        num_key_value_heads=12,
+        head_dim=64,
+        layer_types=["full_attention"] * 12,
+        hidden_act="silu",
+        intermediate_size=3072,
+        num_global_key_value_heads=1,
+        global_head_dim=64,
+        attention_k_eq_v=True,
+    )
+    assert _compiled_vllm_transfer_widths(_write_config(tmp_path, wrapper), "0.32.0") == (36_864, 36_864)
+    child.update(architectures=["LlamaForCausalLM"], use_bidirectional_attention="all")
+    with pytest.raises(ValueError, match="no persistent vLLM KV"):
+        _compiled_vllm_transfer_widths(_write_config(tmp_path, wrapper), "0.32.0")
+
+    child = {**opt, "model_type": "gpt_neo", "num_layers": 12, "num_heads": 12}
+    wrapper["text_config"] = child
+    with pytest.raises(ValueError, match="attention_types"):
+        NaiveKVCacheEstimator.from_hf_config(wrapper, **opts)
+    child["attention_types"] = [[["global", "local"], 6]]
+    assert _compiled_vllm_transfer_widths(_write_config(tmp_path, wrapper), "0.32.0") == (36_864, 36_864)
 
 
 @pytest.mark.parametrize("child_dtype", ["bfloat16", "float32", "float8_e4m3fn"])
@@ -3492,7 +3633,7 @@ def test_vllm_wrapper_uses_the_execution_dtype_for_auto_kv_and_unquantized_weigh
 
     # The OneVision Qwen2 7B checkpoint runs in the parent's FP16 dtype, including its linear weights.
     model = _write_config(tmp_path, _onevision_qwen2_7b(child_dtype))
-    weights = 2 * (2 * 152064 * 3584 + 28 * (4 * 3584**2 + 3 * 3584 * 18944))
+    weights = 16_074_109_568  # FP16 Qwen2 projections, vocabulary, SigLIP tower, connector and vectors.
     for version in ("0.31.0", "0.32.0", "0.33.0"):
         assert _estimate_model_weight_bytes(model, backend="vllm", backend_version=version) == weights
         for mode, width in ((None, 57_344), ("fp8", 28_672)):
@@ -3710,7 +3851,7 @@ def test_qwen2_moe_config_dispatches_dense_weights_and_its_constructed_layer_typ
     child = dict(model_type="qwen2_moe", architectures=["Qwen2ForCausalLM"], num_experts=8, moe_intermediate_size=128)
     parent = {"architectures": ["LlavaForConditionalGeneration"], "text_config": child}
     path = _write_config(tmp_path, parent)
-    assert _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") == 3_710_910_464
+    assert _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") == 4_336_543_744
     assert _compiled_vllm_transfer_widths(path, "0.32.0") == (196_608, 196_608)
     child.update(use_sliding_window=True, max_window_layers=12)
     path = _write_config(tmp_path, parent)
@@ -3746,21 +3887,27 @@ def test_wrapped_gemma_config_uses_llama_projection_weights_and_default_head_dim
         assert _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") >= 18_647_875_584
 
 
-def test_vllm_fp8_linear_weights_keep_parent_dtype_for_embeddings(tmp_path):
+@pytest.mark.parametrize(
+    ("child_dtype", "activation", "scales"),
+    [("bfloat16", "dynamic", 7), ("float8_e4m3fn", "dynamic", 7), ("bfloat16", "static", 14)],
+)
+def test_vllm_fp8_linear_weights_keep_parent_dtype_for_embeddings(tmp_path, child_dtype, activation, scales):
     from aisim.generator.naive import _estimate_model_weight_bytes
 
-    document = _onevision_qwen2_7b("float8_e4m3fn")
-    document["quantization_config"] = {"quant_method": "fp8", "activation_scheme": "dynamic"}
+    document = _onevision_qwen2_7b(child_dtype)
+    document["quantization_config"] = {"quant_method": "fp8", "activation_scheme": activation}
     document["text_config"].update(num_hidden_layers=1, hidden_size=4096, num_attention_heads=32)
     path = _write_config(tmp_path, document)
-    # Both vocabulary matrices remain FP16 even when the serialized linear weights are FP8.
-    assert _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") == (
-        2 * 152064 * 4096 * 2 + 4 * 4096**2 + 3 * 4096 * 18944
-    )
+    # Seven FP8 projections each have a weight scale and, for static input quantization, an activation scale.
     opts = dict(backend="vllm", backend_version="0.32.0", tp_size=1, pp_size=1)
+    unquantized = {k: v for k, v in document.items() if k != "quantization_config"}
+    full = NaiveKVCacheEstimator.from_hf_config(unquantized, **opts).weight_bytes()
+    projections = 2 * 4096 * 128 * (32 + 4) + 3 * 4096 * 18944
+    assert (
+        full - _estimate_model_weight_bytes(path, backend="vllm", backend_version="0.32.0") == projections - 4 * scales
+    )
     quant = document["quantization_config"]
     quant["ignored_layers"] = ["language_model.model.layers.0.mlp.down_proj"]
-    unquantized = {k: v for k, v in document.items() if k != "quantization_config"}
     assert (
         NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes()
         == NaiveKVCacheEstimator.from_hf_config(unquantized, **opts).weight_bytes()
@@ -3768,6 +3915,56 @@ def test_vllm_fp8_linear_weights_keep_parent_dtype_for_embeddings(tmp_path):
     del quant["activation_scheme"]
     with pytest.raises(ValueError, match="activation_scheme"):
         NaiveKVCacheEstimator.from_hf_config(document, **opts)
+
+
+def test_vllm_native_block_fp8_counts_rank_local_scale_tiles(tmp_path):
+    from aisim.generator.naive import _estimate_model_weight_bytes
+
+    # Intern-S1-mini-FP8 has seven block-FP8 Qwen3 projections per layer and BF16 execution.
+    document = {
+        "architectures": ["InternS1ForConditionalGeneration"],
+        "model_type": "interns1",
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["model.vision_tower.proj", "model.language_model.embed_tokens", "lm_head"],
+        },
+        "vision_config": dict(
+            model_type="interns1_vision",
+            hidden_size=64,
+            intermediate_size=192,
+            num_hidden_layers=2,
+            image_size=[64, 64],
+            patch_size=[8, 8],
+        ),
+        "text_config": {
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+            "torch_dtype": "bfloat16",
+            "hidden_size": 4096,
+            "head_dim": 128,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 36,
+            "intermediate_size": 12288,
+            "vocab_size": 153216,
+        },
+    }
+    model = _write_config(tmp_path, document)
+    full = {key: value for key, value in document.items() if key != "quantization_config"}
+    for tp, projections, scales in ((1, 6_945_767_424, 1_695_744), (16, 452_984_832, 110_592)):
+        # QKV replicates one 128-wide KV head on each TP16 rank. The four local fused matrices own their scale tiles.
+        opts = dict(backend="vllm", backend_version="0.32.0", tp_size=tp, pp_size=1)
+        serving_dtype = NaiveKVCacheEstimator.from_hf_config(full, **opts).weight_bytes()
+        physical = NaiveKVCacheEstimator.from_hf_config(document, **opts).weight_bytes()
+        assert serving_dtype - physical == projections - scales
+        if tp == 1:
+            assert _estimate_model_weight_bytes(model, backend="vllm", backend_version="0.32.0") == physical
+    options = _missing_system_cache_options(tmp_path, tp_size=1, capacity=16 * _GIB)
+    options.update(max_num_tokens=512, max_batch_size=1, memory_fraction_value=1, tolerance_fraction=0)
+    assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **options) > 0
 
 
 def test_dispatched_deepseek_counts_resident_weights_and_routed_layers(tmp_path):
@@ -3814,6 +4011,17 @@ def test_dispatched_deepseek_counts_resident_weights_and_routed_layers(tmp_path)
     params = 31 * 256 * 3 * 7168 * 256
     assert bf16 - block_fp8 == params - 4 * (params // (128 * 128))
     assert block_fp8 < 80 * _GIB < bf16
+    for release, expected in (("0.5.9", block_fp8), ("0.5.10rc0", bf16)):
+        assert (
+            NaiveKVCacheEstimator.from_hf_config(raw, **(options | {"backend_version": release})).weight_bytes()
+            == expected
+        )
+    del raw["quantization_config"]["weight_block_size"]
+    raw["quantization_config"]["ignored_layers"] = []
+    for activation, scales in (("dynamic", 3), ("static", 5)):
+        raw["quantization_config"]["activation_scheme"] = activation
+        tensor_fp8 = NaiveKVCacheEstimator.from_hf_config(raw, **options).weight_bytes()
+        assert bf16 - tensor_fp8 == params - 31 * 256 * 4 * scales
 
 
 def test_sglang_llava_uses_its_pinned_transformers_causal_lm(tmp_path):
@@ -3854,7 +4062,10 @@ def test_registered_opt_uses_its_projections_with_a_different_config(tmp_path, c
         assert _compiled_vllm_transfer_widths(path, "0.32.0") == (36_864, 36_864)
         options = _missing_system_cache_options(tmp_path, tp_size=1, capacity=600 << 20)
         options["naive_kv_reservation"] = 0.8
-        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **options) == 407
+        with pytest.raises(ValueError, match="no KV budget"):
+            memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **options)
+        options["gpu_memory_capacity_bytes_override"] = 2 * _GIB
+        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **options) > 0
 
 
 def test_qwen2_projection_uses_the_constructed_config(tmp_path):
@@ -3954,14 +4165,16 @@ def test_bare_normalized_decoders_use_their_local_layers_and_experts(tmp_path):
         with pytest.raises(ValueError, match="no KV budget"):
             memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts)
         opts["gpu_memory_capacity_bytes_override"] = 12 * _GIB
-        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) == 1353
+        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) == (
+            1353 if model is dense else 837
+        )
     deepseek["architectures"] = ["DeepseekV3BidirectionalModel", "DeepseekV3ForCausalLM"]
     parent = {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": deepseek}
     assert NaiveKVCacheEstimator.from_hf_config(parent, **options).kv_bytes_per_token() == 70_272
 
 
 def test_real_opt_child_reserves_positions_and_defaults_the_embedding_projection(tmp_path):
-    options = _missing_system_cache_options(tmp_path, tp_size=1, capacity=400 << 20)
+    options = _missing_system_cache_options(tmp_path, tp_size=1, capacity=1000 << 20)
     parent = {"architectures": ["LlavaNextForConditionalGeneration"]}
     for names in ({}, {"architectures": ["OPTForCausalLM"]}):
         text = {"model_type": "opt", **names}
@@ -3969,7 +4182,7 @@ def test_real_opt_child_reserves_positions_and_defaults_the_embedding_projection
             config = parent | {"text_config": text | embedding}
             estimate = NaiveKVCacheEstimator.from_hf_config(config, tp_size=1, pp_size=1, backend_version="0.32.0")
             assert estimate.kv_bytes_per_token() == 36_864
-            assert estimate.weight_bytes() < 400 << 20
+            assert 900 << 20 > estimate.weight_bytes() > 800 << 20
         path = _write_config(tmp_path, parent | {"text_config": text | {"max_position_embeddings": 131072}})
         with pytest.raises(ValueError, match="no KV budget"):
             memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **options)
@@ -4428,7 +4641,7 @@ def test_sglang_llava_fp8_exclusions_use_the_language_model_expert_prefix(tmp_pa
     model = _write_config(tmp_path, wrapper)
     args = (model, "missing", "sglang", release)
     blocks = memory.estimate_num_gpu_blocks(*args, **opts)
-    assert blocks == 159_290
+    assert blocks == 158_028
     wrapper["quantization_config"] = quant
     for excluded in (
         ["language_model"],
@@ -5170,7 +5383,8 @@ def test_wrapped_checkpoint_kv_precision_prices_transfers_and_blocks(tmp_path, n
             sidecar.pop("producer")
         (tmp_path / "hf_quant_config.json").write_text(json.dumps(sidecar))
     model = _write_config(tmp_path, wrapper)
-    weights = NaiveKVCacheEstimator.from_hf_config(raw, tp_size=8, pp_size=1).weight_bytes()
+    # The unregistered wrapper supplies raw BF16 geometry and no native vLLM decoder class.
+    weights = 2 * (2 * 128256 * 8192 + 80 * (4 * 8192**2 + 3 * 8192 * 28672)) // 8
     budget = 16 * 64 * 40_960
     opts = _missing_system_cache_options(tmp_path, tp_size=8, capacity=weights + budget)
     for backend, version in (("vllm", "0.33.0"), ("sglang", "0.5.20")):

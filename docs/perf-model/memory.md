@@ -120,10 +120,15 @@ when the only weight group uses a supported 8-bit scheme with the sole target
 embeddings or output head still permit that reduction. The embeddings and
 output head use model precision. A decoder projection exclusion or an
 unresolved pattern keeps the model-precision reserve for the projections.
+For native vLLM FP8, those dense projections use one byte per weight even
+when the decoder runs in BF16. Each rank reserves FP32 scales for its local
+weight tiles, or per-projection scales for per-tensor quantization.
 Packed group-wise INT8 weights include one execution-dtype scale per group
 when groups of 32, 64 or 128 align with the projection shards and the scales
 partition across ranks. For block-FP8 DeepSeek
 experts, SGLang's estimate includes the resident expert shards and their scales.
+SGLang 0.5.9 keeps expert weights in FP8 even when the checkpoint lists the
+expert module as excluded. SGLang honors those exclusions from 0.5.10rc0.
 A selected encoder-only attention implementation has no persistent KV blocks
 to transfer.
 Automatic sizing uses each backend's checkpoint metadata. For example, the ModelOpt sidecar for
@@ -135,6 +140,8 @@ capacity for an unquantized dense Llama or Qwen decoder at TP1 reserves a full
 embedding or output head on the endpoint stage. Other pipeline layouts need
 the runtime's resident weight measurements. Speculative
 decoding capacity also needs the runtime draft weights and cache allocation.
+
+Marginal KV bytes describe the selected text decoder. Whole-rank capacity also reserves any resident encoder and projector. In the config-only fallback, LLaVA-family and Intern-S1 dense vision transformers use their declared patch, attention and feed-forward dimensions. The estimate reserves the full vision tower on each language rank as a conservative upper bound when encoder partitioning is unknown. A wrapper that declares an auxiliary encoder with an unrecognized layout requires measured resident weights for capacity. Its decoder can still supply the per-token transfer width.
 
 For a sliding-window decoder, the config-only shared pool estimate allows every
 scheduled token to be present in every attention layer. A prefill can occupy the
