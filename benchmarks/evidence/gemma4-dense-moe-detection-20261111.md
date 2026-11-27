@@ -345,14 +345,15 @@ checked-in rows do not. Those three stale rows, and the ten retired-version CLI
 `FAIL` rows, remain recorded debt rather than regenerated evidence; #1006 owns
 the campaign that replaces them.
 
-Both guards derive their combination set from the generator rather than a
-hardcoded list: the CLI guard uses
-`SupportMatrix().generate_combinations()` and the FPE guard calls the planner for
-every combination the op-level matrix still enumerates. A combination the
-generator starts emitting is therefore covered without editing either test.
-Widening them to historical rows would require the non-current state that #1006
-defines first, because today those rows fail the very condition a widened guard
-would assert.
+Neither guard hardcodes a combination list. The CLI guard checks every
+combination `SupportMatrix().generate_combinations()` currently emits, so a new
+CLI enumeration is covered without editing the test. The FPE guard intersects
+that set with the checked-in FPE rows and calls the planner for each, so it
+covers the combinations the op-level matrix still enumerates; a new FPE
+combination enters it only when a same-source campaign regenerates those rows.
+Widening either guard to historical rows would require the non-current state
+that #1006 defines first, because today those rows fail the very condition a
+widened guard would assert.
 
 ## Exact-head verification at `8f3a62e0` (2026-11-18, historical)
 
