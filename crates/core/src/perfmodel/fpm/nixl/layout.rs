@@ -604,6 +604,10 @@ impl LayerRegions {
         Self { possible, required }
     }
 
+    pub(super) fn layer_count(&self) -> usize {
+        self.possible.len()
+    }
+
     pub(super) fn first_possible(&self) -> Option<usize> {
         self.possible.first().copied()
     }
@@ -646,6 +650,7 @@ pub(super) fn nemotron_state_regions(
     groups: &[Value],
     host: bool,
     owners: Option<&BTreeSet<String>>,
+    configured: Option<&LayerRegions>,
 ) -> Option<LayerRegions> {
     let mut names = BTreeMap::new();
     let mut first_attention = None;
@@ -675,6 +680,19 @@ pub(super) fn nemotron_state_regions(
     }
     if names.is_empty() {
         return None;
+    }
+    if let Some(pattern) = configured {
+        let invalid: BTreeSet<_> = names
+            .keys()
+            .filter(|i| !pattern.possible.contains(i))
+            .copied()
+            .collect();
+        if !invalid.is_empty() {
+            return Some(LayerRegions {
+                possible: BTreeSet::new(),
+                required: invalid,
+            });
+        }
     }
     if let Some(exact) = owners.and_then(|n| nemotron_owners(n, "mixer")) {
         return Some(exact);

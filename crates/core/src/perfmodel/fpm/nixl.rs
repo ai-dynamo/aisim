@@ -108,6 +108,8 @@ pub(crate) struct TransferMetadata {
     #[serde(default, skip_serializing_if = "HeadGeometry::is_empty")]
     model_heads: HeadGeometry,
     #[serde(skip_serializing_if = "Option::is_none")]
+    possible_model_kv_heads: Option<BTreeSet<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     uniform_attention: Option<UniformAttention>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     layer_heads: BTreeMap<String, HeadGeometry>,
@@ -186,6 +188,13 @@ impl TransferMetadata {
                     .then_some(pattern.len() as u64)
                 }),
             speculative: config["speculative_config"].is_object().then_some(true),
+            possible_model_kv_heads: (matches!(
+                family,
+                Some("falcon" | "RefinedWeb" | "RefinedWebModel")
+            ) && configured_heads.num_kv_heads.is_none()
+                && resolved["total_num_kv_heads"].is_null())
+            .then(|| text.rw_kv_candidates(&model["hf_overrides"]))
+            .flatten(),
             model_heads: HeadGeometry {
                 num_kv_heads: resolved["total_num_kv_heads"]
                     .as_u64()
@@ -205,9 +214,13 @@ impl TransferMetadata {
         // config and the separate hidden-layer count do not select its attention mixers.
         let top = top.fields;
         let top_family = top["model_type"].as_str();
+        let explicit =
+            registered.and_then(registry::Registration::decoder) == Some(Decoder::NemotronH);
         if native
-            && top_family.is_none_or(|name| name == "nemotron_h")
-            && (decoder == Some(Decoder::NemotronH) || (names.is_none() && decoder.is_none()))
+            && (explicit
+                || top_family.is_none_or(|name| name == "nemotron_h")
+                    && (decoder == Some(Decoder::NemotronH)
+                        || (names.is_none() && decoder.is_none())))
             && let Some(pattern) = heads::hybrid_pattern(top)
         {
             let positions = pattern
@@ -227,6 +240,21 @@ impl TransferMetadata {
         facts
     }
 
+    fn possible_kv_mismatch(&self, other: &Self) -> Option<(&'static str, String, String)> {
+        if self.possible_model_kv_heads.is_none() && other.possible_model_kv_heads.is_none() {
+            return None;
+        }
+        let options = |m: &Self| {
+            m.model_heads
+                .num_kv_heads
+                .map(|n| BTreeSet::from([n]))
+                .or_else(|| m.possible_model_kv_heads.clone())
+        };
+        let (left, right) = (options(self)?, options(other)?);
+        left.is_disjoint(&right)
+            .then(|| ("num_kv_heads", format!("{left:?}"), format!("{right:?}")))
+    }
+
     fn merge(&mut self, other: &Self) -> Result<(), AicError> {
         merge_observed(
             &mut self.transfer_mode,
@@ -244,6 +272,24 @@ impl TransferMetadata {
             "speculative_config",
         )?;
         self.model_heads.merge(&other.model_heads)?;
+        if let Some(other) = &other.possible_model_kv_heads {
+            self.possible_model_kv_heads
+                .get_or_insert_with(|| other.clone())
+                .retain(|n| other.contains(n));
+        }
+        if self
+            .possible_model_kv_heads
+            .as_ref()
+            .is_some_and(|options| {
+                options.is_empty()
+                    || self
+                        .model_heads
+                        .num_kv_heads
+                        .is_some_and(|n| !options.contains(&n))
+            })
+        {
+            return Err(conflict("num_kv_heads"));
+        }
         if let Some(attention) = &other.uniform_attention {
             let saved = self
                 .uniform_attention
@@ -411,7 +457,13 @@ impl Worker {
         }
         metadata.registered_layers = layout::registered_layers(rank);
         if let Some(regions) = groups.and_then(|g| {
-            layout::nemotron_state_regions(rank, g, host, metadata.registered_layers.as_ref())
+            layout::nemotron_state_regions(
+                rank,
+                g,
+                host,
+                metadata.registered_layers.as_ref(),
+                metadata.nemotron_state_regions.as_ref(),
+            )
         }) {
             metadata
                 .nemotron_state_regions
@@ -630,6 +682,9 @@ pub(crate) struct NixlIdentity {
     pub(crate) disable_hma: Option<String>,
     pub(crate) measured_mamba: bool,
     pub(crate) recorded_groups: Option<Vec<Value>>,
+    pub(crate) complete_pp1_groups: bool,
+    pub(crate) logical_state_layers: Option<usize>,
+    pub(crate) rank_page_size: Option<u64>,
     pub(crate) recorded_memory: Value,
     pub(crate) hybrid_groups: bool,
     pub(crate) workers: Vec<Worker>,
@@ -731,12 +786,21 @@ impl NixlIdentity {
 
     fn common_settings(&mut self, config: &Value, source: &Value) -> Result<(), AicError> {
         self.settings(config)?;
-        self.metadata.merge(&TransferMetadata::configured(
+        let configured = TransferMetadata::configured(
             config,
             config["model_config"]["use_mla"].as_bool(),
             self.architecture.as_deref(),
             source,
-        ))
+        );
+        merge_observed(
+            &mut self.logical_state_layers,
+            configured
+                .nemotron_state_regions
+                .as_ref()
+                .map(layout::LayerRegions::layer_count),
+            "Mamba layer positions",
+        )?;
+        self.metadata.merge(&configured)
     }
 
     fn memory(&mut self, data: &Value) -> Result<(), AicError> {
@@ -756,6 +820,7 @@ impl NixlIdentity {
         entry: &Value,
         v1_phase_width: Option<u64>,
         capture: Capture,
+        skip_state_block_size: bool,
     ) -> Result<bool, AicError> {
         if capture == Capture::References
             && (entry.get("worker_observations").is_some()
@@ -796,8 +861,25 @@ impl NixlIdentity {
                 "vllm_version",
             )?;
         }
-        let mut complete = roster::validate_source(entry, capture, self.phase_width, self.tp_size)?
-            || capture == Capture::BoundReferences;
+        let identified = roster::validate_source(entry, capture, self.phase_width, self.tp_size)?;
+        let mut complete = identified || capture == Capture::BoundReferences;
+        if identified {
+            for row in entry["rank_capacities"].as_array().into_iter().flatten() {
+                merge_observed(
+                    &mut self.rank_page_size,
+                    row["page_size_bytes"].as_u64(),
+                    "page_size_bytes",
+                )?;
+            }
+            let launch_pp = entry.pointer("/launch/topology/pp").and_then(Value::as_u64);
+            let configured_pp = entry
+                .pointer("/runtime_settings/parallel_config/pipeline_parallel_size")
+                .and_then(Value::as_u64);
+            if launch_pp.zip(configured_pp).is_some_and(|(a, b)| a != b) {
+                return Err(roster::invalid());
+            }
+            self.complete_pp1_groups |= launch_pp.or(configured_pp) == Some(1);
+        }
         let start = self.workers.len();
         // The original finalizer kept the initialized common settings and capacity coordinates,
         // but omitted every worker view. A resolved cache layout still applies to those ranks.
@@ -998,7 +1080,9 @@ impl NixlIdentity {
             let has_prefill = phase_groups.contains_key(&Some("prefill"));
             for (phase, identity) in phase_groups {
                 if let Some(mut groups) = identity.recorded_groups {
-                    if has_prefill && phase == Some("decode") && different_modes {
+                    if skip_state_block_size
+                        || has_prefill && phase == Some("decode") && different_modes
+                    {
                         for group in &mut groups {
                             if group["kind"] == "state" {
                                 group.as_object_mut().unwrap().remove("block_size_tokens");
@@ -1037,12 +1121,24 @@ impl NixlIdentity {
     }
 
     fn collection(&mut self, entry: &Value, capture: Capture) -> Result<bool, AicError> {
-        let mut found = self.observation(entry, None, capture)?;
-        if let Some(phases) = entry["phases"].as_object() {
+        let mut found = self.observation(entry, None, capture, false)?;
+        if let Some(phases) = roster::bound_phases(entry)? {
+            let prefill = entry
+                .pointer("/phases/prefill/prefix_caching/prefill/mamba_cache_mode")
+                .and_then(Value::as_str);
+            let decode = entry
+                .pointer("/phases/decode/prefix_caching/decode/mamba_cache_mode")
+                .and_then(Value::as_str);
+            let different_modes = prefill.zip(decode).is_some_and(|(a, b)| a != b);
             for (phase, snapshot) in phases {
                 let before = self.workers.len();
                 let rosters_before = self.rosters.len();
-                if !self.observation(snapshot, None, capture)? {
+                if !self.observation(
+                    snapshot,
+                    None,
+                    capture,
+                    phase == "decode" && different_modes,
+                )? {
                     self.workers.push(Worker::default());
                 }
                 for rank in self.workers[before..]
@@ -1061,6 +1157,21 @@ impl NixlIdentity {
         let Some(groups) = cache["groups"].as_array() else {
             return Ok(());
         };
+        let mut names = BTreeSet::new();
+        for layer in groups
+            .iter()
+            .filter_map(|g| g["layer_names"].as_array())
+            .flatten()
+        {
+            if !names.insert(
+                layer
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| conflict("cache_groups"))?,
+            ) {
+                return Err(conflict("cache_groups"));
+            }
+        }
         // The importer uses the allocation of one shared pool block for every group.
         // spec_page_size_bytes is the page of a single layer or spec, not that allocation.
         let page = cache["allocated_cache_bytes"]
@@ -1127,6 +1238,16 @@ impl NixlIdentity {
     ) -> Result<(), AicError> {
         if let Some(fields) = self.recorded_memory.as_object() {
             for (field, value) in fields {
+                if field == "kv_cache_bytes_limit" {
+                    if selected["kv_cache_bytes"]
+                        .as_u64()
+                        .zip(value.as_u64())
+                        .is_some_and(|(v, l)| v > l)
+                    {
+                        return Err(conflict("kv_cache_bytes"));
+                    }
+                    continue;
+                }
                 let limit = match field.as_str() {
                     "max_num_tokens" => limits.map(|v| v.0),
                     "max_batch_size" => limits.map(|v| v.1),
@@ -1145,6 +1266,15 @@ impl NixlIdentity {
     }
 
     pub(crate) fn selected_groups(&mut self, groups: &Value) -> Result<(), AicError> {
+        if let Some(page) = self.rank_page_size
+            && groups
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|g| g["page_size_bytes"].as_u64().is_some_and(|n| n != page))
+        {
+            return Err(conflict("page_size_bytes"));
+        }
         if let Some(saved) = &self.recorded_groups {
             let selected = groups
                 .as_array()
@@ -1268,6 +1398,7 @@ impl NixlIdentity {
                     } else {
                         Capture::BoundReferences
                     },
+                    false,
                 )?;
                 if let Some(nested) = memory["provenance"].as_str()
                     && let Ok(direct) = serde_json::from_str(nested)
@@ -1627,18 +1758,38 @@ impl NixlIdentity {
                             .ok()
                     })
                     .any(|index| logical.binary_search(&index).is_err());
-                // A sparse archive may retain only the number of layers in its groups.
-                let excess_layers = self
-                    .recorded_groups
-                    .iter()
-                    .flatten()
-                    .filter(|g| g["kind"] == "attention")
-                    .any(|g| {
-                        g["num_layers"]
-                            .as_u64()
-                            .is_some_and(|n| n > logical.len() as u64)
-                    });
-                if invalid_layer || excess_layers {
+                // A native PP1 worker owns every attention layer. Several layers may share one
+                // registered allocation, but the worker lists each logical layer in one group.
+                let mut counts = [0_u64; 2];
+                let mut complete = self.complete_pp1_groups && self.recorded_groups.is_some();
+                for group in self.recorded_groups.iter().flatten() {
+                    let index = match group["kind"].as_str() {
+                        Some("attention") => 0,
+                        Some("state") => 1,
+                        Some("convolution") => continue,
+                        _ => {
+                            complete = false;
+                            continue;
+                        }
+                    };
+                    if let Some(n) = group["num_layers"].as_u64() {
+                        counts[index] = counts[index]
+                            .checked_add(n)
+                            .ok_or_else(|| conflict("cache_groups"))?;
+                    } else {
+                        complete = false;
+                    }
+                }
+                let mismatched = |count, expected: usize| {
+                    count > expected as u64 || complete && count != expected as u64
+                };
+                if self
+                    .logical_state_layers
+                    .is_some_and(|n| mismatched(counts[1], n))
+                {
+                    return Err(conflict("Mamba layer positions"));
+                }
+                if invalid_layer || mismatched(counts[0], logical.len()) {
                     return Err(conflict("attention layer positions"));
                 }
             }
@@ -1769,6 +1920,9 @@ impl NixlIdentity {
     }
 
     pub fn mismatch(&self, decode: &Self) -> Option<(&'static str, String, String)> {
+        if let Some(field) = self.metadata.possible_kv_mismatch(&decode.metadata) {
+            return Some(field);
+        }
         if let (Some(a), Some(b)) = (self.metadata.transfer_mode, decode.metadata.transfer_mode)
             && a != b
         {
@@ -2397,6 +2551,33 @@ mod tests {
             role.select("prefill", None, None, None, None, false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn complete_nemotron_groups_cover_logical_layers_across_allocations() {
+        let select = |groups: &[u64], logical: Vec<usize>, complete| {
+            let mut role = NixlIdentity {
+                architecture: Some("NemotronHForCausalLM".into()),
+                recorded_groups: Some(
+                    groups
+                        .iter()
+                        .map(|count| json!({"kind":"attention","num_layers":count}))
+                        .collect(),
+                ),
+                complete_pp1_groups: complete,
+                metadata: TransferMetadata {
+                    nemotron_attention_layers: Some(logical),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            role.select("prefill", None, None, None, None, false)
+        };
+        assert!(select(&[2], vec![0, 1], true).is_ok());
+        assert!(select(&[1, 1], vec![0, 1], true).is_ok());
+        assert!(select(&[2], vec![0, 1, 2], true).is_err());
+        assert!(select(&[1, 1], vec![0], true).is_err());
+        assert!(select(&[2], vec![0, 1, 2], false).is_ok());
     }
 
     #[test]

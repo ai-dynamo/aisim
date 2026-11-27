@@ -80,6 +80,9 @@ pub(super) struct HfConfig<'a> {
     class: Option<ConfigClass>,
     text_class: Option<ConfigClass>,
     stock_only: bool,
+    // A stock checkpoint proves which constructor owns the text child, even for decoder
+    // classes whose physical head geometry this module does not project.
+    stock_qwen_vl: Option<bool>,
 }
 
 /// Keep only configuration fields consumed by the tagged converters and native
@@ -195,15 +198,92 @@ impl ConfigClass {
     }
 }
 
-fn wrapper_text_default(config: &Value, stock_only: bool) -> Option<&'static str> {
+/// Stock wrappers that dispatch a text dictionary through CONFIG_MAPPING in every
+/// supported Transformers release. The selected child class can differ from its default.
+fn wrapper_text_decoder(config: &Value, stock_only: bool) -> Option<Decoder> {
+    let wrapper = config["model_type"].as_str()?;
     if !stock_only && config["auto_map"].get("AutoConfig").is_some() {
         return None;
     }
-    match config["model_type"].as_str()? {
-        "llava" | "llava_next" => Some("llama"),
-        "idefics2" => Some("mistral"),
-        _ => None,
+    let text = &config["text_config"];
+    if !(text.is_null() || text.is_object()) {
+        return None;
     }
+    let default = match wrapper {
+        "deepseek_vl" | "deepseek_vl_hybrid" | "idefics3" | "janus" | "llava" | "llava_next"
+        | "llava_next_video" | "perception_lm" | "smolvlm" | "video_llava" | "vipllava" => {
+            Some(Decoder::Llama)
+        }
+        "audioflamingo3" | "fast_vlm" | "got_ocr2" | "internvl" | "llava_onevision"
+        | "musicflamingo" | "pp_chart2table" | "qwen2_audio" | "vibevoice_asr" => {
+            Some(Decoder::Qwen2)
+        }
+        "video_llama_3" => text.is_null().then_some(Decoder::Qwen2),
+        "idefics2" | "mistral3" => Some(Decoder::Mistral),
+        // The tagged QianfanOCR and Granite4Vision parser substitutions also dispatch an
+        // explicitly supplied child through CONFIG_MAPPING.
+        "lighton_ocr" | "qianfan_ocr" => Some(Decoder::Qwen3),
+        // These classes default to other decoder families but can construct an explicit
+        // ordinary child. Their own default decoders have no geometry projection here.
+        "aya_vision"
+        | "blip-2"
+        | "cohere2_vision"
+        | "exaone4_5"
+        | "florence2"
+        | "fuyu"
+        | "glm46v"
+        | "glmga"
+        | "granite4_vision"
+        | "granite_speech"
+        | "granite_speech_plus"
+        | "grounding-dino"
+        | "instructblip"
+        | "instructblipvideo"
+        | "lfm2_vl"
+        | "minicpmv4_6"
+        | "mm-grounding-dino"
+        | "omdet-turbo"
+        | "paligemma"
+        | "shieldgemma2" => None,
+        _ => return None,
+    };
+    match text.get("model_type") {
+        Some(family) => {
+            let family = family.as_str()?;
+            Decoder::from_family(family).filter(|d| d.family() == family)
+        }
+        None => default,
+    }
+}
+
+/// Empty and absent child dictionaries differ for these wrappers. The latter uses
+/// the wrapper's own constructor arguments, before post-load hf_overrides.
+fn wrapper_text_geometry(config: &Value, decoder: Decoder) -> Value {
+    let raw = &config["text_config"];
+    let mut fields = geometry_config(raw);
+    if raw.is_null() {
+        let args: Option<(u64, u64, u64, u64, Option<u64>)> = match config["model_type"].as_str() {
+            Some("fast_vlm") => Some((3584, 28, 4, 28, None)),
+            Some("got_ocr2" | "pp_chart2table") => Some((1024, 16, 16, 24, None)),
+            Some("lighton_ocr") => Some((1024, 16, 8, 28, Some(128))),
+            Some("mistral3") => Some((5120, 32, 8, 40, Some(128))),
+            _ => None,
+        };
+        if let Some((hidden, heads, kv, layers, dim)) = args {
+            fields.insert("hidden_size".into(), hidden.into());
+            fields.insert("num_attention_heads".into(), heads.into());
+            fields.insert("num_key_value_heads".into(), kv.into());
+            fields.insert("num_hidden_layers".into(), layers.into());
+            if let Some(dim) = dim {
+                fields.insert("head_dim".into(), dim.into());
+            }
+        }
+    }
+    fields
+        .entry("model_type")
+        .or_insert(Value::from(decoder.family()));
+    initialize_decoder(raw, &mut fields, decoder);
+    Value::Object(fields)
 }
 
 fn refined_web(config: &Value) -> bool {
@@ -334,19 +414,8 @@ fn checkpoint_geometry(config: &Value, stock_only: bool) -> Value {
         text.entry("model_type")
             .or_insert_with(|| Value::from(family));
         top.insert("text_config".into(), Value::Object(text));
-    } else if let Some(default) = wrapper_text_default(config, stock_only) {
-        // These stock wrappers instantiate CONFIG_MAPPING[text_config.model_type].
-        let mut text = geometry_config(&config["text_config"]);
-        let family = text
-            .entry("model_type")
-            .or_insert(Value::from(default))
-            .as_str();
-        if let Some(decoder) = family.and_then(Decoder::from_family)
-            && Some(decoder.family()) == family
-        {
-            initialize_decoder(&config["text_config"], &mut text, decoder);
-        }
-        top.insert("text_config".into(), Value::Object(text));
+    } else if let Some(decoder) = wrapper_text_decoder(config, stock_only) {
+        top.insert("text_config".into(), wrapper_text_geometry(config, decoder));
     } else if let Some(key) = text_field(config) {
         top.insert(key.into(), Value::Object(geometry_config(&config[key])));
     }
@@ -387,6 +456,7 @@ impl CheckpointKey {
 
 pub(super) struct Checkpoint {
     fields: Value,
+    stock_qwen_vl: Option<bool>,
     class: Option<ConfigClass>,
     text_class: Option<ConfigClass>,
 }
@@ -516,8 +586,12 @@ pub(super) fn checkpoint(
         .flatten()?;
     let decoder = stock_decoder(&saved, stock_only);
     let rw = refined_web(&saved);
+    let stock_qwen_vl = (saved["model_type"].is_string()
+        && (stock_only || saved["auto_map"].get("AutoConfig").is_none()))
+    .then(|| qwen2_vl_text_type(&saved, stock_only).is_some());
     if let Some(family) = overrides["model_type"].as_str()
         && saved["model_type"] != family
+        && !(rw && matches!(family, "RefinedWeb" | "RefinedWebModel"))
         && (rw || registry::substitutes_config(family, release))
     {
         // An ordinary model_type update does not change the class AutoConfig loaded.
@@ -558,12 +632,11 @@ pub(super) fn checkpoint(
     Some(Checkpoint {
         fields: effective,
         class: ConfigClass::observed(&saved, stock_only),
+        stock_qwen_vl,
         text_class: if qwen2_vl_text_type(&saved, stock_only).is_some() {
             Some(ConfigClass::Decoder(Decoder::Qwen2))
-        } else if wrapper_text_default(&saved, stock_only).is_some() {
-            stock_decoder(&saved["text_config"], true).map(ConfigClass::Decoder)
         } else {
-            None
+            wrapper_text_decoder(&saved, stock_only).map(ConfigClass::Decoder)
         },
     })
 }
@@ -583,13 +656,14 @@ impl<'a> HfConfig<'a> {
                 .map_or_else(|| ConfigClass::observed(fields, stock_only), |c| c.class),
             text_class: checkpoint.and_then(|c| c.text_class),
             stock_only,
+            stock_qwen_vl: checkpoint.and_then(|c| c.stock_qwen_vl),
         }
     }
 
     pub(super) fn model_type(self, model: &'a Value) -> Option<&'a str> {
         // Stock to_dict() serializes the class's model_type even after config.update()
         // sets a different instance value. vLLM selects its converter from the instance.
-        if (self.class.is_some() || self.text_class.is_some())
+        if (self.stock_qwen_vl.is_some() || self.class.is_some() || self.text_class.is_some())
             && model["hf_config"].is_object()
             && let Some(family) = model["hf_overrides"]["model_type"].as_str()
         {
@@ -611,16 +685,24 @@ impl<'a> HfConfig<'a> {
                 verified: false,
                 class: self
                     .text_class
+                    .or_else(|| {
+                        (self.stock_qwen_vl.is_some()
+                            && text_field(self.fields).is_none()
+                            && (self.verified || fields == self.fields))
+                            .then_some(self.class)
+                            .flatten()
+                    })
                     .or_else(|| ConfigClass::observed(fields, self.stock_only)),
                 ..self
             };
         }
-        let qwen_vl = qwen2_vl_text_type(self.fields, self.stock_only).is_some();
-        let nested = text_field(self.fields).or_else(|| {
-            // A recorded wrapper can establish that its outer override is not a text field.
-            (qwen_vl || registered == Some(registry::Registration::Qwen2Vl))
-                .then_some("text_config")
+        let qwen_vl = self.stock_qwen_vl.unwrap_or_else(|| {
+            self.class.is_none()
+                && (qwen2_vl_text_type(self.fields, self.stock_only).is_some()
+                    || registered == Some(registry::Registration::Qwen2Vl))
         });
+        // A post-load model_type override selects a converter but cannot create a text child.
+        let nested = text_field(self.fields).or_else(|| qwen_vl.then_some("text_config"));
         if let Some(key) = nested {
             Self {
                 fields: &self.fields[key],
@@ -657,6 +739,21 @@ impl<'a> HfConfig<'a> {
             None => !(self.complete || self.verified),
             _ => true,
         }
+    }
+
+    /// RWConfig aliases both public setters to n_head_kv. Canonicalized override maps
+    /// can lose their setter order. A captured effective value takes precedence.
+    pub(super) fn rw_kv_candidates(
+        self,
+        overrides: &Value,
+    ) -> Option<std::collections::BTreeSet<u64>> {
+        if self.class != Some(ConfigClass::RefinedWeb) || !self.attribute("num_kv_heads").is_null()
+        {
+            return None;
+        }
+        let public = positive(&overrides["num_kv_heads"])?;
+        let stored = positive(&overrides["n_head_kv"])?;
+        (public != stored).then(|| std::collections::BTreeSet::from([public, stored]))
     }
 
     fn attribute(self, name: &str) -> &'a Value {
@@ -1055,5 +1152,41 @@ impl UniformAttention {
             head_size,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod wrapper_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wrapper_initializes_the_selected_child_before_overrides() {
+        for wrapper in [
+            "llava_next_video",
+            "video_llava",
+            "vipllava",
+            "qwen2_audio",
+            "qianfan_ocr",
+            "granite4_vision",
+        ] {
+            let raw = json!({"model_type":wrapper,"text_config":{"model_type":"llama","num_attention_heads":16}});
+            let config = checkpoint_geometry(&raw, false);
+            assert_eq!(config["text_config"]["num_key_value_heads"], 16);
+            let mut dynamic = raw;
+            dynamic["auto_map"] = json!({"AutoConfig":"custom.Config"});
+            assert!(
+                checkpoint_geometry(&dynamic, false)["text_config"]["num_key_value_heads"]
+                    .is_null()
+            );
+            assert_eq!(
+                checkpoint_geometry(&dynamic, true)["text_config"]["num_key_value_heads"],
+                16
+            );
+        }
+        let fast =
+            |text| checkpoint_geometry(&json!({"model_type":"fast_vlm","text_config":text}), false);
+        assert_eq!(fast(Value::Null)["text_config"]["num_key_value_heads"], 4);
+        assert_eq!(fast(json!({}))["text_config"]["num_key_value_heads"], 32);
     }
 }

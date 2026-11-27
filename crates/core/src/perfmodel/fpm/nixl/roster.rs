@@ -107,38 +107,488 @@ pub(super) fn validate_probe(probe: &Value) -> Result<(), AicError> {
     Ok(())
 }
 
-fn rank_capacity(entry: &Value) -> Result<Option<u64>, AicError> {
-    let Some(rows) = entry["rank_capacities"].as_array() else {
-        return Ok(None);
-    };
-    let mut minimum = None;
-    let mut complete = true;
-    for row in rows {
-        let bytes = row["kv_cache_bytes"].as_u64();
-        let allocated = row["allocated_cache_bytes"].as_u64();
-        let page = row["page_size_bytes"].as_u64();
-        for (total, blocks) in [(bytes, "initial_free_blocks"), (allocated, "num_blocks")] {
-            if let (Some(total), Some(blocks), Some(page)) = (total, row[blocks].as_u64(), page)
-                && blocks.checked_mul(page) != Some(total)
-            {
-                return Err(super::conflict("kv_cache_bytes"));
+fn capacity_conflict() -> AicError {
+    super::conflict("kv_cache_bytes")
+}
+
+// Older formal summaries stored only usable bytes. Compare every retained measurement
+// of a field and derive the remaining fields only where the collector's inputs exist.
+fn pool_field(key: &str, records: &[&Value]) -> Result<Option<u64>, AicError> {
+    let mut result = None;
+    for record in records {
+        let Some(field) = record.get(key).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let value = field.as_u64().ok_or_else(capacity_conflict)?;
+        if value > 1 << 53 || result.is_some_and(|n| n != value) {
+            return Err(capacity_conflict());
+        }
+        result = Some(value);
+    }
+    Ok(result)
+}
+
+struct RankCapacity {
+    limit: Option<u64>,
+    exact: bool,
+}
+
+fn measured_rank_capacity(
+    row: &Value,
+    worker: &Value,
+    scheduler: &Value,
+    recorded_page: Option<u64>,
+    pool: &mut (Option<u64>, Option<u64>),
+) -> Result<RankCapacity, AicError> {
+    super::merge_observed(
+        &mut pool.0,
+        pool_field("num_blocks", &[row, worker, scheduler])?,
+        "kv_cache_bytes",
+    )?;
+    super::merge_observed(
+        &mut pool.1,
+        pool_field("initial_free_blocks", &[row, scheduler])?,
+        "kv_cache_bytes",
+    )?;
+    let (mut count, mut free) = *pool;
+    let reserved = pool_field("reserved_blocks", &[row, scheduler])?;
+    let mut allocated = pool_field("allocated_cache_bytes", &[row, worker])?;
+    let mut page = recorded_page;
+    super::merge_observed(
+        &mut page,
+        pool_field("page_size_bytes", &[row])?,
+        "page_size_bytes",
+    )?;
+    let mut bytes = pool_field("kv_cache_bytes", &[row])?;
+    if [free, allocated, page, bytes, reserved].contains(&Some(0))
+        || count.is_some_and(|n| n < 2)
+        || free.zip(count).is_some_and(|(f, n)| f >= n)
+    {
+        return Err(capacity_conflict());
+    }
+    if let Some(storage) = worker.get("storages") {
+        let storage = storage
+            .as_array()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(capacity_conflict)?;
+        let mut pointers = BTreeSet::new();
+        let mut device = None;
+        let mut total = 0_u64;
+        for region in storage {
+            let name = region["device"]
+                .as_str()
+                .filter(|d| d.starts_with("cuda:"))
+                .ok_or_else(capacity_conflict)?;
+            let pointer = super::positive(&region["pointer"]).ok_or_else(capacity_conflict)?;
+            let size = pool_field("size_bytes", &[region])?
+                .filter(|n| *n > 0)
+                .ok_or_else(capacity_conflict)?;
+            if device.replace(name).is_some_and(|d| d != name) || !pointers.insert(pointer) {
+                return Err(capacity_conflict());
+            }
+            total = total.checked_add(size).ok_or_else(capacity_conflict)?;
+        }
+        super::merge_observed(&mut allocated, Some(total), "kv_cache_bytes")?;
+    }
+    if let (Some(n), Some(r)) = (free, reserved) {
+        super::merge_observed(
+            &mut count,
+            Some(n.checked_add(r).ok_or_else(capacity_conflict)?),
+            "kv_cache_bytes",
+        )?;
+    }
+    if let (Some(bytes), Some(free)) = (bytes, free) {
+        if !bytes.is_multiple_of(free) {
+            return Err(capacity_conflict());
+        }
+        super::merge_observed(&mut page, Some(bytes / free), "kv_cache_bytes")?;
+    }
+    if let (Some(allocated), Some(count)) = (allocated, count) {
+        if !allocated.is_multiple_of(count) {
+            return Err(capacity_conflict());
+        }
+        super::merge_observed(&mut page, Some(allocated / count), "kv_cache_bytes")?;
+    }
+    if let (Some(physical), Some(page)) = (allocated, page) {
+        if !physical.is_multiple_of(page) {
+            return Err(capacity_conflict());
+        }
+        super::merge_observed(&mut count, Some(physical / page), "kv_cache_bytes")?;
+    }
+    if let (Some(n), Some(r)) = (count, reserved) {
+        super::merge_observed(
+            &mut free,
+            Some(n.checked_sub(r).ok_or_else(capacity_conflict)?),
+            "kv_cache_bytes",
+        )?;
+    }
+    if let (Some(count), Some(page)) = (count, page) {
+        let physical = count.checked_mul(page).ok_or_else(capacity_conflict)?;
+        super::merge_observed(&mut allocated, Some(physical), "kv_cache_bytes")?;
+    }
+    if let (Some(bytes), Some(page)) = (bytes, page) {
+        if !bytes.is_multiple_of(page) {
+            return Err(capacity_conflict());
+        }
+        super::merge_observed(&mut free, Some(bytes / page), "kv_cache_bytes")?;
+    }
+    if let (Some(free), Some(page)) = (free, page) {
+        let usable = free.checked_mul(page).ok_or_else(capacity_conflict)?;
+        super::merge_observed(&mut bytes, Some(usable), "kv_cache_bytes")?;
+    }
+    if count.is_some_and(|n| n < 2)
+        || free == Some(0)
+        || free.zip(count).is_some_and(|(f, n)| f >= n)
+    {
+        return Err(capacity_conflict());
+    }
+    super::merge_observed(&mut pool.0, count, "kv_cache_bytes")?;
+    super::merge_observed(&mut pool.1, free, "kv_cache_bytes")?;
+    let budget = [
+        pool_field("available_cache_bytes", &[row])?,
+        pool_field("available_cache_bytes", &[worker])?,
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    if budget == Some(0) || allocated.zip(budget).is_some_and(|(n, b)| n > b) {
+        return Err(capacity_conflict());
+    }
+    if bytes.is_some_and(|n| n > 1 << 53)
+        || allocated.is_some_and(|n| n > 1 << 53)
+        || bytes.zip(allocated).is_some_and(|(b, a)| b >= a)
+    {
+        return Err(capacity_conflict());
+    }
+    let null = pool_field("null_block_id", &[scheduler])?;
+    if pool_field("pool_count", &[scheduler])?.is_some_and(|n| n != 1)
+        || pool_field("watermark_blocks", &[scheduler])?.is_some_and(|n| n != 0)
+        || null.zip(count).is_some_and(|(id, n)| id >= n)
+        || reserved == Some(0)
+        || count
+            .zip(free)
+            .zip(reserved)
+            .is_some_and(|((n, f), r)| n - f != r)
+    {
+        return Err(capacity_conflict());
+    }
+    if let Some(ids) = scheduler.get("permanent_reserved_block_ids") {
+        let mut blocks = BTreeSet::new();
+        for id in ids.as_array().ok_or_else(capacity_conflict)? {
+            let id = id.as_u64().ok_or_else(capacity_conflict)?;
+            if !blocks.insert(id) || count.is_some_and(|n| id >= n) {
+                return Err(capacity_conflict());
             }
         }
-        if bytes.zip(allocated).is_some_and(|(b, a)| b > a) {
-            return Err(super::conflict("kv_cache_bytes"));
-        }
-        if let Some(bytes) = bytes.filter(|&n| n > 0) {
-            minimum = Some(minimum.map_or(bytes, |m: u64| m.min(bytes)));
-        } else {
-            complete = false;
+        let hybrid = worker["groups"]
+            .as_array()
+            .is_some_and(|groups| groups.iter().any(|g| g.get("layer_specs").is_some()));
+        if blocks.is_empty()
+            || hybrid && blocks.len() != 1
+            || reserved.is_some_and(|r| r != blocks.len() as u64)
+            || null.is_some_and(|id| !blocks.contains(&id))
+        {
+            return Err(capacity_conflict());
         }
     }
+    // A sparse row can still bound the usable allocation. At least the null block is
+    // reserved. Use its measured page size when that survived the original writer.
+    let physical = allocated.or(budget);
+    let mut limit = budget;
+    if let Some(physical) = physical {
+        let reserved = reserved.unwrap_or(1);
+        let page = page.unwrap_or(1);
+        let usable = (physical / page)
+            .checked_sub(reserved)
+            .and_then(|n| n.checked_mul(page))
+            .filter(|n| *n > 0)
+            .ok_or_else(capacity_conflict)?;
+        limit = Some(usable);
+    }
+    if bytes.zip(limit).is_some_and(|(n, l)| n > l) {
+        return Err(capacity_conflict());
+    }
+    Ok(RankCapacity {
+        limit: bytes.or(limit),
+        exact: bytes.is_some(),
+    })
+}
+
+fn indexed_pool(worker: &Value, scheduler: &Value) -> Result<(), AicError> {
+    let pool = worker["pool_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(capacity_conflict)?;
+    let groups = worker["groups"].as_array().ok_or_else(capacity_conflict)?;
+    let assigned = scheduler["group_pool_ids"]
+        .as_array()
+        .ok_or_else(capacity_conflict)?;
+    if scheduler["pool_id"] != pool
+        || groups.len() != assigned.len()
+        || assigned.iter().any(|id| id != pool)
+        || groups.iter().any(|g| g["pool_id"] != pool)
+    {
+        return Err(capacity_conflict());
+    }
+    Ok(())
+}
+
+// When a historical writer omits one rank, measured ranks still bound the minimum.
+fn rank_limits(entry: &Value, mut page: Option<u64>) -> Result<(Option<u64>, bool), AicError> {
+    fn pool(r: &Value) -> (Option<&str>, Option<u64>) {
+        (r["phase"].as_str(), r["dp_rank"].as_u64())
+    }
+    let mut workers = BTreeMap::new();
+    let mut schedulers = BTreeMap::new();
+    for record in entry["artifacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|f| &f["evidence"])
+    {
+        let cache = &record["cache"];
+        let indexed = record["schema_version"] == "aisimulate-runtime-observation/v1";
+        if indexed || record["schema_name"] == "aisimulate_fpm_runtime_memory" {
+            let required: &[&str] = match record["kind"].as_str() {
+                Some("worker") => &[
+                    "num_blocks",
+                    "available_cache_bytes",
+                    "allocated_cache_bytes",
+                    "storages",
+                ],
+                Some("scheduler") => &[
+                    "num_blocks",
+                    "initial_free_blocks",
+                    "reserved_blocks",
+                    "pool_count",
+                    "watermark_blocks",
+                    "null_block_id",
+                ],
+                _ => continue,
+            };
+            if required.iter().any(|key| cache[key].is_null())
+                || indexed
+                    && record["kind"] == "scheduler"
+                    && cache["permanent_reserved_block_ids"].is_null()
+            {
+                return Err(capacity_conflict());
+            }
+        }
+        match record["kind"].as_str() {
+            Some("worker") => {
+                workers.insert((pool(record), record["tp_rank"].as_u64()), record);
+            }
+            Some("scheduler") => {
+                schedulers.insert(pool(record), &record["cache"]);
+            }
+            _ => {}
+        }
+    }
+    let rows = entry["rank_capacities"].as_array();
+    if identified_source(entry) {
+        // These collectors normalize every group against the same shared pool page and
+        // require the normalized groups to agree across workers and collected phases.
+        for row in rows.into_iter().flatten() {
+            super::merge_observed(
+                &mut page,
+                pool_field("page_size_bytes", &[row])?,
+                "page_size_bytes",
+            )?;
+        }
+    }
+    let mut pools: BTreeMap<_, (Option<u64>, Option<u64>)> = BTreeMap::new();
+    // All TP ranks of a phase and DP pool observe the same scheduler. Seed both
+    // quantities before traversing sparse rows so their order cannot change a bound.
+    for row in rows.into_iter().flatten() {
+        let key = pool(row);
+        if key.1.is_some() {
+            let shared = pools.entry(key).or_default();
+            super::merge_observed(
+                &mut shared.0,
+                pool_field("num_blocks", &[row])?,
+                "kv_cache_bytes",
+            )?;
+            super::merge_observed(
+                &mut shared.1,
+                pool_field("initial_free_blocks", &[row])?,
+                "kv_cache_bytes",
+            )?;
+        }
+    }
+    let mut minimum = None;
+    let mut complete = true;
+    for row in rows
+        .into_iter()
+        .flatten()
+        .chain(workers.values().copied().filter(|_| rows.is_none()))
+    {
+        let key = pool(row);
+        let scheduler = schedulers.get(&key).copied().unwrap_or(&Value::Null);
+        let mut unassigned = (None, None);
+        let shared = if key.1.is_some() {
+            pools.entry(key).or_default()
+        } else {
+            &mut unassigned
+        };
+        let record = workers
+            .get(&(key, row["tp_rank"].as_u64()))
+            .copied()
+            .unwrap_or(&Value::Null);
+        let worker = &record["cache"];
+        if record["schema_version"] == "aisimulate-runtime-observation/v1" && !scheduler.is_null() {
+            indexed_pool(worker, scheduler)?;
+        }
+        let capacity = measured_rank_capacity(row, worker, scheduler, page, shared)?;
+        if let Some(limit) = capacity.limit {
+            minimum = Some(minimum.map_or(limit, |n: u64| n.min(limit)));
+        }
+        complete &= capacity.exact;
+    }
+    Ok((minimum, complete))
+}
+
+#[cfg(test)]
+fn rank_capacity(entry: &Value) -> Result<Option<u64>, AicError> {
+    let (minimum, complete) = rank_limits(entry, None)?;
     Ok(minimum.filter(|_| complete))
 }
 
-fn first_phase_settings(entry: &Value) -> Option<&Value> {
-    let phases = entry["prefix_caching"].as_object()?;
-    phases.get("prefill").or_else(|| phases.get("decode"))
+fn retain_bound(expected: &mut Value, limit: Option<u64>) {
+    if let Some(limit) = limit {
+        expected["kv_cache_bytes_limit"] = Value::from(
+            expected["kv_cache_bytes_limit"]
+                .as_u64()
+                .map_or(limit, |n| n.min(limit)),
+        );
+    }
+}
+
+pub(super) fn bound_phases(
+    entry: &Value,
+) -> Result<Option<&serde_json::Map<String, Value>>, AicError> {
+    if entry["source"] != "bound_collection_phases" {
+        return Ok(entry["phases"].as_object());
+    }
+    let phases = entry["phases"]
+        .as_object()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(invalid)?;
+    for (name, snapshot) in phases {
+        if !matches!(name.as_str(), "prefill" | "decode")
+            || snapshot["source"] != "runtime_observations"
+        {
+            return Err(invalid());
+        }
+        let mut identified = false;
+        for marker in snapshot["rank_capacities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| &r["phase"])
+            .chain(
+                snapshot["artifacts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|r| &r["evidence"]["phase"]),
+            )
+        {
+            if !marker.is_null() {
+                if marker != name.as_str() {
+                    return Err(invalid());
+                }
+                identified = true;
+            }
+        }
+        if let Some(settings) = snapshot["prefix_caching"].as_object() {
+            if settings.keys().any(|phase| phase != name) {
+                return Err(invalid());
+            }
+            identified |= settings.contains_key(name);
+        }
+        if !identified {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(phases))
+}
+
+// Importers retain the first collected phase's cache policy. Workers and schedulers
+// from the other phase can legitimately use a different Mamba mode and hash size.
+fn record_prefix_settings(expected: &mut Value, entry: &Value) -> Result<(), AicError> {
+    let mut phases = entry["prefix_caching"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let records = entry["artifacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|f| &f["evidence"]);
+    // The indexed importer reads the per-process prefix record only for hybrid captures.
+    // Older adapters can carry an identically named extension with different semantics.
+    let hybrid: BTreeSet<_> = records
+        .clone()
+        .filter(|r| {
+            entry["source"] == "runtime_observations"
+                && r["kind"] == "worker"
+                && r["cache"]["groups"]
+                    .as_array()
+                    .is_some_and(|gs| gs.iter().any(|g| g.get("layer_specs").is_some()))
+        })
+        .filter_map(|r| r["phase"].as_str())
+        .collect();
+    for record in records {
+        let Some(phase) = record["phase"].as_str().filter(|p| hybrid.contains(p)) else {
+            continue;
+        };
+        let cache = &record["cache"];
+        let prefix = &cache["prefix_caching"];
+        if !prefix.is_object() {
+            return Err(super::conflict("prefix_caching"));
+        }
+        let settings = phases.entry(phase).or_insert_with(|| serde_json::json!({}));
+        if !settings.is_object() {
+            *settings = serde_json::json!({});
+        }
+        for key in ["enable_prefix_caching", "mamba_cache_mode"] {
+            record_memory_field(settings, prefix, key)?;
+            record_memory_field(settings, &record["resolved_config"]["cache_config"], key)?;
+        }
+        for group in cache["groups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|g| g["kind"] == "state")
+        {
+            if record["kind"] == "worker"
+                && Worker::contains_spec(group, "vllm.v1.kv_cache_interface.MambaSpec")
+            {
+                let block = &record["resolved_config"]["cache_config"]["mamba_block_size"];
+                if group["state"]["mamba_cache_mode"].is_null()
+                    || block.is_null()
+                    || &group["block_size_tokens"] != block
+                {
+                    return Err(super::conflict("block_size_tokens"));
+                }
+            }
+            record_memory_field(settings, &group["state"], "mamba_cache_mode")?;
+        }
+        if record["kind"] == "scheduler" {
+            record_memory_field(settings, cache, "mamba_cache_mode")?;
+            for source in [prefix, cache] {
+                record_field(
+                    settings,
+                    "hash_block_size_tokens",
+                    &source["hash_block_size"],
+                )?;
+            }
+        }
+    }
+    if let Some(settings) = phases.get("prefill").or_else(|| phases.get("decode")) {
+        record_memory_settings(expected, settings)?;
+    }
+    Ok(())
 }
 
 pub(super) fn same_memory_setting(key: &str, lhs: &Value, rhs: &Value) -> bool {
@@ -227,11 +677,28 @@ pub(super) fn record_cell_memory(
     expected: &mut Value,
 ) -> Result<Option<u64>, AicError> {
     let memory = &cell["runtime_memory"];
-    let observed = rank_capacity(entry)?;
+    let mut page = None;
+    if identified_source(entry) {
+        for group in cell["cache_groups"].as_array().into_iter().flatten() {
+            super::merge_observed(
+                &mut page,
+                pool_field("page_size_bytes", &[group])?,
+                "page_size_bytes",
+            )?;
+        }
+    }
+    let (limit, complete) = rank_limits(entry, page)?;
+    let observed = limit.filter(|_| complete);
     let saved = memory["kv_cache_bytes"].as_u64();
     let formal = (entry["source"] == "runtime_observations")
         .then(|| compatibility["observed_capacity_bytes"].as_u64())
         .flatten();
+    if !complete {
+        if saved.or(formal).zip(limit).is_some_and(|(s, l)| s > l) {
+            return Err(capacity_conflict());
+        }
+        retain_bound(expected, limit);
+    }
     for (a, b) in [(observed, saved), (formal, observed.or(saved))] {
         if a.zip(b).is_some_and(|(a, b)| a != b) {
             return Err(super::conflict("kv_cache_bytes"));
@@ -246,9 +713,7 @@ pub(super) fn record_cell_memory(
     record_memory_settings(expected, memory)?;
     record_resource_limits(expected, cell)?;
     record_collection_settings(expected, entry)?;
-    if let Some(phase) = first_phase_settings(entry) {
-        record_memory_settings(expected, phase)?;
-    }
+    record_prefix_settings(expected, entry)?;
     Ok(observed.or(saved).or(formal))
 }
 
@@ -266,6 +731,31 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
         record_resource_limits(&mut expected, resources)?;
         record_collection_settings(&mut expected, &evidence["nixl_observation"])?;
         let recorded = memory["kv_cache_bytes"].as_u64();
+        // The released draft writers strip raw provenance from observed_resources. If an
+        // archive also carries it, validate that measurement before applying a user override.
+        if let Some(direct) = memory["provenance"]
+            .as_str()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        {
+            let measured = selected_memory(&direct)?;
+            if measured["kv_cache_bytes"]
+                .as_u64()
+                .is_some_and(|n| recorded != Some(n))
+                || measured["kv_cache_bytes_limit"]
+                    .as_u64()
+                    .zip(recorded)
+                    .is_some_and(|(l, n)| n > l)
+            {
+                return Err(capacity_conflict());
+            }
+        }
+        let (limit, complete) = rank_limits(&evidence["nixl_observation"], None)?;
+        if limit
+            .zip(recorded)
+            .is_some_and(|(l, n)| n > l || complete && n != l)
+        {
+            return Err(capacity_conflict());
+        }
         if let Some(change) = evidence["user_overrides"].get("runtime_memory.kv_cache_bytes") {
             if change["observed"].as_u64() != recorded
                 || change["source"] != "user override; assumption, not a runtime measurement"
@@ -281,29 +771,35 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
         } else {
             recorded
         }
-    } else if evidence["source"] == "bound_collection_phases"
-        && let Some(phases) = evidence["phases"].as_object()
-    {
-        // The writer retains each phase's own rank capacities and chooses their minimum.
-        let mut capacities = Vec::new();
-        for entry in phases.values() {
+    } else if evidence["source"] == "bound_collection_phases" {
+        let phases = bound_phases(evidence)?.ok_or_else(invalid)?;
+        let mut minimum = None;
+        let mut complete = true;
+        for (name, entry) in phases {
             record_collection_settings(&mut expected, entry)?;
-            capacities.extend(rank_capacity(entry)?);
+            let mut settings = serde_json::json!({});
+            record_prefix_settings(&mut settings, entry)?;
+            if name == "prefill" || !phases.contains_key("prefill") {
+                record_memory_settings(&mut expected, &settings)?;
+            }
+            let (limit, exact) = rank_limits(entry, None)?;
+            if let Some(limit) = limit {
+                minimum = Some(minimum.map_or(limit, |m: u64| m.min(limit)));
+            }
+            complete &= exact && limit.is_some();
         }
-        if let Some(phase) = phases.get("prefill").or_else(|| phases.get("decode"))
-            && let Some(settings) = first_phase_settings(phase)
-        {
-            record_memory_settings(&mut expected, settings)?;
+        if !complete {
+            retain_bound(&mut expected, minimum);
         }
-        (capacities.len() == phases.len())
-            .then(|| capacities.into_iter().min())
-            .flatten()
+        minimum.filter(|_| complete)
     } else if identified_source(evidence) {
         record_collection_settings(&mut expected, evidence)?;
-        if let Some(phase) = first_phase_settings(evidence) {
-            record_memory_settings(&mut expected, phase)?;
+        record_prefix_settings(&mut expected, evidence)?;
+        let (limit, complete) = rank_limits(evidence, None)?;
+        if !complete {
+            retain_bound(&mut expected, limit);
         }
-        rank_capacity(evidence)?
+        limit.filter(|_| complete)
     } else {
         None
     };
@@ -1036,15 +1532,15 @@ mod tests {
 
     #[test]
     fn bound_collection_retains_each_phases_limits_and_minimum_capacity() {
-        let phase = |bytes| {
+        let phase = |bytes, phase| {
             json!({"source":"runtime_observations",
             "runtime_settings":{"scheduler_config":{"max_num_batched_tokens":1024}},
             "artifacts":[{"evidence":{"kind":"scheduler","resolved_config":{
                 "cache_config":{"gpu_memory_utilization":0.9}}}}],
-            "rank_capacities":[{"kv_cache_bytes":bytes}]})
+            "rank_capacities":[{"kv_cache_bytes":bytes,"phase":phase}]})
         };
         let mut entry = json!({"source":"bound_collection_phases",
-            "phases":{"prefill":phase(4096),"decode":phase(2048)}});
+            "phases":{"prefill":phase(4096, "prefill"),"decode":phase(2048, "decode")}});
         assert_eq!(
             selected_memory(&entry).unwrap(),
             json!({
@@ -1052,6 +1548,53 @@ mod tests {
         );
         entry["phases"]["decode"]["launch"] = json!({"collection":{"gpu_memory_utilization":0.8}});
         assert!(selected_memory(&entry).is_err());
+    }
+
+    #[test]
+    fn partially_recorded_ranks_preserve_usable_upper_bounds() {
+        let raw = |partial| {
+            json!({"rank_capacities":[{"phase":"prefill","dp_rank":0,"tp_rank":0,
+            "kv_cache_bytes":3211264},partial]})
+        };
+        assert_eq!(
+            rank_limits(
+                &raw(json!({"phase":"decode","dp_rank":0,"tp_rank":0,
+            "num_blocks":80,"page_size_bytes":32768,"allocated_cache_bytes":2621440})),
+                None
+            )
+            .unwrap(),
+            (Some(2588672), false)
+        );
+        let invalid =
+            raw(json!({"phase":"decode","dp_rank":0,"tp_rank":0,"allocated_cache_bytes":2621441}));
+        assert!(rank_limits(&invalid, Some(32768)).is_err());
+        let entry =
+            raw(json!({"phase":"decode","dp_rank":0,"tp_rank":0,"available_cache_bytes":2621440}));
+        assert_eq!(rank_limits(&entry, None).unwrap(), (Some(2_621_439), false));
+    }
+
+    #[test]
+    fn capacity_agrees_with_the_scheduler_for_each_rank_before_taking_the_minimum() {
+        let sizes = |free| {
+            json!({"dp_rank":0,"tp_rank":1,"phase":"prefill","num_blocks":100,
+            "page_size_bytes":32,"allocated_cache_bytes":3200,"available_cache_bytes":3200,
+            "initial_free_blocks":free,"kv_cache_bytes":free * 32})
+        };
+        let mut evidence = json!({"rank_capacities":[sizes(98),sizes(98)], "artifacts":[{"evidence":{
+            "kind":"scheduler","dp_rank":0,"phase":"prefill","cache":{"num_blocks":100,"initial_free_blocks":98,
+            "reserved_blocks":2,"null_block_id":0,"permanent_reserved_block_ids":[0,1]}}}]});
+        evidence["rank_capacities"][0]["tp_rank"] = json!(0);
+        assert_eq!(rank_capacity(&evidence).unwrap(), Some(3136));
+        for (field, bad) in [
+            ("available_cache_bytes", 3199),
+            ("initial_free_blocks", 100),
+        ] {
+            let mut changed = evidence.clone();
+            changed["rank_capacities"][1][field] = json!(bad);
+            assert!(rank_capacity(&changed).is_err());
+        }
+        evidence["rank_capacities"][1] = sizes(99);
+        assert!(rank_capacity(&evidence).is_err());
     }
 
     #[test]

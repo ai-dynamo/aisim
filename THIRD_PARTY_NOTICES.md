@@ -883,11 +883,16 @@ The checkpoint projection in `crates/core/src/perfmodel/fpm/nixl/heads.rs` is a 
 
 The ordinary Qwen2, Qwen3, Llama, Mistral, Falcon and NemotronH checkpoint projections in the same Rust module follow the corresponding stock Transformers configuration constructors. The Llama configuration is copyright 2022 EleutherAI and the HuggingFace Inc. team. The Mistral configuration is copyright 2023 Mistral AI and the HuggingFace Inc. team. The Falcon configuration is copyright 2023 the Falcon authors and HuggingFace Inc. team. All rights reserved. These sources use Apache-2.0.
 
-The LLaVA and LLaVA-NeXT configurations instantiate a stock text decoder, defaulting to Llama. Idefics2 defaults to Mistral. The LLaVA configuration is copyright 2023 Microsoft Research & University of Wisconsin-Madison and the HuggingFace Inc. team. The LLaVA-NeXT and Idefics2 configurations are copyright 2024 The HuggingFace Inc. team. All rights reserved. These sources use Apache-2.0.
+The stock multimodal text configuration mappings are factual constructor metadata from Transformers 5.10.4 through 5.20.2. These wrappers construct the explicitly selected child class or the enclosing configuration’s default. The geometry projection retains the distinct constructor arguments for an absent FastVLM, GOT-OCR2, PP-Chart2Table, LightOnOcr, or Mistral3 child. The LLaVA configuration is copyright 2023 Microsoft Research & University of Wisconsin-Madison and the HuggingFace Inc. team. The LLaVA-NeXT and Idefics2 configurations are copyright 2024 The HuggingFace Inc. team. All rights reserved. These sources use Apache-2.0.
 
 - https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/llava/configuration_llava.py
 - https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/llava_next/configuration_llava_next.py
 - https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/idefics2/configuration_idefics2.py
+- https://github.com/huggingface/transformers/tree/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models
+- https://github.com/huggingface/transformers/blob/18329f1065382e54db698e242cf98bd3f3e5a766/src/transformers/configuration_utils.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/configs/qianfan_ocr.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/configs/granite4_vision.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/transformers_utils/configs/qianfan_ocr.py
 
 The RefinedWeb and RefinedWebModel configuration projects the vLLM RWConfig constructor, attribute aliases and computed head dimension. Copyright 2023 The vLLM team. Copyright 2022 the Big Science Workshop and HuggingFace Inc. team. All rights reserved. The upstream source uses Apache-2.0.
 
