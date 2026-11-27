@@ -108,44 +108,78 @@ def _branch() -> BranchSpace:
     )
 
 
-def test_sparse_log_scheduler_domains_preserve_budgets_and_scale():
+@pytest.mark.parametrize(
+    ("top", "measured", "exact"),
+    [(65, 128, True), (66, 65_536, True), (128, 1024, False), (100_000_000, 1_000_000_000, False)],
+)
+def test_sparse_log_scheduler_domains_preserve_budgets_and_scale(top, measured, exact):
     from vizier import pyvizier as vz
 
     name = "agg_max_num_batched_tokens"
-    # One large declared interval and a distant measured setting must fit without expanding either range.
-    ceiling = 100_000_000
-    exact = 1_000_000_000
-    for top, measured in [(65, 128), (ceiling, exact)]:
-        bounds = _union_scheduler_ranges([range(64, top + 1), range(measured, measured + 1)])
-        branch = replace(
-            _branch(),
-            knob_choices={"backend": ["trtllm"]},
-            integer_ranges={name: bounds},
-            log_integer_ranges=frozenset({name}),
-        )
-        random = make_branch_sampler(branch, study_id="sparse", algorithm="random", seed=42)
-        suggestions = [row.selection[name] for row in random.suggest(24)]
-        assert all(64 <= value <= top or value == measured for value in suggestions)
+    bounds = _union_scheduler_ranges([range(64, top + 1), range(measured, measured + 1)])
+    branch = replace(
+        _branch(),
+        knob_choices={"backend": ["trtllm"]},
+        integer_ranges={name: bounds},
+        log_integer_ranges=frozenset({name}),
+    )
+    random = make_branch_sampler(branch, study_id="sparse", algorithm="random", seed=42)
+    suggestions = [row.selection[name] for row in random.suggest(24)]
+    assert all(64 <= value <= top or value == measured for value in suggestions)
 
-        # The embedded and seeded Vizier samplers register their dimensions through the same function.
-        space = vz.SearchSpace()
-        decoders = {}
-        _add_integer_parameters(space.root, vz, branch, decoders)
-        parameter = space.get(name)
-        assert parameter.scale_type == vz.ScaleType.LOG
+    # The embedded and seeded Vizier samplers register their dimensions through the same function.
+    space = vz.SearchSpace()
+    decoders = {}
+    _add_integer_parameters(space.root, vz, branch, decoders)
+    parameter = space.get(name)
+    assert parameter.scale_type == vz.ScaleType.LOG
+    if exact:
+        assert parameter.type == vz.ParameterType.DISCRETE
+        expected = [*range(64, top + 1), measured]
+        assert parameter.feasible_values == expected
+        assert [decoders[name](value) for value in parameter.feasible_values] == expected
         if top == 65:
             assert set(suggestions) == {64, 65, 128}
-            assert parameter.feasible_values == [64, 65, 128]
-            assert [decoders[name](value) for value in parameter.feasible_values] == [64, 65, 128]
-        else:
-            assert [decoders[name](value) for value in (64, top, top + 1, measured - 1, measured)] == [
-                64,
-                top,
-                top,
-                measured,
-                measured,
-            ]
+    else:
+        # Vizier enumerates the entire physical span for INTEGER parameters in its converters.
+        assert parameter.type == vz.ParameterType.DOUBLE
+        assert parameter.bounds == (64, measured)
+        assert [decoders[name](value) for value in (64, top, top + 1, (top + measured) / 2, measured - 1)] == [
+            64,
+            top,
+            top,
+            top,
+            measured,
+        ]
     assert _union_scheduler_ranges([range(64, 100), range(64, 129)]) == (64, 128)
+
+
+@pytest.mark.parametrize("algorithm", [None, "bayesian"], ids=["embedded", "seeded"])
+@pytest.mark.parametrize(("top", "measured"), [(66, 65_536), (128, 256)])
+def test_vizier_samples_disjoint_ranges_without_enumerating_gaps(monkeypatch, algorithm, top, measured):
+    from vizier import pyvizier as vz
+
+    name = "agg_max_num_batched_tokens"
+    bounds = _union_scheduler_ranges([range(64, top + 1), range(measured, measured + 1)])
+    branch = replace(
+        _branch(),
+        knob_choices={"backend": ["trtllm"]},
+        integer_ranges={name: bounds},
+        log_integer_ranges=frozenset({name}),
+    )
+    get_values = vz.ParameterConfig.feasible_values.fget
+
+    def bounded_values(parameter):
+        if parameter.name == name and parameter.type == vz.ParameterType.INTEGER:
+            raise AssertionError(f"Vizier tried to enumerate the full scheduler range {parameter.bounds}")
+        return get_values(parameter)
+
+    monkeypatch.setattr(vz.ParameterConfig, "feasible_values", property(bounded_values))
+    monkeypatch.setenv("AISIM_SWEEPER_VIZIER_ALGO", "RANDOM_SEARCH")
+    sampler = make_branch_sampler(branch, study_id=f"sparse_{uuid.uuid4().hex}", algorithm=algorithm, seed=42)
+    (suggestion,) = sampler.suggest(1)
+    value = suggestion.selection[name]
+    assert isinstance(value, int) and (64 <= value <= top or value == measured)
 
 
 def test_seeded_bayesian_uses_float64_from_an_fp32_runtime() -> None:

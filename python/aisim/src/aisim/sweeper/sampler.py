@@ -49,6 +49,7 @@ from .search_space import BranchSpace, IntegerRangeUnion, matches_parallel_domai
 
 _CONSTANT_PARAM = "_sweeper_constant"
 _METRIC = "objective"
+_MAX_DISCRETE_UNION_SIZE = 64
 _SWEEPER_VIZIER_ALGO_ENV = "AISIM_SWEEPER_VIZIER_ALGO"
 _LEGACY_SWEEPER_VIZIER_ALGO_ENV = "AISIMULATE_SWEEPER_VIZIER_ALGO"
 _LEGACY_SPICA_VIZIER_ALGO_ENV = "SPICA_VIZIER_ALGO"
@@ -151,19 +152,17 @@ def _add_integer_parameters(root, vz, branch, decoders):
     for knob, bounds in branch.integer_ranges.items():
         scale = vz.ScaleType.LOG if knob in branch.log_integer_ranges else vz.ScaleType.LINEAR
         decoders[knob] = lambda value: round(float(value))
-        if isinstance(bounds, IntegerRangeUnion):
-            # A sparse set of endpoints fits directly in Vizier's discrete domain.
-            if all(len(interval) <= 2 for interval in bounds.intervals):
-                endpoints = [value for interval in bounds.intervals for value in interval]
-                root.add_discrete_param(knob, feasible_values=endpoints, scale_type=scale)
-                continue
-            # Vizier has no disjoint integer range. Project its physical, scaled
-            # coordinate to the nearest feasible value without expanding the union.
-            minimum, maximum = bounds[0], bounds[-1]
-            decoders[knob] = lambda value, domain=bounds: domain[domain.nearest_index(float(value))]
-        else:
+        if not isinstance(bounds, IntegerRangeUnion):
             minimum, maximum = bounds
-        root.add_int_param(knob, min_value=minimum, max_value=maximum, default_value=minimum, scale_type=scale)
+            root.add_int_param(knob, min_value=minimum, max_value=maximum, default_value=minimum, scale_type=scale)
+        elif len(bounds) <= _MAX_DISCRETE_UNION_SIZE:
+            root.add_discrete_param(knob, feasible_values=list(bounds), scale_type=scale)
+        else:
+            # Vizier enumerates every coordinate in an integer range. A continuous
+            # physical coordinate can project onto large unions without expanding them.
+            minimum, maximum = bounds[0], bounds[-1]
+            root.add_float_param(knob, min_value=minimum, max_value=maximum, default_value=minimum, scale_type=scale)
+            decoders[knob] = lambda value, domain=bounds: domain[domain.nearest_index(float(value))]
 
 
 def _vizier_modules() -> tuple[Any, Any]:
