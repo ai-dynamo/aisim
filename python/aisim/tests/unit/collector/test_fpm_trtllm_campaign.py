@@ -40,8 +40,8 @@ def test_frozen_trtllm_plan_binds_observer_and_points(tmp_path):
         build_plan(MODEL, SYSTEM, replace(plan.options, benchmark_points_json=None), frozen, "revision", IMAGE_SHA256)
 
 
-@pytest.mark.parametrize("baseline_power", [200.5, None])
-def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline_power):
+@pytest.mark.parametrize(("baseline_power", "shutdown"), [(200.5, True), (None, True), (200.5, False)])
+def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline_power, shutdown):
     plan = _plan()
     arms = []
     receipt = {"gpu_uuids": ["GPU-0", "GPU-1"], "mean_w_per_gpu": 200.5, "serving_frames_s": 100}
@@ -51,17 +51,23 @@ def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline
             raw = out / "raw" / "node-0"
             ctx = _cell_context(plan, cell, cell.cell_id, "1")
             patch.setattr(simulated, "context", lambda _: ctx)
-            simulated.run(raw, patch, phase=cell.workload_kind, read_cost=0.025)
+            simulated.run(
+                raw, patch, phase=cell.workload_kind, read_cost=0.025, count=16 if shutdown else 6, shutdown=shutdown
+            )
             arms.append((cell, cell.cell_id, out, receipt | {"mean_w_per_gpu": baseline_power}, receipt))
-            reason, clock = _validate_clock(raw, {"GPU-0", "GPU-1"})
-            assert reason is None
-            assert clock["boundary_displacement_s"] == pytest.approx(0.025)
-            assert clock["common_energy_window_s"] == pytest.approx(2.075)
+            if shutdown:
+                reason, clock = _validate_clock(raw, {"GPU-0", "GPU-1"})
+                assert reason is None
+                assert clock["boundary_displacement_s"] == pytest.approx(0.025)
+                assert clock["common_energy_window_s"] == pytest.approx(2.075)
+            else:
+                assert not any(raw.glob("trtllm-*/published.json"))
 
     parquet, rows, summary = publish_campaign(plan, arms, tmp_path / "systems")
     assert parquet.is_file()
     assert {row["workload_kind"] for row in rows} == {"prefill", "decode"}
-    expected = pytest.approx(620 / 2.1) if baseline_power is not None else None
+    assert all(row["latency_ms"] == pytest.approx(210) for row in rows)
+    expected = pytest.approx(620 / 2.1) if shutdown and baseline_power is not None else None
     assert all(row["power_w"] == expected for row in rows)
     assert all(entry["serving_rate_change_pct"] == 0 for entry in summary.values())
     # Use the compiled profile query on the same schema-8 file just published.

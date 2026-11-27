@@ -328,16 +328,17 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
         receipt = _rates(gpus, start, end, replies)
         _save(raw / "throughput-energy.json", receipt)
         if enabled:
-            try:
-                _wait(
-                    lambda: (raw / "benchmark.json").is_file() and (raw / "collector-provenance.json").is_file(),
-                    processes,
-                    "TRT-LLM observer artifact",
-                    timeout=12,
+
+            def observation_finished():
+                return any(raw.glob("trtllm-*/published.json")) or any(
+                    process.poll() is not None for process in processes
                 )
+
+            try:
+                _wait(observation_finished, (), "TRT-LLM observer artifact", timeout=12)
             except TimeoutError:
-                # The observer also seals a valid latency sample on shutdown
-                # when the work ended before the power window could close.
+                # Use the latency artifact already saved by the observer if
+                # shutdown cannot finish the power window.
                 pass
     if enabled and not ((raw / "benchmark.json").is_file() and (raw / "collector-provenance.json").is_file()):
         raise RuntimeError("TRT-LLM observer finished without a latency artifact; see rank records and engine log")
