@@ -282,8 +282,11 @@ def _resolve_moe_dimensions(
     Mirrors :meth:`ModelConfig.resolve_moe_parallelism` for routed checkpoints so
     the native build and the naive fallback price the same layout:
 
-    - both omitted: raise, because the config contract refuses to invent a layout
-      the caller did not request;
+    - both omitted: at attention width ``1`` the only layout is ``1x1``, so it
+      is resolved -- this is what the internal producers mean when they omit the
+      pair for an unsharded deployment. At a wider attention width the omission
+      is ambiguous and raises, because the config contract refuses to invent a
+      layout the caller did not request;
     - one omitted: inferred from the attention width
       (``tp_size * attention_dp_size * cp_size``), as every other SDK path does;
     - both given: returned unchanged for ``ModelConfig`` to validate.
@@ -315,6 +318,11 @@ def _resolve_moe_dimensions(
 
     if moe_tp_size is None:
         if moe_ep_size is None:
+            if attn_width == 1:
+                # Unsharded deployment: no other layout exists, and the Replay
+                # and sweeper metadata producers omit the pair to mean exactly
+                # this, so resolving it invents no choice for the caller.
+                return 1, 1
             raise InvalidEngineConfigurationError(
                 "At least one of moe_tp_size or moe_ep_size must be set for MoE models."
             )
@@ -433,10 +441,12 @@ class KVCacheEstimator:
         also the config contract's rule: a single omitted dimension is inferred from
         the attention width (``tp_size * attention_dp_size * cp_size``), and an
         omitted ``moe_tp_size``/``moe_ep_size`` pair on a routed checkpoint raises the
-        same error ``ModelConfig.resolve_moe_parallelism`` raises, because no layout
-        can be inferred. Dense checkpoints never read these dimensions, so they keep
-        the caller's explicit value and ``1`` for an omitted one, matching direct
-        construction.
+        same error ``ModelConfig.resolve_moe_parallelism`` raises once that width is
+        greater than one, because several layouts are possible. At width one the pair
+        can only be ``1x1``, which is what the Replay and sweeper metadata producers
+        mean by omitting it, so it resolves. Dense checkpoints never read these
+        dimensions, so they keep the caller's explicit value and ``1`` for an omitted
+        one, matching direct construction.
         """
         validate_moe_controls(
             model_path=model_path,
@@ -1286,13 +1296,14 @@ def estimate_kv_cache(
     Omitted MoE widths resolve the same way on both paths: one omitted dimension
     is inferred from the attention width (``tp_size * attention_dp_size *
     cp_size``), and an omitted ``moe_tp_size``/``moe_ep_size`` pair on a routed
-    checkpoint raises, exactly as :meth:`ModelConfig.resolve_moe_parallelism`
-    does, because no layout can be inferred. Dense checkpoints never read these
-    widths, so they keep the caller's explicit value and ``1`` for an omitted
-    one, as direct construction does. The naive fallback shares that rule with
-    :meth:`KVCacheEstimator.from_request`; without it, it would shard expert
-    weights by ``1 * 1`` while the native build resolved a different pair, or
-    price a layout the native path rejects.
+    checkpoint raises the error :meth:`ModelConfig.resolve_moe_parallelism`
+    raises when that width is greater than one, because several layouts are
+    possible. At width one the pair is necessarily ``1x1``, so it resolves. Dense
+    checkpoints never read these widths, so they keep the caller's explicit value
+    and ``1`` for an omitted one, as direct construction does. The naive fallback
+    shares that rule with :meth:`KVCacheEstimator.from_request`; without it, it
+    would shard expert weights by ``1 * 1`` while the native build resolved a
+    different pair, or price a layout the native path rejects.
 
     Args:
         memory_fraction_kind: ``"of_total"`` (vLLM / SGLang) or ``"of_free"``

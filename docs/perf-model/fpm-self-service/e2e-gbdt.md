@@ -66,7 +66,10 @@ when `moe_tp_size * moe_ep_size == 1`. The Replay YAML can still use
 `parallelism.moe_tensor: 1` and `parallelism.moe_expert: 1`; its compiler represents
 those unsharded dimensions as `None` in the canonical identity. Training with
 explicit `1, 1` preserves a different identity and fails the exact identity check
-when Replay loads the artifact. For a sharded topology, retain both fields,
+when Replay loads the artifact. The SDK capacity estimator resolves that
+unsharded omission to `1x1` at attention width one, so omitting the pair here
+does not block KV-cache estimation; see
+[GPU memory and cache capacity](../memory.md#kv-cache-capacity-reservation). For a sharded topology, retain both fields,
 including a dimension equal to 1 as in the template. Use the same reviewed
 identity for training and subsequent SDK construction.
 

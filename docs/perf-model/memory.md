@@ -44,15 +44,21 @@ through the backend's `current` data alias for the requested system and data
 roots. Explicit version selectors are preserved. FPM profile estimates still
 require the profile's literal backend version.
 
-A routed-MoE estimate must name at least one expert width. `estimate_kv_cache`
-and `KVCacheEstimator.from_request` infer a single omitted `moe_tp_size` or
-`moe_ep_size` from the attention width (`tp * attention_dp * cp_size`), and
-reject an omitted pair with `InvalidEngineConfigurationError`, matching
-`ModelConfig.resolve_moe_parallelism`: the caller would otherwise get an expert
-layout it never requested, and the naive fallback would shard expert weights by
-`1 * 1` while the native build priced another layout. Dense checkpoints never
-read these widths, so they keep the caller's explicit value and `1` for an
-omitted one, as direct construction does.
+A routed-MoE SDK estimate must name at least one expert width when the
+attention width (`tp * attention_dp * cp_size`) is greater than one.
+`estimate_kv_cache` and `KVCacheEstimator.from_request` infer a single omitted
+`moe_tp_size` or `moe_ep_size` from that width, and reject an omitted pair with
+`InvalidEngineConfigurationError`, matching
+`ModelConfig.resolve_moe_parallelism`: at that width several layouts exist, the
+caller would otherwise get an expert layout it never requested, and the naive
+fallback would shard expert weights by `1 * 1` while the native build priced
+another layout. At attention width one the only possible pair is `1x1`, and the
+Replay and sweeper metadata producers record an unsharded route as
+`moe_tp_size: null, moe_ep_size: null`
+([FPM identity guidance](fpm-self-service/e2e-gbdt.md#before-you-start)),
+so the estimator resolves those to `1x1` instead of failing single-GPU routed
+capacity estimation. Dense checkpoints never read these widths, so they keep the
+caller's explicit value and `1` for an omitted one, as direct construction does.
 
 For Mistral3's gated Pixtral encoder, the analytical activation estimate includes
 the replicated residual alongside the gate and up intermediates. Encoder tensor

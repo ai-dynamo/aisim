@@ -1237,12 +1237,13 @@ def test_estimate_kv_cache_infers_an_omitted_moe_dimension():
     assert out["source"] == "native"
 
 
-def test_estimate_kv_cache_rejects_an_omitted_moe_pair_like_the_config_contract(monkeypatch):
-    # `ModelConfig.resolve_moe_parallelism` refuses to invent a layout when both
-    # MoE widths are omitted, so the estimator must not price one either: the
-    # caller would silently get an expert layout it never requested. The typed
-    # error is raised before the perf-DB lookup and before the naive fallback,
-    # which would otherwise shard expert weights by 1 * 1.
+def test_estimate_kv_cache_rejects_an_ambiguous_omitted_moe_pair(monkeypatch):
+    # At `tp_size=4` an omitted pair has several possible layouts, and
+    # `ModelConfig.resolve_moe_parallelism` refuses to invent one, so the
+    # estimator must not price one either: the caller would silently get an
+    # expert layout it never requested. The typed error is raised before the
+    # perf-DB lookup and before the naive fallback, which would otherwise shard
+    # expert weights by 1 * 1.
     from aisim_core.sdk import perf_database
 
     def _unreachable(*args, **kwargs):
@@ -1269,6 +1270,118 @@ def test_estimate_kv_cache_rejects_an_omitted_moe_pair_like_the_config_contract(
             gpu_memory_capacity_bytes_override=800 * _GIB,
             allow_naive_fallback=True,
         )
+
+
+def test_estimate_kv_cache_resolves_an_omitted_moe_pair_at_attention_width_one():
+    # An unsharded deployment has exactly one possible layout, and the Replay and
+    # sweeper metadata producers omit the pair to mean it. Resolving `1x1` there
+    # invents no choice, and it keeps single-GPU routed capacity estimation
+    # working instead of turning every such replay into a terminal error.
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=1,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=False,
+    )
+    omitted = memory.estimate_kv_cache("Qwen/Qwen3-30B-A3B", "h200_sxm", "vllm", **kwargs)
+    explicit = memory.estimate_kv_cache(
+        "Qwen/Qwen3-30B-A3B", "h200_sxm", "vllm", moe_tp_size=1, moe_ep_size=1, **kwargs
+    )
+    assert omitted["source"] == explicit["source"] == "native"
+    assert omitted["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_estimate_kv_cache_naive_fallback_resolves_an_omitted_moe_pair_at_attention_width_one(monkeypatch):
+    _fallback_without_database(monkeypatch)
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=1,
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=True,
+    )
+    omitted = memory.estimate_kv_cache("Qwen/Qwen3-30B-A3B", "h200_sxm", "vllm", **kwargs)
+    explicit = memory.estimate_kv_cache(
+        "Qwen/Qwen3-30B-A3B", "h200_sxm", "vllm", moe_tp_size=1, moe_ep_size=1, **kwargs
+    )
+    assert omitted["source"] == explicit["source"] == "naive_fallback"
+    assert omitted["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_replay_worker_metadata_and_the_estimator_agree_on_an_unsharded_route():
+    # Trace the Replay producer through the estimator: an unsharded routed worker
+    # emits `moe_tp_size=None, moe_ep_size=None` on purpose, and that metadata is
+    # the input `estimate_num_gpu_blocks` forwards to the Python estimator.
+    from aisim.compiler import _worker_performance_model_metadata
+    from aisim.config.engine import EnginePredictionConfig
+
+    engine = EnginePredictionConfig(
+        model="Qwen/Qwen3-30B-A3B",
+        hardware="h200_sxm",
+        backend="vllm",
+        workers={"aggregated": {}},
+    )
+    worker = engine.workers.aggregated
+    assert worker is not None
+    config = _worker_performance_model_metadata(engine, worker)["config"]
+    assert config["moe_tp_size"] is None and config["moe_ep_size"] is None
+
+    out = memory.estimate_kv_cache(
+        config["model_path"],
+        config["system"],
+        config["backend"],
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=config["tp_size"],
+        attention_dp_size=config["attention_dp_size"],
+        moe_tp_size=config["moe_tp_size"],
+        moe_ep_size=config["moe_ep_size"],
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=False,
+    )
+    assert out["source"] == "native"
+
+
+def test_sweeper_metadata_and_the_estimator_agree_on_an_unsharded_route():
+    # Same trace for the sweeper producer, which builds the identity from an
+    # unrolled sample.
+    from aisim.sweeper.deploy import _performance_model_metadata
+
+    sample = {
+        "backend": "vllm",
+        "model_name": "Qwen/Qwen3-30B-A3B",
+        "hardware_sku": "h200_sxm",
+        "tp": 1,
+        "attention_dp": 1,
+        "moe_tp": 1,
+        "moe_ep": 1,
+    }
+    config = _performance_model_metadata(sample, "agg", backend_version="0.24.0")["config"]
+    assert config["moe_tp_size"] is None and config["moe_ep_size"] is None
+
+    out = memory.estimate_kv_cache(
+        config["model_path"],
+        config["system"],
+        config["backend"],
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=config["tp_size"],
+        attention_dp_size=config["attention_dp_size"],
+        moe_tp_size=config["moe_tp_size"],
+        moe_ep_size=config["moe_ep_size"],
+        gpu_memory_capacity_bytes_override=800 * _GIB,
+        allow_naive_fallback=False,
+    )
+    assert out["source"] == "native"
 
 
 def test_from_request_rejects_an_omitted_moe_pair():
