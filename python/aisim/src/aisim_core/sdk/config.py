@@ -201,10 +201,11 @@ class ModelConfig:
         """Resolve and validate MoE parallelism dimensions in-place.
 
         For MoE models, the attention width must match the expert width:
-        ``tp_size * attention_dp_size == moe_tp_size * moe_ep_size``. If one
-        MoE dimension is missing, infer it from the other. If both are missing,
-        raise an error so callers do not silently get an MoE layout they did
-        not request.
+        ``tp_size * attention_dp_size * cp_size == moe_tp_size * moe_ep_size``.
+        If one MoE dimension is missing, infer it from the other. If both are
+        missing, raise an error so callers do not silently get an MoE layout
+        they did not request -- except at attention width ``1``, where the pair
+        can only be ``1x1`` and resolving it invents no choice.
         """
 
         def _validate_positive(name: str, value: int) -> None:
@@ -223,7 +224,15 @@ class ModelConfig:
         moe_tp_size = self.moe_tp_size
         moe_ep_size = self.moe_ep_size
         if moe_tp_size is None and moe_ep_size is None:
-            raise ValueError("At least one of moe_tp_size or moe_ep_size must be set for MoE models.")
+            if attn_width == 1:
+                # An unsharded deployment has exactly one possible layout, and
+                # the canonical unsharded identity records the pair as unset, so
+                # resolving `1x1` keeps the CLI and config paths working without
+                # inventing a layout for the caller.
+                moe_tp_size = 1
+                moe_ep_size = 1
+            else:
+                raise ValueError("At least one of moe_tp_size or moe_ep_size must be set for MoE models.")
         elif moe_tp_size is None:
             _validate_positive("moe_ep_size", moe_ep_size)
             if attn_width % moe_ep_size != 0:

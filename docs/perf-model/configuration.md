@@ -24,7 +24,7 @@ greater than one: one omitted width is inferred from that width, while omitting
 both is an error (see
 [GPU memory and cache capacity](memory.md#kv-cache-capacity-reservation)). At
 attention width one the pair is necessarily `1x1`, and an unsharded canonical
-identity records it as unset, so the SDK estimator resolves it. Dense topologies
+identity records it as unset, so the config and the SDK estimator resolve it. Dense topologies
 never read these widths, so an explicit value is kept and an omitted one stays
 `1`.
 

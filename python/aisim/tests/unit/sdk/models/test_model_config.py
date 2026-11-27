@@ -361,6 +361,19 @@ class TestMOEParallelismResolution:
         with pytest.raises(ValueError, match="At least one of moe_tp_size or moe_ep_size must be set"):
             get_model("Qwen/Qwen3-235B-A22B", model_config, backend_name="trtllm")
 
+    def test_both_missing_moe_parallelism_resolves_at_attention_width_one(self):
+        # At width one the pair can only be 1x1, so the default routed CLI/SDK
+        # invocation resolves it instead of failing with the ambiguity error.
+        model_config = config.ModelConfig(
+            tp_size=1,
+            attention_dp_size=1,
+            moe_tp_size=None,
+            moe_ep_size=None,
+        )
+
+        assert model_config.resolve_moe_parallelism() == (1, 1)
+        assert (model_config.moe_tp_size, model_config.moe_ep_size) == (1, 1)
+
     @pytest.mark.parametrize(
         "tp_size,attention_dp_size,moe_tp_size,moe_ep_size,expected_moe_tp_size,expected_moe_ep_size",
         [

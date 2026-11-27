@@ -280,7 +280,7 @@ def _resolve_moe_dimensions(
     """Resolve the MoE tensor/expert widths a request implies.
 
     Mirrors :meth:`ModelConfig.resolve_moe_parallelism` for routed checkpoints so
-    the native build and the naive fallback price the same layout:
+    the native build, the CLI and the naive fallback price the same layout:
 
     - both omitted: at attention width ``1`` the only layout is ``1x1``, so it
       is resolved -- this is what the internal producers mean when they omit the
@@ -442,9 +442,9 @@ class KVCacheEstimator:
         the attention width (``tp_size * attention_dp_size * cp_size``), and an
         omitted ``moe_tp_size``/``moe_ep_size`` pair on a routed checkpoint raises the
         same error ``ModelConfig.resolve_moe_parallelism`` raises once that width is
-        greater than one, because several layouts are possible. At width one the pair
-        can only be ``1x1``, which is what the Replay and sweeper metadata producers
-        mean by omitting it, so it resolves. Dense checkpoints never read these
+        greater than one, because several layouts are possible. At width one both
+        resolve the only possible pair, ``1x1``, which is what the Replay and sweeper
+        metadata producers mean by omitting it. Dense checkpoints never read these
         dimensions, so they keep the caller's explicit value and ``1`` for an omitted
         one, matching direct construction.
         """

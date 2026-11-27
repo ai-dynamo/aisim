@@ -146,6 +146,20 @@ def test_dense_gemma4_moe_parallelism_is_passed_through_untouched():
     assert api._resolve_moe_parallelism(4, 1, None, 4, model_path=_ROUTED_GEMMA4) == (1, 4)
 
 
+def test_routed_estimate_resolves_an_omitted_pair_only_at_attention_width_one():
+    """The CLI estimate path shares the estimator's width-one rule.
+
+    At attention width one the pair can only be ``1x1``, so the default routed
+    invocation (``tp_size=1`` and no MoE widths) must not fail. At a wider width
+    the omission stays ambiguous and the config contract still rejects it.
+    """
+    import aisim.legacy_cli.api as api
+
+    assert api._resolve_moe_parallelism(1, 1, None, None, model_path=_ROUTED_GEMMA4) == (1, 1)
+    with pytest.raises(ValueError, match="At least one of moe_tp_size or moe_ep_size must be set"):
+        api._resolve_moe_parallelism(2, 1, None, None, model_path=_ROUTED_GEMMA4)
+
+
 class _FakeStaticSummary:
     def check_oom(self):
         return False

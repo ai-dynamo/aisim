@@ -60,6 +60,14 @@ so the estimator resolves those to `1x1` instead of failing single-GPU routed
 capacity estimation. Dense checkpoints never read these widths, so they keep the
 caller's explicit value and `1` for an omitted one, as direct construction does.
 
+With `allow_naive_fallback=True`, `estimate_kv_cache` still re-raises every
+`InvalidEngineConfigurationError` instead of pricing the request with the naive
+estimator. The rule applies to all models, not only Gemma 4, and covers the
+omitted-pair and width-mismatch rejections above: a configuration the native
+build refuses must not become a plausible-looking capacity number. Other
+failures (unsupported model/backend, unavailable performance data, no KV budget,
+an HF config fetch failure) remain fallback-eligible when the caller allows it.
+
 For Mistral3's gated Pixtral encoder, the analytical activation estimate includes
 the replicated residual alongside the gate and up intermediates. Encoder tensor
 parallelism shards those intermediates; encoder data parallelism keeps a full
