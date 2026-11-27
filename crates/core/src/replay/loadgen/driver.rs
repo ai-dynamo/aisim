@@ -168,6 +168,9 @@ struct AgenticState {
     // profile has replaced every finished lane play. While it is clear no
     // active profile play is client-finished, so lane scans can be skipped.
     finished_unscanned: bool,
+    // The same for live warmup, which replaces a finished play only on a lane
+    // with quota: while it is clear no lane with quota has a finished play.
+    warmup_finished_unscanned: bool,
     lanes: Vec<AgenticLaneState>,
     // Finite lane replay draws from one source-ordered queue whenever a slot
     // becomes free. Slot assignment must follow admission, not source modulo.
@@ -824,6 +827,7 @@ impl AgenticState {
     fn mark_client_finished(&mut self, play_index: usize) {
         self.plays[play_index].client_finished = true;
         self.finished_unscanned = true;
+        self.warmup_finished_unscanned = true;
     }
 
     fn finish_play_if_quiescent(&mut self, play_index: usize, now_ms: f64) {
@@ -1438,6 +1442,21 @@ impl WorkloadDriver {
                 return None;
             };
             let preparation = self.agentic_preparation.as_ref()?;
+            // Every finished play on a lane with quota is replaced before the
+            // flag is cleared, and a lane never regains quota.
+            debug_assert!(
+                state.warmup_finished_unscanned
+                    || profile
+                        .active_plays
+                        .iter()
+                        .enumerate()
+                        .all(|(lane, &play)| {
+                            !preparation.lane_has_budget(lane) || !state.plays[play].client_finished
+                        })
+            );
+            if !state.warmup_finished_unscanned {
+                return None;
+            }
             return profile
                 .active_plays
                 .iter()
@@ -1607,7 +1626,14 @@ impl WorkloadDriver {
         if !now_ms.is_finite() || now_ms < profile.last_advanced_ms {
             bail!("live warmup clock must be finite and nondecreasing");
         }
-        let active = profile.active_plays.clone();
+        let SchedulingPolicy::Agentic(state) = &self.policy else {
+            unreachable!()
+        };
+        let active = if state.warmup_finished_unscanned {
+            profile.active_plays.clone()
+        } else {
+            Vec::new()
+        };
         let mut changed = false;
         for (lane, play) in active.into_iter().enumerate() {
             let SchedulingPolicy::Agentic(state) = &self.policy else {
@@ -1623,6 +1649,10 @@ impl WorkloadDriver {
                 changed = true;
             }
         }
+        let SchedulingPolicy::Agentic(state) = &mut self.policy else {
+            unreachable!()
+        };
+        state.warmup_finished_unscanned = false;
         self.agentic_profile.as_mut().unwrap().last_advanced_ms = now_ms;
         Ok(changed)
     }
@@ -2178,6 +2208,7 @@ impl WorkloadDriver {
             ready_nodes: vec![0; agentic_plays.len()],
             plays: agentic_plays,
             finished_unscanned: false,
+            warmup_finished_unscanned: false,
             lanes: Vec::new(),
             next_pending_play: 0,
             lifecycle: Vec::new(),
@@ -2527,6 +2558,7 @@ impl WorkloadDriver {
             ready_nodes: vec![0; plays.len()],
             plays,
             finished_unscanned: false,
+            warmup_finished_unscanned: false,
             lanes,
             next_pending_play,
             lifecycle: Vec::new(),
@@ -2875,7 +2907,6 @@ impl WorkloadDriver {
         }
 
         let mut emitted = Vec::new();
-        let mut quota_deferred = Vec::new();
         while emitted.len() < effective_limit {
             let Some(ready_session) = self.ready_sessions.pop() else {
                 break;
@@ -2899,7 +2930,9 @@ impl WorkloadDriver {
                     .unwrap()
                     .lane_has_budget(lane)
                 {
-                    quota_deferred.push(ready_session);
+                    // A lane's quota never returns during live warmup, and the
+                    // profile handoff rebuilds this heap from the node states,
+                    // so a quota-paused entry is dropped.
                     continue;
                 }
                 Some(lane)
@@ -3120,7 +3153,6 @@ impl WorkloadDriver {
                 );
             }
         }
-        self.ready_sessions.extend(quota_deferred);
         emitted
     }
 
