@@ -8,7 +8,9 @@
 # https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90/python/sglang/srt/models
 # https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/auto/modeling_auto.py
 # SGLang 0.5.x stock model entrypoints and declared multimodal classes by first and last patch.
-# transformers rows are exported classes with a composite text config and backend-compatible attention in the pinned HF wheel.
+# transformers rows identify supported composite Transformers entrypoints.
+# compatible rows list additional exported modeling classes accepted as alternatives, grouped by suffix (- for none).
+# https://github.com/huggingface/transformers/tree/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models
 multimodal 6 23 CLIPModel DeepseekOCRForCausalLM DeepseekVL2ForCausalLM DotsOCRForCausalLM DotsVLMForCausalLM
 multimodal 6 23 Gemma3ForConditionalGeneration Gemma3nForConditionalGeneration Glm4vForConditionalGeneration
 multimodal 6 23 Glm4vMoeForConditionalGeneration Grok1AForCausalLM Grok1VForCausalLM
@@ -176,3 +178,249 @@ transformers 22 23 HunYuanVLModel HyperCLOVAXVisionV2ForConditionalGeneration Hy
 transformers 22 23 Kimi_K25ForConditionalGeneration Kimi_K25Model MuseGlimmerModel PaddleOCRVLModel
 transformers 22 23 Qwen3ASRForTokenClassification Qwen3ASRModel Step3p7Model Tipsv2Model Tipsv2VisionBackbone
 transformers 22 23 VibeVoiceForConditionalGeneration VideoPrismClipModel
+compatible 6 8 ForCausalLM Exaone4 Lfm2
+compatible 6 10 ForConditionalGeneration Qwen2_5OmniThinker Qwen3OmniMoeThinker
+compatible 6 16 Model Qwen3
+compatible 6 23 - Blip2TextModelWithProjection Blip2VisionModelWithProjection CLIPTextModelWithProjection
+compatible 6 23 - CLIPVisionModelWithProjection ChameleonVQVAE Emu3VQVAE Idefics3VisionTransformer
+compatible 6 23 - MetaClip2TextModelWithProjection MetaClip2VisionModelWithProjection Qwen3OmniMoeCode2Wav
+compatible 6 23 - Qwen3OmniMoeCode2WavDecoderBlock SmolVLMVisionTransformer
+compatible 6 23 Backbone Dinov2 Dinov2WithRegisters
+compatible 6 23 Encoder Parakeet Voxtral
+compatible 6 23 ForAudioClassification AST
+compatible 6 23 ForCTC Parakeet
+compatible 6 23 ForCausalLM AriaText BitNet CsmDepthDecoder Doge Dots1 Ernie4_5 FlexOlmo GPTNeoX Glm Helium MiniMax
+compatible 6 23 ForCausalLM Ministral ModernBertDecoder Olmo3 Phi4Multimodal SeedOss SmolLM3 VaultGemma
+compatible 6 23 ForConditionalGeneration Chameleon Csm Qwen2_5Omni Qwen2_5OmniPreTrainedModel Qwen2_5OmniTalker
+compatible 6 23 ForConditionalGeneration Qwen3OmniMoePreTrainedModel Qwen3OmniMoeTalker
+compatible 6 23 ForConditionalGeneration Qwen3OmniMoeTalkerCodePredictorModel T5Gemma
+compatible 6 23 ForDepthEstimation DPT
+compatible 6 23 ForImageClassification DeiT Dinov2 Dinov2WithRegisters IJepa ViT ViTMSN
+compatible 6 23 ForImageClassificationWithTeacher DeiT
+compatible 6 23 ForMaskedImageModeling DeiT ViT
+compatible 6 23 ForMaskedLM Esm
+compatible 6 23 ForObjectDetection Yolos
+compatible 6 23 ForPreTraining ViTMAE VideoMAE
+compatible 6 23 ForQuestionAnswering Arcee Exaone4 GPT2 GPTNeoX Llama MiniMax Ministral Mistral Mixtral OPT Qwen2 Qwen3
+compatible 6 23 ForQuestionAnswering Qwen3Moe SeedOss SmolLM3
+compatible 6 23 ForSemanticSegmentation DPT
+compatible 6 23 ForSequenceClassification Arcee DeepseekV2 DeepseekV3 Doge Esm Exaone4 GPT2 GPTNeoX Gemma Gemma3Text Glm
+compatible 6 23 ForSequenceClassification Glm4 GptOss Helium HunYuanDenseV1 HunYuanMoEV1 MiniMax Ministral Mistral
+compatible 6 23 ForSequenceClassification Mixtral ModernBertDecoder OPT Persimmon Phi Phi3 Qwen3Moe SeedOss SmolLM3
+compatible 6 23 ForSequenceClassification Starcoder2 T5Gemma
+compatible 6 23 ForTokenClassification Apertus Arcee DeepseekV3 Esm Exaone4 GPT2 GPTNeoX Gemma Gemma2 Glm Glm4 GptOss
+compatible 6 23 ForTokenClassification Helium Llama MiniMax Ministral Mistral Mixtral Persimmon Phi Phi3 Qwen2 Qwen3
+compatible 6 23 ForTokenClassification Qwen3Moe SeedOss SmolLM3 Starcoder2 T5Gemma
+compatible 6 23 ForVideoClassification VideoMAE Vivit
+compatible 6 23 ForVisionText2Text Idefics
+compatible 6 23 Model AST Apertus Arcee AriaText BitNet Blip2Vision CLIPText CLIPVision Chameleon Cohere Cohere2
+compatible 6 23 Model CsmBackbone CsmDepthDecoder DINOv3ViT DPT DeepseekV2 DeepseekV3 DeiT Dinov2 Dinov2WithRegisters
+compatible 6 23 Model Doge Dots1 EdgeTam EdgeTamVideo EdgeTamVision Ernie4_5 Ernie4_5_Moe Esm Exaone4 FlexOlmo GPT2
+compatible 6 23 Model GPT2DoubleHeads GPTNeoX Gemma Gemma2 Gemma3Text Gemma3nText Glm Glm4 Glm4Moe Glm4vMoeText
+compatible 6 23 Model Glm4vText GptOss Granite Helium HunYuanDenseV1 HunYuanMoEV1 IJepa Idefics InstructBlipVideoVision
+compatible 6 23 Model InstructBlipVision InternVLVision Lfm2 Llama LongcatFlash MetaClip2Text MetaClip2Vision MiniMax
+compatible 6 23 Model Ministral Mixtral ModernBertDecoder OPT Olmo Olmo2 Olmo3 Persimmon Phi Phi3 Phi4Multimodal
+compatible 6 23 Model Phi4MultimodalVision Qwen2 Qwen2VLText Qwen2_5OmniTalker Qwen2_5OmniThinkerText
+compatible 6 23 Model Qwen2_5OmniToken2Wav Qwen2_5OmniToken2WavBigVGAN Qwen2_5OmniToken2WavDiT Qwen2_5_VLText Qwen3Moe
+compatible 6 23 Model Qwen3OmniMoeCode2WavTransformer Qwen3OmniMoeTalker Qwen3OmniMoeTalkerCodePredictor
+compatible 6 23 Model Qwen3OmniMoeThinkerText Qwen3VLMoeText Qwen3VLMoeVision Qwen3VLText Qwen3VLVision Sam2
+compatible 6 23 Model Sam2HieraDet Sam2Video Sam2Vision SeedOss Siglip2Text Siglip2Vision SiglipText SiglipVision
+compatible 6 23 Model SmolLM3 Starcoder2 T5Gemma T5GemmaEncoder VaultGemma ViT ViTMAE ViTMSN VideoMAE Vivit Yolos
+compatible 6 23 PreTrainedModel AST Apertus Arcee Aria AriaText AyaVision BitNet Blip2 CLIP Chameleon Cohere Cohere2
+compatible 6 23 PreTrainedModel Cohere2Vision Csm DINOv3ViT DPT DeepseekV2 DeepseekV3 DeiT Dinov2 Dinov2WithRegisters
+compatible 6 23 PreTrainedModel Doge Dots1 EdgeTam EdgeTamVideo Emu3 Ernie4_5 Ernie4_5_Moe Esm EsmFold Exaone4 FlexOlmo
+compatible 6 23 PreTrainedModel Fuyu GPT2 GPTNeoX Gemma Gemma2 Gemma3 Gemma3n Glm Glm4 Glm4Moe Glm4v Glm4vMoe GotOcr2
+compatible 6 23 PreTrainedModel GptOss Granite Helium HunYuanDenseV1 HunYuanMoEV1 IJepa Idefics Idefics3 InstructBlip
+compatible 6 23 PreTrainedModel InstructBlipVideo InternVL InternVLVision Kosmos2 Kosmos2_5 Lfm2 Lfm2Vl Llama Llama4
+compatible 6 23 PreTrainedModel Llava LlavaNext LlavaNextVideo LlavaOnevision LongcatFlash MetaClip2 MiniMax Ministral
+compatible 6 23 PreTrainedModel Mistral Mistral3 Mixtral Mllama ModernBertDecoder OPT Olmo Olmo2 Olmo3 Ovis2 PaliGemma
+compatible 6 23 PreTrainedModel Parakeet PerceptionLM Persimmon Phi Phi3 Phi4Multimodal Phi4MultimodalVision Pixtral
+compatible 6 23 PreTrainedModel Qwen2 Qwen2VL Qwen2_5Omni Qwen2_5_VL Qwen3 Qwen3Moe Qwen3OmniMoe Qwen3OmniMoeThinkerText
+compatible 6 23 PreTrainedModel Qwen3VL Qwen3VLMoe Sam2 Sam2Video SeedOss Siglip Siglip2 SmolLM3 SmolVLM Starcoder2
+compatible 6 23 PreTrainedModel T5Gemma VaultGemma ViT ViTMAE ViTMSN VideoLlava VideoMAE VipLlava Vivit Voxtral Yolos
+compatible 9 9 - AdaptiveEmbedding ModalEmbeddings QDQBertLayer
+compatible 9 9 Backbone TextNet
+compatible 9 9 Encoder GraniteSpeechCTC
+compatible 9 9 ForClassification MMBT
+compatible 9 9 ForImageClassification TextNet
+compatible 9 9 ForVision2Seq AutoModel
+compatible 9 9 Head AutoModelWithLM
+compatible 9 9 Model MMBT TextNet
+compatible 9 9 PreTrainedModel TextNet
+compatible 9 10 - FalconMambaCache MambaCache
+compatible 9 14 - ViTMAELayer
+compatible 9 23 - BertLayer BigBirdLayer CanineLayer ConvBertLayer EdgeTamVideoInferenceSession FNetLayer GLPNLayer
+compatible 9 23 - GPTNeoXJapaneseLayer GPTNeoXLayer LayoutLMv2Layer LongformerSelfAttention LxmertXLayer MPNetLayer
+compatible 9 23 - MobileBertLayer MraLayer NllbMoeSparseMLP NllbMoeTop2Router NystromformerLayer PerceiverLayer
+compatible 9 23 - Qwen2RMSNorm ReformerAttention ReformerLayer RemBertLayer RoCBertLayer Sam2VideoInferenceSession
+compatible 9 23 - SeamlessM4THifiGan SegformerLayer SplinterLayer SqueezeBertModule SwitchTransformersSparseMLP
+compatible 9 23 - SwitchTransformersTop1Router ViltLayer VisualBertLayer YosoLayer
+compatible 9 23 Backbone Auto
+compatible 9 23 Encoder Lxmert LxmertVisualFeature
+compatible 9 23 ForAudioClassification AutoModel
+compatible 9 23 ForAudioFrameClassification AutoModel
+compatible 9 23 ForAudioTokenization AutoModel
+compatible 9 23 ForAudioXVector AutoModel
+compatible 9 23 ForCTC AutoModel
+compatible 9 23 ForCausalLM AutoModel
+compatible 9 23 ForDepthEstimation AutoModel
+compatible 9 23 ForDocumentQuestionAnswering AutoModel
+compatible 9 23 ForImageClassification AutoModel
+compatible 9 23 ForImageSegmentation AutoModel
+compatible 9 23 ForImageTextToText AutoModel
+compatible 9 23 ForImageToImage AutoModel
+compatible 9 23 ForInstanceSegmentation AutoModel
+compatible 9 23 ForKeypointDetection AutoModel SuperPoint
+compatible 9 23 ForKeypointMatching AutoModel SuperGlue
+compatible 9 23 ForMaskGeneration AutoModel
+compatible 9 23 ForMaskedImageModeling AutoModel
+compatible 9 23 ForMaskedLM AutoModel
+compatible 9 23 ForMultipleChoice AutoModel
+compatible 9 23 ForNextSentencePrediction AutoModel
+compatible 9 23 ForObjectDetection AutoModel
+compatible 9 23 ForPreTraining AutoModel
+compatible 9 23 ForQuestionAnswering AutoModel
+compatible 9 23 ForSemanticSegmentation AutoModel
+compatible 9 23 ForSeq2SeqLM AutoModel
+compatible 9 23 ForSequenceClassification AutoModel
+compatible 9 23 ForSpeechSeq2Seq AutoModel
+compatible 9 23 ForTableQuestionAnswering AutoModel
+compatible 9 23 ForTextEncoding AutoModel
+compatible 9 23 ForTextToSpectrogram AutoModel
+compatible 9 23 ForTextToWaveform AutoModel
+compatible 9 23 ForTimeSeriesPrediction AutoModel
+compatible 9 23 ForTokenClassification AutoModel
+compatible 9 23 ForUniversalSegmentation AutoModel
+compatible 9 23 ForVideoClassification AutoModel
+compatible 9 23 ForVisualQuestionAnswering AutoModel
+compatible 9 23 ForZeroShotImageClassification AutoModel
+compatible 9 23 ForZeroShotObjectDetection AutoModel
+compatible 9 23 FormerLayer Ro
+compatible 9 23 Model Auto Dac Encodec Xcodec
+compatible 9 23 PreTrainedModel Dac Encodec SuperGlue SuperPoint Xcodec
+compatible 10 15 ForConditionalGeneration GlmImage
+compatible 10 18 ForCausalLM GraniteMoeShared
+compatible 10 21 ForCausalLM ExaoneMoe
+compatible 10 21 Model PaddleOCRVL
+compatible 10 23 - GlmImageVQVAE PaddleOCRVisionTransformer Sam3TrackerVideoInferenceSession Sam3VideoInferenceSession
+compatible 10 23 - Sam3VideoSegmentationOutput
+compatible 10 23 Backbone DINOv3ViT LwDetrViT Pixio
+compatible 10 23 Decoder BertGeneration
+compatible 10 23 Encoder BertGeneration Gemma3nAudio Lasr PeAudio PeAudioVideo PeVideo VoxtralRealtime
+compatible 10 23 ForCTC Lasr
+compatible 10 23 ForCausalLM Camembert Cwm Data2VecText Electra Ernie Jais2 JetMoe NanoChat Phimoe RoCBert Roberta
+compatible 10 23 ForCausalLM RobertaPreLayerNorm SolarOpen XLMRoberta XLMRobertaXL Xmod Youtu
+compatible 10 23 ForConditionalGeneration Ernie4_5_VL_Moe HiggsAudioV2 T5Gemma2
+compatible 10 23 ForMaskedLM Albert Bert Camembert Data2VecText DistilBert Electra Ernie EuroBert MobileBert ModernBert
+compatible 10 23 ForMaskedLM RoCBert Roberta RobertaPreLayerNorm XLMRoberta XLMRobertaXL Xmod
+compatible 10 23 ForMultimodalLM AutoModel
+compatible 10 23 ForMultipleChoice Albert Bert Camembert Data2VecText DistilBert Electra Ernie MobileBert ModernBert
+compatible 10 23 ForMultipleChoice RoCBert Roberta RobertaPreLayerNorm XLMRoberta XLMRobertaXL Xmod
+compatible 10 23 ForNextSentencePrediction Bert Ernie MobileBert
+compatible 10 23 ForObjectDetection ConditionalDetr DFine DeformableDetr Detr LwDetr PPDocLayoutV2 PPDocLayoutV3 RTDetr
+compatible 10 23 ForObjectDetection RTDetrV2
+compatible 10 23 ForPreTraining Albert Bert Electra Ernie MobileBert RoCBert
+compatible 10 23 ForQuestionAnswering Albert Bert Camembert Data2VecText DistilBert Electra Ernie Ministral3 MobileBert
+compatible 10 23 ForQuestionAnswering ModernBert Qwen2Moe RoCBert Roberta RobertaPreLayerNorm XLMRoberta XLMRobertaXL
+compatible 10 23 ForQuestionAnswering Xmod
+compatible 10 23 ForSegmentation ConditionalDetr Detr
+compatible 10 23 ForSequenceClassification Albert Camembert Data2VecText DistilBert Electra Ernie EuroBert JetMoe
+compatible 10 23 ForSequenceClassification Ministral3 MobileBert ModernBert Phimoe Qwen2Moe RoCBert Roberta
+compatible 10 23 ForSequenceClassification RobertaPreLayerNorm T5Gemma2 XLMRobertaXL Xmod
+compatible 10 23 ForTokenClassification Albert Bert Camembert Data2VecText DistilBert Electra Ernie EuroBert Ministral3
+compatible 10 23 ForTokenClassification MobileBert ModernBert Qwen2Moe RoCBert Roberta RobertaPreLayerNorm T5Gemma2
+compatible 10 23 ForTokenClassification XLMRoberta XLMRobertaXL Xmod
+compatible 10 23 Head SegformerDecode
+compatible 10 23 Model Afmoe Albert BertLMHead Camembert ConditionalDetr Cwm DFine Data2VecText Dbrx DeformableDetr Detr
+compatible 10 23 Model DistilBert Electra Ernie Ernie4_5_VLMoeText Ernie4_5_VLMoeVariableResolutionResampler
+compatible 10 23 Model Ernie4_5_VLMoeVisionTransformerPretrained Ernie4_5_VL_Moe Ernie4_5_VL_MoeText
+compatible 10 23 Model Ernie4_5_VL_MoeVariableResolutionResampler Ernie4_5_VL_MoeVisionTransformerPretrained EuroBert
+compatible 10 23 Model ExaoneMoe Glm4MoeLite Glm4vMoeVision Glm4vVision GlmImageText GlmImageVision GlmMoeDsa GlmOcrText
+compatible 10 23 Model GlmOcrVision GraniteMoe GraniteMoeHybrid GraniteMoeShared HiggsAudioV2 HiggsAudioV2Tokenizer
+compatible 10 23 Model Jais2 JetMoe Lfm2Moe LwDetr MLCDVision MiniMaxM2 Ministral3 MobileBert ModernBert NanoChat Olmoe
+compatible 10 23 Model PPDocLayoutV2 PPDocLayoutV3 PaddleOCRText PaddleOCRVision PeAudioFrameLevel Phimoe Pixio Qwen2Moe
+compatible 10 23 Model RTDetr RTDetrV2 RoCBert Roberta RobertaPreLayerNorm Sam3Tracker Sam3TrackerVideo Sam3ViT
+compatible 10 23 Model Sam3Video Sam3Vision SolarOpen T5Gemma2 VideoLlama3Vision XLMRobertaXL Xmod Youtu
+compatible 10 23 PreTrainedModel Afmoe Albert Bert BertGeneration Camembert ConditionalDetr Cwm DFine Data2VecText Dbrx
+compatible 10 23 PreTrainedModel DeformableDetr Detr DistilBert Electra Ernie Ernie4_5_VLMoe Ernie4_5_VL_Moe EuroBert
+compatible 10 23 PreTrainedModel ExaoneMoe FastVlm Glm46V Glm4MoeLite GlmImage GlmMoeDsa GlmOcr GraniteMoe
+compatible 10 23 PreTrainedModel GraniteMoeHybrid GraniteMoeShared HiggsAudioV2 HiggsAudioV2Tokenizer Jais2 JetMoe Lasr
+compatible 10 23 PreTrainedModel Lfm2Moe LightOnOcr LwDetr LwDetrViT MLCD MiniMaxM2 Ministral3 MobileBert ModernBert
+compatible 10 23 PreTrainedModel ModernVBert NanoChat Olmoe PPDocLayoutV2 PPDocLayoutV3 PaddleOCRVL Phimoe Pixio
+compatible 10 23 PreTrainedModel Qwen2Moe RTDetr RTDetrV2 RoCBert Roberta RobertaPreLayerNorm Sam3 Sam3Tracker
+compatible 10 23 PreTrainedModel Sam3TrackerVideo Sam3Video SolarOpen T5Gemma2 VideoLlama3 VoxtralRealtime XLMRoberta
+compatible 10 23 PreTrainedModel XLMRobertaXL Xmod Youtu
+compatible 11 23 - JinaEmbeddingsV3Layer PPOCRV5MobileRecEncoderWithSVTR PPOCRV5ServerRecEncoderWithSVTR
+compatible 11 23 ForCausalLM Mistral4
+compatible 11 23 ForConditionalGeneration PI0
+compatible 11 23 ForDepthEstimation CHMv2
+compatible 11 23 ForImageSegmentation CLIPSeg
+compatible 11 23 ForMaskedLM JinaEmbeddingsV3 NomicBert
+compatible 11 23 ForQuestionAnswering JinaEmbeddingsV3
+compatible 11 23 ForSequenceClassification JinaEmbeddingsV3 Mistral4 NomicBert Olmo Olmo2 Olmo3
+compatible 11 23 ForTableRecognition AutoModel
+compatible 11 23 ForTextRecognition AutoModel PPOCRV5MobileRec PPOCRV5ServerRec
+compatible 11 23 ForTokenClassification JinaEmbeddingsV3 Mistral4 NomicBert OpenAIPrivacyFilter
+compatible 11 23 FormerDetrPreTrainedModel Mask
+compatible 11 23 Model AltCLIPText AltCLIPVision CLIPSegText CLIPSegVision ChineseCLIPText ChineseCLIPVision Gemma4Audio
+compatible 11 23 Model Gemma4Text Gemma4Vision HYV3 JinaEmbeddingsV3 Mistral4 NomicBert OpenAIPrivacyFilter OwlViTText
+compatible 11 23 Model OwlViTVision Owlv2Text Owlv2Vision PI0 PPOCRV5MobileRec PPOCRV5ServerRec QianfanOCRVision
+compatible 11 23 Model Sam3LiteTextText XCLIPText XCLIPVision
+compatible 11 23 PreTrainedModel AltCLIP CHMv2 CLIPSeg ChineseCLIP Gemma4 HYV3 JinaEmbeddingsV3 Mistral4 NomicBert
+compatible 11 23 PreTrainedModel OpenAIPrivacyFilter OwlViT Owlv2 PI0 PPOCRV5MobileRec PPOCRV5ServerRec QianfanOCR
+compatible 11 23 PreTrainedModel QianfanOCRVision Sam3LiteText XCLIP
+compatible 13 23 ForObjectDetection Deimv2
+compatible 13 23 Model DeepseekV4 Deimv2 Exaone4_5_Vision Granite4VisionText Laguna
+compatible 13 23 PreTrainedModel DeepseekV4 Deimv2 Exaone4_5_ Gemma4Assistant Granite4Vision Laguna
+compatible 15 15 ForCausalLM Mellum
+compatible 15 23 - PPOCRV6SmallRecEncoderWithSVTR
+compatible 15 23 Backbone Beit RfDetrDinov2 Sapiens2 Swin
+compatible 15 23 Encoder AudioFlamingo3 GlmAsr GraniteSpeechCTC GraniteSpeechPlusCTC
+compatible 15 23 ForCausalLM Gemma4Unified HyperCLOVAX MiniMaxM3VL
+compatible 15 23 ForImageClassification Beit Segformer Swin
+compatible 15 23 ForImageMatting AutoModel Sapiens2
+compatible 15 23 ForInstanceSegmentation RfDetr
+compatible 15 23 ForMaskedImageModeling Beit Swin
+compatible 15 23 ForNormalEstimation AutoModel Sapiens2
+compatible 15 23 ForObjectDetection RfDetr
+compatible 15 23 ForPointmapEstimation AutoModel Sapiens2
+compatible 15 23 ForPoseEstimation AutoModel Sapiens2
+compatible 15 23 ForRNNT AutoModel Parakeet
+compatible 15 23 ForSemanticSegmentation Beit Sapiens2 Segformer
+compatible 15 23 ForTDT AutoModel Parakeet
+compatible 15 23 ForTextRecognition PPOCRV6SmallRec PPOCRV6TinyRec
+compatible 15 23 Model Beit Cohere2Moe DeepseekOcr2Text DeepseekOcr2Vision DeepseekV32 DiffusionGemmaDecoder
+compatible 15 23 Model DiffusionGemmaEncoder DiffusionGemmaEncoderText Gemma4UnifiedText HrmText HyperCLOVAX Mellum
+compatible 15 23 Model MiniMaxM3VLText MiniMaxM3VLVision PPOCRV6SmallRec PPOCRV6TinyRec RfDetr Sapiens2 Segformer Swin
+compatible 15 23 PreTrainedModel AudioFlamingo3 Beit Cohere2Moe Cosmos3Omni DeepseekOcr2 DeepseekOcr2Text DeepseekV32
+compatible 15 23 PreTrainedModel DiffusionGemma Gemma4Unified Gemma4UnifiedAssistant GlmAsr GraniteSpeech
+compatible 15 23 PreTrainedModel GraniteSpeechPlus HrmText HyperCLOVAX Mellum MiniMaxM3VL MusicFlamingo PPOCRV6SmallRec
+compatible 15 23 PreTrainedModel PPOCRV6TinyRec RfDetr RfDetrDinov2 Sapiens2 Segformer Swin VibeVoiceAsr
+compatible 22 23 - HunYuanVLVisionTransformer Nemotron3DiarizationOutput Nemotron3DiarizationSpeakerCache
+compatible 22 23 - Nemotron3_5AsrRNNTOutput NemotronAsrStreamingEncoderModelOutput NemotronAsrStreamingRNNTOutput
+compatible 22 23 Encoder FunAsrNano GraniteSpeech5 NemotronAsrStreaming Qwen3ASR
+compatible 22 23 ForAudioFrameClassification Nemotron3Diarization
+compatible 22 23 ForCTC GraniteSpeech5
+compatible 22 23 ForCausalLM AXK1 AXK2 CohereCompass DiffLlama Moshi Nemotron RecurrentGemma
+compatible 22 23 ForConditionalGeneration KyutaiSpeechToText Moshi
+compatible 22 23 ForMaskedLM Esmc Gte NeoMME
+compatible 22 23 ForQuestionAnswering DiffLlama Nemotron
+compatible 22 23 ForRNNT Nemotron3_5Asr NemotronAsrStreaming
+compatible 22 23 ForRetrieval NeoMME
+compatible 22 23 ForSequenceClassification AXK1 AXK2 CTRL CohereCompassText DiffLlama Esmc GPTBigCode Gte MiniCPM3
+compatible 22 23 ForSequenceClassification Nemotron
+compatible 22 23 ForTokenClassification AXK1 AXK2 DiffLlama Esmc GPTBigCode Gte Nemotron
+compatible 22 23 ForVideoClassification VideoPrism
+compatible 22 23 FormerModel Blip2Q InstructBlipQ InstructBlipVideoQ
+compatible 22 23 Model AXK1 AXK2 CTRL CTRLLMHead CohereCompassText CohereCompassVision Cosmos3EdgeText Cosmos3EdgeVision
+compatible 22 23 Model DiffLlama EmbeddingGemma2Text Esmc GPTBigCode Glm5NextText Glm5NextVision GraniteMoeSWA
+compatible 22 23 Model GraniteSWA Gte HYV4 HunYuanVLText Kimi_K25Vision KyutaiSpeechToText MiMoV2Flash Mimi MiniCPM3
+compatible 22 23 Model Moshi MuseGlimmerText MuseGlimmerVision Nemotron Nemotron3Diarization Nemotron3DiarizationAudio
+compatible 22 23 Model NeoMME NeuCodec Qwen2_5_VisionTransformerPretrained RecurrentGemma Step3p7Text Step3p7Vision
+compatible 22 23 Model Tipsv2Text Tipsv2Vision VibeVoice VideoPrismText VideoPrismVideo VideoPrismVision Xcodec2 Zaya
+compatible 22 23 PreTrainedModel AXK1 AXK2 CTRL CohereCompass Cosmos3Edge DiffLlama EmbeddingGemma2 Esmc FunAsrNano
+compatible 22 23 PreTrainedModel GPTBigCode Glm5Next GraniteMoeSWA GraniteSWA GraniteSpeech5 Gte HYV4 HunYuanVL
+compatible 22 23 PreTrainedModel HyperCLOVAXVisionV2 Kimi_K25 KyutaiSpeechToText MiMoV2Flash Mimi MiniCPM3 Moshi
+compatible 22 23 PreTrainedModel MuseGlimmer MuseGlimmerAssistant Nemotron Nemotron3Diarization Nemotron3_5Asr
+compatible 22 23 PreTrainedModel NemotronAsrStreaming NeoMME NeuCodec Qwen3ASR RecurrentGemma Step3p7 Tipsv2 Tipsv2Text
+compatible 22 23 PreTrainedModel Tipsv2Vision VibeVoice VideoPrism Xcodec2 Zaya

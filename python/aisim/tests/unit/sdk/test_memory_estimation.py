@@ -3664,6 +3664,23 @@ def test_idefics2_compares_constructed_mistral_dimensions_and_checks_all_alterna
         assert NaiveKVCacheEstimator.from_hf_config(inherited, **options).kv_bytes_per_token() == 524_288
 
 
+@pytest.mark.parametrize(
+    ("family", "model_type", "hidden", "heads", "kv_heads", "expected"),
+    [("Idefics3", "idefics3", 4096, 32, 8, 131_072), ("SmolVLM", "smolvlm", 960, 15, 5, 40_960)],
+)
+def test_sglang_transformers_checks_exported_alternatives(family, model_type, hidden, heads, kv_heads, expected):
+    geometry = dict(hidden_size=hidden, num_hidden_layers=32, num_attention_heads=heads, num_key_value_heads=kv_heads)
+    root = dict(model_type=model_type, text_config=dict(model_type="llama", torch_dtype="bfloat16", **geometry))
+    options = dict(system="h100_sxm", backend="sglang", backend_version="0.5.23", tp_size=1, pp_size=1)
+    generation, base = family + "ForConditionalGeneration", family + "PreTrainedModel"
+    for names in ([generation], [generation, base], [base, generation]):
+        estimator = NaiveKVCacheEstimator.from_hf_config(dict(root, architectures=names), **options)
+        assert estimator.kv_bytes_per_token() == expected
+    for incompatible in ("MissingModelExport", "Wav2Vec2PreTrainedModel"):
+        with pytest.raises(ValueError, match="compatible model class for every architecture"):
+            NaiveKVCacheEstimator.from_hf_config(dict(root, architectures=[generation, incompatible]), **options)
+
+
 def test_selected_native_qwen_models_use_the_constructed_child_for_decoder_layers(tmp_path):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
@@ -3698,6 +3715,9 @@ def test_selected_native_qwen_models_use_the_constructed_child_for_decoder_layer
         path = tmp_path / str(width)
         path.mkdir()
         assert _compiled_vllm_transfer_widths(_write_config(path, document), "0.32.0") == (width, width)
+    implicit_text = {k: v for k, v in text.items() if k not in ("vocab_size", "hidden_size", "model_type")}
+    implicit = {**qwen3, "text_config": implicit_text}
+    assert _compiled_vllm_transfer_widths(_write_config(tmp_path, implicit), "0.32.0") == (147_456, 147_456)
     with pytest.raises(ValueError, match="matching parent and decoder head dimensions"):
         _compiled_vllm_transfer_widths(
             _write_config(tmp_path, {**qwen3, "vocab_size": text["vocab_size"] + 1}), "0.32.0"
@@ -3731,11 +3751,16 @@ def test_selected_native_qwen3_moe_reads_the_vl_text_config(tmp_path):
 
 
 @pytest.mark.parametrize(("size", "expected_width"), [("30B-A3B", 24_576), ("235B-A22B", 48_128)])
-def test_selected_qwen3_moe_requires_a_reserve_that_covers_rank_weights(tmp_path, size, expected_width):
+@pytest.mark.parametrize("child_type_declared", [True, False])
+def test_selected_qwen3_moe_requires_a_reserve_that_covers_rank_weights(
+    tmp_path, size, expected_width, child_type_declared
+):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
     document = _load_pre_downloaded_hf_config(f"Qwen/Qwen3-VL-{size}-Instruct")
     parent = {**document, "architectures": ["TrainingCheckpoint", "Qwen3MoeForCausalLM"]}
+    if not child_type_declared:
+        parent["text_config"] = {k: v for k, v in document["text_config"].items() if k != "model_type"}
     options = dict(
         system="h100_sxm", backend="vllm", backend_version="0.32.0", tp_size=8, pp_size=1, moe_tp_size=8, moe_ep_size=1
     )

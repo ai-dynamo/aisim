@@ -232,6 +232,19 @@ _DECODER_GEOMETRY_DEFAULTS = {
 }
 
 
+# These parent configurations always construct their own text class, including for a sparse child dictionary.
+_QWEN3_VL_TEXT_DEFAULTS = {
+    "qwen3_vl": {"vocab_size": 151936, **_DECODER_GEOMETRY_DEFAULTS["qwen3"]},
+    "qwen3_vl_moe": {
+        "vocab_size": 151936,
+        "hidden_size": 2048,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 16,
+        "intermediate_size": 5632,
+    },
+}
+
+
 # Config classes that can also provide the attributes of an explicitly selected Qwen2 or OPT.
 _BORROWED_DECODER_DEFAULTS = {
     "phi3": dict(
@@ -350,10 +363,11 @@ def _sglang_model_registries() -> dict[int, dict[str, set[str]]]:
         for line in source:
             if not line.startswith("#"):
                 kind, first, last, *names = line.split()
+                if kind == "compatible":
+                    suffix, *prefixes = names
+                    names = [prefix + suffix if suffix != "-" else prefix for prefix in prefixes]
                 for patch in range(int(first), int(last) + 1):
-                    releases.setdefault(patch, {"native": set(), "multimodal": set(), "transformers": set()})[
-                        kind
-                    ].update(names)
+                    releases.setdefault(patch, {}).setdefault(kind, set()).update(names)
     return releases
 
 
@@ -382,12 +396,17 @@ def _sglang_wrapper(
         native = next((name for name in names if name in entries["native"]), None)
         choices.add(native or names[0])
         if native is None:
-            fallback = set(names) <= entries["transformers"] or (isinstance(auto_map, dict) and "AutoModel" in auto_map)
-            if not fallback and entries["transformers"].intersection(names):
-                # The loader checks every alternative before constructing its Transformers backend.
+            fallback = bool(entries["transformers"].intersection(names))
+            remote_auto = isinstance(auto_map, dict) and "AutoModel" in auto_map
+            if (
+                fallback
+                and not remote_auto
+                and any(name not in entries["transformers"] and name not in entries["compatible"] for name in names)
+            ):
                 raise ValueError(
                     "SGLang Transformers fallback requires a compatible model class for every architecture"
                 )
+            fallback |= remote_auto
             needs_weights |= fallback or remote or bool(entries["multimodal"].intersection(names))
         else:
             fallback = native.startswith("Transformers")
@@ -1898,6 +1917,7 @@ class NaiveKVCacheEstimator:
                 needs_wrapper_weights = False
                 transformers_wrapper = False
                 text_only = False
+                parent_output_head = False
                 if key is not None and backend == "vllm":
                     needs_wrapper_weights, transformers_wrapper, native_text = wrapper_runtime(
                         architectures, backend_version, hf_config.get("auto_map"), _TEXT_ONLY_DECODERS
@@ -1910,18 +1930,17 @@ class NaiveKVCacheEstimator:
                     )
                     text_only = native_text is not None
                     if text_only:
+                        if key == "text_config" and parent_type in _QWEN3_VL_TEXT_DEFAULTS:
+                            raw_decoder["model_type"] = f"{parent_type}_text"
+                            for field, default in _QWEN3_VL_TEXT_DEFAULTS[parent_type].items():
+                                raw_decoder.setdefault(field, default)
                         # vLLM remaps llm_config to text_config before these constructors read get_text_config().
-                        child_reader = architecture in ("Qwen2ForCausalLM", "Qwen3MoeForCausalLM")
-                        if architecture in ("MiMoForCausalLM", "MiMoV2FlashForCausalLM", "Qwen3ForCausalLM"):
-                            # The output head reads the parent while the layers read its text config.
-                            if any(
-                                hf_config.get(k) is None or hf_config[k] != raw_decoder.get(k)
-                                for k in ("vocab_size", "hidden_size")
-                            ):
-                                raise ValueError(
-                                    f"{architecture} sizing requires matching parent and decoder head dimensions"
-                                ) from error
-                            child_reader = True
+                        parent_output_head = architecture in (
+                            "MiMoForCausalLM",
+                            "MiMoV2FlashForCausalLM",
+                            "Qwen3ForCausalLM",
+                        )
+                        child_reader = parent_output_head or architecture in ("Qwen2ForCausalLM", "Qwen3MoeForCausalLM")
                         if not child_reader:
                             raw_decoder = {k: v for k, v in hf_config.items() if k not in ("llm_config", "text_config")}
                         raw_decoder["architectures"] = [architecture]
@@ -1943,6 +1962,14 @@ class NaiveKVCacheEstimator:
                 )
                 constructor = "deepseek_v3" if selected_type == "kimi_k2" else selected_type
                 _apply_decoder_geometry_defaults(raw_decoder, constructor)
+                # These vLLM output heads read the parent, while their layers use the constructed text config.
+                if parent_output_head and any(
+                    hf_config.get(k) is None or hf_config[k] != raw_decoder.get(k)
+                    for k in ("vocab_size", "hidden_size")
+                ):
+                    raise ValueError(
+                        f"{architecture} sizing requires matching parent and decoder head dimensions"
+                    ) from error
                 if selected_type in _DECODER_HEAD_DEFAULTS or (
                     resolved_vllm_decoder and selected in _VLLM_DENSE_DECODERS
                 ):

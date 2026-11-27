@@ -32,7 +32,7 @@ def test_published_025_metadata_loads_and_is_discoverable():
                 assert "classified_failures" not in event
 
 
-@pytest.mark.parametrize("field", ["unexpected_runtime_field", "classified_failures"])
+@pytest.mark.parametrize("field", ["unexpected_runtime_field", "unexpected_event_field"])
 def test_public_schema_remains_fail_closed_for_unknown_fields(tmp_path, field):
     source = next(DATA.glob("*/vllm/0.25.0/collection_meta.yaml"))
     meta = yaml.safe_load(source.read_text())

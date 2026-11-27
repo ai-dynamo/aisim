@@ -84,6 +84,13 @@ def test_v2_rejects_collection_event_without_status(tmp_path):
         _load_collection_meta_yaml(str(path))
 
 
+@pytest.mark.parametrize("count", [-1, True, "1"])
+def test_v2_rejects_invalid_classified_failure_count(tmp_path, count):
+    document = _v2_document([_event(classified_failures=count)])
+    with pytest.raises(ValueError, match="classified_failures must be a non-negative integer"):
+        _load_collection_meta_yaml(str(_write_meta(tmp_path, document)))
+
+
 def test_v2_accepts_complete_multi_event_history(tmp_path):
     document = _v2_document([_event(), _event(case_plan_hash="sha256:" + "d" * 64, rows=15)])
     path = _write_meta(tmp_path, document)
@@ -198,7 +205,7 @@ def test_v2_writer_runtime_metadata_reaches_strict_database(tmp_path):
     tables = {
         "gemm_perf": append_collection_event(
             _event(rows=1, runtime=runtime),
-            _event(rows=1, runtime=runtime, case_plan_hash="sha256:" + "1" * 64),
+            _event(rows=1, runtime=runtime, case_plan_hash="sha256:" + "1" * 64, classified_failures=1),
             table="gemm_perf",
             merged_rows=2,
         )
@@ -208,6 +215,7 @@ def test_v2_writer_runtime_metadata_reaches_strict_database(tmp_path):
     document = _load_collection_meta_yaml(str(path))
     assert document["runtime"] == runtime
     assert all(event["runtime"] == runtime for event in document["tables"]["gemm_perf"]["collections"])
+    assert document["tables"]["gemm_perf"]["collections"][1]["classified_failures"] == 1
     database = get_database(
         "h100_sxm",
         "sglang",
