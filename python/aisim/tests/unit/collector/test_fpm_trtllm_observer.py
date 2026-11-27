@@ -84,6 +84,7 @@ def run(
     setup_cost=0.0,
     setups=None,
     shutdown=True,
+    extra=None,
 ):
     current = [0.0]
     readings = iter((1000, 621_000))
@@ -119,7 +120,7 @@ def run(
     monkeypatch.setattr(observer, "time", SimpleNamespace(monotonic=lambda: current[0]))
     monkeypatch.setattr(observer, "device_uuid", lambda executor: f"GPU-{executor.global_rank}")
     monkeypatch.setattr(observer, "effective_settings", lambda _: settings)
-    observer.install_hooks(Executor, context(phase), tmp_path)
+    observer.install_hooks(Executor, {**context(phase), **(extra or {})}, tmp_path)
     ranks = [Executor(rank) for rank in range(2)]
 
     def observer_steps():
@@ -248,6 +249,89 @@ def test_incomplete_window_keeps_latency(tmp_path, monkeypatch, options, reason)
     assert result["power"] == observer.unavailable(reason)
 
 
+def test_valid_window_publishes_power_without_shutdown(tmp_path, monkeypatch):
+    # The leader publishes once the peer's record exists, with no shutdown callback.
+    result = run(tmp_path, monkeypatch, shutdown=False)
+    assert result["wall_time"] == pytest.approx(0.21)
+    assert result["power"]["status"] == "measured"
+    assert result["power"]["window_iterations"] == 10
+
+
+@pytest.mark.parametrize(("window", "iterations"), [(None, 10), (2.5, 12)])
+def test_power_window_sets_and_records_the_window(tmp_path, monkeypatch, window, iterations):
+    extra = {} if window is None else {"power_window_s": window}
+    result = run(tmp_path, monkeypatch, extra=extra)
+    assert result["power"]["status"] == "measured"
+    assert result["power"]["window_iterations"] == iterations
+    config = json.loads((tmp_path / "benchmark.json").read_text())["config"]
+    assert config == {"mode": "decode", "power_window_s": 2.0 if window is None else window}
+
+
+def first_batch(tmp_path, monkeypatch, *, extra=None, settings=None, dist=(2, 1), attention_dp=False):
+    class Executor(FakeExecutor):
+        enable_attention_dp = attention_dp
+
+    Executor.dist = SimpleNamespace(tp_size=dist[0], pp_size=dist[1])
+    monkeypatch.setattr(observer, "device_uuid", lambda _: "GPU-0")
+    monkeypatch.setattr(
+        observer, "effective_settings", lambda _: {**observer.SETTINGS, "max_batch_size": 4, **(settings or {})}
+    )
+    observer.install_hooks(Executor, {**context(), **(extra or {})}, tmp_path)
+    executor = Executor(0)
+    executor.iter_counter = 0
+    return executor._prepare_and_schedule_batch()
+
+
+@pytest.mark.parametrize("window", [float("nan"), float("inf"), 1.99])
+def test_invalid_power_window_raises_at_the_first_batch(tmp_path, monkeypatch, window):
+    with pytest.raises(ValueError, match="rank or window"):
+        first_batch(tmp_path, monkeypatch, extra={"power_window_s": window})
+
+
+@pytest.mark.parametrize("tolerance", [0, 128])
+def test_decode_kv_tolerance_accepts_its_bounds(tmp_path, monkeypatch, tolerance):
+    assert first_batch(tmp_path, monkeypatch, extra={"decode_kv_tolerance": tolerance}) == ("batch", None)
+
+
+@pytest.mark.parametrize("tolerance", [129, -1, 2.0, True])
+def test_decode_kv_tolerance_rejects_other_values(tmp_path, monkeypatch, tolerance):
+    with pytest.raises(ValueError, match="decode KV tolerance"):
+        first_batch(tmp_path, monkeypatch, extra={"decode_kv_tolerance": tolerance})
+
+
+def test_off_target_decode_coordinate_is_recorded(tmp_path, monkeypatch):
+    plan, cell, cell_dir = _trtllm_fixture(tmp_path)
+    # The first contiguous decode step reads 32,768 KV tokens, 32 below the target.
+    extra = {"decode_total_kv_read_tokens": 32800, "decode_kv_tolerance": 128}
+    run(cell_dir / "raw" / "pod-0", monkeypatch, extra=extra)
+    collection = validate_native_collection(
+        cell,
+        cell_dir / "raw",
+        expected_backend="trtllm",
+        expected_bundle_sha256="a" * 64,
+        expected_plan_sha256=plan.sha256,
+        expected_attempt_id="attempt",
+    )
+    (point,) = collection.points
+    assert point.point["total_kv_read_tokens"] == 32768
+    assert point.power_w == pytest.approx(620 / 2.1)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"dist": (4, 1)}, "TP2/DP1"),
+        ({"dist": (2, 2)}, "TP2/DP1"),
+        ({"attention_dp": True}, "TP2/DP1"),
+        ({"settings": {"max_batch_size": 3}}, "max_batch_size"),
+        ({"settings": {"max_batch_size": "4"}}, "max_batch_size"),
+    ],
+)
+def test_serving_topology_and_batch_gates(tmp_path, monkeypatch, options, message):
+    with pytest.raises(ValueError, match=message):
+        first_batch(tmp_path, monkeypatch, **options)
+
+
 @pytest.mark.parametrize(
     ("walls", "repeats"),
     [
@@ -276,7 +360,8 @@ def test_source_hash_mismatch_fails_before_executor_runs(tmp_path, monkeypatch):
         sitecustomize._verify({"bundle_sha256": bound}, manifest_path, source)
 
 
-def test_import_receipt_is_not_the_collector_binding(tmp_path, monkeypatch):
+def load_executor(tmp_path, monkeypatch, verify):
+    """Run the bundle's import loader on a stub executor; return the import receipt."""
     root = Path(sitecustomize.__file__).parent
     source = tmp_path / "py_executor.py"
     source.write_text(
@@ -286,11 +371,7 @@ def test_import_receipt_is_not_the_collector_binding(tmp_path, monkeypatch):
         "    def _handle_responses(self): pass\n"
         "    def shutdown(self): pass\n"
     )
-    files = {
-        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-        for name in json.loads((root / "manifest.json").read_text())["files"]
-    }
-    monkeypatch.setattr(sitecustomize, "_verify", lambda context, manifest, path: (path.read_bytes(), files, "e" * 64))
+    monkeypatch.setattr(sitecustomize, "_verify", verify)
     session = {**context(), "attempt_id": "attempt", "configuration": "tp2"}
     (tmp_path / "context.json").write_text(json.dumps(session))
     monkeypatch.setenv("AISIMULATE_RUNTIME_CONTEXT", str(tmp_path / "context.json"))
@@ -299,11 +380,25 @@ def test_import_receipt_is_not_the_collector_binding(tmp_path, monkeypatch):
     monkeypatch.delitem(sys.modules, "_aisim_trtllm_fpm_observer", raising=False)
     module = ModuleType(sitecustomize._TARGET)
     module.__spec__ = SimpleNamespace(origin=str(source))
+    try:
+        sitecustomize._ExecutorLoader().exec_module(module)
+    finally:
+        receipts = list((tmp_path / "out").glob("runtime-instrumentation-imports-*.json"))
+        assert len(receipts) == 1
+    return json.loads(receipts[0].read_text()), module
 
-    sitecustomize._ExecutorLoader().exec_module(module)
 
-    receipt = json.loads(next((tmp_path / "out").glob("runtime-instrumentation-imports-*.json")).read_text())
+def test_import_receipt_is_not_the_collector_binding(tmp_path, monkeypatch):
+    root = Path(sitecustomize.__file__).parent
+    files = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in json.loads((root / "manifest.json").read_text())["files"]
+    }
+    receipt, module = load_executor(
+        tmp_path, monkeypatch, lambda context, manifest, path: (path.read_bytes(), files, "e" * 64)
+    )
     assert receipt["status"] == "verified"
+    assert module.PyExecutor._prepare_and_schedule_batch.__name__ == "schedule_hook"
     assert receipt["schema_version"] == sitecustomize.RECEIPT_SCHEMA
     assert receipt["imports"][sitecustomize._TARGET]["sha256"] == "e" * 64
     collector_binding = {
@@ -312,3 +407,26 @@ def test_import_receipt_is_not_the_collector_binding(tmp_path, monkeypatch):
     }
     with pytest.raises(ValueError, match="instrumentation import schema_version mismatch"):
         _validate_import_binding({"instrumentation_binding": receipt}, collector_binding, None)
+
+
+def test_failed_verification_writes_a_failed_receipt_and_raises(tmp_path, monkeypatch):
+    def verify(context, manifest, path):
+        raise RuntimeError("TRT-LLM pinned executor source mismatch: expected a, got b")
+
+    with pytest.raises(RuntimeError, match="pinned executor source mismatch"):
+        load_executor(tmp_path, monkeypatch, verify)
+    (path,) = (tmp_path / "out").glob("runtime-instrumentation-imports-*.json")
+    receipt = json.loads(path.read_text())
+    assert receipt["status"] == "failed"
+    assert receipt["error"] == "RuntimeError: TRT-LLM pinned executor source mismatch: expected a, got b"
+    assert receipt["schema_version"] == sitecustomize.RECEIPT_SCHEMA
+    assert receipt["imports"] == {}
+    assert "_aisim_trtllm_fpm_observer" not in sys.modules
+
+
+def test_missing_executor_source_raises_import_error(monkeypatch):
+    monkeypatch.setattr(sitecustomize.importlib.machinery.PathFinder, "find_spec", lambda *args: None)
+    finder = sitecustomize._ExecutorFinder()
+    assert finder.find_spec("json") is None
+    with pytest.raises(ImportError, match="executor source is missing"):
+        finder.find_spec(sitecustomize._TARGET)

@@ -31,7 +31,9 @@ The context may also set `power_window_s`, the minimum NVML energy window in
 seconds. It is optional and defaults to `2.0`. It must be finite and at least
 `2`; otherwise the observer raises when the final executor schedules its first
 batch. The leader writes the value to `benchmark.json` as
-`config.power_window_s`.
+`config.power_window_s`. That field is informational: no collector reader
+checks it. The collector separately rejects any measured power window shorter
+than two seconds.
 
 Use the pinned eager TP2 Qwen3-32B-FP8 pilot settings, with block reuse, overlap
 scheduling, chunked prefill and speculation disabled. Drive the batch-four
