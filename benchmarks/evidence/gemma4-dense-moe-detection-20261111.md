@@ -12,23 +12,26 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `372f2e7c2`, which adds the fallback-layout
-resolution and the FPE generator guard described below on top of
-`0faa4f402e2b3fe6ab302921d08c39572941ac8a`. That commit merges `main` at
-`29104f537634779690aa6721b93b39c4204d13cb`; later commits change only this
+The current code head is `c543294ee`, which adds the omitted-MoE-pair
+rejection, the single-dimension fallback resolution, the pre-database width
+gate, the FPE generator guard and the hardware-fact/AFD pins described below on
+top of `0faa4f402e2b3fe6ab302921d08c39572941ac8a`. That commit merges `main` at
+`29104f537634779690aa6721b93b39c4204d13cb`; later commits change tests and this
 document. See
-[Current head after the main merges](#current-head-after-the-main-merges-2026-11-24)
+[Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
 `0809faae9e543487dcf2142dc6afe2427a42f9bd`, where the classifier fix was
 `7d97aac50`, `ad2bb0b68` added the embedded bridge tests, and `a584153b9` added
 the request-wide fallback regression and the CI enforcement flag. That lineage
 is preserved by the rebase in `d4faab7fd`, `45d70db42` and `c63cd7668`; the
-2026-11-18 sections below are historical. **The production behavior change is
-the non-integer expert metadata check** (pre-rebase `8f3a62e0`, now
-`31800b398`): both expert fields must be integers (excluding booleans), or
-absent, before sentinel and range checks. The branch also changes
-`.github/workflows/ci.yml` to enforce bridge imports in an admitted Full CI run.
+2026-11-18 sections below are historical. **The production behavior changes are
+the classification itself and the non-integer expert metadata check**
+(pre-rebase `8f3a62e0`, now `31800b398`): both expert fields must be integers
+(excluding booleans), or absent, before sentinel and range checks; and the
+omitted-MoE-pair rejection in `estimate_kv_cache` described below. The branch
+also changes `.github/workflows/ci.yml` to enforce bridge imports in an admitted
+Full CI run.
 
 ## Scope
 
@@ -40,12 +43,16 @@ constant metrics through offline runner and performance-model doubles, so
 candidate scores are placeholders; only the selected shape set and the
 feasible/infeasible status are meaningful.
 
-## Current head after the main merges (2026-11-24)
+## Current head and verification
 
-The reviewed code head is `0faa4f402e2b3fe6ab302921d08c39572941ac8a`; any
-later commit changes only this document. It adds the omitted-MoE-dimension
-resolution described below on top of three merges of `main`, which sit on top
-of the reviewed commits. `bf527e451` merges `main` at
+`0faa4f402e2b3fe6ab302921d08c39572941ac8a` is the reviewed commit and keeps
+the historical verification results recorded for it. The current code head is
+`c543294ee`: `372f2e7c2` adds the single-dimension fallback resolution, the
+pre-database width gate and the FPE generator guard, `98ebca229` applies the
+config contract's omitted-MoE-pair rejection, and `c543294ee` adds the
+hardware-fact and dense-AFD pins. Later commits from here change tests and this
+document. Everything sits on three merges of `main` on top of the reviewed
+commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
 this branch: because the dense gate now raises
 `InvalidEngineConfigurationError` (a `ValueError`) instead of an
@@ -114,53 +121,56 @@ The request-wide re-raise exposed a pre-existing default in
 `moe_ep_size` with `1` before building the config, so an omitted pair always
 became `moe_tp_size=moe_ep_size=1`.
 
-Both shapes of that default are wrong for a routed-MoE checkpoint, because
-`ModelConfig.resolve_moe_parallelism` requires
+Both shapes of that default conflict with
+`ModelConfig.resolve_moe_parallelism`, which requires
 `tp_size * attention_dp_size * cp_size == moe_tp_size * moe_ep_size`:
 
 - Exactly one dimension omitted defeated the config's inference from the
   attention width, so a valid request such as `tp_size=4` with
   `moe_tp_size=2` became a width mismatch. `from_request` now leaves the single
-  omitted dimension unset, as every other SDK path does, and the config
-  contract resolves it.
-- An omitted pair at `tp_size*dp*cp > 1` became `1x1`, which is not a layout a
-  MoE model can serve (`4 != 1` in the invariant above). Before this PR that
-  mismatch reached the naive fallback; with the re-raise it would have been
-  terminal, turning a fallback-eligible request into an error. The pair now
-  resolves to pure tensor parallelism at the attention width
-  (`moe_tp_size = tp_size * attention_dp_size * cp_size`, `moe_ep_size = 1`),
-  so no expert is sharded and the invariant holds. Dense checkpoints never read
-  these dims, and `estimate_kv_cache` still rejects an explicit `moe_ep_size>1`
-  for dense Gemma 4 before the database lookup.
+  omitted dimension unset and resolves it from the attention width, as every
+  other SDK path does.
+- An omitted pair became `1x1`, which is not a layout a MoE model can serve at
+  `tp_size*dp*cp > 1` (`4 != 1` in the invariant above). The config contract
+  deliberately refuses to invent a layout the caller did not request, so the
+  estimator applies the same rule: for a routed checkpoint,
+  `estimate_kv_cache` and `KVCacheEstimator.from_request` raise
+  `InvalidEngineConfigurationError` (`At least one of moe_tp_size or
+  moe_ep_size must be set for MoE models.`) before the perf-database lookup and
+  before the naive fallback can price `1x1`. Dense checkpoints never read these
+  widths, so they keep placeholder widths, and `estimate_kv_cache` still
+  rejects an explicit `moe_ep_size>1` for dense Gemma 4 before the database
+  lookup.
 
 `test_estimate_kv_cache_infers_an_omitted_moe_dimension` pins the single-dim
-case, `test_estimate_kv_cache_defaults_an_omitted_moe_pair_to_pure_tensor_parallelism`
-pins the pair at `tp_size=4` (including equality with an explicit
-`moe_tp_size=4, moe_ep_size=1` estimate, which is `native` rather than
-fallback), and `test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint`
+case, `test_estimate_kv_cache_rejects_an_omitted_moe_pair_like_the_config_contract`
+pins the rejection with the database and the fallback made unreachable,
+`test_from_request_rejects_an_omitted_moe_pair` pins the public classmethod, and
+`test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint`
 pins that a multi-GPU dense request still estimates natively. This changes
-production behavior for callers that passed only one dimension or neither: the
-request now estimates natively instead of failing the width check.
+production behavior for callers that passed one dimension or neither: the
+single-dimension request now estimates natively instead of failing the width
+check, and an omitted pair on a routed checkpoint now raises instead of
+reaching the naive fallback.
 
 ### Fallback MoE layout and the pre-database width gate
 
-`372f2e7c2` shares that resolution with the naive fallback.
+The MoE-width resolution is shared with the naive fallback.
 `estimate_kv_cache` used to pass `int(moe_ep_size or 1)` and
 `int(moe_tp_size or 1)` to `NaiveKVCacheEstimator.from_model_path`, which
-shards expert weights by `moe_tp_size * moe_ep_size`. A request whose native
-build resolved `4x1` therefore priced `1x1` whenever the perf database was
-unavailable, so the same request returned two different capacities depending
-on which path ran. Both paths now call `_resolve_moe_dimensions`, which applies
-the rule `ModelConfig.resolve_moe_parallelism` describes, and the fallback runs
-it after the native build fails.
+shards expert weights by `moe_tp_size * moe_ep_size`, while the native build
+inferred the omitted dimension from the attention width. A request with
+`tp_size=4, moe_tp_size=2` therefore priced `2x1` on the fallback and `2x2`
+natively, so the same request returned two different capacities depending on
+which path ran. Both paths now call `_resolve_moe_dimensions`, which applies the
+rule `ModelConfig.resolve_moe_parallelism` describes, and the fallback runs it
+after the native build fails.
 
-`test_estimate_kv_cache_naive_fallback_prices_an_omitted_moe_pair_like_the_explicit_layout`
-and `test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension`
-force `perf_database.get_database` to fail at `tp_size=4` on the routed
-`deepseek-ai/DeepSeek-V3` checkpoint, then assert the fallback's
-`total_kv_size_tokens` equals the explicit `(4, 1)` and `(2, 2)` layouts. Before
-the fix those comparisons failed (the pair case raised `no KV budget` and the
-single-dimension case returned 1,867,790 versus 5,782,474 tokens).
+`test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension`
+forces `perf_database.get_database` to fail at `tp_size=4` on the routed
+`deepseek-ai/DeepSeek-V3` checkpoint, then asserts the fallback's
+`total_kv_size_tokens` equals the explicit `(2, 2)` layout. Before the fix that
+comparison returned 1,867,790 versus 5,782,474 tokens.
 
 `from_request` also validates the width invariant for a routed checkpoint after
 building the config and before the perf-database lookup.
@@ -175,9 +185,11 @@ keeps a well-formed dense checkpoint fallback-eligible.
 
 ### Verification at the current head
 
-Local run at `372f2e7c2` on macOS arm64, Python 3.13.18, with the native
-extension rebuilt from this head's tree (`maturin develop --release`, the `pyproject.toml`
-`extension-module,jemalloc` features) so the interpreter and extension agree on
+Local run at `c543294ee` on macOS arm64, Python 3.13.18, with the native
+extension rebuilt from this head's tree (`maturin build --release --locked`,
+the `pyproject.toml`
+`extension-module,jemalloc` features, and the wheel's
+`aisim/_runtime.abi3.so` on `PYTHONPATH`) so the interpreter and extension agree on
 `ENGINE_SPEC_SCHEMA_VERSION` (30 in this tree and on `main`; an extension built
 from another branch with 31 fails unrelated `perfmodel::py` tests). The Rust
 suite also needs the composed systems root that #857 introduced:
@@ -194,22 +206,16 @@ minutes.
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection from the 2026-11-18 command below (includes the three MoE-dimension tests, the fallback-parity and pre-database-gate tests, and the FPE generator guard) | `372f2e7c2` | 1,196 passed, 0 failed |
+| Targeted pytest selection from the 2026-11-18 command below (includes the omitted-MoE-pair and single-dimension tests, the pre-database-gate tests, the hardware-fact and dense-AFD pins, and the FPE generator guard) | `c543294ee` | 1,234 passed, 0 failed |
 | `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `372f2e7c2` | 1,476 passed, 0 failed, 1 ignored |
 | `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2` | 5 passed; no skips |
 | `cargo fmt --all -- --check` | `372f2e7c2` | clean |
-| `tests/test_ci_workflow_contracts.py` and `scripts/ci/test_op_latency_handoff.py` with Fast CI's invocation | `0faa4f402` | 795 passed, 3 skipped, 5 failed for host-only reasons (see below) |
 
-The 5 workflow-contract failures are environmental, not merge regressions: the
-same five fail identically at `main` in a clean worktree. One needs
-a Linux manylinux Python 3.12 root (`test_manylinux_bootstrap_exports_working_python_or_fails_before_build[None]`),
-and four need the `pip-licenses` distribution that this macOS dev venv does not
-install (`test_real_pip_licenses_enforces_the_policy`). That selection was not
-re-run at `372f2e7c2`, which changes no workflow, script or test it covers.
 The perf-model lib total is higher than the 1,460 recorded at `b761646c0`
-because main added tests. These are local results; the commits after
-`372f2e7c2` change only this document. **No Full CI run exists for this head**;
-admission remains with the maintainer.
+because main added tests. These are local results. The commits after
+`372f2e7c2` change Python behavior, tests and this document; they do not touch
+Rust, so the Rust rows stay bound to `372f2e7c2`. **No Full CI run exists for
+this branch**; admission remains with the maintainer.
 
 ### Support-matrix artifacts at the current head
 
@@ -309,11 +315,20 @@ targeted rerun. Neither historical total is current-head passing evidence.
 
 ### Hosted CI evidence, separate from local verification
 
-The Actions API query for exact head `8f3a62e0fde729cf74db0b6b3551608338b367dd`
-on 2026-11-18 returned Fast CI, codeowners and GitHub Pages runs, and **no
-Full CI run**. Thus `rust-feature-modes` is configured to enforce the bridge
-check, but has no hosted validation result for this head. Full CI admission,
-fresh reviews and technical reapproval remain with the controller.
+Hosted results are reported per head SHA. At `13743c36b` the Actions API
+returned `success` for Fast CI (with `codeowners`), `DCO`, Human authorship,
+Python Static Checks, Rust Format and `build`, and **no Full CI run**: the
+upstream `pull-request/783` ref does not exist, so only a maintainer's
+`/ok to test <sha>` admits it. Results for the current head are tracked in the
+PR checks for that SHA; this document does not claim a hosted run for it.
+`rust-feature-modes` is configured to enforce the bridge check, but has no
+hosted validation result for this branch. Full CI admission, fresh reviews and
+technical reapproval remain with the controller.
+
+The following 2026-11-18 query is historical. It targeted exact head
+`8f3a62e0fde729cf74db0b6b3551608338b367dd`
+on 2026-11-18 and returned Fast CI, codeowners and GitHub Pages runs, and **no
+Full CI run**.
 
 The Repository Policy failure was independently checked in both hosted logs:
 
@@ -446,6 +461,8 @@ is pinned by a test rather than argued from reachability:
 | --- | --- | --- |
 | `generator/enumerate.py::enumerate_profiling_configs` | wideEP gate and multi-node floor stay off, and `build_disagg_parallel_lists(is_moe=False)` yields only pure TP/DP candidates | `test_dense_gemma4_producer_configs_are_expert_parallel_free`, `test_routed_gemma4_producer_configs_keep_expert_parallel_shapes` |
 | `generator/request/sweeper.py::_resolve_model_facts` | `ModelFacts.is_moe` is `False`, so the rule engine never selects MoE fields | `test_generator_model_facts_follow_the_classification` |
+| `sweeper/model_hw.py::resolve_model_hardware` → `parallel_configs_for` | `is_moe=False` shrinks the menu to pure TP/DP shapes; the derived `mla` and `enable_wideep` facts stay `False`, and `num_experts` is `0`. `mla` is report-only: no module in `python/aisim/src` reads it | `test_gemma4_hardware_facts_follow_the_expert_configuration` |
+| `compiler.py::_afd_role` → `AFDTopology` (replay) and `sweeper/afd_parallel.py::validate_afd_model` (sweeper and replay preflight) | unchanged: AFD rejects a dense checkpoint from its own expert metadata (`num_experts=None`, `num_moe_layers=0`), before and after this branch, so it stays routed-MoE only and the forwarded `is_moe` cannot reach a topology | `test_model_preflight_rejects_dense_gemma4_afd` |
 | `sdk/task_v2.py::Task._is_moe` → `attention_dp_size` in `run_single_agg` / `run_single_disagg` | a requested `dp` never reaches the attention axis (`attention_dp_size=1`); routed keeps `dp>1` on both roles | `test_run_single_agg_attention_dp_follows_the_gemma4_classification`, `test_run_single_disagg_attention_dp_follows_the_gemma4_classification` |
 | `legacy_cli/api.py::_resolve_moe_parallelism` | MoE widths pass through untouched instead of being resolved | `test_dense_gemma4_moe_parallelism_is_passed_through_untouched` |
 | `legacy_cli/api.py` static and disagg `check_is_moe` gates | neither role calls `resolve_model_config_moe_comm`; routed static and disagg still resolve every required phase | `test_dense_gemma4_static_estimate_skips_moe_comm_resolution`, `test_dense_gemma4_disagg_estimate_skips_moe_comm_resolution`, `test_routed_gemma4_static_estimate_still_resolves_moe_comm`, `test_disagg_resolves_each_role_moe_comm_before_session_run` |
@@ -492,15 +509,17 @@ Pinned by
 | `test_estimate_kv_cache_rejects_dense_gemma4_moe_ep_before_the_database` | A dense checkpoint with `moe_ep_size=2` and `allow_naive_fallback=True` is rejected before the perf-DB lookup and never priced by the naive estimator |
 | `test_estimate_kv_cache_does_not_naive_fallback_on_a_non_gemma_configuration_error` | Outside Gemma 4: a `deepseek-ai/DeepSeek-V3` width mismatch with `allow_naive_fallback=True` raises instead of returning a `source="naive_fallback"` capacity |
 | `test_estimate_kv_cache_infers_an_omitted_moe_dimension` | `tp_size=4` with `moe_tp_size=2` and no `moe_ep_size` is resolved by the config contract and estimated natively, instead of failing the width check because the estimator filled `1` |
-| `test_estimate_kv_cache_defaults_an_omitted_moe_pair_to_pure_tensor_parallelism` | An omitted `moe_tp_size`/`moe_ep_size` pair at `tp_size=4` resolves to `4x1`, matches the explicit estimate exactly, and stays `native` even with `allow_naive_fallback=True`, instead of raising the width mismatch the historical `1x1` default produced |
+| `test_estimate_kv_cache_rejects_an_omitted_moe_pair_like_the_config_contract` | An omitted `moe_tp_size`/`moe_ep_size` pair at `tp_size=4` raises the config contract's error before the perf-DB lookup and before the naive fallback, neither of which may price a layout the engine refuses |
+| `test_from_request_rejects_an_omitted_moe_pair` | `KVCacheEstimator.from_request` applies the same rejection for callers that bypass `estimate_kv_cache` |
 | `test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint` | A multi-GPU dense Gemma 4 request with the pair omitted still estimates natively, because dense checkpoints do not read the MoE dims |
-| `test_estimate_kv_cache_naive_fallback_prices_an_omitted_moe_pair_like_the_explicit_layout` | With the perf database forced unavailable, the omitted pair at `tp_size=4` returns the same `total_kv_size_tokens` as the explicit `4x1` request, instead of sharding expert weights by `1x1` |
 | `test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension` | The same fallback infers `moe_ep_size=2` from `tp_size=4, moe_tp_size=2` and matches the explicit `2x2` capacity (1,867,790 versus 5,782,474 tokens before the fix) |
 | `test_estimate_kv_cache_rejects_a_moe_width_mismatch_before_the_database` | An invalid routed layout is rejected before both the perf-DB lookup and the naive fallback, neither of which may price it |
 | `test_dense_gemma4_static_estimate_skips_moe_comm_resolution` | Static CLI gate: no `resolve_model_config_moe_comm` call for dense Gemma 4 |
 | `test_dense_gemma4_disagg_estimate_skips_moe_comm_resolution` | Disagg CLI gate: neither role resolves MoE communication for dense Gemma 4 |
 | `test_routed_gemma4_static_estimate_still_resolves_moe_comm` | Routed Gemma 4 keeps the static-path resolution for both required phases |
 | `test_dense_gemma4_moe_parallelism_is_passed_through_untouched` | `_resolve_moe_parallelism` leaves dense MoE widths untouched and still resolves routed ones |
+| `test_gemma4_hardware_facts_follow_the_expert_configuration` in `tests/unit/test_model_hw_gemma4_facts.py` | Real `resolve_model_hardware` on the bundled `gb300` spec: dense 31B is `is_moe=False, mla=False, enable_wideep=False, num_experts=0`; routed 26B-A4B is `True, True, False, 128` |
+| `test_model_preflight_rejects_dense_gemma4_afd` in `tests/unit/sdk/test_afd_composition.py` | The AFD preflight raises `NotImplementedError("Dense AFD is not implemented...")` for the dense checkpoint, unchanged by this branch |
 | `test_dense_variant_rejects_moe_ep_gt_1` | The dense guard raises `InvalidEngineConfigurationError` (not `AssertionError`) for an explicit `moe_ep_size>1`, so `python -O` cannot disable it and the Rust bridge keeps the rejection non-fallback-safe |
 | `test_run_single_agg_attention_dp_follows_the_gemma4_classification` | Agg `run_single_agg` forces `attention_dp_size=1` for dense and preserves `dp` for routed |
 | `test_run_single_disagg_attention_dp_follows_the_gemma4_classification` | Both disagg roles apply the same dense/routed attention-DP rule |
