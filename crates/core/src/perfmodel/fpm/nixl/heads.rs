@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-FileCopyrightText: Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
@@ -16,13 +17,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 The LightOn Team and The HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2025 HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2025 The HuggingFace Inc. team. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
 
 //! NIXL hashes the model converter's global geometry. Registered caches use the
 //! attention constructor's rank-local geometry. See THIRD_PARTY_NOTICES.md for sources.
 
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     fs,
     io::{self, BufReader, Read, Seek},
     path::Path,
@@ -41,6 +42,8 @@ pub(super) struct HeadGeometry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) num_kv_heads: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) possible_heads: Option<BTreeSet<(u64, Option<u64>)>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) head_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) content_size: Option<u64>,
@@ -51,7 +54,56 @@ impl HeadGeometry {
         self == &Self::default()
     }
 
+    // With conflicting aliases, each setter order selects a whole (KV heads, head size) pair.
+    fn choices(&self) -> impl Iterator<Item = (Option<u64>, Option<u64>)> + '_ {
+        self.possible_heads
+            .iter()
+            .flatten()
+            .filter_map(|&(n, w)| {
+                (self.num_kv_heads.is_none_or(|v| v == n)
+                    && self.head_size.zip(w).is_none_or(|(a, b)| a == b))
+                .then_some((Some(n), w.or(self.head_size)))
+            })
+            .chain(
+                self.possible_heads
+                    .is_none()
+                    .then_some((self.num_kv_heads, self.head_size)),
+            )
+    }
+
+    fn common_choices(&self, peer: &Self) -> BTreeSet<(u64, Option<u64>)> {
+        self.choices()
+            .flat_map(|(heads, width)| {
+                peer.choices()
+                    .filter_map(move |(other_heads, other_width)| {
+                        if heads.zip(other_heads).is_some_and(|(a, b)| a != b)
+                            || width.zip(other_width).is_some_and(|(a, b)| a != b)
+                        {
+                            None
+                        } else {
+                            Some((heads.or(other_heads)?, width.or(other_width)))
+                        }
+                    })
+            })
+            .collect()
+    }
+
+    pub(super) fn constrain_choices(&mut self, other: &Self) {
+        if self.possible_heads.is_some() || other.possible_heads.is_some() {
+            self.possible_heads = Some(self.common_choices(other));
+        }
+    }
+
     pub(super) fn mismatch(&self, peer: &Self) -> Option<(&'static str, String, String)> {
+        if (self.possible_heads.is_some() || peer.possible_heads.is_some())
+            && self.common_choices(peer).is_empty()
+        {
+            return Some((
+                "num_kv_heads and head_size",
+                format!("{:?}", self.choices().collect::<Vec<_>>()),
+                format!("{:?}", peer.choices().collect::<Vec<_>>()),
+            ));
+        }
         [
             ("num_kv_heads", self.num_kv_heads, peer.num_kv_heads),
             ("head_size", self.head_size, peer.head_size),
@@ -66,6 +118,10 @@ impl HeadGeometry {
 
     pub(super) fn merge(&mut self, other: &Self) -> Result<(), AicError> {
         merge_observed(&mut self.num_kv_heads, other.num_kv_heads, "num_kv_heads")?;
+        self.constrain_choices(other);
+        if self.possible_heads.as_ref().is_some_and(BTreeSet::is_empty) {
+            return Err(super::conflict("num_kv_heads and head_size"));
+        }
         merge_observed(&mut self.head_size, other.head_size, "head_size")?;
         merge_observed(
             &mut self.content_size,
@@ -263,7 +319,7 @@ fn wrapper_text_decoder(config: &Value, stock_only: bool) -> Option<Decoder> {
 
 /// Empty and absent child dictionaries differ for these wrappers. The latter uses
 /// the wrapper's own constructor arguments, before post-load hf_overrides.
-fn wrapper_text_geometry(config: &Value, decoder: Decoder) -> Value {
+fn wrapper_text_geometry(config: &Value, decoder: Option<Decoder>) -> Value {
     let raw = &config["text_config"];
     let mut fields = geometry_config(raw);
     // Voxtral passes these defaults to the selected child even for a partial dictionary.
@@ -295,10 +351,12 @@ fn wrapper_text_geometry(config: &Value, decoder: Decoder) -> Value {
             }
         }
     }
-    fields
-        .entry("model_type")
-        .or_insert(Value::from(decoder.family()));
-    initialize_decoder(raw, &mut fields, decoder);
+    if let Some(decoder) = decoder {
+        fields
+            .entry("model_type")
+            .or_insert(Value::from(decoder.family()));
+        initialize_decoder(raw, &mut fields, decoder);
+    }
     Value::Object(fields)
 }
 
@@ -430,7 +488,12 @@ fn checkpoint_geometry(config: &Value, stock_only: bool) -> Value {
         text.entry("model_type")
             .or_insert_with(|| Value::from(family));
         top.insert("text_config".into(), Value::Object(text));
-    } else if let Some(decoder) = wrapper_text_decoder(config, stock_only) {
+    } else if let decoder = wrapper_text_decoder(config, stock_only)
+        && (decoder.is_some()
+            || config["model_type"] == "voxtral"
+                && config["text_config"].is_object()
+                && (stock_only || config["auto_map"].get("AutoConfig").is_none()))
+    {
         top.insert("text_config".into(), wrapper_text_geometry(config, decoder));
     } else if let Some(key) = text_field(config) {
         top.insert(key.into(), Value::Object(geometry_config(&config[key])));
@@ -541,7 +604,7 @@ pub(super) fn checkpoint(
     model: &Value,
     source: &Value,
     release: Option<&str>,
-) -> Option<Checkpoint> {
+) -> Option<Result<Checkpoint, AicError>> {
     // An omitted override table is different from an explicitly empty one:
     // a historical writer may not have captured the serving overrides.
     let overrides = model.get("hf_overrides").filter(|v| v.is_object())?;
@@ -562,7 +625,8 @@ pub(super) fn checkpoint(
     }
     // The same content-bound reference is used by many ranks and search candidates.
     // Keep only serving geometry, and revalidate when the referenced file changes.
-    static SCOPES: LazyLock<Cache<CheckpointKey, Option<std::sync::Arc<Value>>>> =
+    type Geometry = Result<std::sync::Arc<Value>, &'static str>;
+    static SCOPES: LazyLock<Cache<CheckpointKey, Option<Geometry>>> =
         LazyLock::new(|| Cache::new(128));
     let stock_only = model["trust_remote_code"] == false;
     let rw_substitution = refined_web(overrides);
@@ -602,25 +666,32 @@ pub(super) fn checkpoint(
             if key_for(&file.metadata()?).as_ref() != Some(&key) {
                 return Ok(None);
             }
-            Ok(config
-                .filter(Value::is_object)
-                .filter(|config| {
-                    // The loaded RWConfig rejects constructor kwargs for these read-only properties.
-                    !(rw_substitution
-                        && !refined_web(config)
-                        && (config.get("head_dim").is_some() || config.get("rotary").is_some()))
-                })
-                .map(|mut config| {
-                    // The vLLM parser registers RWConfig under both the override and
-                    // checkpoint names before loading the original constructor arguments.
-                    if rw_substitution && config["model_type"].is_string() {
-                        config["model_type"] = Value::from("RefinedWeb");
-                    }
-                    std::sync::Arc::new(checkpoint_geometry(&config, stock_only))
-                }))
+            let Some(mut config) = config.filter(Value::is_object) else {
+                return Ok(None);
+            };
+            // The loaded RWConfig rejects constructor kwargs for these read-only properties.
+            if (rw_substitution || refined_web(&config))
+                && (config.get("head_dim").is_some() || config.get("rotary").is_some())
+            {
+                return Ok(Some(Err(
+                    "RWConfig cannot load a checkpoint with a read-only head_dim or rotary field",
+                )));
+            }
+            // The vLLM parser registers RWConfig under both the override and
+            // checkpoint names before loading the original constructor arguments.
+            if rw_substitution && config["model_type"].is_string() {
+                config["model_type"] = Value::from("RefinedWeb");
+            }
+            Ok(Some(Ok(std::sync::Arc::new(checkpoint_geometry(
+                &config, stock_only,
+            )))))
         })
         .ok()
         .flatten()?;
+    let saved = match saved {
+        Ok(fields) => fields,
+        Err(message) => return Some(Err(AicError::InvalidEngineConfig(message.into()))),
+    };
     let decoder = stock_decoder(&saved, stock_only);
     let rw = refined_web(&saved);
     let stock_qwen_vl = (saved["model_type"].is_string()
@@ -666,7 +737,7 @@ pub(super) fn checkpoint(
             Value::from(pattern.as_ref()),
         );
     }
-    Some(Checkpoint {
+    Some(Ok(Checkpoint {
         fields: effective,
         class: ConfigClass::observed(&saved, stock_only),
         stock_qwen_vl,
@@ -675,7 +746,7 @@ pub(super) fn checkpoint(
         } else {
             wrapper_text_decoder(&saved, stock_only).map(ConfigClass::Decoder)
         },
-    })
+    }))
 }
 
 impl<'a> HfConfig<'a> {
@@ -703,7 +774,10 @@ impl<'a> HfConfig<'a> {
         if (self.stock_only
             || self.stock_qwen_vl.is_some()
             || self.class.is_some()
-            || self.text_class.is_some())
+            || self.text_class.is_some()
+            || self.complete
+                && self.fields["model_type"].is_string()
+                && self.fields["auto_map"].get("AutoConfig").is_none())
             && model["hf_config"].is_object()
             && let Some(family) = model["hf_overrides"]["model_type"].as_str()
         {
@@ -787,13 +861,13 @@ impl<'a> HfConfig<'a> {
         overrides: &Value,
         public: &str,
         stored: &str,
-    ) -> Option<std::collections::BTreeSet<u64>> {
+    ) -> Option<BTreeSet<u64>> {
         if self.class != Some(ConfigClass::RefinedWeb) || !self.attribute(public).is_null() {
             return None;
         }
         let public = positive(&overrides[public])?;
         let stored = positive(&overrides[stored])?;
-        (public != stored).then(|| std::collections::BTreeSet::from([public, stored]))
+        (public != stored).then(|| BTreeSet::from([public, stored]))
     }
 
     fn attribute(self, name: &str) -> &'a Value {
@@ -802,6 +876,11 @@ impl<'a> HfConfig<'a> {
                 RW_ATTRIBUTES.iter().find(|(public, _, _)| *public == name)
             && let Some(value) = self.fields.get(*stored)
         {
+            if !self.complete && !self.verified && self.fields.get(name).is_some_and(|v| v != value)
+            {
+                // An override-only archive names both setters, but does not retain their order.
+                return &Value::Null;
+            }
             return value;
         }
         &self.fields[name]
@@ -832,7 +911,7 @@ impl<'a> HfConfig<'a> {
                 // These ordinary HF configs do not manufacture either higher-priority alias.
                 None if self.verified
                     && matches!(key, "n_head_kv" | "num_kv_heads")
-                    && matches!(
+                    && (matches!(
                         self.fields["model_type"].as_str(),
                         Some(
                             "qwen2"
@@ -842,7 +921,12 @@ impl<'a> HfConfig<'a> {
                                 | "mistral"
                                 | "nemotron_h"
                         )
-                    ) => {}
+                    ) || (self.stock_only
+                        || self.fields["auto_map"].get("AutoConfig").is_none())
+                        && matches!(
+                            self.fields["model_type"].as_str(),
+                            Some("mixtral" | "qwen2_moe")
+                        )) => {}
                 None if !self.complete => return None,
                 None => {}
             }
@@ -1075,6 +1159,7 @@ impl Decoder {
         top: HfConfig<'_>,
         text: HfConfig<'_>,
         ordered: bool,
+        overrides: &Value,
     ) -> Option<UniformAttention> {
         let config = match self {
             Self::Qwen2 | Self::Qwen3 => text, // Qwen3Model inherits Qwen2Model's text selection.
@@ -1108,18 +1193,57 @@ impl Decoder {
                 })
             })
             .flatten();
+        let possible_heads = (self == Self::Falcon)
+            .then(|| {
+                let (public, stored, query_heads) = match (
+                    config.flag("new_decoder_architecture"),
+                    config.flag("multi_query"),
+                ) {
+                    (Some(true), _) => ("num_kv_heads", "n_head_kv", false),
+                    (Some(false), Some(false)) => ("num_attention_heads", "n_head", true),
+                    _ => return None,
+                };
+                let hidden = positive(&config.fields["hidden_size"]);
+                let counts = config.rw_candidates(overrides, public, stored)?;
+                Some(
+                    counts
+                        .into_iter()
+                        .filter_map(|n| {
+                            // FalconAttention uses the same query-head count for KV heads and the division.
+                            // A non-integral head width cannot be initialized.
+                            let width = if query_heads {
+                                match hidden {
+                                    Some(h) if !h.is_multiple_of(n) => return None,
+                                    Some(h) => Some(h / n),
+                                    None => None,
+                                }
+                            } else {
+                                divided
+                            };
+                            Some((n, width))
+                        })
+                        .collect(),
+                )
+            })
+            .flatten();
+        let query_head_candidates =
+            possible_heads.is_some() && config.flag("new_decoder_architecture") == Some(false);
         let heads = HeadGeometry {
             num_kv_heads,
+            possible_heads,
             head_size,
             ..Default::default()
         };
         let divided_head_size = divided.filter(|_| divided_only);
-        (!heads.is_empty() || divided_head_size.is_some()).then(|| UniformAttention {
-            architecture: Some(self.name().to_owned()),
-            ordered_architecture: ordered,
-            heads,
-            divided_head_size,
-        })
+        // An explicitly registered NemotronH still identifies its layer classes without head scalars.
+        (!heads.is_empty() || divided_head_size.is_some() || ordered && self == Self::NemotronH)
+            .then(|| UniformAttention {
+                architecture: Some(self.name().to_owned()),
+                ordered_architecture: ordered,
+                query_head_candidates,
+                heads,
+                divided_head_size,
+            })
     }
 }
 
@@ -1131,6 +1255,9 @@ pub(super) struct UniformAttention {
     // A constructor selected from the ordered registry list can differ from the profile checkpoint.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) ordered_architecture: bool,
+    // Falcon's old non-MQA decoder partitions query heads; only KV heads may replicate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) query_head_candidates: bool,
     #[serde(flatten)]
     pub(super) heads: HeadGeometry,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1178,7 +1305,7 @@ impl UniformAttention {
         } else {
             self.heads.head_size
         };
-        let num_kv_heads = self.heads.num_kv_heads.and_then(|heads| {
+        let local = |heads: u64| {
             if heads.is_multiple_of(tp) {
                 Some(heads / tp)
             } else if tp.is_multiple_of(heads) {
@@ -1186,9 +1313,16 @@ impl UniformAttention {
             } else {
                 None
             }
-        });
+        };
         Some(HeadGeometry {
-            num_kv_heads,
+            num_kv_heads: self.heads.num_kv_heads.and_then(local),
+            possible_heads: self.heads.possible_heads.as_ref().map(|values| {
+                values
+                    .iter()
+                    .filter(|&&(n, _)| !self.query_head_candidates || n.is_multiple_of(tp))
+                    .filter_map(|&(n, width)| Some((local(n)?, width)))
+                    .collect()
+            }),
             head_size,
             ..Default::default()
         })
@@ -1222,6 +1356,24 @@ mod wrapper_tests {
             assert_eq!(
                 checkpoint_geometry(&dynamic, true)["text_config"]["num_key_value_heads"],
                 16
+            );
+        }
+        for child in ["mixtral", "qwen2_moe"] {
+            let mut raw = json!({"model_type":"voxtral","text_config":{"model_type":child}});
+            let config = checkpoint_geometry(&raw, false);
+            let text = &config["text_config"];
+            assert_eq!(
+                (
+                    &text["num_key_value_heads"],
+                    &text["num_hidden_layers"],
+                    &text["head_dim"]
+                ),
+                (&json!(8), &json!(30), &json!(128))
+            );
+            raw["text_config"]["num_key_value_heads"] = json!(4);
+            assert_eq!(
+                checkpoint_geometry(&raw, false)["text_config"]["num_key_value_heads"],
+                4
             );
         }
         let fast =

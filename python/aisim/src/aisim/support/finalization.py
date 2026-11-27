@@ -283,7 +283,9 @@ def _merge_resources(
                     None,
                 )
                 evidence["worker_observations"] = _worker_observations(
-                    evidence, checkpoint=staged if staged is not None and staged.is_file() else None
+                    evidence,
+                    checkpoint=staged if staged is not None and staged.is_file() else None,
+                    kv_cache_bytes=resources.runtime_memory.kv_cache_bytes,
                 )
             evidence["artifacts"] = [
                 {

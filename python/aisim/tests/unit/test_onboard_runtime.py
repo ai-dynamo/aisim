@@ -301,9 +301,10 @@ def test_snapshot_acceptance_survives_unrelated_probe_progress_but_detects_raw_t
 
 @pytest.mark.parametrize("legacy_inventory", [False, True])
 def test_draft_verifies_bound_geometry_from_its_staged_checkpoint(tmp_path, legacy_inventory):
+    from collector.fpm_forward.runtime_observations import validate_observations
+
     from aisim.support.finalization import _merge_resources
     from aisim.support.runtime import runtime_probe_manifest, verify_runtime_profile
-    from collector.fpm_forward.runtime_observations import validate_observations
 
     from .collector.test_runtime_observations import _mutate
 
@@ -2685,6 +2686,30 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
             {},
             source_references=True,
         )
+    # Each phase's raw KVCacheConfig describes its own initialized pool and block sizes.
+    for item in evidence["artifacts"]:
+        record = item["evidence"]
+        cache = record["cache"]
+        record["raw_cache_config"] = {
+            "num_blocks": cache["num_blocks"],
+            "groups": [{"block_size": group["block_size_tokens"]} for group in cache["groups"]],
+        }
+    observation["runtime_memory"]["provenance"] = json.dumps(evidence)
+    # Finalization must check what the scheduler measured before replacing its record with a reference.
+    sparse = copy.deepcopy(evidence)
+    for row in sparse["rank_capacities"]:
+        row.pop("kv_cache_bytes")
+        row.pop("initial_free_blocks")
+    capacity = observation["runtime_memory"]["kv_cache_bytes"]
+    cell = {**observation, "runtime_memory": {**observation["runtime_memory"], "provenance": json.dumps(sparse)}}
+    assert _merge_resources([cell], {}, source_references=True)["runtime_memory"]["kv_cache_bytes"] == capacity
+    cell["runtime_memory"]["kv_cache_bytes"] += sparse["rank_capacities"][0]["page_size_bytes"]
+    with pytest.raises(ValueError, match="kv_cache_bytes"):
+        _merge_resources([cell], {}, source_references=True)
+    sparse["artifacts"] = [item for item in sparse["artifacts"] if item["evidence"]["kind"] != "scheduler"]
+    cell["runtime_memory"].update(kv_cache_bytes=capacity, provenance=json.dumps(sparse))
+    with pytest.raises(ValueError, match="worker roster"):
+        _merge_resources([cell], {}, source_references=True)
     for version in ("source_references", "source_references_v2"):
         saved = {}
         _merge_resources([observation], saved, source_references=True, observation_format=version)

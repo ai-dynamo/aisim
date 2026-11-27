@@ -393,79 +393,181 @@ fn check_scheduler_groups(groups: &[Value], scheduler: &Value) -> Result<(), Aic
 }
 
 fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError> {
-    if let Some(tensors) = worker["layer_tensors"].as_object() {
-        let count = super::positive(&worker["num_blocks"]).ok_or_else(capacity_conflict)?;
-        let mut strides = BTreeMap::new();
-        for allocation in worker["tensor_allocations"]
+    let count = super::positive(&worker["num_blocks"]).ok_or_else(capacity_conflict)?;
+    let tensors = worker["layer_tensors"]
+        .as_object()
+        .ok_or_else(capacity_conflict)?;
+    let mut storages = BTreeMap::new();
+    for storage in worker["storages"]
+        .as_array()
+        .ok_or_else(capacity_conflict)?
+    {
+        let id = storage["storage_id"]
+            .as_str()
+            .ok_or_else(capacity_conflict)?;
+        let size = super::positive(&storage["size_bytes"]).ok_or_else(capacity_conflict)?;
+        if storages.insert(id, size).is_some() {
+            return Err(capacity_conflict());
+        }
+    }
+    let hybrid = groups.iter().any(|g| g.get("layer_specs").is_some());
+    let kernels = worker["model_runner"]["kernel_block_sizes"].as_array();
+    if hybrid && kernels.is_none_or(|rows| rows.len() != groups.len()) {
+        return Err(capacity_conflict());
+    }
+    let mut used_storage = BTreeSet::new();
+    let mut allocations = BTreeMap::new();
+    for allocation in worker["tensor_allocations"]
+        .as_array()
+        .ok_or_else(capacity_conflict)?
+    {
+        let id = allocation["storage_id"]
+            .as_str()
+            .ok_or_else(capacity_conflict)?;
+        let size = storages.get(id).ok_or_else(capacity_conflict)?;
+        if allocation["size"].as_u64() != Some(*size) {
+            return Err(capacity_conflict());
+        }
+        used_storage.insert(id);
+        let stride = allocation["block_stride"]
+            .as_u64()
+            .ok_or_else(capacity_conflict)?;
+        // Older shared-slot captures use zero for an unpacked allocation.
+        if stride == 0 && (hybrid || !allocation["shared_by"].is_array()) {
+            return Err(capacity_conflict());
+        }
+        for name in allocation["layers"]
             .as_array()
-            .into_iter()
-            .flatten()
+            .or(allocation["shared_by"].as_array())
+            .ok_or_else(capacity_conflict)?
         {
-            if let Some(stride) = super::positive(&allocation["block_stride"]) {
-                for name in allocation["layers"]
-                    .as_array()
-                    .or(allocation["shared_by"].as_array())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                {
-                    strides.insert(name, stride);
-                }
+            let name = name.as_str().ok_or_else(capacity_conflict)?;
+            if allocations.insert(name, (id, stride)).is_some() {
+                return Err(capacity_conflict());
             }
         }
-        for group in groups {
-            let block =
-                super::positive(&group["block_size_tokens"]).ok_or_else(capacity_conflict)?;
-            for name in group["layer_names"]
+    }
+    for (index, group) in groups.iter().enumerate() {
+        let block = super::positive(&group["block_size_tokens"]).ok_or_else(capacity_conflict)?;
+        for name in group["layer_names"]
+            .as_array()
+            .ok_or_else(capacity_conflict)?
+        {
+            let name = name.as_str().ok_or_else(capacity_conflict)?;
+            let (storage, stride) = allocations.remove(name).ok_or_else(capacity_conflict)?;
+            let saved = tensors.get(name).ok_or_else(capacity_conflict)?;
+            if saved.is_array() != hybrid {
+                return Err(capacity_conflict());
+            }
+            let views = saved
                 .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                let Some(saved) = tensors.get(name) else {
-                    continue;
-                };
-                let views = saved
-                    .as_array()
-                    .map(Vec::as_slice)
-                    .unwrap_or(std::slice::from_ref(saved));
-                for view in views {
-                    let kernel = super::positive(&view["kernel_block_size_tokens"])
-                        .ok_or_else(capacity_conflict)?;
-                    let axis = view["block_axis"]
+                .map(Vec::as_slice)
+                .unwrap_or(std::slice::from_ref(saved));
+            if views.is_empty() {
+                return Err(capacity_conflict());
+            }
+            let mut mapping = None;
+            for view in views {
+                let kernel = super::positive(&view["kernel_block_size_tokens"])
+                    .ok_or_else(capacity_conflict)?;
+                let axis = view["block_axis"]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(capacity_conflict)?;
+                if view["storage_id"] != storage || !block.is_multiple_of(kernel) {
+                    return Err(capacity_conflict());
+                }
+                let ratio = block / kernel;
+                let mut step = ratio;
+                if saved.is_array() {
+                    let spacing = view["kernel_block_stride"]
                         .as_u64()
-                        .and_then(|n| usize::try_from(n).ok())
                         .ok_or_else(capacity_conflict)?;
-                    if !block.is_multiple_of(kernel) {
-                        return Err(capacity_conflict());
-                    }
-                    let ratio = block / kernel;
-                    let step = if saved.is_array() {
-                        pool_field("kernel_block_stride", &[view])?
-                            .filter(|&s| s > 0)
-                            .unwrap_or(ratio)
-                    } else {
-                        ratio
-                    };
-                    let blocks = (count - 1)
-                        .checked_mul(step)
-                        .and_then(|n| n.checked_add(ratio))
+                    let spec = &group["layer_specs"][name];
+                    let group_kernel = kernels
+                        .and_then(|rows| super::positive(&rows[index]))
                         .ok_or_else(capacity_conflict)?;
-                    if step < ratio
-                        || view["shape"].get(axis).and_then(Value::as_u64) != Some(blocks)
-                        || strides.get(name).is_some_and(|&stride| {
-                            view["stride_bytes"]
-                                .get(axis)
-                                .and_then(Value::as_u64)
-                                .and_then(|s| s.checked_mul(step))
-                                != Some(stride)
-                        })
+                    let mamba = spec["spec_type"] == "vllm.v1.kv_cache_interface.MambaSpec";
+                    if axis != 0
+                        || mapping
+                            .replace((kernel, spacing))
+                            .is_some_and(|old| old != (kernel, spacing))
+                        || mamba && (group_kernel != block || kernel != block || spacing != 0)
+                        || !mamba
+                            && spec["tokens_per_state"].as_u64().unwrap_or(1) <= 1
+                            && (kernel != group_kernel || spacing != 0)
                     {
                         return Err(capacity_conflict());
                     }
+                    if spacing != 0 {
+                        step = spacing;
+                    }
+                }
+                let blocks = (count - 1)
+                    .checked_mul(step)
+                    .and_then(|n| n.checked_add(ratio))
+                    .ok_or_else(capacity_conflict)?;
+                if step < ratio
+                    || view["shape"].get(axis).and_then(Value::as_u64) != Some(blocks)
+                    || stride != 0
+                        && view["stride_bytes"]
+                            .get(axis)
+                            .and_then(Value::as_u64)
+                            .and_then(|s| s.checked_mul(step))
+                            != Some(stride)
+                {
+                    return Err(capacity_conflict());
                 }
             }
         }
+    }
+    if !allocations.is_empty()
+        || storages.len() != used_storage.len()
+        || tensors.len()
+            != groups
+                .iter()
+                .filter_map(|g| g["layer_names"].as_array())
+                .map(Vec::len)
+                .sum::<usize>()
+    {
+        return Err(capacity_conflict());
+    }
+    Ok(())
+}
+
+fn check_raw_geometry(record: &Value, groups: &[Value]) -> Result<(), AicError> {
+    let cache = &record["cache"];
+    let raw = &record["raw_cache_config"];
+    pool_field("num_blocks", &[cache, raw])?;
+    if let Some(saved) = raw.get("groups") {
+        let saved = saved
+            .as_array()
+            .filter(|rows| rows.len() == groups.len())
+            .ok_or_else(capacity_conflict)?;
+        for (original, group) in saved.iter().zip(groups) {
+            if [
+                ("block_size", "block_size_tokens"),
+                ("page_size_bytes", "spec_page_size_bytes"),
+                ("layer_names", "layer_names"),
+                ("spec_type", "spec_type"),
+            ]
+            .iter()
+            .any(|&(key, field)| {
+                original
+                    .get(key)
+                    .is_some_and(|v| !v.is_null() && v != &group[field])
+            }) {
+                return Err(capacity_conflict());
+            }
+        }
+    }
+    let hardware = pool_field("total_memory_bytes", &[&record["hardware"]])?;
+    if hardware.is_some_and(|total| {
+        ["allocated_cache_bytes", "available_cache_bytes"]
+            .iter()
+            .any(|key| cache[key].as_u64().is_some_and(|bytes| bytes > total))
+    }) {
+        return Err(capacity_conflict());
     }
     Ok(())
 }
@@ -527,6 +629,7 @@ fn rank_limits(entry: &Value, mut page: Option<u64>) -> Result<(Option<u64>, boo
         if indexed || record["schema_name"] == "aisimulate_fpm_runtime_memory" {
             let groups = worker["groups"].as_array().ok_or_else(capacity_conflict)?;
             if indexed {
+                check_raw_geometry(record, groups)?;
                 check_tensor_blocks(worker, groups)?;
             }
             if let Some(scheduler) = schedulers.get(key) {
@@ -638,23 +741,25 @@ pub(super) fn bound_phases(
         .filter(|p| !p.is_empty())
         .ok_or_else(invalid)?;
     for (name, snapshot) in phases {
+        let mut launches = std::iter::once(&snapshot["launch"])
+            .chain(
+                snapshot["artifacts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|r| &r["evidence"]["launch"]),
+            )
+            .filter_map(Value::as_object)
+            .peekable();
         if !matches!(name.as_str(), "prefill" | "decode")
             || snapshot["source"] != "runtime_observations"
             || !identified_source(snapshot)
-            || std::iter::once(&snapshot["launch"])
-                .chain(
-                    snapshot["artifacts"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .map(|r| &r["evidence"]["launch"]),
-                )
-                .filter_map(Value::as_object)
-                .any(|launch| match launch.get("worker_type") {
-                    None | Some(Value::Null) => phases.len() != 2,
-                    Some(role) if role == "aggregated" => phases.len() != 2,
-                    Some(role) => phases.len() != 1 || role != name.as_str(),
-                })
+            || phases.len() == 1 && launches.peek().is_none()
+            || launches.any(|launch| match launch.get("worker_type") {
+                None | Some(Value::Null) => phases.len() != 2,
+                Some(role) if role == "aggregated" => phases.len() != 2,
+                Some(role) => phases.len() != 1 || role != name.as_str(),
+            })
         {
             return Err(invalid());
         }
@@ -679,10 +784,10 @@ pub(super) fn bound_phases(
                 identified = true;
             }
         }
-        if let Some(settings) = snapshot["prefix_caching"].as_object() {
-            if settings.keys().any(|phase| phase != name) {
-                return Err(invalid());
-            }
+        if let Some(settings) = snapshot["prefix_caching"].as_object()
+            && settings.keys().any(|phase| phase != name)
+        {
+            return Err(invalid());
         }
         if !identified || rank_limits(snapshot, None)?.0.is_none() {
             return Err(invalid());
@@ -799,7 +904,7 @@ fn record_prefix_settings(expected: &mut Value, entry: &Value) -> Result<(), Aic
         };
         let cache = &record["cache"];
         let prefix = &cache["prefix_caching"];
-        if !prefix.is_object() {
+        if !prefix["enable_prefix_caching"].is_boolean() {
             return Err(super::conflict("prefix_caching"));
         }
         let settings = phases.entry(phase).or_insert_with(|| serde_json::json!({}));
@@ -842,6 +947,12 @@ fn record_prefix_settings(expected: &mut Value, entry: &Value) -> Result<(), Aic
         }
     }
     for settings in phases.values() {
+        if settings
+            .get("enable_prefix_caching")
+            .is_some_and(|v| !v.is_boolean())
+        {
+            return Err(super::conflict("prefix_caching"));
+        }
         if let Some(mode) = settings.get("mamba_cache_mode").filter(|v| !v.is_null())
             && (!matches!(mode.as_str(), Some("none" | "align"))
                 || mode == "align" && settings["enable_prefix_caching"] == false)
@@ -1222,6 +1333,40 @@ pub(super) fn validate_source(
 ) -> Result<bool, AicError> {
     if !identified_source(entry) {
         return Ok(false);
+    }
+    for record in std::iter::once(entry).chain(
+        entry["artifacts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|file| &file["evidence"]),
+    ) {
+        let topology = &record["launch"]["topology"];
+        let configs = [
+            &record["runtime_settings"]["parallel_config"],
+            &record["resolved_config"]["parallel_config"],
+        ];
+        if ["pp", "cp"].iter().any(|key| {
+            topology
+                .get(*key)
+                .is_some_and(|v| !v.is_null() && v.as_u64() != Some(1))
+        }) || configs.iter().any(|p| {
+            [
+                "pipeline_parallel_size",
+                "decode_context_parallel_size",
+                "prefill_context_parallel_size",
+            ]
+            .iter()
+            .any(|key| {
+                p.get(*key)
+                    .is_some_and(|v| !v.is_null() && v.as_u64() != Some(1))
+            })
+        }) || record
+            .get("pp_rank")
+            .is_some_and(|rank| !rank.is_null() && rank.as_u64() != Some(0))
+        {
+            return Err(invalid());
+        }
     }
     let parallel = &entry["runtime_settings"]["parallel_config"];
     let topology = &entry["launch"]["topology"];
@@ -1930,12 +2075,48 @@ mod tests {
             "spec_page_size_bytes":96,"pool_id":"pool","block_size_tokens":8,"layer_names":["a","b"],
             "layer_specs":{"a":spec,"b":spec}}]});
         let mut worker = json!({"num_blocks":100,"layer_tensors":{"a":[{"block_axis":0,
-            "kernel_block_size_tokens":4,"kernel_block_stride":3,"shape":[299,2],"stride_bytes":[32,2]}]},
-            "tensor_allocations":[{"layers":["a"],"block_stride":96}]});
+            "kernel_block_size_tokens":4,"kernel_block_stride":3,"shape":[299,2],"stride_bytes":[32,2],"storage_id":"s"}]},
+            "storages":[{"storage_id":"s","size_bytes":9600}],"model_runner":{"kernel_block_sizes":[4]},
+            "tensor_allocations":[{"layers":["a"],"block_stride":96,"storage_id":"s","size":9600}]});
         let groups = [group];
         check_scheduler_groups(&groups, &scheduler).unwrap();
-        let measured = [json!({"block_size_tokens":8,"layer_names":["a"]})];
+        let measured = [
+            json!({"block_size_tokens":8,"layer_names":["a"],"layer_specs":{"a":{"tokens_per_state":2}}}),
+        ];
         check_tensor_blocks(&worker, &measured).unwrap();
+        let mut shared = worker.clone();
+        shared["tensor_allocations"] =
+            json!([{"shared_by":["a"],"storage_id":"s","size":9600,"block_stride":0}]);
+        shared["layer_tensors"]["a"] = json!({"storage_id":"s","block_axis":0,
+            "kernel_block_size_tokens":8,"shape":[100,2],"stride_bytes":[96,2]});
+        check_tensor_blocks(
+            &shared,
+            &[json!({"block_size_tokens":8,"layer_names":["a"]})],
+        )
+        .unwrap();
+        for (path, value) in [
+            ("/layer_tensors", json!({})),
+            ("/tensor_allocations/0/size", json!(4800)),
+            ("/layer_tensors/a/0/storage_id", json!("other")),
+            ("/layer_tensors/a/0/block_axis", json!(1)),
+            ("/layer_tensors/a/0/kernel_block_stride", Value::Null),
+        ] {
+            let mut bad = worker.clone();
+            *bad.pointer_mut(path).unwrap() = value;
+            assert!(check_tensor_blocks(&bad, &measured).is_err(), "{path}");
+        }
+        let record = json!({"cache":{"num_blocks":100,"available_cache_bytes":9600},
+            "hardware":{"total_memory_bytes":9600},"raw_cache_config":{"num_blocks":100,"groups":[{"block_size":8}]}});
+        check_raw_geometry(&record, &measured).unwrap();
+        for (path, value) in [
+            ("/raw_cache_config/num_blocks", 50),
+            ("/raw_cache_config/groups/0/block_size", 4),
+            ("/hardware/total_memory_bytes", 4800),
+        ] {
+            let mut bad = record.clone();
+            *bad.pointer_mut(path).unwrap() = json!(value);
+            assert!(check_raw_geometry(&bad, &measured).is_err(), "{path}");
+        }
         scheduler["groups"][0]["block_size_tokens"] = json!(16);
         assert!(check_scheduler_groups(&groups, &scheduler).is_err());
         worker["num_blocks"] = json!(200);

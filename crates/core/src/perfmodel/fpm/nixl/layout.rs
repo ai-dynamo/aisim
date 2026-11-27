@@ -650,34 +650,46 @@ pub(super) fn nemotron_state_regions(
 ) -> Option<LayerRegions> {
     let mut names = BTreeMap::new();
     let mut first_attention = None;
+    let mut complete = true;
     for g in groups {
-        let state = match g["kind"].as_str()? {
-            "state" => true,
-            "attention" => false,
-            _ => return None,
+        let state = match g["kind"].as_str() {
+            Some("state") => true,
+            Some("attention") => false,
+            _ => {
+                complete = false;
+                continue;
+            }
         };
-        for layer in g["layer_names"].as_array()?.iter() {
-            let name = layer.as_str()?;
+        let Some(layers) = g["layer_names"].as_array() else {
+            complete = false;
+            continue;
+        };
+        for layer in layers {
             let suffix = if state { ".mixer" } else { ".mixer.attn" };
-            let index = name
-                .strip_prefix("model.layers.")?
-                .strip_suffix(suffix)?
-                .parse::<usize>()
-                .ok()?;
+            let index = layer
+                .as_str()
+                .and_then(|n| n.strip_prefix("model.layers."))
+                .and_then(|n| n.strip_suffix(suffix))
+                .and_then(|n| n.parse::<usize>().ok());
+            let (Some(index), Some(name)) = (index, layer.as_str()) else {
+                complete = false;
+                continue;
+            };
             if state {
-                if concrete_spec(g, name)? != "vllm.v1.kv_cache_interface.MambaSpec" {
-                    return None;
+                if concrete_spec(g, name) == Some("vllm.v1.kv_cache_interface.MambaSpec") {
+                    observed_layers.insert(index);
+                    names.insert(index, name);
+                } else {
+                    complete = false;
                 }
-                names.insert(index, name);
             } else {
                 first_attention = Some(first_attention.map_or(index, |i: usize| i.min(index)));
             }
         }
     }
-    if names.is_empty() {
+    if !complete || names.is_empty() {
         return None;
     }
-    observed_layers.extend(names.keys().copied());
     if let Some(exact) = owners.and_then(|n| nemotron_owners(n, "mixer")) {
         return Some(exact);
     }

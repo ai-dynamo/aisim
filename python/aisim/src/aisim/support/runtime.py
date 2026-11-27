@@ -395,7 +395,11 @@ def _worker_attention_backends(evidence: dict[str, Any]) -> list:
 
 
 def _worker_observations(
-    evidence: dict[str, Any], architecture: str | None = None, *, checkpoint: Path | None = None
+    evidence: dict[str, Any],
+    architecture: str | None = None,
+    *,
+    checkpoint: Path | None = None,
+    kv_cache_bytes: int | None = None,
 ) -> list:
     from aisim import _runtime
 
@@ -409,7 +413,9 @@ def _worker_observations(
             launch = {**record["launch"], "model_config": {**reference, "path": str(checkpoint)}}
             record = {**record, "launch": launch}
         records.append({**item, "evidence": record})
-    return json.loads(_runtime.nixl_worker_observations(json.dumps({**evidence, "artifacts": records}), architecture))
+    return json.loads(
+        _runtime.nixl_worker_observations(json.dumps({**evidence, "artifacts": records}), architecture, kv_cache_bytes)
+    )
 
 
 def _worker_observation_digest(
@@ -474,7 +480,10 @@ def _observed_transfer_settings(evidence: dict[str, Any], *, schema: str, invent
         architecture = inventory.get("model_metadata", {}).get("architecture")
         staged = Path(inventory["observations_index"]).with_name("model-config.json")
         snapshot["worker_observations"] = _worker_observations(
-            evidence, architecture, checkpoint=staged if staged.is_file() else None
+            evidence,
+            architecture,
+            checkpoint=staged if staged.is_file() else None,
+            kv_cache_bytes=inventory["observed_resources"]["runtime_memory"]["kv_cache_bytes"],
         )
         if version := evidence.get("runtime", {}).get("version"):
             snapshot["runtime"] = {"version": version}
