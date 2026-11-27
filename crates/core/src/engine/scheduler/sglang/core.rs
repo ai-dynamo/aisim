@@ -667,6 +667,7 @@ impl SglangCore {
             handoff_id,
             request_id,
             transferable_prompt_tokens,
+            full_local_hit: false,
         }]
     }
 

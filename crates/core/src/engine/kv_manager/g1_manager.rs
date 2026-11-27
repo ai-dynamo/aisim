@@ -73,6 +73,10 @@ impl DestinationReservation {
         self.inner.fresh_source_reads()
     }
 
+    pub(crate) fn full_local_hit(&self) -> bool {
+        self.inner.full_local_hit()
+    }
+
     pub(crate) fn transferable_prompt_tokens(&self, block_size: usize) -> usize {
         self.inner.transferable_prompt_tokens(block_size)
     }

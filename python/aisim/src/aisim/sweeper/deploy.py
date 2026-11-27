@@ -288,18 +288,28 @@ def _add_grouped_prefix_caching(
     payload["vllm_version"] = deployment.backend_version
     # Cold ranks also size their pool with the profile context unless the search overrides it.
     payload.setdefault("max_model_len", profile.context_length)
-    if not payload["enable_prefix_caching"]:
-        return
-    # The search gate checks the largest budget of the domain. Each candidate is checked with its own, before replay.
-    payload["prefix_match_unit"] = grouped_prefix_caching_requirements(
-        deployment,
-        backend_version=backend_version,
-        architecture=profile.architecture,
-        prefix_match_unit=None,
-        max_batched_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
-        field=f"{role}_enable_prefix_caching",
-        pd_rank=role != "agg",
-    )
+    if payload["enable_prefix_caching"]:
+        payload["prefix_match_unit"] = grouped_prefix_caching_requirements(
+            deployment,
+            backend_version=backend_version,
+            architecture=profile.architecture,
+            prefix_match_unit=None,
+            max_batched_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
+            field=f"{role}_enable_prefix_caching",
+            pd_rank=role != "agg",
+        )
+    if deployment.resources.runtime_memory is not None:
+        # Different topologies in one study may capture different scheduler settings.
+        # Check the selected shape before creating a replay with another shape's values.
+        from .kv_load import InfeasibleKVCapacity
+
+        try:
+            deployment.resources.validate_envelope(
+                max_num_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
+                max_batch_size=int(sample[f"{role}_max_num_seqs"]),
+            )
+        except ValueError as error:
+            raise InfeasibleKVCapacity(str(error)) from error
 
 
 def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:

@@ -1655,23 +1655,12 @@ sub-block matching without an explicit full-state scratch count.
   more block for the copy that its next step takes. With a hash block smaller
   than the state block, that is the case when the transferred tokens end at
   the prompt's partial tail, its last hash boundary, which vLLM caches when the
-  load completes. In one count replay keeps free more than vLLM. For a
-  prompt of more than one token in block mode, replay counts that block from
-  the reservation on: in the load's own test and for later transfers. vLLM
-  counts it only after the load has finished (see the differences of a
-  decode worker below). The
-  count of a sliding-window or `convolution` group stops at its admission
-  cap, as in vLLM. So a transferred request admitted past that cap can wait
-  for its first step. If no other request runs, the decode worker then stops,
-  as in vLLM, and replay ends with an error such as
-  `replay invariant violated: offline disagg replay encountered an effect-free zero-duration pass with 2 in-flight requests remaining`.
-  This needs a prefix-cacheable `state` group, which makes the prefill stop
-  one token short. It also needs a prompt above the cap of a sliding-window
-  or `convolution` group.
-  On vLLM 0.31.0 with a hash block of 1 token, two transferred requests of
-  one prompt token stop the decode worker in the same way when they fill the
-  pool: each caches its loaded state at its only token, and the first step of
-  each needs a block for the copy of that state, which no request frees.
+  load completes. Replay counts this copy from reservation onward, including
+  a one-token vLLM 0.31.0 prompt whose state is cached at token one. The
+  whole-prompt check caps a sliding-window or convolution group at its
+  admission limit. Later loads must also leave room for the earlier load's
+  first real forward, including any window pages beyond that limit. The
+  earlier request can then run and release its pages for the next load.
   Before a decode worker accepts a transferred request, it also checks the
   first step after the load, from the transferred tokens to the whole
   prompt, without the admission cap. When that step needs more than the
@@ -1731,19 +1720,13 @@ sub-block matching without an explicit full-state scratch count.
   The known differences above also apply to prefill and decode workers with
   prefix caching. A decode worker also differs from vLLM in these ways:
 
-  - When the local prefix covers every transferred token, vLLM 0.31.0,
-    0.32.0 and 0.33.0 load nothing and charge no transfer. Replay loads the
-    state of such a request again: it reserves the blocks of a load, applies
-    the two tests of a load and charges the fixed bytes of
-    [KV transfer](kv-transfer.md). So such a request can wait for blocks
-    that vLLM does not take, and a replay in which it never gets them ends
-    with the error
-    `offline disagg replay encountered an effect-free zero-duration pass`
-    that the paragraph on the two tests above quotes, where vLLM takes no
-    block for a load. When every group agrees on such a prefix, vLLM also
-    keeps it as it is. Replay rounds it down to a multiple of the scheduler
-    block, so with hits inside a block it also loads the full-attention
-    blocks above that multiple.
+  - When the local hit covers the transferred tokens, a vLLM Pull connector
+    can notify the source without reading any remote blocks. In
+    `destination_missing` mode replay charges zero payload time for that hit.
+    Its memory model still reserves the destination load and rounds the held
+    full-attention prefix down to a scheduler-block boundary. A request can
+    therefore wait for destination capacity even though its transfer costs
+    zero time. See [KV transfer](kv-transfer.md).
   - vLLM keeps the cached hit blocks of a sliding-window or `convolution`
     group inside the window. Replay takes new blocks there, so its block
     count there is equal or higher.

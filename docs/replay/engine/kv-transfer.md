@@ -90,7 +90,7 @@ decode worker receives every full-attention block, as one transfer unit holds
 a block of each full-attention group. No full-attention spec of vLLM 0.31.0,
 0.32.0 or 0.33.0 opts out of prefix caching. Only a profile that describes no
 deployment of these versions has such a group. The state moves with every
-transfer that moves at least one token.
+transfer that moves at least one token. When the local hit covers the entire remote prefill, `destination_missing` charges zero payload time and the source still receives its completion notification.
 The two workers must agree on their model, KV dtype, attention backend and
 observed model dtype when those facts are available. The selected deployment's
 `runtime_memory.model_dtype` records vLLM's initialized `ModelConfig.dtype`.
@@ -170,23 +170,13 @@ describes how to obtain the transfer bytes of a group.
 
 Replay differs from vLLM in these known ways for a grouped profile:
 
-- When the prefix cache of the decode worker already holds every transferred
-  token of a request, vLLM 0.31.0, 0.32.0 and 0.33.0 load nothing and charge
-  no transfer. Replay loads the state of such a request again: it reserves
-  the blocks of a load, applies the two tests that a decode worker makes to
-  reserve a transferred request (see
-  [grouped caches](kv-cache.md#other-cache-modes)) and charges
-  `fixed_bytes`. With hits inside a block, replay also rounds its local
-  prefix down to a multiple of the scheduler block, where vLLM keeps it, so
-  replay also moves the full-attention blocks above that multiple. So such a
-  request can wait for blocks that vLLM does not take, and a replay in which
-  it never gets them ends with an error where vLLM takes no block for a
-  load. Only a prefill that stops one token short can reach this case,
-  because a hit of the decode worker ends before the last prompt token. If
-  the decode worker lacks the state of the transferred tokens, vLLM computes
-  the prompt again from the hit that every group agrees on. Replay computes
-  one token. Neither live run measured these cases.
-- `fixed_bytes` charges every block of a sliding-window or `convolution`
+- On a complete local hit the replay destination still reserves blocks for
+  its load and rounds its held full-attention prefix down to the scheduler
+  block. It can wait for these blocks even when the Pull notification carries
+  zero KV bytes. If the decode worker lacks the state of the transferred
+  tokens, vLLM can recompute from the hit shared by every group. Replay
+  recomputes one token. See [grouped caches](kv-cache.md#other-cache-modes).
+- On a partial hit, `fixed_bytes` charges every block of a sliding-window or `convolution`
   group inside the window, whatever the decode worker caches. vLLM moves only
   the window blocks that the decode worker does not cache. GLM-5.3-Flash has
   no such group.

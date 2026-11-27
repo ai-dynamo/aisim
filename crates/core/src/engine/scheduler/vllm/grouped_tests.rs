@@ -3714,59 +3714,48 @@ fn grouped_destination_in_byte_mode_gives_back_the_need_of_a_dropped_load() {
 }
 
 #[test]
-fn grouped_destination_caps_the_first_pass_need_of_a_window_group() {
-    // Five pages and one batch of 32 tokens, so the window cap is
-    // cdiv(15 + 32, 16) + 1 = 4 blocks in both modes (V31
-    // `vllm/v1/kv_cache_interface.py:859-866`). A load of 65 tokens loads 64,
-    // and its window holds cdiv(64, 16) = 4 blocks, null blocks included. So
-    // vLLM counts min(5, 4) - 4 = 0 window blocks for the rest of the prompt
-    // (V31 `vllm/v1/core/single_type_kv_cache_manager.py:216-238`), though
-    // the first pass opens window block 4. The state counts 1 block in block
-    // mode, as token 65 opens a new state block, and 0 bytes in byte mode,
-    // which holds its state block already. So a distinct second load passes
-    // the load test at once: 2 + 1 <= 3 free blocks in block mode, and
-    // 300 + 0 <= 300 free bytes for a prompt of 66 tokens in byte mode.
-    let block = {
-        let mut args = prefix_core(window_transfer_groups(), 500, 32, 16, "0.31.0").args;
-        args.worker_type = WorkerType::Decode;
-        VllmCore::new(args)
-    };
+fn grouped_destination_keeps_room_for_its_first_window_allocation() {
+    // The admission cap is four window blocks. Opening block five on the first
+    // decode pass takes a real page in both modes, plus a new state in block mode.
+    let mut groups = window_transfer_groups();
+    groups[1].prefill_checkpoint_blocks = Some(0);
+    let mut args = prefix_core(groups, 500, 32, 16, "0.33.0").args;
+    args.worker_type = WorkerType::Decode;
+    let block = VllmCore::new(args);
     let byte = pd_core(window_transfer_groups(), 500, 32, WorkerType::Decode, None);
-    for (mut core, need, second_prompt, held) in [(block, 1, 65, 4), (byte, 0, 66, 5)] {
+    for (mut core, need, second_prompt) in [(block, 2, 65), (byte, 100, 66)] {
         let first = HandoffId::new(Uuid::from_u128(1781));
+        let second = HandoffId::new(Uuid::from_u128(1783));
         assert_eq!(
             reserve_grouped(&mut core, first, pd_request(1780, 65, 2)),
             Some(0)
         );
         assert_eq!(core.kv_manager.grouped_inflight_need(), need);
-        let second = HandoffId::new(Uuid::from_u128(1783));
         let request = DirectRequest {
             tokens: (1_000..1_000 + second_prompt).collect(),
             ..pd_request(1782, 0, 2)
         };
-        assert_eq!(reserve_grouped(&mut core, second, request), Some(0));
-        // Then the first load cannot run its first pass, as in vLLM. In block
-        // mode each first pass needs a window block and a state block, and 1
-        // block is free. In byte mode the first load needs a window page, and
-        // no byte is free. A waiting request does not preempt, and the
-        // waiting loop stops at the first request that does not fit (V31
-        // `vllm/v1/core/sched/scheduler.py:1223-1230`). So neither load runs,
-        // and with no request running the rank stops.
+        assert_eq!(reserve_grouped(&mut core, second, request), None);
         activate(&mut core, first);
-        activate(&mut core, second);
-        let mut trace = TraceCollector::default();
-        let mut step = 0;
-        for _ in 0..3 {
-            assert_eq!(step_pd(&mut core, &mut trace, &mut step), 0);
-        }
-        assert!(core.state.running.is_empty());
-        for id in [1780, 1782] {
-            assert_eq!(
-                core.state.requests[&Uuid::from_u128(id)].status,
-                RequestStatus::Waiting
+        let mut now = 0.0;
+        let mut completed = Vec::new();
+        for _ in 0..12 {
+            let pass = async_step(&mut core, &mut now);
+            completed.extend(
+                pass.output_signals
+                    .iter()
+                    .filter(|o| o.completed)
+                    .map(|o| o.uuid.as_u128()),
             );
+            if reserved_units(&core.retry_pending_destinations(), second).is_some() {
+                activate(&mut core, second);
+            }
+            if core.is_drained() {
+                break;
+            }
         }
-        assert_eq!(grouped_pool(&core).active_blocks(), held);
+        assert_eq!(completed, [1780, 1782]);
+        assert!(core.is_drained());
     }
 }
 
@@ -4273,7 +4262,7 @@ fn grouped_decode_one_token_load_takes_the_copy_of_its_state_in_its_first_pass()
                 Some(1),
                 "{label}"
             );
-            assert_eq!(core.kv_manager.grouped_inflight_need(), 0, "{label}");
+            assert_eq!(core.kv_manager.grouped_inflight_need(), copy, "{label}");
             activate(&mut core, handoff_id);
             // One attention block and one state block.
             assert_eq!(block_pool(&core).active_blocks(), 2, "{label}");
@@ -4297,84 +4286,42 @@ fn grouped_decode_one_token_load_takes_the_copy_of_its_state_in_its_first_pass()
 
 #[test]
 fn grouped_decode_one_token_loads_wait_for_the_block_of_the_copy() {
-    // vLLM 0.31.0 at a hash block of 1 token. Two loads of one token are
-    // reserved before either is activated: each holds 2 blocks, and each
-    // needs one more block for the copy of its state in its first step.
-    // On 6 pages both run in pass 0 with 6 blocks. On 5 pages only the first
-    // one fits its copy; the second one runs after the first one ended. On
-    // 4 pages no block is free, so neither runs: vLLM stops its waiting loop
-    // at a request that it cannot allocate (V31 `sched:1223-1230`).
-    // The peak of pass 0 counts each copy. With one batch vLLM frees each
-    // copy at the end of the pass (V31 `sched:1434-1442`), so after the pass
-    // every load holds its attention block and its state block. With two
-    // batches a decode worker defers that free until it processes the step
-    // that runs the copies (V31 `sched:175-181`, `:2712-2721`,
-    // `:1987-1989`), so vLLM still holds 6 and 5 blocks after pass 0 on 6
-    // and 5 pages. Replay does not model the deferred free and releases the
-    // copies at the end of the pass, so the two-batch rows give replay's
-    // count.
-    for max_concurrent_batches in [1, 2] {
-        for (pages, first_pass, peak) in [
-            (6u64, vec![1001u128, 1002], 6usize),
-            (5, vec![1001], 5),
-            (4, vec![], 4),
-        ] {
-            let label = format!("{max_concurrent_batches} {pages}");
-            let mut core = one_token_load_core("0.31.0", 1, pages, max_concurrent_batches);
+    // v0.31 publishes the one-token partial state. The first decode pass needs
+    // one writable copy in addition to its two loaded blocks.
+    for batches in [1, 2] {
+        for pages in [4, 5, 6] {
+            let mut core = one_token_load_core("0.31.0", 1, pages, batches);
             let a = HandoffId::new(Uuid::from_u128(2001));
             let b = HandoffId::new(Uuid::from_u128(2002));
             assert_eq!(
                 reserve_grouped(&mut core, a, one_token_load(1001, 7)),
-                Some(1),
-                "{label}"
+                Some(1)
             );
-            assert_eq!(
-                reserve_grouped(&mut core, b, one_token_load(1002, 9)),
-                Some(1),
-                "{label}"
-            );
+            let both = reserve_grouped(&mut core, b, one_token_load(1002, 9)).is_some();
+            assert_eq!(both, pages == 6);
             activate(&mut core, a);
-            activate(&mut core, b);
-            assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
-            assert_eq!(core.kv_manager.grouped_inflight_need(), 2, "{label}");
-            let mut now = 0.0;
-            block_pool(&core).reset_peak_active_blocks();
-            let pass = async_step(&mut core, &mut now);
-            let outputs: Vec<u128> = pass
-                .output_signals
-                .iter()
-                .map(|output| output.uuid.as_u128())
-                .collect();
-            assert_eq!(outputs, first_pass, "{label}");
-            assert_eq!(block_pool(&core).peak_active_blocks(), peak, "{label}");
-            assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
-            assert_eq!(
-                core.kv_manager.grouped_inflight_need(),
-                2 - first_pass.len() as u64,
-                "{label}"
-            );
-            assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0, "{label}");
-            if pages == 4 {
-                // Nothing changes in the next passes either.
-                for _ in 0..3 {
-                    let pass = async_step(&mut core, &mut now);
-                    assert!(pass.output_signals.is_empty(), "{label}");
-                }
-                assert_eq!(block_pool(&core).active_blocks(), 4, "{label}");
-            } else {
-                let mut completed = 0;
-                for _ in 0..8 {
-                    let pass = async_step(&mut core, &mut now);
-                    assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 0, "{label}");
-                    completed += pass
-                        .output_signals
-                        .iter()
-                        .filter(|output| output.completed)
-                        .count();
-                }
-                assert_eq!(completed, 2, "{label}");
-                assert_eq!(block_pool(&core).active_blocks(), 0, "{label}");
+            if both {
+                activate(&mut core, b);
             }
+            let mut now = 0.0;
+            let mut completed = Vec::new();
+            for _ in 0..12 {
+                let pass = async_step(&mut core, &mut now);
+                completed.extend(
+                    pass.output_signals
+                        .iter()
+                        .filter(|o| o.completed)
+                        .map(|o| o.uuid.as_u128()),
+                );
+                if reserved_units(&core.retry_pending_destinations(), b).is_some() {
+                    activate(&mut core, b);
+                }
+                if core.is_drained() {
+                    break;
+                }
+            }
+            assert_eq!(completed, [1001, 1002], "{batches} {pages}");
+            assert!(core.is_drained());
         }
     }
 }
@@ -7560,6 +7507,40 @@ fn grouped_decode_rank_stops_a_request_whose_chunk_in_flight_computed_only_outpu
         );
         assert_eq!(core.mocker_metrics().vllm_preemptions_total, 1, "{version}");
     }
+}
+
+#[test]
+fn grouped_decode_protects_a_solo_output_only_chunk_until_an_empty_pass() {
+    let mut args = prefix_core(full_and_state_transfer_groups(), 1200, 32, 16, "0.31.0").args;
+    args.worker_type = WorkerType::Decode;
+    args.max_concurrent_batches = 2;
+    let mut core = VllmCore::new(args);
+    let x = submit_tokens(&mut core, 1, (1000..1020).collect(), 120);
+    let r = submit_tokens(&mut core, 2, (2000..2005).collect(), 60);
+    let mut now = 0.0;
+    for _ in 0..=48 {
+        async_step(&mut core, &mut now);
+    }
+    // R has restarted after the preemption above. X leaves, and a held
+    // destination occupies its six pages without participating in any pass.
+    assert_eq!(core.state.requests[&r].num_computed_tokens, 16);
+    core.apply_command(SchedulerCommand::CancelRequest { request_id: x })
+        .unwrap();
+    let held = HandoffId::new(Uuid::from_u128(7));
+    assert!(reserve_grouped(&mut core, held, pd_request(8, 81, 2)).is_some());
+    let recompute = async_step(&mut core, &mut now);
+    assert!(recompute.output_signals.is_empty());
+    assert_eq!(core.state.requests[&r].num_computed_tokens, 48);
+    // R's next allocation cannot fit alongside the transfer. This decision
+    // must wait for the sole request whose recompute is still in flight.
+    let pass = async_step(&mut core, &mut now);
+    assert_eq!(pass.mocker_metrics.vllm_preemptions_total, 1);
+    assert_eq!(core.state.requests[&r].num_computed_tokens, 48);
+    assert!(pass.output_signals.is_empty());
+    assert!(core.policy_preempt(now).is_some());
+    core.apply_command(SchedulerCommand::CancelDestination { handoff_id: held })
+        .unwrap();
+    drain_async(&mut core, &mut now, "output-only recompute");
 }
 
 #[test]

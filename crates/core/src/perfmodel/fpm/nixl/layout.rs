@@ -382,7 +382,7 @@ fn on_gpu(cache: &Value, allocation: &Value, view: &Value, block_first: bool) ->
     }
 }
 
-fn view_span(dims: &[(u64, u64)], item_bytes: u64) -> Option<u128> {
+pub(super) fn view_span(dims: &[(u64, u64)], item_bytes: u64) -> Option<u128> {
     dims.iter()
         .try_fold(u128::from(item_bytes), |span, &(count, stride)| {
             span.checked_add(u128::from(count.checked_sub(1)?) * u128::from(stride))

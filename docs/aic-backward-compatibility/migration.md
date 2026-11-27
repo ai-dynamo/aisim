@@ -745,8 +745,8 @@ explains the retained workload routing and feature mathematics.
   evidence of that version then plans prefix caching on. `aisim onboard
   finalize` plans the resolved profile with the current rule.
 - `FpmRuntimeMemoryConfig` literals must supply `enable_prefix_caching`,
-  `mamba_cache_mode`, `hash_block_size_tokens` and `runtime_framework_version`
-  as `None`. Serialized records that omit these fields still deserialize, and
+  `mamba_cache_mode`, `hash_block_size_tokens`, `runtime_framework_version` and
+  `model_dtype` as `None`. Serialized records that omit these fields still deserialize, and
   `None` is not serialized.
 
 ### Rust AgentX snapshot options

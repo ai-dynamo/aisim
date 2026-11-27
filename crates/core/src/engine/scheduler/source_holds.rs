@@ -88,6 +88,7 @@ pub enum SchedulerLifecycleEvent {
         handoff_id: HandoffId,
         request_id: Uuid,
         transferable_prompt_tokens: usize,
+        full_local_hit: bool,
     },
     TtftMilestone {
         request_id: Uuid,

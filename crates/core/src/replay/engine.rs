@@ -232,7 +232,9 @@ impl ReplayRoleConfig {
             )?),
             None => None,
         };
-        let memory = deployment.and_then(|d| d.pointer("/resources/runtime_memory"));
+        let memory = deployment
+            .and_then(|d| d.pointer("/resources/runtime_memory"))
+            .filter(|v| !v.is_null());
         for (field, version) in [
             ("timing backend_version", timing.backend_version.as_deref()),
             (
@@ -292,6 +294,25 @@ impl ReplayRoleConfig {
         if let (Some(memory), Some(resources)) =
             (memory, deployment.and_then(|d| d.get("resources")))
         {
+            for (key, rank) in [
+                ("max_num_tokens", self.rank.max_num_batched_tokens),
+                ("max_batch_size", self.rank.max_num_seqs),
+            ] {
+                if let Some(recorded) = resources[key].as_u64() {
+                    ensure!(
+                        rank as u64 == recorded,
+                        "grouped runtime memory requires the exact recorded rank-local {key}={recorded}, replay rank has {rank}"
+                    );
+                }
+            }
+            if let Some(limit) = memory["max_model_len"].as_u64() {
+                ensure!(
+                    self.rank
+                        .max_model_len
+                        .is_some_and(|context| context as u64 <= limit),
+                    "grouped replay rank max_model_len exceeds runtime memory max_model_len={limit}"
+                );
+            }
             observed.selected_memory(
                 memory,
                 Some((
@@ -1165,6 +1186,48 @@ mod disaggregated_tests {
             role.as_mut().unwrap().rank.kv_cache_groups.clear();
         }
         config.validate_topology(&topology).unwrap();
+    }
+
+    #[test]
+    fn grouped_injected_replay_checks_each_rank_scheduler_envelope() {
+        use serde_json::json;
+        let groups = json!([{"name":"full","kind":"attention","num_layers":1,"block_size_tokens":4,
+            "page_size_bytes":64,"prefix_cacheable":true,"transfer_bytes_per_block":64}]);
+        let role = |phase| {
+            json!({"rank":{"worker_type":phase,"vllm_version":"0.33.0","enable_prefix_caching":false,
+            "max_num_batched_tokens":128,"max_num_seqs":32,"max_model_len":64,"kv_cache_groups":groups,
+            "kv_cache_capacity_bytes":2048, "timing_model":{"type":"external","provider":"ais","config":{
+                "system":"gpu","backend":"vllm","backend_version":"0.33.0","model":"model",
+                "fpm_profile":{"model":"model","deployments":[{"system":"gpu","backend":"vllm","backend_version":"0.33.0",
+                    "worker_type":phase,"tp":1,"pp":1,"dp":1,"moe_tp":1,"moe_ep":1,
+                    "resources":{"cache_layout":"grouped","cache_groups":groups,"max_num_tokens":128,"max_batch_size":32,
+                        "runtime_memory":{"max_model_len":128}}}]}}}}})
+        };
+        let spec: ReplaySpec = serde_json::from_value(json!({"topology":{"kind":"disaggregated",
+            "prefill":{"initial_workers":1},"decode":{"initial_workers":1}},
+            "engine":{"prefill":role("prefill"),"decode":role("decode")},
+            "requests":[{"id":"one","arrival_time_ms":0.0,"input_tokens":4,"output_tokens":2}]}))
+        .unwrap();
+        let timing = EngineConfig::default().built_in_timing_model().unwrap();
+        assert_eq!(
+            run_engine_replay_with_timing(spec.clone(), timing.clone())
+                .unwrap()
+                .request_counts
+                .completed_requests,
+            1
+        );
+        for (field, value, expected) in [
+            ("max_num_seqs", 64, "max_batch_size"),
+            ("max_num_batched_tokens", 256, "max_num_tokens"),
+            ("max_model_len", 256, "max_model_len"),
+        ] {
+            for phase in ["prefill", "decode"] {
+                let mut changed = spec.clone();
+                changed.engine[phase]["rank"][field] = json!(value);
+                let err = run_engine_replay_with_timing(changed, timing.clone()).unwrap_err();
+                assert!(err.to_string().contains(expected), "{err}");
+            }
+        }
     }
 
     #[test]

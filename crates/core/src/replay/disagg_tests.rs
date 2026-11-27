@@ -2768,12 +2768,12 @@ fn grouped_destination_missing_mode_moves_the_missing_blocks_and_the_state() {
     // FlashKDA checkpoint blocks. A state group moves its running block only,
     // and the decode rank reserves no checkpoint block, so the two rows of a
     // version expect the same times.
-    for (version, checkpoint, new_bytes, again_bytes, fixed_bytes) in [
-        ("0.31.0", false, 91_256_320, 65_166_080, 52_120_960),
-        ("0.32.0", false, 105_103_616, 61_146_624, 39_168_128),
-        ("0.32.0", true, 105_103_616, 61_146_624, 39_168_128),
-        ("0.33.0", false, 105_103_616, 61_146_624, 39_168_128),
-        ("0.33.0", true, 105_103_616, 61_146_624, 39_168_128),
+    for (version, checkpoint, new_bytes, again_bytes) in [
+        ("0.31.0", false, 91_256_320, 65_166_080),
+        ("0.32.0", false, 105_103_616, 61_146_624),
+        ("0.32.0", true, 105_103_616, 61_146_624),
+        ("0.33.0", false, 105_103_616, 61_146_624),
+        ("0.33.0", true, 105_103_616, 61_146_624),
     ] {
         let mut config = grouped_glm_disagg_config(version, checkpoint);
         for args in [&mut config.prefill_args, &mut config.decode_args] {
@@ -2781,8 +2781,7 @@ fn grouped_destination_missing_mode_moves_the_missing_blocks_and_the_state() {
             args.prefix_match_unit = Some(2176);
             args.kv_transfer_timing_mode = KvTransferTimingMode::DestinationMissing;
         }
-        let [new_ms, again_ms, known_difference_full_hit_ms] =
-            grouped_glm_transfer_ms(&config, &requests)[..]
+        let [new_ms, again_ms, full_hit_ms] = grouped_glm_transfer_ms(&config, &requests)[..]
         else {
             unreachable!("three requests");
         };
@@ -2798,16 +2797,25 @@ fn grouped_destination_missing_mode_moves_the_missing_blocks_and_the_state() {
             (again_ms - again_bytes as f64 / 1e6).abs() < 1e-6,
             "{version} checkpoint={checkpoint}: again={again_ms}"
         );
-        // A known difference that the run did not measure: the decode rank
-        // holds every transferred block, so vLLM moves nothing
-        // (`nixl/pull_scheduler.py:59-65`, `:149-153`), while replay still
-        // charges the fixed bytes. These are computed from the measured
-        // constants: the row of 1,000 tokens less one attention block.
+        // No remote blocks are read for the last prompt (pull_scheduler.py:149-156).
+        // Its notification still reaches the source and the request completes.
         assert!(
-            (known_difference_full_hit_ms - fixed_bytes as f64 / 1e6).abs() < 1e-6,
-            "{version} checkpoint={checkpoint}: known difference, full hit={known_difference_full_hit_ms}"
+            full_hit_ms.abs() < 1e-6,
+            "{version} checkpoint={checkpoint}: {full_hit_ms}"
         );
     }
+}
+
+#[test]
+fn grouped_destination_missing_charges_state_with_no_full_attention_units() {
+    let mut config = grouped_glm_disagg_config("0.33.0", false);
+    for rank in [&mut config.prefill_args, &mut config.decode_args] {
+        rank.kv_cache_groups.retain(|group| group.name != "mla");
+        rank.kv_transfer_timing_mode = KvTransferTimingMode::DestinationMissing;
+    }
+    let bytes = 92_288 + 4 * 9_768_960;
+    let deltas = grouped_glm_transfer_ms(&config, &[request(1, 2177, 2, 0.0)]);
+    assert!((deltas[0] - f64::from(bytes) / 1e6).abs() < 1e-6);
 }
 
 #[test]

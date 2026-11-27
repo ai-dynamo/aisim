@@ -723,6 +723,7 @@ impl DisaggFlowState {
                     handoff_id,
                     request_id,
                     transferable_prompt_tokens,
+                    full_local_hit,
                 } => {
                     let uuid = self.uuid_for_handoff(handoff_id)?;
                     if uuid != request_id {
@@ -743,6 +744,7 @@ impl DisaggFlowState {
                         HandoffFact::DestinationReserved {
                             handoff_id,
                             transferable_prompt_tokens,
+                            full_local_hit,
                         },
                         now_ms,
                         collector,

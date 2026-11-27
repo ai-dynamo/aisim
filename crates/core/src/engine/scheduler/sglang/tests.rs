@@ -3586,6 +3586,7 @@ mod destination_lifecycle {
                 handoff_id: reserved_handoff,
                 request_id: reserved_request,
                 transferable_prompt_tokens: 4,
+                full_local_hit: false,
             }] if *reserved_handoff == handoff_id && *reserved_request == logical_uuid
         ));
         assert!(destination.destination_is_held(handoff_id));
@@ -3904,6 +3905,7 @@ mod destination_lifecycle {
                 handoff_id: reserved_handoff,
                 request_id: reserved_request,
                 transferable_prompt_tokens: 0,
+                full_local_hit: false,
             }] if *reserved_handoff == second_handoff && *reserved_request == second_request
         ));
         assert_eq!(core.destination_reservation_attempts(), attempts + 1);
@@ -3972,6 +3974,7 @@ mod destination_lifecycle {
                 reserved.lifecycle_events.as_slice(),
                 [SchedulerLifecycleEvent::DestinationReserved {
                     transferable_prompt_tokens: 8,
+                    full_local_hit: false,
                     ..
                 }]
             ));

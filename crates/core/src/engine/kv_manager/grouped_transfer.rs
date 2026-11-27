@@ -325,8 +325,8 @@ impl GroupedTransferRules {
     /// V31, V32 and v0.33), and the state moves with every transfer that
     /// moves a token (V31 `nixl/base_worker.py:3507-3528`, V32 `:3472-3492`,
     /// v0.33 `:3810-3830`). When the decode rank holds every block, vLLM
-    /// moves nothing (V31, V32 and v0.33 `nixl/pull_scheduler.py:59-65`), but
-    /// this formula still counts the fixed bytes, as the handoff timing does.
+    /// moves nothing (V31, V32 and v0.33 `nixl/pull_scheduler.py:59-65`).
+    /// The destination reports that case separately from the number of full blocks.
     #[cfg(test)]
     pub(crate) fn payload_bytes(&self, transfer_tokens: usize, local_full_blocks: usize) -> u64 {
         let missing = self
@@ -341,9 +341,9 @@ impl GroupedTransferRules {
     /// `state_bytes` holds the fixed bytes. The destination reports its
     /// missing full-attention blocks in the same unit, as vLLM pulls only the
     /// blocks that the decode rank lacks (`nixl/pull_scheduler.py:149-156`,
-    /// the same in V31, V32 and v0.33). So the delay is the `payload_bytes`
-    /// over the bandwidth in both timing modes. The struct comes from the
-    /// builder of the linear path, which also maps the mode.
+    /// the same in V31, V32 and v0.33). A full local hit is reported separately:
+    /// a Pull notification needs no KV read. Other loads use this payload and
+    /// the configured bandwidth.
     pub(crate) fn handoff_transfer_timing(
         &self,
         transfer_tokens: usize,
@@ -549,10 +549,8 @@ mod tests {
                 Some(1.0),
                 KvTransferTimingMode::DestinationMissing,
             );
-            // This pins the arithmetic of the timing struct only. When no
-            // block is missing, vLLM moves nothing (`nixl/pull_scheduler.py:59-65`,
-            // `:149-153`), while this timing still charges the fixed bytes: a
-            // known difference that the run did not measure.
+            // Zero missing full-attention blocks still incur the fixed bytes if
+            // other groups need a read. A full local hit bypasses the KV read.
             assert!(close(missing.delay_ms(0), fixed as f64 / 1e6), "{version}");
             assert!(close(missing.delay_ms(1), row as f64 / 1e6), "{version}");
         }

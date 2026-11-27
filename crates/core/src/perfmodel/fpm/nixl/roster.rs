@@ -392,6 +392,37 @@ fn check_scheduler_groups(groups: &[Value], scheduler: &Value) -> Result<(), Aic
     Ok(())
 }
 
+/// Byte interval occupied by a v0.33 layer view in one physical pool block.
+fn layer_view_interval(view: &Value, ratio: u64, storage_size: u64) -> Option<(u128, u128)> {
+    let item = super::positive(&view["element_size_bytes"])?;
+    let start = u128::from(view["storage_offset_bytes"].as_u64()?);
+    let shape = view["shape"].as_array()?;
+    let strides = view["stride_bytes"].as_array()?;
+    if shape.len() != strides.len() {
+        return None;
+    }
+    let mut dimensions = shape
+        .iter()
+        .zip(strides)
+        .map(|(n, stride)| Some((super::positive(n)?, stride.as_u64()?)))
+        .collect::<Option<Vec<_>>>()?;
+    // The block axis is zero for the v0.33 layer-list format. Its in-page
+    // extent covers only the kernel blocks of one pool block.
+    let blocks = dimensions.first()?.0;
+    dimensions[0].0 = ratio;
+    let end = start.checked_add(super::layout::view_span(&dimensions, item)?)?;
+    dimensions[0].0 = blocks;
+    dimensions.sort_unstable_by_key(|&(_, stride)| stride);
+    let mut span = u128::from(item);
+    for (count, stride) in dimensions {
+        if !stride.is_multiple_of(item) || count > 1 && u128::from(stride) < span {
+            return None;
+        }
+        span = span.checked_add(u128::from(count - 1) * u128::from(stride))?;
+    }
+    (start.checked_add(span)? <= u128::from(storage_size)).then_some((start, end))
+}
+
 fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError> {
     let count = super::positive(&worker["num_blocks"]).ok_or_else(capacity_conflict)?;
     let tensors = worker["layer_tensors"]
@@ -486,6 +517,7 @@ fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError>
                 return Err(capacity_conflict());
             }
             let mut mapping = None;
+            let mut intervals = Vec::new();
             for view in views {
                 let kernel = super::positive(&view["kernel_block_size_tokens"])
                     .ok_or_else(capacity_conflict)?;
@@ -496,18 +528,12 @@ fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError>
                 let offset = view["storage_offset_bytes"]
                     .as_u64()
                     .ok_or_else(capacity_conflict)?;
-                // The indexed single-view layouts start at the recorded layer offset.
-                // v0.33 can place multiple state or attention views inside the layer's page.
-                let inside_layer = if hybrid {
-                    offset
-                        .checked_sub(start)
-                        .zip(group["layer_specs"][name]["page_size_bytes"].as_u64())
-                        .is_some_and(|(within, page)| within < page)
-                } else {
-                    offset == start
-                };
                 if view["storage_id"] != storage
-                    || !inside_layer
+                    || if hybrid {
+                        offset < start
+                    } else {
+                        offset != start
+                    }
                     || offset >= storages[storage]
                     || !block.is_multiple_of(kernel)
                 {
@@ -538,6 +564,14 @@ fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError>
                     if spacing != 0 {
                         step = spacing;
                     }
+                    let interval = layer_view_interval(view, ratio, storages[storage])
+                        .ok_or_else(capacity_conflict)?;
+                    let page =
+                        super::positive(&spec["page_size_bytes"]).ok_or_else(capacity_conflict)?;
+                    if interval.1 > u128::from(start) + u128::from(page) {
+                        return Err(capacity_conflict());
+                    }
+                    intervals.push(interval);
                 }
                 let blocks = (count - 1)
                     .checked_mul(step)
@@ -554,6 +588,10 @@ fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError>
                 {
                     return Err(capacity_conflict());
                 }
+            }
+            intervals.sort_unstable();
+            if intervals.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+                return Err(capacity_conflict());
             }
         }
     }
@@ -594,6 +632,22 @@ fn check_raw_geometry(record: &Value, groups: &[Value]) -> Result<(), AicError> 
                     .is_some_and(|v| !v.is_null() && v != &group[field])
             }) {
                 return Err(capacity_conflict());
+            }
+        }
+    }
+    // The v0.33 observer reads the raw allocation plan separately from the bound tensor views.
+    if let Some(raw_allocations) = raw["tensor_allocations"].as_array() {
+        for allocation in raw_allocations.iter().filter(|a| a["layers"].is_array()) {
+            let bound = cache["tensor_allocations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|a| a["layers"] == allocation["layers"])
+                .ok_or_else(capacity_conflict)?;
+            for field in ["offset", "layer_stride", "block_stride", "size"] {
+                if allocation.get(field).is_some_and(|v| v != &bound[field]) {
+                    return Err(capacity_conflict());
+                }
             }
         }
     }
@@ -2116,7 +2170,7 @@ mod tests {
             "spec_page_size_bytes":96,"pool_id":"pool","block_size_tokens":8,"layer_names":["a","b"],
             "layer_specs":{"a":spec,"b":spec}}]});
         let mut worker = json!({"num_blocks":100,"layer_tensors":{"a":[{"block_axis":0,
-            "kernel_block_size_tokens":4,"kernel_block_stride":3,"shape":[299,2],"stride_bytes":[32,2],"storage_id":"s","storage_offset_bytes":4}]},
+            "kernel_block_size_tokens":4,"kernel_block_stride":3,"element_size_bytes":2,"shape":[299,2],"stride_bytes":[32,2],"storage_id":"s","storage_offset_bytes":4}]},
             "storages":[{"storage_id":"s","size_bytes":9600}],"model_runner":{"kernel_block_sizes":[4]},
             "tensor_allocations":[{"layers":["a"],"layer_stride":96,"block_stride":96,"offset":0,"storage_id":"s","size":9600}]});
         let groups = [group];
@@ -2172,6 +2226,38 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn indexed_mamba_subviews_fit_each_page_and_do_not_overlap() {
+        let groups = [
+            json!({"block_size_tokens":4,"layer_names":["s"],"layer_specs":{"s":{
+            "spec_type":"vllm.v1.kv_cache_interface.MambaSpec","page_size_bytes":96}}}),
+        ];
+        let view = |offset| {
+            json!({"block_axis":0,"kernel_block_size_tokens":4,"kernel_block_stride":0,
+            "element_size_bytes":2,"shape":[100,2],"stride_bytes":[96,2],"storage_id":"pool","storage_offset_bytes":offset})
+        };
+        let mut worker = json!({"num_blocks":100,"model_runner":{"kernel_block_sizes":[4]},
+            "tensor_allocations":[{"storage_id":"pool","size":9600,"layers":["s"],"layer_stride":96,"block_stride":96,"offset":0}],
+            "storages":[{"storage_id":"pool","size_bytes":9600}]});
+        for (second, valid) in [(92, true), (94, false), (2, false)] {
+            worker["layer_tensors"]["s"] = json!([view(0), view(second)]);
+            assert_eq!(
+                check_tensor_blocks(&worker, &groups).is_ok(),
+                valid,
+                "offset {second}"
+            );
+        }
+        let mut record = json!({"cache":worker,"raw_cache_config":{"tensor_allocations":[{
+            "size":9600,"layers":["s"],"offset":0,"block_stride":96,"layer_stride":96}]}});
+        check_raw_geometry(&record, &groups).unwrap();
+        for field in ["offset", "layer_stride", "block_stride", "size"] {
+            let original = record["raw_cache_config"]["tensor_allocations"][0][field].take();
+            record["raw_cache_config"]["tensor_allocations"][0][field] = json!(9601);
+            assert!(check_raw_geometry(&record, &groups).is_err(), "{field}");
+            record["raw_cache_config"]["tensor_allocations"][0][field] = original;
+        }
     }
 
     #[test]

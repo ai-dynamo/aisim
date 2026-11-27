@@ -2803,6 +2803,47 @@ def test_grouped_pd_surfaces_conflicting_evidence_only_for_reachable_shapes(grou
     assert _fpm_parallel_configs(pinned, "disagg") == [candidate]
 
 
+@pytest.mark.parametrize("heterogeneous", [False, True])
+def test_grouped_search_intersects_each_captured_scheduler_domain(grouped_case, heterogeneous):
+    from aisim.sweeper.config import SmartSearchConfig
+    from aisim.sweeper.search_space import enumerate_branches
+
+    profile, root = grouped_case
+    shared = _with_transfer_markers(_with_prefix_evidence(profile))["deployments"][0]
+    prefill, decode = ({**deepcopy(shared), "worker_type": role} for role in ("prefill", "decode"))
+    decode["resources"].update(max_num_tokens=96, max_batch_size=8)
+    if heterogeneous:
+        decode["system"] = "h100_sxm"
+        (root / "h100_sxm.yaml").write_bytes((root / "h200_sxm.yaml").read_bytes())
+    profile["deployments"] = [prefill, decode]
+    raw = {
+        **_pd_search(profile, root),
+        "prefill_max_num_batched_tokens": [128, 256],
+        "prefill_max_num_seqs": [2, 4],
+        "decode_max_num_batched_tokens": [48, 96],
+        "decode_max_num_seqs": [2, 4],
+        "engine_integer_log_ranges": {"decode_max_num_seqs": [4, 16]},
+        "decode_hardware_sku": decode["system"],
+    }
+    workload = Workload(isl=32, osl=4, concurrency=1, request_count=2)
+
+    def branches():
+        return enumerate_branches(SmartSearchConfig(search_space=raw, workload=workload), max_seq_len=512)
+
+    (branch,) = branches()
+    for field, expected in [
+        ("prefill_max_num_batched_tokens", 128),
+        ("prefill_max_num_seqs", 4),
+        ("decode_max_num_batched_tokens", 96),
+        ("decode_max_num_seqs", 8),
+    ]:
+        assert branch.knob_choices[field] == [expected]
+        assert field not in branch.integer_ranges
+    raw["prefill_max_num_batched_tokens"] = [64, 256]
+    with pytest.raises(ValueError, match="prefill_max_num_batched_tokens=128"):
+        branches()
+
+
 def test_grouped_heterogeneous_pd_search_keeps_only_valid_pairs(grouped_case):
     from aisim.sweeper.config import SmartSearchConfig
     from aisim.sweeper.search_space import enumerate_branches

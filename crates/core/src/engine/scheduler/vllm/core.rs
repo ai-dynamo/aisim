@@ -1865,6 +1865,7 @@ impl VllmCore {
             }
         };
         self.pending_destinations.mark_front_attempted(generation);
+        let full_local_hit = kv.full_local_hit();
         let transferable_prompt_tokens = kv.transferable_prompt_tokens(self.args.block_size);
         let (handoff_id, request_id, request) = self
             .pending_destinations
@@ -1876,6 +1877,7 @@ impl VllmCore {
             handoff_id,
             request_id,
             transferable_prompt_tokens,
+            full_local_hit,
         }]
     }
 
@@ -4074,6 +4076,7 @@ impl VllmCore {
                 // and not committed. vLLM stamps it too.
                 self.in_flight_requests.clear();
                 self.in_flight_requests.extend(scheduled.keys().copied());
+                self.pass_ran_work = !self.in_flight_requests.is_empty();
             }
         }
         self.passes_executed += 1;

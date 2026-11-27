@@ -1067,9 +1067,9 @@ impl GroupedPrefixCoordinator {
     /// of a fine-grained hit again, also where vLLM keeps it. With a hash
     /// block smaller than the scheduler block, vLLM keeps it when the first
     /// `num_tokens - 1` tokens end on a hash block boundary and are all
-    /// cached, and loads nothing, while replay moves the full-attention
-    /// blocks above the floor and the fixed bytes. A nonzero junction keeps
-    /// its position.
+    /// cached and loads nothing. Replay reserves blocks above the floor but
+    /// reports a complete local hit from the original match for transfer timing.
+    /// A nonzero junction keeps its position.
     ///
     /// Only the full-attention groups get hit blocks to pin. On a decode rank
     /// vLLM drops each group's hit blocks below its skipped tokens before it
@@ -1309,6 +1309,14 @@ impl GroupedPrefixCoordinator {
             })
     }
 
+    /// An excluded full-attention group always needs its unhashed remote blocks.
+    pub(crate) fn full_attention_is_cacheable(&self) -> bool {
+        self.rules
+            .groups
+            .iter()
+            .all(|rule| rule.kind != GroupRuleKind::FullAttention || rule.cacheable)
+    }
+
     /// The tokens of the hit blocks that `hit` keeps in every full-attention
     /// group. A group that is not prefix-cacheable keeps none, so the count
     /// is 0 with such a group, even when a state hit gives `hit.tokens`. It
@@ -1391,9 +1399,7 @@ impl GroupedPrefixCoordinator {
         prompt: usize,
         loaded_tokens: usize,
     ) -> usize {
-        // Keep the modeled one-token load behavior: it transfers the whole
-        // prompt and only counts the copy once activation publishes it.
-        if loaded_tokens >= prompt || request.prefix_hash_at(loaded_tokens).is_none() {
+        if request.prefix_hash_at(loaded_tokens).is_none() {
             return 0;
         }
         self.rules
@@ -1766,6 +1772,7 @@ impl GroupedPrefixCoordinator {
         prompt: usize,
         computed: usize,
         tokens: usize,
+        cap_window: bool,
     ) -> usize {
         let rules = &self.rules;
         rules
@@ -1783,7 +1790,9 @@ impl GroupedPrefixCoordinator {
                         },
                     ) => {
                         let mut required = tokens.div_ceil(block);
-                        if let GroupRuleKind::SlidingWindow { window } = rule.kind {
+                        if let GroupRuleKind::SlidingWindow { window } = rule.kind
+                            && cap_window
+                        {
                             required = required.min(window_admission_blocks(
                                 window,
                                 block,

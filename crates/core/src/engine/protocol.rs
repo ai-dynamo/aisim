@@ -171,6 +171,7 @@ pub enum LifecycleEvent {
         handoff_id: HandoffId,
         request_id: Uuid,
         transferable_prompt_tokens: usize,
+        full_local_hit: bool,
     },
     /// A host-aware scheduler reached a scheduler-thread stage for one request.
     TtftMilestone {

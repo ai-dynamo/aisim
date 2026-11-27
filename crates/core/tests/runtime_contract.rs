@@ -1948,6 +1948,7 @@ fn grouped_destination_rejects_an_empty_prompt_before_reserving() {
                 handoff_id,
                 request_id,
                 transferable_prompt_tokens: 0,
+                full_local_hit: false,
             }]
         );
         assert_eq!(effects.metrics.kv_cache_used_bytes, Some(100));

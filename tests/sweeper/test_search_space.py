@@ -341,6 +341,7 @@ def test_heterogeneous_disagg_filters_authored_pairs_without_rebuilding_them(
     ).search_space
     role = [ReplicaParallelConfig(_AGG_CFG.shape, count) for count in range(1, 257)]
     pairs = [DisaggParallelConfig(rank, rank) for rank in reversed(role)]
+    pairs += [DisaggParallelConfig(role[i], role[j]) for i, j in [(10, 20), (20, 10), (10, 5), (5, 20)]]
 
     def feasible(*args, worker_type, candidate_configs, **kwargs):
         excluded = role[10] if worker_type == "prefill" else role[20]
@@ -355,7 +356,9 @@ def test_heterogeneous_disagg_filters_authored_pairs_without_rebuilding_them(
     found = search_space_module._heterogeneous_disagg_configs(
         space, backend="trtllm", max_seq_len=512, candidate_configs=pairs
     )
-    assert found == [pair for pair in pairs if 8 <= pair.total_gpus <= 500 and pair.prefill not in (role[10], role[20])]
+    assert found == [
+        pair for pair in pairs if 8 <= pair.total_gpus <= 500 and pair.prefill != role[10] and pair.decode != role[20]
+    ]
 
 
 @pytest.mark.filterwarnings("error")

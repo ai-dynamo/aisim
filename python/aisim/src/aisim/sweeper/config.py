@@ -1257,7 +1257,11 @@ class SearchSpace(BaseModel):
                     backend_version=backend_version,
                     architecture=profile.architecture,
                     prefix_match_unit=None,
-                    max_batched_tokens=_role_runtime(self, "vllm", role)[0],
+                    max_batched_tokens=(
+                        deployment.resources.max_num_tokens
+                        if deployment.resources.runtime_memory is not None
+                        else _role_runtime(self, "vllm", role)[0]
+                    ),
                     field=f"{role}_enable_prefix_caching",
                     pd_rank=False,
                 )

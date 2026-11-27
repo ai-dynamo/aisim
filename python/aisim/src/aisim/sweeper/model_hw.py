@@ -430,7 +430,13 @@ def _profile_parallel_configs(
                 backend_version=backend_version,
                 architecture=profile.architecture,
                 prefix_match_unit=None,
-                max_batched_tokens=max_batched_tokens_for(role) if max_batched_tokens_for else DEFAULT_MAX_NUM_TOKENS,
+                max_batched_tokens=(
+                    deployment.resources.max_num_tokens
+                    if deployment.resources.runtime_memory is not None
+                    else max_batched_tokens_for(role)
+                    if max_batched_tokens_for
+                    else DEFAULT_MAX_NUM_TOKENS
+                ),
                 field=f"{role}_enable_prefix_caching",
                 pd_rank=role != "agg",
             )

@@ -774,6 +774,20 @@ impl NixlIdentity {
         }
         entry["artifacts"].as_array().ok_or_else(roster::invalid)?;
         identity.observation(entry, None, Capture::Full, false)?;
+        if let (Some(selected), Some(measured)) = (
+            cache_groups.and_then(Value::as_array),
+            &identity.recorded_groups,
+        ) {
+            // Checkpoint markers were recorded by the original grouped importer. A fresh
+            // projection must preserve even a measured zero in the groups it will save.
+            for (group, observed) in selected.iter().zip(measured) {
+                for field in ["prefill_checkpoint_blocks", "prefill_checkpoint_alignment"] {
+                    if observed.get(field).is_some_and(|v| v != &group[field]) {
+                        return Err(conflict(field));
+                    }
+                }
+            }
+        }
         let measured = roster::selected_memory(entry)?;
         if let Some(bytes) = kv_cache_bytes
             && (measured["kv_cache_bytes"]
