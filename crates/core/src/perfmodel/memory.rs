@@ -165,6 +165,12 @@ pub enum KvCacheEstimateError {
         variant_kind: &'static str,
     },
     /// Invalid caller controls or checkpoint metadata. Must not trigger fallback.
+    ///
+    /// Externally this variant is terminal: surface it to the caller instead of
+    /// retrying with a fallback, regression, or naive estimator. The Python
+    /// `estimate_kv_cache` already re-raises the underlying
+    /// `InvalidEngineConfigurationError` before any naive pricing, so a retry
+    /// would only rebuild a layout the native path rejected.
     BadConfig {
         field: String,
         reason: String,
@@ -238,6 +244,15 @@ impl std::error::Error for KvCacheEstimateError {}
 /// budget, HF config fetch failure) retain the historical
 /// [`KvCacheEstimateError::Unsupported`] mapping. Both retain the Python
 /// diagnostic.
+///
+/// Checked consumers:
+/// - The replay capacity path (`python.rs::estimate_aic_num_gpu_blocks`) calls
+///   the Python `estimate_num_gpu_blocks` entry point directly and propagates
+///   its error; it never substitutes a fallback count.
+/// - The embedded bridge tests pin both sides: `BadConfig` for a rejected
+///   configuration (`dense_gemma4_capacity_rejects_instead_of_estimating_naively`,
+///   `routed_gemma4_omitted_moe_pair_maps_to_bad_config`) and a Python rejection
+///   that survives `allow_naive_fallback: true`.
 #[cfg(feature = "python")]
 pub fn estimate_kv_cache(
     req: KvCacheEstimateRequest,
