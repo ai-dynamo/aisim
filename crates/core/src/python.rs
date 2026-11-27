@@ -4841,10 +4841,10 @@ fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult
 #[pyfunction]
 #[pyo3(signature = (records, architecture=None))]
 fn nixl_worker_observations(records: &str, architecture: Option<&str>) -> PyResult<String> {
-    let parsed: Vec<serde_json::Value> = serde_json::from_str(records)
+    let parsed: serde_json::Value = serde_json::from_str(records)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(
-        crate::perfmodel::fpm::NixlIdentity::compact_workers(&parsed, architecture)
+        crate::perfmodel::fpm::NixlIdentity::compact_observation(&parsed, architecture)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
             .to_string(),
     )

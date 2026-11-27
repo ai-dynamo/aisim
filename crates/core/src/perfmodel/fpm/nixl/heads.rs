@@ -10,6 +10,12 @@
 // SPDX-FileCopyrightText: Copyright 2023 The vLLM team
 // SPDX-FileCopyrightText: Copyright 2022 the Big Science Workshop and HuggingFace Inc. team. All rights reserved.
 // SPDX-FileCopyrightText: Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2025 The HuggingFace Team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2024 HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2026 The PaddlePaddle Team and The HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2026 The LightOn Team and The HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2025 HuggingFace Inc. team. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 //! NIXL hashes the model converter's global geometry. Registered caches use the
@@ -211,9 +217,8 @@ fn wrapper_text_decoder(config: &Value, stock_only: bool) -> Option<Decoder> {
     }
     let default = match wrapper {
         "deepseek_vl" | "deepseek_vl_hybrid" | "idefics3" | "janus" | "llava" | "llava_next"
-        | "llava_next_video" | "perception_lm" | "smolvlm" | "video_llava" | "vipllava" => {
-            Some(Decoder::Llama)
-        }
+        | "llava_next_video" | "perception_lm" | "smolvlm" | "video_llava" | "vipllava"
+        | "voxtral" => Some(Decoder::Llama),
         "audioflamingo3" | "fast_vlm" | "got_ocr2" | "internvl" | "llava_onevision"
         | "musicflamingo" | "pp_chart2table" | "qwen2_audio" | "vibevoice_asr" => {
             Some(Decoder::Qwen2)
@@ -261,6 +266,17 @@ fn wrapper_text_decoder(config: &Value, stock_only: bool) -> Option<Decoder> {
 fn wrapper_text_geometry(config: &Value, decoder: Decoder) -> Value {
     let raw = &config["text_config"];
     let mut fields = geometry_config(raw);
+    // Voxtral passes these defaults to the selected child even for a partial dictionary.
+    if config["model_type"] == "voxtral" {
+        for (key, value) in [
+            ("hidden_size", 3072),
+            ("num_hidden_layers", 30),
+            ("num_key_value_heads", 8),
+            ("head_dim", 128),
+        ] {
+            fields.entry(key).or_insert(Value::from(value));
+        }
+    }
     if raw.is_null() {
         let args: Option<(u64, u64, u64, u64, Option<u64>)> = match config["model_type"].as_str() {
             Some("fast_vlm") => Some((3584, 28, 4, 28, None)),
@@ -425,6 +441,7 @@ fn checkpoint_geometry(config: &Value, stock_only: bool) -> Value {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CheckpointKey {
     stock_only: bool,
+    rw_substitution: bool,
     path: std::path::PathBuf,
     digest: String,
     size: u64,
@@ -434,11 +451,18 @@ struct CheckpointKey {
 }
 
 impl CheckpointKey {
-    fn new(path: &Path, digest: &str, metadata: &fs::Metadata, stock_only: bool) -> Option<Self> {
+    fn new(
+        path: &Path,
+        digest: &str,
+        metadata: &fs::Metadata,
+        stock_only: bool,
+        rw_substitution: bool,
+    ) -> Option<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         Some(Self {
             stock_only,
+            rw_substitution,
             path: path.to_owned(),
             digest: digest.to_owned(),
             size: metadata.len(),
@@ -541,7 +565,11 @@ pub(super) fn checkpoint(
     static SCOPES: LazyLock<Cache<CheckpointKey, Option<std::sync::Arc<Value>>>> =
         LazyLock::new(|| Cache::new(128));
     let stock_only = model["trust_remote_code"] == false;
-    let key = CheckpointKey::new(path, digest, &metadata, stock_only)?;
+    let rw_substitution = refined_web(overrides);
+    let key_for = |metadata: &fs::Metadata| {
+        CheckpointKey::new(path, digest, metadata, stock_only, rw_substitution)
+    };
+    let key = key_for(&metadata)?;
     let saved = SCOPES
         .get_or_insert_with(&key, || -> std::io::Result<_> {
             let mut options = fs::OpenOptions::new();
@@ -554,9 +582,7 @@ pub(super) fn checkpoint(
             }
             let mut file = options.open(path)?;
             let opened = file.metadata()?;
-            if !opened.is_file()
-                || CheckpointKey::new(path, digest, &opened, stock_only).as_ref() != Some(&key)
-            {
+            if !opened.is_file() || key_for(&opened).as_ref() != Some(&key) {
                 return Ok(None);
             }
             let mut hash = Sha256::new();
@@ -573,14 +599,25 @@ pub(super) fn checkpoint(
             };
             let config = serde_json::from_reader::<_, Value>(reader).ok();
             // Keep the scope only if the same descriptor still identifies the hashed file.
-            if CheckpointKey::new(path, digest, &file.metadata()?, stock_only).as_ref()
-                != Some(&key)
-            {
+            if key_for(&file.metadata()?).as_ref() != Some(&key) {
                 return Ok(None);
             }
             Ok(config
                 .filter(Value::is_object)
-                .map(|config| std::sync::Arc::new(checkpoint_geometry(&config, stock_only))))
+                .filter(|config| {
+                    // The loaded RWConfig rejects constructor kwargs for these read-only properties.
+                    !(rw_substitution
+                        && !refined_web(config)
+                        && (config.get("head_dim").is_some() || config.get("rotary").is_some()))
+                })
+                .map(|mut config| {
+                    // The vLLM parser registers RWConfig under both the override and
+                    // checkpoint names before loading the original constructor arguments.
+                    if rw_substitution && config["model_type"].is_string() {
+                        config["model_type"] = Value::from("RefinedWeb");
+                    }
+                    std::sync::Arc::new(checkpoint_geometry(&config, stock_only))
+                }))
         })
         .ok()
         .flatten()?;
@@ -663,7 +700,10 @@ impl<'a> HfConfig<'a> {
     pub(super) fn model_type(self, model: &'a Value) -> Option<&'a str> {
         // Stock to_dict() serializes the class's model_type even after config.update()
         // sets a different instance value. vLLM selects its converter from the instance.
-        if (self.stock_qwen_vl.is_some() || self.class.is_some() || self.text_class.is_some())
+        if (self.stock_only
+            || self.stock_qwen_vl.is_some()
+            || self.class.is_some()
+            || self.text_class.is_some())
             && model["hf_config"].is_object()
             && let Some(family) = model["hf_overrides"]["model_type"].as_str()
         {
@@ -697,9 +737,8 @@ impl<'a> HfConfig<'a> {
             };
         }
         let qwen_vl = self.stock_qwen_vl.unwrap_or_else(|| {
-            self.class.is_none()
-                && (qwen2_vl_text_type(self.fields, self.stock_only).is_some()
-                    || registered == Some(registry::Registration::Qwen2Vl))
+            qwen2_vl_text_type(self.fields, self.stock_only).is_some()
+                || !self.complete && registered == Some(registry::Registration::Qwen2Vl)
         });
         // A post-load model_type override selects a converter but cannot create a text child.
         let nested = text_field(self.fields).or_else(|| qwen_vl.then_some("text_config"));
@@ -741,18 +780,19 @@ impl<'a> HfConfig<'a> {
         }
     }
 
-    /// RWConfig aliases both public setters to n_head_kv. Canonicalized override maps
+    /// RWConfig aliases public and stored setters. Canonicalized override maps
     /// can lose their setter order. A captured effective value takes precedence.
-    pub(super) fn rw_kv_candidates(
+    pub(super) fn rw_candidates(
         self,
         overrides: &Value,
+        public: &str,
+        stored: &str,
     ) -> Option<std::collections::BTreeSet<u64>> {
-        if self.class != Some(ConfigClass::RefinedWeb) || !self.attribute("num_kv_heads").is_null()
-        {
+        if self.class != Some(ConfigClass::RefinedWeb) || !self.attribute(public).is_null() {
             return None;
         }
-        let public = positive(&overrides["num_kv_heads"])?;
-        let stored = positive(&overrides["n_head_kv"])?;
+        let public = positive(&overrides[public])?;
+        let stored = positive(&overrides[stored])?;
         (public != stored).then(|| std::collections::BTreeSet::from([public, stored]))
     }
 

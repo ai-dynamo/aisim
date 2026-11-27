@@ -2677,6 +2677,14 @@ def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evide
         rank["attention_backend"] = "FLASHINFER"
     workers[-1]["attention_backend"] = ["FLASH_ATTN", "FLASHINFER"]
     observation["runtime_memory"]["provenance"] = json.dumps(evidence)
+    bad = json.loads(observation["runtime_memory"]["provenance"])
+    bad["rank_capacities"][0]["available_cache_bytes"] *= 2
+    with pytest.raises(ValueError, match="kv_cache_bytes"):
+        _merge_resources(
+            [{**observation, "runtime_memory": {**observation["runtime_memory"], "provenance": json.dumps(bad)}}],
+            {},
+            source_references=True,
+        )
     for version in ("source_references", "source_references_v2"):
         saved = {}
         _merge_resources([observation], saved, source_references=True, observation_format=version)

@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
+
+//! Modified vLLM scheduler group and hash block checks. See THIRD_PARTY_NOTICES.md
+//! for the original paths, immutable revision, and Apache-2.0 license.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -244,13 +248,7 @@ fn measured_rank_capacity(
     }
     super::merge_observed(&mut pool.0, count, "kv_cache_bytes")?;
     super::merge_observed(&mut pool.1, free, "kv_cache_bytes")?;
-    let budget = [
-        pool_field("available_cache_bytes", &[row])?,
-        pool_field("available_cache_bytes", &[worker])?,
-    ]
-    .into_iter()
-    .flatten()
-    .min();
+    let budget = pool_field("available_cache_bytes", &[row, worker])?;
     if budget == Some(0) || allocated.zip(budget).is_some_and(|(n, b)| n > b) {
         return Err(capacity_conflict());
     }
@@ -333,6 +331,145 @@ fn indexed_pool(worker: &Value, scheduler: &Value) -> Result<(), AicError> {
     Ok(())
 }
 
+fn check_scheduler_groups(groups: &[Value], scheduler: &Value) -> Result<(), AicError> {
+    let scheduled = scheduler["groups"]
+        .as_array()
+        .filter(|s| s.len() == groups.len())
+        .ok_or_else(capacity_conflict)?;
+    for (group, saved) in groups.iter().zip(scheduled) {
+        // The scheduler omits worker-only labels. For a uniform group vLLM
+        // broadcasts the first named layer's concrete spec to the group.
+        let saved = saved.as_object().ok_or_else(capacity_conflict)?;
+        let mut expected: BTreeMap<_, _> = group
+            .as_object()
+            .ok_or_else(capacity_conflict)?
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        expected.remove("kind");
+        expected.remove("layer_classes");
+        if group["spec_type"]
+            .as_str()
+            .is_some_and(|s| s.ends_with(".UniformTypeKVCacheSpecs"))
+        {
+            let names = group["layer_names"]
+                .as_array()
+                .ok_or_else(capacity_conflict)?;
+            let first = names
+                .first()
+                .and_then(Value::as_str)
+                .and_then(|name| group["layer_specs"].get(name))
+                .filter(|s| s.is_object())
+                .ok_or_else(capacity_conflict)?;
+            for (key, source) in [
+                ("spec_type", "spec_type"),
+                ("spec_page_size_bytes", "page_size_bytes"),
+                ("dtype", "dtype"),
+            ] {
+                expected.insert(key, &first[source]);
+            }
+            let layers = saved
+                .get("layer_specs")
+                .and_then(Value::as_object)
+                .ok_or_else(capacity_conflict)?;
+            if layers.len() != names.len()
+                || !names
+                    .iter()
+                    .all(|name| name.as_str().and_then(|n| layers.get(n)) == Some(first))
+            {
+                return Err(super::conflict("scheduler cache_groups"));
+            }
+            expected.insert("layer_specs", &saved["layer_specs"]);
+        }
+        if saved.len() != expected.len()
+            || expected
+                .into_iter()
+                .any(|(key, value)| saved.get(key) != Some(value))
+        {
+            return Err(super::conflict("scheduler cache_groups"));
+        }
+    }
+    Ok(())
+}
+
+fn check_tensor_blocks(worker: &Value, groups: &[Value]) -> Result<(), AicError> {
+    if let Some(tensors) = worker["layer_tensors"].as_object() {
+        let count = super::positive(&worker["num_blocks"]).ok_or_else(capacity_conflict)?;
+        let mut strides = BTreeMap::new();
+        for allocation in worker["tensor_allocations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(stride) = super::positive(&allocation["block_stride"]) {
+                for name in allocation["layers"]
+                    .as_array()
+                    .or(allocation["shared_by"].as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    strides.insert(name, stride);
+                }
+            }
+        }
+        for group in groups {
+            let block =
+                super::positive(&group["block_size_tokens"]).ok_or_else(capacity_conflict)?;
+            for name in group["layer_names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                let Some(saved) = tensors.get(name) else {
+                    continue;
+                };
+                let views = saved
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(std::slice::from_ref(saved));
+                for view in views {
+                    let kernel = super::positive(&view["kernel_block_size_tokens"])
+                        .ok_or_else(capacity_conflict)?;
+                    let axis = view["block_axis"]
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(capacity_conflict)?;
+                    if !block.is_multiple_of(kernel) {
+                        return Err(capacity_conflict());
+                    }
+                    let ratio = block / kernel;
+                    let step = if saved.is_array() {
+                        pool_field("kernel_block_stride", &[view])?
+                            .filter(|&s| s > 0)
+                            .unwrap_or(ratio)
+                    } else {
+                        ratio
+                    };
+                    let blocks = (count - 1)
+                        .checked_mul(step)
+                        .and_then(|n| n.checked_add(ratio))
+                        .ok_or_else(capacity_conflict)?;
+                    if step < ratio
+                        || view["shape"].get(axis).and_then(Value::as_u64) != Some(blocks)
+                        || strides.get(name).is_some_and(|&stride| {
+                            view["stride_bytes"]
+                                .get(axis)
+                                .and_then(Value::as_u64)
+                                .and_then(|s| s.checked_mul(step))
+                                != Some(stride)
+                        })
+                    {
+                        return Err(capacity_conflict());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // When a historical writer omits one rank, measured ranks still bound the minimum.
 fn rank_limits(entry: &Value, mut page: Option<u64>) -> Result<(Option<u64>, bool), AicError> {
     fn pool(r: &Value) -> (Option<&str>, Option<u64>) {
@@ -384,6 +521,22 @@ fn rank_limits(entry: &Value, mut page: Option<u64>) -> Result<(Option<u64>, boo
             _ => {}
         }
     }
+    for ((key, _), record) in &workers {
+        let worker = &record["cache"];
+        let indexed = record["schema_version"] == "aisimulate-runtime-observation/v1";
+        if indexed || record["schema_name"] == "aisimulate_fpm_runtime_memory" {
+            let groups = worker["groups"].as_array().ok_or_else(capacity_conflict)?;
+            if indexed {
+                check_tensor_blocks(worker, groups)?;
+            }
+            if let Some(scheduler) = schedulers.get(key) {
+                check_scheduler_groups(groups, scheduler)?;
+                if indexed {
+                    indexed_pool(worker, scheduler)?;
+                }
+            }
+        }
+    }
     let rows = entry["rank_capacities"].as_array();
     if identified_source(entry) {
         // These collectors normalize every group against the same shared pool page and
@@ -396,12 +549,17 @@ fn rank_limits(entry: &Value, mut page: Option<u64>) -> Result<(Option<u64>, boo
             )?;
         }
     }
+    // The formal memory collector identifies a single cell without writing a phase.
+    let shared_pool = |(phase, dp): (Option<&str>, Option<u64>)| {
+        dp.is_some()
+            && (matches!(phase, Some("prefill" | "decode"))
+                || phase.is_none() && entry["source"] == "vllm_initialized_cache")
+    };
     let mut pools: BTreeMap<_, (Option<u64>, Option<u64>)> = BTreeMap::new();
-    // All TP ranks of a phase and DP pool observe the same scheduler. Seed both
-    // quantities before traversing sparse rows so their order cannot change a bound.
+    // Complete rank summaries already carry both scheduler counts.
     for row in rows.into_iter().flatten() {
         let key = pool(row);
-        if key.1.is_some() {
+        if shared_pool(key) {
             let shared = pools.entry(key).or_default();
             super::merge_observed(
                 &mut shared.0,
@@ -415,36 +573,42 @@ fn rank_limits(entry: &Value, mut page: Option<u64>) -> Result<(Option<u64>, boo
             )?;
         }
     }
-    let mut minimum = None;
-    let mut complete = true;
-    for row in rows
+    let ranks = rows
         .into_iter()
         .flatten()
-        .chain(workers.values().copied().filter(|_| rows.is_none()))
-    {
-        let key = pool(row);
-        let scheduler = schedulers.get(&key).copied().unwrap_or(&Value::Null);
-        let mut unassigned = (None, None);
-        let shared = if key.1.is_some() {
-            pools.entry(key).or_default()
-        } else {
-            &mut unassigned
-        };
-        let record = workers
-            .get(&(key, row["tp_rank"].as_u64()))
-            .copied()
-            .unwrap_or(&Value::Null);
-        let worker = &record["cache"];
-        if record["schema_version"] == "aisimulate-runtime-observation/v1" && !scheduler.is_null() {
-            indexed_pool(worker, scheduler)?;
+        .chain(workers.values().copied().filter(|_| rows.is_none()));
+    // A sparse rank can establish a count from its byte measurements. Recheck
+    // earlier ranks against it. Each phase/DP pool can gain only two counts.
+    loop {
+        let mut changed = false;
+        let mut minimum = None;
+        let mut complete = true;
+        for row in ranks.clone() {
+            let key = pool(row);
+            let scheduler = schedulers.get(&key).copied().unwrap_or(&Value::Null);
+            let mut unassigned = (None, None);
+            let shared = if shared_pool(key) {
+                pools.entry(key).or_default()
+            } else {
+                &mut unassigned
+            };
+            let before = *shared;
+            let record = workers
+                .get(&(key, row["tp_rank"].as_u64()))
+                .copied()
+                .unwrap_or(&Value::Null);
+            let worker = &record["cache"];
+            let capacity = measured_rank_capacity(row, worker, scheduler, page, shared)?;
+            changed |= shared_pool(key) && *shared != before;
+            if let Some(limit) = capacity.limit {
+                minimum = Some(minimum.map_or(limit, |n: u64| n.min(limit)));
+            }
+            complete &= capacity.exact;
         }
-        let capacity = measured_rank_capacity(row, worker, scheduler, page, shared)?;
-        if let Some(limit) = capacity.limit {
-            minimum = Some(minimum.map_or(limit, |n: u64| n.min(limit)));
+        if !changed {
+            return Ok((minimum, complete));
         }
-        complete &= capacity.exact;
     }
-    Ok((minimum, complete))
 }
 
 #[cfg(test)]
@@ -453,7 +617,7 @@ fn rank_capacity(entry: &Value) -> Result<Option<u64>, AicError> {
     Ok(minimum.filter(|_| complete))
 }
 
-fn retain_bound(expected: &mut Value, limit: Option<u64>) {
+pub(super) fn retain_bound(expected: &mut Value, limit: Option<u64>) {
     if let Some(limit) = limit {
         expected["kv_cache_bytes_limit"] = Value::from(
             expected["kv_cache_bytes_limit"]
@@ -476,6 +640,21 @@ pub(super) fn bound_phases(
     for (name, snapshot) in phases {
         if !matches!(name.as_str(), "prefill" | "decode")
             || snapshot["source"] != "runtime_observations"
+            || !identified_source(snapshot)
+            || std::iter::once(&snapshot["launch"])
+                .chain(
+                    snapshot["artifacts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|r| &r["evidence"]["launch"]),
+                )
+                .filter_map(Value::as_object)
+                .any(|launch| match launch.get("worker_type") {
+                    None | Some(Value::Null) => phases.len() != 2,
+                    Some(role) if role == "aggregated" => phases.len() != 2,
+                    Some(role) => phases.len() != 1 || role != name.as_str(),
+                })
         {
             return Err(invalid());
         }
@@ -504,13 +683,89 @@ pub(super) fn bound_phases(
             if settings.keys().any(|phase| phase != name) {
                 return Err(invalid());
             }
-            identified |= settings.contains_key(name);
         }
-        if !identified {
+        if !identified || rank_limits(snapshot, None)?.0.is_none() {
             return Err(invalid());
         }
     }
     Ok(Some(phases))
+}
+
+fn check_scheduler_hash(record: &Value) -> Result<(), AicError> {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let invalid = || super::conflict("hash_block_size_tokens");
+    let cache = &record["cache"];
+    let settings = &record["resolved_config"]["cache_config"];
+    let groups = cache["groups"]
+        .as_array()
+        .filter(|g| !g.is_empty())
+        .ok_or_else(invalid)?;
+    let hash = super::positive(&cache["hash_block_size"]).ok_or_else(invalid)?;
+    let scheduler_block = super::positive(&cache["block_size"]).ok_or_else(invalid)?;
+    let unit = settings.get("prefix_match_unit").filter(|v| !v.is_null());
+    if cache["prefix_caching"]["block_size"] != scheduler_block {
+        return Err(invalid());
+    }
+    let mamba = |g: &Value| g["spec_type"] == "vllm.v1.kv_cache_interface.MambaSpec";
+    let caching = settings["enable_prefix_caching"] == true;
+    let split = groups.len() > 1
+        && caching
+        && !groups
+            .iter()
+            .any(|g| mamba(g) && g["state"]["mamba_cache_mode"] != "align");
+    let alignment = if split
+        && groups
+            .iter()
+            .any(|g| mamba(g) && g["block_size_tokens"].as_u64().is_some_and(|b| b > hash))
+    {
+        hash
+    } else {
+        scheduler_block
+    };
+    let mut lcm = 1;
+    let mut all = 0;
+    let mut participating = 0;
+    let mut mandatory = false;
+    for group in groups {
+        let block = super::positive(&group["block_size_tokens"]).ok_or_else(invalid)?;
+        lcm = (lcm / gcd(lcm, block))
+            .checked_mul(block)
+            .ok_or_else(invalid)?;
+        all = gcd(all, block);
+        if !split || group["spec_type"] == "vllm.v1.kv_cache_interface.CircularBufferSpec" {
+            continue;
+        }
+        // A sliding MLA group may opt out. Include every eligible optional group
+        // to test whether their GCD can reach the recorded hash size.
+        let optional = group["spec_type"] == "vllm.v1.kv_cache_interface.SlidingWindowMLASpec";
+        let fits = block.is_multiple_of(hash)
+            && group["layer_specs"]
+                .as_object()
+                .into_iter()
+                .flat_map(|layers| layers.values())
+                .filter_map(|s| s["tokens_per_state"].as_u64().filter(|&n| n > 1))
+                .all(|n| alignment.is_multiple_of(n));
+        if !optional && !fits {
+            return Err(invalid());
+        }
+        mandatory |= !optional;
+        if fits {
+            participating = gcd(participating, block);
+        }
+    }
+    let valid_hash = if !split {
+        hash == lcm && (groups.len() != 1 || !caching || unit.is_none_or(|v| *v == hash))
+    } else if let Some(unit) = unit {
+        *unit == hash && (participating > 0 || all.is_multiple_of(hash))
+    } else {
+        participating == hash || !mandatory && all == hash
+    };
+    if scheduler_block != lcm || !valid_hash {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 // Importers retain the first collected phase's cache policy. Workers and schedulers
@@ -575,6 +830,7 @@ fn record_prefix_settings(expected: &mut Value, entry: &Value) -> Result<(), Aic
             record_memory_field(settings, &group["state"], "mamba_cache_mode")?;
         }
         if record["kind"] == "scheduler" {
+            check_scheduler_hash(record)?;
             record_memory_field(settings, cache, "mamba_cache_mode")?;
             for source in [prefix, cache] {
                 record_field(
@@ -583,6 +839,14 @@ fn record_prefix_settings(expected: &mut Value, entry: &Value) -> Result<(), Aic
                     &source["hash_block_size"],
                 )?;
             }
+        }
+    }
+    for settings in phases.values() {
+        if let Some(mode) = settings.get("mamba_cache_mode").filter(|v| !v.is_null())
+            && (!matches!(mode.as_str(), Some("none" | "align"))
+                || mode == "align" && settings["enable_prefix_caching"] == false)
+        {
+            return Err(super::conflict("mamba_cache_mode"));
         }
     }
     if let Some(settings) = phases.get("prefill").or_else(|| phases.get("decode")) {
@@ -738,6 +1002,11 @@ pub(super) fn selected_memory(evidence: &Value) -> Result<Value, AicError> {
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
         {
             let measured = selected_memory(&direct)?;
+            for (key, value) in measured.as_object().into_iter().flatten() {
+                if !matches!(key.as_str(), "kv_cache_bytes" | "kv_cache_bytes_limit") {
+                    record_field(&mut expected, key, value)?;
+                }
+            }
             if measured["kv_cache_bytes"]
                 .as_u64()
                 .is_some_and(|n| recorded != Some(n))
@@ -1533,7 +1802,7 @@ mod tests {
     #[test]
     fn bound_collection_retains_each_phases_limits_and_minimum_capacity() {
         let phase = |bytes, phase| {
-            json!({"source":"runtime_observations",
+            json!({"source":"runtime_observations","observation_schema":"aisimulate-runtime-observation/v1",
             "runtime_settings":{"scheduler_config":{"max_num_batched_tokens":1024}},
             "artifacts":[{"evidence":{"kind":"scheduler","resolved_config":{
                 "cache_config":{"gpu_memory_utilization":0.9}}}}],
@@ -1547,6 +1816,18 @@ mod tests {
             "max_num_tokens":1024,"gpu_memory_utilization":0.9,"kv_cache_bytes":2048})
         );
         entry["phases"]["decode"]["launch"] = json!({"collection":{"gpu_memory_utilization":0.8}});
+        assert!(selected_memory(&entry).is_err());
+        entry["phases"]["decode"] = phase(2048, "decode");
+        entry["phases"]["prefill"]["launch"] = json!({"worker_type":"aggregated"});
+        assert!(selected_memory(&entry).is_ok());
+        entry["phases"].as_object_mut().unwrap().remove("decode");
+        assert!(selected_memory(&entry).is_err());
+        entry["phases"]["prefill"]["launch"] = json!({});
+        assert!(selected_memory(&entry).is_err());
+        entry["phases"]["prefill"]["launch"]["worker_type"] = json!("prefill");
+        assert!(selected_memory(&entry).is_ok());
+        entry["phases"]["prefill"] = json!({"source":"runtime_observations","observation_schema":"aisimulate-runtime-observation/v1",
+            "prefix_caching":{"prefill":{}},"rank_capacities":[{"phase":"prefill"}]});
         assert!(selected_memory(&entry).is_err());
     }
 
@@ -1574,6 +1855,48 @@ mod tests {
     }
 
     #[test]
+    fn sparse_rank_byte_measurements_check_each_budget_in_the_same_pool() {
+        const PAGE: u64 = 32_768;
+        // TP1 retained 98 usable pages. Only ranks sharing its scheduler inherit
+        // that count and its physical allocation.
+        for (budget, physical, phase, dp, exact) in [
+            (99, 100, "decode", Some(0), None),
+            (99, 99, "decode", Some(0), Some(true)),
+            (100, 100, "decode", Some(0), Some(true)),
+            (99, 100, "prefill", Some(0), Some(false)),
+            (99, 100, "decode", Some(1), Some(false)),
+            (99, 100, "decode", None, Some(false)),
+        ] {
+            let tp0 = json!({"phase":"decode","dp_rank":0,"tp_rank":0,
+                "available_cache_bytes":budget * PAGE});
+            let tp1 = json!({"phase":phase,"dp_rank":dp,"tp_rank":1,
+                "allocated_cache_bytes":physical * PAGE,"kv_cache_bytes":98 * PAGE});
+            for ranks in [[&tp0, &tp1], [&tp1, &tp0]] {
+                let entry = json!({"rank_capacities":ranks});
+                assert_eq!(
+                    rank_limits(&entry, Some(PAGE)).ok(),
+                    exact.map(|e| (Some(98 * PAGE), e)),
+                    "{entry}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_formal_collector_identifies_an_unnamed_single_phase_pool() {
+        let mut entry = json!({"rank_capacities":[
+            {"dp_rank":0,"tp_rank":0,"available_cache_bytes":99*32},
+            {"dp_rank":0,"tp_rank":1,"allocated_cache_bytes":100*32,"kv_cache_bytes":98*32}
+        ]});
+        assert_eq!(
+            rank_limits(&entry, Some(32)).unwrap(),
+            (Some(98 * 32), false)
+        );
+        entry["source"] = json!("vllm_initialized_cache");
+        assert!(rank_limits(&entry, Some(32)).is_err());
+    }
+
+    #[test]
     fn capacity_agrees_with_the_scheduler_for_each_rank_before_taking_the_minimum() {
         let sizes = |free| {
             json!({"dp_rank":0,"tp_rank":1,"phase":"prefill","num_blocks":100,
@@ -1595,6 +1918,53 @@ mod tests {
         }
         evidence["rank_capacities"][1] = sizes(99);
         assert!(rank_capacity(&evidence).is_err());
+    }
+
+    #[test]
+    fn indexed_worker_measurements_match_their_scheduler_and_tensor_block_axis() {
+        let spec = json!({"spec_type":"vllm.v1.kv_cache_interface.FullAttentionSpec","dtype":"torch.bfloat16","page_size_bytes":96});
+        let group = json!({"kind":"attention","spec_type":super::super::UNIFORM_SPEC,"dtype":null,
+            "spec_page_size_bytes":192,"pool_id":"pool","block_size_tokens":8,"layer_names":["a","b"],
+            "layer_classes":{"a":"Attention","b":"Attention"},"layer_specs":{"a":spec,"b":spec}});
+        let mut scheduler = json!({"groups":[{"spec_type":spec["spec_type"],"dtype":spec["dtype"],
+            "spec_page_size_bytes":96,"pool_id":"pool","block_size_tokens":8,"layer_names":["a","b"],
+            "layer_specs":{"a":spec,"b":spec}}]});
+        let mut worker = json!({"num_blocks":100,"layer_tensors":{"a":[{"block_axis":0,
+            "kernel_block_size_tokens":4,"kernel_block_stride":3,"shape":[299,2],"stride_bytes":[32,2]}]},
+            "tensor_allocations":[{"layers":["a"],"block_stride":96}]});
+        let groups = [group];
+        check_scheduler_groups(&groups, &scheduler).unwrap();
+        let measured = [json!({"block_size_tokens":8,"layer_names":["a"]})];
+        check_tensor_blocks(&worker, &measured).unwrap();
+        scheduler["groups"][0]["block_size_tokens"] = json!(16);
+        assert!(check_scheduler_groups(&groups, &scheduler).is_err());
+        worker["num_blocks"] = json!(200);
+        assert!(check_tensor_blocks(&worker, &measured).is_err());
+        assert!(
+            measured_rank_capacity(
+                &json!({"available_cache_bytes":3201}),
+                &json!({"available_cache_bytes":3202}),
+                &Value::Null,
+                None,
+                &mut (None, None)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scheduler_hash_matches_its_groups_and_explicit_prefix_match_unit() {
+        let mut record = json!({"resolved_config":{"cache_config":{"enable_prefix_caching":true}},
+            "cache":{"groups":[{"block_size_tokens":64,"spec_type":"vllm.v1.kv_cache_interface.FullAttentionSpec"},
+                {"block_size_tokens":64,"spec_type":"vllm.v1.kv_cache_interface.MambaSpec","state":{"mamba_cache_mode":"align"}}],
+                "block_size":64,"hash_block_size":64,"prefix_caching":{"block_size":64}}});
+        check_scheduler_hash(&record).unwrap();
+        record["cache"]["hash_block_size"] = json!(32);
+        assert!(check_scheduler_hash(&record).is_err());
+        record["resolved_config"]["cache_config"]["prefix_match_unit"] = json!(32);
+        check_scheduler_hash(&record).unwrap();
+        record["cache"]["groups"][1]["state"]["mamba_cache_mode"] = json!("none");
+        assert!(check_scheduler_hash(&record).is_err());
     }
 
     #[test]

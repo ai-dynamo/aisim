@@ -408,8 +408,8 @@ def _worker_observations(
             # Preserve the observer's digest. Rust verifies the staged content against it.
             launch = {**record["launch"], "model_config": {**reference, "path": str(checkpoint)}}
             record = {**record, "launch": launch}
-        records.append(record)
-    return json.loads(_runtime.nixl_worker_observations(json.dumps(records), architecture))
+        records.append({**item, "evidence": record})
+    return json.loads(_runtime.nixl_worker_observations(json.dumps({**evidence, "artifacts": records}), architecture))
 
 
 def _worker_observation_digest(
