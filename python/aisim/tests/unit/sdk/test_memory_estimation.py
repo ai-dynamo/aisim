@@ -2226,7 +2226,7 @@ def test_native_gemma4_partitions_each_active_pool_at_tp4(tmp_path, kind, kv_hea
 
 @pytest.mark.parametrize(
     ("attention", "serialized", "window"),
-    [("all", 1024, 513), ("vision", 1024, 1024), (None, None, 512), ("all", None, 257)],
+    [("all", 1024, 513), ("all", 0, 1), ("vision", 1024, 1024), (None, None, 512), ("all", None, 257)],
 )
 def test_native_gemma4_capacity_uses_the_initialized_window(tmp_path, attention, serialized, window):
     from aisim_core.sdk.config_builders import build_model_config
@@ -2250,6 +2250,43 @@ def test_native_gemma4_capacity_uses_the_initialized_window(tmp_path, attention,
         assert native.get_kvcache_bytes_per_sequence(tokens) == expected
         assert native.get_kvcache_max_tokens(expected) == tokens
         assert config_only.get_kvcache_max_tokens(expected) == tokens
+
+
+@pytest.mark.parametrize(
+    ("layers", "global_heads", "sliding_heads", "supported"),
+    [
+        ("full", 4, 6, True),
+        ("full", 6, 4, False),
+        ("sliding", 6, 8, False),
+        ("mixed", 4, 8, True),
+        ("mixed", 4, 6, False),
+    ],
+)
+def test_gemma4_transfer_validates_only_instantiated_pools(tmp_path, layers, global_heads, sliding_heads, supported):
+    from aisim.capacity import estimate_kv_bytes_per_token
+    from aisim_core.sdk.config_builders import build_model_config
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("google/gemma-4-26B-A4B")
+    text = document["text_config"]
+    text.update(attention_k_eq_v=True, num_global_key_value_heads=global_heads, num_key_value_heads=sliding_heads)
+    if layers != "mixed":
+        # The Gemma constructor always makes the final layer full, even for a serialized all-sliding list.
+        text["layer_types"] = [f"{layers}_attention"] * text["num_hidden_layers"]
+    path = _write_config(tmp_path, document)
+    config = build_model_config(tp_size=4, pp_size=1, attention_dp_size=1, moe_tp_size=4, moe_ep_size=1)
+    args = dict(tp_size=4, pp_size=1, backend_version="0.27.0")
+    for rate in (
+        lambda: get_model(path, config, "vllm", "0.27.0").get_kvcache_bytes_per_sequence(1),
+        lambda: estimate_kv_bytes_per_token(path, **args),
+        lambda: memory.NaiveKVCacheEstimator.from_hf_config(document, **args).kv_bytes_per_token(),
+    ):
+        if supported:
+            assert rate() == 61_440
+        else:
+            with pytest.raises(ValueError, match="KV heads 6"):
+                rate()
 
 
 def test_registered_gemma4_flat_and_per_layer_release_selection(tmp_path):
@@ -5130,6 +5167,19 @@ def test_native_vllm_fp8_expert_shards_follow_the_release_and_gpu(checkpoint, tp
     assert get_model(checkpoint, aligned, "vllm", "0.28.0").get_kvcache_bytes_per_sequence(1) > 0
 
 
+@pytest.mark.parametrize("width", [769, 1025])
+def test_fp8_expert_width_must_divide_evenly_before_scale_tiles_are_split(tmp_path, width):
+    from aisim_core.sdk.config_builders import build_model_config
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("Qwen/Qwen3-30B-A3B-FP8")
+    path = _write_config(tmp_path, {**raw, "moe_intermediate_size": width})
+    config = build_model_config(tp_size=8, pp_size=1, attention_dp_size=1, moe_tp_size=8, moe_ep_size=1)
+    with pytest.raises(ValueError, match="must be divisible by moe_tp_size=8"):
+        get_model(path, config, "vllm", "0.33.0")
+
+
 def test_fp8_expert_tiles_follow_implicit_vllm_tp_and_the_qwen_vl_expert_module(tmp_path):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
@@ -5483,6 +5533,26 @@ def test_weight_only_sparse_mla_uses_the_default_cache_of_its_serving_gpu(tmp_pa
             estimate_kv_bytes_per_token(model, **args, system=system)
     with pytest.raises(ValueError, match="runtime latent and indexer cache formats"):
         estimate_kv_bytes_per_token(model, **args, system="sm120", kvcache_quant_mode="bfloat16")
+
+
+@pytest.mark.parametrize("system", ["sm90", None, "unknown"])
+def test_sparse_cache_constructors_resolve_the_same_target(tmp_path, system):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    raw = _load_pre_downloaded_hf_config("zai-org/GLM-5-FP8")
+    document = {**raw, "architectures": [_UNKNOWN_WRAPPER], "text_config": raw}
+    path = _write_config(tmp_path, document)
+    (tmp_path / "sm90.yaml").write_text("gpu: {sm_version: 90}\n")
+    args = dict(tp_size=8, pp_size=1, backend_version="0.33.0", system=system, systems_paths=[str(tmp_path)])
+    for estimator in (
+        memory.NaiveKVCacheEstimator.from_model_path(path, allow_hf_config_download=False, **args),
+        memory.NaiveKVCacheEstimator.from_hf_config(document, **args),
+    ):
+        if system == "sm90":
+            assert estimator.kv_bytes_per_token() == 100_152
+        else:
+            with pytest.raises(ValueError, match="sparse MLA.*target GPU"):
+                estimator.kv_bytes_per_token()
 
 
 def test_sparse_auto_transfer_with_missing_gpu_uses_only_hardware_independent_defaults(tmp_path):

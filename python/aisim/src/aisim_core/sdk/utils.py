@@ -1118,7 +1118,7 @@ def gemma4_sliding_window(config: dict) -> int | None:
     """Read the serialized Gemma 4 window as its text config constructor does."""
     window = config.get("sliding_window", 512)
     if config.get("use_bidirectional_attention") == "all":
-        return layout_integer(window, "sliding_window") // 2 + 1
+        return layout_integer(window, "sliding_window", minimum=0) // 2 + 1
     return window
 
 
@@ -2303,7 +2303,12 @@ def validate_fp8_moe_shard(
     )
     if not quantized_experts:
         return
-    shard = intermediate_size // moe_tp_size
+    shard, remainder = divmod(intermediate_size, moe_tp_size)
+    if remainder:
+        raise ValueError(
+            f"Invalid quantized MoE configuration: moe_intermediate_size={intermediate_size} "
+            f"must be divisible by moe_tp_size={moe_tp_size}."
+        )
     release = common.parse_support_matrix_version(vllm_version)
     if (
         release is not None

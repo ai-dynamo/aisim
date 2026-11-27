@@ -61,6 +61,7 @@ from .measurement_evidence import extract_measurement_evidence
 from .native_artifact import (
     COLLECTOR_PROVENANCE_FILENAME,
     PRODUCER_RECEIPT_FILENAME,
+    _InvalidGlmMeasurement,
     validate_native_collection,
     write_producer_receipt,
 )
@@ -1880,10 +1881,6 @@ def _validate_runtime_collection(
     )["measured_point_count"]
 
 
-class _InvalidGlmMeasurement(ValueError):
-    """The retained GLM measurement contradicts its raw evidence."""
-
-
 def _runtime_collection_summary(
     cell: FPMCell,
     raw_root: Path,
@@ -2426,7 +2423,7 @@ def _run_collection_impl(
             )
         except (OSError, TypeError, ValueError) as error:
             if isinstance(error, _InvalidGlmMeasurement) and not formal_database_terminal:
-                # Older runners could pass a cell whose retained median cannot be published.
+                # Older runners could pass a cell whose retained samples cannot be published.
                 entry.update(status="failed", error_type=type(error).__name__, error=str(error))
                 checkpoint_changed = True
                 continue

@@ -1813,12 +1813,9 @@ class NaiveKVCacheEstimator:
         if estimator._selected_decoder is not None:
             if sidecar is not None and not estimator._vllm_native_decoder:
                 estimator._selected_decoder = attach_quantization_sidecar(estimator._selected_decoder, sidecar)
-            raw = estimator._selected_decoder
-            if (sidecar is not None and not estimator._vllm_native_decoder) or (
-                system is not None and estimator._nested_index_head_dim is not None
-            ):
-                target = _config_only_system_spec(system, systems_paths) if estimator._nested_index_head_dim else {}
-                estimator._set_checkpoint_cache_precision(raw, backend, backend_version, hf_config, system_spec=target)
+                estimator._set_checkpoint_cache_precision(
+                    estimator._selected_decoder, backend, backend_version, hf_config
+                )
         elif "deepseek_v4" in estimator.geometry:
             estimator._set_checkpoint_cache_precision(
                 _load_model_config_from_model_path(model_path), backend, backend_version
@@ -2169,8 +2166,6 @@ class NaiveKVCacheEstimator:
         backend: str,
         backend_version: str | None,
         document: dict | None = None,
-        *,
-        system_spec: dict | None = None,
     ) -> None:
         if "deepseek_v4" in self.geometry:
             self._v4_cache_mode = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
@@ -2199,7 +2194,8 @@ class NaiveKVCacheEstimator:
         )
         mode = _automatic_decoder_kv_mode(document or {}, raw, backend, backend_version)
         if self._nested_index_head_dim is not None:
-            sm_version = (system_spec or {}).get("gpu", {}).get("sm_version")
+            system_spec = _config_only_system_spec(*self._vllm_dtype_target)
+            sm_version = system_spec.get("gpu", {}).get("sm_version")
             unknown_gpu = sm_version is None and not perf_database.is_xpu_system_spec(system_spec)
             layers = self.geometry["layers"]
             stage_layers = layers // self.pp_size
@@ -2987,14 +2983,25 @@ class NaiveKVCacheEstimator:
         return self._kv_layer_bytes(geom["num_kv_heads"], geom["head_dim"]) * int(layers)
 
     def _validate_attention_tp(self) -> None:
-        for key in ("num_attention_heads", "swa_query_heads"):
-            heads = self.geometry.get(key)
-            if heads and layout_integer(heads, key) % self.tp_size:
-                raise ValueError(f"{key} {heads} must be divisible by tp_size {self.tp_size}")
-        for key in ("num_kv_heads", "swa_kv_heads"):
-            heads = self.geometry.get(key)
+        geom = self.geometry
+        pools = []
+        if geom.get("num_global_layers") != 0:
+            pools.append(("num_attention_heads", "num_kv_heads"))
+        if geom.get("num_swa_layers"):
+            pools.append(
+                (
+                    "swa_query_heads" if geom.get("swa_query_heads") else "num_attention_heads",
+                    "swa_kv_heads" if geom.get("swa_kv_heads") else "num_kv_heads",
+                )
+            )
+        for query_key, kv_key in pools:
+            queries, heads = geom.get(query_key), geom.get(kv_key)
+            if queries and layout_integer(queries, query_key) % self.tp_size:
+                raise ValueError(f"{query_key} {queries} must be divisible by tp_size {self.tp_size}")
             if heads and max(heads, self.tp_size) % min(heads, self.tp_size):
-                raise ValueError(f"{key} {heads} cannot partition or replicate uniformly over tp_size {self.tp_size}")
+                raise ValueError(
+                    f"{kv_key} {heads} cannot partition or replicate uniformly over tp_size {self.tp_size}"
+                )
 
     def _kv_layer_bytes(self, kv_heads: int, head_dim: int) -> float:
         heads_per_rank = -(-int(kv_heads) // max(self.tp_size, 1))

@@ -2127,6 +2127,49 @@ def test_resume_refuses_a_glm_cell_with_an_unpublishable_median(tmp_path, status
     assert not (cell_dir / "producer-receipt.json").exists()
 
 
+def test_passed_glm_cell_with_incomplete_samples_can_start_a_new_attempt(tmp_path, monkeypatch):
+    from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
+
+    from . import test_fpm_glm53flash_native_collection as nc
+    from .test_fpm_runtime_memory import _glm_plan
+
+    plan = _glm_plan(tmp_path, worker_type="prefill")
+    with monkeypatch.context() as staged:
+        _, _, checkpoint = _staged_run(staged, tmp_path, plan, smoke=True)
+    (cell,) = plan.cells
+    attempt = checkpoint["cells"][cell.cell_id]["attempt_id"]
+    cell_dir = tmp_path / "artifacts" / plan.sha256[:16] / "smoke" / "cells" / cell.cell_id
+    pod = cell_dir / "raw/pod-0"
+    provenance = pod / COLLECTOR_PROVENANCE_FILENAME
+    _write_provenance(provenance, cell_id=cell.cell_id, plan_sha256=plan.sha256, attempt_id=attempt)
+    record = json.loads(provenance.read_bytes())
+    record["runtime"]["backend_version"] = "0.33.0"
+    provenance.write_text(json.dumps(record))
+    payload = nc.glm_native_payload("prefill", points=[nc.PREFILL_COLD, nc.PREFILL_CACHED])
+    payload["execution_identity"] = dict(zip(EXECUTION_COLUMNS, cell.execution_identity, strict=True))
+    nc._glm_producer_shape(tmp_path)("prefill", payload)
+    artifact = nc.write_glm_rank(pod, payload)
+    assert _runtime_collection_summary(cell, cell_dir / "raw", plan=plan)["measured_point_count"] == 2
+    record = json.loads(artifact.read_bytes())
+    record["results"][0]["fpms"][0]["benchmark_measurement"]["raw_fpms"].pop()
+    artifact.write_text(json.dumps(record))
+
+    checkpoint_path = tmp_path / "checkpoints/fpm_forward_smoke.json"
+    errors = _rerun_smoke(tmp_path, plan, retry_failed=False)
+    assert [error["classification"] for error in errors] == ["campaign_incomplete"]
+    entry = json.loads(checkpoint_path.read_bytes())["cells"][cell.cell_id]
+    assert (entry["status"], entry["attempt_id"]) == ("failed", attempt)
+    assert "expected 10 saved raw samples" in entry["error"]
+
+    def stop_at_render(*args, **kwargs):
+        raise RuntimeError("Rendering replacement")
+
+    monkeypatch.setattr(fpm_runner, "_render_cell", stop_at_render)
+    errors = _rerun_smoke(tmp_path, plan, retry_failed=True)
+    assert [error["error_message"] for error in errors] == ["Rendering replacement"]
+    assert json.loads(checkpoint_path.read_bytes())["cells"][cell.cell_id]["attempt_id"] != attempt
+
+
 def test_recovery_of_a_cell_without_a_receipt_writes_the_digests_of_the_recovering_checkout(tmp_path, monkeypatch):
     from collector.fpm_forward.native_artifact import validate_native_collection
 

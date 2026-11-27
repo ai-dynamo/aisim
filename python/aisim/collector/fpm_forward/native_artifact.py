@@ -54,6 +54,10 @@ COLLECTOR_PROVENANCE_FILENAME = "collector-provenance.json"
 PRODUCER_RECEIPT_FILENAME = "producer-receipt.json"
 
 
+class _InvalidGlmMeasurement(ValueError):
+    """The retained GLM measurement contradicts its raw evidence."""
+
+
 @dataclass(frozen=True, slots=True)
 class NativePointMeasurement:
     point: dict[str, Any]
@@ -1114,9 +1118,7 @@ def _validate_glm_repetitions(
             raise ValueError(f"{error}: the recorded forwards do not support the rejection reason: {path}")
         discarded_forwards[attempt_id] = _glm_discarded_forwards(attempt, point, rank, path)
     previous_forward, previous_output = previous
-    # An asynchronously scheduled attempt may start before a discarded output finishes.
-    # Completion times still follow the process-local forward indices across all attempts.
-    last_completion = previous_output
+    # The GLM scheduler drains the preceding attempt before starting the next one.
     previous_attempt = -1
     variance_field = "var_decode_kv_tokens" if point["point_type"] == "decode" else "var_prefill_length"
     # The producer fixes each request length for the point. Advancing every decode by one preserves variance.
@@ -1137,11 +1139,11 @@ def _validate_glm_repetitions(
             if previous_attempt < attempt_id < repetition["attempt"]:
                 for forward, completion, prior_end in discarded_forwards[attempt_id]:
                     if prior_end is not None and (
-                        prior_end < last_completion
+                        prior_end < previous_output
                         or (
                             forward == previous_forward + 1
-                            and math.isfinite(last_completion)
-                            and prior_end != last_completion
+                            and math.isfinite(previous_output)
+                            and prior_end != previous_output
                         )
                     ):
                         raise ValueError(
@@ -1149,9 +1151,9 @@ def _validate_glm_repetitions(
                         )
                     if forward <= previous_forward:
                         raise ValueError(f"{error}: repeated or unordered discarded forward: {path}")
-                    if completion < last_completion:
+                    if completion < previous_output:
                         raise ValueError(f"{error}: discarded completion precedes an earlier forward: {path}")
-                    previous_forward, last_completion = forward, completion
+                    previous_forward, previous_output = forward, completion
         previous_attempt = repetition["attempt"]
         fpms = repetition.get("fpms")
         if not isinstance(fpms, list) or len(fpms) != len(steps):
@@ -1220,9 +1222,6 @@ def _validate_glm_repetitions(
             if step and timing["start_monotonic"] != previous_output:
                 raise ValueError(f"{error}: inter-output interval must start at the preceding output: {path}")
             previous_output = timing["end_monotonic"]
-            if previous_output < last_completion:
-                raise ValueError(f"{error}: accepted completion precedes an earlier forward: {path}")
-            last_completion = previous_output
             receipt = receipts[step]
             if (
                 basis != ("schedule_to_output" if step == 0 else "inter_output")
@@ -1436,17 +1435,22 @@ def _validate_glm_provenance(
         line_digests[benchmark_id] = hashlib.sha256(line).hexdigest()
         row = rows_by_id.get(benchmark_id)
         if row is not None and row.get("repetition_evidence_sha256") == line_digests[benchmark_id]:
-            previous = _validate_glm_repetitions(
-                record,
-                row,
-                rank,
-                expected_producer,
-                path,
-                previous,
-                block,
-                balanced_decode=("decode_contexts_sha256" in evidence and evidence["decode_contexts_sha256"] is None),
-                context_limit=context_limit or MAX_CONTEXT,
-            )
+            try:
+                previous = _validate_glm_repetitions(
+                    record,
+                    row,
+                    rank,
+                    expected_producer,
+                    path,
+                    previous,
+                    block,
+                    balanced_decode=(
+                        "decode_contexts_sha256" in evidence and evidence["decode_contexts_sha256"] is None
+                    ),
+                    context_limit=context_limit or MAX_CONTEXT,
+                )
+            except ValueError as error:
+                raise _InvalidGlmMeasurement(str(error)) from error
     for row in payload["results"]:
         point = row["point"]
         if not _is_hex(row.get("repetition_evidence_sha256"), 64):

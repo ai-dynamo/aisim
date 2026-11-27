@@ -911,7 +911,7 @@ def test_glm_publication_matches_each_dispatch_to_its_scheduled_tokens(tmp_path,
         ("observed-dispatch", "contradicts its dispatch"),
         ("discarded-rank", "rank, point or sample"),
         ("discarded-forward", "repeated or unordered"),
-        ("discarded-completed-late", "completion precedes"),
+        ("discarded-completed-late", "starts before the preceding output"),
         ("discarded-without-index", "lacks its recorded identity"),
         ("discarded-without-timing", "lacks its recorded identity"),
         ("discarded-prefill-basis", "invalid timing basis"),
@@ -926,7 +926,7 @@ def test_glm_publication_matches_each_dispatch_to_its_scheduled_tokens(tmp_path,
         ("partial-cache-hit", "cached prefix"),
         ("discarded-missing-chunks", "prefill_chunks"),
         ("discarded-unfinished", "finish the prompts"),
-        ("overlapping-discarded", None),
+        ("overlapping-discarded", "starts before the preceding output"),
         ("false-rejection", "do not support the rejection reason"),
         ("missing-reason", "rejection reason"),
         ("extra-prefill-dispatch", "invalid|missing dispatch"),
@@ -962,8 +962,12 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
             repetition["prompt_specs"][0][1][0] += 7
         rejected.pop("role")
         rejected.pop("repetition")
-        rejected["fpms"][0]["benchmark_sample"]["forward_index"] = 0
-        rejected["fpms"][0]["benchmark_sample"]["cudagraph"] = {"status": "unavailable"}
+        fpm = rejected["fpms"][0]
+        sample = fpm["benchmark_sample"]
+        sample.update(forward_index=0, cudagraph={"status": "unavailable"})
+        timing = sample["timing"]
+        accepted_start = timing["start_monotonic"]
+        timing.update(start_monotonic=accepted_start - fpm["wall_time"], end_monotonic=accepted_start)
         rejected["dispatches"][0] = None
         rejected.update(attempt=0, rejection_reason="missing actual graph dispatch receipt")
         record["rejected_repetitions"] = [rejected]
@@ -997,10 +1001,7 @@ def test_glm_publication_accounts_for_each_attempt_and_its_measured_chunks(tmp_p
                 "forward_index"
             ]
         elif fault in {"discarded-completed-late", "overlapping-discarded"}:
-            fpm = rejected["fpms"][0]
-            timing = fpm["benchmark_sample"]["timing"]
-            # The discarded and accepted schedules may overlap, while completion still follows forward IDs.
-            end = timing["end_monotonic"] + (1 if fault == "discarded-completed-late" else -fpm["wall_time"] / 2)
+            end = accepted_start + (1 if fault == "discarded-completed-late" else fpm["wall_time"] / 2)
             timing.update(start_monotonic=end - fpm["wall_time"], end_monotonic=end)
         elif fault == "discarded-prefill-basis":
             rejected["fpms"][0]["benchmark_sample"]["timing"]["basis"] = "inter_output"
