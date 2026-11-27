@@ -44,6 +44,15 @@ through the backend's `current` data alias for the requested system and data
 roots. Explicit version selectors are preserved. FPM profile estimates still
 require the profile's literal backend version.
 
+A routed-MoE estimate must name at least one expert width. `estimate_kv_cache`
+and `KVCacheEstimator.from_request` infer a single omitted `moe_tp_size` or
+`moe_ep_size` from the attention width (`tp * attention_dp * cp_size`), and
+reject an omitted pair with `InvalidEngineConfigurationError`, matching
+`ModelConfig.resolve_moe_parallelism`: the caller would otherwise get an expert
+layout it never requested, and the naive fallback would shard expert weights by
+`1 * 1` while the native build priced another layout. Dense checkpoints never
+read these widths.
+
 For Mistral3's gated Pixtral encoder, the analytical activation estimate includes
 the replicated residual alongside the gate and up intermediates. Encoder tensor
 parallelism shards those intermediates; encoder data parallelism keeps a full

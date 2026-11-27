@@ -1237,37 +1237,59 @@ def test_estimate_kv_cache_infers_an_omitted_moe_dimension():
     assert out["source"] == "native"
 
 
-def test_estimate_kv_cache_defaults_an_omitted_moe_pair_to_pure_tensor_parallelism():
-    # An omitted pair means pure tensor parallelism at the attention width. It
-    # cannot mean moe_tp_size=moe_ep_size=1: at tp_size=4 that breaks the
-    # engine's tp*dp*cp == moe_tp*moe_ep invariant, and the request-wide
-    # re-raise makes the mismatch terminal where it used to reach the naive
-    # fallback.
-    kwargs = dict(
-        max_num_tokens=8192,
-        max_batch_size=256,
-        memory_fraction_kind="of_total",
-        memory_fraction_value=0.9,
-        tp_size=4,
-        gpu_memory_capacity_bytes_override=800 * _GIB,
-        allow_naive_fallback=True,
+def test_estimate_kv_cache_rejects_an_omitted_moe_pair_like_the_config_contract(monkeypatch):
+    # `ModelConfig.resolve_moe_parallelism` refuses to invent a layout when both
+    # MoE widths are omitted, so the estimator must not price one either: the
+    # caller would silently get an expert layout it never requested. The typed
+    # error is raised before the perf-DB lookup and before the naive fallback,
+    # which would otherwise shard expert weights by 1 * 1.
+    from aisim_core.sdk import perf_database
+
+    def _unreachable(*args, **kwargs):
+        pytest.fail("an omitted MoE pair must be rejected before the database lookup")
+
+    monkeypatch.setattr(perf_database, "get_database", _unreachable)
+    monkeypatch.setattr(
+        memory.NaiveKVCacheEstimator,
+        "from_model_path",
+        classmethod(lambda *args, **kwargs: pytest.fail("naive fallback must not price an omitted MoE pair")),
     )
-    omitted = memory.estimate_kv_cache("deepseek-ai/DeepSeek-V3", "h200_sxm", "vllm", **kwargs)
-    explicit = memory.estimate_kv_cache(
-        "deepseek-ai/DeepSeek-V3",
-        "h200_sxm",
-        "vllm",
-        moe_tp_size=4,
-        moe_ep_size=1,
-        **kwargs,
-    )
-    assert omitted["source"] == explicit["source"] == "native"
-    assert omitted["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+    with pytest.raises(
+        InvalidEngineConfigurationError, match="At least one of moe_tp_size or moe_ep_size must be set for MoE models"
+    ):
+        memory.estimate_kv_cache(
+            "deepseek-ai/DeepSeek-V3",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.9,
+            tp_size=4,
+            gpu_memory_capacity_bytes_override=800 * _GIB,
+            allow_naive_fallback=True,
+        )
+
+
+def test_from_request_rejects_an_omitted_moe_pair():
+    # The public classmethod applies the same rule for callers that bypass
+    # `estimate_kv_cache`.
+    with pytest.raises(
+        InvalidEngineConfigurationError, match="At least one of moe_tp_size or moe_ep_size must be set for MoE models"
+    ):
+        memory.KVCacheEstimator.from_request(
+            "deepseek-ai/DeepSeek-V3",
+            "h200_sxm",
+            "vllm",
+            max_num_tokens=8192,
+            max_batch_size=256,
+            tp_size=4,
+        )
 
 
 def test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint():
-    # Dense models never read the MoE dims, so resolving the pair must not turn
-    # an ordinary multi-GPU dense request into a MoE validation error.
+    # Dense models never read the MoE dims, so the pair rule must not turn an
+    # ordinary multi-GPU dense request into a MoE validation error.
     out = memory.estimate_kv_cache(
         "nvidia/Gemma-4-31B-IT-NVFP4",
         "h200_sxm",
@@ -1316,34 +1338,6 @@ def _fallback_without_database(monkeypatch):
         raise RuntimeError("perf DB not available")
 
     monkeypatch.setattr(perf_database, "get_database", _missing_database)
-
-
-def test_estimate_kv_cache_naive_fallback_prices_an_omitted_moe_pair_like_the_explicit_layout(monkeypatch):
-    # The fallback shards expert weights by moe_tp_size * moe_ep_size. It used
-    # to substitute 1 for both omitted dims while the native build resolved
-    # tp_size=4, so the same request produced a different capacity depending on
-    # which path ran. Both now resolve the pair to pure tensor parallelism.
-    _fallback_without_database(monkeypatch)
-    kwargs = dict(
-        max_num_tokens=8192,
-        max_batch_size=256,
-        memory_fraction_kind="of_total",
-        memory_fraction_value=0.9,
-        tp_size=4,
-        gpu_memory_capacity_bytes_override=800 * _GIB,
-        allow_naive_fallback=True,
-    )
-    omitted = memory.estimate_kv_cache("deepseek-ai/DeepSeek-V3", "h200_sxm", "vllm", **kwargs)
-    explicit = memory.estimate_kv_cache(
-        "deepseek-ai/DeepSeek-V3",
-        "h200_sxm",
-        "vllm",
-        moe_tp_size=4,
-        moe_ep_size=1,
-        **kwargs,
-    )
-    assert omitted["source"] == explicit["source"] == "naive_fallback"
-    assert omitted["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
 
 
 def test_estimate_kv_cache_naive_fallback_infers_a_single_omitted_moe_dimension(monkeypatch):

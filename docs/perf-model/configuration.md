@@ -18,7 +18,10 @@ parallelism, SGLang `--attn-cp-size` / vLLM `-pcp`; extra attention ranks, so
 `tp * attention_dp * cp_size == moe_tp_size * moe_ep_size`) and `dcp`
 (decode context parallelism, vLLM `-dcp` / SGLang `--dcp-size`; stripes the
 decode KV cache across the existing TP ranks and adds no GPUs). Both default to
-one and stay out of the serialized identity when unset.
+one and stay out of the serialized identity when unset. A routed-MoE topology
+must set at least one of `moe_tp_size`/`moe_ep_size`: one omitted width is
+inferred from the attention width, while omitting both is an error (see
+[GPU memory and cache capacity](memory.md#kv-cache-capacity-reservation)).
 
 ```python
 from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel

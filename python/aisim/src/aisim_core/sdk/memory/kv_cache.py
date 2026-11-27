@@ -251,8 +251,26 @@ def _apply_tolerance(estimate: dict[str, Any], tolerance_fraction: float | None)
     return estimate
 
 
+def _model_is_moe(model_path: str) -> bool:
+    """Classify a checkpoint as routed MoE, leaving absent metadata unresolved.
+
+    ``check_is_moe`` reads the cached checkpoint metadata. A checkpoint whose
+    metadata cannot be fetched or parsed at all is not this helper's concern:
+    the model build reports it with its own error, exactly as it did before the
+    MoE width gate existed. A corrupt Gemma 4 expert declaration is a typed
+    configuration error and stays terminal.
+    """
+    try:
+        return check_is_moe(model_path)
+    except InvalidEngineConfigurationError:
+        raise
+    except Exception:
+        return False
+
+
 def _resolve_moe_dimensions(
     *,
+    is_moe: bool,
     tp_size: int,
     attention_dp_size: int,
     cp_size: int,
@@ -264,9 +282,10 @@ def _resolve_moe_dimensions(
     Mirrors :meth:`ModelConfig.resolve_moe_parallelism` so the native build and
     the naive fallback price the same layout:
 
-    - both omitted: pure tensor parallelism at the attention width
-      (``tp_size * attention_dp_size * cp_size``, ``1``), because an omitted
-      pair carries no layout to infer;
+    - both omitted: raise for a routed-MoE checkpoint, because the config
+      contract refuses to invent a layout the caller did not request. A dense
+      checkpoint never reads these widths, so it keeps placeholder widths (the
+      attention width, ``1``) that nothing prices;
     - one omitted: inferred from that width, as every other SDK path does;
     - both given: returned unchanged for ``ModelConfig`` to validate.
 
@@ -284,6 +303,10 @@ def _resolve_moe_dimensions(
 
     if moe_tp_size is None:
         if moe_ep_size is None:
+            if is_moe:
+                raise InvalidEngineConfigurationError(
+                    "At least one of moe_tp_size or moe_ep_size must be set for MoE models."
+                )
             return attn_width, 1
         moe_ep = _positive("moe_ep_size", int(moe_ep_size))
         if attn_width % moe_ep != 0:
@@ -396,11 +419,13 @@ class KVCacheEstimator:
         the signal for the caller to fall back to the naive estimator.
 
         Omitted MoE widths are resolved here rather than by ``ModelConfig`` alone so
-        the naive fallback in :func:`estimate_kv_cache` can share the rule: an
-        omitted ``moe_tp_size``/``moe_ep_size`` pair means pure tensor parallelism at
-        the attention width (``tp_size * attention_dp_size * cp_size``, ``1``), and a
-        single omitted dimension is inferred from that width. Dense checkpoints never
-        read these dimensions.
+        the naive fallback in :func:`estimate_kv_cache` can share the rule, which is
+        also the config contract's rule: a single omitted dimension is inferred from
+        the attention width (``tp_size * attention_dp_size * cp_size``), and an
+        omitted ``moe_tp_size``/``moe_ep_size`` pair on a routed checkpoint raises the
+        same error ``ModelConfig.resolve_moe_parallelism`` raises, because no layout
+        can be inferred. Dense checkpoints never read these dimensions, so they keep
+        placeholder widths.
         """
         validate_moe_controls(
             model_path=model_path,
@@ -426,7 +451,9 @@ class KVCacheEstimator:
         # Resolve the MoE widths after the dense diagnostic above: a dense
         # checkpoint with explicit expert parallelism must hear that rule, not a
         # width-inference error about dims it never reads.
+        is_moe = _model_is_moe(model_path)
         resolved_moe_tp, resolved_moe_ep = _resolve_moe_dimensions(
+            is_moe=is_moe,
             tp_size=tp_size,
             attention_dp_size=attention_dp_size,
             cp_size=cp_size,
@@ -463,12 +490,6 @@ class KVCacheEstimator:
         # the fallback would price a topology the native path refuses. Dense
         # checkpoints never read these dimensions, and unavailable metadata is
         # left for the build below to report with its own error, as before.
-        try:
-            is_moe = check_is_moe(model_path)
-        except InvalidEngineConfigurationError:
-            raise
-        except Exception:
-            is_moe = False
         if is_moe:
             try:
                 model_config.resolve_moe_parallelism()
@@ -1253,10 +1274,13 @@ def estimate_kv_cache(
 
     Omitted MoE widths resolve the same way on both paths: one omitted dimension
     is inferred from the attention width (``tp_size * attention_dp_size *
-    cp_size``), and an omitted ``moe_tp_size``/``moe_ep_size`` pair means pure
-    tensor parallelism at that width. The naive fallback shares that rule with
+    cp_size``), and an omitted ``moe_tp_size``/``moe_ep_size`` pair on a routed
+    checkpoint raises, exactly as :meth:`ModelConfig.resolve_moe_parallelism`
+    does, because no layout can be inferred. Dense checkpoints never read these
+    widths. The naive fallback shares that rule with
     :meth:`KVCacheEstimator.from_request`; without it, it would shard expert
-    weights by ``1 * 1`` while the native build resolved a different pair.
+    weights by ``1 * 1`` while the native build resolved a different pair, or
+    price a layout the native path rejects.
 
     Args:
         memory_fraction_kind: ``"of_total"`` (vLLM / SGLang) or ``"of_free"``
@@ -1527,6 +1551,7 @@ def estimate_kv_cache(
         # ModelConfig, so leaving the raw values here would shard an omitted
         # width by 1 and disagree with a native build of the same request.
         fallback_moe_tp, fallback_moe_ep = _resolve_moe_dimensions(
+            is_moe=_model_is_moe(model_path),
             tp_size=int(tp_size),
             attention_dp_size=int(attention_dp_size),
             cp_size=int(cp_size),
