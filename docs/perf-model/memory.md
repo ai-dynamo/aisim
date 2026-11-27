@@ -65,8 +65,10 @@ With `allow_naive_fallback=True`, `estimate_kv_cache` still re-raises every
 estimator. The rule applies to all models, not only Gemma 4, and covers the
 omitted-pair and width-mismatch rejections above: a configuration the native
 build refuses must not become a plausible-looking capacity number. Other
-failures (unsupported model/backend, unavailable performance data, no KV budget,
-an HF config fetch failure) remain fallback-eligible when the caller allows it.
+failures from the native model build (unsupported model/backend, unavailable
+performance data, an HF config fetch failure) remain fallback-eligible when the
+caller allows it. Budget math runs after the model builds, outside the fallback
+path, so its failures (no KV budget, zero per-token KV size) always propagate.
 
 For Mistral3's gated Pixtral encoder, the analytical activation estimate includes
 the replicated residual alongside the gate and up intermediates. Encoder tensor
