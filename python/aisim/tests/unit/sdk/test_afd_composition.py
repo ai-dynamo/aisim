@@ -217,6 +217,18 @@ def test_model_preflight_rejects_interleaved_dense_before_database_preparation()
         validate_afd_model("meta-llama/Llama-4-Maverick-17B-128E-Instruct")
 
 
+def test_model_preflight_rejects_dense_gemma4_afd():
+    # AFD is routed-MoE only and this PR does not change that: the dense Gemma 4
+    # checkpoint was already rejected here before `check_is_moe` stopped calling
+    # the whole GEMMA4MIX family MoE, because AFD reads the checkpoint's own
+    # expert metadata (num_experts=None, num_moe_layers=0) rather than the
+    # classification. Pin the outcome so the two stay aligned.
+    from aisim.sweeper.afd_parallel import validate_afd_model
+
+    with pytest.raises(NotImplementedError, match="Dense AFD is not implemented"):
+        validate_afd_model("nvidia/Gemma-4-31B-IT-NVFP4")
+
+
 @pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("fallback_policy", ["deny", "allow", "regression"])
 def test_canonical_pool_constructor_cannot_fallback_from_nonprefix_dense(fallback_policy):
