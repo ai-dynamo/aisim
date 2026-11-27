@@ -19,6 +19,11 @@ from types import ModuleType
 _TARGET = "tensorrt_llm._torch.pyexecutor.py_executor"
 _SOURCE = "tensorrt_llm/_torch/pyexecutor/py_executor.py"
 _ROOT = Path(__file__).resolve().parent
+# Distinct from the collector's aisimulate-runtime-instrumentation-imports/v1
+# binding. This receipt hashes this loader and the upstream executor, which
+# that contract's reader (runtime_observations._validate_import_binding) does
+# not accept.
+RECEIPT_SCHEMA = "aisim-trtllm-fpm-observer-imports/v1"
 
 
 def _digest(raw):
@@ -62,7 +67,7 @@ class _ExecutorLoader(importlib.abc.Loader):
         directory.mkdir(parents=True, exist_ok=True)
         receipt = directory / f"runtime-instrumentation-imports-{socket.gethostname()}-{os.getpid()}.json"
         record = {
-            "schema_version": "aisimulate-runtime-instrumentation-imports/v1",
+            "schema_version": RECEIPT_SCHEMA,
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
             "root": str(_ROOT),

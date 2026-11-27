@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
-
 from collector.fpm_forward.native_artifact import _decode_latency_gate, validate_native_collection
 from collector.fpm_forward.runtime.trtllm import observer, sitecustomize
+from collector.fpm_forward.runtime_observations import _validate_import_binding
 
 from .test_fpm_power import _trtllm_fixture
 
@@ -273,3 +274,41 @@ def test_source_hash_mismatch_fails_before_executor_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(sitecustomize.importlib.metadata, "version", lambda _: "1.3.0rc29")
     with pytest.raises(RuntimeError, match="pinned executor source mismatch"):
         sitecustomize._verify({"bundle_sha256": bound}, manifest_path, source)
+
+
+def test_import_receipt_is_not_the_collector_binding(tmp_path, monkeypatch):
+    root = Path(sitecustomize.__file__).parent
+    source = tmp_path / "py_executor.py"
+    source.write_text(
+        "class PyExecutor:\n"
+        "    def _prepare_and_schedule_batch(self): pass\n"
+        "    def _collect_scheduled_batch_stats(self, stats): return stats\n"
+        "    def _handle_responses(self): pass\n"
+        "    def shutdown(self): pass\n"
+    )
+    files = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in json.loads((root / "manifest.json").read_text())["files"]
+    }
+    monkeypatch.setattr(sitecustomize, "_verify", lambda context, manifest, path: (path.read_bytes(), files, "e" * 64))
+    session = {**context(), "attempt_id": "attempt", "configuration": "tp2"}
+    (tmp_path / "context.json").write_text(json.dumps(session))
+    monkeypatch.setenv("AISIMULATE_RUNTIME_CONTEXT", str(tmp_path / "context.json"))
+    monkeypatch.setenv("AISIMULATE_RUNTIME_INSTRUMENTATION", str(root / "manifest.json"))
+    monkeypatch.setenv("AISIMULATE_RUNTIME_OBSERVATION_DIR", str(tmp_path / "out"))
+    monkeypatch.delitem(sys.modules, "_aisim_trtllm_fpm_observer", raising=False)
+    module = ModuleType(sitecustomize._TARGET)
+    module.__spec__ = SimpleNamespace(origin=str(source))
+
+    sitecustomize._ExecutorLoader().exec_module(module)
+
+    receipt = json.loads(next((tmp_path / "out").glob("runtime-instrumentation-imports-*.json")).read_text())
+    assert receipt["status"] == "verified"
+    assert receipt["schema_version"] == sitecustomize.RECEIPT_SCHEMA
+    assert receipt["imports"][sitecustomize._TARGET]["sha256"] == "e" * 64
+    collector_binding = {
+        "schema_version": "aisimulate-runtime-instrumentation-imports/v1",
+        "loader_sha256": receipt["loader_sha256"],
+    }
+    with pytest.raises(ValueError, match="instrumentation import schema_version mismatch"):
+        _validate_import_binding({"instrumentation_binding": receipt}, collector_binding, None)
