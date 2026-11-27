@@ -101,7 +101,7 @@ from aisim_core.sdk.memory.vllm_registry import (
     is_known_transformers_config,
     select_architecture,
     select_wrapper_architecture,
-    wrapper_requires_residency,
+    wrapper_runtime,
 )
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.base import _MODEL_REGISTRY, BaseModel
@@ -345,15 +345,20 @@ def _sglang_model_registries() -> dict[int, dict[str, set[str]]]:
             if not line.startswith("#"):
                 kind, first, last, *names = line.split()
                 for patch in range(int(first), int(last) + 1):
-                    releases.setdefault(patch, {"native": set(), "multimodal": set()})[kind].update(names)
+                    releases.setdefault(patch, {"native": set(), "multimodal": set(), "transformers": set()})[
+                        kind
+                    ].update(names)
     return releases
 
 
-def _sglang_wrapper(names: list[str], version: str | None, auto_map: object) -> tuple[str | None, bool]:
+def _sglang_wrapper(
+    names: list[str], version: str | None, document: dict, decoder: dict
+) -> tuple[str | None, bool, bool]:
     """The first registered entrypoint wins. Only a known text decoder establishes decoder-only residency."""
+    auto_map = document.get("auto_map")
     remote = has_remote_model(auto_map)
     if not names:
-        return None, remote
+        return None, remote, False
     release = parse_support_matrix_version(version)
     registries = _sglang_model_registries()
     if (
@@ -366,18 +371,43 @@ def _sglang_wrapper(names: list[str], version: str | None, auto_map: object) -> 
         candidates = registries.values()
     choices = set()
     needs_weights = False
+    transformers = True
     for entries in candidates:
         native = next((name for name in names if name in entries["native"]), None)
         choices.add(native or names[0])
         if native is None:
-            needs_weights |= remote or bool(entries["multimodal"].intersection(names))
+            fallback = set(names) <= entries["transformers"] or (isinstance(auto_map, dict) and "AutoModel" in auto_map)
+            needs_weights |= fallback or remote or bool(entries["multimodal"].intersection(names))
         else:
+            fallback = native.startswith("Transformers")
             needs_weights |= native in entries["multimodal"] or native not in _TEXT_ONLY_DECODERS
+        if fallback and "TransformersMultiModalForCausalLM" not in entries["native"]:
+            # SGLang 0.5.6 through 0.5.9 constructs its generic attention layers and output head from the parent.
+            dimensions = (
+                "vocab_size",
+                "hidden_size",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "num_key_value_heads",
+            )
+            if any(document.get(k) is None or document[k] != decoder.get(k) for k in dimensions):
+                raise ValueError(
+                    "sizing a legacy SGLang Transformers model requires matching parent and decoder dimensions"
+                )
+            size = layout_integer(document["hidden_size"], "hidden_size") // layout_integer(
+                document["num_attention_heads"], "num_attention_heads"
+            )
+            default_head = _DECODER_HEAD_DEFAULTS.get(decoder.get("model_type"), (None, None))[0]
+            if document.get("head_dim", size) != decoder.get("head_dim", default_head or size):
+                raise ValueError(
+                    "sizing a legacy SGLang Transformers model requires matching parent and decoder head_dim"
+                )
+        transformers &= fallback
     if len(choices) == 1:
-        return choices.pop(), needs_weights
+        return choices.pop(), needs_weights, transformers
     if choices & _TEXT_WRAPPERS:
         raise ValueError(f"SGLang's selected wrapper for {names!r} depends on the backend release")
-    return names[0], needs_weights
+    return names[0], needs_weights, transformers
 
 
 def _uses_bare_decoder(config: dict, backend: str, version: str | None) -> bool:
@@ -617,6 +647,9 @@ def _select_text_decoder(
                 raise ValueError(f"{named} requires its decoder configuration for model_type={kind!r}")
             if decoder.get("num_key_value_heads", 1) is None:
                 raise ValueError(f"{named} requires a valid num_key_value_heads")
+        return kind, named
+    if native_dispatch and kind == "qwen3_vl_moe_text" and named == "Qwen3MoeForCausalLM":
+        # The Qwen3 MoE implementation reads the VL text config's attention and expert dimensions directly.
         return kind, named
     if native_dispatch and not selected and named:
         default = default_causal_lm(kind, backend_version)
@@ -1653,6 +1686,7 @@ class NaiveKVCacheEstimator:
         self._cache_backend: str | None = None
         self._cache_release: Version | None = None
         self._vllm_native_decoder = False
+        self._transformers_wrapper = False
         self._vllm_check_model_dtype = False
         self._vllm_model_dtype: str | None = None
         self._vllm_dtype_target: tuple[str | None, str | list[str] | None] = (None, None)
@@ -1840,25 +1874,42 @@ class NaiveKVCacheEstimator:
                     model_type if isinstance(model_type, str) else _TEXT_CONFIG_DEFAULTS.get(architecture, (None,))[0]
                 )
                 needs_wrapper_weights = False
+                transformers_wrapper = False
+                text_only = False
                 if key is not None and backend == "vllm":
-                    architecture = select_wrapper_architecture(
+                    needs_wrapper_weights, transformers_wrapper, native_text = wrapper_runtime(
+                        architectures, backend_version, hf_config.get("auto_map"), _TEXT_ONLY_DECODERS
+                    )
+                    architecture = native_text or select_wrapper_architecture(
                         architectures,
                         backend_version,
                         hf_config.get("auto_map"),
                         _TEXT_WRAPPERS if key == "text_config" else set(),
                     )
-                    needs_wrapper_weights = wrapper_requires_residency(
-                        architectures, backend_version, hf_config.get("auto_map"), _TEXT_ONLY_DECODERS
-                    )
+                    text_only = native_text is not None
+                    if text_only:
+                        # These constructors read get_text_config() or vLLM's equivalent hf_text_config.
+                        child_reader = architecture in ("Qwen2ForCausalLM", "Qwen3MoeForCausalLM")
+                        if architecture in ("MiMoForCausalLM", "MiMoV2FlashForCausalLM") and key == "text_config":
+                            # MiMo constructs its output head from the parent and its attention layers from the child.
+                            if any(hf_config.get(k) != raw_decoder.get(k) for k in ("vocab_size", "hidden_size")):
+                                raise ValueError(
+                                    "MiMo sizing requires matching parent and decoder head dimensions"
+                                ) from error
+                            child_reader = True
+                        if not child_reader or key != "text_config":
+                            raw_decoder = {k: v for k, v in hf_config.items() if k not in ("llm_config", "text_config")}
+                        raw_decoder["architectures"] = [architecture]
                 elif key is not None and backend == "sglang":
-                    architecture, needs_wrapper_weights = _sglang_wrapper(
-                        architectures, backend_version, hf_config.get("auto_map")
+                    architecture, needs_wrapper_weights, transformers_wrapper = _sglang_wrapper(
+                        architectures, backend_version, hf_config, raw_decoder
                     )
                 selected_type, selected = _select_text_decoder(
-                    raw_decoder, key, architecture, parent_type, backend, backend_version
+                    raw_decoder, None if text_only else key, architecture, parent_type, backend, backend_version
                 )
                 resolved_vllm_decoder = backend == "vllm" and (
-                    (key == "text_config" and architecture in _TEXT_WRAPPERS)
+                    text_only
+                    or (key == "text_config" and architecture in _TEXT_WRAPPERS)
                     or (
                         key is None
                         and selected is not None
@@ -1972,10 +2023,11 @@ class NaiveKVCacheEstimator:
                     decoder.geometry["num_routed_layers"] = len(
                         _deepseek_routed_layers(raw_decoder, decoder.geometry["layers"])
                     )
-                decoder._is_nested_decoder = key is not None
-                if key is not None:
+                decoder._is_nested_decoder = key is not None and not text_only
+                if decoder._is_nested_decoder:
                     decoder._wrapper_config = {**hf_config, "architectures": [architecture]}
                     decoder._wrapper_requires_residency = needs_wrapper_weights
+                    decoder._transformers_wrapper = transformers_wrapper
                 decoder._vllm_native_decoder = resolved_vllm_decoder
                 decoder._checkpoint_dir = checkpoint_dir
                 decoder._vllm_dtype_target = dtype_target
@@ -2180,6 +2232,9 @@ class NaiveKVCacheEstimator:
             else:
                 mode = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
         model_dtype_bytes = self.weight_dtype_bytes
+        if self._transformers_wrapper and (backend == "vllm" or model_dtype_bytes == 4):
+            # vLLM uses its supported GPU dtype; SGLang downcasts FP32 to FP16 or BF16.
+            model_dtype_bytes = 2
         self._quantized_weights = bool(
             raw.get("quantization_config") or raw.get("hf_quant_config") or raw.get("quant_algo")
         )

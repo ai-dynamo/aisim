@@ -3582,6 +3582,81 @@ def test_registered_multimodal_entrypoint_requires_whole_rank_residency(tmp_path
     assert trailing.weight_bytes() == estimate.weight_bytes() > 0
 
 
+@pytest.mark.parametrize(("backend", "version"), [("vllm", "0.32.0"), ("sglang", "0.5.23")])
+@pytest.mark.parametrize("vision", [{}, {"vision_config": {}}, {"vision_config": {"num_hidden_layers": 27}}])
+def test_transformers_multimodal_fallback_uses_execution_precision_and_resident_weights(
+    tmp_path, backend, version, vision
+):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    document = {
+        "architectures": ["Idefics2ForConditionalGeneration"],
+        "model_type": "idefics2",
+        "torch_dtype": "float32",
+        "text_config": {"model_type": "mistral", "max_position_embeddings": 32768, "vocab_size": 32003},
+        **vision,
+    }
+    model = _write_config(tmp_path, document)
+    # The Transformers Mistral decoder has 32 layers, eight KV heads and 128 elements per head.
+    width = 32 * 2 * 8 * 128 * 2
+    assert (
+        estimate_kv_bytes_per_token(
+            model, system="h100_sxm", tp_size=1, pp_size=1, backend=backend, backend_version=version
+        )
+        == width
+    )
+    with pytest.raises(ValueError, match="resident weights for the vision tower"):
+        memory.estimate_num_gpu_blocks(
+            model,
+            "h100_sxm",
+            backend,
+            version,
+            **_missing_system_cache_options(tmp_path, tp_size=1, capacity=24 * _GIB),
+        )
+
+
+def test_legacy_sglang_transformers_model_checks_the_parent_attention_shape():
+    from aisim_core.sdk.memory import NaiveKVCacheEstimator
+
+    text = {**_UNKNOWN_DECODER, "model_type": "mistral", "vocab_size": 32003}
+    parent = {"architectures": ["Idefics2ForConditionalGeneration"], "model_type": "idefics2", "text_config": text}
+    options = dict(backend="sglang", backend_version="0.5.9", tp_size=1, pp_size=1)
+    with pytest.raises(ValueError, match="requires matching parent and decoder dimensions"):
+        NaiveKVCacheEstimator.from_hf_config(parent, **options)
+    estimate = NaiveKVCacheEstimator.from_hf_config({**text, **parent}, **options)
+    assert estimate.kv_bytes_per_token() == _UNKNOWN_DECODER_KV_BYTES
+    with pytest.raises(ValueError, match="resident weights"):
+        estimate.weight_bytes()
+    with pytest.raises(ValueError, match="matching parent and decoder head_dim"):
+        NaiveKVCacheEstimator.from_hf_config({**text, **parent, "head_dim": 128}, **options)
+
+
+@pytest.mark.parametrize("alternatives", [[], ["LlavaOnevisionForConditionalGeneration"]])
+def test_selected_native_qwen2_reads_only_the_text_config(tmp_path, alternatives):
+    parent = _onevision_qwen2_7b("float16")
+    parent["text_config"]["max_position_embeddings"] = 32768
+    parent["architectures"] = ["UnknownTrainingCheckpoint", "Qwen2ForCausalLM", *alternatives]
+    parent["vision_config"] = {"model_type": "siglip_vision_model"}
+    (tmp_path / "composite").mkdir()
+    path = _write_config(tmp_path / "composite", parent)
+    text = {**parent["text_config"], "architectures": ["Qwen2ForCausalLM"]}
+    (tmp_path / "text").mkdir()
+    plain = _write_config(tmp_path / "text", text)
+    options = _missing_system_cache_options(tmp_path, tp_size=1, capacity=24 * _GIB)
+    assert _compiled_vllm_transfer_widths(path, "0.32.0") == (57_344, 57_344)
+    expected = memory.estimate_num_gpu_blocks(plain, "h100_sxm", "vllm", "0.32.0", **options)
+    assert memory.estimate_num_gpu_blocks(path, "h100_sxm", "vllm", "0.32.0", **options) == expected > 0
+
+
+def test_selected_native_qwen3_moe_reads_the_vl_text_config(tmp_path):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    document = _load_pre_downloaded_hf_config("Qwen/Qwen3-VL-30B-A3B-Instruct")
+    for tail in ([], ["LlavaOnevisionForConditionalGeneration"]):
+        parent = {**document, "architectures": ["TrainingCheckpoint", "Qwen3MoeForCausalLM", *tail]}
+        assert _compiled_vllm_transfer_widths(_write_config(tmp_path, parent), "0.32.0") == (98_304, 98_304)
+
+
 def test_vllm_effective_quantizer_class_sidecar_and_modelopt_exclusions(tmp_path):
     from pathlib import Path
 

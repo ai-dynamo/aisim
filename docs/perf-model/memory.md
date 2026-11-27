@@ -145,6 +145,8 @@ Marginal KV bytes describe the selected text decoder. Whole-rank capacity also r
 
 A registered vLLM or SGLang multimodal class can construct an encoder even when the checkpoint omits its configuration. For example, `InternVLChatModel` builds its default vision tower from a checkpoint containing only its language configuration. When the selected wrapper’s resident weights cannot be determined from the configuration, supply measured resident weights for whole-rank capacity. ModelOpt MXFP8 requires BF16 execution. For routed experts, the fallback reserves execution-width weights until the rank-local quantized matrices and their scales can be sized together.
 
+For the released Idefics2 checkpoint, the Transformers backend constructs a Mistral decoder and a vision encoder. With the checkpoint’s FP32 declaration, vLLM 0.32 uses BF16 on H100 and SGLang 0.5.23 uses FP16. Both allocate 131,072 KV bytes per token at TP1 for 32 layers, eight KV heads and a 128-element head. Whole-rank capacity also requires the encoder and connector weights, even when the checkpoint omits the vision configuration. When vLLM selects its native Qwen2 class from the checkpoint’s architecture list, the decoder reads `text_config` and allocates only its own weights.
+
 For a sliding-window decoder, the config-only shared pool estimate allows every
 scheduled token to be present in every attention layer. A prefill can occupy the
 retained window and its in-flight tokens at the same time. The runtime's

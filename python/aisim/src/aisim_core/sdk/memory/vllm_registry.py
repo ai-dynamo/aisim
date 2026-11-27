@@ -138,7 +138,8 @@ def has_remote_model(auto_map: object) -> bool:
     return isinstance(auto_map, dict) and any(isinstance(key, str) and key.startswith("AutoModel") for key in auto_map)
 
 
-def _select(names: list[str], version: str, remote_model: bool) -> str | None:
+def _select(names: list[str], version: str, remote_model: bool) -> tuple[str | None, bool]:
+    """Return the native class and whether the Transformers backend handles this lookup."""
     registrations = _registry(version).names
     stock = registrations["vllm"]
     if not any(name in stock for name in names):
@@ -146,34 +147,44 @@ def _select(names: list[str], version: str, remote_model: bool) -> str | None:
         # stock class returns control to native dispatch even when AutoModel exists.
         first = names[0]
         if first in registrations["hf"] or (remote_model and first not in registrations["hf_incompatible"]):
-            return None
+            return None, True
     for name in names:
         registered = _normalize(name, stock)
         if registered is not None:
             if version == "0.31.0" and registered == "CwmForCausalLM":
-                return "LlamaForCausalLM"
-            return _IMPLEMENTATIONS.get(registered, registered)
-    return None
+                return "LlamaForCausalLM", False
+            return _IMPLEMENTATIONS.get(registered, registered), registered.startswith("Transformers")
+    return None, False
 
 
-def wrapper_requires_residency(
+def wrapper_runtime(
     names: list[str], version: str | None, auto_map: object, text_decoders: set[str]
-) -> bool:
-    """An unmodeled stock or remote wrapper can own weights outside its nested decoder."""
+) -> tuple[bool, bool, str | None]:
+    """Resolve auxiliary residency, Transformers execution, and any unambiguously selected native text model."""
     remote_model = has_remote_model(auto_map)
     if not names:
-        return remote_model
+        return remote_model, False, None
     release = _recorded_release(version)
-    if release is None and any(_normalize(name, _registry(_RELEASES[0]).names["other_multimodal"]) for name in names):
-        return True
-    for candidate in (release,) if release is not None else _RELEASES:
-        selected = _select(names, candidate, remote_model)
+    candidates = (release,) if release is not None else _RELEASES
+    needs_weights = release is None and any(
+        _normalize(name, _registry(_RELEASES[0]).names["other_multimodal"]) for name in names
+    )
+    transformers = True
+    choices = set()
+    for candidate in candidates:
+        selected, fallback = _select(names, candidate, remote_model)
+        transformers &= fallback
+        choices.add(selected)
         if selected is None:
-            if remote_model or any(is_registered_multimodal(name, candidate) for name in names):
-                return True
-        elif selected not in text_decoders or is_registered_multimodal(selected, candidate):
-            return True
-    return False
+            needs_weights |= (
+                fallback or remote_model or any(is_registered_multimodal(name, candidate) for name in names)
+            )
+        else:
+            needs_weights |= selected not in text_decoders or is_registered_multimodal(selected, candidate)
+    selected_text = choices.pop() if len(choices) == 1 and not needs_weights else None
+    if version is not None and release is None:
+        selected_text = None
+    return needs_weights, transformers, selected_text if selected_text in text_decoders else None
 
 
 def select_architecture(
@@ -184,9 +195,9 @@ def select_architecture(
     if version is not None:
         release = _recorded_release(version)
         # Keep the original class and its compatibility checks on unrecorded releases.
-        choices = {_select(names, release, remote_model) if release is not None else names[0]}
+        choices = {_select(names, release, remote_model)[0] if release is not None else names[0]}
     else:
-        choices = {_select(names, release, remote_model) for release in _RELEASES}
+        choices = {_select(names, release, remote_model)[0] for release in _RELEASES}
     if modeled is not None:
         choices = {name if name in modeled else None for name in choices}
     if len(choices) != 1:
