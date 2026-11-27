@@ -65,6 +65,7 @@ window.AgentX = (() => {
       out[m+"/"+k]=n?{v:rows.reduce((s,r)=>s+r[k],0)/n,se:rows.every(r=>finite(r[k+"_se"]))?Math.sqrt(rows.reduce((s,r)=>s+r[k+"_se"]**2,0))/n:null,req:rows.reduce((s,r)=>s+r.n,0),runs:n}:null;
     }
     out.excluded=runs.reduce((s,r)=>s+(r.accuracy_metrics?.tpot_ms?.excluded||0),0);
+    out.recorded=runs.filter(r=>r.accuracy_metrics).length;  // Historical results predate these metrics.
     return out;
   }
   function stepAggregate(runs){
@@ -79,14 +80,17 @@ window.AgentX = (() => {
   const errorText=(v,se,digits=1)=>`${v.toFixed(digits)}%${finite(se)?` <span class="agentx-se">± ${se.toFixed(digits)}</span>`:""}`;
   function cells(runs){
     const a=requestAggregate(runs),step=stepAggregate(runs);
-    const sc=k=>{const x=step[k];return x?`<td class="agentx-metric">${errorText(x.mape,x.se)}<small>n=${x.n.toLocaleString()} steps</small></td>`:'<td class="agentx-metric">—</td>';};
-    return sc("decode")+sc("prefill")+REQUEST_METRICS.map(([m,k])=>{const x=a[m+"/"+k];return x?`<td class="agentx-metric">${errorText(x.v,x.se)}<small>n=${x.req.toLocaleString()} req${x.runs>1?` · ${x.runs} runs`:""}${m==="tpot_ms"&&k==="e2e"&&a.excluded?` · ${a.excluded} excluded &lt;1 ms`:""}</small></td>`:'<td class="agentx-metric">—</td>';}).join("");
+    // Results recorded before these metrics say so instead of showing an empty score.
+    const empty=(note="")=>`<td class="agentx-metric">${a.recorded?"—":'<span class="agentx-unavailable">Not computed</span><small>historical result</small>'}${note}</td>`;
+    const excluded=(m,k)=>m==="tpot_ms"&&k==="e2e"&&a.excluded?`${a.excluded} excluded &lt;1 ms`:"";
+    const sc=k=>{const x=step[k];return x?`<td class="agentx-metric">${errorText(x.mape,x.se)}<small>n=${x.n.toLocaleString()} steps</small></td>`:empty();};
+    return sc("decode")+sc("prefill")+REQUEST_METRICS.map(([m,k])=>{const x=a[m+"/"+k],e=excluded(m,k);return x?`<td class="agentx-metric">${errorText(x.v,x.se)}<small>n=${x.req.toLocaleString()} req${x.runs>1?` · ${x.runs} runs`:""}${e?` · ${e}`:""}</small></td>`:empty(e?`<small>${e}</small>`:"");}).join("");
   }
   function metricsTable(runs){
     const a=requestAggregate(runs),st=stepAggregate(runs);
     const srow=(k,label)=>{const x=st[k];return x?`<tr data-metric="step-${k}"><th scope="row">${label}</th><td>${x.mape.toFixed(2)}%</td><td>± ${x.se.toFixed(2)}%</td><td class="agentx-samples">${x.n.toLocaleString()} steps</td></tr>`:"";};
     const row=(m,k,label)=>{const x=a[m+"/"+k];return x?`<tr data-metric="${k}-${m}"><th scope="row">${label}</th><td>${x.v.toFixed(2)}%</td><td>${finite(x.se)?`± ${x.se.toFixed(2)}%`:"—"}</td><td class="agentx-samples">${x.req.toLocaleString()} requests</td></tr>`:"";};
-    return `<h3 class="agentx-metrics-title">Accuracy metrics (unsigned)</h3><div class="table-scroll"><table class="agentx-summary-table agentx-metrics-table"><thead><tr><th scope="col">Metric</th><th scope="col">Error</th><th scope="col">Stderr</th><th scope="col" class="agentx-samples">Samples</th></tr></thead><tbody>${srow("decode","Step error, decode (held-out steps)")}${srow("prefill","Step error, prefill (held-out steps)")}${row("tpot_ms","e2e","TPOT e2e error (request-average)")}${row("ttft_ms","e2e","TTFT e2e error (request-average)")}${row("tpot_ms","quantile","TPOT per-request quantile error, p5–p95")}${row("ttft_ms","quantile","TTFT per-request quantile error, p5–p95")}</tbody></table></div><p class="agentx-summary-note">Closed-loop replay; matched requests only. Silicon requests with TPOT under 1 ms (burst delivery) are excluded from TPOT: ${a.excluded} here.${st.dropped?` ${st.dropped.toLocaleString()} held-out steps are dropped because SGLang recorded their device time on the adjacent record.`:""} Request-metric stderr is a 1,000-resample bootstrap over requests; step stderr is std/√n over steps.</p>`;
+    return `<h3 class="agentx-metrics-title">Accuracy metrics (unsigned)</h3><div class="table-scroll"><table class="agentx-summary-table agentx-metrics-table"><thead><tr><th scope="col">Metric</th><th scope="col">Error</th><th scope="col">Stderr</th><th scope="col" class="agentx-samples">Samples</th></tr></thead><tbody>${srow("decode","Step error, decode (held-out steps)")}${srow("prefill","Step error, prefill (held-out steps)")}${row("tpot_ms","e2e","TPOT e2e error (request-average)")}${row("ttft_ms","e2e","TTFT e2e error (request-average)")}${row("tpot_ms","quantile","TPOT per-request quantile error, p5–p95")}${row("ttft_ms","quantile","TTFT per-request quantile error, p5–p95")}</tbody></table></div><p class="agentx-summary-note">${a.recorded?"":"These historical results predate the agreed metrics: they were not computed, and only the point comparison above applies. "}Closed-loop replay; matched requests only. Silicon requests with TPOT under 1 ms (burst delivery) are excluded from TPOT${a.recorded?`: ${a.excluded} here`:""}.${st.dropped?` ${st.dropped.toLocaleString()} held-out steps are dropped because SGLang recorded their device time on the adjacent record.`:""} Request-metric stderr is a 1,000-resample bootstrap over requests; step stderr is std/√n over steps.</p>`;
   }
   function comparisonRows(result) {
     return [["tpot_ms","TPOT","ms/token"],["ttft_ms","TTFT","ms"],["output_tokens_s","Output throughput","output tokens/s"]].map(([metric,label,unit])=>{
@@ -357,5 +361,5 @@ window.AgentX = (() => {
       await select();
     }catch(error){root.innerHTML=`<p role="alert">${esc(error.message)}</p>`;}
   }
-  return {load,detail,aggregate,performanceModel,requestAggregate,stepAggregate,specDec,featureChecklist,validateFeatureEvidence};
+  return {load,detail,aggregate,performanceModel,requestAggregate,stepAggregate,specDec,cells,featureChecklist,validateFeatureEvidence};
 })();

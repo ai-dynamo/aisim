@@ -199,6 +199,9 @@ def main():
         (args.output / "scenarios.json").write_bytes(scenario_data)
     if smoke:
         (args.output / "SMOKE_ONLY.txt").write_text("Partial dataset smoke; not qualified for publication.\n")
+    elif op_level_config is not None:
+        # The public overview accepts only the published method lists; the op-level baseline stays local.
+        (args.output / "LOCAL_ONLY.txt").write_text("Local op-level baseline; not qualified for publication.\n")
     else:
         qualification = {
             "schema_version": 3 if scenario_data is not None else 2,

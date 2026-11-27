@@ -1225,6 +1225,13 @@ def test_op_level_is_scored_only_when_configured_without_artifact_or_tuning(case
     assert op_level.count == 0 and op_level.closed  # scored, never tuned
 
 
+def test_op_level_reports_decode_context_parallelism_as_unsupported():
+    parallelism = SimpleNamespace(decode_context_parallel_size=2)
+    context = SimpleNamespace(worker=SimpleNamespace(config=SimpleNamespace(parallelism=parallelism)))
+    with pytest.raises(aic_predictors.DependencyError, match="decode context parallelism"):
+        aic_predictors.AicOpLevelPredictor.create(context)
+
+
 def test_op_level_request_selects_uncorrected_op_level_and_rejects_bad_overrides():
     @dataclass(frozen=True)
     class Request:

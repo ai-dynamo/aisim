@@ -147,9 +147,7 @@ def kept(spec, records):
 
 
 def train_artifact(spec, seeds, cache, output):
-    """Retrain deterministically; an existing artifact from the same inputs is reused."""
-    if output.exists():
-        return output
+    """Retrain deterministically with the evaluated wheel; only the immutable downloads are cached."""
     learned = runtime_module("aisim_core.sdk.fpm_learned")
 
     records = []
@@ -174,16 +172,20 @@ def train_artifact(spec, seeds, cache, output):
     return output
 
 
-def artifacts(model, workdir):
-    """``{"replay": path, "held_out": path}`` for a model with step captures, else None."""
+def artifacts(model, workdir, output):
+    """``{"replay": path, "held_out": path}`` for a model with step captures, else None.
+
+    Downloads are cached under ``workdir/hf`` (immutable revisions). Models are retrained into ``output``
+    for every evaluation, so a reused work directory never serves another wheel's model.
+    """
     spec = STEP_CAPTURES.get(model)
     if spec is None:
         return None
     cache = workdir / "hf"
     key = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
     return {
-        "replay": train_artifact(spec, (TRAIN_SEED, TEST_SEED), cache, workdir / f"{key}-replay.json"),
-        "held_out": train_artifact(spec, (TRAIN_SEED,), cache, workdir / f"{key}-held-out.json"),
+        "replay": train_artifact(spec, (TRAIN_SEED, TEST_SEED), cache, output / f"{key}-replay.json"),
+        "held_out": train_artifact(spec, (TRAIN_SEED,), cache, output / f"{key}-held-out.json"),
     }
 
 
@@ -204,6 +206,9 @@ def step_kind(fpm):
     if prefill and decode:
         return None  # Mixed steps are not shown.
     return "prefill" if prefill else "decode" if decode else None
+
+
+LEARNED_MTP_REJECTION = "fpm_learned does not support speculative decoding"
 
 
 def _estimator(timing_config):
@@ -229,10 +234,22 @@ def packed(fpm, width):
     """
     if width == 1 or step_kind(fpm) != "decode":
         return fpm
-    s = dict(fpm["scheduled_requests"])
+    # Per-request lists (extend, past-KV and accept lengths) describe logical requests; the packed
+    # query must not carry them, or the native validator rejects the count mismatch.
+    s = {key: value for key, value in fpm["scheduled_requests"].items() if not isinstance(value, list)}
     s["num_decode_requests"] *= width
     s["sum_decode_kv_tokens"] *= width
     return {**fpm, "scheduled_requests": s}
+
+
+def _available(timing_config):
+    """The estimator, or None where the evaluated wheel rejects a learned FPM with speculative decoding."""
+    try:
+        return _estimator(timing_config)
+    except ValueError as error:
+        if timing_config.get("estimation_mode") == LEARNED and LEARNED_MTP_REJECTION in str(error):
+            return None
+        raise
 
 
 def shifted_pairs(records, predict):
@@ -258,13 +275,15 @@ def score_steps(model, lanes, timing_config, workdir, reference_config=None):
     spec = STEP_CAPTURES.get(model)
     if spec is None:
         return None
-    estimator = _estimator(timing_config)
     if timing_config.get("speculation"):
         raise ValueError("AgentX step scoring supports legacy nextn speculation only")
     # Replay packs operation-level decode by the configured verification width; the learned FPM reads
     # logical counts.
     width = 1 if timing_config.get("estimation_mode") == LEARNED else int(timing_config.get("nextn") or 0) + 1
-    reference = _estimator(reference_config) if spec["drop_unattributed"] else None
+    estimator = _available(timing_config)
+    reference = _available(reference_config) if spec["drop_unattributed"] else None
+    if estimator is None or (spec["drop_unattributed"] and reference is None):
+        return None  # The evaluated wheel cannot price learned MTP steps; step metrics are unavailable.
     errors = {"decode": [], "prefill": []}
     dropped = 0
     for window_lanes, records in windows(spec, TEST_SEED, workdir / "hf", scoring=True):

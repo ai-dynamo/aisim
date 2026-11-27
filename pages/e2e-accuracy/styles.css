@@ -864,6 +864,7 @@ dialog::backdrop { background: #0009; }
 :root[data-theme="dark"]{--agentx-op:#1d3550;--agentx-op-sub:#172a40;--agentx-learned:#4a3218;--agentx-learned-sub:#3a2814}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--agentx-op:#1d3550;--agentx-op-sub:#172a40;--agentx-learned:#4a3218;--agentx-learned-sub:#3a2814}}
 .agentx-se{color:var(--muted,#6b7280);font-size:.85em}
+.agentx-unavailable{color:var(--muted,#6b7280);font-style:italic}
 .agentx-cpu{display:block;white-space:nowrap;font-size:12px;line-height:1.5}
 .agentx-table{min-width:1560px}
 .agentx-table th.agentx-group{text-align:center;border-bottom:1px solid var(--border)}

@@ -184,6 +184,9 @@ class AicOpLevelPredictor(_AicPredictor):
 
     @classmethod
     def create(cls, context: PredictorContext) -> AicOpLevelPredictor:
+        # The legacy mapping does not carry decode context parallelism; report it rather than price DCP=1.
+        if context.worker.config.parallelism.decode_context_parallel_size != 1:
+            raise DependencyError("Op-level scoring does not support decode context parallelism (dcp > 1).")
         perf_model = _import_aisim_forward_pass_perf_model()
         config_type = _canonical_config_type()
         if config_type is None:

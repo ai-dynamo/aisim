@@ -753,10 +753,13 @@ and unqueued pre-first-token terms, one per line), then three grouped metrics:
 quantile error (p5–p95)** (TPOT, TTFT). Each group has an information popover.
 Concurrency pages are filtered by performance model (`perf=` in the URL; an
 omitted `perf` means Op-based, so older links keep their meaning) and show the
-point comparison plus an accuracy-metrics table. Learned rows retrain in a
-scratch directory outside the sealed shard tree (`--learned-workdir`, default a
-temporary directory). A wheel without the learned FPM publishes op-based entries
-only; each shard records `learned_fpm` and qualification expects exactly those.
+point comparison plus an accuracy-metrics table. Results recorded before these
+metrics show "Not computed". Learned models retrain with the evaluated wheel on
+every campaign in a removed temporary directory outside the sealed shard tree;
+`--learned-workdir` keeps only the immutable step-capture downloads. A wheel
+without the learned FPM publishes op-based entries only; each shard records
+`learned_fpm` and qualification expects exactly those. A wheel that rejects a
+learned FPM with speculative decoding publishes no step metrics for that model.
 
 - All errors are unsigned percentages over uniquely matched requests.
   e2e error is `100 * abs(mean AISim / mean silicon - 1)` of request TTFT or TPOT.
@@ -773,7 +776,8 @@ only; each shard records `learned_fpm` and qualification expects exactly those.
   models price steps through `RustForwardPassPerfModel.best_available` with the
   replay's compiled timing configuration. Op-based decode steps are packed by
   verification width `nextn + 1` (`B*v` requests, `B*v*s` KV tokens), as replay
-  packs them; the learned FPM reads logical counts. Mixed prefill+decode steps are not
+  packs them, without the logical per-request lists; the learned FPM reads
+  logical counts. Mixed prefill+decode steps are not
   shown. SGLang 0.5.20 can record a step's device time on the adjacent record.
   GLM therefore drops each step whose `device_time_s_by_category` lacks its target
   forward (`extend` for prefill, `target_verify` for MTP decode) and the record

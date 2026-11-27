@@ -345,7 +345,10 @@ def test_shifted_pairs_flag_both_records_of_a_split_step():
 
 def test_operation_level_decode_is_packed_by_verification_width(tmp_path, monkeypatch):
     step = fpm(decode=1, wall=0.01)
-    step["scheduled_requests"]["sum_decode_kv_tokens"] = 2584
+    # Capture-shaped: per-request lists describe the one logical request.
+    step["scheduled_requests"].update(
+        sum_decode_kv_tokens=2584, extend_lengths=[4], past_kv_lengths=[2584], spec_accept_lengths=[3]
+    )
     prefill = fpm(prefill=1, wall=0.01)
     seen = []
 
@@ -362,8 +365,49 @@ def test_operation_level_decode_is_packed_by_verification_width(tmp_path, monkey
     monkeypatch.setattr(agentx_learned, "_estimator", Estimator)
     op = {"estimation_mode": "op_level", "nextn": 3}
     agentx_learned.score_steps("m", 8, op, tmp_path)
+    # Packed counts without the logical per-request lists, which the native validator would reject.
     assert seen[0] == ("op_level", {"num_prefill_requests": 0, "num_decode_requests": 4, "sum_decode_kv_tokens": 10336})
     assert seen[1][1] == prefill["scheduled_requests"]
     seen.clear()
     agentx_learned.score_steps("m", 8, {**op, "estimation_mode": "fpm_learned"}, tmp_path)
     assert seen[0][1] == step["scheduled_requests"]  # The learned FPM reads logical requests.
+
+
+def test_wheels_without_learned_mtp_publish_op_based_results_without_step_metrics(tmp_path, monkeypatch):
+    def construct(config):
+        if config["estimation_mode"] == "fpm_learned":
+            raise ValueError("invalid engine config: fpm_learned does not support speculative decoding")
+        return object()
+
+    monkeypatch.setattr(agentx_learned, "STEP_CAPTURES", {"m": {"drop_unattributed": True}})
+    monkeypatch.setattr(agentx_learned, "_estimator", construct)
+    op, learned = {"estimation_mode": "op_level", "nextn": 3}, {"estimation_mode": "fpm_learned", "nextn": 3}
+    assert agentx_learned.score_steps("m", 8, op, tmp_path, learned) is None
+    assert agentx_learned.score_steps("m", 8, learned, tmp_path, learned) is None
+
+    def broken(config):
+        raise ValueError("invalid engine config: something else")
+
+    monkeypatch.setattr(agentx_learned, "_estimator", broken)
+    with pytest.raises(ValueError, match="something else"):
+        agentx_learned.score_steps("m", 8, op, tmp_path, learned)
+
+
+def test_learned_models_retrain_every_evaluation(tmp_path, monkeypatch):
+    trained = []
+    learned = type(
+        "Learned",
+        (),
+        {
+            "FEATURE_PRESETS": {"p": ()},
+            "group_iterations": staticmethod(lambda records: records),
+            "train": staticmethod(lambda *args, **kwargs: trained.append(1) or {"wheel": len(trained)}),
+        },
+    )
+    monkeypatch.setattr(agentx_learned, "runtime_module", lambda name: learned)
+    monkeypatch.setattr(agentx_learned, "windows", lambda *args, **kwargs: iter([]))
+    spec = {"repository": "r", "revision": "v", "root": "x", "features": "p", "drop_unattributed": False}
+    output = tmp_path / "model.json"
+    agentx_learned.train_artifact(spec, (42,), tmp_path, output)
+    agentx_learned.train_artifact(spec, (42,), tmp_path, output)
+    assert len(trained) == 2 and json.loads(output.read_text()) == {"wheel": 2}

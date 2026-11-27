@@ -1388,3 +1388,15 @@ test("AgentX SpecDec shows None only for a recorded disabled state", () => {
   assert.equal(spec({state:"disabled",parameters:{method:"off"}}),"None");
   assert.match(spec({state:"enabled",parameters:{method:"mtp",draft_length:3}}),/^MTP<small>3 draft tokens/);
 });
+
+test("AgentX metric cells label historical results and keep exclusions without a score", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const cells=runs=>{context.runs=runs;return vm.runInContext("window.AgentX.cells(runs)",context);};
+  const historical=cells([{id:"old"}]);
+  assert.equal((historical.match(/Not computed/g)||[]).length,6);
+  const empty={n:0,excluded:0,e2e:null,quantile:null,e2e_se:null,quantile_se:null};
+  const burst=cells([{accuracy_metrics:{tpot_ms:{...empty,excluded:3},ttft_ms:empty,step:null}}]);
+  assert.doesNotMatch(burst,/Not computed/);
+  assert.match(burst,/3 excluded &lt;1 ms/);
+});

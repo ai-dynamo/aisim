@@ -580,30 +580,33 @@ def campaign(args):
     ]
     evaluated_driver = driver_digest()
     # Training inputs and models stay outside the sealed shard tree: the Hub cache holds symlinks.
-    workdir = args.learned_workdir or Path(tempfile.mkdtemp(prefix="agentx-learned-"))
+    # Models are retrained per evaluation; only --learned-workdir's immutable downloads persist.
     learned = learned_supported()
     trained = {}
     results = []
-    for run in selected:
-        for performance_model in performance_models(run, learned):
-            if learned and run["model"] not in trained:
-                trained[run["model"]] = learned_artifacts(run["model"], workdir)
-            results.append(
-                run_one(
-                    args.inputs,
-                    run,
-                    args.output / run["id"] / performance_model,
-                    args.point_timeout,
-                    {
-                        "benchmark_id": run["id"],
-                        "evaluated_revision": args.commit,
-                        "dataset_revision": args.revision,
-                    },
-                    performance_model,
-                    trained.get(run["model"]),
-                    workdir,
+    with tempfile.TemporaryDirectory(prefix="agentx-learned-") as scratch:
+        scratch = Path(scratch)
+        workdir = args.learned_workdir or scratch
+        for run in selected:
+            for performance_model in performance_models(run, learned):
+                if learned and run["model"] not in trained:
+                    trained[run["model"]] = learned_artifacts(run["model"], workdir, scratch / "models")
+                results.append(
+                    run_one(
+                        args.inputs,
+                        run,
+                        args.output / run["id"] / performance_model,
+                        args.point_timeout,
+                        {
+                            "benchmark_id": run["id"],
+                            "evaluated_revision": args.commit,
+                            "dataset_revision": args.revision,
+                        },
+                        performance_model,
+                        trained.get(run["model"]),
+                        workdir,
+                    )
                 )
-            )
     snapshot = {
         "branch": args.branch,
         "commit_sha": args.commit,
@@ -723,7 +726,7 @@ if __name__ == "__main__":
     parser.add_argument("--shards", type=Path)
     parser.add_argument("--point-timeout", type=int, default=1200)
     parser.add_argument(
-        "--learned-workdir", type=Path, help="Step-capture cache and trained models; outside --output (default: temp)"
+        "--learned-workdir", type=Path, help="Step-capture download cache outside --output (default: temporary)"
     )
     args = parser.parse_args()
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
