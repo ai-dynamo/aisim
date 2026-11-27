@@ -12,7 +12,7 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `2a126f94e`. It contains the omitted-MoE-pair
+The current code head is `64b4f53d9`. It contains the omitted-MoE-pair
 rejection, the single-dimension fallback resolution, the pre-database width
 gate, the FPE generator guard and the hardware-fact/AFD pins described below, on
 top of `0faa4f402e2b3fe6ab302921d08c39572941ac8a`, which merges `main` at
@@ -21,9 +21,10 @@ change code as well as this document: `372f2e7c2` adds the fallback resolution
 and the generator guard, `98ebca229` applies the omitted-pair rejection,
 `c543294ee` adds the hardware-fact and preflight pins, `474614019` adds the
 search-space AFD pin, `0c331e377` keeps a dense checkpoint's omitted MoE width at
-`1`, `59344e5df` resolves an omitted pair at attention width one, and
-`2a126f94e` pins the routed rejection on the capacity bridge. The commit after
-`2a126f94e` changes only this document.
+`1`, `59344e5df` resolves an omitted pair at attention width one,
+`2a126f94e` pins the routed rejection on the capacity bridge, and `64b4f53d9`
+states the width rule in the legacy CLI help. The commit after `64b4f53d9`
+changes only this document.
 See [Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -53,14 +54,14 @@ feasible/infeasible status are meaningful.
 
 `0faa4f402e2b3fe6ab302921d08c39572941ac8a` is the reviewed commit and keeps
 the historical verification results recorded for it. The current code head is
-`2a126f94e`: `372f2e7c2` adds the single-dimension fallback resolution, the
+`64b4f53d9`: `372f2e7c2` adds the single-dimension fallback resolution, the
 pre-database width gate and the FPE generator guard, `98ebca229` applies the
 config contract's omitted-MoE-pair rejection, `c543294ee` adds the
 hardware-fact and preflight pins, `474614019` adds the search-space AFD pin,
 `0c331e377` keeps a dense checkpoint's omitted MoE width at `1`, `59344e5df`
-resolves an omitted pair at attention width one, and `2a126f94e` pins the routed
-rejection on the capacity bridge. The commit after `2a126f94e` changes only
-this document. Everything sits on
+resolves an omitted pair at attention width one, `2a126f94e` pins the routed
+rejection on the capacity bridge, and `64b4f53d9` states the width rule in the
+legacy CLI help. The commit after `64b4f53d9` changes only this document. Everything sits on
 three merges of `main` on top of the reviewed
 commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
@@ -242,7 +243,7 @@ keeps a well-formed dense checkpoint fallback-eligible.
 
 ### Verification at the current head
 
-Local run at `2a126f94e` on macOS arm64, Python 3.13.18, with the native
+Local run at `64b4f53d9` on macOS arm64, Python 3.13.18, with the native
 extension rebuilt from this head's tree (`maturin build --release --locked`,
 the `pyproject.toml`
 `extension-module,jemalloc` features, and the wheel's
@@ -263,14 +264,14 @@ minutes.
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection (the twelve paths in the command below; includes the ambiguous-omitted-pair, width-one, producer-trace and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `59344e5df` | 1,242 passed, 0 failed |
+| Targeted pytest selection (the twelve paths in the command below; includes the ambiguous-omitted-pair, width-one, producer-trace and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `64b4f53d9` | 1,242 passed, 0 failed |
+| Full CLI unit suite (`python/aisim/tests/unit/cli`), covering the updated `--moe-*-size` help text | `64b4f53d9` | 479 passed, 0 failed |
 | `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `372f2e7c2` | 1,476 passed, 0 failed, 1 ignored |
 | `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2`, then `2a126f94e` | 5 passed; no skips at `372f2e7c2`, 6 passed at `2a126f94e` (adds the routed omitted-pair `BadConfig` pin) |
 | `cargo fmt --all -- --check` / `cargo fmt --check -p aisim-core` | `372f2e7c2`, then `2a126f94e` | clean |
 
 The pytest row is this command, run from the repository root at
-`2a126f94e` (the Python selection last changed at `59344e5df`; the commits after
-it only add the Rust bridge test and this document):
+`64b4f53d9`:
 
 ```
 VIRTUAL_ENV=python/aisim/.venv PYTHONPATH=python/aisim/src \
