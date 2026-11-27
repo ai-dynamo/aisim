@@ -12,13 +12,16 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `c543294ee`, which adds the omitted-MoE-pair
+The current code head is `474614019`. It contains the omitted-MoE-pair
 rejection, the single-dimension fallback resolution, the pre-database width
-gate, the FPE generator guard and the hardware-fact/AFD pins described below on
-top of `0faa4f402e2b3fe6ab302921d08c39572941ac8a`. That commit merges `main` at
-`29104f537634779690aa6721b93b39c4204d13cb`; later commits change tests and this
-document. See
-[Current head and verification](#current-head-and-verification)
+gate, the FPE generator guard and the hardware-fact/AFD pins described below, on
+top of `0faa4f402e2b3fe6ab302921d08c39572941ac8a`, which merges `main` at
+`29104f537634779690aa6721b93b39c4204d13cb`. The commits after `0faa4f402`
+change code as well as this document: `372f2e7c2` adds the fallback resolution
+and the generator guard, `98ebca229` applies the omitted-pair rejection,
+`c543294ee` adds the hardware-fact and preflight pins, and `474614019` adds the
+search-space AFD pin. The commit after `474614019` changes only this document.
+See [Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
 `0809faae9e543487dcf2142dc6afe2427a42f9bd`, where the classifier fix was
@@ -47,11 +50,12 @@ feasible/infeasible status are meaningful.
 
 `0faa4f402e2b3fe6ab302921d08c39572941ac8a` is the reviewed commit and keeps
 the historical verification results recorded for it. The current code head is
-`c543294ee`: `372f2e7c2` adds the single-dimension fallback resolution, the
+`474614019`: `372f2e7c2` adds the single-dimension fallback resolution, the
 pre-database width gate and the FPE generator guard, `98ebca229` applies the
-config contract's omitted-MoE-pair rejection, and `c543294ee` adds the
-hardware-fact and dense-AFD pins. Later commits from here change tests and this
-document. Everything sits on three merges of `main` on top of the reviewed
+config contract's omitted-MoE-pair rejection, `c543294ee` adds the
+hardware-fact and preflight pins, and `474614019` adds the search-space AFD pin.
+The commit after `474614019` changes only this document. Everything sits on
+three merges of `main` on top of the reviewed
 commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
 this branch: because the dense gate now raises
@@ -185,7 +189,7 @@ keeps a well-formed dense checkpoint fallback-eligible.
 
 ### Verification at the current head
 
-Local run at `c543294ee` on macOS arm64, Python 3.13.18, with the native
+Local run at `474614019` on macOS arm64, Python 3.13.18, with the native
 extension rebuilt from this head's tree (`maturin build --release --locked`,
 the `pyproject.toml`
 `extension-module,jemalloc` features, and the wheel's
@@ -206,7 +210,7 @@ minutes.
 
 | Verification | Tested commit | Result |
 | --- | --- | --- |
-| Targeted pytest selection from the 2026-11-18 command below (includes the omitted-MoE-pair and single-dimension tests, the pre-database-gate tests, the hardware-fact and dense-AFD pins, and the FPE generator guard) | `c543294ee` | 1,234 passed, 0 failed |
+| Targeted pytest selection from the 2026-11-18 command below (includes the omitted-MoE-pair and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `474614019` | 1,236 passed, 0 failed |
 | `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `372f2e7c2` | 1,476 passed, 0 failed, 1 ignored |
 | `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2` | 5 passed; no skips |
 | `cargo fmt --all -- --check` | `372f2e7c2` | clean |
@@ -462,7 +466,7 @@ is pinned by a test rather than argued from reachability:
 | `generator/enumerate.py::enumerate_profiling_configs` | wideEP gate and multi-node floor stay off, and `build_disagg_parallel_lists(is_moe=False)` yields only pure TP/DP candidates | `test_dense_gemma4_producer_configs_are_expert_parallel_free`, `test_routed_gemma4_producer_configs_keep_expert_parallel_shapes` |
 | `generator/request/sweeper.py::_resolve_model_facts` | `ModelFacts.is_moe` is `False`, so the rule engine never selects MoE fields | `test_generator_model_facts_follow_the_classification` |
 | `sweeper/model_hw.py::resolve_model_hardware` → `parallel_configs_for` | `is_moe=False` shrinks the menu to pure TP/DP shapes; the derived `mla` and `enable_wideep` facts stay `False`, and `num_experts` is `0`. `mla` is report-only: no module in `python/aisim/src` reads it | `test_gemma4_hardware_facts_follow_the_expert_configuration` |
-| `compiler.py::_afd_role` → `AFDTopology` (replay) and `sweeper/afd_parallel.py::validate_afd_model` (sweeper and replay preflight) | unchanged: AFD rejects a dense checkpoint from its own expert metadata (`num_experts=None`, `num_moe_layers=0`), before and after this branch, so it stays routed-MoE only and the forwarded `is_moe` cannot reach a topology | `test_model_preflight_rejects_dense_gemma4_afd` |
+| `compiler.py::_afd_role` → `AFDTopology` (replay), `sweeper/afd_parallel.py::validate_afd_model` (sweeper and replay preflight) and `sweeper/search_space.py` → `enumerate_afd_topologies` | unchanged: a dense checkpoint resolves `num_experts=0` (or `None` from its own metadata in the preflight), and `AFDTopology`/`resolve_afd_parallelism` normalize that to zero experts (`afd_parallel.py:199`), so both entry points raise the same `NotImplementedError` whether `is_moe` is `True` (before this branch) or `False` (after). AFD stays routed-MoE only and the forwarded `is_moe` cannot reach a topology | `test_model_preflight_rejects_dense_gemma4_afd`, `test_search_space_afd_enumeration_rejects_a_dense_gemma4_shape` |
 | `sdk/task_v2.py::Task._is_moe` → `attention_dp_size` in `run_single_agg` / `run_single_disagg` | a requested `dp` never reaches the attention axis (`attention_dp_size=1`); routed keeps `dp>1` on both roles | `test_run_single_agg_attention_dp_follows_the_gemma4_classification`, `test_run_single_disagg_attention_dp_follows_the_gemma4_classification` |
 | `legacy_cli/api.py::_resolve_moe_parallelism` | MoE widths pass through untouched instead of being resolved | `test_dense_gemma4_moe_parallelism_is_passed_through_untouched` |
 | `legacy_cli/api.py` static and disagg `check_is_moe` gates | neither role calls `resolve_model_config_moe_comm`; routed static and disagg still resolve every required phase | `test_dense_gemma4_static_estimate_skips_moe_comm_resolution`, `test_dense_gemma4_disagg_estimate_skips_moe_comm_resolution`, `test_routed_gemma4_static_estimate_still_resolves_moe_comm`, `test_disagg_resolves_each_role_moe_comm_before_session_run` |
@@ -519,7 +523,7 @@ Pinned by
 | `test_routed_gemma4_static_estimate_still_resolves_moe_comm` | Routed Gemma 4 keeps the static-path resolution for both required phases |
 | `test_dense_gemma4_moe_parallelism_is_passed_through_untouched` | `_resolve_moe_parallelism` leaves dense MoE widths untouched and still resolves routed ones |
 | `test_gemma4_hardware_facts_follow_the_expert_configuration` in `tests/unit/test_model_hw_gemma4_facts.py` | Real `resolve_model_hardware` on the bundled `gb300` spec: dense 31B is `is_moe=False, mla=False, enable_wideep=False, num_experts=0`; routed 26B-A4B is `True, True, False, 128` |
-| `test_model_preflight_rejects_dense_gemma4_afd` in `tests/unit/sdk/test_afd_composition.py` | The AFD preflight raises `NotImplementedError("Dense AFD is not implemented...")` for the dense checkpoint, unchanged by this branch |
+| `test_model_preflight_rejects_dense_gemma4_afd` and `test_search_space_afd_enumeration_rejects_a_dense_gemma4_shape` in `tests/unit/sdk/test_afd_composition.py` | The AFD preflight and the search-space enumerator both raise `NotImplementedError("Dense AFD is not implemented...")` for a dense checkpoint; the enumerator is parametrized over `is_moe` `False`/`True` to show the pre-branch classification produced the same rejection |
 | `test_dense_variant_rejects_moe_ep_gt_1` | The dense guard raises `InvalidEngineConfigurationError` (not `AssertionError`) for an explicit `moe_ep_size>1`, so `python -O` cannot disable it and the Rust bridge keeps the rejection non-fallback-safe |
 | `test_run_single_agg_attention_dp_follows_the_gemma4_classification` | Agg `run_single_agg` forces `attention_dp_size=1` for dense and preserves `dp` for routed |
 | `test_run_single_disagg_attention_dp_follows_the_gemma4_classification` | Both disagg roles apply the same dense/routed attention-DP rule |
