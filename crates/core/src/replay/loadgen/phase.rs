@@ -1360,6 +1360,7 @@ mod tests {
                     .unwrap();
             }
         }
+        assert!(driver.pop_ready(10.0, lanes).is_empty());
         assert_eq!(
             driver.finish_agentic_preparation(10.0).unwrap(),
             Some(AgenticPreparationTransition::OpenProfile)
