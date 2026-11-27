@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -40,11 +41,25 @@ def test_frozen_trtllm_plan_binds_observer_and_points(tmp_path):
         build_plan(MODEL, SYSTEM, replace(plan.options, benchmark_points_json=None), frozen, "revision", IMAGE_SHA256)
 
 
-@pytest.mark.parametrize(("baseline_power", "shutdown"), [(200.5, True), (None, True), (200.5, False)])
-def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline_power, shutdown):
+@pytest.mark.parametrize(
+    ("baseline_power", "shutdown", "shifted_reads"),
+    [
+        (200.5, True, ()),
+        (None, True, ()),
+        (200.5, False, ()),
+        (200.5, True, ("energy_start", "energy_end")),
+        (200.5, True, ("energy_end",)),
+    ],
+)
+def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline_power, shutdown, shifted_reads):
     plan = _plan()
     arms = []
-    receipt = {"gpu_uuids": ["GPU-0", "GPU-1"], "mean_w_per_gpu": 200.5, "serving_frames_s": 100}
+    receipt = {
+        "gpu_uuids": ["GPU-0", "GPU-1"],
+        "mean_w_per_gpu": 200.5,
+        "serving_frames_s": 100,
+        "arm_finished_s": 5.0,
+    }
     for cell in plan.cells:
         with monkeypatch.context() as patch:
             out = tmp_path / cell.workload_kind
@@ -56,10 +71,21 @@ def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline
             )
             arms.append((cell, cell.cell_id, out, receipt | {"mean_w_per_gpu": baseline_power}, receipt))
             if shutdown:
-                reason, clock = _validate_clock(raw, {"GPU-0", "GPU-1"})
-                assert reason is None
-                assert clock["boundary_displacement_s"] == pytest.approx(0.025)
-                assert clock["common_energy_window_s"] == pytest.approx(2.075)
+                (leader_path,) = raw.glob("trtllm-*/rank-0.json")
+                leader = json.loads(leader_path.read_text())
+                for read in shifted_reads:
+                    for bound in ("before_s", "after_s"):
+                        leader[read][bound] += 30
+                if shifted_reads:
+                    leader_path.write_text(json.dumps(leader))
+                reason, clock = _validate_clock(raw, {"GPU-0", "GPU-1"}, arm_finished_s=receipt["arm_finished_s"])
+                if shifted_reads:
+                    assert reason == "ambiguous_energy_boundaries"
+                    assert clock["boundary_displacement_s"] == pytest.approx(30.025)
+                else:
+                    assert reason is None
+                    assert clock["boundary_displacement_s"] == pytest.approx(0.025)
+                    assert clock["common_energy_window_s"] == pytest.approx(2.075)
             else:
                 assert not any(raw.glob("trtllm-*/published.json"))
 
@@ -67,7 +93,9 @@ def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline
     assert parquet.is_file()
     assert {row["workload_kind"] for row in rows} == {"prefill", "decode"}
     assert all(row["latency_ms"] == pytest.approx(210) for row in rows)
-    expected = pytest.approx(620 / 2.1) if shutdown and baseline_power is not None else None
+    expected = pytest.approx(620 / 2.1) if shutdown and baseline_power is not None and not shifted_reads else None
+    if shifted_reads:
+        assert all(entry["power_unavailable_reason"] == "ambiguous_energy_boundaries" for entry in summary.values())
     assert all(row["power_w"] == expected for row in rows)
     assert all(entry["serving_rate_change_pct"] == 0 for entry in summary.values())
     # Use the compiled profile query on the same schema-8 file just published.

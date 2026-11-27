@@ -326,7 +326,6 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
             replies = _drive(url, model, cell.workload_kind)
             end = read()
         receipt = _rates(gpus, start, end, replies)
-        _save(raw / "throughput-energy.json", receipt)
         if enabled:
 
             def observation_finished():
@@ -340,6 +339,8 @@ def _run_arm(plan, cell, attempt, root, *, bundle, snapshot, image, bindings, si
                 # Use the latency artifact already saved by the observer if
                 # shutdown cannot finish the power window.
                 pass
+    receipt["arm_finished_s"] = time.monotonic()
+    _save(raw / "throughput-energy.json", receipt)
     if enabled and not ((raw / "benchmark.json").is_file() and (raw / "collector-provenance.json").is_file()):
         raise RuntimeError("TRT-LLM observer finished without a latency artifact; see rank records and engine log")
     return receipt
@@ -359,7 +360,7 @@ def _validate_coordinates(cell, rows):
         raise ValueError(f"{cell.cell_id} reported a point outside the frozen serving workload")
 
 
-def _validate_clock(raw, gpus):
+def _validate_clock(raw, gpus, *, arm_finished_s=None):
     """Verify the energy counter brackets and the two completion boundaries."""
     rank_paths = sorted(raw.glob("trtllm-*/rank-*.json"))
     if len(rank_paths) != 2:
@@ -369,15 +370,21 @@ def _validate_clock(raw, gpus):
     if not start or not end or set(start["energy_mj"]) != gpus or set(end["energy_mj"]) != gpus:
         return "gpu_mapping_unavailable", None
     repeats = len(leader["steps"])
-    if not repeats or len(peer["steps"]) < repeats or not peer["anchor"]:
+    if not repeats or len(peer["steps"]) < repeats or not leader["anchor"] or not peer["anchor"]:
         return "rank_boundary_mismatch", None
     # The two ranks share the node's monotonic clock. Review how far the
     # complete NVML read brackets extend from the matched completions.
     opening = (leader["anchor"]["completed_s"], peer["anchor"]["completed_s"])
     closing = (leader["steps"][-1]["completed_s"], peer["steps"][repeats - 1]["completed_s"])
+    # Rank 0 reads NVML synchronously after completing the boundary pass.
+    # The opening read ends before rank 0 schedules the first repeat.
+    next_schedule = opening[0] + leader["steps"][0]["outside_s"]
+    # The next TP completion, when recorded, requires rank 0 to have resumed.
+    # For a terminal window use the end of the same arm after engine teardown.
+    next_completion = peer["steps"][repeats]["completed_s"] if len(peer["steps"]) > repeats else arm_finished_s
     brackets = (start["before_s"], start["after_s"], end["before_s"], end["after_s"])
-    if not all(math.isfinite(stamp) for stamp in (*opening, *closing, *brackets)) or (
-        start["before_s"] > start["after_s"] or end["before_s"] > end["after_s"]
+    if next_completion is None or not all(
+        math.isfinite(stamp) for stamp in (*opening, *closing, *brackets, next_schedule, next_completion)
     ):
         return "ambiguous_energy_boundaries", None
     displacement = max(
@@ -392,7 +399,11 @@ def _validate_clock(raw, gpus):
         "closing_rank_times_s": closing,
     }
     # Rev 6.1 records counter-read displacement for the publication review.
-    if duration < 2:
+    if (
+        duration < 2
+        or not opening[0] <= start["before_s"] <= start["after_s"] <= next_schedule
+        or not closing[0] <= end["before_s"] <= end["after_s"] <= next_completion
+    ):
         return "ambiguous_energy_boundaries", details
     return None, details
 
@@ -414,7 +425,9 @@ def publish_campaign(plan, arms, systems_root):
         off_power, on_power = off["mean_w_per_gpu"], on["mean_w_per_gpu"]
         paired_power = off_power is not None and on_power is not None
         if measured[0]["power_w"] is not None:
-            reason, details = _validate_clock(observed / "raw" / "node-0", gpus)
+            reason, details = _validate_clock(
+                observed / "raw" / "node-0", gpus, arm_finished_s=on.get("arm_finished_s")
+            )
             if not paired_power and reason is None:
                 reason = "matched_power_unavailable"
             if reason:
