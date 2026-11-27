@@ -27,8 +27,8 @@ states the width rule in the legacy CLI help, `5a3fea421` resolves the width-one
 omission in `ModelConfig` too, `3943df8c4` states and pins the configuration
 adapter's stricter MoE-width rule, and `8a9eb51d2` publishes that rule in the
 packaged JSON schema. `baa7d698c` corrects the fallback-eligibility list in
-`docs/perf-model/memory.md`, and `3921562bd`, `7d8e650e4` and the final commit
-change only this document.
+`docs/perf-model/memory.md`, and `3921562bd`, `7d8e650e4`, `cd0f2533c` and the
+final commit change only this document.
 See [Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -69,8 +69,8 @@ rejection on the capacity bridge, `64b4f53d9` states the width rule in the
 legacy CLI help, `5a3fea421` resolves the width-one omission in
 `ModelConfig`, `3943df8c4` states and pins the configuration adapter's stricter
 MoE-width rule, and `8a9eb51d2` publishes it in the packaged JSON schema.
-`baa7d698c` changes only `memory.md`, and `3921562bd`, `7d8e650e4` and the final
-commit change only this document. Everything sits on
+`baa7d698c` changes only `memory.md`, and `3921562bd`, `7d8e650e4`, `cd0f2533c`
+and the final commit change only this document. Everything sits on
 three merges of `main` on top of the reviewed
 commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
