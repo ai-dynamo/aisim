@@ -279,15 +279,21 @@ def _resolve_moe_dimensions(
 ) -> tuple[int, int]:
     """Resolve the MoE tensor/expert widths a request implies.
 
-    Mirrors :meth:`ModelConfig.resolve_moe_parallelism` so the native build and
-    the naive fallback price the same layout:
+    Mirrors :meth:`ModelConfig.resolve_moe_parallelism` for routed checkpoints so
+    the native build and the naive fallback price the same layout:
 
-    - both omitted: raise for a routed-MoE checkpoint, because the config
-      contract refuses to invent a layout the caller did not request. A dense
-      checkpoint never reads these widths, so it keeps placeholder widths (the
-      attention width, ``1``) that nothing prices;
-    - one omitted: inferred from that width, as every other SDK path does;
+    - both omitted: raise, because the config contract refuses to invent a layout
+      the caller did not request;
+    - one omitted: inferred from the attention width
+      (``tp_size * attention_dp_size * cp_size``), as every other SDK path does;
     - both given: returned unchanged for ``ModelConfig`` to validate.
+
+    A dense checkpoint never reads these widths -- ``ModelConfig`` skips the
+    invariant and dense models build no expert ops -- so it keeps the caller's
+    explicit value and the historical ``1`` for an omitted one. Inferring from
+    the attention width there would turn a valid dense request such as
+    ``tp_size=4, moe_tp_size=2`` into ``moe_ep_size=2``, which direct
+    construction of a dense model rejects.
 
     :class:`NaiveKVCacheEstimator` shards expert weights by
     ``moe_tp_size * moe_ep_size`` and never sees ``ModelConfig``, so resolving
@@ -301,13 +307,17 @@ def _resolve_moe_dimensions(
             raise InvalidEngineConfigurationError(f"{name} must be positive, got {value}.")
         return int(value)
 
+    if not is_moe:
+        return (
+            _positive("moe_tp_size", int(moe_tp_size)) if moe_tp_size is not None else 1,
+            _positive("moe_ep_size", int(moe_ep_size)) if moe_ep_size is not None else 1,
+        )
+
     if moe_tp_size is None:
         if moe_ep_size is None:
-            if is_moe:
-                raise InvalidEngineConfigurationError(
-                    "At least one of moe_tp_size or moe_ep_size must be set for MoE models."
-                )
-            return attn_width, 1
+            raise InvalidEngineConfigurationError(
+                "At least one of moe_tp_size or moe_ep_size must be set for MoE models."
+            )
         moe_ep = _positive("moe_ep_size", int(moe_ep_size))
         if attn_width % moe_ep != 0:
             raise InvalidEngineConfigurationError(
@@ -425,7 +435,8 @@ class KVCacheEstimator:
         omitted ``moe_tp_size``/``moe_ep_size`` pair on a routed checkpoint raises the
         same error ``ModelConfig.resolve_moe_parallelism`` raises, because no layout
         can be inferred. Dense checkpoints never read these dimensions, so they keep
-        placeholder widths.
+        the caller's explicit value and ``1`` for an omitted one, matching direct
+        construction.
         """
         validate_moe_controls(
             model_path=model_path,
@@ -1277,7 +1288,8 @@ def estimate_kv_cache(
     cp_size``), and an omitted ``moe_tp_size``/``moe_ep_size`` pair on a routed
     checkpoint raises, exactly as :meth:`ModelConfig.resolve_moe_parallelism`
     does, because no layout can be inferred. Dense checkpoints never read these
-    widths. The naive fallback shares that rule with
+    widths, so they keep the caller's explicit value and ``1`` for an omitted
+    one, as direct construction does. The naive fallback shares that rule with
     :meth:`KVCacheEstimator.from_request`; without it, it would shard expert
     weights by ``1 * 1`` while the native build resolved a different pair, or
     price a layout the native path rejects.

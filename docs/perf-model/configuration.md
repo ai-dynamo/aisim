@@ -22,6 +22,8 @@ one and stay out of the serialized identity when unset. A routed-MoE topology
 must set at least one of `moe_tp_size`/`moe_ep_size`: one omitted width is
 inferred from the attention width, while omitting both is an error (see
 [GPU memory and cache capacity](memory.md#kv-cache-capacity-reservation)).
+Dense topologies never read these widths, so an explicit value is kept and an
+omitted one stays `1`.
 
 ```python
 from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel

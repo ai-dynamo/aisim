@@ -51,7 +51,8 @@ reject an omitted pair with `InvalidEngineConfigurationError`, matching
 `ModelConfig.resolve_moe_parallelism`: the caller would otherwise get an expert
 layout it never requested, and the naive fallback would shard expert weights by
 `1 * 1` while the native build priced another layout. Dense checkpoints never
-read these widths.
+read these widths, so they keep the caller's explicit value and `1` for an
+omitted one, as direct construction does.
 
 For Mistral3's gated Pixtral encoder, the analytical activation estimate includes
 the replicated residual alongside the gate and up intermediates. Encoder tensor

@@ -1305,6 +1305,47 @@ def test_estimate_kv_cache_accepts_an_omitted_moe_pair_for_a_dense_checkpoint():
     assert out["source"] == "native"
 
 
+def test_estimate_kv_cache_keeps_one_for_a_dense_omitted_moe_ep_size():
+    # A single omitted width must not be inferred for a dense checkpoint: the
+    # dense guard accepts only moe_ep_size=1, so `tp_size=4, moe_tp_size=2` would
+    # become `2x2` and reject a request that direct construction accepts.
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        moe_tp_size=2,
+        gpu_memory_capacity_bytes_override=200 * _GIB,
+        allow_naive_fallback=False,
+    )
+    inferred = memory.estimate_kv_cache("nvidia/Gemma-4-31B-IT-NVFP4", "h200_sxm", "vllm", **kwargs)
+    explicit = memory.estimate_kv_cache("nvidia/Gemma-4-31B-IT-NVFP4", "h200_sxm", "vllm", moe_ep_size=1, **kwargs)
+    assert inferred["source"] == explicit["source"] == "native"
+    assert inferred["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
+def test_estimate_kv_cache_naive_fallback_keeps_one_for_a_dense_omitted_moe_ep_size(monkeypatch):
+    # The fallback shards expert weights by the product, so inferring `2x2` here
+    # would under-count dense weights by a factor of two as well as reject the
+    # request natively.
+    _fallback_without_database(monkeypatch)
+    kwargs = dict(
+        max_num_tokens=8192,
+        max_batch_size=256,
+        memory_fraction_kind="of_total",
+        memory_fraction_value=0.9,
+        tp_size=4,
+        moe_tp_size=2,
+        gpu_memory_capacity_bytes_override=200 * _GIB,
+        allow_naive_fallback=True,
+    )
+    inferred = memory.estimate_kv_cache("nvidia/Gemma-4-31B-IT-NVFP4", "h200_sxm", "vllm", **kwargs)
+    explicit = memory.estimate_kv_cache("nvidia/Gemma-4-31B-IT-NVFP4", "h200_sxm", "vllm", moe_ep_size=1, **kwargs)
+    assert inferred["source"] == explicit["source"] == "naive_fallback"
+    assert inferred["total_kv_size_tokens"] == explicit["total_kv_size_tokens"]
+
+
 def test_estimate_kv_cache_keeps_the_naive_fallback_for_a_valid_dense_gemma4_checkpoint(monkeypatch):
     # The metadata gate must not turn the documented naive fallback into an
     # error for a well-formed dense checkpoint whose database is unavailable.
