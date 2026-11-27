@@ -253,6 +253,21 @@ class TestEstimateModelWeightBytes:
             _estimate_model_weight_bytes(str(tmp_path))
         assert f"Normalized model parsing failed for {tmp_path}; trying the raw-config estimator." in caplog.messages
 
+    def test_sglang_generator_selects_its_own_mixed_attention_decoder(self, tmp_path):
+        from aisim.generator.api import generate_naive_config
+        from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+        raw = _load_pre_downloaded_hf_config("Qwen/Qwen3-0.6B")
+        raw.update(use_sliding_window=True, max_window_layers=14)
+        raw.pop("layer_types", None)
+        raw.pop("sliding_window", None)
+        wrapper = {"architectures": ["LlavaForConditionalGeneration"], "text_config": raw}
+        (tmp_path / "config.json").write_text(json.dumps(wrapper))
+        result = generate_naive_config(str(tmp_path), 1, "h100_sxm", "sglang", backend_version="0.5.20")
+        assert result["parallelism"]["tp"] == 1
+        with pytest.raises(RuntimeError, match="vLLM Qwen3 does not support sliding attention"):
+            _estimate_model_weight_bytes(str(tmp_path), backend="vllm", backend_version="0.32.0")
+
     def test_estimates_an_unknown_wrapper_from_its_decoder(self, tmp_path):
         decoder = {
             "hidden_size": 256,

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 
 from packaging.version import Version
@@ -19,7 +20,7 @@ from aisim_core.sdk.models.helpers import mtp_scale_factor, quant_exclude_patter
 from aisim_core.sdk.utils import gemma4_cache_shapes
 
 # Official release index (first) and its Linux platform manifest digests for the vLLM
-# adapters that support both the flat and heterogeneous Transformers readers.
+# releases with supported Transformers readers that disagree on a Gemma configuration.
 _GEMMA4_ADAPTER_IMAGES = {
     ("0.28.0", "vllm"): (
         "sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14",
@@ -57,7 +58,41 @@ _GEMMA4_ADAPTER_IMAGES = {
         "sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7",
         "sha256:0229393589110073085ffb558d3da4ce1114b93e985019a8811433b5fc793bac",
     ),
+    ("0.32.0", "vllm"): (
+        "sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34",
+        "sha256:6ee133356d49ed24cee03dd0cda3d3980279a11c107ce3e752c89e76540f41c9",
+        "sha256:6ff5ff0ddf3658d2c2d677dac5ca2d4726ce0156b4371166d918181b210bd4bc",
+    ),
+    ("0.32.0", "vllm_xpu"): (
+        "sha256:20509fabe50dda62c09c0786d1a6effa299d3dbdddcc49331b93e65144652a8c",
+        "sha256:9dd913e9036633d55ace17265cbfc29f48b9b85fe4bc8b129debcf7e1b269ce7",
+    ),
+    ("0.33.0", "vllm"): (
+        "sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e",
+        "sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3",
+        "sha256:e3481489818d3e563cae517b84ab959cc8b69f85a9fbb771c189140131ffc65c",
+    ),
+    ("0.33.0", "vllm_xpu"): (
+        "sha256:be3a9aea234be64ffc2816ac561c597e0f0b1f44a61a7f4912780e4d77450086",
+        "sha256:010bdc441c72ee222f459d3b688bb41317525f1bd7223afe6218490b0c526832",
+    ),
 }
+
+
+def _has_table_rows(path: Path) -> bool:
+    if path.suffix == ".parquet":
+        from pyarrow.parquet import read_metadata
+
+        return read_metadata(path).num_rows > 0
+    with path.open(encoding="utf-8") as stream:
+        lines = (line for line in stream if line.strip() and not line.lstrip().startswith("#"))
+        next(lines, None)  # CSV header
+        return next(lines, None) is not None
+
+
+@lru_cache(maxsize=256)
+def _cached_table_rows(path: Path, revision: tuple[int, ...]) -> bool:
+    return _has_table_rows(path)
 
 
 def _gemma4_collection_images(directory: Path, version: str, framework: str, *, cache: bool) -> Iterator[bool]:
@@ -88,19 +123,19 @@ def _gemma4_collection_images(directory: Path, version: str, framework: str, *, 
             if not isinstance(runtime, dict):
                 continue
             rows = event.get("rows")
-            if "rows" not in event and collection.get("schema_version", 1) == 1:
-                # Reduced schema 1 may record only the status. The retained
-                # Parquet row count distinguishes measurements from empty tables.
-                parquet = directory / f"{table}.parquet"
-                if parquet.is_file():
-                    from pyarrow.parquet import read_metadata
-
-                    rows = read_metadata(parquet).num_rows
-                else:
-                    with (directory / f"{table}.txt").open(encoding="utf-8") as stream:
-                        lines = (line for line in stream if line.strip() and not line.lstrip().startswith("#"))
-                        next(lines, None)  # CSV header
-                        rows = int(next(lines, None) is not None)
+            if (
+                collection.get("schema_version") == 1
+                and collection.get("provenance") in ("local", "collected")
+                and set(event) == {"status"}
+                and event["status"] in ("complete", "partial")
+            ):
+                # A valid reduced record omits its count. Read the retained table once per revision.
+                path = directory / f"{table}.parquet"
+                if not path.is_file():
+                    path = directory / f"{table}.txt"
+                rows = int(
+                    _cached_table_rows(path, perf_database._file_revision(path)) if cache else _has_table_rows(path)
+                )
             if type(rows) is not int or rows <= 0:
                 continue
             if runtime.get("framework") != framework:
@@ -182,7 +217,7 @@ def check_gemma4_adapter_runtime(
 ) -> None:
     """Require an observed image when supported Transformers readers select different Gemma geometry."""
     release = common.parse_support_matrix_version(version)
-    if release is None or not Version("0.28.0rc1") <= release < Version("0.32.0rc0"):
+    if release is None or release < Version("0.28.0rc1"):
         return
     decoder = document.get(decoder_config_key(document), document)
     if not isinstance(decoder, dict) or "per_layer_config" not in decoder:
@@ -192,7 +227,16 @@ def check_gemma4_adapter_runtime(
         isinstance(names, list) and names[:1] == ["Gemma4ForConditionalGeneration"]
     ):
         return
-    # These vLLM adapters accept both flat and per-layer Transformers implementations.
+    if release >= Version("0.32.0rc0"):
+        # All supported readers have per-layer geometry, but only Transformers 5.17+
+        # inherits default_rope_type. An explicit global value removes the difference.
+        overrides = decoder.get("per_layer_config")
+        if (
+            "default_rope_type" in decoder
+            or not isinstance(overrides, dict)
+            or not any(isinstance(row, dict) and "default_rope_type" in row for row in overrides.values())
+        ):
+            return
     tp_size = validate_parallel_size("tp_size", tp_size)
     try:
         gemma4_cache_shapes(

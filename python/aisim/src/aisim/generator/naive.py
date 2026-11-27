@@ -184,7 +184,13 @@ def _get_system_config(system_name: str) -> dict[str, Any]:
     return result
 
 
-def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, Any] | None = None) -> int:
+def _estimate_model_weight_bytes(
+    model_path: str,
+    *,
+    backend: str = "vllm",
+    backend_version: str | None = None,
+    model_metadata: dict[str, Any] | None = None,
+) -> int:
     """
     Estimate model weight size in bytes based on model config.
 
@@ -198,6 +204,8 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
 
     Args:
         model_path: HuggingFace model path or local path.
+        backend: Serving backend that selects the decoder.
+        backend_version: Serving backend release for config-only sizing.
         model_metadata: Optional dictionary populated with the detected
             ``architecture`` and ``is_moe`` values from the same config used
             for sizing.
@@ -243,6 +251,8 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
         try:
             estimator = NaiveKVCacheEstimator.from_hf_config(
                 raw_config,
+                backend=backend,
+                backend_version=backend_version,
                 tp_size=1,
                 pp_size=1,
             )
@@ -402,6 +412,7 @@ def build_naive_generator_params(
     generator_overrides: dict[str, Any] | None = None,
     preserve_engine_limits: bool = False,
     model_config: dict[str, Any] | None = None,
+    backend_version: str | None = None,
 ) -> dict[str, Any]:
     """
     Build generator parameters for naive configuration generation.
@@ -419,6 +430,7 @@ def build_naive_generator_params(
         total_gpus: Total number of GPUs available.
         system_name: Name of the system (e.g., 'h200_sxm', 'gb200').
         backend_name: Name of the backend (e.g., 'trtllm', 'sglang', 'vllm').
+        backend_version: Serving backend release for config-only sizing.
         mode: Serving mode — ``"agg"`` (aggregated, single worker type) or
             ``"disagg"`` (disaggregated, separate prefill/decode workers).
         optimization_type: ``"throughput"`` or ``"latency"`` (or ``None``
@@ -458,7 +470,9 @@ def build_naive_generator_params(
     if model_config is not None:
         model_weight_bytes = _estimate_weight_bytes_from_config(model_config, model_name)
     else:
-        model_weight_bytes = _estimate_model_weight_bytes(model_name, model_metadata=model_metadata)
+        model_weight_bytes = _estimate_model_weight_bytes(
+            model_name, backend=backend_name, backend_version=backend_version, model_metadata=model_metadata
+        )
 
     # Calculate minimum GPU count that fits the model
     min_gpus, fits, required_tp = _calculate_min_tp(

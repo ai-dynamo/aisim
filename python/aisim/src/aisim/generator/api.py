@@ -702,17 +702,7 @@ def generate_naive_config(
     generator_overrides = generator_overrides or {}
     effective_dynamo_version = generator_dynamo_version or generator_overrides.get("generator_dynamo_version")
 
-    # Build generator parameters
-    generator_params = build_naive_generator_params(
-        model_name=model_path,
-        total_gpus=total_gpus,
-        system_name=system,
-        backend_name=backend,
-        generator_dynamo_version=effective_dynamo_version,
-        generator_overrides=generator_overrides,
-    )
-
-    # Determine backend version
+    # Resolve the serving release for weight sizing and template selection.
     if generated_config_version:
         backend_version = generated_config_version
         logger.warning("Using generated-config-version: %s", generated_config_version)
@@ -733,6 +723,16 @@ def generate_naive_config(
             backend,
         )
     logger.info("Using backend version: %s", backend_version)
+
+    generator_params = build_naive_generator_params(
+        model_name=model_path,
+        total_gpus=total_gpus,
+        system_name=system,
+        backend_name=backend,
+        backend_version=backend_version,
+        generator_dynamo_version=effective_dynamo_version,
+        generator_overrides=generator_overrides,
+    )
 
     params_dict = generator_params.get("params", {})
     agg_or_prefill_params = params_dict.get("agg") or params_dict.get("prefill") or params_dict.get("decode") or {}

@@ -2362,6 +2362,7 @@ def test_gemma4_per_layer_fields_use_the_initialized_configuration(tmp_path, bac
         "allow_global_per_layer_attribute_access": False,
         "keys_to_ignore_at_inference": ["past_key_values"],
         "serialize_explicit_per_layer_config": False,
+        "per_layer_attributes": None,
         "name_or_path": text.get("_name_or_path", ""),
         "use_return_dict": False,
         "output_attentions": True,
@@ -2370,6 +2371,19 @@ def test_gemma4_per_layer_fields_use_the_initialized_configuration(tmp_path, bac
         "_attn_implementation": None,
     }
     options = dict(tp_size=1, pp_size=1, backend=backend, backend_version=release)
+    assert estimate_kv_bytes_per_token(_write_config(tmp_path, document), **options) == 225_280
+    fields["default_rope_type"] = "default"
+    if backend == "vllm":
+        with pytest.raises(ValueError, match="runtime profile"):
+            estimate_kv_bytes_per_token(_write_config(tmp_path, document), **options)
+        with pytest.raises(ValueError, match="no global default_rope_type"):
+            estimate_kv_bytes_per_token(_write_config(tmp_path, document), **(options | {"backend_version": "0.30.0"}))
+        text["default_rope_type"] = "default"
+    rope = text["rope_scaling"] = {
+        **text["rope_parameters"],
+        "full_attention": {"rope_type": "default", "rope_theta": 2e5},
+    }
+    fields["rope_scaling"] = rope
     assert estimate_kv_bytes_per_token(_write_config(tmp_path, document), **options) == 225_280
     fields["is_causal"] = True
     model = _write_config(tmp_path, document)
@@ -2485,7 +2499,12 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
     metadata.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": table}))
     (attention / "collection_meta.yaml").write_text(
         json.dumps(
-            {"schema_version": 1, "runtime": custom, "tables": {"generation_attention_perf": {"status": "complete"}}}
+            {
+                "schema_version": 1,
+                "provenance": "local",
+                "runtime": custom,
+                "tables": {"generation_attention_perf": {"status": "complete"}},
+            }
         )
     )
     retained = attention / "generation_attention_perf.parquet"
@@ -2496,11 +2515,45 @@ def test_gemma4_calibrated_xpu_adapter_uses_the_official_image(tmp_path):
                 get_model(path, config, "vllm", database=database)
         else:
             assert get_model(path, config, "vllm", database=database).get_kvcache_bytes_per_sequence(1) == 225_280
+    # Only a collector-valid reduced measurement can qualify a stock image.
+    metadata.write_text(json.dumps({"schema_version": 1, "runtime": runtime, "tables": {}}))
+    reduced = {"schema_version": 1, "provenance": "local", "runtime": runtime}
+    pq.write_table(pa.table({"latency": [0.5]}), retained)
+    for entry in ({}, {"status": "failed"}, {"status": "partial"}):
+        (attention / "collection_meta.yaml").write_text(
+            json.dumps(reduced | {"tables": {"generation_attention_perf": entry}})
+        )
+        if entry.get("status") == "partial":
+            from unittest.mock import patch
+
+            with patch.object(pq, "read_metadata", wraps=pq.read_metadata) as footer:
+                for _ in range(2):
+                    assert (
+                        get_model(path, config, "vllm", database=database).get_kvcache_bytes_per_sequence(1) == 225_280
+                    )
+                assert footer.call_count == 1
+            empty = attention / "empty.parquet"
+            pq.write_table(pa.table({"latency": pa.array([], type=pa.float32())}), empty)
+            empty.replace(retained)
+        with pytest.raises(ValueError, match="runtime profile"):
+            get_model(path, config, "vllm", database=database)
     (directory / "gemm_perf.txt").unlink()
     with pytest.raises(ValueError, match="runtime profile"):
         estimate_kv_bytes_per_token(path, tp_size=1, **args)
     with pytest.raises(ValueError, match="runtime profile"):
         get_model(target, draft_config, "vllm", database=database)
+
+
+def test_strict_catalog_refusal_precedes_naive_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIC_STRICT_PROVENANCE", "1")
+    (tmp_path / "test_h100.yaml").write_text("data_dir: data/test_h100\ngpu: {name: NVIDIA H100}\n")
+    directory = tmp_path / "data/test_h100/gemm/vllm/0.30.0"
+    directory.mkdir(parents=True)
+    (directory / "collection_meta.yaml").write_text("tables: [")
+    (directory / "gemm_perf.txt").write_text("m,n,k,latency\n1,1,1,1\n")
+    options = _missing_system_cache_options(tmp_path, tp_size=1, capacity=80 * _GIB)
+    with pytest.raises(memory.perf_database.StrictProvenanceError, match="failed to parse collection_meta"):
+        memory.estimate_num_gpu_blocks("facebook/opt-125m", "test_h100", "vllm", "0.30.0", **options)
 
 
 def test_gemma4_adapter_compares_each_ranks_cache_without_deployment_evidence(tmp_path):
@@ -2925,6 +2978,8 @@ def test_fixed_llama_wrapper_uses_its_decoder_independently_of_the_training_clas
     for decoder_key in ("text_config", "llm_config"):
         model = _write_config(tmp_path, {"architectures": ["UnknownConditionalGeneration"], decoder_key: text})
         assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1) == bare == 23_040
+    training = {k: v for k, v in text.items() if k != "num_hidden_layers"}
+    assert estimate_kv_bytes_per_token(_write_config(tmp_path, training), tp_size=1, pp_size=1) == 24_576
     text["architectures"] = ["DeepseekV3ForCausalLM"]
     normalized = wrapper.replace("ForConditionalGeneration", "LMHeadModel")
     for names in (["OldCheckpoint", wrapper], ["OldCheckpoint", normalized], ["AlbertModel", wrapper]):
@@ -3014,8 +3069,6 @@ def test_config_class_defaults_and_explicit_vllm_decoder_dispatch():
 )
 def test_vllm_dispatches_the_first_available_text_decoder(tmp_path, classes, expected):
     from aisim.capacity import estimate_kv_bytes_per_token
-    from aisim.compiler import prediction_to_replay_spec
-    from aisim.config import CorePredictionConfig
 
     # Each of 40 layers stores K and V in FP16. Llama uses 8 heads of width 64,
     # Qwen2 uses 8 of width 5120 / 40, and OPT uses all 40 of width 5120 / 40.
@@ -3039,6 +3092,13 @@ def test_vllm_dispatches_the_first_available_text_decoder(tmp_path, classes, exp
     )
     path = _write_config(tmp_path, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": text})
     assert estimate_kv_bytes_per_token(path, tp_size=1, pp_size=1, backend_version="0.32.0") == expected
+    assert _compiled_vllm_transfer_widths(path, "0.32.0") == (expected, expected)
+
+
+def _compiled_vllm_transfer_widths(path, version):
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config import CorePredictionConfig
+
     worker = dict(
         parallelism={"tensor": 1},
         timing={"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
@@ -3049,14 +3109,102 @@ def test_vllm_dispatches_the_first_available_text_decoder(tmp_path, classes, exp
         mode="disaggregated",
         hardware="gb300",
         backend="vllm",
-        backend_version="0.32.0",
+        backend_version=version,
         context_length=4096,
         workers={"prefill": worker, "decode": worker},
         kv_transfer={"bytes_per_token": "auto", "bandwidth_gb_per_second": 50},
     )
     deployment = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
-    assert deployment.prefill_engine_args["kv_transfer_bytes_per_token"] == expected
-    assert deployment.decode_engine_args["kv_transfer_bytes_per_token"] == expected
+    return deployment.prefill_engine_args["kv_transfer_bytes_per_token"], deployment.decode_engine_args[
+        "kv_transfer_bytes_per_token"
+    ]
+
+
+@pytest.mark.parametrize(
+    "parent_type,wrappers,child_type,head_dim,expected",
+    [
+        ("llava_next", ["LlavaNextForConditionalGeneration"], "qwen2", 64, 147_456),
+        ("interns1", ["InternS1ForConditionalGeneration", "InternVLForConditionalGeneration"], "qwen3", 128, 147_456),
+        ("interns1", ["InternVLLMHeadModel", "InternS1ForConditionalGeneration"], None, 64, 73_728),
+        ("internvl", ["InternS1ForConditionalGeneration", "InternVLForConditionalGeneration"], None, 64, 147_456),
+    ],
+)
+def test_vllm_uses_the_parent_config_and_registered_language_model(
+    tmp_path, parent_type, wrappers, child_type, head_dim, expected
+):
+    from aisim.capacity import estimate_kv_bytes_per_token
+
+    # Both InternVL names load InternS1 in vLLM. Its HF parents default to Qwen3
+    # and Qwen2 respectively. Qwen3 reads head_dim, while Qwen2 uses 4096 / 32.
+    child = dict(
+        hidden_size=4096,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        num_hidden_layers=36,
+        head_dim=head_dim,
+        intermediate_size=12288,
+        max_position_embeddings=65536,
+        vocab_size=153216,
+    )
+    if child_type:
+        child["model_type"] = child_type
+    model = _write_config(tmp_path, {"model_type": parent_type, "architectures": wrappers, "text_config": child})
+    for version in ("0.31.0", "0.32.0", "0.33.0"):
+        assert estimate_kv_bytes_per_token(model, tp_size=1, pp_size=1, backend_version=version) == expected
+        assert _compiled_vllm_transfer_widths(model, version) == (expected, expected)
+
+
+@pytest.mark.parametrize("config_type", ["phi3", "gemma"])
+def test_registered_opt_uses_its_projections_with_a_different_config(tmp_path, config_type):
+    config = dict(
+        model_type=config_type,
+        hidden_size=768,
+        num_attention_heads=12,
+        num_key_value_heads=1,
+        head_dim=32,
+        num_hidden_layers=12,
+        intermediate_size=3072,
+        ffn_dim=3072,
+        max_position_embeddings=2048,
+        vocab_size=50272,
+        word_embed_proj_dim=768,
+        enable_bias=True,
+        activation_function="relu",
+        layer_norm_elementwise_affine=True,
+        do_layer_norm_before=False,
+    )
+    for names in (["OPTForCausalLM"], ["UnknownCheckpoint", "OPTLMHeadModel"]):
+        config["architectures"] = names
+        path = _write_config(tmp_path, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": config})
+        assert _compiled_vllm_transfer_widths(path, "0.32.0") == (36_864, 36_864)
+        options = _missing_system_cache_options(tmp_path, tp_size=1, capacity=600 << 20)
+        options["naive_kv_reservation"] = 0.8
+        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **options) == 407
+
+
+def test_qwen2_projection_uses_the_constructed_config(tmp_path):
+    parent = {"architectures": ["LlavaNextForConditionalGeneration"]}
+    # Phi3Config derives its KV head count and Qwen2 initializes the rotary parameters.
+    phi3 = {"model_type": "phi3", "architectures": ["Qwen2ForCausalLM"]}
+    for fields in ({}, {"num_key_value_heads": 32, "rope_parameters": {"rope_type": "default", "rope_theta": 10000}}):
+        path = _write_config(tmp_path, parent | {"text_config": phi3 | fields})
+        assert _compiled_vllm_transfer_widths(path, "0.32.0") == (393_216, 393_216)
+    vision = dict(
+        model_type="clip_vision_model",
+        hidden_size=1024,
+        num_attention_heads=16,
+        num_hidden_layers=24,
+        intermediate_size=4096,
+    )
+    for fields in ({}, {"architectures": ["Qwen2ForCausalLM"]}):
+        path = _write_config(tmp_path, parent | {"text_config": vision | fields})
+        with pytest.raises(ValueError, match="causal LM|Qwen2ForCausalLM requires"):
+            _compiled_vllm_transfer_widths(path, "0.32.0")
+    path = _write_config(tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "text_config": vision})
+    with pytest.raises(ValueError, match="no causal LM"):
+        NaiveKVCacheEstimator.from_model_path(
+            path, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.20", allow_hf_config_download=False
+        )
 
 
 def test_vllm_stops_at_a_registered_decoder_even_when_its_geometry_is_unknown():
@@ -3069,6 +3217,8 @@ def test_vllm_stops_at_a_registered_decoder_even_when_its_geometry_is_unknown():
 
     # Dory first appeared in v0.33.0. Older registries reach the default 32-layer Llama.
     assert width("DoryForCausalLM", "0.32.0") == 524_288
+    for version in ("v0.32.0", "0.31.0rc5", "0.33.0rc3"):
+        assert width("VLlama3ForCausalLM", version) == 524_288
     with pytest.raises(ValueError, match="conflicts with architectures='DoryForCausalLM'"):
         width("DoryForCausalLM", "0.33.0")
     with pytest.raises(ValueError, match="depends on the backend release"):
@@ -3097,6 +3247,19 @@ def test_bare_normalized_decoders_use_their_local_layers_and_experts(tmp_path):
     with pytest.raises(ValueError, match="divisible by tp_size"):
         estimate_kv_bytes_per_token(path, tp_size=3, pp_size=1, backend_version="0.32.0")
 
+    llama = _load_pre_downloaded_hf_config("meta-llama/Meta-Llama-3.1-8B")
+    llama["architectures"] = ["LLaMAForCausalLM"]
+    opts = _missing_system_cache_options(tmp_path, tp_size=2, capacity=80 * _GIB)
+    del opts["dcp_size"]
+    model = _write_config(tmp_path, llama)
+    assert memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **opts) == memory.estimate_num_gpu_blocks(
+        model, "missing", "vllm", "0.32.0", dcp_size=1, **opts
+    )
+    del llama["num_hidden_layers"]
+    for names in (False, {}, [], ""):
+        with pytest.raises(ValueError, match="architectures"):
+            _compiled_vllm_transfer_widths(_write_config(tmp_path, llama | {"architectures": names}), "0.32.0")
+
     deepseek = _load_pre_downloaded_hf_config("deepseek-ai/DeepSeek-V3")
     deepseek.pop("quantization_config", None)
     deepseek["architectures"] = ["DeepseekV2ForCausalLM"]
@@ -3106,6 +3269,17 @@ def test_bare_normalized_decoders_use_their_local_layers_and_experts(tmp_path):
     inferred = NaiveKVCacheEstimator.from_hf_config(deepseek, **options).weight_bytes()
     # The routed BF16 FFNs alone span 58 layers, each with 256 experts sharded over 8 GPUs.
     assert explicit == inferred >= 58 * 256 * 3 * 7168 * 2048 * 2 // 8 > 80 * _GIB
+    # Zero routed layers retain the native MLA and dense matrices (10,977,280,000 BF16 bytes/rank).
+    dense = deepseek | {"first_k_dense_replace": 61}
+    for model in (dense, {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": dense}):
+        path = _write_config(tmp_path, model)
+        assert _compiled_vllm_transfer_widths(path, "0.32.0") == (70_272, 70_272)
+        opts = _missing_system_cache_options(tmp_path, tp_size=8, capacity=10 * _GIB)
+        opts.update(moe_tp_size=8, moe_ep_size=1, naive_kv_reservation=0.8)
+        with pytest.raises(ValueError, match="no KV budget"):
+            memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts)
+        opts["gpu_memory_capacity_bytes_override"] = 12 * _GIB
+        assert memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **opts) == 1353
     deepseek["architectures"] = ["DeepseekV3BidirectionalModel", "DeepseekV3ForCausalLM"]
     parent = {"architectures": ["LlavaNextForConditionalGeneration"], "text_config": deepseek}
     assert NaiveKVCacheEstimator.from_hf_config(parent, **options).kv_bytes_per_token() == 70_272
@@ -3124,6 +3298,35 @@ def test_real_opt_child_reserves_positions_and_defaults_the_embedding_projection
         path = _write_config(tmp_path, parent | {"text_config": text | {"max_position_embeddings": 131072}})
         with pytest.raises(ValueError, match="no KV budget"):
             memory.estimate_num_gpu_blocks(path, "missing", "vllm", "0.32.0", **options)
+
+
+@pytest.mark.parametrize("classes", [["UnknownOPTCheckpoint", "OPTForCausalLM"], ["OPTLMHeadModel"]])
+def test_flat_opt_dispatch_reserves_learned_positions(tmp_path, classes):
+    cfg = {
+        "model_type": "opt",
+        "torch_dtype": "bfloat16",
+        "architectures": classes,
+        "vocab_size": 50272,
+        "max_position_embeddings": 131072,
+    }
+    path = _write_config(tmp_path, cfg)
+    opts = _missing_system_cache_options(tmp_path, tp_size=1, capacity=400 << 20)
+    opts["memory_fraction_value"] = 1
+    for version in ("0.31.0", "0.32.0", "0.33.0"):
+        # The tied BF16 weights alone occupy 448,659,456 bytes. The config-only
+        # estimate conservatively reserves 526,218,240 bytes, including both vocabulary matrices.
+        with pytest.raises(ValueError, match=r"non-KV memory \(526218240 bytes\)"):
+            memory.estimate_num_gpu_blocks(path, "missing", "vllm", version, **opts)
+        # One physical block is reserved by the vLLM scheduler.
+        assert (
+            memory.estimate_num_gpu_blocks(
+                path, "missing", "vllm", version, **(opts | {"gpu_memory_capacity_bytes_override": 600 << 20})
+            )
+            == ((600 << 20) - 526_218_240) // (16 * 36_864) - 1
+        )
+    model = _write_config(tmp_path, cfg | {"architectures": ["BloomForCausalLM", "OPTForCausalLM"]})
+    with pytest.raises(ValueError, match="conflicts with architectures='BloomForCausalLM'"):
+        memory.estimate_num_gpu_blocks(model, "missing", "vllm", "0.32.0", **opts)
 
 
 @pytest.mark.parametrize("model_type", ["", "fake_llama_config"])

@@ -236,6 +236,10 @@ _QUERY_VERSIONS_BASENAME = "query_versions.yaml"
 _SLOT_ALIASES = ("current", "previous", "next")
 
 
+class StrictProvenanceError(ValueError):
+    """The requested collection failed its strict provenance checks."""
+
+
 class UnlistedQueryVersionError(ValueError):
     """A requested backend version exists outside the queryable slots.
 
@@ -721,6 +725,11 @@ def _parse_reuse_yaml(path: str) -> dict:
     return {"entries": validated}
 
 
+def _file_revision(path: str | os.PathLike) -> tuple[int, ...]:
+    stat = os.stat(path)
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
 def _load_collection_meta_yaml(path: str, *, cache: bool = False) -> dict:
     if not cache:
         return _read_collection_meta_yaml(path)
@@ -728,10 +737,9 @@ def _load_collection_meta_yaml(path: str, *, cache: bool = False) -> dict:
     # the parsed document to this file revision, including atomic replacements.
     path = os.path.abspath(path)
     try:
-        stat = os.stat(path)
+        signature = _file_revision(path)
     except OSError:
         return _read_collection_meta_yaml(path)
-    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
     return copy.deepcopy(_cached_collection_meta_yaml(path, signature))
 
 
@@ -1264,7 +1272,7 @@ def _check_strict_provenance_coverage(version_path: str, *, strict: bool, only_t
                 "cannot verify sidecar coverage (Collector V3 design §5/§7.4)"
             )
             if strict:
-                raise ValueError(message) from e
+                raise StrictProvenanceError(message) from e
             _warn_strict_provenance_once("unreadable-version-dir", version_path, message)
             return
         if not data_filenames:
@@ -1278,7 +1286,7 @@ def _check_strict_provenance_coverage(version_path: str, *, strict: bool, only_t
             "sidecar (Collector V3 design §5/§7.4)"
         )
         if strict:
-            raise ValueError(message)
+            raise StrictProvenanceError(message)
         _warn_strict_provenance_once("missing-sidecar", version_path, message)
         return
 
@@ -1286,7 +1294,7 @@ def _check_strict_provenance_coverage(version_path: str, *, strict: bool, only_t
         meta = _load_collection_meta_yaml(meta_path)
     except ValueError as e:
         if strict:
-            raise
+            raise StrictProvenanceError(str(e)) from e
         _warn_strict_provenance_once("malformed-sidecar", meta_path, str(e))
         return
 
@@ -1310,7 +1318,7 @@ def _check_strict_provenance_coverage(version_path: str, *, strict: bool, only_t
         "(Collector V3 design §5/§7.4)"
     )
     if strict:
-        raise ValueError(message)
+        raise StrictProvenanceError(message)
     _warn_strict_provenance_once("uncovered-table", meta_path, message)
 
 
@@ -1356,7 +1364,7 @@ def _check_strict_provenance_for_request(paths: list[str], backend: str, data_di
             declared_entries = _parse_reuse_yaml(reuse_path)["entries"]
         except ValueError as e:
             if strict:
-                raise
+                raise StrictProvenanceError(str(e)) from e
             _warn_strict_provenance_once("malformed-reuse", reuse_path, str(e))
             continue
         for entry in declared_entries:
@@ -1391,7 +1399,7 @@ def _version_dir_unusable_for_request(
         )
     except ValueError as e:
         if strict:
-            raise
+            raise StrictProvenanceError(str(e)) from e
         _warn_strict_provenance_once("malformed-sidecar", version_path, str(e))
         return False
 

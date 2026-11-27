@@ -852,3 +852,46 @@ hf 33 Model Ultrabert UnlimitedOcr UnlimitedOcrText UnlimitedOcrVision
 hf 33 PreTrainedModel BailingHybrid Beam Kolibri1 Molmo2 MossTranscribeDiarize MuseSpark PPDocLayoutV4 Ultrabert
 hf 33 PreTrainedModel UnlimitedOcr UnlimitedOcrText
 hf 33 Processor Molmo2 Molmo2Video MossTranscribeDiarize MuseSpark UnlimitedOcr
+# Causal LM entries map model_type=class_prefix to the default generation class in all eligible Transformers wheels.
+causal 31/32/33 - bert-generation=BertGenerationDecoder reformer=ReformerModelWithLMHead
+causal 31/32/33 ForCausalLM afmoe=Afmoe apertus=Apertus arcee=Arcee aria_text=AriaText bamba=Bamba bart=Bart
+causal 31/32/33 ForCausalLM big_bird=BigBird bigbird_pegasus=BigBirdPegasus biogpt=BioGpt bitnet=BitNet
+causal 31/32/33 ForCausalLM blenderbot=Blenderbot blenderbot-small=BlenderbotSmall bloom=Bloom blt=Blt
+causal 31/32/33 ForCausalLM camembert=Camembert codegen=CodeGen cohere=Cohere cohere2=Cohere2 cohere2_moe=Cohere2Moe
+causal 31/32/33 ForCausalLM cpmant=CpmAnt cwm=Cwm data2vec-text=Data2VecText dbrx=Dbrx deepseek_v2=DeepseekV2
+causal 31/32/33 ForCausalLM deepseek_v3=DeepseekV3 deepseek_v4=DeepseekV4 diffllama=DiffLlama doge=Doge dots1=Dots1
+causal 31/32/33 ForCausalLM electra=Electra emu3=Emu3 ernie=Ernie ernie4_5=Ernie4_5 ernie4_5_moe=Ernie4_5_Moe
+causal 31/32/33 ForCausalLM exaone4=Exaone4 exaone_moe=ExaoneMoe falcon=Falcon falcon_h1=FalconH1
+causal 31/32/33 ForCausalLM falcon_mamba=FalconMamba flex_olmo=FlexOlmo fuyu=Fuyu gemma=Gemma gemma2=Gemma2
+causal 31/32/33 ForCausalLM gemma3_text=Gemma3 gemma3n_text=Gemma3n gemma4_assistant=Gemma4Assistant gemma4_text=Gemma4
+causal 31/32/33 ForCausalLM gemma4_unified_assistant=Gemma4UnifiedAssistant gemma4_unified_text=Gemma4Unified git=Git
+causal 31/32/33 ForCausalLM glm=Glm glm4=Glm4 glm4_moe=Glm4Moe glm4_moe_lite=Glm4MoeLite glm_moe_dsa=GlmMoeDsa
+causal 31/32/33 ForCausalLM gpt_bigcode=GPTBigCode gpt_neo=GPTNeo gpt_neox=GPTNeoX gpt_neox_japanese=GPTNeoXJapanese
+causal 31/32/33 ForCausalLM gpt_oss=GptOss gptj=GPTJ granite=Granite granitemoe=GraniteMoe
+causal 31/32/33 ForCausalLM granitemoehybrid=GraniteMoeHybrid granitemoeshared=GraniteMoeShared helium=Helium
+causal 31/32/33 ForCausalLM hrm_text=HrmText hunyuan_v1_dense=HunYuanDenseV1 hunyuan_v1_moe=HunYuanMoEV1 hy_v3=HYV3
+causal 31/32/33 ForCausalLM hyperclovax=HyperCLOVAX jais2=Jais2 jamba=Jamba jetmoe=JetMoe laguna=Laguna lfm2=Lfm2
+causal 31/32/33 ForCausalLM lfm2_moe=Lfm2Moe llama=Llama llama4=Llama4 llama4_text=Llama4 longcat_flash=LongcatFlash
+causal 31/32/33 ForCausalLM mamba=Mamba mamba2=Mamba2 marian=Marian mbart=MBart megatron-bert=MegatronBert
+causal 31/32/33 ForCausalLM mellum=Mellum minimax=MiniMax minimax_m2=MiniMaxM2 ministral=Ministral
+causal 31/32/33 ForCausalLM ministral3=Ministral3 mistral=Mistral mixtral=Mixtral mllama=Mllama
+causal 31/32/33 ForCausalLM modernbert-decoder=ModernBertDecoder moshi=Moshi mpt=Mpt musicgen=Musicgen
+causal 31/32/33 ForCausalLM musicgen_melody=MusicgenMelody mvp=Mvp nanochat=NanoChat nemotron=Nemotron
+causal 31/32/33 ForCausalLM nemotron_h=NemotronH olmo=Olmo olmo2=Olmo2 olmo3=Olmo3 olmo_hybrid=OlmoHybrid olmoe=Olmoe
+causal 31/32/33 ForCausalLM opt=OPT pegasus=Pegasus persimmon=Persimmon phi=Phi phi3=Phi3
+causal 31/32/33 ForCausalLM phi4_multimodal=Phi4Multimodal phimoe=Phimoe plbart=PLBart prophetnet=ProphetNet
+causal 31/32/33 ForCausalLM qwen2=Qwen2 qwen2_moe=Qwen2Moe qwen3=Qwen3 qwen3_5=Qwen3_5 qwen3_5_moe=Qwen3_5Moe
+causal 31/32/33 ForCausalLM qwen3_5_moe_text=Qwen3_5Moe qwen3_5_text=Qwen3_5 qwen3_moe=Qwen3Moe qwen3_next=Qwen3Next
+causal 31/32/33 ForCausalLM recurrent_gemma=RecurrentGemma rembert=RemBert roberta=Roberta
+causal 31/32/33 ForCausalLM roberta-prelayernorm=RobertaPreLayerNorm roc_bert=RoCBert roformer=RoFormer rwkv=Rwkv
+causal 31/32/33 ForCausalLM seed_oss=SeedOss smollm3=SmolLM3 solar_open=SolarOpen stablelm=StableLm
+causal 31/32/33 ForCausalLM starcoder2=Starcoder2 trocr=TrOCR vaultgemma=VaultGemma whisper=Whisper xglm=XGLM
+causal 31/32/33 ForCausalLM xlm-roberta=XLMRoberta xlm-roberta-xl=XLMRobertaXL xlstm=xLSTM xmod=Xmod youtu=Youtu
+causal 31/32/33 ForCausalLM zamba=Zamba zamba2=Zamba2
+causal 31/32/33 ForConditionalGeneration gemma3=Gemma3 gemma3n=Gemma3n gemma4=Gemma4 gemma4_unified=Gemma4Unified
+causal 31/32/33 ForConditionalGeneration got_ocr2=GotOcr2
+causal 31/32/33 LMHeadModel bert=Bert ctrl=CTRL gpt-sw3=GPT2 gpt2=GPT2 openai-gpt=OpenAIGPT xlm=XLMWith xlnet=XLNet
+causal 32/33 ForCausalLM axk1=AXK1 axk2=AXK2 cohere_compass_text=CohereCompass deepseek_v32=DeepseekV32
+causal 32/33 ForCausalLM granite_swa=GraniteSWA granitemoe_swa=GraniteMoeSWA inkling_text=Inkling
+causal 32/33 ForCausalLM mimo_v2_flash=MiMoV2Flash minicpm3=MiniCPM3 minimax_m3_vl_text=MiniMaxM3VL qwen4_exp=Qwen4Exp
+causal 32/33 ForCausalLM qwen4_exp_text=Qwen4Exp zaya=Zaya

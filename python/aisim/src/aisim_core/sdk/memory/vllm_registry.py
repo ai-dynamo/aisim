@@ -10,32 +10,73 @@ model configuration in vLLM 0.31.0, 0.32.0 and 0.33.0. See THIRD_PARTY_NOTICES.m
 
 from functools import cache
 from importlib.resources import files
+from typing import NamedTuple
+
+from packaging.version import Version
+
+from aisim_core.sdk.common import parse_support_matrix_version
 
 _RELEASES = ("0.31.0", "0.32.0", "0.33.0")
+# These release candidates use the same native registry and resolver as the final releases.
+_REGISTRY_RELEASES = {Version(tag): tag for tag in _RELEASES} | {
+    Version("0.31.0rc5"): "0.31.0",
+    Version("0.33.0rc3"): "0.33.0",
+}
+
+
+class _Registry(NamedTuple):
+    names: dict[str, set[str]]
+    causal_lms: dict[str, str]
 
 
 @cache
-def _registry(version: str) -> dict[str, set[str]]:
-    registry: dict[str, set[str]] = {"vllm": set(), "hf": set(), "hf_incompatible": set(), "config": set()}
+def _registry(version: str) -> _Registry:
+    names: dict[str, set[str]] = {"vllm": set(), "hf": set(), "hf_incompatible": set(), "config": set()}
+    causal_lms: dict[str, str] = {}
     minor = version.split(".")[1]
     with files(__package__).joinpath("vllm_text_architectures.txt").open(encoding="utf-8") as source:
         for line in source:
             if line.startswith("#"):
                 continue
             namespace, versions, suffix, *prefixes = line.split()
-            if minor in versions.split("/"):
-                registry[namespace].update(p if suffix == "-" else p + suffix for p in prefixes)
-    return registry
+            if minor not in versions.split("/"):
+                continue
+            ending = "" if suffix == "-" else suffix
+            if namespace == "causal":
+                for pair in prefixes:
+                    model_type, prefix = pair.split("=")
+                    causal_lms[model_type] = prefix + ending
+            else:
+                names[namespace].update(prefix + ending for prefix in prefixes)
+    return _Registry(names, causal_lms)
+
+
+def _recorded_release(version: str | None) -> str | None:
+    parsed = parse_support_matrix_version(version)
+    if parsed is not None and parsed.local is not None:
+        parsed = Version(parsed.public)
+    return _REGISTRY_RELEASES.get(parsed)
+
+
+def default_causal_lm(model_type: str, version: str | None) -> str | None:
+    """The class with_hf_config supplies from Transformers when a child has no architectures."""
+    release = _recorded_release(version)
+    if release is not None:
+        return _registry(release).causal_lms.get(model_type)
+    choices = {_registry(v).causal_lms.get(model_type) for v in _RELEASES}
+    if len(choices) != 1:
+        raise ValueError(f"vLLM default decoder for {model_type!r} depends on the backend release")
+    return choices.pop()
 
 
 def is_known_transformers_config(model_type: str, version: str | None) -> bool:
     """The parent indexes AutoConfig by model type before its text architecture can be selected."""
-    release = (version or "").partition("+")[0]
-    if release in _RELEASES:
-        return model_type in _registry(release)["config"]
+    release = _recorded_release(version)
+    if release is not None:
+        return model_type in _registry(release).names["config"]
     if version is None:
-        return all(model_type in _registry(v)["config"] for v in _RELEASES)
-    return any(model_type in _registry(v)["config"] for v in _RELEASES)
+        return all(model_type in _registry(v).names["config"] for v in _RELEASES)
+    return any(model_type in _registry(v).names["config"] for v in _RELEASES)
 
 
 # These registrations load the same decoder implementation under another name.
@@ -43,6 +84,7 @@ _IMPLEMENTATIONS = {
     "DeepseekV3BidirectionalModel": "DeepseekV3ForCausalLM",
     "IQuestCoderForCausalLM": "LlamaForCausalLM",
     "InternLM3ForCausalLM": "LlamaForCausalLM",
+    "InternVLForConditionalGeneration": "InternS1ForConditionalGeneration",
     "LLaMAForCausalLM": "LlamaForCausalLM",
     "LlamaModel": "LlamaForCausalLM",
     "Ministral3ForCausalLM": "MistralForCausalLM",
@@ -78,7 +120,7 @@ def _normalize(name: str, stock: set[str]) -> str | None:
 
 
 def _select(names: list[str], version: str, remote_model: bool) -> str | None:
-    registrations = _registry(version)
+    registrations = _registry(version).names
     stock = registrations["vllm"]
     if not any(name in stock for name in names):
         # An installed export takes precedence over AutoModel. An incompatible
@@ -101,9 +143,9 @@ def select_architecture(names: list[str], version: str | None, auto_map: object)
         isinstance(key, str) and key.startswith("AutoModel") for key in auto_map
     )
     if version is not None:
-        release = version.partition("+")[0]
+        release = _recorded_release(version)
         # Keep the original class and its compatibility checks on unrecorded releases.
-        return _select(names, release, remote_model) if release in _RELEASES else names[0]
+        return _select(names, release, remote_model) if release is not None else names[0]
     choices = {_select(names, release, remote_model) for release in _RELEASES}
     if len(choices) != 1:
         raise ValueError(f"vLLM decoder selection for {names!r} depends on the backend release")
@@ -116,7 +158,7 @@ def select_wrapper_architecture(
     """Resolve a list containing a modeled wrapper while preserving generic nested configurations."""
     if not names or not any(_normalize(name, wrappers) for name in names):
         return names[0] if names else None
-    if version is not None and version.partition("+")[0] not in _RELEASES:
+    if version is not None and _recorded_release(version) is None:
         return names[0]
     selected = select_architecture(names, version, auto_map)
     if selected not in wrappers:

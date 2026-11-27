@@ -98,7 +98,7 @@ def resolve_model_hardware(
         )
     vram_per_gpu = int(system_spec["gpu"]["mem_capacity"])
     gpus_per_node = int(system_spec["node"]["num_gpus_per_node"])
-    weight_bytes = _estimate_model_weight_bytes(model_name)
+    weight_bytes = _estimate_model_weight_bytes(model_name, backend=backend)
 
     # Large MoE (a node can't hold ~2x the weights) auto-enables multi-node wideEP.
     enable_wideep = is_moe and gpus_per_node * vram_per_gpu < 2 * weight_bytes

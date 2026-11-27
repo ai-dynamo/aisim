@@ -961,7 +961,7 @@ _GEMMA4_OTHER_DEFAULTS = {
         "layers.*.experts.down_proj": "rowwise",
         "layers.*.experts": "moe_tp_experts",
     },
-    "default_rope_type": "default",
+    "per_layer_attributes": None,
     "default_theta": 10000.0,
     "has_no_defaults_at_init": False,
     "is_heterogeneous": False,
@@ -1012,12 +1012,25 @@ def _check_gemma4_layer_attributes(
     backend: str,
     release: Version | None,
     validate_inherited_attention: bool,
+    compare_adapter_readers: bool,
 ) -> None:
     # Transformers first removes overrides that equal the effective global attribute.
     # SGLang flattens only attention geometry. vLLM leaves other overrides attached:
     # a global read then raises unless the checkpoint explicitly permits that access.
     defaults = {**_GEMMA4_OTHER_DEFAULTS, **_GEMMA4_VLLM_GLOBAL_DEFAULTS, **config, "layer_types": types}
-    if defaults["rope_parameters"] is None:
+    # Transformers 5.17 introduced default_rope_type. vLLM 0.31 ships that reader,
+    # while compatible older wheels still lack the attribute. SGLang 0.5.22 pins 5.19.
+    if release is not None and (
+        (backend == "vllm" and release >= Version("0.31.0rc1") and not compare_adapter_readers)
+        or (backend == "sglang" and release >= Version("0.5.22"))
+    ):
+        defaults.setdefault("default_rope_type", "default")
+    if backend == "vllm" and release is not None and release < Version("0.28.0rc1"):
+        defaults["base_model_fsdp_plan"] = config.get("base_model_fsdp_plan")
+    # Gemma leaves the legacy keyword for PreTrainedConfig's rope_scaling property setter.
+    if "rope_scaling" in config:
+        defaults["rope_parameters"] = config["rope_scaling"]
+    elif defaults["rope_parameters"] is None:
         defaults["rope_parameters"] = _GEMMA4_VLLM_GLOBAL_DEFAULTS["rope_parameters"]
     if defaults["use_bidirectional_attention"] == "all":
         defaults.setdefault("is_causal", False)
@@ -1055,7 +1068,7 @@ def _check_gemma4_layer_attributes(
         # before attaching per_layer_config, so they cannot satisfy a sparse override.
         defaults.pop("global_head_dim", None)
         defaults.pop("num_global_key_value_heads", None)
-    if "sliding_attention" in types and "sliding_attention" not in defaults["rope_parameters"]:
+    if "sliding_attention" in types and "sliding_attention" not in (defaults["rope_parameters"] or {}):
         global_reads.add("rope_local_base_freq")
     expert_layer = False
     if release is None or release < Version("0.32.0rc0"):
@@ -1150,6 +1163,7 @@ def gemma4_cache_shapes(
         )
     ):
         raise ValueError("Gemma 4 cache geometry requires the SGLang release or a runtime profile")
+    compare_flat_readers = compare_adapter_readers and (release is None or release < Version("0.32.0rc0"))
     flat_sglang = backend == "sglang" and release is not None and release < Version("0.5.22")
     flat_vllm = backend == "vllm" and release is not None and release < Version("0.28.0rc1")
     # vLLM 0.27 still reads the global attributes, but its Transformers 5.14 pin
@@ -1186,8 +1200,10 @@ def gemma4_cache_shapes(
                 raise ValueError("Gemma 4 per_layer_config requires runtime cache geometry")
             by_layer[int(key)] = fields
         types = [*types[:-1], "full_attention"]
-        _check_gemma4_layer_attributes(config, by_layer, types, backend, release, validate_inherited_attention)
-        if compare_adapter_readers and backend == "vllm":
+        _check_gemma4_layer_attributes(
+            config, by_layer, types, backend, release, validate_inherited_attention, compare_adapter_readers
+        )
+        if compare_flat_readers and backend == "vllm":
             # These adapters read KV heads per layer. A 5.14 config may still
             # read head_dim globally while validating a heterogeneous configuration.
             guarded_global_read = guarded_global_read and any(
@@ -1206,11 +1222,11 @@ def gemma4_cache_shapes(
             if shape != first:
                 if backend != "vllm" or not same_rank_shape(first, shape):
                     raise ValueError("AISim requires one Gemma 4 cache geometry per attention layer type")
-                if (release is None or compare_adapter_readers) and guarded_global_read:
+                if (release is None or compare_flat_readers) and guarded_global_read:
                     raise ValueError("Gemma 4 per_layer_config requires the vLLM release or a runtime profile")
         if not flat_vllm:
             explicit_shapes = shapes
-    if explicit_shapes is None or release is None or compare_adapter_readers:
+    if explicit_shapes is None or release is None or compare_flat_readers:
         use_flat_sglang_heads = backend == "sglang" and (flat_sglang or release is None)
         full_heads = (
             config.get("num_global_key_value_heads")
