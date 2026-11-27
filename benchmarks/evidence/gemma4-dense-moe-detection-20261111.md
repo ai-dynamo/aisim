@@ -12,7 +12,7 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `3943df8c4`. It contains the omitted-MoE-pair
+The current code head is `8a9eb51d2`. It contains the omitted-MoE-pair
 rejection, the single-dimension fallback resolution, the pre-database width
 gate, the FPE generator guard and the hardware-fact/AFD pins described below, on
 top of `0faa4f402e2b3fe6ab302921d08c39572941ac8a`, which merges `main` at
@@ -24,10 +24,11 @@ search-space AFD pin, `0c331e377` keeps a dense checkpoint's omitted MoE width a
 `1`, `59344e5df` resolves an omitted pair at attention width one,
 `2a126f94e` pins the routed rejection on the capacity bridge, `64b4f53d9`
 states the width rule in the legacy CLI help, `5a3fea421` resolves the width-one
-omission in `ModelConfig` too, and `3943df8c4` states and pins the configuration
-adapter's stricter MoE-width rule. `baa7d698c` corrects the fallback-eligibility
-list in `docs/perf-model/memory.md`, `3921562bd` and the final commit change only
-this document.
+omission in `ModelConfig` too, `3943df8c4` states and pins the configuration
+adapter's stricter MoE-width rule, and `8a9eb51d2` publishes that rule in the
+packaged JSON schema. `baa7d698c` corrects the fallback-eligibility list in
+`docs/perf-model/memory.md`, and `3921562bd`, `7d8e650e4` and the final commit
+change only this document.
 See [Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -66,9 +67,10 @@ hardware-fact and preflight pins, `474614019` adds the search-space AFD pin,
 resolves an omitted pair at attention width one, `2a126f94e` pins the routed
 rejection on the capacity bridge, `64b4f53d9` states the width rule in the
 legacy CLI help, `5a3fea421` resolves the width-one omission in
-`ModelConfig`, and `3943df8c4` states and pins the configuration adapter's
-stricter MoE-width rule. `baa7d698c` changes only `memory.md`, and `3921562bd`
-and the final commit change only this document. Everything sits on
+`ModelConfig`, `3943df8c4` states and pins the configuration adapter's stricter
+MoE-width rule, and `8a9eb51d2` publishes it in the packaged JSON schema.
+`baa7d698c` changes only `memory.md`, and `3921562bd`, `7d8e650e4` and the final
+commit change only this document. Everything sits on
 three merges of `main` on top of the reviewed
 commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
@@ -258,8 +260,9 @@ keeps a well-formed dense checkpoint fallback-eligible.
 
 ### Verification at the current head
 
-Local run at `5a3fea421` on macOS arm64, Python 3.13.18, with the native
-extension rebuilt from this head's tree (`maturin build --release --locked`,
+Local runs at `5a3fea421` through `8a9eb51d2` on macOS arm64, Python 3.13.18,
+with the native extension rebuilt from `5a3fea421`'s tree (later commits change
+only Python and documentation) (`maturin build --release --locked`,
 the `pyproject.toml`
 `extension-module,jemalloc` features, and the wheel's
 `aisim/_runtime.abi3.so` on `PYTHONPATH`) so the interpreter and extension agree on
@@ -281,7 +284,7 @@ minutes.
 | --- | --- | --- |
 | Targeted pytest selection (the twelve paths in the command below; includes the ambiguous-omitted-pair, width-one, producer-trace and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `5a3fea421`, then `3943df8c4` | 1,244 passed at each, 0 failed |
 | Full CLI unit suite (`python/aisim/tests/unit/cli`), covering the updated `--moe-*-size` help text and the width-one CLI path | `5a3fea421` | 480 passed, 0 failed |
-| Configuration-adapter suite (`python/aisim/tests/unit/sdk/config_adapter`), including the packaged-schema drift check and the one-sided MoE-width rejection | `3943df8c4` | 145 passed, 0 failed |
+| Configuration-adapter suite (`python/aisim/tests/unit/sdk/config_adapter`), including the packaged-schema drift check, the one-sided MoE-width rejection and the schema-level pair guard | `3943df8c4`, then `8a9eb51d2` | 145 passed, then 151 passed, 0 failed |
 | `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `372f2e7c2` | 1,476 passed, 0 failed, 1 ignored |
 | `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2`, then `2a126f94e` | 5 passed; no skips at `372f2e7c2`, 6 passed at `2a126f94e` (adds the routed omitted-pair `BadConfig` pin) |
 | `cargo fmt --all -- --check` / `cargo fmt --check -p aisim-core` | `372f2e7c2`, then `2a126f94e` | clean |
@@ -621,6 +624,7 @@ Pinned by
 | `test_routed_gemma4_static_estimate_still_resolves_moe_comm` | Routed Gemma 4 keeps the static-path resolution for both required phases |
 | `test_dense_gemma4_moe_parallelism_is_passed_through_untouched` | `_resolve_moe_parallelism` leaves dense MoE widths untouched and still resolves routed ones |
 | `test_worker_moe_widths_are_required_together_without_inference` in `tests/unit/sdk/config_adapter/test_schema.py` | The configuration-adapter schema is the strict layer: a one-sided pair is rejected with its own message and is never inferred from the attention width |
+| `test_packaged_json_schema_rejects_a_one_sided_moe_pair` / `test_packaged_json_schema_accepts_an_absent_or_null_moe_pair` | The published `estimate-request-v1.schema.json` itself rejects a one-sided pair (integer/null mixes included) and accepts two integer or two absent/null widths |
 | `test_gemma4_hardware_facts_follow_the_expert_configuration` in `tests/unit/test_model_hw_gemma4_facts.py` | Real `resolve_model_hardware` on the bundled `gb300` spec: dense 31B is `is_moe=False, mla=False, enable_wideep=False, num_experts=0`; routed 26B-A4B is `True, True, False, 128` |
 | `test_model_preflight_rejects_dense_gemma4_afd` and `test_search_space_afd_enumeration_rejects_a_dense_gemma4_shape` in `tests/unit/sdk/test_afd_composition.py` | The AFD preflight and the search-space enumerator both raise `NotImplementedError("Dense AFD is not implemented...")` for a dense checkpoint; the enumerator is parametrized over `is_moe` `False`/`True` to show the pre-branch classification produced the same rejection |
 | `test_dense_variant_rejects_moe_ep_gt_1` | The dense guard raises `InvalidEngineConfigurationError` (not `AssertionError`) for an explicit `moe_ep_size>1`, so `python -O` cannot disable it and the Rust bridge keeps the rejection non-fallback-safe |
