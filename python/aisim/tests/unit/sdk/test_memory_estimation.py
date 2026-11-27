@@ -3693,6 +3693,69 @@ def test_sglang_transformers_checks_exported_alternatives(family, model_type, hi
             NaiveKVCacheEstimator.from_hf_config(dict(root, architectures=[generation, incompatible]), **options)
 
 
+@pytest.mark.parametrize("version", ["0.5.8", "0.5.9", "0.5.23"])
+def test_sglang_local_model_precedes_auto_map(tmp_path_factory, version):
+    from aisim.compiler import prediction_to_replay_spec
+    from aisim.config import CorePredictionConfig
+
+    dimensions = dict(
+        vocab_size=128259, hidden_size=4096, num_hidden_layers=32, num_attention_heads=32, num_key_value_heads=8
+    )
+    # Idefics3 publishes the dimensions on its text config. Older SGLang releases read the parent.
+    root = dict(text_config=dict(model_type="llama", torch_dtype="bfloat16", **dimensions), torch_dtype="bfloat16")
+    if version != "0.5.23":
+        root.update(dimensions)
+    generation = "Idefics3ForConditionalGeneration"
+    target = {"AutoModel": "modeling_local.LocalVisionModel"}
+
+    def widths(names, auto_map, transfer="auto", model_type="idefics3"):
+        folder = tmp_path_factory.mktemp(model_type)
+        document = dict(root, model_type=model_type, architectures=names)
+        if auto_map:
+            document["auto_map"] = auto_map
+            (folder / "modeling_local.py").write_text(
+                "from transformers import Idefics3Model\nclass LocalVisionModel(Idefics3Model):\n    pass\n"
+            )
+        path = _write_config(folder, document)
+        worker = dict(
+            timing={"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
+            kv_cache={"capacity": {"type": "fixed", "blocks": 256}},
+        )
+        engine = dict(
+            model=path,
+            mode="disaggregated",
+            hardware="h100_sxm",
+            backend="sglang",
+            backend_version=version,
+            context_length=4096,
+            workers={"prefill": worker, "decode": worker},
+            kv_transfer={"bytes_per_token": transfer, "bandwidth_gb_per_second": 50},
+        )
+        dep = prediction_to_replay_spec(CorePredictionConfig.model_validate({"engine": engine})).backend_deployment
+        return tuple(args["kv_transfer_bytes_per_token"] for args in (dep.prefill_engine_args, dep.decode_engine_args))
+
+    for names in ([generation, "EncodecModel"], ["EncodecModel", generation], ["EncodecModel"]):
+        for mapping in (target, {}):
+            with pytest.raises(ValueError, match="compatible model class for every architecture"):
+                widths(names, mapping)
+    assert widths([generation, "EncodecModel"], target, 777) == (777, 777)
+    with pytest.raises(ValueError, match="compatible model class for every architecture"):
+        widths([generation, "MissingModelExport"], {})
+    assert widths([generation, "MissingModelExport"], target) == (131_072, 131_072)
+    for mapping in ({}, target):
+        assert widths([generation, "Idefics3PreTrainedModel"], mapping) == (131_072, 131_072)
+        for names in (
+            ["LlavaForConditionalGeneration", "EncodecModel"],
+            ["EncodecModel", "LlavaForConditionalGeneration"],
+        ):
+            assert widths(names, mapping, model_type="llava") == (131_072, 131_072)
+    if version == "0.5.8":
+        with pytest.raises(ValueError, match="compatible model class for every architecture"):
+            widths([generation, "AutoModelForCausalLM"], target)
+    else:
+        assert widths([generation, "AutoModelForCausalLM"], target) == (131_072, 131_072)
+
+
 def test_selected_native_qwen_models_use_the_constructed_child_for_decoder_layers(tmp_path):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 

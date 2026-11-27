@@ -363,7 +363,7 @@ def _sglang_model_registries() -> dict[int, dict[str, set[str]]]:
         for line in source:
             if not line.startswith("#"):
                 kind, first, last, *names = line.split()
-                if kind == "compatible":
+                if kind in ("compatible", "incompatible"):
                     suffix, *prefixes = names
                     names = [prefix + suffix if suffix != "-" else prefix for prefix in prefixes]
                 for patch in range(int(first), int(last) + 1):
@@ -377,6 +377,7 @@ def _sglang_wrapper(
     """The first registered entrypoint wins. Only a known text decoder establishes decoder-only residency."""
     auto_map = document.get("auto_map")
     remote = has_remote_model(auto_map)
+    remote_auto = isinstance(auto_map, dict) and "AutoModel" in auto_map
     if not names:
         return None, remote, False
     release = parse_support_matrix_version(version)
@@ -397,8 +398,8 @@ def _sglang_wrapper(
         choices.add(native or names[0])
         if native is None:
             fallback = bool(entries["transformers"].intersection(names))
-            remote_auto = isinstance(auto_map, dict) and "AutoModel" in auto_map
-            if (
+            # SGLang consults AutoModel only when the architecture has no local Transformers export.
+            if entries["incompatible"].intersection(names) or (
                 fallback
                 and not remote_auto
                 and any(name not in entries["transformers"] and name not in entries["compatible"] for name in names)
