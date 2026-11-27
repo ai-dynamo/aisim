@@ -158,6 +158,7 @@ include = [
     { path = "collector/fpm_forward/runtime/dsv41/LICENSE", format = "wheel" },
     { path = "collector/fpm_forward/runtime/glm53flash/*.json", format = "wheel" },
     { path = "collector/fpm_forward/runtime/glm53flash/LICENSE", format = "wheel" },
+    { path = "collector/fpm_forward/runtime/trtllm/*.json", format = "wheel" },
     # Ship estimator models and profiles with their canonical implementation.
     "src/aisim_core/sdk/**/*.md",
     "src/aisim_core/data/schema_snapshots/*.json",
