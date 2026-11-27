@@ -12,7 +12,7 @@ available in this checkout; these tables remain historical author-reported
 results, not verification of the current head. No GPU was run, and no
 performance data was added, re-collected, or re-fitted.
 
-The current code head is `59344e5df`. It contains the omitted-MoE-pair
+The current code head is `2a126f94e`. It contains the omitted-MoE-pair
 rejection, the single-dimension fallback resolution, the pre-database width
 gate, the FPE generator guard and the hardware-fact/AFD pins described below, on
 top of `0faa4f402e2b3fe6ab302921d08c39572941ac8a`, which merges `main` at
@@ -21,8 +21,9 @@ change code as well as this document: `372f2e7c2` adds the fallback resolution
 and the generator guard, `98ebca229` applies the omitted-pair rejection,
 `c543294ee` adds the hardware-fact and preflight pins, `474614019` adds the
 search-space AFD pin, `0c331e377` keeps a dense checkpoint's omitted MoE width at
-`1`, and `59344e5df` resolves an omitted pair at attention width one. The commit
-after `59344e5df` changes only this document.
+`1`, `59344e5df` resolves an omitted pair at attention width one, and
+`2a126f94e` pins the routed rejection on the capacity bridge. The commit after
+`2a126f94e` changes only this document.
 See [Current head and verification](#current-head-and-verification)
 for the verification at that SHA. The pre-rebase head was
 `8f3a62e0fde729cf74db0b6b3551608338b367dd`, based on
@@ -52,13 +53,14 @@ feasible/infeasible status are meaningful.
 
 `0faa4f402e2b3fe6ab302921d08c39572941ac8a` is the reviewed commit and keeps
 the historical verification results recorded for it. The current code head is
-`59344e5df`: `372f2e7c2` adds the single-dimension fallback resolution, the
+`2a126f94e`: `372f2e7c2` adds the single-dimension fallback resolution, the
 pre-database width gate and the FPE generator guard, `98ebca229` applies the
 config contract's omitted-MoE-pair rejection, `c543294ee` adds the
 hardware-fact and preflight pins, `474614019` adds the search-space AFD pin,
-`0c331e377` keeps a dense checkpoint's omitted MoE width at `1`, and `59344e5df`
-resolves an omitted pair at attention width one. The commit after `59344e5df`
-changes only this document. Everything sits on
+`0c331e377` keeps a dense checkpoint's omitted MoE width at `1`, `59344e5df`
+resolves an omitted pair at attention width one, and `2a126f94e` pins the routed
+rejection on the capacity bridge. The commit after `2a126f94e` changes only
+this document. Everything sits on
 three merges of `main` on top of the reviewed
 commits. `bf527e451` merges `main` at
 `24d06d418db0ec4aee309e0e24770958c8fdea19` and reconciles one consumer with
@@ -186,19 +188,27 @@ instead of reaching the naive fallback, and an omitted pair at width one still
 estimates as `1x1`.
 
 The Rust entry points forward the rule rather than re-implementing it, and they
-report it differently. `estimate_aic_num_gpu_blocks`, which Replay's
-`materialize_aic_capacity` calls, forwards `config.moe_tp_size` and
-`config.moe_ep_size` (both `None` when unset) to Python's
-`estimate_num_gpu_blocks` and wraps any rejection in
-`anyhow!("AIC KV-cache capacity estimation failed: ...")`; it does not return a
-`KvCacheEstimateError`. The separate `estimate_kv_cache` bridge in `memory.rs`
-is the one that maps `InvalidEngineConfigurationError` to
-`KvCacheEstimateError::BadConfig { field: "engine" }` (`b761646c0`), but its Rust
-config layer (`AicTimingConfig::validate_parallel_shape`) requires the two
-widths to be configured together, so the omitted-pair rejection is not reachable
-through that request. At attention width one both entry points resolve `1x1`,
-which is what keeps an unsharded routed Replay or sweeper deployment working. No
-Rust code changes here.
+report it differently:
+
+- `crates/core/src/perfmodel/memory.rs::estimate_kv_cache` takes a
+  `KvCacheEstimateRequest`, whose `ParallelMapping` serde-defaults both widths to
+  `None`, forwards them unchanged, and maps Python's
+  `InvalidEngineConfigurationError` to
+  `KvCacheEstimateError::BadConfig { field: "engine" }` (`b761646c0`). The
+  rejected pair is therefore reachable and non-fallback-safe on this bridge;
+  `routed_gemma4_omitted_moe_pair_maps_to_bad_config` pins it with a routed
+  checkpoint at `tp_size=4` and both widths unset.
+- `crates/core/src/python.rs::estimate_aic_num_gpu_blocks`, which Replay's
+  `materialize_aic_capacity` calls, forwards `config.moe_tp_size` and
+  `config.moe_ep_size` (both `None` when unset) to Python's
+  `estimate_num_gpu_blocks` and wraps a rejection in
+  `anyhow!("AIC KV-cache capacity estimation failed: ...")`. It does not return
+  a `KvCacheEstimateError`; `AicTimingConfig::validate_parallel_shape` only
+  requires the two widths to be configured together, so the omitted pair reaches
+  Python and surfaces through that `anyhow` context.
+
+At attention width one both entry points resolve `1x1`, which is what keeps an
+unsharded routed Replay or sweeper deployment working.
 
 ### Fallback MoE layout and the pre-database width gate
 
@@ -232,7 +242,7 @@ keeps a well-formed dense checkpoint fallback-eligible.
 
 ### Verification at the current head
 
-Local run at `59344e5df` on macOS arm64, Python 3.13.18, with the native
+Local run at `2a126f94e` on macOS arm64, Python 3.13.18, with the native
 extension rebuilt from this head's tree (`maturin build --release --locked`,
 the `pyproject.toml`
 `extension-module,jemalloc` features, and the wheel's
@@ -255,11 +265,12 @@ minutes.
 | --- | --- | --- |
 | Targeted pytest selection (the twelve paths in the command below; includes the ambiguous-omitted-pair, width-one, producer-trace and single-dimension tests, the pre-database-gate tests, the hardware-fact and AFD pins, and the FPE generator guard) | `59344e5df` | 1,242 passed, 0 failed |
 | `cargo test -p aisim-core --features embed-python --lib perfmodel::` (covers `memory.rs` and the `fpm/model.rs` fallback policy test) | `372f2e7c2` | 1,476 passed, 0 failed, 1 ignored |
-| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2` | 5 passed; no skips |
-| `cargo fmt --all -- --check` | `372f2e7c2` | clean |
+| `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1 cargo test -p aisim-core --features embed-python --test perfmodel_dense_gemma4_bridge` | `372f2e7c2`, then `2a126f94e` | 5 passed; no skips at `372f2e7c2`, 6 passed at `2a126f94e` (adds the routed omitted-pair `BadConfig` pin) |
+| `cargo fmt --all -- --check` / `cargo fmt --check -p aisim-core` | `372f2e7c2`, then `2a126f94e` | clean |
 
 The pytest row is this command, run from the repository root at
-`59344e5df`:
+`2a126f94e` (the Python selection last changed at `59344e5df`; the commits after
+it only add the Rust bridge test and this document):
 
 ```
 VIRTUAL_ENV=python/aisim/.venv PYTHONPATH=python/aisim/src \
@@ -753,6 +764,12 @@ Four checks keep the classification and the rejection from regressing.
    - `routed_gemma4_is_not_rejected_by_the_dense_guard` is the control: the
      routed checkpoint keeps `moe_ep_size=2` and must never produce the dense
      diagnostic.
+   - `routed_gemma4_omitted_moe_pair_maps_to_bad_config` is the omitted-pair
+     contract on the same bridge: a routed request at `tp_size=4` with both
+     serde-defaulted widths unset must return
+     `KvCacheEstimateError::BadConfig { field: "engine" }`, not the
+     fallback-eligible `Unsupported`, with the Python contract diagnostic
+     verbatim in `reason`.
 
    Each test prints a visible `SKIP` and returns when the SDK is not
    importable, and hard-fails instead when `AIC_REQUIRE_DENSE_GEMMA4_BRIDGE=1`
