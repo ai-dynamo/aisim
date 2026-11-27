@@ -10,7 +10,9 @@ installs the two lists at import time inside the engine process:
 
 - SGLang (``_sglang.py``): wraps ``SchedulerMetricsReporter._build_scheduled_request_metrics`` and
   swaps ``ScheduledRequestMetrics`` for a subclass carrying the two lists
-  (values from the schedule-time ``batch.extend_lens`` / ``batch.prefix_lens``).
+  (values from the schedule-time ``batch.extend_lens`` / ``batch.prefix_lens``),
+  plus step diagnostics: speculative configuration and accepted tokens, device
+  time per DeviceTimer category, and host timestamps (``_request_fields.STEP_FIELDS``).
 - Dynamo vLLM (``_dynamo_vllm.py``): wraps ``InstrumentedScheduler._extract_scheduled`` the same way
   (values from ``SchedulerOutput.num_scheduled_tokens`` / ``num_computed_tokens``).
 
@@ -44,13 +46,14 @@ from collections.abc import Callable
 from types import ModuleType
 
 from ._dynamo_vllm import patch_dynamo_vllm_instrumented_scheduler
-from ._sglang import patch_sglang_metrics_reporter
+from ._sglang import patch_sglang_batch_result_processor, patch_sglang_metrics_reporter
 
 __all__ = [
     "TARGETS",
     "hook_path",
     "install",
     "patch_dynamo_vllm_instrumented_scheduler",
+    "patch_sglang_batch_result_processor",
     "patch_sglang_metrics_reporter",
 ]
 
@@ -59,6 +62,7 @@ logger = logging.getLogger("aisim.fpm_hooks")
 #: module name -> patch function applied right after that module is executed
 TARGETS: dict[str, Callable[[ModuleType], None]] = {
     "sglang.srt.managers.scheduler_components.metrics_reporter": patch_sglang_metrics_reporter,
+    "sglang.srt.managers.scheduler_components.batch_result_processor": patch_sglang_batch_result_processor,
     "dynamo.vllm.instrumented_scheduler": patch_dynamo_vllm_instrumented_scheduler,
 }
 

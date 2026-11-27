@@ -1,30 +1,57 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang hook: per-request (extend, past) lists on the FPM the scheduler emits.
+"""SGLang hook: per-request lists and step diagnostics on the FPM the scheduler emits.
 
 Applied to ``sglang.srt.managers.scheduler_components.metrics_reporter`` after
 import. Values come from the schedule-time ``ScheduleBatch.extend_lens`` /
 ``prefix_lens`` (aligned with ``batch.reqs``); the per-request attributes
 (``req.extend_input_len``) are already reset when metrics are emitted, so they
 are only a fallback. Decode batches contribute ``(1, seq_len)`` per request
-from ``batch.seq_lens_cpu``, the same source as the aggregate.
+from ``batch.seq_lens_cpu``, the same source as the aggregate. Under
+speculative decoding a decode request's extend is the verify width
+``spec_num_draft_tokens`` (``1 + k``, the convention of the learned-model
+docs), and the tokens it committed are in ``spec_accept_lengths``.
 
-Collect with ``--disable-overlap-schedule``: the stock FPM emitter accumulates
-every finished forward interval, which merges the next step into the current
-record under the overlap scheduler (see the learned-model docs).
+Step diagnostics (see ``_request_fields.STEP_FIELDS``) come from three more wrappers:
+
+- ``_init_fpm`` adds a DeviceTimer reporter that sums device time per
+  category (``target_verify``, ``eagle_draft``, ``eagle_draft_extend``, ...);
+  the record drains it, so the categories cover the intervals of ``wall_time``.
+- ``_emit_forward_pass_metrics`` hands the batch result and the host emission
+  time to the builder; ``accept_lens`` is read only when it is already on the
+  CPU, so the hook never adds a device synchronization.
+- The schedule-time host timestamp is ``batch.fpm_start_time``.
+
+SGLang 0.5.20 sums every forward interval that finished since the last
+record, so under the overlap scheduler a record can include the next step
+(see the learned-model docs). The host timestamps make such records visible.
+
+SGLang 0.5.23 and later (sgl-project/sglang#38711) time each batch result on
+its own (``FpmTiming``), pass the result to the builder, and build speculative
+decode aggregates from a snapshot taken before the result settles. The hook
+then takes per-category device time from the record's own intervals instead of
+the DeviceTimer reporter, and takes the decode pairs from the same snapshot.
 """
 
 from __future__ import annotations
 
 import importlib
 import logging
+import time
 from types import ModuleType
+from typing import Any
 
 from ._request_fields import extend_struct, has_request_fields, with_pairs
 
 logger = logging.getLogger("aisim.fpm_hooks")
 
 _PATCHED = "_aisim_fpm_request_lists"
+_STEP_CONTEXT = "_aisim_fpm_step_context"
+_DEVICE_TIME = "_aisim_fpm_device_time_by_category"
+_TIMER_HOOKED = "_aisim_fpm_category_reporter"
+_SNAPSHOT_PAIRS = "_aisim_fpm_snapshot_pairs"
+_PRESETTLE = "_aisim_fpm_presettle"
+_TIMING_TOTALS = "_aisim_fpm_device_time_by_category"
 
 
 def request_pairs(batch) -> list[tuple[int, int]] | None:
@@ -60,11 +87,157 @@ def request_pairs(batch) -> list[tuple[int, int]] | None:
     return pairs
 
 
-def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
-    """Install the hook on an imported ``metrics_reporter`` module. Returns ``True`` when applied."""
+def accept_lengths(result, num_requests: int) -> list[int] | None:
+    """Tokens committed per request by a speculative step (bonus included), or ``None``."""
+    if result is None:
+        return None
+    lens = getattr(result, "accept_lens", None)
+    if lens is not None:
+        if not getattr(lens, "is_cpu", True):
+            return None  # reading it would synchronize with the device
+        values = lens.tolist() if hasattr(lens, "tolist") else list(lens)
+    else:
+        correct = getattr(result, "num_correct_drafts_per_req_cpu", None)
+        if correct is None:
+            return None
+        bonus = int(getattr(result, "num_non_draft_tokens_per_req", 1) or 1)
+        values = [int(c) + bonus for c in correct]
+    if len(values) != num_requests:
+        return None
+    # A row that finished or was retracted before this result settled commits nothing.
+    presettle = getattr(result, _PRESETTLE, None)
+    if presettle is not None and len(presettle) == num_requests:
+        values = [0 if skipped else v for v, (_, skipped) in zip(values, presettle, strict=True)]
+    # A grammar can stop a request's run early; SGLang then commits only the retained tokens.
+    retained = getattr(result, "grammar_retained_tokens", None)
+    if retained is not None and len(retained) == num_requests:
+        values = [v if r is None else len(r) for v, r in zip(values, retained, strict=True)]
+    return [int(v) for v in values]
+
+
+def attach_device_time_reporter(reporter) -> bool:
+    """Add a per-category DeviceTimer reporter to an SGLang metrics reporter (idempotent)."""
+    timer = getattr(reporter, "forward_pass_device_timer", None)
+    add = getattr(timer, "add_reporter", None)
+    if add is None or getattr(timer, _TIMER_HOOKED, False):
+        return False
+    totals: dict[str, float] = {}
+
+    def by_category(t, category="unknown", **_metadata):
+        totals[category] = totals.get(category, 0.0) + float(t)
+
+    add(by_category)
+    setattr(timer, _TIMER_HOOKED, True)
+    setattr(reporter, _DEVICE_TIME, totals)
+    return True
+
+
+def step_fields(reporter, batch, num_requests: int) -> dict[str, Any]:
+    """Step diagnostics for the record being emitted; empty outside an emission."""
+    context = getattr(reporter, _STEP_CONTEXT, None)
+    if context is None:
+        return {}
+    result, emitted_at = context
+    step: dict[str, Any] = {"host_emitted_at_s": float(emitted_at)}
+    scheduled_at = getattr(batch, "fpm_start_time", None)
+    if scheduled_at:
+        step["host_scheduled_at_s"] = float(scheduled_at)
+    totals = getattr(reporter, _DEVICE_TIME, None)
+    if totals:
+        step["device_time_s_by_category"] = dict(totals)
+        totals.clear()
+    snapshot = getattr(reporter, "_active_spec_config_snapshot", None)
+    if snapshot is not None:
+        spec = snapshot()
+        step["spec_num_steps"] = int(spec.get("num_steps", 0) or 0)
+        step["spec_num_draft_tokens"] = int(spec.get("num_draft_tokens", 0) or 0)
+    width = _result_verify_width(result)
+    if width:
+        # The adaptive controller may already have switched the live config; it only
+        # runs chains (topk 1, width = steps + 1), so take the steps from this forward too.
+        if step.get("spec_num_draft_tokens") == step.get("spec_num_steps", 0) + 1:
+            step["spec_num_steps"] = width - 1
+        step["spec_num_draft_tokens"] = width
+    accepted = accept_lengths(result, num_requests)
+    if accepted is not None:
+        step["spec_accept_lengths"] = accepted
+    return step
+
+
+def fill_decode_seq_lens(batch, context) -> bool:
+    """Give a decode batch schedule-time ``seq_lens_cpu`` when the producer left it ``None``.
+
+    SGLang 0.5.20 with speculative decoding under the overlap scheduler keeps
+    decode sequence lengths on the device only, and its stock FPM builder
+    iterates ``batch.seq_lens_cpu`` and raises. When the record is emitted the
+    step's tokens are already appended, so the schedule-time length is
+    ``req.seqlen`` minus the tokens this step committed (``accept_lens`` when on
+    the CPU, else one) and minus the pending bonus token, which speculative
+    ``seq_lens`` leaves out of the KV prefix. Returns ``True`` when the attribute
+    was set, so the caller restores ``None`` afterwards and SGLang's own state is
+    unchanged.
+    """
+    mode = getattr(batch, "forward_mode", None)
+    if mode is None or not mode.is_decode() or getattr(batch, "seq_lens_cpu", 0) is not None:
+        return False
+    reqs = list(getattr(batch, "reqs", None) or [])
+    presettle = getattr(context[0], _PRESETTLE, None) if context is not None else None
+    if presettle is not None and len(presettle) == len(reqs):
+        batch.seq_lens_cpu = [past for past, _ in presettle]
+        return True
+    committed = accept_lengths(context[0], len(reqs)) if context is not None else None
+    committed = committed or [1] * len(reqs)
+    # Only speculative decode leaves seq_lens_cpu unset; skip the pending token if SGLang says otherwise.
+    spec = getattr(batch, "spec_algorithm", None)
+    pending = 0 if spec is not None and spec.is_none() else 1
+    batch.seq_lens_cpu = [
+        max(int(getattr(req, "seqlen", 0)) - n - pending, 0) for req, n in zip(reqs, committed, strict=True)
+    ]
+    return True
+
+
+def _result_verify_width(result) -> int:
+    """The verify width the forward ran with, from its own result (0 when the result does not carry it).
+
+    Adaptive speculative decoding can switch the active width before a delayed
+    result is processed, so the result's width wins over the live configuration.
+    """
+    width = getattr(result, "speculative_num_draft_tokens", None)
+    return width if type(width) is int and width > 0 else 0
+
+
+def verify_width(reporter, result) -> int:
+    """Verify width (``1 + k``) of the forward behind ``result``; 0 without speculation.
+
+    Read from the result when it carries the width, else from the active
+    speculative configuration. Kept apart from the optional step diagnostics so
+    a diagnostics failure never changes the required decode extend.
+    """
+    width = _result_verify_width(result)
+    if width:
+        return width
+    snapshot = getattr(reporter, "_active_spec_config_snapshot", None)
+    if snapshot is None:
+        return 0
+    return int(snapshot().get("num_draft_tokens", 0) or 0)
+
+
+def speculative_pairs(batch, pairs: list[tuple[int, int]], width: int) -> list[tuple[int, int]]:
+    """Decode pairs of a speculative step carry the verify width (``1 + k``) as the extend.
+
+    A decode batch with speculation active runs one target verify over
+    ``width`` tokens per request; prefill (extend) batches are unchanged.
+    """
+    mode = getattr(batch, "forward_mode", None)
+    if width <= 1 or mode is None or not mode.is_decode():
+        return pairs
+    return [(width, past) for _, past in pairs]
+
+
+def _owner_class(module: ModuleType) -> type | None:
     # The owner class is SchedulerMetricsReporter in current SGLang; find it by
     # method name so a rename does not silently disable the hook.
-    mixin = next(
+    return next(
         (
             obj
             for obj in vars(module).values()
@@ -72,8 +245,161 @@ def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
         ),
         None,
     )
-    build = getattr(mixin, "_build_scheduled_request_metrics", None)
-    if mixin is None or build is None:
+
+
+def _wrap_init_fpm(owner: type, attach_reporter: bool) -> None:
+    init_fpm = vars(owner).get("_init_fpm")
+    if not attach_reporter:
+        return
+    if init_fpm is None:
+        logger.info("fpm_hooks: SGLang metrics reporter has no _init_fpm; device time per category is lazy")
+        return
+
+    def wrapped_init_fpm(self, *args, **kwargs):
+        out = init_fpm(self, *args, **kwargs)
+        if _fpm_enabled(self):
+            attach_device_time_reporter(self)
+        return out
+
+    wrapped_init_fpm.__wrapped__ = init_fpm  # type: ignore[attr-defined]
+    owner._init_fpm = wrapped_init_fpm
+
+
+def _wrap_emit(owner: type, attach_reporter: bool) -> None:
+    emit = vars(owner).get("_emit_forward_pass_metrics")
+    if emit is None:
+        logger.warning("fpm_hooks: SGLang metrics reporter has no _emit_forward_pass_metrics; no step diagnostics")
+        return
+
+    def wrapped_emit(self, batch, *args, **kwargs):
+        # Fallback when _init_fpm ran before the hook: the first record may
+        # then miss the device time reported before this point.
+        if attach_reporter and _fpm_enabled(self):
+            attach_device_time_reporter(self)
+        result = args[0] if args else kwargs.get("result")
+        setattr(self, _STEP_CONTEXT, (result, time.monotonic()))
+        try:
+            return emit(self, batch, *args, **kwargs)
+        finally:
+            setattr(self, _STEP_CONTEXT, None)
+
+    wrapped_emit.__wrapped__ = emit  # type: ignore[attr-defined]
+    owner._emit_forward_pass_metrics = wrapped_emit
+
+
+def _wrap_spec_snapshot(owner: type) -> None:
+    """Keep the (1, past) pairs behind the speculative decode snapshot (SGLang 0.5.23+)."""
+    snapshot = vars(owner).get("snapshot_spec_decode_metrics")
+    if snapshot is None:
+        return
+
+    def wrapped_snapshot(self, batch, result, *args, **kwargs):
+        out = snapshot(self, batch, result, *args, **kwargs)
+        if getattr(result, "fpm_scheduled_requests", None) is not None:
+            # Same source as the snapshot aggregate: req.seqlen - 1 before the result settles.
+            reqs = list(getattr(batch, "reqs", None) or [])
+            setattr(result, _SNAPSHOT_PAIRS, [(1, max(int(req.seqlen) - 1, 0)) for req in reqs])
+        return out
+
+    wrapped_snapshot.__wrapped__ = snapshot  # type: ignore[attr-defined]
+    owner.snapshot_spec_decode_metrics = wrapped_snapshot
+
+
+def _fpm_enabled(reporter) -> bool:
+    """SGLang's per-rank ``enable_fpm`` (only the publishing rank sets it); ``True`` when unknown."""
+    return bool(getattr(getattr(reporter, "scheduler", None), "enable_fpm", True))
+
+
+def record_presettle(batch, result) -> None:
+    """Keep each row's KV prefix and whether SGLang will skip settling it, before the result settles.
+
+    ``req.seqlen - 1`` excludes the pending bonus token; a row that finished or
+    was retracted while this forward was in flight commits nothing.
+    """
+    rows = []
+    for req in getattr(batch, "reqs", None) or []:
+        finished = getattr(req, "finished", None)
+        skipped = bool(getattr(req, "is_retracted", False) or (finished() if callable(finished) else False))
+        rows.append((max(int(req.seqlen) - 1, 0), skipped))
+    setattr(result, _PRESETTLE, rows)
+
+
+def patch_sglang_batch_result_processor(module: ModuleType) -> bool:
+    """Record pre-settlement row state for speculative decode results. Returns ``True`` when applied."""
+    owner = next(
+        (obj for obj in vars(module).values() if isinstance(obj, type) and "_resolve_spec_v2_tokens" in vars(obj)),
+        None,
+    )
+    if owner is None:
+        logger.info("fpm_hooks: SGLang batch_result_processor has no _resolve_spec_v2_tokens; no pre-settle state")
+        return False
+    resolve = vars(owner)["_resolve_spec_v2_tokens"]
+    if getattr(resolve, _PATCHED, False):
+        return False
+
+    def wrapped_resolve(self, result, batch, *args, **kwargs):
+        try:
+            if _fpm_enabled(getattr(self, "metrics_reporter", None)):
+                record_presettle(batch, result)
+        except Exception:
+            logger.debug("fpm_hooks: pre-settle state unavailable", exc_info=True)
+        return resolve(self, result, batch, *args, **kwargs)
+
+    setattr(wrapped_resolve, _PATCHED, True)
+    wrapped_resolve.__wrapped__ = resolve  # type: ignore[attr-defined]
+    owner._resolve_spec_v2_tokens = wrapped_resolve
+    return True
+
+
+def patch_fpm_timing(timing_cls: type) -> bool:
+    """Give each per-result FPM record its own device time per category (SGLang 0.5.23+).
+
+    ``FpmTiming`` sees every interval of one batch result; the totals are added
+    to the record when its span is published, so they match ``wall_time``.
+    """
+    ready = vars(timing_cls).get("on_interval_ready")
+    publish_when_ready = vars(timing_cls).get("publish_when_ready")
+    if ready is None or publish_when_ready is None or getattr(ready, _PATCHED, False):
+        return False
+
+    def wrapped_ready(self, interval):
+        try:
+            totals = self.__dict__.setdefault(_TIMING_TOTALS, {})
+            category = (getattr(interval, "metadata", None) or {}).get("category", "unknown")
+            totals[category] = totals.get(category, 0.0) + interval.elapsed_time() / 1000.0
+        except Exception:
+            logger.debug("fpm_hooks: interval category time unavailable", exc_info=True)
+        return ready(self, interval)
+
+    def wrapped_publish_when_ready(self, metrics, publisher):
+        timing = self
+
+        class _WithCategories:
+            def publish(self, record):
+                import msgspec
+
+                totals = timing.__dict__.get(_TIMING_TOTALS)
+                scheduled = getattr(record, "scheduled_requests", None)
+                if totals and "device_time_s_by_category" in getattr(scheduled, "__struct_fields__", ()):
+                    scheduled = msgspec.structs.replace(scheduled, device_time_s_by_category=dict(totals))
+                    record = msgspec.structs.replace(record, scheduled_requests=scheduled)
+                publisher.publish(record)
+
+        return publish_when_ready(self, metrics, _WithCategories())
+
+    setattr(wrapped_ready, _PATCHED, True)
+    wrapped_ready.__wrapped__ = ready  # type: ignore[attr-defined]
+    wrapped_publish_when_ready.__wrapped__ = publish_when_ready  # type: ignore[attr-defined]
+    timing_cls.on_interval_ready = wrapped_ready
+    timing_cls.publish_when_ready = wrapped_publish_when_ready
+    return True
+
+
+def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
+    """Install the hook on an imported ``metrics_reporter`` module. Returns ``True`` when applied."""
+    owner = _owner_class(module)
+    build = getattr(owner, "_build_scheduled_request_metrics", None)
+    if owner is None or build is None:
         logger.warning(
             "fpm_hooks: no class in SGLang metrics_reporter defines _build_scheduled_request_metrics; skipping"
         )
@@ -89,16 +415,56 @@ def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
     # metrics_reporter imports the class name inside the builder at call time,
     # so rebinding the module attribute is enough for the encoder to see it.
     fpm_mod.ScheduledRequestMetrics = extended
+    diagnostics_failed = False
 
-    def wrapped(self, batch):
-        metrics = build(self, batch)
-        pairs = request_pairs(batch)
+    timing_cls = getattr(fpm_mod, "FpmTiming", None)
+    per_result_timing = timing_cls is not None
+
+    def wrapped(self, batch, *args, **kwargs):
+        nonlocal diagnostics_failed
+        # SGLang 0.5.23+ passes the batch result; a speculative decode result
+        # carries a pre-settle aggregate snapshot that the builder returns as is.
+        result = args[0] if args else kwargs.get("result")
+        snapshot_pairs = None
+        if getattr(result, "fpm_scheduled_requests", None) is not None:
+            snapshot_pairs = getattr(result, _SNAPSHOT_PAIRS, None)
+        restore = snapshot_pairs is None and fill_decode_seq_lens(batch, getattr(self, _STEP_CONTEXT, None))
+        try:
+            metrics = build(self, batch, *args, **kwargs)
+            pairs = snapshot_pairs if snapshot_pairs is not None else request_pairs(batch)
+        finally:
+            if restore:
+                batch.seq_lens_cpu = None
+        try:
+            # Drain per-category device time even for records without lists.
+            step = step_fields(self, batch, len(pairs) if pairs is not None else 0)
+        except Exception:
+            # Diagnostics must never break the scheduler loop.
+            if not diagnostics_failed:
+                logger.exception("fpm_hooks: SGLang step diagnostics failed; emitting lists only")
+                diagnostics_failed = True
+            step = {}
+        if pairs is None and not getattr(batch, "reqs", None):
+            # A timed forward with no local requests (an idle attention-DP rank)
+            # still carries its host times and device-time categories.
+            pairs = []
         if pairs is None:
             return metrics
-        return with_pairs(extended, metrics, pairs)
+        try:
+            context = getattr(self, _STEP_CONTEXT, None)
+            width = verify_width(self, result if result is not None else (context[0] if context else None))
+        except Exception:
+            # The live configuration is unreadable; fall back to what diagnostics recorded.
+            width = int(step.get("spec_num_draft_tokens", 0) or 0)
+        return with_pairs(extended, metrics, speculative_pairs(batch, pairs, width), step)
 
     setattr(wrapped, _PATCHED, True)
     wrapped.__wrapped__ = build  # type: ignore[attr-defined]
-    mixin._build_scheduled_request_metrics = wrapped
-    logger.info("fpm_hooks: SGLang FPM now carries extend_lengths / past_kv_lengths")
+    owner._build_scheduled_request_metrics = wrapped
+    _wrap_init_fpm(owner, attach_reporter=not per_result_timing)
+    _wrap_emit(owner, attach_reporter=not per_result_timing)
+    _wrap_spec_snapshot(owner)
+    if per_result_timing:
+        patch_fpm_timing(timing_cls)
+    logger.info("fpm_hooks: SGLang FPM now carries per-request lists and step diagnostics")
     return True

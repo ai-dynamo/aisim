@@ -60,14 +60,16 @@ One record = one FPM event from one engine worker:
   next step's launch that its own step did not hide (see
   [collecting the FPM stream](learned-forward-pass-model.md#1-collect-the-fpm-stream)).
 - **SGLang** (`SchedulerMetricsReporter` + `DeviceTimer`): CUDA events around the
-  forward, accumulated and flushed when the batch result is processed. With the
-  overlap scheduler on, the disaggregated prefill loop does KV hand-off work before
-  the flush, so the next forward completes first and is merged into the current record
-  (2× bimodal step times for identical batch shapes, 18% of records dropped, 22%
-  prefill error). **All SGLang collection is done with `--disable-overlap-schedule`**,
-  which makes each record exactly one forward. A model trained overlap-off still
-  predicts overlap-on decode steps to within a near-constant 5.5% offset; overlap-on
-  prefill records are not usable as truth.
+  forward. Before 0.5.23 they are accumulated and flushed when the batch result is
+  processed. With the overlap scheduler on, the disaggregated prefill loop does KV
+  hand-off work before the flush, so the next forward completes first and is merged
+  into the current record (2× bimodal step times for identical batch shapes, 18% of
+  records dropped, 22% prefill error); speculative decoding shifts time between
+  neighbouring records the same way. SGLang 0.5.23 (sgl-project/sglang#38711) times
+  each batch result on its own. **Collect SGLang FPM with the deployment's overlap
+  setting on 0.5.23 or later.** Overlap off is a different step: on GLM-5.3 with MTP
+  it adds 12% decode GPU time at equal batch and KV size. Only on older SGLang use
+  `--disable-overlap-schedule`, accepting that offset (5.5% to 14% on decode so far).
 
 A **capture run** is one fresh deployment on its own nodes, one aiperf seed, every
 concurrency tier run once (20 min each). Runs are the unit of independence: steps
@@ -105,10 +107,11 @@ base, the two lists are added at runtime inside the engine process by
    imported eagerly.
 2. **Extended `ScheduledRequestMetrics`.** FPM is a `msgspec` struct serialized to
    msgpack. The hook creates a frozen subclass of the producer's
-   `ScheduledRequestMetrics` with two extra `list[int]` fields (`_request_fields.extend_struct`),
+   `ScheduledRequestMetrics` with two extra `list[int]` fields and the optional step
+   diagnostics (`_request_fields.extend_struct`),
    keeps the class name and module, and copies the original instance into it
    (`_request_fields.with_pairs`). The msgpack payload keeps FPM `version` 1; aggregate-only
-   consumers ignore the two extra keys, the Dynamo runtime decodes the event
+   consumers ignore the extra keys, the Dynamo runtime decodes the event
    unchanged and the Rust trace sink writes them out. If the producer's struct already
    has both fields (a patched image), the hook is a no-op.
 3. **SGLang** (`fpm_hooks/_sglang.py`; the leading underscore keeps the hook directory, which precedes the stdlib and site-packages on `PYTHONPATH`, from shadowing the real `sglang` package; no module there may share a stdlib name either, such as `_struct`). The class that defines
@@ -124,7 +127,12 @@ base, the two lists are added at runtime inside the engine process by
      on the SGLang version it may include the token being decoded, i.e. be one above
      "KV before the step". The learned model tolerates exactly that (one token of slack
      per decode request in its consistency bound), and the trees see the same
-     convention at training and inference time.
+     convention at training and inference time;
+   - speculative decode batches: `(spec_num_draft_tokens, batch.seq_lens_cpu[i])`, so
+     the extend is the verify width `1 + k`, as on the vLLM path.
+
+   The same wrapper adds the step diagnostics below; `_emit_forward_pass_metrics` and
+   `_init_fpm` are wrapped to provide them.
 4. **Dynamo vLLM** (`fpm_hooks/_dynamo_vllm.py`). `InstrumentedScheduler._extract_scheduled`
    is wrapped; the pairs come from the `SchedulerOutput` the scheduler just produced:
    `num_scheduled_tokens[req_id]` is the extend, the request's `num_computed_tokens`
@@ -149,6 +157,51 @@ base, the two lists are added at runtime inside the engine process by
    predicting from NaN features. During the V4.1 captures a class-name change (mixin →
    `SchedulerMetricsReporter`) was caught exactly this way and fixed by the
    method-name lookup.
+
+### Recording without Dynamo
+
+A plain SGLang server publishes FPM on `{--forward-pass-metrics-ipc-name}.{dp_rank}`
+and stores nothing. Launch it through the hooks so the records carry the per-request
+lists and step diagnostics (a plain `python -m sglang.launch_server` publishes stock
+aggregates only), then run one recorder per capture run next to the server:
+
+```bash
+python -m aisim_core.fpm_hooks sglang.launch_server -- ... --enable-forward-pass-metrics \
+  --forward-pass-metrics-ipc-name ipc:///tmp/fpm-run1
+python -m aisim_core.fpm_hooks record --endpoint ipc:///tmp/fpm-run1.0 --output run1/fpm.jsonl
+```
+
+Each JSON line holds the publisher `sequence`, the receive time (Unix and monotonic)
+and the payload under `fpm`, decoded without a type so the hook fields survive (item
+6 above). Split tiers afterwards by receive time. On exit (SIGINT, SIGTERM or
+`--duration`), `fpm.jsonl.summary.json` gives the message count and any gaps between
+received sequence numbers. SGLang numbers records after dequeuing them, so records it
+drops on publisher queue overflow leave no gap: zero gaps does not prove that no record
+was lost.
+
+### Step diagnostics (SGLang)
+
+The SGLang hook also writes these optional fields into `scheduled_requests`. They are
+not model features. They describe what a step contained under speculative decoding
+and where its time went, which the measured-SD-round and SD-approximation comparison
+in [whole-forward.md](../methods/whole-forward.md) needs. Records without the source
+data keep the defaults (zero or empty); the Dynamo vLLM hook leaves them at the
+defaults.
+
+| Field | Meaning |
+| --- | --- |
+| `spec_num_steps`, `spec_num_draft_tokens` | Speculative configuration of the step; 0 when speculation is off. When the result carries its verify width (`result.speculative_num_draft_tokens`, SGLang 0.5.23+), both come from that forward (steps = width - 1 for the chain configurations the adaptive controller runs); otherwise from the live `_active_spec_config_snapshot`, which the adaptive controller may already have switched. |
+| `spec_accept_lengths[i]` | Tokens committed by request *i* in a speculative decode step, bonus token included (`result.accept_lens`, or the grammar-retained run). 0 for a row that finished or was retracted while the forward was in flight, which SGLang does not settle. Read only when already on the CPU, so the hook adds no device synchronization; empty otherwise. |
+| `device_time_s_by_category` | Seconds of device time per DeviceTimer category (`decode`, `extend`, `target_verify`, `eagle_draft`, `eagle_draft_extend`, ...). On SGLang 0.5.23+ the hook sums the intervals of the record's own batch result, so the categories add up to `wall_time` minus any gaps between intervals. Before 0.5.23 it adds one DeviceTimer reporter and drains it at each record, covering the same intervals as `wall_time`. |
+| `host_scheduled_at_s` | Host monotonic time when the scheduler started building the batch (`batch.fpm_start_time`). Unavailable on SGLang 0.5.23+, which removed `fpm_start_time`; the field stays 0.0 there. |
+| `host_emitted_at_s` | Host monotonic time when the metrics handler started for the record. On SGLang 0.5.23+ the record can be queued later, once the timer's pending intervals complete. Consecutive differences approximate the step period on the host clock. Their gap to the summed device time bounds exposed CPU time only loosely: under overlap it can also include GPU idle gaps and work from neighbouring steps. They also show where a record merged two forwards. |
+
+Host times are per worker process and only comparable within one capture.
+Checked against SGLang v0.5.20 (`94602c9c`) and v0.5.23 (`297e54fd`): DeviceTimer tags the
+target verify, the EAGLE/MTP draft and the draft extend, and
+`GenerationBatchResult.accept_lens` is on the CPU when the record is emitted. On
+0.5.23 a speculative decode record's aggregates come from a snapshot taken before
+the result settles; the hook takes the per-request lists from the same snapshot.
 
 ### Validation of the recorded lists
 
