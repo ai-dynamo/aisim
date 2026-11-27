@@ -3519,6 +3519,7 @@ def test_vllm_implicit_and_partial_vision_towers():
         qwen,
         {**qwen, "vision_config": {}},
         {**qwen, "architectures": ["UnknownNativeCheckpoint", *qwen["architectures"]]},
+        {**qwen, "architectures": [*qwen["architectures"], "LlavaForConditionalGeneration"]},
     ):
         estimator = NaiveKVCacheEstimator.from_hf_config(raw, **opts)
         assert estimator.kv_bytes_per_token() == 1536
@@ -3538,6 +3539,47 @@ def test_vllm_implicit_and_partial_vision_towers():
     assert intern == resident(
         "InternVLForConditionalGeneration", model_type="internvl", vision_config={"model_type": "internvl_vision"}
     )
+
+
+@pytest.mark.parametrize(
+    ("backend", "version", "wrapper"),
+    [
+        ("vllm", "0.31.0", "DeepseekVLV2ForCausalLM"),
+        ("vllm", "0.32.0", "InternVLChatModel"),
+        ("vllm", "0.32.0", "HCXVisionV2ForCausalLM"),
+        ("vllm", "0.33.0", "MiniCPMV"),
+        ("sglang", "0.5.6.post2", "DeepseekVL2ForCausalLM"),
+        ("sglang", "0.5.23", "InternVLChatModel"),
+        ("sglang", "0.5.23", "MiniCPMV"),
+        ("sglang", "0.5.23", "YiVLForCausalLM"),
+    ],
+)
+def test_registered_multimodal_entrypoint_requires_whole_rank_residency(tmp_path, backend, version, wrapper):
+    text = {**_UNKNOWN_DECODER, "model_type": "qwen2", "max_position_embeddings": 4096}
+    opts = dict(tp_size=1, pp_size=1, backend=backend, backend_version=version)
+    for wrapper_names in ([wrapper], ["UnknownCheckpoint", wrapper]):
+        doc = {"architectures": wrapper_names, "llm_config": text}
+        estimator = NaiveKVCacheEstimator.from_hf_config(doc, **opts)
+        assert estimator.kv_bytes_per_token() == 1024
+        with pytest.raises(ValueError, match="resident weights for the vision tower"):
+            estimator.weight_bytes()
+        with pytest.raises(ValueError, match="resident weights for the vision tower"):
+            memory.estimate_num_gpu_blocks(
+                _write_config(tmp_path, doc),
+                "missing",
+                backend,
+                version,
+                **_missing_system_cache_options(tmp_path, tp_size=1, capacity=128 * 2**20),
+            )
+    # The native OPT model reads its decoder's config. A later, unselected multimodal alternative adds no weights.
+    opt = {**text, "model_type": "opt", "ffn_dim": 1024, "word_embed_proj_dim": 256, "do_layer_norm_before": True}
+    plain = {**opt, "architectures": ["Unregistered", "OPTForCausalLM"], "llm_config": opt}
+    estimate = NaiveKVCacheEstimator.from_hf_config(plain, **opts)
+    trailing = NaiveKVCacheEstimator.from_hf_config(
+        {**plain, "architectures": [*plain["architectures"], wrapper]}, **opts
+    )
+    assert trailing.kv_bytes_per_token() == estimate.kv_bytes_per_token()
+    assert trailing.weight_bytes() == estimate.weight_bytes() > 0
 
 
 def test_vllm_effective_quantizer_class_sidecar_and_modelopt_exclusions(tmp_path):
@@ -3633,27 +3675,50 @@ def test_modelopt_mxfp8_uses_checkpoint_dtype_and_rank_local_projection_widths(t
     quant = doc["quantization_config"] = {"quant_method": "modelopt_mxfp8"}
     model = _write_config(tmp_path, doc)
     opts = dict(tp_size=1, pp_size=1, backend_version="0.32.0")
-    for dtype in ("F16", "BF16"):
-        header = json.dumps({"embed.weight": {"dtype": dtype, "shape": [1], "data_offsets": [0, 2]}}).encode()
-        header += b" " * (-len(header) % 8)
-        (tmp_path / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + bytes(2))
-        if dtype == "F16":
-            with pytest.raises(ValueError, match="MXFP8 requires bfloat16"):
-                _compiled_vllm_transfer_widths(model, "0.32.0")
-        else:
-            assert _compiled_vllm_transfer_widths(model, "0.32.0") == (1536, 1536)
+    for scale in ("U8", "F8_E8M0"):
+        for dtype in ("F16", "BF16"):
+            header = json.dumps(
+                {
+                    "embed.weight": {"dtype": dtype, "shape": [1], "data_offsets": [0, 2]},
+                    "proj.weight": {"dtype": "F8_E4M3", "shape": [1, 32], "data_offsets": [2, 34]},
+                    "proj.weight_scale": {"dtype": scale, "shape": [1, 1], "data_offsets": [34, 35]},
+                }
+            ).encode()
+            header += b" " * (-len(header) % 8)
+            (tmp_path / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + bytes(35))
+            if dtype == "F16":
+                with pytest.raises(ValueError, match="MXFP8 requires bfloat16"):
+                    _compiled_vllm_transfer_widths(model, "0.32.0")
+            else:
+                assert _compiled_vllm_transfer_widths(model, "0.32.0") == (1536, 1536)
     with pytest.raises(ValueError, match="checkpoint headers"):
         NaiveKVCacheEstimator.from_hf_config(doc, **opts)
     doc["torch_dtype"] = "bfloat16"
     doc["text_config"].update(num_attention_heads=16, num_key_value_heads=8, intermediate_size=29_568)
     assert NaiveKVCacheEstimator.from_hf_config(doc, **(opts | {"tp_size": 4})).weight_bytes() > 0
     opts["tp_size"] = 8
-    for ignored in ([], ["*.self_attn.o_proj"], ["language_model.model.layers.0.mlp.down_proj"]):
+    for ignored in ([], ["*.self_attn.o_proj"], ["language_model.model.layers.0.mlp.down_proj"], ["*.mlp.down_pro*"]):
         quant["ignored_layers"] = ignored
         with pytest.raises(ValueError, match="MXFP8.*32"):
             NaiveKVCacheEstimator.from_hf_config(doc, **opts)
-    quant["ignored_layers"] = ["*.mlp.down_proj"]
-    assert NaiveKVCacheEstimator.from_hf_config(doc, **opts).weight_bytes() > 0
+    for ignored in ("*.mlp.down_proj", "model.language_model.layers.*.mlp.down_proj"):
+        quant["ignored_layers"] = [ignored]
+        assert NaiveKVCacheEstimator.from_hf_config(doc, **opts).weight_bytes() > 0
+
+
+def test_naive_generator_resolves_mxfp8_on_its_target(tmp_path):
+    from aisim.generator.naive import _estimate_model_weight_bytes, build_naive_generator_params
+
+    doc = _synthetic_multimodal_w8()
+    doc.update(torch_dtype="float32", quantization_config={"quant_method": "modelopt_mxfp8"})
+    model = _write_config(tmp_path, doc)
+    params = build_naive_generator_params(model, 8, "h100_sxm", "vllm", backend_version="0.32.0")
+    assert params["params"]["agg"]["tensor_parallel_size"] == 1
+    opts = dict(tp_size=1, pp_size=1, backend_version="0.32.0", system="h100_sxm")
+    expected = NaiveKVCacheEstimator.from_hf_config(doc, **opts).weight_bytes()
+    assert _estimate_model_weight_bytes(model, backend_version="0.32.0", system="h100_sxm") == expected
+    with pytest.raises(RuntimeError, match="requires a deployment target"):
+        _estimate_model_weight_bytes(model, backend_version="0.32.0")
 
 
 def test_borrowed_gemma_and_gpt_neo_construct_before_vllm_dispatch(tmp_path):
@@ -5395,14 +5460,18 @@ def test_sglang_mxfp8_experts_use_the_fixed_checkpoint_block(tmp_path):
 def test_sglang_mxfp8_gpu_requirements_follow_expert_exclusions(tmp_path, estimate):
     from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
 
-    # InternVL 3.5 uses the BF16 Qwen3-30B-A3B decoder under llm_config.
     text = _load_pre_downloaded_hf_config("Qwen/Qwen3-30B-A3B")
-    wrapper = {"architectures": ["InternVLChatModel"], "llm_config": text}
-    model = _write_config(tmp_path, wrapper)
+    wrapper = {"llm_config": text}
+    model = _write_config(tmp_path, {**wrapper, "architectures": ["InternVLChatModel"]})
     opts = _missing_system_cache_options(tmp_path, tp_size=2, capacity=80 * _GIB)
     opts.update(moe_tp_size=2, moe_ep_size=1)
     for name, sm in (("hopper", 90), ("sm100", 100), ("sm120", 120)):
         (tmp_path / f"{name}.yaml").write_text(f"gpu: {{sm_version: {sm}}}\n")
+    # InternVL constructs a vision tower and projector alongside this decoder. Exercise the
+    # expert exclusions on the same text-only model after checking the whole-rank boundary.
+    with pytest.raises(ValueError, match="resident weights for the vision tower"):
+        estimate(model, "sm120", "sglang", "0.5.20", **opts)
+    _write_config(tmp_path, wrapper)
     plain = estimate(model, "sm120", "sglang", "0.5.20", **opts)
 
     quant = {

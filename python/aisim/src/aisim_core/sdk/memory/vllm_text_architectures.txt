@@ -4,6 +4,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Each row lists the source, vLLM minor releases, class suffix (- for none), and class prefixes.
 # vllm entries are stock registrations. hf entries can stop the Transformers lookup before native dispatch.
+# multimodal entries identify registered native and Transformers multimodal implementations.
+# other_multimodal entries are additional multimodal names from v0.7.0–v0.30.0 and v0.34.0, for unrecorded releases.
+# https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/registry.py
 # hf_incompatible entries exist in all eligible wheels, shadow AutoModel and decline the Transformers backend.
 # config entries are AutoConfig model types available in every eligible Transformers wheel.
 # Release-specific wheel inventories and source attribution are described in THIRD_PARTY_NOTICES.md.
@@ -83,6 +86,53 @@ vllm 33 ForRetrieval ColUltraVBert
 vllm 33 ForSequenceClassification D3
 vllm 33 Model DFlash2BeamDraft DFlashQwen3XPress Lfm2Bidirectional ModernVBert MuseSparkDSpark ParseAuxMTP
 vllm 33 Model Qwen3XPress
+multimodal 31/32/33 - ColQwen3 ColQwen3_5 HfMoondream Llama_Nemotron_Nano_VL MiniCPMO MiniCPMV NVLM_D
+multimodal 31/32/33 - NemotronH_Nano_Omni_Reasoning_V3 NemotronH_Nano_VL_V2 NemotronH_Omni_Reasoning_V3
+multimodal 31/32/33 - NemotronH_Super_Omni_Reasoning_V3 Ovis Ovis2_5 Qwen3ASRRealtimeGeneration Terratorch
+multimodal 31/32/33 - VoxtralRealtimeGeneration
+multimodal 31/32/33 ForActionPrediction OpenVLA
+multimodal 31/32/33 ForBlockDiffusion DiffusionGemma
+multimodal 31/32/33 ForCausalLM DeepseekOCR DeepseekOCR2 DeepseekV41 DeepseekVLV2 Dots3Note DotsOCR GLM4V
+multimodal 31/32/33 ForCausalLM HCXVisionV2 MiMoV2Omni Molmo Moondream3 MoonshotKimia MuseGlimmer Ovis2_6
+multimodal 31/32/33 ForCausalLM Ovis2_6_Moe Phi3V Phi4MM TransformersMultiModal TransformersMultiModalMoE
+multimodal 31/32/33 ForCausalLM UnlimitedOCR
+multimodal 31/32/33 ForCausalLMV Phi4
+multimodal 31/32/33 ForConditionalGeneration Aria AudioFlamingo3 Bagel BailingMoeV3VL Bee Blip2 Cohere2Vision
+multimodal 31/32/33 ForConditionalGeneration CohereAsr CohereCompass Cosmos3 Cosmos3Edge DeepseekV4 Eagle2_5_VL
+multimodal 31/32/33 ForConditionalGeneration Emu3 Ernie4_5_VLMoe Exaone4_5_ FireRedASR2 FunASR FunAudioChat
+multimodal 31/32/33 ForConditionalGeneration Gemma3 Gemma3n Gemma4 Gemma4Unified Glm4v Glm4vMoe Glm5Next GlmAsr
+multimodal 31/32/33 ForConditionalGeneration GlmOcr Granite4Vision GraniteSpeech GraniteSpeechPlus HunYuanVL
+multimodal 31/32/33 ForConditionalGeneration Idefics3 Inkling InternS1 InternS1Pro InternS2Mobius
+multimodal 31/32/33 ForConditionalGeneration InternS2Preview InternVL Isaac KananaV Keye KeyeVL1_5 KimiK25
+multimodal 31/32/33 ForConditionalGeneration KimiK3 KimiVL Lfm2Vl LightOnOCR Llama4 Llava LlavaNext
+multimodal 31/32/33 ForConditionalGeneration LlavaNextVideo LlavaOnevision LlavaOnevision2 MiniCPMV4_6
+multimodal 31/32/33 ForConditionalGeneration MiniMaxM3Sparse Mistral3 Molmo2 MossTranscribeDiarize MuseGlimmer
+multimodal 31/32/33 ForConditionalGeneration NemotronParse OpenCUA OpenPanguVL PaddleOCRVL PaliGemma Pixtral
+multimodal 31/32/33 ForConditionalGeneration QianfanOCR Qwen2Audio Qwen2VL Qwen2_5Omni Qwen2_5_VL Qwen3ASR
+multimodal 31/32/33 ForConditionalGeneration Qwen3OmniMoe Qwen3VL Qwen3VLMoe Qwen3_5 Qwen3_5Moe Qwen4Exp R
+multimodal 31/32/33 ForConditionalGeneration SmolVLM Step3VL Step3p7 StepVL VibeVoiceAsr Voxtral Whisper
+multimodal 31/32/33 ForRanking JinaVL
+multimodal 31/32/33 ForRetrieval ColModernVBert ColPali
+multimodal 31/32/33 ForSequenceClassification LlamaNemotronVL TransformersMultiModal
+multimodal 31/32/33 ForTokenClassification Qwen3ASRForcedAligner
+multimodal 31/32/33 Model CLIP H2OVLChat InternVLChat LlamaNemotronVL MiDashengLM MossAudio OpsColQwen3
+multimodal 31/32/33 Model Qwen2_5Omni Qwen3VLNemotronEmbed Siglip SkyworkR1VChat TransformersMultiModalEmbedding
+multimodal 31/32/33 Model Ultravox
+multimodal 32/33 ForConditionalGeneration MiniCPMV4_7
+multimodal 32/33 ForJointSchema ClefOmni
+multimodal 32/33 Model EmbeddingGemma2
+multimodal 33 - Alpamayo2Super
+multimodal 33 ForCausalLM RadioMBartPrefix
+multimodal 33 ForConditionalGeneration MiniCPMOcr MuseSpark Step5
+multimodal 33 ForJointSchema ClefFlash
+multimodal 33 ForRetrieval ColUltraVBert
+multimodal 33 Model ModernVBert
+other_multimodal * - Cheers VoxtralStreamingGeneration
+other_multimodal * ForCausalLM Fuyu Phi4Multimodal
+other_multimodal * ForConditionalGeneration AyaVision Canary Chameleon ChatGLM Cheers FireRedLID Florence2
+other_multimodal * ForConditionalGeneration KimiK31 Lfm3Audio Lfm3Vl Mantis MingV3ASR MiniMaxVL01 Mllama
+other_multimodal * ForConditionalGeneration MusicFlamingo Nemotron3_5Transcribe QwenVL Tarsier Tarsier2
+other_multimodal * Model ChatGLM QWenLMHead
 hf 31/32 Model ModernVBert
 hf_incompatible 31/32/33 - FastSpeech2ConformerHifiGan FastSpeech2ConformerWithHifiGan FlavaImageCodebook
 hf_incompatible 31/32/33 - ReformerModelWithLMHead SLANeXtSLAHead SLANetSLAHead SpeechT5HifiGan

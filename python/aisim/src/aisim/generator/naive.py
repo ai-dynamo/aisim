@@ -190,6 +190,8 @@ def _estimate_model_weight_bytes(
     *,
     backend: str = "vllm",
     backend_version: str | None = None,
+    system: str | None = None,
+    systems_paths: str | list[str] | None = None,
     model_metadata: dict[str, Any] | None = None,
 ) -> int:
     """
@@ -207,6 +209,8 @@ def _estimate_model_weight_bytes(
         model_path: HuggingFace model path or local path.
         backend: Serving backend that selects the decoder.
         backend_version: Serving backend release for config-only sizing.
+        system: Deployment target for checkpoint execution dtype.
+        systems_paths: Directories containing the target's system specification.
         model_metadata: Optional dictionary populated with the detected
             ``architecture`` and ``is_moe`` values from the same config used
             for sizing.
@@ -250,7 +254,14 @@ def _estimate_model_weight_bytes(
         )
         logger.debug("Normalized parser error for %s: %s", model_path, e)
         try:
-            options = dict(backend=backend, backend_version=backend_version, tp_size=1, pp_size=1)
+            options = dict(
+                backend=backend,
+                backend_version=backend_version,
+                tp_size=1,
+                pp_size=1,
+                system=system,
+                systems_paths=systems_paths,
+            )
             if backend == "vllm" and os.path.isdir(model_path):
                 # Local checkpoint metadata can change between generator requests.
                 estimator = NaiveKVCacheEstimator.from_model_path(model_path, allow_hf_config_download=True, **options)
@@ -474,7 +485,11 @@ def build_naive_generator_params(
         model_weight_bytes = _estimate_weight_bytes_from_config(model_config, model_name)
     else:
         model_weight_bytes = _estimate_model_weight_bytes(
-            model_name, backend=backend_name, backend_version=backend_version, model_metadata=model_metadata
+            model_name,
+            backend=backend_name,
+            backend_version=backend_version,
+            system=system_name,
+            model_metadata=model_metadata,
         )
 
     # Calculate minimum GPU count that fits the model

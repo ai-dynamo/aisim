@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
 # SPDX-FileCopyrightText: Copyright 2025-2026 the HuggingFace Team
+# SPDX-FileCopyrightText: Copyright the safetensors contributors
 # SPDX-License-Identifier: Apache-2.0
 # Adapted grouping: https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_planning.py
 # Step geometry: https://github.com/sgl-project/sglang/blob/94602c9c2b7cbdb8efd5c52802dac6a1c180089e/python/sglang/srt/configs/model_config.py
@@ -96,10 +97,11 @@ from aisim_core.sdk.fpm_model_metadata import attach_quantization_sidecar, inher
 from aisim_core.sdk.fpm_profile import FpmModelProfile, _load_fpm_timing_profile
 from aisim_core.sdk.memory.vllm_registry import (
     default_causal_lm,
+    has_remote_model,
     is_known_transformers_config,
-    is_registered_conditional_generator,
     select_architecture,
     select_wrapper_architecture,
+    wrapper_requires_residency,
 )
 from aisim_core.sdk.models import get_model
 from aisim_core.sdk.models.base import _MODEL_REGISTRY, BaseModel
@@ -147,6 +149,7 @@ _VLLM_DENSE_DECODERS = {
     "Qwen3ForCausalLM",
     "OPTForCausalLM",
 }
+_TEXT_ONLY_DECODERS = set(_SELECTED_DECODER_ARCHITECTURES.values()) | _VLLM_DENSE_DECODERS
 
 _TEXT_CONFIG_DEFAULTS = {
     "InternS1ForConditionalGeneration": ("interns1", "qwen3"),
@@ -335,9 +338,46 @@ def _sglang_llava_causal_lm(kind: str, version: str | None) -> str | None:
 
 
 @cache
-def _sglang_multimodal_generators() -> frozenset[str]:
-    source = files(__package__).joinpath("sglang_multimodal_architectures.txt").read_text(encoding="utf-8")
-    return frozenset(name for name in source.splitlines() if not name.startswith("#"))
+def _sglang_model_registries() -> dict[int, dict[str, set[str]]]:
+    releases: dict[int, dict[str, set[str]]] = {}
+    with files(__package__).joinpath("sglang_multimodal_architectures.txt").open(encoding="utf-8") as source:
+        for line in source:
+            if not line.startswith("#"):
+                kind, first, last, *names = line.split()
+                for patch in range(int(first), int(last) + 1):
+                    releases.setdefault(patch, {"native": set(), "multimodal": set()})[kind].update(names)
+    return releases
+
+
+def _sglang_wrapper(names: list[str], version: str | None, auto_map: object) -> tuple[str | None, bool]:
+    """The first registered entrypoint wins. Only a known text decoder establishes decoder-only residency."""
+    remote = has_remote_model(auto_map)
+    if not names:
+        return None, remote
+    release = parse_support_matrix_version(version)
+    registries = _sglang_model_registries()
+    if (
+        release is not None
+        and release.micro in registries
+        and release.public == ("0.5.6.post2" if release.micro == 6 else f"0.5.{release.micro}")
+    ):
+        candidates = (registries[release.micro],)
+    else:
+        candidates = registries.values()
+    choices = set()
+    needs_weights = False
+    for entries in candidates:
+        native = next((name for name in names if name in entries["native"]), None)
+        choices.add(native or names[0])
+        if native is None:
+            needs_weights |= remote or bool(entries["multimodal"].intersection(names))
+        else:
+            needs_weights |= native in entries["multimodal"] or native not in _TEXT_ONLY_DECODERS
+    if len(choices) == 1:
+        return choices.pop(), needs_weights
+    if choices & _TEXT_WRAPPERS:
+        raise ValueError(f"SGLang's selected wrapper for {names!r} depends on the backend release")
+    return names[0], needs_weights
 
 
 def _uses_bare_decoder(config: dict, backend: str, version: str | None) -> bool:
@@ -819,8 +859,30 @@ def _vllm_fp8_linear_scale_bytes(quant: dict, geom: dict, tp: int) -> int:
     return 4 * sum(((out + block_n - 1) // block_n) * ((inp + block_k - 1) // block_k) for out, inp in matrices)
 
 
-def _check_modelopt_mxfp8_inputs(geom: dict, tp: int, ignored: list[str], prefix: str, opt: bool) -> None:
+def _check_modelopt_mxfp8_inputs(geom: dict, tp: int, ignored: list[str], wrapper: str | None, opt: bool) -> None:
     # KMxfp8Static groups the input of each quantized rank-local matrix into sets of 32.
+    if wrapper in _FIXED_LLAMA_WRAPPERS:
+        # Idefics3 and SmolVLM construct an inner LlamaModel directly, without a checkpoint-name mapper.
+        prefix = "model.text_model.layers."
+    else:
+        prefix = ("language_model." if wrapper is not None else "") + (
+            "model.decoder.layers." if opt else "model.layers."
+        )
+        # The serving mapper expands wildcard suffixes before renaming the checkpoint's module prefixes.
+        mapped = []
+        for pattern in ignored:
+            patterns = (
+                (pattern[:-1], pattern[:-1] + ".*")
+                if len(pattern) >= 2 and pattern.endswith("*") and pattern[-2] != "."
+                else (pattern,)
+            )
+            for name in patterns:
+                if wrapper in _TEXT_CONFIG_DEFAULTS and name.startswith("model.language_model."):
+                    name = "language_model.model." + name.removeprefix("model.language_model.")
+                if opt and name.startswith("decoder."):
+                    name = "model." + name
+                mapped.append(name)
+        ignored = mapped
     hidden = layout_integer(geom["hidden"], "hidden_size")
     inter = layout_integer(geom["inter"], "intermediate_size")
     q = layout_integer(geom["num_attention_heads"], "num_attention_heads") * layout_integer(
@@ -834,15 +896,22 @@ def _check_modelopt_mxfp8_inputs(geom: dict, tp: int, ignored: list[str], prefix
     )
     for module, width, shards in blocks:
         row_parallel = module.endswith(("o_proj", "out_proj", "down_proj", "fc2"))
-        if width % (32 * (tp if row_parallel else 1)) == 0:
+        aligned = width % (32 * (tp if row_parallel else 1)) == 0
+        if aligned and (not ignored or not shards):
             continue
         if row_parallel and width % tp:
             raise ValueError(f"vLLM {module} input width must be divisible by tensor parallel size")
         for i in range(geom["layers"]):
-            name = f"{prefix}model.{'decoder.' if opt else ''}layers.{i}.{module}"
-            if any(pattern in name or fnmatchcase(name, pattern) for pattern in ignored):
+            name = f"{prefix}{i}.{module}"
+            if name in ignored:
                 continue
-            if shards and all(name.rsplit(".", 1)[0] + "." + shard in ignored for shard in shards):
+            if shards:
+                excluded = [name.rsplit(".", 1)[0] + "." + shard in ignored for shard in shards]
+                if any(excluded):
+                    if not all(excluded):
+                        raise ValueError(f"vLLM requires the same quantization scheme for all shards of {name}")
+                    continue
+            if aligned or any(pattern in name or fnmatchcase(name, pattern) for pattern in ignored):
                 continue
             raise ValueError(f"vLLM ModelOpt MXFP8 requires {name} rank-local input width divisible by 32")
 
@@ -1575,6 +1644,7 @@ class NaiveKVCacheEstimator:
         self._selected_decoder: dict | None = None
         self._is_nested_decoder = False
         self._wrapper_config: dict | None = None
+        self._wrapper_requires_residency = False
         self._sglang_layer_prefix = "model.layers.{}."
         self._scalar_cache_problem: str | None = None
         self._nested_index_head_dim: int | None = None
@@ -1689,12 +1759,14 @@ class NaiveKVCacheEstimator:
         moe_tp_size: int = 1,
         backend: str = "vllm",
         backend_version: str | None = None,
+        system: str | None = None,
+        systems_paths: str | list[str] | None = None,
     ) -> NaiveKVCacheEstimator:
         """Build directly from an already-loaded HF ``config.json`` dictionary.
 
-        This is the no-I/O counterpart to :meth:`from_model_path`. Callers that
-        already loaded a config can reuse it without issuing a second HF request.
+        Callers that already loaded a config can reuse it without issuing a second HF request.
         """
+        backend_version = _config_only_backend_version(system, backend, backend_version, systems_paths)
         estimator = cls._from_resolved_hf_config(
             hf_config,
             tp_size=tp_size,
@@ -1703,9 +1775,12 @@ class NaiveKVCacheEstimator:
             moe_tp_size=moe_tp_size,
             backend=backend,
             backend_version=backend_version,
+            dtype_target=(system, systems_paths),
         )
         if backend == "vllm" and estimator.architecture not in _VLLM_DENSE_DECODERS:
-            check_gemma4_adapter_runtime(hf_config, backend_version, tp_size)
+            check_gemma4_adapter_runtime(
+                hf_config, backend_version, tp_size, system=system, systems_paths=systems_paths
+            )
         return estimator
 
     @classmethod
@@ -1764,9 +1839,20 @@ class NaiveKVCacheEstimator:
                 parent_type = (
                     model_type if isinstance(model_type, str) else _TEXT_CONFIG_DEFAULTS.get(architecture, (None,))[0]
                 )
-                if key == "text_config" and backend == "vllm":
+                needs_wrapper_weights = False
+                if key is not None and backend == "vllm":
                     architecture = select_wrapper_architecture(
-                        architectures, backend_version, hf_config.get("auto_map"), _TEXT_WRAPPERS
+                        architectures,
+                        backend_version,
+                        hf_config.get("auto_map"),
+                        _TEXT_WRAPPERS if key == "text_config" else set(),
+                    )
+                    needs_wrapper_weights = wrapper_requires_residency(
+                        architectures, backend_version, hf_config.get("auto_map"), _TEXT_ONLY_DECODERS
+                    )
+                elif key is not None and backend == "sglang":
+                    architecture, needs_wrapper_weights = _sglang_wrapper(
+                        architectures, backend_version, hf_config.get("auto_map")
                     )
                 selected_type, selected = _select_text_decoder(
                     raw_decoder, key, architecture, parent_type, backend, backend_version
@@ -1888,10 +1974,8 @@ class NaiveKVCacheEstimator:
                     )
                 decoder._is_nested_decoder = key is not None
                 if key is not None:
-                    decoder._wrapper_config = {
-                        **hf_config,
-                        "architectures": architectures if backend == "sglang" else [architecture],
-                    }
+                    decoder._wrapper_config = {**hf_config, "architectures": [architecture]}
+                    decoder._wrapper_requires_residency = needs_wrapper_weights
                 decoder._vllm_native_decoder = resolved_vllm_decoder
                 decoder._checkpoint_dir = checkpoint_dir
                 decoder._vllm_dtype_target = dtype_target
@@ -2154,7 +2238,7 @@ class NaiveKVCacheEstimator:
                         self.geometry,
                         self.tp_size,
                         ignored,
-                        "language_model." if self._is_nested_decoder else "",
+                        self._wrapper_config["architectures"][0] if self._wrapper_config else None,
                         self.architecture == "OPTForCausalLM",
                     )
                 # For mixed or potentially excluded linears retain the execution-width reserve.
@@ -2837,6 +2921,23 @@ class NaiveKVCacheEstimator:
                         dtypes.add(dtype)
             except (OSError, ValueError, AttributeError, KeyError, TypeError) as exc:
                 raise ValueError(f"{problem}: {path.name}") from exc
+        # The serving reader ignores types absent from safetensors.torch's dtype map, including E8M0 scales.
+        dtypes &= _VLLM_FP8_WEIGHT_DTYPES.keys() | {
+            "F16",
+            "BF16",
+            "F32",
+            "F64",
+            "C64",
+            "BOOL",
+            "U8",
+            "U16",
+            "U32",
+            "U64",
+            "I8",
+            "I16",
+            "I32",
+            "I64",
+        }
         if not dtypes:
             return "float32"  # vLLM's default when no weights report a dtype.
         floating = {dtype for dtype in dtypes if dtype.startswith(("F", "BF", "C"))} - _VLLM_FP8_WEIGHT_DTYPES.keys()
@@ -2906,8 +3007,7 @@ class NaiveKVCacheEstimator:
         if decoder is None or self._wrapper_config is None:
             return decoder
         document = self._wrapper_config
-        names = document.get("architectures") or [None]
-        wrapper = names[0]
+        wrapper = document["architectures"][0]
         vision = document.get("vision_config")
         family = document.get("model_type") or _TEXT_CONFIG_DEFAULTS.get(wrapper, (None,))[0]
         llava = wrapper in _TEXT_CONFIG_DEFAULTS and wrapper.startswith("Llava")
@@ -2928,11 +3028,7 @@ class NaiveKVCacheEstimator:
                 vision = {}
             elif (
                 wrapper not in _TEXT_WRAPPERS
-                and not (
-                    self._cache_backend == "vllm"
-                    and is_registered_conditional_generator(wrapper, str(self._cache_release))
-                )
-                and not (self._cache_backend == "sglang" and _sglang_multimodal_generators().intersection(names))
+                and not self._wrapper_requires_residency
                 and not document.get("vision_tower")
                 and not document.get("mm_vision_tower")
                 and document.get("projector_config") is None

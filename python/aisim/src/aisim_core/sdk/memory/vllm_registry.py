@@ -31,7 +31,9 @@ class _Registry(NamedTuple):
 
 @cache
 def _registry(version: str) -> _Registry:
-    names: dict[str, set[str]] = {"vllm": set(), "hf": set(), "hf_incompatible": set(), "config": set()}
+    names: dict[str, set[str]] = {
+        key: set() for key in ("vllm", "multimodal", "other_multimodal", "hf", "hf_incompatible", "config")
+    }
     causal_lms: dict[str, str] = {}
     minor = version.split(".")[1]
     with files(__package__).joinpath("vllm_text_architectures.txt").open(encoding="utf-8") as source:
@@ -39,7 +41,7 @@ def _registry(version: str) -> _Registry:
             if line.startswith("#"):
                 continue
             namespace, versions, suffix, *prefixes = line.split()
-            if minor not in versions.split("/"):
+            if versions != "*" and minor not in versions.split("/"):
                 continue
             ending = "" if suffix == "-" else suffix
             if namespace == "causal":
@@ -79,13 +81,15 @@ def is_known_transformers_config(model_type: str, version: str | None) -> bool:
     return any(model_type in _registry(v).names["config"] for v in _RELEASES)
 
 
-def is_registered_conditional_generator(name: str | None, version: str | None) -> bool:
-    """A registered conditional generation wrapper can construct auxiliary modules from defaults."""
+def is_registered_multimodal(name: str | None, version: str | None) -> bool:
+    """Check the normalized stock entrypoint against the release's multimodal registrations."""
     if not isinstance(name, str):
         return False
     release = _recorded_release(version)
+    if release is None and _normalize(name, _registry(_RELEASES[0]).names["other_multimodal"]) is not None:
+        return True
     return any(
-        (registered := _normalize(name, _registry(v).names["vllm"])) and registered.endswith("ForConditionalGeneration")
+        _normalize(name, _registry(v).names["vllm"]) in _registry(v).names["multimodal"]
         for v in ((release,) if release is not None else _RELEASES)
     )
 
@@ -130,6 +134,10 @@ def _normalize(name: str, stock: set[str]) -> str | None:
     return None
 
 
+def has_remote_model(auto_map: object) -> bool:
+    return isinstance(auto_map, dict) and any(isinstance(key, str) and key.startswith("AutoModel") for key in auto_map)
+
+
 def _select(names: list[str], version: str, remote_model: bool) -> str | None:
     registrations = _registry(version).names
     stock = registrations["vllm"]
@@ -148,13 +156,31 @@ def _select(names: list[str], version: str, remote_model: bool) -> str | None:
     return None
 
 
+def wrapper_requires_residency(
+    names: list[str], version: str | None, auto_map: object, text_decoders: set[str]
+) -> bool:
+    """An unmodeled stock or remote wrapper can own weights outside its nested decoder."""
+    remote_model = has_remote_model(auto_map)
+    if not names:
+        return remote_model
+    release = _recorded_release(version)
+    if release is None and any(_normalize(name, _registry(_RELEASES[0]).names["other_multimodal"]) for name in names):
+        return True
+    for candidate in (release,) if release is not None else _RELEASES:
+        selected = _select(names, candidate, remote_model)
+        if selected is None:
+            if remote_model or any(is_registered_multimodal(name, candidate) for name in names):
+                return True
+        elif selected not in text_decoders or is_registered_multimodal(selected, candidate):
+            return True
+    return False
+
+
 def select_architecture(
     names: list[str], version: str | None, auto_map: object, *, modeled: set[str] | None = None
 ) -> str | None:
     """Select the decoder implementation for a nonempty list on a generation worker."""
-    remote_model = isinstance(auto_map, dict) and any(
-        isinstance(key, str) and key.startswith("AutoModel") for key in auto_map
-    )
+    remote_model = has_remote_model(auto_map)
     if version is not None:
         release = _recorded_release(version)
         # Keep the original class and its compatibility checks on unrecorded releases.
@@ -175,13 +201,11 @@ def select_wrapper_architecture(
     if not names:
         return None
     modeled = any(_normalize(name, wrappers) for name in names)
-    if not modeled and not any(is_registered_conditional_generator(name, version) for name in names):
+    if not modeled and not any(is_registered_multimodal(name, version) for name in names):
         return names[0]
     if version is not None and _recorded_release(version) is None:
-        if not modeled and len(names) > 1:
-            raise ValueError(f"vLLM requires a recorded backend release to select the wrapper in {names!r}")
         return names[0]
     selected = select_architecture(names, version, auto_map)
-    if modeled and selected not in wrappers:
+    if modeled and selected not in wrappers and not is_registered_multimodal(selected, version):
         raise ValueError(f"vLLM cannot derive the text decoder from the selected wrapper in {names!r}")
     return selected
