@@ -147,8 +147,8 @@ aiconfigurator cli estimate --model-path Qwen/Qwen3-32B --system h200_sxm --tp-s
 - `--tp-size` (alias `--tp`): Tensor parallelism size. Default: `1`
 - `--pp-size` (alias `--pp`): Pipeline parallelism size. Default: `1`
 - `--attention-dp-size` (alias `--dp`): Attention data parallelism size. Default: `1`
-- `--moe-tp-size` (alias `--etp`): MoE tensor parallelism size (inferred from the attention width when `--moe-ep-size` is set; a MoE model must set at least one MoE width)
-- `--moe-ep-size` (alias `--ep`): MoE expert parallelism size (inferred from the attention width when `--moe-tp-size` is set; a MoE model must set at least one MoE width)
+- `--moe-tp-size` (alias `--etp`): MoE tensor parallelism size (inferred from the attention width when `--moe-ep-size` is set; a routed MoE model at `tp*attention_dp*cp_size > 1` must set at least one MoE width, while attention width `1` resolves to `1x1`)
+- `--moe-ep-size` (alias `--ep`): MoE expert parallelism size (inferred from the attention width when `--moe-tp-size` is set; a routed MoE model at `tp*attention_dp*cp_size > 1` must set at least one MoE width, while attention width `1` resolves to `1x1`)
 - `--gemm-quant-mode`: GEMM quantization mode (auto-inferred from model config if omitted)
 - `--kvcache-quant-mode`: KV cache quantization mode (auto-inferred if omitted)
 - `--fmha-quant-mode`: FMHA quantization mode (auto-inferred if omitted). DeepSeek-V3 / Kimi-K2.5 context attention (MLA prefill) has no fp8 FMHA data — auto-inferred fp8 is downgraded to `bfloat16` for context-touching estimates (agg, prefill, static, static_ctx), while decode/generation keeps fp8. Explicitly passing `fp8` for a context estimate is rejected with a clear error.
