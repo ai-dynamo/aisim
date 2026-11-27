@@ -83,6 +83,16 @@ class WorkloadSettingsV1(_StrictModel):
 
 
 class WorkerSettingsV1(_StrictModel):
+    """Worker parallelism for an adapter-supplied plan.
+
+    This is the strict layer for MoE widths: ``moe_tp_size`` and
+    ``moe_ep_size`` must be supplied together or not at all, and neither is
+    inferred from the attention width. A one-sided pair is rejected here rather
+    than resolved, unlike :meth:`~aisim_core.sdk.config.ModelConfig.resolve_moe_parallelism`
+    and the KV estimator, which infer a single omitted width and resolve the
+    width-one omission.
+    """
+
     replicas: int = Field(gt=0)
     gpus_per_replica: int = Field(gt=0)
     batch_size: int = Field(gt=0)

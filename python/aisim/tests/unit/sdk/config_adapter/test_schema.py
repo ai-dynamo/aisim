@@ -141,6 +141,12 @@ def test_worker_width_invariants_are_enforced(values):
         WorkerSettingsV1(replicas=1, batch_size=1, **values)
 
 
+def test_worker_moe_widths_are_required_together_without_inference():
+    """The adapter is the strict layer: a one-sided pair is rejected, not resolved."""
+    with pytest.raises(ValidationError, match="moe_tp_size and moe_ep_size must be set together"):
+        WorkerSettingsV1(replicas=1, batch_size=1, gpus_per_replica=2, tp_size=2, moe_tp_size=2)
+
+
 def test_adaptation_outcome_status_invariants_are_enforced():
     error = AdaptationDiagnostic(severity="error", code="invalid", message="invalid")
     warning = AdaptationDiagnostic(severity="warning", code="warning", message="warning")
