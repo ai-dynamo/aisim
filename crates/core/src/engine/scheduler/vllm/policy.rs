@@ -3,8 +3,9 @@
 // Copyright contributors to the vLLM project.
 // Modified Rust simulation of vLLM b3563fc65ae0f5359802593d78e7ea097e1fed31
 // scheduling contracts and of the v0.31.0
-// (db9527a46873454610df6dbedf79a36d6bf1a7f6) and v0.32.0
-// (5df63a7203cdb9328d824a27b682e77c7b9928be) grouped KV rules;
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules;
 // immutable sources and license: THIRD_PARTY_NOTICES.md.
 // MTP slot/admission rules additionally adapted from vLLM v0.32.0, commit
 // 5df63a7203cdb9328d824a27b682e77c7b9928be, vllm/v1/core/sched/scheduler.py
@@ -101,7 +102,6 @@ pub(super) trait PolicySequence {
     fn len(&self) -> usize;
     fn max_output_tokens(&self) -> usize;
     fn generated_tokens(&self) -> usize;
-    fn num_input_tokens(&self) -> usize;
     fn num_allocated_tokens(&self) -> usize;
     fn current_known_blocks(&self) -> usize;
     fn to_completion_blocks(&self) -> usize;
@@ -125,10 +125,6 @@ impl PolicySequence for RequestKvState {
 
     fn generated_tokens(&self) -> usize {
         self.generated_tokens()
-    }
-
-    fn num_input_tokens(&self) -> usize {
-        self.num_input_tokens()
     }
 
     fn num_allocated_tokens(&self) -> usize {
@@ -164,12 +160,14 @@ pub(super) enum AdmissionDecision {
     Reject,
 }
 
-/// Grouped admission. In byte mode (prefix caching off) the pending
-/// forward's physical bytes decide, and logical prompt length remains
-/// independent of bounded cache residency. With `whole_prompt` (prefix
-/// caching on) the blocks of the whole prompt decide, as vLLM's
-/// `allocate_slots` does by default (`mgr:519-536`). Only a prompt whose
-/// blocks do not fit the empty pool is rejected.
+/// Grouped admission. Both modes follow the first test of vLLM's
+/// `allocate_slots`, on by default, which admits a request only when its
+/// whole sequence fits (v0.31 `mgr:519-536`, v0.32 `mgr:522-539`, v0.33
+/// `mgr:531-548`). With `whole_prompt` (prefix caching on) the blocks of the
+/// whole prompt decide. In byte mode (prefix caching off) the bytes of the
+/// whole sequence decide, counted with the admission cap of a window group
+/// and the fixed blocks of the state groups. Only a request that does not
+/// fit the empty pool is rejected.
 pub(super) fn decide_grouped_waiting_admission<S: PolicySequence>(
     sequence: &S,
     kv_manager: &G1Manager,
@@ -218,14 +216,27 @@ pub(super) fn decide_grouped_waiting_admission<S: PolicySequence>(
     if minimum.is_none_or(|bytes| bytes > pool.capacity_bytes()) {
         return Some(AdmissionDecision::Reject);
     }
+    // vLLM's first test counts the blocks of the whole sequence, the output
+    // tokens of a resumed request included (v0.33 `mgr:531-548`). A request
+    // whose whole sequence does not fit the empty pool is never admitted.
+    let whole = kv_manager.grouped_whole_sequence_bytes(required_tokens);
+    if whole > pool.capacity_bytes() {
+        return Some(AdmissionDecision::Reject);
+    }
     if token_budget == 0 || (!enable_chunked_prefill && required_tokens > token_budget) {
         return Some(AdmissionDecision::Wait);
     }
+    if whole > pool.capacity_bytes() - pool.used_bytes() {
+        return Some(AdmissionDecision::Wait);
+    }
+    // vLLM's second test counts the chunk (v0.33 `mgr:570-588`).
     let target = required_tokens.min(token_budget);
     let needed = pool.required_bytes(0, target);
-    // A request whose configured chunk alone exceeds the entire pool must
-    // enter schedule_request, which reports an explicit configuration error.
-    // Contention alone preserves FIFO and must never preempt running work.
+    // After the whole-sequence test above, this test cannot make a request
+    // wait: the bytes of the chunk of a request without blocks are at most
+    // the bytes of its whole sequence. It stays because it is vLLM's second
+    // test. Contention alone preserves FIFO and must never preempt running
+    // work.
     if needed.is_some_and(|bytes| {
         bytes <= pool.capacity_bytes() && bytes > pool.capacity_bytes() - pool.used_bytes()
     }) {
@@ -238,13 +249,12 @@ pub(super) fn decide_grouped_waiting_admission<S: PolicySequence>(
 }
 
 /// Whether a waiting request whose allocation fails may preempt running
-/// work. With grouped prefix caching it may not: admission tests the blocks
-/// of the whole prompt, and the allocation then tests the blocks of the
-/// chunk, as vLLM's `allocate_slots` does (`mgr:519-576`). A waiting request
-/// that fails either test stays queued, because vLLM stops its waiting loop
-/// there (v0.31 `sched:1223-1230`, v0.32 `sched:1275-1282`).
+/// work. On a grouped pool it may not, in byte mode or in block mode. The
+/// request stays queued, because vLLM stops its waiting loop at a request
+/// that `allocate_slots` refuses (`mgr:519-576`, v0.31 `sched:1223-1230`,
+/// v0.32 `sched:1275-1282`).
 pub(super) fn waiting_allocation_may_preempt(kv_manager: &G1Manager) -> bool {
-    kv_manager.grouped_prefix_rules().is_none()
+    kv_manager.grouped().is_none()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -269,14 +279,23 @@ pub(super) enum DestinationAdmissionDecision {
 }
 
 /// `state_blocks` is the transferred recurrent state reserved with the prompt.
+/// A grouped cache passes the bytes of every group for the loaded tokens as
+/// `grouped_required_bytes` and its pool as `grouped_capacity_bytes`. Groups
+/// require vLLM, so the TRT-LLM arm does not read them.
 pub(super) fn destination_capacity_error<S: PolicySequence>(
     policy: SchedulingPolicy,
     sequence: &S,
     num_gpu_blocks: usize,
     state_blocks: usize,
+    grouped_required_bytes: Option<u64>,
+    grouped_capacity_bytes: Option<u64>,
 ) -> Option<&'static str> {
-    let (exceeds, message) = match policy {
-        SchedulingPolicy::Vllm => (
+    let (exceeds, message) = match (policy, grouped_required_bytes, grouped_capacity_bytes) {
+        (SchedulingPolicy::Vllm, Some(required), Some(capacity)) => (
+            required > capacity,
+            "destination prompt and state exceed the grouped KV pool capacity",
+        ),
+        (SchedulingPolicy::Vllm, _, _) => (
             sequence.current_known_blocks().saturating_add(state_blocks) > num_gpu_blocks,
             if state_blocks == 0 {
                 "destination prompt exceeds the KV pool capacity"
@@ -284,7 +303,7 @@ pub(super) fn destination_capacity_error<S: PolicySequence>(
                 "destination prompt and state exceed the KV pool capacity"
             },
         ),
-        SchedulingPolicy::TrtllmGuaranteedNoEvict => (
+        (SchedulingPolicy::TrtllmGuaranteedNoEvict, _, _) => (
             sequence.to_completion_blocks().saturating_add(state_blocks) > num_gpu_blocks,
             "TRT-LLM destination request exceeds the to-completion KV pool capacity",
         ),
@@ -308,11 +327,11 @@ pub(super) fn cap_output_for_model_len(
     }
 }
 
-pub(super) fn should_reject_for_model_len<S: PolicySequence>(
-    sequence: &S,
+pub(super) fn should_reject_for_model_len(
+    prompt_tokens: usize,
     max_model_len: Option<usize>,
 ) -> bool {
-    max_model_len.is_some_and(|limit| sequence.num_input_tokens() >= limit)
+    max_model_len.is_some_and(|limit| prompt_tokens >= limit)
 }
 
 /// Number of additional tokens the request may generate before reaching

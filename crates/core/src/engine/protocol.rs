@@ -98,27 +98,38 @@ pub struct Request {
 }
 
 /// Commands supported by the standalone scheduler.
+///
+/// A KV handoff has a source on the rank that prefills and a destination on
+/// the rank that decodes. A prefill rank refuses the destination commands and
+/// a decode rank refuses the source commands. An aggregated rank takes both,
+/// except with `kv_cache_groups`, where it refuses all six.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Submit one request.
     Submit(Request),
     /// Submit a request whose completed prefill KV must remain source-held.
+    /// A source command, for a prefill rank.
     SubmitHandoffPrefill {
         handoff_id: HandoffId,
         request: Request,
     },
     /// Accept a decode request and reserve its destination KV footprint.
+    /// A destination command, for a decode rank.
     ReserveDestination {
         handoff_id: HandoffId,
         request: Request,
     },
     /// Make a reserved destination runnable after transfer completion.
+    /// A destination command, for a decode rank.
     ActivateDestination { handoff_id: HandoffId },
     /// Release a successfully transferred source hold.
+    /// A source command, for a prefill rank.
     ReleaseSource { handoff_id: HandoffId },
     /// Cancel pending or held source ownership.
+    /// A source command, for a prefill rank.
     CancelSource { handoff_id: HandoffId },
     /// Cancel pending, reserved, or active destination ownership.
+    /// A destination command, for a decode rank.
     CancelDestination { handoff_id: HandoffId },
     /// Cancel one request.
     ///
@@ -160,6 +171,7 @@ pub enum LifecycleEvent {
         handoff_id: HandoffId,
         request_id: Uuid,
         transferable_prompt_tokens: usize,
+        full_local_hit: bool,
     },
     /// A host-aware scheduler reached a scheduler-thread stage for one request.
     TtftMilestone {
@@ -304,7 +316,10 @@ pub struct CacheTierAttribution {
 pub struct Admission {
     /// Admitted request.
     pub request_id: Uuid,
-    /// Prompt tokens reused from all KV-cache tiers.
+    /// Prompt tokens reused from all KV-cache tiers. For a readmission on a
+    /// rank with KV cache groups, the tokens of the request that the
+    /// admission served from the cache, which can include its own output
+    /// tokens.
     pub reused_input_tokens: usize,
     /// Tier provenance captured before a host-loaded prefix becomes G1.
     pub cache_tier_attribution: Option<CacheTierAttribution>,
@@ -402,6 +417,9 @@ pub struct Metrics {
     pub running_requests: u64,
     pub waiting_requests: u64,
     pub preemptions_total: u64,
+    /// G1 lookup performed by a grouped destination at this command or pass
+    /// completion. A blocked reservation still contributes its lookup.
+    pub g1_destination_lookup: Option<PrefixCacheLookupCounts>,
     /// SGLang radix-cache tokens reused by the most recently completed pass.
     ///
     /// Backends without an equivalent pass-local metric report zero.
@@ -450,7 +468,7 @@ pub struct CommandEffects {
     pub suppressed_pending_output: bool,
 }
 
-/// G1 prefix-cache lookup observations at scheduler pass start.
+/// G1 prefix-cache lookup observations during scheduling or destination reservation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PrefixCacheLookupCounts {
     pub query_count: u64,

@@ -603,6 +603,7 @@ def _check_replay(path: Path, original: SupportRequest, collection: dict[str, An
         verify_finalized_data,
         verify_finalized_quality,
     )
+    from .runtime import _ordered_runtime_evidence
     from .validation import _completion_issues, _fpm_artifacts, _prediction_config
 
     report = _json(path)
@@ -644,9 +645,11 @@ def _check_replay(path: Path, original: SupportRequest, collection: dict[str, An
             original,
             observations,
             verified_manifest,
-            source_references=manifest.get("observation_provenance") == "source_references",
+            source_references="observation_provenance" in manifest,
+            observation_format=manifest.get("observation_provenance", "source_references"),
         )
-        if request.profile_deployment().resources.model_dump(mode="json") != expected_resources:
+        actual_resources = request.profile_deployment().resources.model_dump(mode="json")
+        if _ordered_runtime_evidence(actual_resources) != _ordered_runtime_evidence(expected_resources):
             raise ValueError("finalized replay resources differ from verified collection memory")
     request.profile_deployment().resources.require_memory()
     trace = _checked(report["trace"])

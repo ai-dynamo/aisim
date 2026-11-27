@@ -329,6 +329,38 @@ def test_heterogeneous_disagg_requires_one_common_implicit_backend_version(monke
         )
 
 
+def test_heterogeneous_disagg_filters_authored_pairs_without_rebuilding_them(
+    monkeypatch,
+):
+    space = _config(
+        deployment_mode=["disagg"],
+        prefill_hardware_sku="h200_sxm",
+        backend_version="1.0",
+        gpu_budget=500,
+        min_gpu_budget=8,
+    ).search_space
+    role = [ReplicaParallelConfig(_AGG_CFG.shape, count) for count in range(1, 257)]
+    pairs = [DisaggParallelConfig(rank, rank) for rank in reversed(role)]
+    pairs += [DisaggParallelConfig(role[i], role[j]) for i, j in [(10, 20), (20, 10), (10, 5), (5, 20)]]
+
+    def feasible(*args, worker_type, candidate_configs, **kwargs):
+        excluded = role[10] if worker_type == "prefill" else role[20]
+        return [candidate for candidate in candidate_configs if candidate != excluded]
+
+    monkeypatch.setattr(search_space_module, "parallel_configs_for", feasible)
+    monkeypatch.setattr(
+        search_space_module,
+        "DisaggParallelConfig",
+        lambda **kw: pytest.fail("rebuilt a candidate pair"),
+    )
+    found = search_space_module._heterogeneous_disagg_configs(
+        space, backend="trtllm", max_seq_len=512, candidate_configs=pairs
+    )
+    assert found == [
+        pair for pair in pairs if 8 <= pair.total_gpus <= 500 and pair.prefill != role[10] and pair.decode != role[20]
+    ]
+
+
 @pytest.mark.filterwarnings("error")
 def test_all_backends_runner_incompatible_raises_typed_terminal_error(monkeypatch):
     def unexpected_parallel_lookup(*args, **kwargs):

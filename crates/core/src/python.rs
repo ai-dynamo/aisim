@@ -2798,9 +2798,27 @@ fn materialize_aic_capacity(
         role.rank.validate()?;
         return Ok(());
     }
-    if resources.as_ref().is_some_and(|resources| {
+    if let Some(grouped) = resources.as_ref().filter(|resources| {
         resources.cache_layout == crate::perfmodel::fpm::FpmCacheLayout::Grouped
     }) {
+        if matches!(
+            config.worker_type,
+            Some(ForwardPassWorkerType::Prefill | ForwardPassWorkerType::Decode)
+        ) && let Some(observed) = grouped
+            .runtime_memory
+            .as_ref()
+            .and_then(|memory| memory.runtime_framework_version.as_deref())
+            && let Some(version) = &config.backend_version
+        {
+            ensure!(
+                crate::perfmodel::fpm::FpmRuntimeMemoryConfig::matches_grouped_version(
+                    observed,
+                    version,
+                    role.rank.enable_prefix_caching
+                ),
+                "grouped FPM cache P/D requires runtime_memory.runtime_framework_version ({observed}) to equal the deployment's backend_version ({version})"
+            );
+        }
         ensure!(
             !capacity_is_explicit,
             "grouped FPM cache cannot use fixed num_gpu_blocks; use the profile byte budget"
@@ -4790,6 +4808,214 @@ fn run_replay_with_artifacts_json(py: Python<'_>, payload: &str) -> PyResult<Str
         .map_err(replay_python_error)
 }
 
+/// Check the cache group's rules before planning a prefix-cached pilot.
+#[pyfunction]
+fn validate_grouped_prefix_geometry(
+    groups_json: &str,
+    hash_block: usize,
+    version: &str,
+) -> PyResult<()> {
+    let validate = || -> anyhow::Result<()> {
+        let groups: Vec<crate::perfmodel::FpmCacheGroup> = serde_json::from_str(groups_json)?;
+        for group in &groups {
+            group.validate()?;
+        }
+        let version = crate::engine::VllmRuleVersion::parse(version)
+            .ok_or_else(|| anyhow!("unsupported grouped prefix caching version {version}"))?;
+        crate::engine::GroupedPrefixRules::new(&groups, hash_block, version)?;
+        Ok(())
+    };
+    validate().map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// Model dtype recorded by an initialized worker, if this profile has that evidence.
+#[pyfunction]
+#[pyo3(signature = (provenance, model_dtype=None))]
+fn observed_model_dtype(provenance: &str, model_dtype: Option<&str>) -> PyResult<Option<String>> {
+    crate::perfmodel::fpm::NixlIdentity::observed(model_dtype, provenance, None, None, None)
+        .map(|identity| identity.model_dtype)
+        .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+}
+
+/// Compact initialized worker fields for a hash-bound onboarding observation.
+#[pyfunction]
+#[pyo3(signature = (records, architecture=None, kv_cache_bytes=None, cache_groups=None))]
+fn nixl_worker_observations(
+    records: &str,
+    architecture: Option<&str>,
+    kv_cache_bytes: Option<u64>,
+    cache_groups: Option<&str>,
+) -> PyResult<String> {
+    let parse = |s: &str| {
+        serde_json::from_str(s).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    };
+    Ok(crate::perfmodel::fpm::NixlIdentity::compact_observation(
+        &parse(records)?,
+        architecture,
+        kv_cache_bytes,
+        cache_groups.map(parse).transpose()?.as_ref(),
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+    .to_string())
+}
+
+#[pyfunction]
+#[pyo3(signature=(entry, source_sha256, inventory, draft, cell=None))]
+fn nixl_observation_digest(
+    entry: &str,
+    source_sha256: &str,
+    inventory: &str,
+    draft: bool,
+    cell: Option<&str>,
+) -> PyResult<String> {
+    let parse = |value: &str| {
+        serde_json::from_str(value).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid worker observation: {e}"))
+        })
+    };
+    crate::perfmodel::fpm::NixlIdentity::observation_digest(
+        &parse(entry)?,
+        source_sha256,
+        &parse(inventory)?,
+        draft,
+        cell.map(parse).transpose()?.as_ref(),
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+#[pyfunction]
+fn nixl_bound_cell_digests(digests: Vec<String>) -> PyResult<Vec<String>> {
+    crate::perfmodel::fpm::NixlIdentity::bound_cell_digests(digests)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+type ObservationRow<'a> = (&'a str, Option<&'a str>, Option<&'a str>, u64);
+
+/// A selected role's measured NIXL identity. Sweeps compare multiple peers without
+/// decoding the same worker archive again.
+#[pyclass(frozen)]
+struct GroupedPdObservation {
+    identity: crate::perfmodel::fpm::NixlIdentity,
+    kv_cache_dtype: Option<String>,
+    recorded_version: Option<String>,
+}
+
+#[pymethods]
+impl GroupedPdObservation {
+    #[new]
+    #[pyo3(signature=(role, evidence, row=None, tp_size=None, groups=None, architecture=None, memory=None, scheduler_limits=None))]
+    fn new(
+        role: &str,
+        evidence: (&str, Option<&str>, &str),
+        row: Option<ObservationRow<'_>>,
+        tp_size: Option<u64>,
+        groups: Option<&str>,
+        architecture: Option<&str>,
+        memory: Option<&str>,
+        scheduler_limits: Option<(u64, u64)>,
+    ) -> PyResult<Self> {
+        let (provenance, dtype, backend) = evidence;
+        let select = || {
+            let mut identity = crate::perfmodel::fpm::NixlIdentity::observed(
+                dtype,
+                provenance,
+                row.map(|r| r.3),
+                tp_size,
+                architecture,
+            )?;
+            if let Some(memory) = memory {
+                identity.selected_memory(
+                    &serde_json::from_str(memory)
+                        .map_err(|error| crate::AicError::InvalidEngineConfig(error.to_string()))?,
+                    scheduler_limits.map(|(tokens, batch)| (Some(tokens), Some(batch))),
+                )?;
+            }
+            if let Some(groups) = groups {
+                identity
+                    .selected_groups(&serde_json::from_str(groups).map_err(|error| {
+                        crate::AicError::InvalidEngineConfig(error.to_string())
+                    })?)?;
+            }
+            identity.select(
+                role,
+                Some(backend),
+                row.map(|r| r.0),
+                row.and_then(|r| r.1),
+                row.and_then(|r| r.2),
+                false,
+            )?;
+            Ok::<_, crate::AicError>(Self {
+                identity,
+                kv_cache_dtype: row.map(|r| r.0.to_owned()),
+                recorded_version: row.and_then(|r| r.2).map(str::to_owned),
+            })
+        };
+        select().map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn requirement(&self, decode: &Self) -> Option<String> {
+        if matches!((&self.kv_cache_dtype, &decode.kv_cache_dtype), (Some(a), Some(b)) if a != b) {
+            return Some("matching kv_cache_dtype".to_owned());
+        }
+        if matches!((&self.identity.attention_backend, &decode.identity.attention_backend), (Some(a), Some(b)) if a != b)
+        {
+            return Some("matching attention_backend when both backends are known".to_owned());
+        }
+        self.identity
+            .mismatch(&decode.identity)
+            .map(|(field, _, _)| format!("matching {field} when both runtimes recorded it"))
+    }
+
+    fn require_warm_version(&self) -> PyResult<()> {
+        self.identity
+            .check_version(self.recorded_version.as_deref(), true)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+}
+
+/// Compare runtime evidence for two selected rows without retaining their identities.
+#[pyfunction]
+#[pyo3(signature = (prefill, decode, prefill_row=None, decode_row=None, tp_size=None, prefix_caching=(false,false), architecture=None))]
+fn grouped_observation_requirement(
+    prefill: (&str, Option<&str>, &str),
+    decode: (&str, Option<&str>, &str),
+    prefill_row: Option<ObservationRow<'_>>,
+    decode_row: Option<ObservationRow<'_>>,
+    tp_size: Option<u64>,
+    prefix_caching: (bool, bool),
+    architecture: Option<&str>,
+) -> PyResult<Option<String>> {
+    let prefill = GroupedPdObservation::new(
+        "prefill",
+        prefill,
+        prefill_row,
+        tp_size,
+        None,
+        architecture,
+        None,
+        None,
+    )?;
+    let decode = GroupedPdObservation::new(
+        "decode",
+        decode,
+        decode_row,
+        tp_size,
+        None,
+        architecture,
+        None,
+        None,
+    )?;
+    if let Some(reason) = prefill.requirement(&decode) {
+        return Ok(Some(reason));
+    }
+    for (rank, warm) in [(&prefill, prefix_caching.0), (&decode, prefix_caching.1)] {
+        if warm {
+            rank.require_warm_version()?;
+        }
+    }
+    Ok(None)
+}
+
 #[pyfunction]
 fn canonical_timing_config_json(payload: &str, worker_type: &str) -> PyResult<String> {
     let convert = || -> anyhow::Result<String> {
@@ -4893,6 +5119,13 @@ fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(canonical_timing_config_json, module)?)?;
+    module.add_function(wrap_pyfunction!(validate_grouped_prefix_geometry, module)?)?;
+    module.add_function(wrap_pyfunction!(observed_model_dtype, module)?)?;
+    module.add_class::<GroupedPdObservation>()?;
+    module.add_function(wrap_pyfunction!(grouped_observation_requirement, module)?)?;
+    module.add_function(wrap_pyfunction!(nixl_bound_cell_digests, module)?)?;
+    module.add_function(wrap_pyfunction!(nixl_worker_observations, module)?)?;
+    module.add_function(wrap_pyfunction!(nixl_observation_digest, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_with_artifacts_json, module)?)?;
     module.add_function(wrap_pyfunction!(scan_weka_requests, module)?)?;

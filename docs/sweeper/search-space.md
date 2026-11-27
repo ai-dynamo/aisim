@@ -386,7 +386,9 @@ Every resulting candidate records `kv_load_ratio`, the derived `concurrency`,
 `kv_load_capacity_tokens` and per-role `*_kv_capacity_tokens`. These token fields
 are absent for grouped caches, which instead record `kv_load_capacity_bytes`,
 `kv_load_request_cache_bytes`. Consumers must treat token-capacity fields as optional
-and use the byte-based fields for grouped layouts.
+and use the byte-based fields for grouped layouts. Grouped prefill sizing uses
+`isl` occupied tokens per request. Grouped decode and aggregated sizing use
+`isl + floor(osl / 2)`.
 
 ## `num_request_ratio` (synthetic length scales with the load)
 

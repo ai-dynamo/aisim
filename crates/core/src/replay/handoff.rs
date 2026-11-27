@@ -27,6 +27,8 @@ pub enum HandoffFact {
     DestinationReserved {
         handoff_id: HandoffId,
         transferable_prompt_tokens: usize,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        full_local_hit: bool,
     },
     TransferCompleted {
         handoff_id: HandoffId,
@@ -240,6 +242,7 @@ struct DestinationProgress {
     accepted: bool,
     reserved: bool,
     transferable_prompt_tokens: Option<usize>,
+    full_local_hit: bool,
     activation_issued: bool,
     activation_applied: bool,
     cancel_issued: bool,
@@ -334,6 +337,7 @@ impl HandoffCoordinatorCore {
             }
             HandoffFact::DestinationReserved {
                 transferable_prompt_tokens,
+                full_local_hit,
                 ..
             } => {
                 if self.destination.reserved {
@@ -343,6 +347,7 @@ impl HandoffCoordinatorCore {
                     bail!("destination reserved before ownership was accepted");
                 }
                 self.destination.reserved = true;
+                self.destination.full_local_hit = full_local_hit;
                 self.destination.transferable_prompt_tokens = Some(transferable_prompt_tokens);
                 self.advance_active()
             }
@@ -470,14 +475,18 @@ impl HandoffCoordinatorCore {
                 .destination
                 .transferable_prompt_tokens
                 .expect("reserved destination must report its transferable footprint");
-            return Ok(vec![
-                self.issue(HandoffAction::StartTransfer {
-                    handoff_id: self.handoff_id,
-                    delay_ms: transfer_timing
+            return Ok(vec![self.issue(HandoffAction::StartTransfer {
+                handoff_id: self.handoff_id,
+                delay_ms: if self.destination.full_local_hit
+                    && transfer_timing.mode == crate::engine::TransferTimingMode::DestinationMissing
+                {
+                    0.0
+                } else {
+                    transfer_timing
                         .delay_ms(transferable_prompt_tokens)
-                        .unwrap_or(self.fallback_transfer_delay_ms),
-                }),
-            ]);
+                        .unwrap_or(self.fallback_transfer_delay_ms)
+                },
+            })]);
         }
         if self.transfer.completed && !self.destination.activation_issued {
             self.destination.activation_issued = true;
@@ -653,12 +662,39 @@ mod tests {
             .on_fact(HandoffFact::DestinationReserved {
                 handoff_id,
                 transferable_prompt_tokens: 3,
+                full_local_hit: false,
             })
             .unwrap()
             .remove(0);
         match transfer.action {
             HandoffAction::StartTransfer { delay_ms, .. } => delay_ms,
             action => panic!("expected transfer action, got {action:?}"),
+        }
+    }
+
+    #[test]
+    fn destination_reserved_preserves_historical_json() {
+        let handoff_id = HandoffId::new(Uuid::from_u128(1));
+        let mut historical = serde_json::json!({
+            "DestinationReserved": { "handoff_id": handoff_id, "transferable_prompt_tokens": 0 }
+        });
+        let fact = |full_local_hit| HandoffFact::DestinationReserved {
+            handoff_id,
+            transferable_prompt_tokens: 0,
+            full_local_hit,
+        };
+        for full_local_hit in [false, true] {
+            if full_local_hit {
+                historical["DestinationReserved"]["full_local_hit"] = true.into();
+            }
+            assert_eq!(
+                serde_json::to_value(fact(full_local_hit)).unwrap(),
+                historical
+            );
+            assert_eq!(
+                serde_json::from_value::<HandoffFact>(historical.clone()).unwrap(),
+                fact(full_local_hit)
+            );
         }
     }
 

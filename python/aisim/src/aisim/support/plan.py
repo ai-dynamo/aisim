@@ -14,6 +14,7 @@ import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from enum import IntEnum, auto
 from importlib.resources import files
 from importlib.util import find_spec, module_from_spec
 from pathlib import Path
@@ -22,7 +23,11 @@ from typing import Any
 import yaml
 
 from aisim.config import CorePredictionConfig, CoreRecommendationConfig
-from aisim.config.engine import GROUPED_PREFIX_CACHING_VERSIONS, grouped_prefix_caching_requirements
+from aisim.config.engine import (
+    GROUPED_PREFIX_CACHING_VERSIONS,
+    GroupedPrefixGeometryError,
+    grouped_prefix_caching_requirements,
+)
 
 from .config_profile import _cache_group_shapes, linear_block_size, linear_runtime_resources
 from .fpm import fpm_cli_args
@@ -36,6 +41,22 @@ _GLM_ARCHITECTURE = "Glm5NextForConditionalGeneration"
 # and audited_release; onboard init must not import the observer. A test keeps the copies equal.
 MEMORY_OBSERVATION_VERSIONS = ("0.27.0", "0.32.0", "0.33.0")
 SOURCE_MANIFEST_RELEASES = ("0.32.0", "0.33.0")
+
+
+class _PlannerVersion(IntEnum):
+    """The successive planner changes that altered a grouped plan's files or cache bound."""
+
+    BEFORE_CLI_RENAME = auto()
+    BEFORE_GROUPED_PREFIX_CACHING = auto()
+    BEFORE_STATE_STARTUP_BOUND = auto()
+    BEFORE_WINDOW_STARTUP_BOUND = auto()
+    BEFORE_CONVOLUTION_PREFIX_CACHING = auto()
+    BEFORE_CONVOLUTION_GEOMETRY_CHECK = auto()
+    CURRENT = auto()
+
+
+class _PoolRefusal(ValueError):
+    """The planner's refusal of a pool that cannot hold the grouped cache peak of one request."""
 
 
 def audited_memory_release(version: str | None) -> str | None:
@@ -136,8 +157,9 @@ def _probe_observed_resources(request: SupportRequest) -> dict[str, Any] | None:
 
 
 def _configs(
-    request: SupportRequest, root: Path, *, grouped_cold: bool = False
+    request: SupportRequest, root: Path, *, grouped_cold: bool = False, restore_unchecked_convolution: bool = False
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, int]]]:
+    historical_warm = False
     preset = request.parallelism()
     workload = request.workload
     common = {
@@ -184,10 +206,19 @@ def _configs(
                     architecture=request.fpm_profile.architecture,
                     prefix_match_unit=None,
                     max_batched_tokens=worker["scheduler"]["max_batched_tokens"],
+                    pd_rank=request.worker_type in {"prefill", "decode"},
                 )
                 prefix_caching = (
                     not grouped_cold and _evidence_version(request, deployment) == deployment.backend_version
                 )
+            except GroupedPrefixGeometryError:
+                # The immediately preceding planner wrote the warm flag for this
+                # geometry. Reconstruct it only when verifying that saved manifest.
+                historical_warm = (
+                    restore_unchecked_convolution
+                    and _evidence_version(request, deployment) == deployment.backend_version
+                )
+                prefix_caching = False
             except ValueError:
                 prefix_caching = False
             worker.setdefault("kv_cache", {})["prefix_caching"] = prefix_caching
@@ -200,6 +231,8 @@ def _configs(
     if request.worker_type in {"prefill", "decode"}:
         # A role is independently collectable. A complete P/D serving config
         # also needs the independently accepted counterpart and runtime support.
+        if historical_warm:
+            worker["kv_cache"]["prefix_caching"] = True
         worker["timing"]["systems_paths"] = [str(root / "systems")]
         return (
             {
@@ -233,6 +266,9 @@ def _configs(
         "optimizer": {"algorithm": "random", "max_trials": 1, "parallelism": 1, "seed": request.search.seed},
     }
     CoreRecommendationConfig.model_validate(recommendation)
+    if historical_warm:
+        # The two validated pilot documents share this worker's cache settings.
+        worker["kv_cache"]["prefix_caching"] = True
     return prediction, {"pilot": recommendation}, [preset]
 
 
@@ -345,7 +381,10 @@ def _commands(
 
 
 def _plan_documents(
-    request: SupportRequest, root: Path, *, legacy_cli: bool = False, grouped_cold: bool = False
+    request: SupportRequest,
+    root: Path,
+    *,
+    planner: _PlannerVersion = _PlannerVersion.CURRENT,
 ) -> tuple[dict[str, Any], dict[Path, bytes]]:
     package_spec = find_spec("aisim_core")
     if package_spec is None:
@@ -357,9 +396,22 @@ def _plan_documents(
             f"GPU {request.identity.gpu!r} has no packaged system specification; "
             "new GPU architectures require integration"
         )
+    legacy_cli = planner == _PlannerVersion.BEFORE_CLI_RENAME
     if request.identity.framework_version is None:
         return _pending_version_documents(request, root, legacy_cli=legacy_cli)
-    prediction, recommendations, presets = _configs(request, root, grouped_cold=grouped_cold)
+    grouped_cold = planner <= _PlannerVersion.BEFORE_GROUPED_PREFIX_CACHING
+    if (
+        not grouped_cold
+        and planner <= _PlannerVersion.BEFORE_CONVOLUTION_PREFIX_CACHING
+        and request.fpm_profile is not None
+    ):
+        grouped_cold = any(group.kind == "convolution" for group in request.profile_deployment().resources.cache_groups)
+    prediction, recommendations, presets = _configs(
+        request,
+        root,
+        grouped_cold=grouped_cold,
+        restore_unchecked_convolution=planner == _PlannerVersion.BEFORE_CONVOLUTION_GEOMETRY_CHECK,
+    )
     commands = _commands(request, root, list(recommendations), legacy_cli=legacy_cli)
     runtime_prerequisite = (
         "Prepare and verify the declared model/tokenizer snapshots, visible GPUs, model access and compatible "
@@ -481,9 +533,31 @@ def _plan_documents(
                 else "Native timing collection policy; runtime memory observation is unavailable for this vLLM version."
             )
         elif deployment.resources.cache_layout == "grouped":
+            if planner <= _PlannerVersion.BEFORE_WINDOW_STARTUP_BOUND:
+                # Windows used one chunk before e08c69e70. Align state added its startup pages in 900472e40.
+                memory = deployment.resources.runtime_memory
+                state_startup = (
+                    planner == _PlannerVersion.BEFORE_WINDOW_STARTUP_BOUND
+                    and memory is not None
+                    and memory.mamba_cache_mode == "align"
+                )
+                context, chunk = request.search.context_length, scheduler["max_batched_tokens"]
+                peak = 0
+                for group in estimate["cache_groups"]:
+                    block, window = group["block_size_tokens"], group.get("sliding_window")
+                    if group["kind"] == "state":
+                        pages = group["blocks_per_request"]
+                        if state_startup and group.get("prefix_cacheable"):
+                            pages += 1 + (group.get("prefill_checkpoint_blocks") or 0)
+                    elif window is not None:
+                        pages = min(-(-context // block), -(-(window - 1 + chunk + block - 1) // block))
+                    else:
+                        pages = -(-context // block)
+                    peak += pages * group["page_size_bytes"]
+                estimate["request_peak_cache_bytes"] = peak
             if estimate["request_peak_cache_bytes"] > estimate["total_kv_size_bytes"]:
                 source = "observed" if deployment.resources.memory_source == "runtime" else "declared"
-                raise ValueError(
+                raise _PoolRefusal(
                     f"{source} FPM resources leave insufficient rank-local bytes for grouped cache peak allocation"
                 )
         elif deployment.resources.memory_source == "runtime":
@@ -749,17 +823,34 @@ def check_plan(request: SupportRequest, root: Path, *, allow_missing: bool = Fal
         raise ValueError(f"saved request in {root} was modified or cannot be read") from exc
     if request_id(saved) != prior["request_id"] or validation_id(saved) != prior.get("validation_id"):
         raise ValueError(f"saved request identity in {root} was modified or differs from the requested plan")
-    expected, documents = _plan_documents(saved, root)
+    try:
+        expected, documents = _plan_documents(saved, root)
+        refusal, completed = None, True
+    except _PoolRefusal as exc:
+        expected, refusal, completed = None, exc, False
     if prior != expected:
         # Validate the entire original presentation, including its generated-file
         # hashes. Do not rewrite saved commands/evidence or ignore differing fields.
         # A plan saved before replay modeled grouped prefix caching keeps its
         # grouped replay cold until `onboard plan --overwrite` writes it again.
-        for legacy_cli, grouped_cold in ((True, False), (False, True), (True, True)):
-            expected, documents = _plan_documents(saved, root, legacy_cli=legacy_cli, grouped_cold=grouped_cold)
+        # A plan saved before the peak bound counted vLLM's startup blocks keeps
+        # its value until `onboard plan --overwrite` writes it again. When its
+        # pool is too small for the plan of this checkout, it keeps its value,
+        # because the planner refuses to write it again. Only the pool refusal of
+        # a rendering is caught; every other error of a rendering is raised.
+        # Only combinations that one planner could have produced are valid.
+        for planner in reversed(tuple(_PlannerVersion)[:-1]):
+            try:
+                expected, documents = _plan_documents(saved, root, planner=planner)
+            except _PoolRefusal:
+                continue
+            completed = True
             if prior == expected:
                 break
         else:
+            # The pool refusal stands only when every rendering refused the pool.
+            if not completed:
+                raise refusal
             raise ValueError(
                 f"generated plan input {root / 'support-plan.json'} was modified; choose a new output directory"
             )

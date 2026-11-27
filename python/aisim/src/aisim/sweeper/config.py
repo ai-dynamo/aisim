@@ -1243,44 +1243,46 @@ class SearchSpace(BaseModel):
         profile = load_fpm_profile(self.fpm_profile)
         if not any(deployment.resources.cache_layout == "grouped" for deployment in profile.deployments):
             return self
-        from .search_space import _fpm_parallel_configs, _parallel_role, _role_runtime
+        from .model_hw import NoViableParallelConfig, NoWarmParallelConfig
+        from .search_space import _fpm_parallel_configs, _role_runtime
+
+        backend_version = self.requested_backend_version("vllm")
+
+        def validate_role(role, deployment):
+            if self.aic_nextn or self.speculation is not None:
+                raise ValueError("grouped FPM cache requires vLLM without speculative decoding")
+            if role == "agg" and self.agg_enable_prefix_caching:
+                grouped_prefix_caching_requirements(
+                    deployment,
+                    backend_version=backend_version,
+                    architecture=profile.architecture,
+                    prefix_match_unit=None,
+                    max_batched_tokens=(
+                        deployment.resources.max_num_tokens
+                        if deployment.resources.runtime_memory is not None
+                        else _role_runtime(self, "vllm", role)[0]
+                    ),
+                    field=f"{role}_enable_prefix_caching",
+                    pd_rank=False,
+                )
+            if getattr(self, f"{role}_native_host_offload") is not None:
+                raise ValueError("grouped FPM cache supports only HBM without host offload")
+            if (
+                getattr(self, f"{role}_num_gpu_blocks") is not None
+                or getattr(self, f"{role}_kv_bytes_per_token") != "auto"
+            ):
+                raise ValueError("grouped FPM cache requires profile groups and a byte budget, not scalar capacity")
 
         for mode in self.deployment_mode:
-            configs = _fpm_parallel_configs(self, mode)
-            for role in ("agg",) if mode == "agg" else ("prefill", "decode"):
-                for shape in {_parallel_role(config, role).shape for config in configs}:
-                    deployment = profile.select(
-                        model=self.model_name,
-                        worker_type="aggregated" if role == "agg" else role,
-                        system=self.hardware_sku_for(role),
-                        backend="vllm",
-                        backend_version=self.requested_backend_version("vllm"),
-                        tp_size=shape.tp,
-                        pp_size=shape.pp,
-                        attention_dp_size=shape.dp,
-                        moe_tp_size=shape.moe_tp,
-                        moe_ep_size=shape.moe_ep,
-                    )
-                    if deployment.resources.cache_layout != "grouped":
-                        continue
-                    if role != "agg" or self.aic_nextn or self.speculation is not None:
-                        raise ValueError("grouped FPM cache requires aggregated vLLM without speculative decoding")
-                    if self.agg_enable_prefix_caching:
-                        # The search has no prefix_match_unit. Each candidate is checked again with its own budget.
-                        grouped_prefix_caching_requirements(
-                            deployment,
-                            backend_version=self.requested_backend_version("vllm"),
-                            architecture=profile.architecture,
-                            prefix_match_unit=None,
-                            max_batched_tokens=_role_runtime(self, "vllm", "agg")[0],
-                            field="agg_enable_prefix_caching",
-                        )
-                    if self.agg_native_host_offload is not None:
-                        raise ValueError("grouped FPM cache supports only HBM without host offload")
-                    if self.agg_num_gpu_blocks is not None or self.agg_kv_bytes_per_token != "auto":
-                        raise ValueError(
-                            "grouped FPM cache requires profile groups and a byte budget, not scalar capacity"
-                        )
+            try:
+                _fpm_parallel_configs(self, mode, validate_grouped_role=validate_role)
+            except NoViableParallelConfig as error:
+                if isinstance(error, NoWarmParallelConfig) and (
+                    len(set(self.deployment_mode)) == 1
+                    or self.parallel_configs_by_mode.get(mode, self.parallel_configs)
+                    or self.parallel_custom_configs_by_mode.get(mode)
+                ):
+                    raise
         return self
 
 

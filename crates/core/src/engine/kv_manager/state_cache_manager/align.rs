@@ -120,14 +120,10 @@ impl StateAlignRules {
         block: usize,
         junction: Option<usize>,
     ) -> bool {
-        let tail = self.partial_tail(prompt);
         tokens == self.replay_boundary(prompt, block)
             || (matches!(self.layout, Layout::StateCache { .. })
                 && tokens == self.last_cacheable_stop(prompt))
-            || (self.alignment == self.hash
-                && self.hash < block
-                && !tail.is_multiple_of(block)
-                && tokens == tail)
+            || self.retains_partial(prompt, tokens, block)
             || junction.is_some_and(|pos| {
                 tokens
                     == match self.layout {
@@ -135,6 +131,13 @@ impl StateAlignRules {
                         Layout::Grouped(_) => self.block_floor(pos, block),
                     }
             })
+    }
+
+    pub(crate) fn retains_partial(self, prompt: usize, tokens: usize, block: usize) -> bool {
+        self.alignment == self.hash
+            && self.hash < block
+            && !tokens.is_multiple_of(block)
+            && tokens == self.partial_tail(prompt)
     }
 
     pub(crate) fn checkpoint_position(self, end: usize) -> usize {

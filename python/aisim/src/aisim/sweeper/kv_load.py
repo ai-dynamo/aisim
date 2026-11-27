@@ -20,6 +20,17 @@ class InfeasibleKVCapacity(ValueError):
     """A candidate's selected shape and batching leave no usable KV capacity."""
 
 
+def validate_scheduler_envelope(resources, sample: dict[str, Any], role: str) -> None:
+    """Reject an incompatible trial before materializing its deployment or pricing its KV load."""
+    try:
+        resources.validate_envelope(
+            max_num_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
+            max_batch_size=int(sample[f"{role}_max_num_seqs"]),
+        )
+    except ValueError as error:
+        raise InfeasibleKVCapacity(str(error)) from error
+
+
 @dataclass(frozen=True)
 class KVLoadResolution:
     """The requested normalized load and the concrete closed-loop concurrency."""
@@ -192,10 +203,12 @@ def _role_grouped_capacity(
         moe_tp_size=shape.moe_tp,
         moe_ep_size=shape.moe_ep,
     )
+    if role != "agg" or deployment.resources.cache_layout == "grouped":
+        validate_scheduler_envelope(deployment.resources, sample, role)
     if deployment.resources.cache_layout != "grouped":
         return None
-    if role != "agg" or sample.get(f"{role}_num_gpu_blocks") is not None:
-        raise ValueError("grouped FPM cache requires aggregated replay without fixed scalar blocks")
+    if sample.get(f"{role}_num_gpu_blocks") is not None:
+        raise ValueError("grouped FPM cache requires replay without fixed scalar blocks")
     roots = resolved.get("systems_paths")
     if not roots and resolved.get("systems_path"):
         roots = [resolved["systems_path"]]
@@ -214,7 +227,8 @@ def _role_grouped_capacity(
             backend_version=identity["backend_version"],
             fpm_profile=profile,
             worker_type="aggregated" if role == "agg" else role,
-            context_length=sample.get("context_length"),
+            # The role's own context first, then the global one, as its deployment resolves max_model_len.
+            context_length=sample.get(f"{role}_context_length") or sample.get("context_length"),
             request_occupancy_tokens=request_occupancy_tokens,
             max_num_tokens=int(sample[f"{role}_max_num_batched_tokens"]),
             max_batch_size=int(sample[f"{role}_max_num_seqs"]),
@@ -248,7 +262,8 @@ def resolve_kv_load(
     """Map a normalized KV load to candidate-specific closed-loop concurrency.
 
     ``ratio=1`` is the estimated steady-state KV occupancy where each in-flight
-    request holds ``isl + floor(osl / 2)`` tokens on average. ``ratio=0`` is the
+    decode or aggregated request holds ``isl + floor(osl / 2)`` tokens on average.
+    A grouped prefill worker holds only the input tokens. ``ratio=0`` is the
     minimum useful replay load and therefore maps to one request.
     """
     if workload.isl is None or workload.osl is None:
@@ -299,7 +314,7 @@ def resolve_kv_load(
             role=role,
             config=config,
             backend_version=backend_version,
-            request_occupancy_tokens=expected_tokens_per_request,
+            request_occupancy_tokens=isl if role == "prefill" else expected_tokens_per_request,
         )
         if grouped is not None:
             capacity_bytes[role], request_bytes[role], request_capacities[role] = grouped

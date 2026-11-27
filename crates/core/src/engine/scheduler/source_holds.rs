@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
-use crate::engine::common::protocols::DirectRequest;
+use crate::engine::common::protocols::{DirectRequest, WorkerType};
 use crate::engine::{HandoffId, HandoffTransferTiming, TtftMilestone};
 
 pub enum SchedulerCommand {
@@ -42,6 +42,33 @@ pub enum SchedulerCommand {
     },
 }
 
+impl SchedulerCommand {
+    /// Refuse a KV handoff command of the opposite role: a decode rank holds
+    /// no source and a prefill rank loads no destination. An aggregated rank
+    /// has no opposite role.
+    pub(crate) fn ensure_handoff_role(&self, worker_type: WorkerType) -> Result<()> {
+        // The command and, of the prefill and decode roles, the one that takes it.
+        let (kind, role) = match self {
+            Self::SubmitHandoffPrefill { .. } => ("SubmitHandoffPrefill", WorkerType::Prefill),
+            Self::ReleaseSource { .. } => ("ReleaseSource", WorkerType::Prefill),
+            Self::CancelSource { .. } => ("CancelSource", WorkerType::Prefill),
+            Self::ReserveDestination { .. } => ("ReserveDestination", WorkerType::Decode),
+            Self::ActivateDestination { .. } => ("ActivateDestination", WorkerType::Decode),
+            Self::CancelDestination { .. } => ("CancelDestination", WorkerType::Decode),
+            Self::Submit(_) | Self::CancelRequest { .. } => return Ok(()),
+        };
+        match (worker_type, role) {
+            (WorkerType::Decode, WorkerType::Prefill) => bail!(
+                "a decode rank holds no KV handoff source, so it refuses {kind}; a prefill rank takes it"
+            ),
+            (WorkerType::Prefill, WorkerType::Decode) => bail!(
+                "a prefill rank loads no KV handoff destination, so it refuses {kind}; a decode rank takes it"
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerCommandResult {
     Submitted(Uuid),
@@ -61,6 +88,7 @@ pub enum SchedulerLifecycleEvent {
         handoff_id: HandoffId,
         request_id: Uuid,
         transferable_prompt_tokens: usize,
+        full_local_hit: bool,
     },
     TtftMilestone {
         request_id: Uuid,

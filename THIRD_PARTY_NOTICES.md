@@ -658,6 +658,13 @@ its step. Its align module adapts the prefill split and retention boundaries,
 including the checkpoint branch of v0.32.0 and the checkpoint position and
 validity tests in `kv_cache_interface.py`. The grouped coordinator adapts the
 admission cap of a sliding-window group from that same interface.
+From `kv_cache_manager.py`, `kv_cache_coordinator.py` and `sched/scheduler.py`,
+the grouped coordinator also adapts the local prefix that a decode rank takes for a KV load: the
+full-attention hit of a model with Mamba layers unless another group hits
+deeper, and otherwise the hit that every group agrees on.
+From `single_type_kv_cache_manager.py`, the state cache manager also adapts the count of a state
+group's own hit in both admission tests of a KV load. The decode rank then
+drops that hit block without holding it.
 From `block_pool.py`, it adapts the lookup of one spec group and the free order
 of cached blocks. From `kv_cache_utils.py`, it adapts the rule that the hash
 block divides the block of every prefix-cacheable group. From `engine/core.py`,
@@ -665,11 +672,20 @@ it adapts the block of the align split, which is the smallest block of the
 prefix-cacheable groups. From `config/vllm.py`, it adapts the bound on in-flight
 tokens that the admission cap uses. The test module ports cases from the
 upstream tests listed below.
-From v0.31.0 and v0.32.0, `crates/core/src/engine/kv_manager/vllm_backend.rs`
+From `block_pool.py` of v0.31.0, v0.32.0 and v0.33.0,
+`crates/core/src/engine/cache/vllm_block_pool.rs` adapts the later keys that one
+cached block of a grouped pool holds beside its first key, and their removal
+with the block when it is evicted. With the full-attention manager of
+`single_type_kv_cache_manager.py`, which registers the prompt's tail entry
+again in the cache step that gives a block its full key, it adapts the order
+of the blocks of a key: such a block becomes the last block of its tail key.
+From v0.31.0, v0.32.0 and v0.33.0, `crates/core/src/engine/kv_manager/vllm_backend.rs`
 adapts, from `kv_cache_manager.py`, the whole-prompt admission cost of
 `allocate_slots`, its test of the first chunk before the hit blocks are
 pinned and the prefill end of a request that resumes after a preemption, and
-`grouped_prefix.rs` counts the blocks of that first chunk.
+`grouped_prefix.rs` counts the blocks of that first chunk. From `request.py`,
+`vllm_backend.rs` adapts the block hashes that each output token of a request
+extends.
 `crates/core/src/engine/scheduler/vllm/policy.rs` adapts the whole-prompt test
 of `allocate_slots` and, from `sched/scheduler.py`, the token budget of a prompt
 without chunked prefill and the stop of the waiting loop at a request that does
@@ -683,7 +699,13 @@ tests of these rules.
 check of `kv_cache_utils.py` that the pool holds one request of `max_model_len`
 tokens, with the size of each group from `kv_cache_interface.py`, summed per
 group.
-In v0.33.0 that check is in `kv_cache_planning.py`. `config.rs` also refuses
+In v0.33.0 that check is in `kv_cache_planning.py`.
+`crates/core/src/perfmodel/fpm/resources.rs` adapts, from
+`kv_cache_interface.py`, the startup size of a `MambaSpec` in align mode and the
+startup size of a `SlidingWindowSpec`, which is its admission cap, and, from
+`config/vllm.py`, the bound on in-flight tokens that the cap uses, with two
+concurrent batches, for the peak cache bound of planning.
+`config.rs` also refuses
 `prefill_schedule_interval` above 1 on the v0.33.0 row, because
 `sched/scheduler.py` of v0.33.0 applies that interval without data parallelism
 and the simulation does not.
@@ -691,7 +713,16 @@ From `sched/scheduler.py` and `kv_cache_interface.py`, `grouped_prefix.rs` also
 adapts the rule that only a rank with a Mamba layer in align mode splits its
 prefill.
 `crates/core/src/engine/scheduler/vllm/core.rs` and `vllm_backend.rs` adapt the
-release of the skipped blocks of a completed source.
+release of the skipped blocks of an ending request on a prefill or decode rank,
+before the release of its other blocks.
+`vllm_backend.rs` also adapts the two admission tests of an async KV load and
+the reservation of the blocks that the loads in flight still need, which
+`grouped_prefix.rs` counts by `_request_remaining_blocks` of
+`sched/scheduler.py` with the admission cap of a sliding-window group.
+`core.rs` also adapts the set of prefills in flight of `sched/scheduler.py`,
+so that a decode rank keeps free what its local prefills still need. `core.rs`
+also adapts the queue order that serves the requests that hold KV blocks first.
+`crates/core/tests/runtime_contract.rs` holds replay tests of these rules.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_coordinator.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
@@ -702,6 +733,7 @@ release of the skipped blocks of a completed source.
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/block_pool.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/core.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/vllm.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/request.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_coordinator.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
@@ -712,6 +744,7 @@ release of the skipped blocks of a completed source.
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/block_pool.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/request.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/tests/v1/core/test_mamba_align_chunk_split.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_coordinator.py
@@ -724,6 +757,7 @@ release of the skipped blocks of a completed source.
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/block_pool.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py
 - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/vllm.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/request.py
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
@@ -740,42 +774,166 @@ file is vendored.
 The repository-root file `crates/core/src/engine/kv_manager/grouped_transfer.rs`
 adapts the P/D transfer rules of vLLM's NIXL connector and KV cache manager
 from vLLM v0.31.0, immutable commit `db9527a46873454610df6dbedf79a36d6bf1a7f6`,
-and from vLLM v0.32.0, immutable commit
-`5df63a7203cdb9328d824a27b682e77c7b9928be`: the block clip of each cache
+from vLLM v0.32.0, immutable commit
+`5df63a7203cdb9328d824a27b682e77c7b9928be`, and from vLLM v0.33.0, immutable
+commit `4ba787ec9959e566d3b587a796dff07673324da5`: the block clip of each cache
 group, the whole-block reads of a full-attention group, the in-window block
 count of a decode rank for a sliding-window group, the prefill backoff and
 truncation, the blocks that a decode rank pulls, the state pairing and the
-copy on each TP rank. The rules count the same blocks in both versions and
-take the bytes that the connector reads for one block of each group from the
-profile, so one set of rules covers both.
+copy on each TP rank. The rules count the same blocks in the three versions
+and take the bytes that the connector reads for one block of each group from
+the profile, so one set of rules covers them.
 `crates/core/src/engine/scheduler/vllm/grouped_tests.rs` holds the scheduler
-tests of these rules.
+tests of these rules. The native replay pair validation in
+`crates/core/src/replay/engine.rs`, the initialized identity comparison in
+`crates/core/src/perfmodel/fpm/nixl.rs`, the model and rank head geometry in
+`crates/core/src/perfmodel/fpm/nixl/heads.rs`, the physical layout permutations in
+`crates/core/src/perfmodel/fpm/nixl/layout.rs`, and profile pairing in
+`python/aisim/src/aisim/config/engine.py` adapt the observable model identity,
+version, KV head geometry, transfer mode, attention backend and cache dtype checks
+of the NIXL handshake. GPU layout resolution in the engine core applies to its TP workers, while the NIXL
+worker selects the registered GPU or host buffer layout. The ordinary per-layer head dimensions and TP partition follow
+`vllm/model_executor/models/{falcon,llama,mistral,nemotron_h,qwen2,qwen3}.py` at the same three
+revisions. The Qwen2-VL and Qwen2.5-VL wrappers select their Qwen2 language model in
+`vllm/model_executor/models/{qwen2_vl,qwen2_5_vl}.py`. The stock class names and their release-specific registrations in
+`crates/core/src/perfmodel/fpm/nixl/registry.rs` derive from the three model registries. Architecture selection and model-level fields follow
+`vllm/model_executor/models/registry.py`, `vllm/config/model.py` and
+`vllm/transformers_utils/{config,model_arch_config_convertor}.py`. The NemotronH
+attention and Mamba mixer names follow `vllm/model_executor/models/nemotron_h.py`.
+GPU page registration and shared addresses follow `register_kv_caches` in
+`vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py`. The singleton latent KV head follows
+`vllm/model_executor/layers/attention/mla_attention.py` at those revisions.
 
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/model_executor/models/registry.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/model_executor/models/qwen2_vl.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/model_executor/models/qwen2_5_vl.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/model_arch_config_convertor.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/models/inkling/nvidia/sconv_swa_attn.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_layout.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/config/cache.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/attention/backends/utils.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/utils.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/core/single_type_kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/v1/kv_cache_interface.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/registry.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/qwen2_vl.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/models/qwen2_5_vl.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/transformers_utils/model_arch_config_convertor.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/models/inkling/nvidia/sconv_swa_attn.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_layout.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/cache.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/attention/backends/utils.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/utils.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
 - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/attention/prefill_prefix_lm_attention.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/models/registry.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/models/qwen2_vl.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/models/qwen2_5_vl.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/transformers_utils/model_arch_config_convertor.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/transformers_utils/config.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/models/inkling/nvidia/sconv_swa_attn.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_layout.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/config/cache.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/engine/core.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/attention/backends/utils.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/utils.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/model_executor/layers/attention/prefill_prefix_lm_attention.py
 
 Copyright contributors to the vLLM project. Licensed under Apache-2.0:
 https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/LICENSE
 https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/LICENSE
+https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/LICENSE
 
 This is a modified Rust simulation adaptation, restricted to no speculative
 decoding, no HiSparse, no bounded replay window and no `all` Mamba cache mode.
 No upstream method body is copied. The identified upstream revisions have no
 root NOTICE file. The repository's Apache-2.0 LICENSE supplies the license
 text, and no upstream source file is vendored.
+
+The Rust pool checks in `crates/core/src/perfmodel/fpm/nixl/roster.rs` adapt the scheduler group and hash block rules in [`vllm/v1/core/kv_cache_utils.py`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_utils.py) and the kernel block mapping in [`vllm/v1/worker/utils.py`](https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/worker/utils.py). Both files are copyright the contributors to the vLLM project and use Apache-2.0.
+
+The checkpoint projection in `crates/core/src/perfmodel/fpm/nixl/heads.rs` is a modified Rust adaptation of the Qwen2-VL and Qwen2.5-VL text configuration constructors. Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved. Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved. Both upstream configuration files use Apache-2.0. Neither Transformers revision has a root NOTICE file.
+
+The ordinary Qwen2, Qwen3, Llama, Mistral, Falcon and NemotronH checkpoint projections in the same Rust module follow the corresponding stock Transformers configuration constructors. The Llama configuration is copyright 2022 EleutherAI and the HuggingFace Inc. team. The Mistral configuration is copyright 2023 Mistral AI and the HuggingFace Inc. team. The Falcon configuration is copyright 2023 the Falcon authors and HuggingFace Inc. team. All rights reserved. These sources use Apache-2.0.
+
+The stock multimodal text configuration mappings are factual constructor metadata from Transformers 5.10.4 through 5.20.2. These wrappers construct the explicitly selected child class or the enclosing configuration’s default. The modified Rust projection also uses the wrapper-specific child constructor arguments from the six configuration files listed below. Voxtral applies its defaults to a partial text configuration as well. The LLaVA configuration is copyright 2023 Microsoft Research & University of Wisconsin-Madison and the HuggingFace Inc. team. The LLaVA-NeXT and Idefics2 configurations are copyright 2024 The HuggingFace Inc. team. All rights reserved. These sources use Apache-2.0.
+
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/llava/configuration_llava.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/llava_next/configuration_llava_next.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/idefics2/configuration_idefics2.py
+- Copyright 2025 The HuggingFace Team. All rights reserved. [configuration_fast_vlm.py](https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/fast_vlm/configuration_fast_vlm.py)
+- Copyright 2024 HuggingFace Inc. team. All rights reserved. [configuration_got_ocr2.py](https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/got_ocr2/configuration_got_ocr2.py)
+- Copyright 2026 The PaddlePaddle Team and The HuggingFace Inc. team. All rights reserved. [configuration_pp_chart2table.py](https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/pp_chart2table/configuration_pp_chart2table.py)
+- Copyright 2026 The LightOn Team and The HuggingFace Inc. team. All rights reserved. [configuration_lighton_ocr.py](https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/lighton_ocr/configuration_lighton_ocr.py)
+- Copyright 2025 HuggingFace Inc. team. All rights reserved. [configuration_mistral3.py](https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/mistral3/configuration_mistral3.py)
+- Copyright 2025 The HuggingFace Inc. team. All rights reserved. [configuration_voxtral.py](https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/voxtral/configuration_voxtral.py)
+- https://github.com/huggingface/transformers/blob/18329f1065382e54db698e242cf98bd3f3e5a766/src/transformers/configuration_utils.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/configs/qianfan_ocr.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/configs/granite4_vision.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/transformers_utils/configs/qianfan_ocr.py
+
+The RefinedWeb and RefinedWebModel configuration projects the vLLM RWConfig constructor, attribute aliases and computed head dimension. Copyright 2023 The vLLM team. Copyright 2022 the Big Science Workshop and HuggingFace Inc. team. All rights reserved. The upstream source uses Apache-2.0.
+
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/config.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/transformers_utils/config.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/transformers_utils/configs/falcon.py
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/transformers_utils/configs/falcon.py
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/transformers_utils/configs/falcon.py
+
+The NemotronH model layer list and its computed layer count follow the stock Transformers configuration. Copyright 2024-2025 NVIDIA Corporation and The HuggingFace Inc. team. All rights reserved. The ordered native loader fallback uses the public Transformers modeling classes from the published wheels allowed by each tagged vLLM release, from Transformers 5.10.4 through 5.20.2. The table in `crates/core/src/perfmodel/fpm/nixl/transformers_models.txt` includes every exported modeling class whose stock `is_backend_compatible` or `_can_set_attn_implementation` can succeed, including classes whose compatibility is unknown. A possible backend in any permitted Transformers version retains the corresponding vLLM release bit. A zero mask identifies a stock class present and incompatible across all permitted versions. vLLM checks a literal class before it tries a dynamic model mapping. The underlying class names are factual package metadata.
+
+- [Transformers 5.10.4 source distribution](https://files.pythonhosted.org/packages/f7/5d/1df789ca27a436ce09de67c8fee6acd2a528d34c28685991f8203e5418ae/transformers-5.10.4.tar.gz), `src/transformers/modeling_utils.py`
+- https://github.com/huggingface/transformers/blob/v5.20.2/src/transformers/modeling_utils.py
+- https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/requirements/common.txt
+- https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/requirements/common.txt
+- https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/requirements/common.txt
+
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen2/configuration_qwen2.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen3/configuration_qwen3.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/llama/configuration_llama.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/mistral/configuration_mistral.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/falcon/configuration_falcon.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/qwen2/configuration_qwen2.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/qwen3/configuration_qwen3.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/llama/configuration_llama.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/mistral/configuration_mistral.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/falcon/configuration_falcon.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/nemotron_h/configuration_nemotron_h.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/nemotron_h/configuration_nemotron_h.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen2_vl/configuration_qwen2_vl.py
+- https://github.com/huggingface/transformers/blob/5eddc12edfaf8cafde8c9bae4ccb12f8a139b4f9/src/transformers/models/qwen2_5_vl/configuration_qwen2_5_vl.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/qwen2_vl/configuration_qwen2_vl.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/src/transformers/models/qwen2_5_vl/configuration_qwen2_5_vl.py
+- https://github.com/huggingface/transformers/blob/c4c4605f961877852b89b97478536bb3a26b6fd1/LICENSE
 
 
 The inference-mode scope and MSA query-position metadata integration in

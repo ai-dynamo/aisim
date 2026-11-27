@@ -701,9 +701,13 @@ explains the retained workload routing and feature mathematics.
   review and accept the new draft. The new draft has a new request identity, so
   `aisim onboard finalize` refuses the existing collection directory. Plan and
   collect again into a new output directory. That costs a new formal
-  collection. Sizing and cold replay do not read the field. Grouped prefix
-  caching reads it, so such a session needs the new import to plan prefix
-  caching on. Without it the plan stays cold.
+  collection. Aggregated cold replay does not read the field. Grouped prefix caching
+  reads it, so such a session needs the new import to plan prefix caching on.
+  Without it the plan stays cold. The peak bound of the cache budget
+  (`request_peak_cache_bytes`) reads the field too. Without it each `state`
+  group counts `blocks_per_request` blocks in that bound. For a Mamba group
+  that is below vLLM's startup count in `align` mode, and with the field the
+  bound equals that count. See [memory accounting](../perf-model/memory.md#fpm-profile-cache-groups-and-byte-budgets).
 - A vLLM 0.33.0 runtime probe import now also writes
   `runtime_memory.runtime_framework_version`, the version of the runtime that
   observed the cache groups. A session whose probe was imported before this
@@ -741,9 +745,35 @@ explains the retained workload routing and feature mathematics.
   evidence of that version then plans prefix caching on. `aisim onboard
   finalize` plans the resolved profile with the current rule.
 - `FpmRuntimeMemoryConfig` literals must supply `enable_prefix_caching`,
-  `mamba_cache_mode`, `hash_block_size_tokens` and `runtime_framework_version`
-  as `None`. Serialized records that omit these fields still deserialize, and
+  `mamba_cache_mode`, `hash_block_size_tokens`, `runtime_framework_version` and
+  `model_dtype` as `None`. Serialized records that omit these fields still deserialize, and
   `None` is not serialized.
+
+### Rust P/D reservation events
+
+Rust callers constructing `aisim_core::engine::LifecycleEvent::DestinationReserved` or `aisim_core::replay::HandoffFact::DestinationReserved` must supply the new `full_local_hit` field. Set it to `true` when the destination's NIXL connector confirms that the Pull requires no external KV read. This can happen even with a non-cacheable state group. Zero missing full-attention blocks can still require a window or state payload. Use `false` when the connector decision is unknown. Propagate the value when translating a lifecycle event into a handoff fact. In `destination_missing` mode a confirmed local hit skips the payload and still notifies the source.
+
+```rust
+let event = LifecycleEvent::DestinationReserved {
+    handoff_id,
+    request_id,
+    transferable_prompt_tokens,
+    full_local_hit: false,
+};
+if let LifecycleEvent::DestinationReserved {
+    handoff_id, transferable_prompt_tokens, full_local_hit, ..
+} = event {
+    let fact = HandoffFact::DestinationReserved {
+        handoff_id, transferable_prompt_tokens, full_local_hit,
+    };
+    // Consumers that only need the token count can ignore the other fields.
+    if let HandoffFact::DestinationReserved { transferable_prompt_tokens, .. } = fact {
+        record_tokens(transferable_prompt_tokens);
+    }
+}
+```
+
+Exhaustive field patterns for either variant must bind `full_local_hit` or include `..`. Existing serialized `HandoffFact` records that omit the field deserialize as `false`. Writers omit `false` and serialize `true` explicitly.
 
 ### Rust AgentX snapshot options
 

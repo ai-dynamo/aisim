@@ -1,12 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project.
+// Some tests of a modified Rust simulation of the vLLM v0.31.0
+// (db9527a46873454610df6dbedf79a36d6bf1a7f6), v0.32.0
+// (5df63a7203cdb9328d824a27b682e77c7b9928be) and v0.33.0
+// (4ba787ec9959e566d3b587a796dff07673324da5) grouped KV rules.
+// Immutable sources and license: THIRD_PARTY_NOTICES.md.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use aisim_core::engine::{Backend, EngineConfig, SglangConfig, TimingModel, TimingModelConfig};
+use aisim_core::engine::generalized::{EngineIdentity, SchedulerCommand};
+use aisim_core::engine::{
+    Backend, Command, CommandResult, EncoderShape, EngineConfig, EngineFactory, HandoffId,
+    ImageSpec, LifecycleEvent, Request, SglangConfig, TimingModel, TimingModelConfig, WorkerType,
+};
 use aisim_core::replay::loadgen::ReplayRequestPayload;
 use aisim_core::replay::{
     AggregatedRoundRobinPlacement, AuthoredKvHints, NoEngineEvents, NoReplayMetadata, Placement,
@@ -87,6 +98,58 @@ fn aggregated_spec(
         sla: Default::default(),
         requests,
     }
+}
+
+/// One prefill and one decode worker that share one cold vLLM 0.31.0 rank: the
+/// six GLM-5.3-Flash groups at TP 4 with an fp8 cache and the bytes that the
+/// connector of vLLM 0.31.0 reads for one block of each, a pool of 128 pages,
+/// and a handoff priced at 1 GB/s over the full prompt. A live run measured the
+/// attention value and the sum of the other five groups
+/// (`benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`). The split of that
+/// sum is a reading of the connector code.
+fn disaggregated_grouped_spec(requests: Vec<ReplayRequest>) -> ReplaySpec {
+    const GLM_PAGE: u64 = 13_045_120;
+    let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, requests);
+    spec.topology = ReplayTopology::Disaggregated {
+        prefill: WorkerPoolSpec {
+            initial_workers: 1,
+            startup_delay_ms: 0.0,
+        },
+        decode: WorkerPoolSpec {
+            initial_workers: 1,
+            startup_delay_ms: 0.0,
+        },
+        handoff_latency_ms: 1.0,
+    };
+    // Name, kind, layers, block, transfer bytes, prefix_cacheable.
+    let groups = [
+        ("mla", "attention", 22, 2176, 13_045_120, true),
+        ("kpool_tail", "state", 11, 4, 13_045_120, false),
+        ("kda_0", "state", 9, 2176, 9_768_960, true),
+        ("kda_1", "state", 9, 2176, 9_768_960, true),
+        ("kda_2", "state", 8, 2176, 9_768_960, true),
+        ("kda_3", "state", 8, 2176, 9_768_960, true),
+    ]
+    .map(|(name, kind, layers, block, bytes, cacheable)| {
+        let mut group = serde_json::json!({
+            "name": name, "kind": kind, "num_layers": layers, "block_size_tokens": block,
+            "page_size_bytes": GLM_PAGE, "prefix_cacheable": cacheable,
+            "transfer_bytes_per_block": bytes
+        });
+        if kind == "state" {
+            group["blocks_per_request"] = 1.into();
+        }
+        group
+    });
+    let rank = &mut spec.engine["rank"];
+    rank["enable_prefix_caching"] = false.into();
+    rank["vllm_version"] = "0.31.0".into();
+    rank["max_num_batched_tokens"] = 8192.into();
+    rank["kv_cache_capacity_bytes"] = (128 * GLM_PAGE).into();
+    rank["kv_cache_groups"] = groups.to_vec().into();
+    rank["kv_transfer_bandwidth"] = 1.0.into();
+    rank["kv_transfer_timing_mode"] = "full_prompt".into();
+    spec
 }
 
 struct RecordingTelemetryObserver {
@@ -340,6 +403,2760 @@ fn grouped_prefix_hit_above_the_pool_is_a_livelock() {
             "replay invariant violated: offline replay detected an effect-free zero-duration pass with 1 in-flight requests remaining",
             "{version}"
         );
+    }
+}
+
+#[test]
+fn grouped_prefix_tail_key_on_a_full_block_reaches_the_livelock_of_a_hit_above_the_pool() {
+    // Blocks of 4 tokens, a hash block of 2, a ring and two state groups with
+    // a checkpoint block: vLLM's startup count for a max_model_len of 47 is
+    // 12 attention blocks, the ring block and 3 blocks per state group, 19
+    // (v0.32 kv_cache_interface.py:1076-1082, v0.33 :1135-1141).
+    //
+    // The first prompt has 20 tokens. Its tail entry lies at (20 - 1) / 2 * 2
+    // = 18, inside the attention block 16..20. The chunk 12..20 fills that
+    // block, so the block has its full key when the tail entry comes, and
+    // vLLM gives it the tail key as one more key (v0.32
+    // single_type_kv_cache_manager.py:849-884, block_pool.py:449-523, v0.33
+    // single_type_kv_cache_manager.py:859-897, block_pool.py:486-560). Each
+    // state group keeps the checkpoint state at 18.
+    //
+    // The second prompt shares 19 tokens with the first, so it hits 18 tokens
+    // in every group, inside a block. Its whole prompt of 45 tokens then
+    // needs 12 attention blocks, 5 of them hit blocks that no request holds,
+    // and their copy block, the ring block, and per state group the hit
+    // block, the copy block, the running block and the checkpoint block:
+    // 13 + 1 + 2 * 4 = 22 (v0.32 kv_cache_manager.py:522-539,
+    // single_type_kv_cache_manager.py:213-265, :1724-1778, v0.33
+    // kv_cache_manager.py:531-548, single_type_kv_cache_manager.py:214-266,
+    // :1740-1795). In a pool of 19, 20 or 21 blocks vLLM keeps it waiting,
+    // and with nothing running nothing evicts the hit blocks. Replay reports
+    // the livelock and drops no request. In a pool of 22 blocks the second
+    // prompt computes 18..20, 20..32, 32..44 and 44..45, so with one batch
+    // its first token comes after four prefill passes of 10 ms, at 140 ms,
+    // and its second token one decode pass of 2 ms later.
+    for version in ["0.32.0", "0.33.0"] {
+        for async_scheduling in [true, false] {
+            for pool in [19, 20, 21, 22] {
+                let mut first = request("first", 0.0, 20, 3);
+                first.input_token_ids = Some((0..19).chain([1_000_000]).collect());
+                let mut second = request("second", 100.0, 45, 2);
+                second.input_token_ids = Some((0..19).chain(2_000_000..2_000_026).collect());
+                let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![first, second]);
+                let rank = &mut spec.engine["rank"];
+                rank["enable_prefix_caching"] = true.into();
+                rank["prefix_match_unit"] = 2.into();
+                rank["vllm_version"] = version.into();
+                rank["max_model_len"] = 47.into();
+                rank["max_num_batched_tokens"] = 12.into();
+                rank["max_num_seqs"] = 2.into();
+                rank["kv_cache_capacity_bytes"] = (pool * 64).into();
+                if !async_scheduling {
+                    rank["async_scheduling"] = false.into();
+                }
+                let mut groups = vec![
+                    serde_json::json!({"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "prefix_cacheable":true}),
+                    serde_json::json!({"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false}),
+                ];
+                for index in 0..2 {
+                    groups.push(serde_json::json!({"name": format!("state_{index}"), "kind":"state", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true, "prefill_checkpoint_blocks":1, "prefill_checkpoint_alignment":2}));
+                }
+                rank["kv_cache_groups"] = serde_json::Value::Array(groups);
+                let replay = Replayer::new(spec, ReplayEngineFactory::new())
+                    .unwrap()
+                    .run();
+                let case = format!("{version} async {async_scheduling} pool {pool}");
+                if pool < 22 {
+                    assert_eq!(
+                        replay.unwrap_err().to_string(),
+                        "replay invariant violated: offline replay detected an effect-free zero-duration pass with 1 in-flight requests remaining",
+                        "{case}"
+                    );
+                    continue;
+                }
+                let report = replay.unwrap();
+                assert_eq!(report.request_counts.completed_requests, 2, "{case}");
+                let second = report
+                    .per_request
+                    .iter()
+                    .find(|row| row.request_id.as_deref() == Some("second"))
+                    .unwrap();
+                assert_eq!(second.reused_input_tokens, 18, "{case}");
+                assert_eq!(second.readmission_count, 0, "{case}");
+                if !async_scheduling {
+                    assert_eq!(second.first_token_ms, Some(140.0), "{case}");
+                    assert_eq!(second.last_token_ms, Some(142.0), "{case}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn aggregated_grouped_request_completes_at_the_startup_count_with_async_scheduling() {
+    // Six attention blocks, a ring and two working blocks for each of four
+    // state groups give the startup count of 15 at max_model_len 13,056
+    // (v0.31 kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33
+    // :1135-1141). Aggregated workers retire their previous state in the
+    // next scheduler step, so the 12,000-token request fits with either
+    // scheduling mode and no token is recomputed.
+    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
+        for async_scheduling in [true, false] {
+            let mut lone = request("lone", 0.0, 12_000, 4);
+            lone.input_token_ids = Some((0..12_000).collect());
+            let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![lone]);
+            let rank = &mut spec.engine["rank"];
+            rank["enable_prefix_caching"] = true.into();
+            rank["prefix_match_unit"] = 1088.into();
+            rank["vllm_version"] = version.into();
+            rank["max_model_len"] = 13_056.into();
+            rank["max_num_batched_tokens"] = 2176.into();
+            rank["kv_cache_capacity_bytes"] = (15 * 64).into();
+            if !async_scheduling {
+                rank["async_scheduling"] = false.into();
+            }
+            let mut groups = vec![
+                serde_json::json!({"name":"mla", "kind":"attention", "num_layers":1, "block_size_tokens":2176, "page_size_bytes":64, "prefix_cacheable":true}),
+                serde_json::json!({"name":"kpool_tail", "kind":"state", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false}),
+            ];
+            for index in 0..4 {
+                let mut kda = serde_json::json!({"name": format!("kda_{index}"), "kind":"state", "num_layers":1, "block_size_tokens":2176, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+                if let Some(blocks) = checkpoint {
+                    kda["prefill_checkpoint_blocks"] = blocks.into();
+                }
+                groups.push(kda);
+            }
+            rank["kv_cache_groups"] = serde_json::Value::Array(groups);
+            let report = Replayer::new(spec, ReplayEngineFactory::new())
+                .unwrap()
+                .run()
+                .unwrap();
+            assert_eq!(report.request_counts.completed_requests, 1, "{version}");
+            assert_eq!(report.per_request[0].readmission_count, 0, "{version}");
+            assert_eq!(report.committed_prefill_tokens, 12_000);
+        }
+    }
+}
+
+/// An aggregated vLLM rank in block mode with a full-attention group, a
+/// 4-token ring when `ring` is set, and four prefix-cacheable state groups of
+/// `block`-token blocks, at a hash block equal to the block and a pool of
+/// `pages` pages.
+fn aggregated_state_spec(
+    requests: Vec<ReplayRequest>,
+    version: &str,
+    block: u64,
+    ring: bool,
+    max_model_len: u64,
+    budget: u64,
+    pages: u64,
+) -> ReplaySpec {
+    let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, requests);
+    let rank = &mut spec.engine["rank"];
+    rank["enable_prefix_caching"] = true.into();
+    rank["prefix_match_unit"] = block.into();
+    rank["vllm_version"] = version.into();
+    rank["max_model_len"] = max_model_len.into();
+    rank["max_num_batched_tokens"] = budget.into();
+    rank["max_num_seqs"] = 2.into();
+    rank["block_size"] = block.into();
+    rank["kv_cache_capacity_bytes"] = (pages * 64).into();
+    let mut groups = vec![
+        serde_json::json!({"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "prefix_cacheable":true}),
+    ];
+    if ring {
+        groups.push(serde_json::json!({"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false}));
+    }
+    for index in 0..4 {
+        let mut state = serde_json::json!({"name": format!("state_{index}"), "kind":"state", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+        if version != "0.31.0" {
+            state["prefill_checkpoint_blocks"] = 0.into();
+        }
+        groups.push(state);
+    }
+    rank["kv_cache_groups"] = serde_json::Value::Array(groups);
+    spec
+}
+
+#[test]
+fn grouped_prefix_request_preempted_after_output_tokens_resumes_on_its_own_blocks() {
+    // Blocks of 4 tokens, four state groups and no ring, max_model_len 44:
+    // vLLM's startup count is cdiv(44, 4) = 11 attention blocks and 2 blocks
+    // in each state group, 19 (v0.31 kv_cache_interface.py:1083-1094, v0.32
+    // :1076-1082, v0.33 :1135-1141). A prompt of 38 tokens with 5 output
+    // tokens arrives at 0 ms, and a prompt of 4 tokens at 26 ms, during its
+    // prefill. With async scheduling a block goes only on the processed
+    // count (v0.31 kv_cache_manager.py:549-556, v0.32 :552-559, v0.33
+    // :561-568), so a step of the long request after its first chunk needs
+    // the hit block, the block before it and a new block in each state
+    // group. In pools of 19 to 22 blocks replay preempts the long request
+    // after it has output tokens past the block that ends at 36, its replay
+    // boundary. The block that ends at 40 holds prompt and output tokens.
+    // vLLM hashes output tokens (v0.31, v0.32 and v0.33 request.py:272-288),
+    // and replay gives that block its key in the pass that fills it. With two
+    // batches vLLM gives the key in the request's next `allocate_slots` call if
+    // that call succeeds (v0.31 kv_cache_manager.py:574-576 and :608-612, v0.32
+    // :577-579 and :612-616, v0.33 :586-588 and :621-625), or when it processes
+    // the outputs of the filling step while the request still runs (v0.31 and
+    // v0.32 sched/async_scheduler.py:73-77, v0.33
+    // sched/scheduler.py:2407-2415), so the lives of the long request can
+    // differ from vLLM's.
+    // The test pins only that the replay ends: both requests complete, well
+    // before the cap of 10 s of simulated time. It does not pin how often
+    // replay preempts either request.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for pages in 19..=22 {
+            let mut long = request("long", 0.0, 38, 5);
+            long.input_token_ids = Some((1_000_000..1_000_038).collect());
+            let mut short = request("short", 26.0, 4, 1);
+            short.input_token_ids = Some((2_000_000..2_000_004).collect());
+            let mut spec =
+                aggregated_state_spec(vec![long, short], version, 4, false, 44, 5, pages);
+            spec.max_sim_time_ms = Some(10_000.0);
+            let report = run_within_60_s(spec);
+            assert_eq!(
+                report.request_counts.completed_requests, 2,
+                "{version} pool {pages}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_state_block_below_the_attention_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // A full-attention group of 8-token blocks, a state group of 2-token
+    // blocks, the hash block 2 and max_model_len 16: vLLM's startup count is
+    // cdiv(16, 8) = 2 attention blocks and 2 state blocks, 4 (v0.31
+    // kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33 :1135-1141).
+    // Two prompts of 8 and 14 tokens with 2 output tokens each arrive at 0 ms,
+    // with a budget of 3 tokens. By vLLM's rules at v0.31.0, v0.32.0 and
+    // v0.33.0, with two batches and this pool a life of the second request that
+    // has passed token 8 preempts itself (derived from the rules): it holds 2
+    // attention blocks and 2 state blocks, the whole pool, so it is the only
+    // running request and the request that vLLM preempts (v0.31 sched:765-771,
+    // v0.32 :796-802, v0.33 :932-938), and the block of a state that it has
+    // left goes only on the processed count (v0.31 kv_cache_manager.py:549-556,
+    // single_type_kv_cache_manager.py:1626-1675, v0.32 :552-559, :1592-1641,
+    // v0.33 :561-568, :1608-1657), so a chunk behind its step in flight needs a
+    // third state block, 5 blocks in a pool of 4. In this layout replay frees
+    // that block on the computed count, one step earlier than vLLM, so both
+    // requests complete without a preemption, as they do in vLLM with one
+    // batch. The cap of 10 s of simulated time bounds the run.
+    for (version, checkpoint) in [("0.31.0", None), ("0.32.0", Some(0)), ("0.33.0", Some(0))] {
+        let mut first = request("first", 0.0, 8, 2);
+        first.input_token_ids = Some([0].into_iter().chain(1_000_000..1_000_007).collect());
+        let mut second = request("second", 0.0, 14, 2);
+        second.input_token_ids = Some([0].into_iter().chain(2_000_000..2_000_013).collect());
+        let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, vec![first, second]);
+        spec.max_sim_time_ms = Some(10_000.0);
+        let rank = &mut spec.engine["rank"];
+        rank["enable_prefix_caching"] = true.into();
+        rank["prefix_match_unit"] = 2.into();
+        rank["vllm_version"] = version.into();
+        rank["max_model_len"] = 16.into();
+        rank["max_num_batched_tokens"] = 3.into();
+        rank["max_num_seqs"] = 3.into();
+        rank["kv_cache_capacity_bytes"] = (4 * 64).into();
+        let mut state = serde_json::json!({"name":"state", "kind":"state", "num_layers":1, "block_size_tokens":2, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+        if let Some(blocks) = checkpoint {
+            state["prefill_checkpoint_blocks"] = blocks.into();
+        }
+        rank["kv_cache_groups"] = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "prefix_cacheable":true},
+            state,
+        ]);
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        assert_eq!(
+            [record(&report, "first"), record(&report, "second")]
+                .map(|record| record.readmission_count),
+            [0, 0],
+            "{version}"
+        );
+    }
+}
+
+/// An aggregated vLLM rank in block mode with `groups`, the hash block
+/// `hash`, two batches and a pool of `pages` pages, with a cap of 10 s of
+/// simulated time. Each request is `(id, arrival ms, prompt tokens, output
+/// tokens, prompt tokens shared with the other requests)`: its prompt starts
+/// with the shared tokens 0, 1, 2, ... and goes on with tokens of its own.
+#[allow(clippy::too_many_arguments)]
+fn startup_pool_spec(
+    groups: serde_json::Value,
+    version: &str,
+    hash: u64,
+    max_model_len: u64,
+    budget: u64,
+    max_num_seqs: u64,
+    pages: u64,
+    requests: &[(&str, f64, usize, usize, usize)],
+) -> ReplaySpec {
+    let requests = requests
+        .iter()
+        .enumerate()
+        .map(|(index, &(id, arrival, prompt, output, shared))| {
+            let own = 1_000_000 * (index as u32 + 1);
+            let mut replay_request = request(id, arrival, prompt, output);
+            replay_request.input_token_ids = Some(
+                (0..shared as u32)
+                    .chain(own..own + (prompt - shared) as u32)
+                    .collect(),
+            );
+            replay_request
+        })
+        .collect();
+    let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, requests);
+    spec.max_sim_time_ms = Some(10_000.0);
+    let rank = &mut spec.engine["rank"];
+    rank["enable_prefix_caching"] = true.into();
+    rank["prefix_match_unit"] = hash.into();
+    rank["vllm_version"] = version.into();
+    rank["max_model_len"] = max_model_len.into();
+    rank["max_num_batched_tokens"] = budget.into();
+    rank["max_num_seqs"] = max_num_seqs.into();
+    rank["kv_cache_capacity_bytes"] = (pages * 64).into();
+    rank["kv_cache_groups"] = groups;
+    spec
+}
+
+/// A prefix-cacheable state group of `block`-token blocks, with a
+/// checkpoint count of 0 where the version takes one.
+fn cacheable_state(block: u64, version: &str) -> serde_json::Value {
+    named_cacheable_state("state", block, version)
+}
+
+/// [`cacheable_state`] with the group name `name`.
+fn named_cacheable_state(name: &str, block: u64, version: &str) -> serde_json::Value {
+    let mut state = serde_json::json!({"name":name, "kind":"state", "num_layers":1, "block_size_tokens":block, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":true});
+    if version != "0.31.0" {
+        state["prefill_checkpoint_blocks"] = 0.into();
+    }
+    state
+}
+
+/// Runs `spec` and asserts that every request completes without a
+/// readmission.
+fn assert_completes_without_readmission(spec: ReplaySpec, label: &str) {
+    let requests = spec.requests.len();
+    let report = run_within_60_s(spec);
+    assert_eq!(
+        report.request_counts.completed_requests, requests,
+        "{label}"
+    );
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|record| record.readmission_count == 0),
+        "{label}"
+    );
+}
+
+#[test]
+fn grouped_prefix_window_group_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // A sliding-window group of 8-token blocks with a window of 16 beside a
+    // state group of 2-token blocks, the hash block 2, no full-attention
+    // group, max_model_len 40 and a budget of 3: the smallest pool that the
+    // configuration accepts is 6 pages, 4 window blocks and 2 state blocks.
+    // One prompt of 32 tokens with 2 output tokens arrives at 0 ms. The layout
+    // has no prefix-cacheable full-attention group, so an aggregated rank
+    // frees the blocks of a step in flight on the computed count, one step
+    // earlier than vLLM, and the request completes without a preemption, as
+    // with one batch. With the hold of vLLM the replay of this request does
+    // not end: the request preempts itself in every life. The cap of 10 s of
+    // simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "sliding_window":16, "prefix_cacheable":true},
+            cacheable_state(2, version),
+        ]);
+        let spec = startup_pool_spec(groups, version, 2, 40, 3, 2, 6, &[("q0", 0.0, 32, 2, 9)]);
+        assert_completes_without_readmission(spec, version);
+    }
+}
+
+#[test]
+fn grouped_prefix_convolution_group_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // A convolution group of 8-token blocks with a window of 8 beside a state
+    // group of 2-token blocks, the hash block 2, no full-attention group,
+    // max_model_len 40 and a budget of 3: the smallest pool that the
+    // configuration accepts is 5 pages, 3 convolution blocks and 2 state
+    // blocks. One prompt of 32 tokens with 2 output tokens arrives at 0 ms.
+    // The layout has no prefix-cacheable full-attention group, so an
+    // aggregated rank frees on the computed count, one step earlier than
+    // vLLM, and the request completes without a preemption. With the hold of
+    // vLLM the replay of this request does not end. The cap of 10 s of
+    // simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"conv", "kind":"convolution", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "sliding_window":8, "prefix_cacheable":true},
+            cacheable_state(2, version),
+        ]);
+        let spec = startup_pool_spec(groups, version, 2, 40, 3, 2, 5, &[("q0", 0.0, 32, 2, 9)]);
+        assert_completes_without_readmission(spec, version);
+    }
+}
+
+/// A full-attention group of 4-token blocks, a ring of `ring` tokens and a
+/// state group of 4-token blocks, the hash block 4. The ring makes the
+/// scheduler block `ring`, above the state block, so a hit of a resumed
+/// request ends on a multiple of `ring`. vLLM's startup count is
+/// cdiv(max_model_len, 4) attention blocks, 1 ring block and 2 state blocks
+/// (v0.31 kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33
+/// :1135-1141), `pages`. One prompt of `prompt` tokens with 3 output tokens
+/// arrives at 115 ms, with a budget of 4 tokens and 3 sequences. An
+/// aggregated rank frees on the computed count in this layout, one step
+/// earlier than vLLM, and the request completes without a preemption. With
+/// the hold of vLLM the replay of this request does not end. The cap of 10 s
+/// of simulated time bounds the run.
+fn assert_ring_layout_completes(ring: u64, max_model_len: u64, pages: u64, prompt: usize) {
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "prefix_cacheable":true},
+            {"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":ring, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false},
+            cacheable_state(4, version),
+        ]);
+        let spec = startup_pool_spec(
+            groups,
+            version,
+            4,
+            max_model_len,
+            4,
+            3,
+            pages,
+            &[("q0", 115.0, prompt, 3, 0)],
+        );
+        assert_completes_without_readmission(spec, version);
+    }
+}
+
+#[test]
+fn grouped_prefix_ring_of_12_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // max_model_len 96: 24 attention blocks, 1 ring block and 2 state blocks,
+    // 27 pages, and a prompt of 93 tokens.
+    assert_ring_layout_completes(12, 96, 27, 93);
+}
+
+#[test]
+fn grouped_prefix_ring_of_16_above_the_state_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // max_model_len 128: 32 attention blocks, 1 ring block and 2 state
+    // blocks, 35 pages, and a prompt of 125 tokens.
+    assert_ring_layout_completes(16, 128, 35, 125);
+}
+
+#[test]
+fn grouped_prefix_opted_out_attention_group_completes_at_the_startup_count_with_async_scheduling() {
+    // A full-attention group of 3-token blocks with prefix_cacheable: false
+    // beside a state group of 4-token blocks, the hash block 4. The layout
+    // has no prefix-cacheable full-attention group, and its scheduler block
+    // is 12. vLLM's startup count at max_model_len 72 is cdiv(72, 3) = 24
+    // attention blocks and 2 state blocks, 26 (v0.31
+    // kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33 :1135-1141).
+    // A prompt of 70 tokens arrives at 30 ms and one of 68 tokens at 60 ms,
+    // each with 1 output token, with a budget of 7 and 2 sequences. An
+    // aggregated rank frees on the computed count in this layout, one step
+    // earlier than vLLM, and both requests complete without a preemption.
+    // With the hold of vLLM the replay does not end. The cap of 10 s of
+    // simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":3, "page_size_bytes":64, "prefix_cacheable":false},
+            cacheable_state(4, version),
+        ]);
+        let spec = startup_pool_spec(
+            groups,
+            version,
+            4,
+            72,
+            7,
+            2,
+            26,
+            &[("q0", 60.0, 68, 1, 0), ("q1", 30.0, 70, 1, 0)],
+        );
+        assert_completes_without_readmission(spec, version);
+    }
+}
+
+#[test]
+fn grouped_prefix_two_state_groups_above_the_attention_block_complete_at_the_startup_count_with_async_scheduling()
+ {
+    // A full-attention group of 4-token blocks and two state groups of
+    // 16-token blocks, the hash block 4. The state blocks equal the scheduler
+    // block, but the full-attention block lies below it, so an aggregated
+    // rank frees the blocks of a step in flight on the computed count, one
+    // step earlier than vLLM. vLLM's startup count at max_model_len 79 is
+    // cdiv(79, 4) = 20 attention blocks and 2 blocks per state group, 24
+    // (v0.31 kv_cache_interface.py:1083-1094, v0.32 :1076-1082, v0.33
+    // :1135-1141). Three requests with a budget of 31 and 2 sequences: 47 + 32
+    // tokens at 0 ms, 69 + 1 at 10 ms and 78 + 1 at 20 ms, the first and the
+    // third sharing 6 prompt tokens. Every request completes. With the hold
+    // of vLLM the replay of the third request does not end. The cap of 10 s
+    // of simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":64, "prefix_cacheable":true},
+            named_cacheable_state("state_0", 16, version),
+            named_cacheable_state("state_1", 16, version),
+        ]);
+        let spec = startup_pool_spec(
+            groups,
+            version,
+            4,
+            79,
+            31,
+            2,
+            24,
+            &[
+                ("q0", 0.0, 47, 32, 6),
+                ("q1", 10.0, 69, 1, 0),
+                ("q2", 20.0, 78, 1, 6),
+            ],
+        );
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 3, "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefix_two_state_groups_of_32_above_the_attention_block_complete_at_the_startup_count_with_async_scheduling()
+ {
+    // A full-attention group of 8-token blocks and two state groups of
+    // 32-token blocks, the hash block 8: the full-attention block lies below
+    // the scheduler block of 32, so an aggregated rank frees on the computed
+    // count, one step earlier than vLLM. vLLM's startup count at
+    // max_model_len 224 is cdiv(224, 8) = 28 attention blocks and 2 blocks per
+    // state group, 32 (v0.31 kv_cache_interface.py:1083-1094, v0.32
+    // :1076-1082, v0.33 :1135-1141). Two requests with a budget of 63 and 3
+    // sequences: 182
+    // + 9 tokens at 0 ms and 217 + 3 at 10 ms, which shares no prompt token
+    // with the first one (its first 142 tokens are the shared tokens of the
+    // helper, which the first request does not have). Both complete. With the hold of vLLM the replay of
+    // the second request does not end. The cap of 10 s of simulated time
+    // bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "prefix_cacheable":true},
+            named_cacheable_state("state_0", 32, version),
+            named_cacheable_state("state_1", 32, version),
+        ]);
+        let spec = startup_pool_spec(
+            groups,
+            version,
+            8,
+            224,
+            63,
+            3,
+            32,
+            &[("q0", 0.0, 182, 9, 0), ("q1", 10.0, 217, 3, 142)],
+        );
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+    }
+}
+
+#[test]
+fn grouped_prefix_window_block_below_the_scheduler_block_completes_at_the_startup_count_with_async_scheduling()
+ {
+    // A full-attention group and four state groups of 8-token blocks beside a
+    // sliding-window group of 2-token blocks with a window of 4, the hash
+    // block 2, max_model_len 24, a budget of 7 and 4 sequences, at replay's
+    // startup count of 21 pages: 3 full-attention blocks, 10 window blocks
+    // and 2 blocks per state group. The same with a convolution group of
+    // 2-token blocks and a window of 2 at 20 pages, with 9 convolution
+    // blocks. One prompt of 23 tokens with 1 output token arrives at 0 ms.
+    // Every state block equals the scheduler block of 8, but the window or
+    // convolution block lies below it, so the layout loses the hold: an
+    // aggregated rank frees the blocks of a step in flight on the computed
+    // count, one step earlier than vLLM, and the request completes without a
+    // preemption at 50 ms. These values are replay's own. With the hold the
+    // replay of this request does not end. The cap of 10 s of simulated time
+    // bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for (small, pages) in [
+            (
+                serde_json::json!({"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":2, "page_size_bytes":64, "sliding_window":4, "prefix_cacheable":true}),
+                21,
+            ),
+            (
+                serde_json::json!({"name":"conv", "kind":"convolution", "num_layers":1, "block_size_tokens":2, "page_size_bytes":64, "sliding_window":2, "prefix_cacheable":true}),
+                20,
+            ),
+        ] {
+            let label = format!("{version} {}", small["name"].as_str().unwrap());
+            let groups = serde_json::json!([
+                {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":8, "page_size_bytes":64, "prefix_cacheable":true},
+                named_cacheable_state("state_0", 8, version),
+                named_cacheable_state("state_1", 8, version),
+                named_cacheable_state("state_2", 8, version),
+                named_cacheable_state("state_3", 8, version),
+                small,
+            ]);
+            let spec = startup_pool_spec(
+                groups,
+                version,
+                2,
+                24,
+                7,
+                4,
+                pages,
+                &[("q0", 0.0, 23, 1, 0)],
+            );
+            let report = run_within_60_s(spec);
+            assert_eq!(report.request_counts.completed_requests, 1, "{label}");
+            let record = record(&report, "q0");
+            assert_eq!(record.readmission_count, 0, "{label}");
+            assert_eq!(record.terminal_time_ms, 50.0, "{label}");
+        }
+    }
+}
+
+#[test]
+fn grouped_prefix_state_group_and_ring_without_attention_complete_at_the_startup_count_with_async_scheduling()
+ {
+    // A ring of 2 tokens and a prefix-cacheable state group of 2-token
+    // blocks, the hash block 2, max_model_len 10, a budget of 3 and 2
+    // sequences: the smallest pool that the configuration accepts is 3 pages,
+    // 1 ring block and 2 state blocks. One prompt of 7 tokens with 1 output
+    // token arrives at 0 ms. The layout has no prefix-cacheable full-attention
+    // group, so an aggregated rank frees on the computed count, one step
+    // earlier than vLLM, and the request completes without a preemption at
+    // 40 ms, as with one batch. With the hold of vLLM the replay of this
+    // request does not end. The cap of 10 s of simulated time bounds the run.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let groups = serde_json::json!([
+            {"name":"ring", "kind":"state", "num_layers":1, "block_size_tokens":2, "page_size_bytes":64, "blocks_per_request":1, "prefix_cacheable":false},
+            cacheable_state(2, version),
+        ]);
+        let spec = startup_pool_spec(groups, version, 2, 10, 3, 2, 3, &[("q0", 0.0, 7, 1, 3)]);
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 1, "{version}");
+        let record = record(&report, "q0");
+        assert_eq!(record.readmission_count, 0, "{version}");
+        assert_eq!(record.terminal_time_ms, 40.0, "{version}");
+    }
+}
+
+#[test]
+fn aggregated_grouped_requests_share_the_pool_after_a_state_crossing() {
+    // Two GLM-shaped requests share 29 blocks. The 2,162-token request
+    // crosses a 2,176-token boundary while the 21,758-token prompt is
+    // finishing prefill. The four previous states of its preceding chunk
+    // expire at the next aggregate scheduler step. That leaves room for
+    // the new attention block and four fresh states without preemption.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut a = request("a", 0.0, 2162, 60);
+        a.input_token_ids = Some((1_000_000..1_002_162).collect());
+        let mut l = request("l", 13.0, 21_758, 30);
+        l.input_token_ids = Some((2_000_000..2_021_758).collect());
+        let spec = aggregated_state_spec(vec![a, l], version, 2176, true, 26_112, 2720, 29);
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 2, "{version}");
+        assert_eq!(
+            [record(&report, "a"), record(&report, "l")].map(|record| record.readmission_count),
+            [0, 0],
+            "{version}"
+        );
+    }
+}
+
+#[test]
+fn grouped_prefix_request_that_preempts_itself_after_its_output_tokens_fill_a_block_keeps_the_key()
+{
+    // GLM-shaped groups of 2,176-token blocks with the hash block 2,176, a
+    // 4-token ring and four state groups, max_model_len 6,528: vLLM's startup
+    // count is 3 + 1 + 4 x 2 = 12 blocks, and the pool has 16. F has 2,300
+    // prompt tokens and 300 output tokens at 0 ms, S has 2,170 prompt tokens
+    // and 30 output tokens at 50 ms. The values below are replay's, derived
+    // from its rule:
+    // - S's sixth output token fills the full-attention block that ends at
+    //   2,176, and replay gives that block its key in the pass that fills it,
+    //   with one batch and with two. S's step to 2,177 tokens needs a new
+    //   attention block and a new block in each state group, 5, and finds 3,
+    //   so S, the last running request, preempts itself (v0.31 sched:765-771,
+    //   v0.32 :796-802, v0.33 :932-938).
+    // - Life 2 hits 0 tokens with the junction 2,176, because no state group
+    //   holds a state at 2,176. Its chunk stops at the junction, each state
+    //   group keeps its state there, and S preempts itself as life 1 did.
+    // - Life 3 is admitted when F ends, hits 2,176 tokens and decodes to the
+    //   end.
+    // So replay readmits S twice with one batch and with two.
+    // With two batches vLLM preempts S once more. Its `allocate_slots`
+    // caches the blocks of min(computed + new, request.num_tokens) tokens
+    // (v0.31 kv_cache_manager.py:608-612, v0.32 :612-616, v0.33 :621-625),
+    // and `request.num_tokens` is one short while the sampled token of the
+    // step in flight is not appended. So the block that the sixth output
+    // token fills gets its key in S's next `allocate_slots` call, and only if
+    // that call succeeds: the capacity test returns before the cache step
+    // (v0.31 :574-576, v0.32 :577-579, v0.33 :586-588). The cache step of the
+    // processed outputs skips a request that is not running (v0.31 and
+    // v0.32 sched/async_scheduler.py:73-77, v0.33 sched/scheduler.py:2407-2415).
+    // S is preempted in exactly that next call, so vLLM frees the block
+    // without the key, and its life 2 hits 0 tokens with no junction. This
+    // test pins replay's value: replay does not model that the key is lost.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        for async_scheduling in [true, false] {
+            let case = format!("{version} async {async_scheduling}");
+            let mut f = request("f", 0.0, 2300, 300);
+            f.input_token_ids = Some((1_000_000..1_002_300).collect());
+            let mut s = request("s", 50.0, 2170, 30);
+            s.input_token_ids = Some((2_000_000..2_002_170).collect());
+            let mut spec = aggregated_state_spec(vec![f, s], version, 2176, true, 6528, 2720, 16);
+            if !async_scheduling {
+                spec.engine["rank"]["async_scheduling"] = false.into();
+            }
+            let report = run_within_60_s(spec);
+            assert_eq!(report.request_counts.completed_requests, 2, "{case}");
+            assert_eq!(
+                [record(&report, "f"), record(&report, "s")].map(|record| record.readmission_count),
+                [0, 2],
+                "{case}"
+            );
+            // The largest hit of S is the one of life 3.
+            assert_eq!(record(&report, "s").reused_input_tokens, 2176, "{case}");
+        }
+    }
+}
+
+#[test]
+fn grouped_prefill_rank_holds_its_source_and_reports_block_unit_timing() {
+    // Both roles pass the configuration gate, so the replay runs. The prefill
+    // rank holds its source after 999 of the 1,000 prompt tokens, because
+    // vLLM leaves the last one to the decode rank, which computes it in its
+    // first pass. The prompt is committed once, split across the two ranks.
+    let spec = disaggregated_grouped_spec(vec![request("grouped", 0.0, 1000, 4)]);
+    let rank = serde_json::from_value::<ReplayEngineConfig>(spec.engine.clone())
+        .unwrap()
+        .rank;
+    let report = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(report.committed_prefill_tokens, 1000);
+    assert_eq!(report.request_counts.completed_requests, 1);
+    assert_eq!(report.request_counts.total_output_tokens, 4);
+    // A handoff is complete when its request carries every lifecycle
+    // timestamp, as the replay parity runner counts it.
+    let handoffs_complete = report
+        .per_request
+        .iter()
+        .filter(|record| {
+            [
+                record.prefill_admit_ms,
+                record.source_held_ms,
+                record.destination_reserved_ms,
+                record.destination_activated_ms,
+                record.decode_admit_ms,
+                record.source_released_ms,
+            ]
+            .iter()
+            .all(Option::is_some)
+        })
+        .count();
+    assert_eq!(handoffs_complete, 1);
+    let record = &report.per_request[0];
+    assert_eq!(record.source_held_ms, Some(10.0));
+    assert_eq!(record.decode_worker_idx, Some(0));
+    assert_eq!(
+        record.terminal_status,
+        aisim_core::replay::ReplayTerminalStatus::Completed
+    );
+
+    // The report keeps neither the held timing nor the transfer units, so
+    // the same rank shows both through the engine API.
+    let engine = |worker_type| {
+        let config = EngineConfig {
+            worker_type,
+            ..rank.clone()
+        };
+        EngineFactory::new(config)
+            .unwrap()
+            .build(EngineIdentity::new(0), NonZeroU32::MIN)
+            .unwrap()
+    };
+    let handoff_id = HandoffId::new(Uuid::from_u128(2));
+    let request = Request {
+        request_id: Uuid::from_u128(1),
+        tokens: vec![7; 1000],
+        max_output_tokens: 4,
+        output_token_ids: None,
+        session_id: None,
+        cache_salt: None,
+        images: Vec::new(),
+        kv_hint: None,
+    };
+    let mut prefill = engine(WorkerType::Prefill);
+    let source = Command::SubmitHandoffPrefill {
+        handoff_id,
+        request: Request {
+            max_output_tokens: 1,
+            ..request.clone()
+        },
+    };
+    prefill
+        .apply_command_effects(SchedulerCommand::new(0, source), 0.0)
+        .unwrap();
+    let pass = prefill.execute_pass(0.0).unwrap().unwrap();
+    let completed = prefill.complete_pass(pass.pass_id, pass.end_ms).unwrap();
+    let timing = completed.effects.by_rank[0]
+        .effects
+        .lifecycle_events
+        .iter()
+        .find_map(|event| match event {
+            LifecycleEvent::SourceHeld {
+                transfer_timing, ..
+            } => Some(*transfer_timing),
+            _ => None,
+        })
+        .expect("the prefill rank holds its source");
+    // The 999 tokens fill one full-attention block of 13,045,120 bytes. The
+    // state bytes are one block of each state group, 52,120,960 bytes. Their
+    // sum is the 65,166,080 bytes that the live run measured for this prompt.
+    assert_eq!(timing.full_prompt_tokens, 1);
+    assert_eq!(timing.kv_bytes_per_token, Some(13_045_120));
+    assert_eq!(timing.state_bytes, 52_120_960);
+    assert_eq!(13_045_120 + timing.state_bytes, 65_166_080);
+    // The decode rank reserves every group for the 999 loaded tokens and
+    // reports the one full-attention block it lacks in the same unit.
+    let destination = Command::ReserveDestination {
+        handoff_id,
+        request,
+    };
+    let effects = engine(WorkerType::Decode)
+        .apply_command_effects(SchedulerCommand::new(0, destination), 0.0)
+        .unwrap();
+    let units = effects.by_rank[0]
+        .effects
+        .lifecycle_events
+        .iter()
+        .find_map(|event| match event {
+            LifecycleEvent::DestinationReserved {
+                transferable_prompt_tokens,
+                ..
+            } => Some(*transferable_prompt_tokens),
+            _ => None,
+        });
+    assert_eq!(units, Some(1));
+}
+
+#[test]
+fn grouped_pd_rejects_unequal_tensor_parallel_sizes() {
+    // Each role can inherit the shared TP size or supply its own descriptor.
+    for role in ["prefill", "decode"] {
+        let mut spec = disaggregated_grouped_spec(vec![request("tp-mismatch", 0.0, 1000, 4)]);
+        spec.engine["tensor_parallel_size"] = 4.into();
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 8
+        });
+        let error = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap_err();
+        assert!(matches!(error, ReplayError::InvalidSpec(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid replay spec: grouped prefill and decode roles require equal tensor_parallel_size",
+            "{role} TP override"
+        );
+    }
+    // Equal shared defaults must not hide different explicit role values.
+    let mut spec = disaggregated_grouped_spec(vec![request("tp-overrides", 0.0, 1000, 4)]);
+    for (role, tp) in [("prefill", 4), ("decode", 8)] {
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": tp
+        });
+    }
+    let error = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap_err();
+    assert!(matches!(error, ReplayError::InvalidSpec(_)));
+    assert!(error.to_string().contains("equal tensor_parallel_size"));
+}
+
+#[test]
+fn grouped_pd_reports_destination_lookups_and_first_decode_forwards() {
+    for (mode, cache) in [
+        ("destination_missing", true),
+        ("full_prompt", true),
+        ("destination_missing", false),
+    ] {
+        let requests = [("cold", 0.0), ("warm", 100.0)].map(|(id, at)| {
+            let mut req = request(id, at, 9, 1);
+            req.input_token_ids = Some((0..9).collect());
+            req
+        });
+        let mut spec = small_grouped_pd_spec(requests.to_vec(), 32, Some(64));
+        let rank = &mut spec.engine["rank"];
+        rank["kv_transfer_timing_mode"] = mode.into();
+        rank["enable_prefix_caching"] = cache.into();
+        rank["prefix_match_unit"] = if cache {
+            4.into()
+        } else {
+            serde_json::Value::Null
+        };
+        rank["kv_cache_groups"] = serde_json::json!([{
+            "name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":4,
+            "page_size_bytes":100, "transfer_bytes_per_block":100, "prefix_cacheable":true
+        }]);
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .with_telemetry_observer(
+                1_000.0,
+                Box::new(RecordingTelemetryObserver {
+                    samples: Arc::clone(&samples),
+                }),
+            )
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 2);
+        let samples = samples.lock().unwrap();
+        let final_sample = samples.last().unwrap();
+        let counts = final_sample.decode_interval_metrics.g1_prefix_cache_lookup;
+        assert_eq!(
+            counts.map(|c| (c.query_count, c.queried_tokens, c.matched_tokens)),
+            cache.then_some((2, 18, 8)),
+            "{mode}"
+        );
+        assert_eq!(
+            final_sample.traffic.accept_length_forward_count, 2,
+            "{mode}"
+        );
+        assert_eq!(final_sample.traffic.avg_accept_length, Some(1.0), "{mode}");
+    }
+}
+
+#[test]
+fn grouped_pd_requires_context_parallel_size_one_on_each_role() {
+    for role in ["prefill", "decode"] {
+        let mut spec = disaggregated_grouped_spec(vec![request("cp-override", 0.0, 1000, 1)]);
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "prefill_context_parallel_size": 4
+        });
+        let error = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prefill_context_parallel_size=1"),
+            "{role}: {error}"
+        );
+    }
+}
+
+#[test]
+fn grouped_pd_accepts_equal_tensor_parallel_sizes() {
+    for prefill_override in [false, true] {
+        for decode_override in [false, true] {
+            let mut spec = disaggregated_grouped_spec(vec![request("equal-tp", 0.0, 1000, 4)]);
+            spec.engine["tensor_parallel_size"] = 4.into();
+            for (role, override_tp) in [("prefill", prefill_override), ("decode", decode_override)]
+            {
+                if override_tp {
+                    spec.engine[role] = serde_json::json!({
+                        "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 4
+                    });
+                }
+            }
+            let report = Replayer::new(spec, ReplayEngineFactory::new())
+                .unwrap()
+                .run()
+                .unwrap();
+            assert_eq!(report.request_counts.completed_requests, 1);
+            assert_eq!(report.request_counts.total_output_tokens, 4);
+            assert_eq!(report.committed_prefill_tokens, 1000);
+        }
+    }
+}
+
+#[test]
+fn injected_grouped_replay_checks_the_selected_canonical_timing_identity() {
+    use aisim_core::{BackendKind, ForwardPassPerfModelConfig, ForwardPassWorkerType};
+    use serde_json::{Value, json};
+
+    struct Timing;
+    impl TimingModel for Timing {
+        fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+            Ok(1.0)
+        }
+        fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+            Ok(1.0)
+        }
+    }
+
+    let run = |provider: &str, case: &str| {
+        let mut spec = disaggregated_grouped_spec(vec![request("canonical", 0.0, 32, 2)]);
+        let rank = spec.engine["rank"].clone();
+        for (name, worker) in [
+            ("prefill", ForwardPassWorkerType::Prefill),
+            ("decode", ForwardPassWorkerType::Decode),
+        ] {
+            let mut timing =
+                ForwardPassPerfModelConfig::new("org/Model", name, BackendKind::Vllm, worker);
+            timing.backend_version = Some("0.31.0".into());
+            let mut row = json!({
+                "system":name, "backend":"vllm", "backend_version":"0.31.0", "worker_type":name,
+                "tp":1, "pp":1, "dp":1, "moe_tp":1, "moe_ep":1, "kv_cache_dtype":"fp8", "attention_backend":"fa3",
+                "resources":{"cache_layout":"grouped", "cache_groups":rank["kv_cache_groups"],
+                    "runtime_memory":{"model_dtype":"torch.bfloat16","runtime_framework_version":"0.31.0"}}
+            });
+            // Another deployment was observed on a different runtime with a different dtype.
+            let mut other = row.clone();
+            other["system"] = "other".into();
+            other["resources"]["runtime_memory"] =
+                json!({"model_dtype":"half", "runtime_framework_version":"0.33.0"});
+            let mut config = serde_json::to_value(&timing).unwrap();
+            if name == "decode" {
+                match case {
+                    "sparse" => {
+                        config["tp"] = Value::Null;
+                        config["attention_dp"] = Value::Null;
+                    }
+                    "unknown" => {
+                        config["attention_backend"] = "auto".into();
+                        row["resources"]["runtime_memory"]["model_dtype"] = "BF16".into();
+                    }
+                    "kv_cache_dtype" | "attention_backend" => row[case] = "other".into(),
+                    "model_dtype" => {
+                        row["resources"]["runtime_memory"]["model_dtype"] = "half".into()
+                    }
+                    "runtime_framework_version" => {
+                        row["resources"]["runtime_memory"][case] = "0.32.0".into()
+                    }
+                    "kv_cache_groups" => {
+                        row["resources"]["cache_groups"][0]["num_layers"] = 1.into()
+                    }
+                    "conflicting_model_dtype" => {
+                        row["resources"]["runtime_memory"]["provenance"] =
+                            json!({"runtime_settings":{"model_config":{"dtype":"half"}}})
+                                .to_string()
+                                .into()
+                    }
+                    "backend" => config["backend"] = "sglang".into(),
+                    "worker_type" => config["worker_type"] = "prefill".into(),
+                    "dcp" | "tp" | "attention_dp" | "cp_size" => config[case] = 2.into(),
+                    "profile_dcp" | "single_dcp" => config["dcp"] = 1.into(),
+                    _ => {}
+                }
+            }
+            if case != "single_dcp" {
+                config["fpm_profile"] = json!({"model":"org/Model", "deployments":[other, row]});
+            }
+            let mut role = rank.clone();
+            role["timing_model"] = json!({"type":"external","provider":provider,"config":config});
+            spec.engine[name] = json!({"rank":role});
+        }
+        Replayer::new(
+            spec,
+            ReplayEngineFactory::with_timing_model(Arc::new(Timing)),
+        )
+        .unwrap()
+        .run()
+    };
+
+    for provider in ["ais", "aic"] {
+        for case in ["control", "unknown", "sparse", "single_dcp"] {
+            assert_eq!(
+                run(provider, case)
+                    .unwrap()
+                    .request_counts
+                    .completed_requests,
+                1,
+                "{provider}/{case}"
+            );
+        }
+        for case in [
+            "kv_cache_dtype",
+            "attention_backend",
+            "model_dtype",
+            "runtime_framework_version",
+            "kv_cache_groups",
+            "conflicting_model_dtype",
+            "backend",
+            "worker_type",
+            "dcp",
+            "tp",
+            "attention_dp",
+            "cp_size",
+            "profile_dcp",
+        ] {
+            let error = run(provider, case).unwrap_err().to_string();
+            let field = case
+                .strip_prefix("profile_")
+                .or_else(|| case.strip_prefix("conflicting_"))
+                .unwrap_or(case);
+            assert!(error.contains(field), "{provider}/{case}: {error}");
+        }
+    }
+}
+
+#[test]
+fn linear_pd_accepts_unequal_tensor_parallel_sizes() {
+    for role in ["prefill", "decode"] {
+        let mut spec = aggregated_spec(
+            Backend::Vllm,
+            1,
+            0.0,
+            vec![request("linear-tp", 0.0, 32, 4)],
+        );
+        spec.topology = disaggregated_grouped_spec(Vec::new()).topology;
+        spec.engine["tensor_parallel_size"] = 4.into();
+        spec.engine[role] = serde_json::json!({
+            "rank": spec.engine["rank"].clone(), "tensor_parallel_size": 8
+        });
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(report.request_counts.completed_requests, 1);
+        assert_eq!(report.request_counts.total_output_tokens, 4);
+        assert_eq!(report.committed_prefill_tokens, 32);
+    }
+}
+
+#[test]
+fn grouped_and_linear_roles_cannot_pair_in_one_handoff() {
+    // A grouped rank counts the handoff in full-attention blocks and a linear
+    // rank in tokens, so a grouped prefill rank with a linear decode rank, or
+    // the reverse, would price the transfer in mixed units.
+    let linear = serde_json::to_value(EngineConfig {
+        num_gpu_blocks: 1024,
+        block_size: 4,
+        max_num_seqs: 4,
+        max_num_batched_tokens: 64,
+        kv_transfer_bytes_per_token: Some(16),
+        kv_transfer_bandwidth: Some(1.0),
+        timing_model: TimingModelConfig::Fixed {
+            prefill_ms: 10.0,
+            decode_ms: 2.0,
+        },
+        ..EngineConfig::for_backend(Backend::Vllm)
+    })
+    .unwrap();
+    for role in ["prefill", "decode"] {
+        let mut spec = disaggregated_grouped_spec(vec![request("mixed", 0.0, 1000, 4)]);
+        spec.engine[role] = serde_json::json!({ "rank": linear });
+        let Err(error) = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+        else {
+            panic!("a linear {role} rank next to a grouped rank must be refused");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid replay spec: kv_cache_groups must be identical on the prefill and decode roles",
+            "linear {role} rank"
+        );
+    }
+}
+
+/// A request of `prompt` tokens and two output tokens.
+fn handoff_request(id: u128, prompt: usize) -> Request {
+    Request {
+        request_id: Uuid::from_u128(id),
+        tokens: (0..prompt as u32).collect(),
+        max_output_tokens: 2,
+        output_token_ids: None,
+        session_id: None,
+        cache_salt: None,
+        images: Vec::new(),
+        kv_hint: None,
+    }
+}
+
+/// The KV handoff command `kind` for handoff `handoff`, with a request of
+/// `request` where the command carries one.
+fn handoff_command(kind: &str, handoff: u128, request: u128, prompt: usize) -> Command {
+    let handoff_id = HandoffId::new(Uuid::from_u128(handoff));
+    match kind {
+        "SubmitHandoffPrefill" => Command::SubmitHandoffPrefill {
+            handoff_id,
+            request: handoff_request(request, prompt),
+        },
+        "ReleaseSource" => Command::ReleaseSource { handoff_id },
+        "CancelSource" => Command::CancelSource { handoff_id },
+        "ReserveDestination" => Command::ReserveDestination {
+            handoff_id,
+            request: handoff_request(request, prompt),
+        },
+        "ActivateDestination" => Command::ActivateDestination { handoff_id },
+        "CancelDestination" => Command::CancelDestination { handoff_id },
+        _ => unreachable!("{kind} is no KV handoff command"),
+    }
+}
+
+/// Run on `engine` a plain request and then one handoff of the rank's own
+/// role to its end, and describe every accepted command and every pass.
+/// `refuse` is called with the time, a handoff and a request number before
+/// the first command, while the first pass is in flight, after the own
+/// handoff starts and before it ends (the last two with its numbers).
+fn own_role_run(
+    engine: &mut aisim_core::engine::Engine,
+    worker_type: WorkerType,
+    prompt: usize,
+    refuse: &mut dyn FnMut(&mut aisim_core::engine::Engine, f64, u128, u128),
+) -> Vec<String> {
+    let mut trace = Vec::new();
+    let apply = |engine: &mut aisim_core::engine::Engine,
+                 trace: &mut Vec<String>,
+                 command: Command,
+                 now_ms: f64| {
+        let effects = engine
+            .apply_command_effects(SchedulerCommand::new(0, command), now_ms)
+            .unwrap();
+        trace.push(format!("command at {now_ms}: {effects:?}"));
+    };
+    // Run passes until `done` holds for a completed pass, or until no rank has
+    // work; with `in_flight`, refuse once while the first pass is in flight.
+    let run = |engine: &mut aisim_core::engine::Engine,
+               trace: &mut Vec<String>,
+               now_ms: &mut f64,
+               refuse: &mut dyn FnMut(&mut aisim_core::engine::Engine, f64, u128, u128),
+               in_flight: bool,
+               done: &dyn Fn(&str) -> bool| {
+        for pass_index in 0..200 {
+            let Some(pass) = engine.execute_pass(*now_ms).unwrap() else {
+                return;
+            };
+            trace.push(format!("pass started: {pass:?}"));
+            if in_flight && pass_index == 0 {
+                refuse(engine, *now_ms, 902, 903);
+            }
+            let completed = engine.complete_pass(pass.pass_id, pass.end_ms).unwrap();
+            *now_ms = pass.end_ms;
+            let completed = format!("pass completed: {completed:?}");
+            let stop = done(&completed);
+            trace.push(completed);
+            if stop {
+                return;
+            }
+        }
+        panic!("the engine did not finish in 200 passes");
+    };
+    let mut now_ms = 0.0;
+    refuse(engine, now_ms, 900, 901);
+    apply(
+        engine,
+        &mut trace,
+        Command::Submit(handoff_request(1, prompt)),
+        now_ms,
+    );
+    run(engine, &mut trace, &mut now_ms, refuse, true, &|_| false);
+    assert!(engine.is_drained());
+    if worker_type == WorkerType::Prefill {
+        apply(
+            engine,
+            &mut trace,
+            handoff_command("SubmitHandoffPrefill", 20, 21, prompt),
+            now_ms,
+        );
+        refuse(engine, now_ms, 20, 21);
+        run(engine, &mut trace, &mut now_ms, refuse, false, &|pass| {
+            pass.contains("SourceHeld")
+        });
+        assert!(trace.last().unwrap().contains("SourceHeld"));
+        refuse(engine, now_ms, 20, 21);
+        apply(
+            engine,
+            &mut trace,
+            handoff_command("ReleaseSource", 20, 21, prompt),
+            now_ms,
+        );
+        assert!(trace.last().unwrap().contains("result: Applied"));
+    } else {
+        apply(
+            engine,
+            &mut trace,
+            handoff_command("ReserveDestination", 20, 21, prompt),
+            now_ms,
+        );
+        assert!(trace.last().unwrap().contains("DestinationAccepted"));
+        refuse(engine, now_ms, 20, 21);
+        apply(
+            engine,
+            &mut trace,
+            handoff_command("ActivateDestination", 20, 21, prompt),
+            now_ms,
+        );
+        assert!(trace.last().unwrap().contains("result: Applied"));
+        refuse(engine, now_ms, 20, 21);
+        run(engine, &mut trace, &mut now_ms, refuse, false, &|_| false);
+    }
+    assert!(engine.is_drained());
+    trace
+}
+
+#[test]
+fn engine_refuses_kv_handoff_commands_of_the_opposite_role() {
+    // A KV handoff has a source on a prefill rank and a destination on a
+    // decode rank. `SchedulerRank` hands each command to the core of its
+    // rank, whose role check refuses a source command on a decode rank and a
+    // destination command on a prefill rank before any state changes, and
+    // `Engine::apply_command_effects` adds the context "applying command to
+    // attention-DP rank 0". So `{:#}` of the error is that context, ": ",
+    // and the text of the role.
+    let source = ["SubmitHandoffPrefill", "ReleaseSource", "CancelSource"];
+    let destination = [
+        "ReserveDestination",
+        "ActivateDestination",
+        "CancelDestination",
+    ];
+    let linear = |backend, worker_type| EngineConfig {
+        num_gpu_blocks: 64,
+        block_size: 4,
+        max_num_seqs: 4,
+        max_num_batched_tokens: 64,
+        worker_type,
+        sglang: SglangConfig {
+            num_reserved_decode_tokens: 0,
+            ..SglangConfig::default()
+        },
+        timing_model: TimingModelConfig::Fixed {
+            prefill_ms: 10.0,
+            decode_ms: 2.0,
+        },
+        ..EngineConfig::for_backend(backend)
+    };
+    let grouped =
+        serde_json::from_value::<ReplayEngineConfig>(disaggregated_grouped_spec(Vec::new()).engine)
+            .unwrap()
+            .rank;
+    // A grouped prefill rank refuses `ReserveDestination` with its own text, in
+    // a check that runs before the role check, so only the other two
+    // destination commands reach the role text there.
+    let mut ranks = Vec::new();
+    for backend in [Backend::Vllm, Backend::Trtllm, Backend::Sglang] {
+        ranks.push((
+            format!("{backend:?} decode"),
+            linear(backend, WorkerType::Decode),
+            16,
+            &source[..],
+        ));
+        ranks.push((
+            format!("{backend:?} prefill"),
+            linear(backend, WorkerType::Prefill),
+            16,
+            &destination[..],
+        ));
+    }
+    ranks.push((
+        "grouped vLLM prefill".to_string(),
+        EngineConfig {
+            worker_type: WorkerType::Prefill,
+            ..grouped
+        },
+        1000,
+        &destination[1..],
+    ));
+    let build = |config: &EngineConfig| {
+        EngineFactory::new(config.clone())
+            .unwrap()
+            .build(EngineIdentity::new(0), NonZeroU32::MIN)
+            .unwrap()
+    };
+    for (name, config, prompt, kinds) in ranks {
+        let reference = own_role_run(
+            &mut build(&config),
+            config.worker_type,
+            prompt,
+            &mut |_, _, _, _| {},
+        );
+        for kind in kinds {
+            let text = if config.worker_type == WorkerType::Decode {
+                format!(
+                    "applying command to attention-DP rank 0: a decode rank holds no KV handoff source, so it refuses {kind}; a prefill rank takes it"
+                )
+            } else {
+                format!(
+                    "applying command to attention-DP rank 0: a prefill rank loads no KV handoff destination, so it refuses {kind}; a decode rank takes it"
+                )
+            };
+            let mut refusals = 0;
+            let trace = own_role_run(
+                &mut build(&config),
+                config.worker_type,
+                prompt,
+                &mut |engine, now_ms, handoff, request| {
+                    let error = engine
+                        .apply_command_effects(
+                            SchedulerCommand::new(
+                                0,
+                                handoff_command(kind, handoff, request, prompt),
+                            ),
+                            now_ms,
+                        )
+                        .unwrap_err();
+                    assert_eq!(format!("{error:#}"), text, "{name}");
+                    refusals += 1;
+                },
+            );
+            assert_eq!(refusals, 4, "{name} {kind}");
+            // The refused commands left no trace: every command and pass of
+            // the plain request and of the own handoff is as without them.
+            assert_eq!(trace, reference, "{name} {kind}");
+        }
+    }
+
+    // On vLLM and TRT-LLM the image refusal comes before the role check.
+    let image = ImageSpec {
+        identity: 1,
+        token_start: 4,
+        token_end: 8,
+        encoder: EncoderShape {
+            sequences: 1,
+            patch_tokens: 16,
+            transformer_tokens: 16,
+            output_tokens: 4,
+        },
+        embedding_bytes: 128,
+    };
+    for backend in [Backend::Vllm, Backend::Trtllm] {
+        for (worker_type, kind) in [
+            (WorkerType::Decode, "SubmitHandoffPrefill"),
+            (WorkerType::Prefill, "ReserveDestination"),
+        ] {
+            let mut command = handoff_command(kind, 30, 31, 8);
+            match &mut command {
+                Command::SubmitHandoffPrefill { request, .. }
+                | Command::ReserveDestination { request, .. } => {
+                    request.images = vec![image.clone()];
+                }
+                _ => unreachable!(),
+            }
+            let mut engine = build(&linear(backend, worker_type));
+            let error = engine
+                .apply_command_effects(SchedulerCommand::new(0, command), 0.0)
+                .unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                "applying command to attention-DP rank 0: native request images require the SGLang backend; vLLM and TRT-LLM do not support them",
+                "{backend:?} {kind}"
+            );
+            assert!(engine.is_drained(), "{backend:?} {kind}");
+        }
+    }
+}
+
+/// `disaggregated_grouped_spec` with a full-attention group and a Mamba-type
+/// state group of 16-token blocks and 100-byte pages, a pool of `pages` pages
+/// and no transfer delay. With `max_model_len`, the rank caches prefixes at a
+/// 16-token hash block, so it runs in block mode.
+fn small_grouped_pd_spec(
+    requests: Vec<ReplayRequest>,
+    pages: u64,
+    max_model_len: Option<usize>,
+) -> ReplaySpec {
+    let mut spec = disaggregated_grouped_spec(requests);
+    let rank = &mut spec.engine["rank"];
+    rank["kv_cache_groups"] = serde_json::json!([
+        {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":16, "page_size_bytes":100, "prefix_cacheable":true, "transfer_bytes_per_block":100},
+        {"name":"state", "kind":"state", "num_layers":1, "block_size_tokens":16, "page_size_bytes":100, "blocks_per_request":1, "prefix_cacheable":true, "transfer_bytes_per_block":100},
+    ]);
+    rank["kv_cache_capacity_bytes"] = (pages * 100).into();
+    rank["kv_transfer_bandwidth"] = serde_json::Value::Null;
+    if let Some(max_model_len) = max_model_len {
+        rank["enable_prefix_caching"] = true.into();
+        rank["prefix_match_unit"] = 16.into();
+        rank["max_model_len"] = max_model_len.into();
+    }
+    spec
+}
+
+#[test]
+fn grouped_prefill_tests_the_original_length_before_mamba_backoff() {
+    let mut spec = small_grouped_pd_spec(
+        vec![request("fits", 0.0, 7, 2), request("at-limit", 5.0, 8, 2)],
+        16,
+        None,
+    );
+    spec.engine["rank"]["max_model_len"] = 16.into();
+    spec.engine["prefill"] = serde_json::json!({"rank": spec.engine["rank"].clone()});
+    spec.engine["prefill"]["rank"]["max_model_len"] = 8.into();
+    let report = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(
+        record(&report, "fits").terminal_status,
+        aisim_core::replay::ReplayTerminalStatus::Completed
+    );
+    let rejected = record(&report, "at-limit");
+    assert_eq!(
+        rejected.terminal_status,
+        aisim_core::replay::ReplayTerminalStatus::Rejected
+    );
+    assert!(rejected.source_held_ms.is_none() && rejected.destination_reserved_ms.is_none());
+}
+
+#[test]
+fn grouped_destination_rejects_an_empty_prompt_before_reserving() {
+    let handoff_id = HandoffId::new(Uuid::from_u128(20));
+    let request_id = Uuid::from_u128(21);
+    for max_model_len in [None, Some(64)] {
+        let spec = small_grouped_pd_spec(Vec::new(), 8, max_model_len);
+        let mut rank = serde_json::from_value::<ReplayEngineConfig>(spec.engine)
+            .unwrap()
+            .rank;
+        rank.worker_type = WorkerType::Decode;
+        // The state still needs a destination, even when no full-attention
+        // block travels remotely. A one-token original prompt is valid.
+        rank.kv_cache_groups.retain(|group| group.name == "state");
+        let mut engine = EngineFactory::new(rank)
+            .unwrap()
+            .build(EngineIdentity::new(0), NonZeroU32::MIN)
+            .unwrap();
+        let reserve = |prompt| {
+            SchedulerCommand::new(
+                0,
+                Command::ReserveDestination {
+                    handoff_id,
+                    request: handoff_request(21, prompt),
+                },
+            )
+        };
+        let cancel = || SchedulerCommand::new(0, Command::CancelDestination { handoff_id });
+        let error = engine.apply_command_effects(reserve(0), 0.0).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "applying command to attention-DP rank 0: grouped KV destinations require a nonempty prompt"
+        );
+        assert!(engine.is_drained());
+        let after_error = engine.apply_command_effects(cancel(), 0.0).unwrap();
+        assert_eq!(after_error.by_rank[0].effects.result, CommandResult::Noop);
+        assert_eq!(
+            after_error.by_rank[0].effects.metrics.kv_cache_used_bytes,
+            Some(0)
+        );
+        let accepted = engine.apply_command_effects(reserve(1), 0.0).unwrap();
+        let effects = &accepted.by_rank[0].effects;
+        assert_eq!(
+            effects.result,
+            CommandResult::DestinationAccepted { request_id }
+        );
+        assert_eq!(
+            effects.lifecycle_events,
+            [LifecycleEvent::DestinationReserved {
+                handoff_id,
+                request_id,
+                transferable_prompt_tokens: 0,
+                full_local_hit: false,
+            }]
+        );
+        assert_eq!(effects.metrics.kv_cache_used_bytes, Some(100));
+        let cancelled = engine.apply_command_effects(cancel(), 0.0).unwrap();
+        assert_eq!(cancelled.by_rank[0].effects.result, CommandResult::Applied);
+        assert_eq!(
+            cancelled.by_rank[0].effects.metrics.kv_cache_used_bytes,
+            Some(0)
+        );
+        assert!(engine.is_drained());
+    }
+}
+
+fn record<'a>(
+    report: &'a aisim_core::replay::ReplayReport,
+    id: &str,
+) -> &'a aisim_core::replay::PerRequestRecord {
+    report
+        .per_request
+        .iter()
+        .find(|record| record.request_id.as_deref() == Some(id))
+        .unwrap()
+}
+
+/// Runs `spec` on its own thread, so that a livelock fails the caller after
+/// 60 s instead of hanging it.
+fn run_within_60_s(spec: ReplaySpec) -> aisim_core::replay::ReplayReport {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        sender.send(report).unwrap();
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the replay ends within 60 s")
+}
+
+/// The times at which the decode rank admitted a request, readmissions
+/// included.
+fn decode_admissions(record: &aisim_core::replay::PerRequestRecord) -> Vec<f64> {
+    record
+        .admission_history
+        .iter()
+        .filter(|admission| admission.pool == ReplayRequestPool::Decode)
+        .map(|admission| admission.at_ms)
+        .collect()
+}
+
+#[test]
+fn full_window_handoffs_reserve_the_first_decode_forward() {
+    let mut spec = disaggregated_grouped_spec(distinct_requests(&[(8, 2, 0.0); 4]));
+    let rank = &mut spec.engine["rank"];
+    rank["kv_cache_groups"] = serde_json::json!([{
+        "name": "window", "kind": "attention", "num_layers": 1, "block_size_tokens": 4,
+        "page_size_bytes": 64, "sliding_window": 5, "prefix_cacheable": true,
+        "transfer_bytes_per_block": 64
+    }]);
+    rank["max_num_batched_tokens"] = 32.into();
+    rank["kv_transfer_bandwidth"] = serde_json::Value::Null;
+    let mut decode = rank.clone();
+    // A full 8-token load has one live page. Computing token 8 from a
+    // watermark of 7 still needs both window pages.
+    decode["kv_cache_capacity_bytes"] = (4 * 64).into();
+    spec.engine["decode"] = serde_json::json!({"rank": decode});
+    let report = run_within_60_s(spec.clone());
+    assert_eq!(report.request_counts.completed_requests, 4);
+
+    spec.engine["decode"]["rank"]["kv_cache_capacity_bytes"] = 64.into();
+    let report = run_within_60_s(spec);
+    assert_eq!(report.request_counts.completed_requests, 0);
+    assert!(
+        report
+            .per_request
+            .iter()
+            .all(|record| record.destination_reserved_ms.is_none()
+                && record.terminal_status == aisim_core::replay::ReplayTerminalStatus::Failed)
+    );
+}
+
+#[test]
+fn grouped_destination_waits_for_room_for_its_whole_prompt() {
+    // Two distinct prompts of 33 tokens on a pool of 6 pages, in byte mode
+    // and in block mode. Each load of 32 tokens takes 2 attention blocks and
+    // 1 state block, and the whole prompt needs a third attention block.
+    // vLLM admits a load only when the whole prompt fits, with the loaded
+    // tokens computed (V32 `vllm/v1/core/kv_cache_manager.py:522-539`): 4
+    // pages. Two loads of 3 pages would fill the pool, and neither request
+    // could compute its last prompt token. Both prefills end at 10 ms. The
+    // first load is reserved then and activated after the 1 ms handoff, and
+    // its two decode passes of 2 ms end at 15 ms. Until then at most 3 pages
+    // are free, so the second load is reserved at 15 ms.
+    for max_model_len in [None, Some(64)] {
+        let mut first = request("first", 0.0, 33, 2);
+        first.input_token_ids = Some((0..33).collect());
+        let mut second = request("second", 0.0, 33, 2);
+        second.input_token_ids = Some((1000..1033).collect());
+        let spec = small_grouped_pd_spec(vec![first, second], 6, max_model_len);
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{max_model_len:?}"
+        );
+        let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert_eq!(
+            first.destination_reserved_ms,
+            Some(10.0),
+            "{max_model_len:?}"
+        );
+        assert_eq!(first.terminal_time_ms, 15.0, "{max_model_len:?}");
+        assert_eq!(
+            second.destination_reserved_ms,
+            Some(15.0),
+            "{max_model_len:?}"
+        );
+    }
+}
+
+#[test]
+fn grouped_destination_retries_when_an_activation_publishes_its_hit() {
+    // Two identical prompts of 81 tokens on a decode pool of 11 pages in
+    // block mode. A prefill rank without prefix caching and with room for
+    // both ends both prefills at 10 ms, so both loads arrive then. The first
+    // load takes 5 attention blocks and 1 state block. The second needs 7
+    // free pages for its whole prompt without a hit and finds 5, so it
+    // waits. The first load activates after the 1 ms handoff, at 11 ms, and
+    // publishes its 5 attention blocks. The second prompt then hits them and
+    // needs 1 attention block and 1 state block, so it is reserved at 11 ms,
+    // not when the first request finishes at 27 ms (11 ms and 8 decode passes
+    // of 2 ms).
+    let prompt: Vec<u32> = (0..81).collect();
+    let requests = ["first", "second"].map(|id| {
+        let mut request = request(id, 0.0, 81, 8);
+        request.input_token_ids = Some(prompt.clone());
+        request
+    });
+    let mut spec = small_grouped_pd_spec(requests.to_vec(), 11, Some(144));
+    let mut prefill = spec.engine["rank"].clone();
+    prefill["enable_prefix_caching"] = false.into();
+    prefill["prefix_match_unit"] = serde_json::Value::Null;
+    prefill["kv_cache_capacity_bytes"] = (64 * 100).into();
+    spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+    let report = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(report.request_counts.completed_requests, 2);
+    let (first, second) = (record(&report, "first"), record(&report, "second"));
+    assert_eq!(second.source_held_ms, Some(10.0));
+    assert_eq!(first.destination_activated_ms, Some(11.0));
+    assert_eq!(first.terminal_time_ms, 27.0);
+    assert_eq!(second.destination_reserved_ms, Some(11.0));
+}
+
+#[test]
+fn grouped_destination_keeps_room_for_the_first_pass_of_each_load() {
+    // The two prompts of 33 tokens on a pool of 7 pages. Both prefills end at
+    // 10 ms, and the first load of 3 pages is reserved then. Its first pass
+    // takes a third attention block. In block mode it also takes a new state
+    // block, as token 33 crosses a state block boundary. vLLM admits a load
+    // only when its blocks fit the free blocks minus what the other loads in
+    // flight still need (V32 `vllm/v1/core/kv_cache_manager.py:561-579`). In
+    // byte mode the second load of 3 pages and the 1 page of the first pass
+    // fit the 4 free pages, so the second load is reserved at 10 ms. In block
+    // mode the first pass needs 2, so the second load waits. The first load
+    // activates at 11 ms, and its first pass leaves 2 free pages. The next
+    // pass is formed while the first is in flight and holds the previous
+    // state block one step longer, so 2 pages stay free, less than the 4 of
+    // the whole prompt. The first request ends at 15 ms, and the second load
+    // is reserved then. In byte mode both loads activate at 11 ms. The first
+    // pass of the first request takes the last free page, so the first pass
+    // of the second request waits, as vLLM's waiting loop stops there
+    // (V32 `vllm/v1/core/sched/scheduler.py:1275-1282`). That pass runs when
+    // the first request ends at 15 ms, and the second request ends after two
+    // decode passes of 2 ms, at 19 ms. In block mode the second load
+    // activates at 16 ms and ends at 20 ms. No request computes its prompt
+    // again.
+    for (max_model_len, second_reserved_ms, second_end_ms) in
+        [(None, 10.0, 19.0), (Some(64), 15.0, 20.0)]
+    {
+        let mut first = request("first", 0.0, 33, 2);
+        first.input_token_ids = Some((0..33).collect());
+        let mut second = request("second", 0.0, 33, 2);
+        second.input_token_ids = Some((1000..1033).collect());
+        let spec = small_grouped_pd_spec(vec![first, second], 7, max_model_len);
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{max_model_len:?}"
+        );
+        let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert_eq!(
+            first.destination_reserved_ms,
+            Some(10.0),
+            "{max_model_len:?}"
+        );
+        assert_eq!(
+            second.destination_reserved_ms,
+            Some(second_reserved_ms),
+            "{max_model_len:?}"
+        );
+        assert_eq!(first.terminal_time_ms, 15.0, "{max_model_len:?}");
+        assert_eq!(second.terminal_time_ms, second_end_ms, "{max_model_len:?}");
+        assert_eq!(
+            (first.readmission_count, second.readmission_count),
+            (0, 0),
+            "{max_model_len:?}"
+        );
+    }
+}
+
+#[test]
+fn grouped_destination_partial_state_copies_do_not_stall_replay() {
+    // Both loads finish prefill together. Each reserves three of six blocks,
+    // but activation will publish a partial state whose next write needs a
+    // copy. The second load must wait while the first can still finish.
+    for version in ["0.31.0", "0.32.0"] {
+        for async_scheduling in [false, true] {
+            let label = format!("{version} async={async_scheduling}");
+            let mut first = request("first", 0.0, 21, 2);
+            first.input_token_ids = Some((0..21).collect());
+            let mut second = request("second", 0.0, 21, 2);
+            second.input_token_ids = Some((1000..1021).collect());
+            let mut spec = small_grouped_pd_spec(vec![first, second], 6, Some(64));
+            let rank = &mut spec.engine["rank"];
+            rank["prefix_match_unit"] = 4.into();
+            rank["vllm_version"] = version.into();
+            rank["async_scheduling"] = async_scheduling.into();
+            rank["kv_cache_groups"][1]["prefill_checkpoint_blocks"] = 0.into();
+            // Cold prefill avoids prefix-checkpoint chunking, so both loads
+            // reach the decode rank before either transfer activates.
+            let mut prefill = rank.clone();
+            prefill["enable_prefix_caching"] = false.into();
+            prefill["prefix_match_unit"] = serde_json::Value::Null;
+            prefill["kv_cache_capacity_bytes"] = 1_600.into();
+            spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+            let report = run_within_60_s(spec);
+            assert_eq!(report.request_counts.completed_requests, 2, "{label}");
+            let (first, second) = (record(&report, "first"), record(&report, "second"));
+            assert_eq!(first.destination_reserved_ms, Some(10.0), "{label}");
+            assert!(second.destination_reserved_ms.unwrap() > 10.0, "{label}");
+            assert_eq!(
+                (first.readmission_count, second.readmission_count),
+                (0, 0),
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_destination_defers_its_own_state_copy_until_a_peer_finishes() {
+    // A one-token load holds two blocks and has no state copy at a hash
+    // unit of four. The next load takes three blocks for 20 of 21 tokens.
+    // In block mode its partial state needs a fourth block in the first
+    // pass, so it must wait for the peer to finish on this five-block pool.
+    // Byte mode publishes no cached state and can admit both loads at once.
+    for version in ["0.31.0", "0.32.0"] {
+        for async_scheduling in [false, true] {
+            for block_mode in [false, true] {
+                let label = format!("{version} async={async_scheduling} block={block_mode}");
+                let mut first = request("first", 0.0, 1, 2);
+                first.input_token_ids = Some(vec![99]);
+                let mut second = request("second", 0.0, 21, 2);
+                second.input_token_ids = Some((1000..1021).collect());
+                let max_model_len = block_mode.then_some(32);
+                let mut spec = small_grouped_pd_spec(vec![first, second], 5, max_model_len);
+                let rank = &mut spec.engine["rank"];
+                if block_mode {
+                    rank["prefix_match_unit"] = 4.into();
+                }
+                rank["vllm_version"] = version.into();
+                rank["async_scheduling"] = async_scheduling.into();
+                rank["kv_cache_groups"][1]["prefill_checkpoint_blocks"] = 0.into();
+                let mut prefill = rank.clone();
+                prefill["enable_prefix_caching"] = false.into();
+                prefill["prefix_match_unit"] = serde_json::Value::Null;
+                prefill["kv_cache_capacity_bytes"] = 1_600.into();
+                spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+                let report = run_within_60_s(spec);
+                assert_eq!(report.request_counts.completed_requests, 2, "{label}");
+                let (first, second) = (record(&report, "first"), record(&report, "second"));
+                assert_eq!(first.destination_reserved_ms, Some(10.0), "{label}");
+                if block_mode {
+                    assert!(
+                        second.destination_reserved_ms.unwrap() >= first.terminal_time_ms,
+                        "{label}"
+                    );
+                } else {
+                    assert_eq!(second.destination_reserved_ms, Some(10.0), "{label}");
+                }
+                assert_eq!(
+                    (first.readmission_count, second.readmission_count),
+                    (0, 0),
+                    "{label}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_destination_keeps_room_for_a_first_pass_in_byte_mode_too() {
+    // A first prompt of 33 tokens and a distinct second prompt of 34 tokens on
+    // a decode pool of 7 pages. A prefill rank without prefix caching and with
+    // room for both ends both prefills at 10 ms. The first load holds 3 pages,
+    // and its first pass takes 1 more, 2 in block mode. The second load holds
+    // 4 pages for its 33 tokens, and its first pass takes none. So its whole
+    // prompt fits the 4 free pages, but the load would leave none for the
+    // first pass. It waits in both modes until the first request ends at
+    // 15 ms. If it took them, the first pass of the first request would never
+    // fit, and the second request would wait behind it.
+    for max_model_len in [None, Some(64)] {
+        let mut first = request("first", 0.0, 33, 2);
+        first.input_token_ids = Some((0..33).collect());
+        let mut second = request("second", 0.0, 34, 2);
+        second.input_token_ids = Some((1000..1034).collect());
+        let mut spec = small_grouped_pd_spec(vec![first, second], 7, max_model_len);
+        let mut prefill = spec.engine["rank"].clone();
+        prefill["enable_prefix_caching"] = false.into();
+        prefill["prefix_match_unit"] = serde_json::Value::Null;
+        prefill["kv_cache_capacity_bytes"] = (64 * 100).into();
+        spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{max_model_len:?}"
+        );
+        let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert_eq!(second.source_held_ms, Some(10.0), "{max_model_len:?}");
+        assert_eq!(first.terminal_time_ms, 15.0, "{max_model_len:?}");
+        assert_eq!(
+            second.destination_reserved_ms,
+            Some(15.0),
+            "{max_model_len:?}"
+        );
+    }
+}
+
+#[test]
+fn grouped_destination_in_byte_mode_with_a_window_group_stops_where_vllm_stops() {
+    check_window_group_stop_threshold(false, 27);
+}
+
+#[test]
+fn grouped_destination_in_block_mode_with_a_window_group_stops_where_vllm_stops() {
+    check_window_group_stop_threshold(true, 28);
+}
+
+fn check_window_group_stop_threshold(prefix_caching: bool, stalled_pages: u64) {
+    // Full attention, a window of 33 tokens and a state group of one block per
+    // request, 16-token blocks and 100-byte pages, max_model_len 240, one
+    // batch of 32 tokens and prefix caching off, so the window cap is
+    // cdiv(32 + 32, 16) + 1 = 5 blocks (v0.31.0
+    // `vllm/v1/kv_cache_interface.py:859-866`, v0.32.0 `:878-885`, v0.33.0
+    // `:937-944`). Two distinct prompts of 161 tokens
+    // end their prefills together, and each load of 160 tokens holds 10 + 2 +
+    // 1 = 13 pages for 50 ms. With the loaded tokens computed, the reserve
+    // that vLLM keeps for a held load counts the rest of its sequence with
+    // the cap: 11 - 10 = 1 full-attention page, and for the window group
+    // min(11, 5) less the 10 block positions that the load holds, null blocks
+    // included, so no page (v0.31.0
+    // `vllm/v1/core/sched/scheduler.py:3003-3017`, v0.32.0 `:3060-3076`,
+    // v0.33.0 `:3404-3420`). The first step after the load counts the window
+    // page that token 161 opens, without the cap: 2 pages (v0.31.0
+    // `vllm/v1/core/kv_cache_manager.py:558-576`, v0.32.0 `:561-579`, v0.33.0
+    // `:570-588`).
+    // - 26 pages: the second load needs 13 pages and the reserve 1, against
+    //   13 free, so it waits, and it is reserved when the first request ends.
+    // - 27 pages: the second load fits on 14 free pages with the reserve, and
+    //   1 page stays free. After both loads each first step needs 2. vLLM's
+    //   waiting loop breaks at the first refusal (v0.31.0
+    //   `vllm/v1/core/sched/scheduler.py:1194-1230`, v0.32.0 `:1241-1282`,
+    //   v0.33.0 `:1420-1461`), and its engine loop goes on with empty steps
+    //   (v0.31.0 `vllm/v1/engine/core.py:1526-1542`, v0.32.0 `:1603-1619`,
+    //   v0.33.0 `:1678-1696`). No request runs again until a client aborts
+    //   one of them (v0.31.0 `vllm/v1/core/sched/scheduler.py:2585-2648`,
+    //   v0.32.0 `:2649-2712`, v0.33.0 `:2964-3029`). Replay ends with the
+    //   error of a pass without effect.
+    // - 28 pages: both loads are reserved and the first step of the first
+    //   request fits. The first request is preempted once, and the second
+    //   request ends first.
+    // With prefix caching on, the first forward also opens a state block.
+    // The tagged EngineCore schedulers reproduce the same three outcomes
+    // at 27, 28 and 29 pages respectively on each of these releases.
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let spec = |pages: u64| {
+            let requests = ["first", "second"]
+                .into_iter()
+                .zip([0u32, 1_000])
+                .map(|(id, first_token)| {
+                    let mut request = request(id, 0.0, 161, 40);
+                    request.input_token_ids = Some((first_token..first_token + 161).collect());
+                    request
+                })
+                .collect();
+            let mut spec = small_grouped_pd_spec(requests, pages, prefix_caching.then_some(240));
+            spec.topology = ReplayTopology::Disaggregated {
+                prefill: WorkerPoolSpec {
+                    initial_workers: 1,
+                    startup_delay_ms: 0.0,
+                },
+                decode: WorkerPoolSpec {
+                    initial_workers: 1,
+                    startup_delay_ms: 0.0,
+                },
+                handoff_latency_ms: 50.0,
+            };
+            let rank = &mut spec.engine["rank"];
+            rank["kv_cache_groups"] = serde_json::json!([
+                {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":16, "page_size_bytes":100, "prefix_cacheable":true, "transfer_bytes_per_block":100},
+                {"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":16, "page_size_bytes":100, "sliding_window":33, "prefix_cacheable":true, "transfer_bytes_per_block":100},
+                {"name":"state", "kind":"state", "num_layers":1, "block_size_tokens":16, "page_size_bytes":100, "blocks_per_request":1, "prefix_cacheable":true, "prefill_checkpoint_blocks":0, "transfer_bytes_per_block":100},
+            ]);
+            rank["vllm_version"] = version.into();
+            rank["max_num_batched_tokens"] = 32.into();
+            rank["max_model_len"] = 240.into();
+            rank["async_scheduling"] = false.into();
+            // The prefill rank ends both prefills in one pass.
+            let mut prefill = rank.clone();
+            prefill["max_num_batched_tokens"] = 4096.into();
+            prefill["kv_cache_capacity_bytes"] = (64 * 100).into();
+            spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+            spec
+        };
+
+        let report = Replayer::new(spec(stalled_pages - 1), ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{version} prefix caching {prefix_caching}"
+        );
+        let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert_eq!(
+            second.destination_reserved_ms,
+            Some(first.terminal_time_ms),
+            "{version} prefix caching {prefix_caching}"
+        );
+        assert_eq!(
+            (first.readmission_count, second.readmission_count),
+            (0, 0),
+            "{version} prefix caching {prefix_caching}"
+        );
+
+        let error = Replayer::new(spec(stalled_pages), ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "replay invariant violated: offline disagg replay encountered an effect-free zero-duration pass with 2 in-flight requests remaining",
+            "{version} prefix caching {prefix_caching}"
+        );
+
+        let report = Replayer::new(spec(stalled_pages + 1), ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{version} prefix caching {prefix_caching}"
+        );
+        let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert!(
+            first.destination_reserved_ms.is_some(),
+            "{version} prefix caching {prefix_caching}"
+        );
+        assert_eq!(
+            first.destination_reserved_ms, second.destination_reserved_ms,
+            "{version} prefix caching {prefix_caching}"
+        );
+        assert_eq!(
+            (first.readmission_count, second.readmission_count),
+            (1, 0),
+            "{version} prefix caching {prefix_caching}"
+        );
+        assert!(
+            second.terminal_time_ms < first.terminal_time_ms,
+            "{version} prefix caching {prefix_caching}"
+        );
+    }
+}
+
+#[test]
+fn grouped_window_and_state_loads_can_stall_without_full_attention() {
+    // These v0.33 layouts meet the native startup requirement. The two
+    // waiting first forwards cannot release each other's window/state pages.
+    for (pages, prefix_caching, prompts, budget, max_len) in [
+        (5, false, [65, 66], 32, 80),
+        (6, false, [65, 66], 32, 80),
+        (5, true, [49, 49], 16, 64),
+    ] {
+        let requests = ["first", "second"]
+            .into_iter()
+            .zip(prompts)
+            .zip([0u32, 1_000])
+            .map(|((id, length), start)| {
+                let mut request = request(id, 0.0, length, 2);
+                request.input_token_ids = Some((start..start + length as u32).collect());
+                request
+            })
+            .collect();
+        let mut spec = small_grouped_pd_spec(requests, pages, prefix_caching.then_some(max_len));
+        let rank = &mut spec.engine["rank"];
+        rank["vllm_version"] = "0.33.0".into();
+        rank["max_model_len"] = max_len.into();
+        rank["max_num_batched_tokens"] = budget.into();
+        rank["async_scheduling"] = false.into();
+        rank["kv_cache_groups"][0]["name"] = "window".into();
+        rank["kv_cache_groups"][0]["sliding_window"] = 16.into();
+        rank["kv_cache_groups"][1]["prefill_checkpoint_blocks"] = 0.into();
+        let mut prefill = rank.clone();
+        prefill["max_num_batched_tokens"] = 256.into();
+        prefill["kv_cache_capacity_bytes"] = 6400.into();
+        spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+        let result = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run();
+        if pages == 5 {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "replay invariant violated: offline disagg replay encountered an effect-free zero-duration pass with 2 in-flight requests remaining",
+                "prefix caching {prefix_caching}"
+            );
+        } else {
+            assert_eq!(result.unwrap().request_counts.completed_requests, 2);
+        }
+    }
+}
+
+#[test]
+fn grouped_destination_burst_completes_without_readmission() {
+    // Four distinct prompts of 2,177 tokens on a GLM-5.3-Flash decode pool of
+    // 16 pages, in byte mode and in block mode. A load holds 6 blocks for its
+    // 2,176 tokens. In block mode its first pass takes 5 more: an attention
+    // block and a new block of each KDA group. Two loads would leave 4 free
+    // blocks, and neither first pass would fit. In byte mode a first pass
+    // takes only the attention block.
+    for prefix_caching in [false, true] {
+        let requests = (0..4)
+            .map(|i| {
+                let mut request = request(&format!("r{i}"), 0.0, 2177, 2);
+                request.input_token_ids = Some((i * 10_000..i * 10_000 + 2177).collect());
+                request
+            })
+            .collect();
+        let mut spec = disaggregated_grouped_spec(requests);
+        spec.engine["prefill"] = serde_json::json!({ "rank": spec.engine["rank"].clone() });
+        let rank = &mut spec.engine["rank"];
+        let page = rank["kv_cache_groups"][0]["page_size_bytes"]
+            .as_u64()
+            .unwrap();
+        if prefix_caching {
+            rank["enable_prefix_caching"] = true.into();
+            rank["prefix_match_unit"] = 2176.into();
+        }
+        rank["max_model_len"] = 4352.into();
+        rank["kv_cache_capacity_bytes"] = (16 * page).into();
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            report.request_counts.completed_requests, 4,
+            "{prefix_caching}"
+        );
+        assert!(
+            report
+                .per_request
+                .iter()
+                .all(|record| record.readmission_count == 0),
+            "{prefix_caching}"
+        );
+    }
+}
+
+#[test]
+fn grouped_decode_rank_serves_a_loaded_handoff_before_a_preempted_request() {
+    // Two distinct prompts of 33 tokens with long outputs: 17 tokens each in
+    // byte mode on 7 pages, and 20 tokens each in block mode on 8 pages. The
+    // first request outgrows the pool while the first pass of the second
+    // request waits, so it preempts itself. A preempted request goes to the
+    // front of the waiting queue without its blocks, and vLLM serves the
+    // requests that hold KV blocks first (V32
+    // `vllm/v1/core/sched/scheduler.py:913-917`). So the second request runs,
+    // and the first request computes its prompt again.
+    for (max_model_len, pages, output) in [(None, 7, 17), (Some(80), 8, 20)] {
+        let mut first = request("first", 0.0, 33, output);
+        first.input_token_ids = Some((0..33).collect());
+        let mut second = request("second", 0.0, 33, output);
+        second.input_token_ids = Some((1000..1033).collect());
+        let spec = small_grouped_pd_spec(vec![first, second], pages, max_model_len);
+        let report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{max_model_len:?}"
+        );
+        let (first, second) = (record(&report, "first"), record(&report, "second"));
+        assert_eq!(
+            (first.readmission_count, second.readmission_count),
+            (1, 0),
+            "{max_model_len:?}"
+        );
+    }
+}
+
+#[test]
+fn grouped_decode_rank_serves_a_loaded_glm_handoff_before_a_preempted_request() {
+    // Two distinct GLM-5.3-Flash prompts of 2,177 tokens with 2,200 output
+    // tokens each, in byte mode as the P/D compiler sets it, on a decode pool
+    // of 13 pages. Each load holds 6 pages, and each first pass takes the
+    // second attention page. Both loads fit, the first pass of the second
+    // request waits for the last page, and the first request needs a third
+    // attention page at 4,352 tokens. It preempts itself, and the loaded
+    // second request runs before it.
+    let requests = (0..2)
+        .map(|i| {
+            let mut request = request(&format!("r{i}"), 0.0, 2177, 2200);
+            request.input_token_ids = Some((i * 10_000..i * 10_000 + 2177).collect());
+            request
+        })
+        .collect();
+    let mut spec = disaggregated_grouped_spec(requests);
+    spec.engine["prefill"] = serde_json::json!({ "rank": spec.engine["rank"].clone() });
+    let rank = &mut spec.engine["rank"];
+    let page = rank["kv_cache_groups"][0]["page_size_bytes"]
+        .as_u64()
+        .unwrap();
+    rank["max_model_len"] = 8704.into();
+    rank["kv_cache_capacity_bytes"] = (13 * page).into();
+    let report = Replayer::new(spec, ReplayEngineFactory::new())
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(report.request_counts.completed_requests, 2);
+    assert_eq!(
+        (
+            record(&report, "r0").readmission_count,
+            record(&report, "r1").readmission_count
+        ),
+        (1, 0)
+    );
+}
+
+#[test]
+fn grouped_decode_rank_waits_for_an_event_after_a_repeated_self_preemption() {
+    // Prompts of 84, 90 and 14 tokens with 8 output tokens each, on pools of
+    // 17 pages in block mode, with handoffs at 1e-5 GB/s, 10 bytes per ms.
+    // The prefill rank computes 13, 83 and 89 tokens. It holds h14 at 10 ms
+    // and h84 at 20 ms. At 10 ms h90 does not fit beside h84. The pass in
+    // flight ran h90, so vLLM does not preempt it there (v0.31
+    // `vllm/v1/core/sched/scheduler.py:773-775`, v0.32 `:804-806`, v0.33
+    // `:940-942`). At 20 ms it still does not fit and preempts itself. It is
+    // readmitted at 20 ms with its 80 cached tokens and held at 30 ms. The
+    // transfers of 200, 700 and 700 bytes share the links fairly. h14 sends
+    // 100 bytes alone, 50 beside h84 and its last 50 beside both loads, by
+    // 45 ms. h84 sends its last 600 bytes at 5 bytes per ms by 165 ms, and
+    // h90 its last 50 bytes by 170 ms. h90 activates when the decode pass
+    // that runs at 170 ms ends, at 171 ms.
+    //
+    // The full-attention group is not prefix-cacheable, so no block of h14
+    // gets a key. With a prefix-cacheable group the turn below does not
+    // repeat: see
+    // `grouped_decode_rank_waits_for_blocks_when_a_preempted_request_hits_its_own_blocks`.
+    //
+    // h14 holds 2 blocks and the loads in flight hold 14, so 1 block is
+    // free. h14 emits outputs at 47, 49 and 51 ms. Token 17 then needs an
+    // attention block and a new state block. The pass at 51 ms is formed
+    // behind the pass that ran h14, so it stops h14, and the next pass at
+    // 51 ms, with no pass in flight, preempts it. Its readmission needs 3
+    // blocks and finds 3. Its 16-token chunk takes 2 at 0 ms, as a decode
+    // rank prices no prefill. The pass behind that chunk stops h14 again,
+    // and the pass after it preempts it with the same pool. vLLM repeats
+    // that turn until a transfer ends. Replay lets h14 wait for the next
+    // event, the activation of h84 at 165 ms. Then h84 decodes every 2 ms,
+    // and a turn of h14 takes three passes: one readmits it, one stops it
+    // behind the pass that ran its chunk, and one preempts it. So h14 is
+    // readmitted at 165, 171, 177 and 183 ms. The pass at 171 ms preempts no
+    // request, so it admits h90, which ends 8 passes later at 187 ms. h84
+    // ends at 181 ms. Token 17 of h14 then fits in the pass at 185 ms, and
+    // h14 emits its last five outputs from 187 to 195 ms.
+    let requests = [84u32, 90, 14]
+        .iter()
+        .enumerate()
+        .map(|(i, &prompt)| {
+            let mut request = request(&format!("h{prompt}"), 0.0, prompt as usize, 8);
+            let first = 10_000 * (i as u32 + 1);
+            request.input_token_ids = Some((first..first + prompt).collect());
+            request
+        })
+        .collect();
+    let mut spec = small_grouped_pd_spec(requests, 17, Some(128));
+    spec.engine["rank"]["kv_cache_groups"][0]["prefix_cacheable"] = false.into();
+    spec.engine["rank"]["kv_transfer_bandwidth"] = 1e-5.into();
+    let report = run_within_60_s(spec);
+    assert_eq!(report.request_counts.completed_requests, 3);
+    let (h84, h90, h14) = (
+        record(&report, "h84"),
+        record(&report, "h90"),
+        record(&report, "h14"),
+    );
+    assert_eq!(
+        [h14, h84, h90].map(|record| record.destination_activated_ms),
+        [Some(45.0), Some(165.0), Some(171.0)]
+    );
+    assert_eq!(
+        decode_admissions(h14),
+        [45.0, 51.0, 165.0, 171.0, 177.0, 183.0]
+    );
+    assert_eq!((h14.terminal_time_ms, h14.readmission_count), (195.0, 5));
+    // h84 ends 8 passes of 2 ms after 165 ms. h90 is admitted by the pass
+    // at 171 ms and ends 8 passes later. Its readmission is the one of
+    // the prefill rank.
+    assert_eq!(
+        [h84, h90].map(|record| (record.terminal_time_ms, record.readmission_count)),
+        [(181.0, 0), (187.0, 1)]
+    );
+    assert_eq!(h90.decode_admit_ms, Some(171.0));
+}
+
+#[test]
+fn grouped_decode_rank_waits_for_blocks_when_a_preempted_request_hits_its_own_blocks() {
+    // The script of
+    // `grouped_decode_rank_waits_for_an_event_after_a_repeated_self_preemption`
+    // with a prefix-cacheable full-attention group. The prefill rank and the
+    // transfers are the same: h14 activates at 45 ms, h84 at 165 ms and h90
+    // at 171 ms.
+    //
+    // h14 holds 2 blocks and the loads in flight hold 14, so 1 block is
+    // free. h14 emits outputs at 47, 49 and 51 ms. The pass at 49 ms
+    // computes token 16. The 14 prompt tokens and 2 output tokens fill the
+    // attention block, which gets its key. Token 17 then needs an attention
+    // block and a new state block. The pass at 51 ms is formed behind the
+    // pass that ran h14, so it stops h14, and the next pass at 51 ms, with
+    // no pass in flight, preempts it. Its attention block stays cached. Its
+    // readmission finds that block and no state, so it hits nothing and has
+    // a junction at 16 tokens (v0.31 and v0.32
+    // `vllm/v1/core/kv_cache_manager.py:312-321`, v0.33 `:319-328`). Its 17
+    // tokens need 3 blocks and find 3. Its 16-token chunk takes 2 at 0 ms,
+    // as a decode rank prices no prefill, and keeps the state at the
+    // junction. The pass behind that chunk stops h14 again, and the pass
+    // after it preempts it. The pool then has 3 cached blocks with 2 visible
+    // keys, and it had 1 cached block with 1 key after the first
+    // preemption, so the turn does not repeat. The next readmission hits 16
+    // tokens. vLLM counts a hit block that no request holds against the
+    // free blocks (v0.31
+    // `vllm/v1/core/single_type_kv_cache_manager.py:261-268`, `:1813-1816`,
+    // v0.32 `:258-265`, `:1775-1778`, v0.33 `:259-266`, `:1792-1795`). So the
+    // 17 tokens need a new block and the hit block in each group, 4 blocks,
+    // and 3 are free: h14 waits for blocks. h84 ends 8 passes after its
+    // activation, at 181 ms, and h90 at 187 ms. The blocks of h84 are free
+    // after the pass at 181 ms is formed, so the pass at 183 ms readmits h14
+    // with its 16 cached tokens, and h14 emits its last five outputs from
+    // 185 to 193 ms. These times and counts are derived from the rules.
+    let requests = [84u32, 90, 14]
+        .iter()
+        .enumerate()
+        .map(|(i, &prompt)| {
+            let mut request = request(&format!("h{prompt}"), 0.0, prompt as usize, 8);
+            let first = 10_000 * (i as u32 + 1);
+            request.input_token_ids = Some((first..first + prompt).collect());
+            request
+        })
+        .collect();
+    let mut spec = small_grouped_pd_spec(requests, 17, Some(128));
+    spec.engine["rank"]["kv_transfer_bandwidth"] = 1e-5.into();
+    let report = run_within_60_s(spec);
+    assert_eq!(report.request_counts.completed_requests, 3);
+    let (h84, h90, h14) = (
+        record(&report, "h84"),
+        record(&report, "h90"),
+        record(&report, "h14"),
+    );
+    assert_eq!(
+        [h14, h84, h90].map(|record| record.destination_activated_ms),
+        [Some(45.0), Some(165.0), Some(171.0)]
+    );
+    // One readmission at 51 ms with no hit, then the wait for blocks until
+    // the pass at 183 ms: 2 readmissions, 183 + 5 passes of 2 ms, and the
+    // last admission hits the 16 cached tokens.
+    assert_eq!(decode_admissions(h14), [45.0, 51.0, 183.0]);
+    assert_eq!((h14.terminal_time_ms, h14.readmission_count), (193.0, 2));
+    assert_eq!(h14.decode_reused_input_tokens, Some(16));
+    assert_eq!(
+        [h84, h90].map(|record| (record.terminal_time_ms, record.readmission_count)),
+        [(181.0, 0), (187.0, 1)]
+    );
+    assert_eq!(h90.decode_admit_ms, Some(171.0));
+}
+
+/// Distinct prompts of the given (prompt, output, arrival) shapes, with the
+/// token IDs of request i starting at 1,000 * (i + 1).
+fn distinct_requests(shapes: &[(usize, usize, f64)]) -> Vec<ReplayRequest> {
+    shapes
+        .iter()
+        .enumerate()
+        .map(|(i, &(prompt, output, at))| {
+            let mut request = request(&format!("q{i}"), at, prompt, output);
+            let first = 1000 * (i as u32 + 1);
+            request.input_token_ids = Some((first..first + prompt as u32).collect());
+            request
+        })
+        .collect()
+}
+
+#[test]
+fn grouped_decode_rank_waits_when_a_turn_leaves_the_pool_as_it_was() {
+    // Three distinct prompts of 31, 30 and 34 tokens with 40, 31 and 20
+    // outputs, arriving at 0, 3 and 6 ms, on pools of 13 pages in block mode,
+    // with a 32-token budget, 0.5 ms decode passes and handoffs at
+    // 3e-7 GB/s. The full-attention group is not prefix-cacheable, so no
+    // block of q0 gets a key. At 2,992 ms q0 has computed 64 of its 65
+    // tokens and needs 2 more blocks, while two loads in flight hold 7. It
+    // preempts itself and recomputes its tokens in 0 ms chunks with no hit.
+    // The turn publishes no key, so q0 preempts itself again with 7 blocks
+    // in use and no cached block. q0 waits for the next event, and the
+    // three requests complete in both timing modes.
+    for timing_mode in ["full_prompt", "destination_missing"] {
+        let requests = distinct_requests(&[(31, 40, 0.0), (30, 31, 3.0), (34, 20, 6.0)]);
+        let mut spec = small_grouped_pd_spec(requests, 13, Some(128));
+        let rank = &mut spec.engine["rank"];
+        rank["kv_cache_groups"][0]["prefix_cacheable"] = false.into();
+        rank["kv_transfer_bandwidth"] = 3e-7.into();
+        rank["timing_model"] =
+            serde_json::json!({"type": "fixed", "prefill_ms": 10.0, "decode_ms": 0.5});
+        rank["max_num_batched_tokens"] = 32.into();
+        rank["kv_transfer_timing_mode"] = timing_mode.into();
+        let report = run_within_60_s(spec);
+        assert_eq!(report.request_counts.completed_requests, 3, "{timing_mode}");
+    }
+}
+
+#[test]
+fn grouped_decode_rank_readmits_a_request_whose_pool_lost_a_visible_key() {
+    // Four distinct GLM-5.3-Flash prompts of 2,178, 6,000, 1,000 and 4,354
+    // tokens, with decode prefix caching on 16 decode pages, a 128-page
+    // prefill pool, a 2,176-token budget, handoffs at 0.01 GB/s and 5 ms
+    // decode passes. The second attention block of g0 holds 2 prompt tokens
+    // and 2,174 output tokens. It has its key and stays cached when g0 ends.
+    // Then g3 is readmitted and preempts itself three times at that time,
+    // always with 6 blocks in use. The first and the second time also have 5
+    // cached blocks each, but one of the 4 visible keys left the pool
+    // between them: the second turn takes the oldest cached block, the last
+    // copy of the key of g3 at 4,352 tokens. So g3 makes a third turn. That
+    // turn has its junction at 2,176 tokens (v0.31 and v0.32
+    // `vllm/v1/core/kv_cache_manager.py:312-321`, v0.33 `:319-328`) and
+    // caches 4 more blocks, the states at the junction. The 4,412 tokens of
+    // g3 then hit 2,176 tokens. They need 2 new attention blocks and the hit
+    // block, the ring block, and a new block and the hit block in each of
+    // the 4 state groups: 12 blocks, and 10 are free (v0.31
+    // `vllm/v1/core/single_type_kv_cache_manager.py:261-268`, `:1813-1816`,
+    // v0.32 `:258-265`, `:1775-1778`, v0.33 `:259-266`, `:1792-1795`). So g3
+    // waits. When g2 ends, the readmission of g3 hits 2,176 tokens. These
+    // times and counts are derived from the rules.
+    let requests = [
+        (2178, 2500, 126.0),
+        (6000, 50, 8.0),
+        (1000, 1, 155.0),
+        (4354, 2200, 130.0),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (prompt, output, at))| {
+        let mut request = request(&format!("g{i}"), at, prompt, output);
+        let first = i as u32 * 100_000;
+        request.input_token_ids = Some((first..first + prompt as u32).collect());
+        request
+    })
+    .collect();
+    let mut spec = disaggregated_grouped_spec(requests);
+    let rank = &mut spec.engine["rank"];
+    let page = rank["kv_cache_groups"][0]["page_size_bytes"]
+        .as_u64()
+        .unwrap();
+    rank["max_model_len"] = 8704.into();
+    rank["enable_prefix_caching"] = true.into();
+    rank["prefix_match_unit"] = 2176.into();
+    rank["max_num_batched_tokens"] = 2176.into();
+    rank["kv_transfer_bandwidth"] = 0.01.into();
+    rank["timing_model"] =
+        serde_json::json!({"type": "fixed", "prefill_ms": 10.0, "decode_ms": 5.0});
+    let mut prefill = spec.engine["rank"].clone();
+    prefill["kv_cache_capacity_bytes"] = (128 * page).into();
+    spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+    spec.engine["rank"]["kv_cache_capacity_bytes"] = (16 * page).into();
+    let report = run_within_60_s(spec);
+    assert_eq!(report.request_counts.completed_requests, 4);
+    let (g0, g2, g3) = (
+        record(&report, "g0"),
+        record(&report, "g2"),
+        record(&report, "g3"),
+    );
+    let admissions = decode_admissions(g3);
+    // The three turns above.
+    assert_eq!(
+        admissions
+            .iter()
+            .filter(|&&at| at == g0.terminal_time_ms)
+            .count(),
+        3
+    );
+    assert_eq!(admissions.last(), Some(&g2.terminal_time_ms));
+    assert_eq!(g3.decode_reused_input_tokens, Some(2176));
+}
+
+#[test]
+fn grouped_decode_rank_readmits_a_request_that_made_progress_at_one_time() {
+    // Five distinct prompts on a decode pool of 14 pages in block mode, with
+    // decode passes priced at 0 ms, a 32-token budget, a 160-page prefill
+    // pool and handoffs at 3e-6 GB/s. The full-attention group is not
+    // prefix-cacheable, so no block of q2 gets a key and a turn can repeat.
+    // q1 and q2 activate at 283.33 ms, and every step at that time costs 0
+    // ms. After 2 outputs the next token of q2 does not fit. The pass in
+    // flight ran q2, so that pass stops it, and the pass after it preempts
+    // it, with 11 blocks in use and no cached block. Readmitted, it emits 13
+    // more outputs before q1 preempts it, and after its next readmission it
+    // preempts itself again after 15 outputs, with the same pool. It made
+    // progress in between, so it is readmitted. Only its third
+    // self-preemption repeats the second, and q2 waits until q1 ends at the
+    // same time. So q2 has 4 readmissions, all at its activation time.
+    let requests = distinct_requests(&[
+        (14, 33, 0.0),
+        (15, 40, 3.0),
+        (15, 40, 6.0),
+        (33, 3, 9.0),
+        (34, 20, 12.0),
+    ]);
+    let mut spec = small_grouped_pd_spec(requests, 14, Some(96));
+    let rank = &mut spec.engine["rank"];
+    rank["kv_cache_groups"][0]["prefix_cacheable"] = false.into();
+    rank["kv_transfer_bandwidth"] = 3e-6.into();
+    rank["timing_model"] =
+        serde_json::json!({"type": "fixed", "prefill_ms": 10.0, "decode_ms": 0.0});
+    rank["max_num_batched_tokens"] = 32.into();
+    rank["kv_transfer_timing_mode"] = "destination_missing".into();
+    let mut prefill = spec.engine["rank"].clone();
+    prefill["kv_cache_capacity_bytes"] = (160 * 100).into();
+    spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+    let report = run_within_60_s(spec);
+    assert_eq!(report.request_counts.completed_requests, 5);
+    let (q1, q2) = (record(&report, "q1"), record(&report, "q2"));
+    let activated = q2.destination_activated_ms.unwrap();
+    assert_eq!(decode_admissions(q2), [activated; 5]);
+    assert_eq!(q1.terminal_time_ms, activated);
+}
+
+#[test]
+fn grouped_prefill_rank_in_byte_mode_waits_for_its_whole_sequence_until_a_transfer_ends() {
+    // Two distinct prompts of 33 and 49 tokens with 2 output tokens each, in
+    // byte mode, with prefill passes priced at 0 ms, a 16-token budget, a
+    // prefill pool of 6 pages, a decode pool of 32 pages and handoffs at
+    // 1e-5 GB/s, 10 bytes per ms. The prefill rank computes 32 and 48
+    // tokens. It holds q0 at 0 ms with 2 attention pages and the state page,
+    // and the transfer of these 300 bytes ends at 30 ms. The whole sequence
+    // of q1 needs `cdiv(48, 16)` = 3 attention pages and the state page, 400
+    // bytes (v0.31 kv_cache_manager.py:519-536), and 300 are free. So q1
+    // waits from 0 ms until the release of q0 at 30 ms. Then q1 computes its
+    // 48 tokens and is held. The decode rank runs q0 from 30 ms and reserves
+    // q1 when that pass ends, at 32 ms, so the 400 bytes of q1 arrive at 72
+    // ms. Each request emits its 2 outputs in the two decode passes after its
+    // activation.
+    for async_scheduling in [true, false] {
+        let requests = distinct_requests(&[(33, 2, 0.0), (49, 2, 0.0)]);
+        let mut spec = small_grouped_pd_spec(requests, 32, None);
+        let rank = &mut spec.engine["rank"];
+        rank["kv_transfer_bandwidth"] = 1e-5.into();
+        rank["timing_model"] =
+            serde_json::json!({"type": "fixed", "prefill_ms": 0.0, "decode_ms": 2.0});
+        rank["max_num_batched_tokens"] = 16.into();
+        rank["async_scheduling"] = async_scheduling.into();
+        let mut prefill = spec.engine["rank"].clone();
+        prefill["kv_cache_capacity_bytes"] = (6 * 100).into();
+        spec.engine["prefill"] = serde_json::json!({ "rank": prefill });
+        let report = run_within_60_s(spec);
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{async_scheduling}"
+        );
+        let (q0, q1) = (record(&report, "q0"), record(&report, "q1"));
+        let prefill_admissions: Vec<f64> = q1
+            .admission_history
+            .iter()
+            .filter(|admission| admission.pool == ReplayRequestPool::Prefill)
+            .map(|admission| admission.at_ms)
+            .collect();
+        assert_eq!(prefill_admissions, [30.0], "{async_scheduling}");
+        assert_eq!(
+            (q0.source_held_ms, q0.source_released_ms, q1.source_held_ms),
+            (Some(0.0), Some(30.0), Some(30.0)),
+            "{async_scheduling}"
+        );
+        assert_eq!(
+            [q0, q1].map(|record| (record.destination_activated_ms, record.terminal_time_ms)),
+            [(Some(30.0), 34.0), (Some(72.0), 76.0)],
+            "{async_scheduling}"
+        );
+    }
+}
+
+#[test]
+fn grouped_aggregated_rank_in_byte_mode_rejects_a_request_whose_whole_sequence_exceeds_the_pool() {
+    // An aggregated rank in byte mode with one window group: window 4,
+    // 4-token blocks of 4 bytes, a 12-byte pool and a budget of 8 tokens per
+    // pass. The whole sequence of the 16-token prompt counts
+    // `min(cdiv(16, 4), cap)` = 4 blocks, 16 bytes > 12. The cap is
+    // `cdiv(3 + 8, 4) + 1` = 4 blocks with one batch and `cdiv(3 + 16, 4) +
+    // 1` = 6 with two (v0.33 kv_cache_manager.py:531-548,
+    // single_type_kv_cache_manager.py:214-227,
+    // kv_cache_interface.py:918-944). Its last forward alone needs one
+    // block, so only the whole-sequence test refuses it. vLLM's first test
+    // never admits such a request, and replay rejects it in its first pass.
+    // Each 4-token request holds 2 blocks at most, 8 bytes, and completes:
+    // the first beside the rejected request, the last after it.
+    for async_scheduling in [true, false] {
+        let requests = vec![
+            request("first", 0.0, 4, 2),
+            request("long", 0.0, 16, 1),
+            request("last", 100.0, 4, 2),
+        ];
+        let mut spec = aggregated_spec(Backend::Vllm, 1, 0.0, requests);
+        let rank = &mut spec.engine["rank"];
+        rank["enable_prefix_caching"] = false.into();
+        rank["max_num_batched_tokens"] = 8.into();
+        rank["kv_cache_capacity_bytes"] = 12.into();
+        rank["async_scheduling"] = async_scheduling.into();
+        rank["kv_cache_groups"] = serde_json::json!([
+            {"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":4, "sliding_window":4}
+        ]);
+        let report = run_within_60_s(spec);
+        assert_eq!(
+            report.request_counts.completed_requests, 2,
+            "{async_scheduling}"
+        );
+        assert_eq!(
+            ["first", "long", "last"].map(|id| record(&report, id).terminal_status),
+            [
+                aisim_core::replay::ReplayTerminalStatus::Completed,
+                aisim_core::replay::ReplayTerminalStatus::Rejected,
+                aisim_core::replay::ReplayTerminalStatus::Completed,
+            ],
+            "{async_scheduling}"
+        );
+    }
+}
+
+#[test]
+fn grouped_decode_rank_checks_a_forward_on_the_count_that_its_next_pass_reaches() {
+    // A full-attention group of 3-token pages of 4 bytes and a window group of
+    // window 4 and 4-token pages of 8 bytes, in byte mode on pools of 36 bytes,
+    // with an 8-token budget. A prompt of 9 tokens loads 8 and computes one
+    // token per decode pass. A forward to `t` tokens holds `cdiv(t, 3)` full
+    // pages and the window pages from `(processed - 3) / 4` up to `cdiv(t, 4)`
+    // (`vllm/v1/core/single_type_kv_cache_manager.py` v0.31 `:687-725`,
+    // `:1153-1188`, v0.32 `:672-710`, `:1135-1170`, v0.33 `:682-720`,
+    // `:1148-1183`; `vllm/v1/core/kv_cache_manager.py` v0.31 `:549-556`, v0.32
+    // `:552-559`, v0.33 `:561-568`). With async scheduling the pass from 15 to
+    // 16 tokens is formed behind the pass in flight and has the processed count
+    // 14: 6 full pages and 2 window pages, 40 bytes. The allocation fails, the
+    // pass in flight ran the request, and vLLM stops
+    // (`vllm/v1/core/sched/scheduler.py` v0.31 `:175-181`, `:773-775`, v0.32
+    // `:186-192`, `:804-806`, v0.33 `:193-195`, `:940-942`). The next pass has
+    // the processed count 15 and needs 6 full pages and 1 window page, 32
+    // bytes. So a request with 8 output tokens, whose last pass ends at 16
+    // tokens, completes. With 9 output tokens the pass from 16 to 17 needs 40
+    // bytes on the computed count too, and the forward check reports the
+    // configuration error.
+    let run = |output| {
+        let mut spec = disaggregated_grouped_spec(distinct_requests(&[(9, output, 0.0)]));
+        let rank = &mut spec.engine["rank"];
+        rank["kv_cache_groups"] = serde_json::json!([
+            {"name":"full", "kind":"attention", "num_layers":1, "block_size_tokens":3, "page_size_bytes":4, "prefix_cacheable":true, "transfer_bytes_per_block":4},
+            {"name":"window", "kind":"attention", "num_layers":1, "block_size_tokens":4, "page_size_bytes":8, "sliding_window":4, "prefix_cacheable":true, "transfer_bytes_per_block":8},
+        ]);
+        rank["kv_cache_capacity_bytes"] = 36.into();
+        rank["kv_transfer_bandwidth"] = serde_json::Value::Null;
+        rank["max_num_batched_tokens"] = 8.into();
+        Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+    };
+    let report = run(8).unwrap();
+    assert_eq!(report.request_counts.completed_requests, 1);
+    assert_eq!(report.per_request[0].readmission_count, 0);
+    let error = run(9).unwrap_err().to_string();
+    assert!(
+        error.contains(
+            "grouped KV forward needs 40 bytes for 1 scheduled tokens after 16 computed tokens, exceeding the entire 36-byte cache pool"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn grouped_roles_with_two_vllm_versions_cannot_pair() {
+    // A grouped handoff follows the transfer rules of one vLLM version, so a
+    // prefill rank of one vLLM version cannot hand off to a decode rank of
+    // another. vLLM refuses such a pair too: its handshake compares a
+    // compatibility hash of the vLLM version and the connector version
+    // (v0.33.0 `nixl/base_worker.py:1193-1208`). The check is on by default
+    // (`enforce_handshake_compat`, `:1038-1040`).
+    for (prefill_version, decode_version) in [
+        ("0.32.0", "0.33.0"),
+        ("0.33.0", "0.32.0"),
+        ("0.31.0", "0.32.0"),
+    ] {
+        let mut spec = disaggregated_grouped_spec(vec![request("versions", 0.0, 1000, 4)]);
+        spec.engine["rank"]["vllm_version"] = prefill_version.into();
+        let mut decode = spec.engine["rank"].clone();
+        decode["vllm_version"] = decode_version.into();
+        spec.engine["decode"] = serde_json::json!({ "rank": decode });
+        let Err(error) = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .run()
+        else {
+            panic!("grouped roles of two vLLM versions must be refused");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid replay spec: vllm_version must be identical on the prefill and decode roles",
+            "{prefill_version} {decode_version}"
+        );
+    }
+}
+
+#[test]
+fn grouped_pd_replay_on_vllm_0330_equals_the_replay_on_vllm_0320_in_every_field() {
+    // The 0.33.0 row of the rule table shares every branch with the 0.32.0
+    // row, and the transfer rules take no version. So one P/D replay under
+    // the two labels gives the same report and the same records.
+    let run = |version: &str, block_mode: bool, async_scheduling: bool| {
+        // A prompt, the same prompt again, a prefix of it and another prompt.
+        let requests = [
+            ("first", 0.0, 0..5_000),
+            ("again", 1_000.0, 0..5_000),
+            ("prefix", 2_000.0, 0..2_177),
+            ("other", 2_000.0, 20_000..22_177),
+        ]
+        .map(|(id, arrival_ms, tokens)| {
+            let tokens: Vec<u32> = tokens.collect();
+            let mut request = request(id, arrival_ms, tokens.len(), 2);
+            request.input_token_ids = Some(tokens);
+            request
+        });
+        let mut spec = disaggregated_grouped_spec(requests.to_vec());
+        let rank = &mut spec.engine["rank"];
+        rank["vllm_version"] = version.into();
+        rank["async_scheduling"] = async_scheduling.into();
+        // The bytes of one block of each group on vLLM 0.32.0 and 0.33.0, and
+        // the checkpoint fields that the runtime probe of vLLM 0.33.0 records.
+        let bytes = [
+            21_978_496_u64,
+            92_288,
+            9_768_960,
+            9_768_960,
+            9_768_960,
+            9_768_960,
+        ];
+        for (group, bytes) in rank["kv_cache_groups"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(bytes)
+        {
+            group["transfer_bytes_per_block"] = bytes.into();
+            if group["kind"] == "state" && group["prefix_cacheable"] == true {
+                group["prefill_checkpoint_blocks"] = 1.into();
+                group["prefill_checkpoint_alignment"] = 16.into();
+            }
+        }
+        if block_mode {
+            rank["enable_prefix_caching"] = true.into();
+            rank["prefix_match_unit"] = 2176.into();
+            rank["max_model_len"] = 131_072.into();
+        }
+        let mut report = Replayer::new(spec, ReplayEngineFactory::new())
+            .unwrap()
+            .with_capture_options(canonical_options())
+            .run()
+            .unwrap();
+        report.throughput.wall_time_ms = 0.0;
+        (
+            serde_json::to_value(&report).unwrap(),
+            serde_json::to_value(&report.per_request).unwrap(),
+        )
+    };
+    for block_mode in [false, true] {
+        for async_scheduling in [false, true] {
+            let label = format!("block mode {block_mode}, async scheduling {async_scheduling}");
+            let v33 = run("0.33.0", block_mode, async_scheduling);
+            assert_eq!(v33, run("0.32.0", block_mode, async_scheduling), "{label}");
+            assert_eq!(v33.0["completed_requests"], 4, "{label}");
+        }
     }
 }
 

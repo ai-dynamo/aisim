@@ -1,5 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
+
+// Modified startup sizing derived from vLLM v0.31.0, v0.32.0 and v0.33.0:
+// https://github.com/vllm-project/vllm/tree/db9527a46873454610df6dbedf79a36d6bf1a7f6
+// https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
+// https://github.com/vllm-project/vllm/tree/4ba787ec9959e566d3b587a796dff07673324da5
+// Exact upstream source paths and Apache-2.0 attribution: THIRD_PARTY_NOTICES.md.
 
 //! Rank-local cache descriptors and timing-independent profile memory sizing.
 
@@ -11,6 +18,23 @@ use super::{
 use crate::{AicError, BackendKind, MemoryBreakdown};
 
 const MAX_EXACT_BYTES: u64 = 1 << 53;
+
+/// The batches whose tokens a window group holds at vLLM's startup count:
+/// `max_concurrent_batches` under async scheduling at pipeline parallel size
+/// 1 (`vllm/config/vllm.py:592-613` at v0.31, `:577-598` at v0.32, `:588-609`
+/// at v0.33). Replay turns async scheduling on unless `async_scheduling` is
+/// false. vLLM turns it on when it is unset and the configuration allows it
+/// (`:1576-1635` at v0.31, `:1585-1644` at v0.32, `:1685-1719` at v0.33).
+/// With a larger pipeline parallel size the V2 model runner of vLLM keeps
+/// `pp_size + 1` batches, but an FPM profile fixes `pp` at 1, so two is vLLM's
+/// count for every FPM profile with async scheduling. With `async_scheduling:
+/// false` vLLM counts one batch, and the bound is then above vLLM's count by
+/// `cdiv(max_num_tokens, block)` pages at most. A convolution group takes the
+/// same term: it stands for the `SlidingWindowSpec` that vLLM's Inkling
+/// convolution layer returns, with the kernel size as the window
+/// (`vllm/models/inkling/nvidia/sconv_swa_attn.py:158` and `:185-193` at v0.31,
+/// v0.32 and v0.33).
+const STARTUP_IN_FLIGHT_BATCHES: u64 = 2;
 
 fn invalid(message: impl Into<String>) -> AicError {
     AicError::InvalidEngineConfig(message.into())
@@ -62,23 +86,28 @@ pub struct FpmCacheGroup {
     /// `align` mode, a Mamba group also holds the previous block for one or two
     /// steps. vLLM's startup sizing in that mode counts `2 + k + c` blocks for a
     /// Mamba group, where `c` is the spec's `num_prefill_checkpoint_blocks`. It
-    /// counts 1 block for a ring group. Required for `state` groups and invalid
-    /// for every other kind.
+    /// counts 1 block for a ring group. The peak bound of the cache budget
+    /// counts those `2 + k + c` blocks for a prefix-cacheable state group of a
+    /// profile that records `mamba_cache_mode: align`; this field stays the
+    /// steady count. Required for `state` groups and invalid for every other
+    /// kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks_per_request: Option<u32>,
     /// Whether vLLM's manager for this group takes part in prefix caching. A
     /// ring spec does not. A rank with `kv_cache_groups` and
-    /// `enable_prefix_caching` refuses a group that leaves it unset. `None`
-    /// in a profile imported before this field existed.
+    /// `enable_prefix_caching` refuses a group that leaves it unset. The
+    /// grouped P/D transfer rules also read it, so a prefill or decode rank
+    /// with `kv_cache_groups` refuses a group that leaves it unset too.
+    /// `None` in a profile imported before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_cacheable: Option<bool>,
     /// The bytes that vLLM's P/D connector reads for one block of this group in
     /// a transfer on one TP rank, for the vLLM version of the deployment. The
     /// connector reads a block in regions that layers of other groups can
     /// share, so the value can be larger than `page_size_bytes`. Positive and at
-    /// most 2**53. The probe import of a vLLM 0.33.0 record does not write it:
-    /// what the P/D connector of vLLM 0.33.0 reads for a block depends on facts
-    /// that the record does not hold. Sizing does not read it.
+    /// most 2**53. A profile can supply the connector's measured or derived
+    /// per-group value. Grouped P/D requires this field for every group. Cache
+    /// sizing does not use it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_bytes_per_block: Option<u64>,
     /// The `num_prefill_checkpoint_blocks` of a Mamba spec: 0 or 1, and only
@@ -200,7 +229,9 @@ impl FpmCacheGroup {
     /// chunks no larger than `max_num_tokens`. The extra block alignment can
     /// coexist with the entire new chunk; clipping only to the retention window
     /// would underestimate prefill memory. A state group needs only its fixed
-    /// blocks, whatever the context.
+    /// blocks, whatever the context. The steady occupancy of the cache budget
+    /// counts this one-chunk form; its peak bound counts
+    /// [`Self::startup_request_bytes`].
     pub fn peak_request_bytes(
         &self,
         context_length: u64,
@@ -222,6 +253,51 @@ impl FpmCacheGroup {
             } else {
                 full
             }
+        };
+        pages
+            .checked_mul(self.page_size_bytes)
+            .filter(|bytes| *bytes <= MAX_EXACT_BYTES)
+            .ok_or_else(|| invalid("cache request allocation exceeds 2**53 bytes"))
+    }
+
+    /// What vLLM's startup check reserves for one request of `context_length`
+    /// tokens, with `align` when the profile records `mamba_cache_mode:
+    /// align`. In that mode a prefix-cacheable state group, a Mamba spec,
+    /// counts `2 + k + c` pages (`kv_cache_interface.py:1083-1094` at v0.31,
+    /// `:1076-1082` at v0.32, `:1135-1141` at v0.33): `blocks_per_request`
+    /// (`1 + k`), one previous block and `c` checkpoint blocks. A group with a
+    /// `sliding_window`, in any mode, counts the admission cap of a
+    /// `SlidingWindowSpec`, `cdiv(min(window - 1 + 2 * max_num_tokens,
+    /// context_length), block) + 1` pages (`kv_cache_interface.py:840-877` at
+    /// v0.31, `:859-896` at v0.32, `:918-955` at v0.33), with the in-flight
+    /// tokens of `STARTUP_IN_FLIGHT_BATCHES` batches. Every other group gives
+    /// [`Self::peak_request_bytes`].
+    pub fn startup_request_bytes(
+        &self,
+        context_length: u64,
+        max_num_tokens: u32,
+        align: bool,
+    ) -> Result<u64, AicError> {
+        let align_state =
+            align && self.kind == FpmCacheKind::State && self.prefix_cacheable == Some(true);
+        if self.sliding_window.is_none() && !align_state {
+            return self.peak_request_bytes(context_length, max_num_tokens);
+        }
+        self.validate()?;
+        if context_length == 0 || max_num_tokens == 0 {
+            return Err(invalid("cache context and max_num_tokens must be positive"));
+        }
+        let pages = if let Some(window) = self.sliding_window {
+            let in_flight = STARTUP_IN_FLIGHT_BATCHES * u64::from(max_num_tokens);
+            (u64::from(window) - 1 + in_flight)
+                .min(context_length)
+                .div_ceil(u64::from(self.block_size_tokens))
+                + 1
+        } else {
+            // `validate` guarantees a positive count for state groups.
+            self.blocks_per_request.map_or(0, u64::from)
+                + 1
+                + self.prefill_checkpoint_blocks.map_or(0, u64::from)
         };
         pages
             .checked_mul(self.page_size_bytes)
@@ -305,7 +381,9 @@ pub enum FpmMambaCacheMode {
 /// non-KV memory limit or a capacity that can be scaled to another setting.
 ///
 /// The three optional prefix-caching fields record the settings that the probe
-/// ran with. Selection and sizing do not read them. Grouped prefix caching
+/// ran with. Selection does not read them. Sizing reads only
+/// `mamba_cache_mode`, and only for the peak bound of a state group
+/// (`request_peak_cache_bytes`). Grouped prefix caching
 /// needs `enable_prefix_caching` true and `hash_block_size_tokens`, and replay
 /// then hashes prompts in blocks of `hash_block_size_tokens`. Replay models grouped prefix caching
 /// for vLLM 0.31.0, 0.32.0 and 0.33.0 only. For a linear profile, the simulated
@@ -331,9 +409,46 @@ pub struct FpmRuntimeMemoryConfig {
     /// `backend_version`, which is a dataset label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_framework_version: Option<String>,
+    /// Initialized vLLM ModelConfig.dtype, independent of KV and FMHA precision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_dtype: Option<String>,
 }
 
 impl FpmRuntimeMemoryConfig {
+    /// FPM tables name the release. The NIXL handshake also compares the installed local build suffix.
+    pub(crate) fn modeled_release(installed: &str) -> &str {
+        installed
+            .split_once('+')
+            .map_or(installed, |(release, _)| release)
+    }
+
+    pub(crate) fn matches_grouped_version(
+        installed: &str,
+        modeled: &str,
+        prefix_caching: bool,
+    ) -> bool {
+        let version = if prefix_caching {
+            installed
+        } else {
+            Self::modeled_release(installed)
+        };
+        version == modeled
+    }
+
+    pub(crate) fn normalize_model_dtype(dtype: &str) -> Option<String> {
+        let lower = dtype.trim().to_ascii_lowercase();
+        Some(
+            match lower.strip_prefix("torch.").unwrap_or(&lower) {
+                "" | "auto" | "unknown" => return None,
+                "half" | "fp16" => "float16",
+                "bf16" => "bfloat16",
+                "float" | "fp32" => "float32",
+                other => other,
+            }
+            .to_owned(),
+        )
+    }
+
     pub fn validate(&self) -> Result<(), AicError> {
         if self.kv_cache_bytes == 0
             || self.kv_cache_bytes > MAX_EXACT_BYTES
@@ -363,6 +478,13 @@ impl FpmRuntimeMemoryConfig {
             .is_some_and(|version| version.trim().is_empty())
         {
             return Err(invalid("runtime_framework_version must be nonempty"));
+        }
+        if self
+            .model_dtype
+            .as_deref()
+            .is_some_and(|dtype| dtype.trim().is_empty())
+        {
+            return Err(invalid("model_dtype must be nonempty"));
         }
         Ok(())
     }
@@ -549,8 +671,13 @@ pub struct FpmCacheBudget {
     pub resource_provenance: String,
     pub cache_layout: FpmCacheLayout,
     pub cache_groups: Vec<FpmCacheGroup>,
-    /// Per-request upper bound, including window block alignment and the
-    /// configured prefill chunk. This is not an aggregate token capacity.
+    /// Per-request upper bound, as vLLM's startup check counts it. This is not
+    /// an aggregate token capacity. A window or convolution group counts the
+    /// pages of its window and of two batches of the configured prefill chunk,
+    /// at most the context, plus one page of alignment. In a profile that records
+    /// `mamba_cache_mode: align`, it counts `2 + k + c` blocks for a
+    /// prefix-cacheable state group; `blocks_per_request` stays the steady
+    /// count.
     pub request_peak_cache_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_occupancy_cache_bytes: Option<u64>,
@@ -682,9 +809,16 @@ impl ForwardPassPerfModelConfig {
     }
 
     pub(super) fn fpm_deployment(&self) -> Result<Option<&serde_json::Value>, AicError> {
-        let Some(profile) = &self.fpm_profile else {
-            return Ok(None);
-        };
+        self.fpm_profile
+            .as_ref()
+            .map(|profile| self.matching_fpm_deployment(profile))
+            .transpose()
+    }
+
+    pub(crate) fn matching_fpm_deployment<'a>(
+        &self,
+        profile: &'a serde_json::Map<String, serde_json::Value>,
+    ) -> Result<&'a serde_json::Value, AicError> {
         if profile.get("model").and_then(serde_json::Value::as_str) != Some(self.model.as_str()) {
             return Err(invalid("FPM profile model identity mismatch"));
         }
@@ -747,7 +881,7 @@ impl ForwardPassPerfModelConfig {
         if matching.next().is_some() {
             return Err(invalid("duplicate FPM deployment resources"));
         }
-        Ok(Some(deployment))
+        Ok(deployment)
     }
 }
 
@@ -867,7 +1001,16 @@ impl FpmResourceConfig {
             })
         });
         let token_count = |bytes| self.kv_bytes_per_token.map(|rate| bytes / rate);
-        let footprint = |tokens: u64, chunk: u32| {
+        let align = self
+            .runtime_memory
+            .as_ref()
+            .is_some_and(|memory| memory.mamba_cache_mode == Some(FpmMambaCacheMode::Align));
+        // The peak (`startup: true`) counts vLLM's startup count of each group:
+        // the window cap with two batches in flight, and the startup blocks of
+        // a state group in align mode. The steady occupancy (`startup: false`)
+        // counts `peak_request_bytes`: one chunk for a window group and
+        // `blocks_per_request` for a state group.
+        let footprint = |tokens: u64, chunk: u32, startup: bool| {
             let bytes = if let Some(cache) = &self.mamba_cache {
                 let pages = tokens.div_ceil(u64::from(cache.block_size_tokens));
                 // Peak includes old/new state plus a partial attention source.
@@ -882,14 +1025,19 @@ impl FpmResourceConfig {
                 tokens.checked_mul(self.kv_bytes_per_token.unwrap())
             } else {
                 self.cache_groups.iter().try_fold(0u64, |sum, group| {
-                    sum.checked_add(group.peak_request_bytes(tokens, chunk).ok()?)
+                    let bytes = if startup {
+                        group.startup_request_bytes(tokens, chunk, align)
+                    } else {
+                        group.peak_request_bytes(tokens, chunk)
+                    };
+                    sum.checked_add(bytes.ok()?)
                 })
             };
             bytes
                 .filter(|bytes| *bytes <= MAX_EXACT_BYTES)
                 .ok_or_else(|| invalid("cache request allocation exceeds 2**53 bytes"))
         };
-        let request_peak_cache_bytes = footprint(context, request.max_num_tokens)?;
+        let request_peak_cache_bytes = footprint(context, request.max_num_tokens, true)?;
         let request_occupancy_cache_bytes = request
             .request_occupancy_tokens
             .map(|tokens| {
@@ -898,7 +1046,7 @@ impl FpmResourceConfig {
                         "request_occupancy_tokens must be positive and within context_length",
                     ));
                 }
-                footprint(tokens, 1)
+                footprint(tokens, 1, false)
             })
             .transpose()?;
         Ok(FpmCacheBudget {
@@ -1027,6 +1175,7 @@ mod tests {
                 mamba_cache_mode: None,
                 hash_block_size_tokens: None,
                 runtime_framework_version: None,
+                model_dtype: None,
             }),
             ..resources()
         }
@@ -1362,7 +1511,9 @@ mod tests {
         assert_eq!(grouped.total_kv_size_bytes, 600);
         assert_eq!(grouped.total_kv_size_tokens, None);
         assert_eq!(grouped.memory_breakdown, None);
-        assert_eq!(grouped.request_peak_cache_bytes, 1760);
+        // vLLM's startup count of the 32-token window with two batches of 128
+        // tokens: cdiv(min(31 + 256, 4096), 16) + 1 = 19 pages of 160 bytes.
+        assert_eq!(grouped.request_peak_cache_bytes, 3040);
 
         runtime.cache_layout = FpmCacheLayout::Linear;
         runtime.cache_groups.clear();
@@ -1393,9 +1544,10 @@ mod tests {
         q.request_occupancy_tokens = Some(1152);
         let budget = runtime.estimate_budget(&q, 4096).unwrap();
         // A 32-token retained window can straddle three 16-token pages.
-        // A 128-token prefill chunk needs eleven pages. Each page is 160 bytes.
+        // The peak counts vLLM's startup count with two batches of 128 tokens:
+        // cdiv(min(31 + 256, 4096), 16) + 1 = 19 pages. Each page is 160 bytes.
         assert_eq!(budget.request_occupancy_cache_bytes, Some(480));
-        assert_eq!(budget.request_peak_cache_bytes, 1760);
+        assert_eq!(budget.request_peak_cache_bytes, 3040);
         q.max_num_tokens = 1;
         assert!(runtime.estimate_budget(&q, 4096).is_err());
         q.max_num_tokens = 128;
@@ -1645,8 +1797,9 @@ mod tests {
             result.tolerance_adjusted.unwrap().total_kv_size_tokens,
             None
         );
-        // At most 11 aligned pages cover 31 history + 128 scheduled tokens.
-        assert_eq!(result.request_peak_cache_bytes, 1760);
+        // 31 history tokens and two batches of 128 in-flight tokens span
+        // cdiv(min(31 + 256, 4096), 16) + 1 = 19 pages of 160 bytes.
+        assert_eq!(result.request_peak_cache_bytes, 3040);
         assert_eq!(
             result.memory_breakdown.unwrap().cuda_graph_reserved_bytes,
             20
@@ -1908,6 +2061,188 @@ mod tests {
         let budget = grouped.estimate_budget(&query, 8_192).unwrap();
         assert_eq!(budget.request_peak_cache_bytes, 117_406_080);
         assert_eq!(budget.request_occupancy_cache_bytes, Some(117_406_080));
+    }
+
+    #[test]
+    fn align_profile_peak_counts_the_startup_blocks_of_each_state_group() {
+        // The groups of the test above: one attention group and five state
+        // groups of 13,045,120-byte pool blocks with 2,176-token blocks. The
+        // four KDA groups are Mamba specs and take part in prefix caching; the
+        // 4-token tail is a ring and does not.
+        const PAGE: u64 = 13_045_120;
+        let pool_group =
+            |name: &str, kind, block_size_tokens, blocks_per_request, cacheable| FpmCacheGroup {
+                name: name.into(),
+                kind,
+                num_layers: 1,
+                block_size_tokens,
+                page_size_bytes: PAGE,
+                sliding_window: None,
+                blocks_per_request,
+                prefix_cacheable: cacheable,
+                transfer_bytes_per_block: None,
+                prefill_checkpoint_blocks: None,
+                prefill_checkpoint_alignment: None,
+            };
+        let groups = |kda_cacheable: Option<bool>, checkpoint: Option<u32>| {
+            let mut groups = vec![
+                pool_group(
+                    "mla_indexer",
+                    FpmCacheKind::Attention,
+                    2_176,
+                    None,
+                    Some(true),
+                ),
+                pool_group("kpool_tail", FpmCacheKind::State, 4, Some(1), Some(false)),
+            ];
+            for i in 0..4 {
+                groups.push(FpmCacheGroup {
+                    prefill_checkpoint_blocks: checkpoint,
+                    prefill_checkpoint_alignment: (checkpoint == Some(1)).then_some(16),
+                    ..pool_group(
+                        &format!("kda_{i}"),
+                        FpmCacheKind::State,
+                        2_176,
+                        Some(1),
+                        kda_cacheable,
+                    )
+                });
+            }
+            groups
+        };
+        let budget_with = |mode: Option<Option<FpmMambaCacheMode>>,
+                           groups: Vec<FpmCacheGroup>,
+                           occupancy: Option<u64>| {
+            let mut resources = match mode {
+                None => resources(),
+                Some(mode) => {
+                    let mut resources = runtime_resources();
+                    let memory = resources.runtime_memory.as_mut().unwrap();
+                    memory.max_model_len = 8_192;
+                    memory.enable_prefix_caching = Some(true);
+                    memory.mamba_cache_mode = mode;
+                    resources
+                }
+            };
+            resources.cache_groups = groups;
+            resources.max_num_tokens = 8_192;
+            let mut query = request();
+            query.max_num_tokens = 8_192;
+            query.cuda_graph_reserved_bytes = 0;
+            query.request_occupancy_tokens = occupancy;
+            let budget = resources.estimate_budget(&query, 8_192).unwrap();
+            (
+                budget.request_peak_cache_bytes,
+                budget.request_occupancy_cache_bytes,
+            )
+        };
+        let budget = |mode, groups| budget_with(mode, groups, Some(8_192));
+        let align = Some(Some(FpmMambaCacheMode::Align));
+        // 8,192 tokens fill cdiv(8,192, 2,176) = 4 attention blocks, and the
+        // ring holds 1 block in every mode (`kv_cache_interface.py:982-985`
+        // at v0.33). In align mode vLLM's startup check counts `2 + k + c`
+        // blocks for a Mamba group (`kv_cache_interface.py:1083-1094` at
+        // v0.31, `:1076-1082` at v0.32, `:1135-1141` at v0.33), with
+        // k = 0: 4 + 1 + 4 * 2 = 13 blocks without a
+        // checkpoint block and 4 + 1 + 4 * 3 = 17 with one. In mode `none`
+        // vLLM counts `1 + k`, the steady count: 4 + 1 + 4 = 9. The steady
+        // occupancy of one decode token counts 9 blocks in every case.
+        let steady = Some(9 * PAGE);
+        for checkpoint in [None, Some(0)] {
+            assert_eq!(
+                budget(align, groups(Some(true), checkpoint)),
+                (13 * PAGE, steady)
+            );
+        }
+        assert_eq!(13 * PAGE, 169_586_560);
+        assert_eq!(
+            budget(align, groups(Some(true), Some(1))),
+            (17 * PAGE, steady)
+        );
+        assert_eq!(17 * PAGE, 221_767_040);
+        // A budget without an occupancy query counts the same peak.
+        assert_eq!(
+            budget_with(align, groups(Some(true), Some(1)), None),
+            (17 * PAGE, None)
+        );
+        // Mode `none`, no recorded mode, no runtime memory, and KDA groups of
+        // a profile imported before `prefix_cacheable` existed keep the
+        // steady count of each state group.
+        for (mode, cacheable) in [
+            (Some(Some(FpmMambaCacheMode::None)), Some(true)),
+            (Some(None), Some(true)),
+            (None, Some(true)),
+            (align, None),
+        ] {
+            assert_eq!(budget(mode, groups(cacheable, Some(1))), (9 * PAGE, steady));
+        }
+        assert_eq!(9 * PAGE, 117_406_080);
+
+        // A KDA group alone gives its startup pages only in align mode, and
+        // keeps the checks and the exact-byte limit of the steady bound.
+        let kda = &groups(Some(true), Some(1))[2];
+        assert_eq!(
+            kda.startup_request_bytes(8_192, 8_192, true).unwrap(),
+            3 * PAGE
+        );
+        assert_eq!(
+            kda.startup_request_bytes(8_192, 8_192, false).unwrap(),
+            PAGE
+        );
+        // A Mamba spec with one speculative block (k = 1) holds
+        // `blocks_per_request` = 1 + k = 2 blocks; its startup count is
+        // 2 + k + c = 2 + 1 + 1 = 4.
+        let speculative = FpmCacheGroup {
+            blocks_per_request: Some(2),
+            ..kda.clone()
+        };
+        assert_eq!(
+            speculative
+                .startup_request_bytes(8_192, 8_192, true)
+                .unwrap(),
+            4 * PAGE
+        );
+        for (context, chunk) in [(0, 1), (1, 0)] {
+            assert_eq!(
+                kda.startup_request_bytes(context, chunk, true)
+                    .unwrap_err()
+                    .to_string(),
+                kda.peak_request_bytes(context, chunk)
+                    .unwrap_err()
+                    .to_string()
+            );
+        }
+        let mut huge = FpmCacheGroup {
+            page_size_bytes: MAX_EXACT_BYTES / 2,
+            prefill_checkpoint_blocks: Some(0),
+            prefill_checkpoint_alignment: None,
+            ..kda.clone()
+        };
+        // 2 * 2**52 = 2**53 passes; 3 * 2**52 does not.
+        assert_eq!(
+            huge.startup_request_bytes(1, 1, true).unwrap(),
+            MAX_EXACT_BYTES
+        );
+        huge.prefill_checkpoint_blocks = Some(1);
+        huge.prefill_checkpoint_alignment = Some(16);
+        match huge.startup_request_bytes(1, 1, true) {
+            Err(AicError::InvalidEngineConfig(message)) => {
+                assert_eq!(message, "cache request allocation exceeds 2**53 bytes")
+            }
+            other => panic!("expected the exact-byte refusal, got {other:?}"),
+        }
+        let mut unusable = kda.clone();
+        unusable.blocks_per_request = None;
+        assert_eq!(
+            unusable
+                .startup_request_bytes(8_192, 8_192, true)
+                .unwrap_err()
+                .to_string(),
+            unusable
+                .peak_request_bytes(8_192, 8_192)
+                .unwrap_err()
+                .to_string()
+        );
     }
 
     #[test]

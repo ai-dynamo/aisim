@@ -104,6 +104,7 @@ impl RankMetricsState {
         self.interval
             .checked_add_assign(ReplaySchedulerIntervalMetrics {
                 preemptions,
+                g1_prefix_cache_lookup: metrics.g1_destination_lookup,
                 ..ReplaySchedulerIntervalMetrics::default()
             })?;
         if accumulate_cache {

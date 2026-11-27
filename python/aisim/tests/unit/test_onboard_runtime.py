@@ -299,6 +299,47 @@ def test_snapshot_acceptance_survives_unrelated_probe_progress_but_detects_raw_t
     assert status["integrity_issues"]
 
 
+@pytest.mark.parametrize("legacy_inventory", [False, True])
+def test_draft_verifies_bound_geometry_from_its_staged_checkpoint(tmp_path, legacy_inventory):
+    from collector.fpm_forward.runtime_observations import validate_observations
+
+    from aisim.support.finalization import _merge_resources
+    from aisim.support.runtime import runtime_probe_manifest, verify_runtime_profile
+
+    from .collector.test_runtime_observations import _mutate
+
+    checkpoint, index, launch = _campaign(tmp_path)
+    _mutate(index, lambda record: record["resolved_config"]["model_config"].update(hf_overrides={}))
+    assert _import(checkpoint, index, tmp_path / "drafts", configurations=["tp2"]) == 0
+    request = SupportRequest.model_validate(_load(checkpoint).configurations["tp2"].draft_request)
+    manifest = runtime_probe_manifest(request)
+    workers = manifest["nixl_observation"]["worker_observations"]
+    assert any(row.get("model_heads", {}).get("num_kv_heads") == 4 for row in workers)
+    expected = verify_runtime_profile(request)
+    cell = validate_observations(index, {"tp2": launch})["tp2"]["resources"]
+
+    if legacy_inventory:
+        manifest = {
+            **manifest,
+            "schema_version": "aisimulate-onboarding-runtime-probe/v1",
+            "source_artifacts": [
+                {key: item[key] for key in ("path", "sha256")} for item in manifest["source_artifacts"]
+            ],
+        }
+
+    def finalized():
+        return _merge_resources([cell], {"runtime_probe": manifest}, source_references=True)
+
+    original = finalized()
+    Path(launch["model_config"]["path"]).rename(tmp_path / "moved-original.json")
+    assert finalized() == original
+    assert verify_runtime_profile(request) == expected
+    staged = Path(manifest["observations_index"]).with_name("model-config.json")
+    staged.write_text("{}")
+    with pytest.raises(ValueError, match="source artifact changed"):
+        verify_runtime_profile(request)
+
+
 def test_probe_public_preview_does_not_need_geometry_or_execute_bundle(tmp_path, capsys, monkeypatch):
     checkpoint, index, _ = _campaign(tmp_path)
     from collector.fpm_forward import runtime_probe
@@ -1097,9 +1138,10 @@ def test_plan_names_the_cache_geometry_of_an_observed_profile(tmp_path, capsys, 
 
 
 def test_plan_admits_the_imported_glm_draft_at_its_observed_capacity(tmp_path, capsys):
-    # The live GLM probe record leaves 13,696 usable pool blocks of 13,516,800 bytes. A request at its 1,048,576-token
-    # context needs 482 attention blocks of 2,176 tokens and one block in each of the five state groups, the 4-token
-    # tail group too: 487 blocks.
+    # The live GLM probe record leaves 13,696 usable pool blocks of 13,516,800 bytes. vLLM's startup check reserves,
+    # for one request at its 1,048,576-token context, 482 attention blocks of 2,176 tokens, one block of the 4-token
+    # tail ring, and 2 + c = 3 blocks (running, previous, checkpoint) in each of the four KDA groups of align mode,
+    # whose spec has one prefill checkpoint block (v0.33.0 kv_cache_interface.py:1135-1141): 482 + 1 + 12 = 495.
     _, _, _, files = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
     root = tmp_path / "collection"
     assert cli.main(["onboard", "plan", "--config", files["request"], "--output-dir", str(root)]) == 0
@@ -1108,7 +1150,7 @@ def test_plan_admits_the_imported_glm_draft_at_its_observed_capacity(tmp_path, c
     assert plan["prerequisites"][0]["detail"] == (
         "Observed cache capacity and grouped geometry are bound to this deployment and runtime envelope."
     )
-    assert plan["resources"]["request_peak_cache_bytes"] == 487 * 13_516_800
+    assert plan["resources"]["request_peak_cache_bytes"] == 495 * 13_516_800
     assert plan["resources"]["total_kv_size_bytes"] == 13_696 * 13_516_800
 
 
@@ -1312,6 +1354,46 @@ def test_grouped_capacity_override_keeps_its_whole_block_plan_check(tmp_path, ca
         "observed FPM resources leave insufficient rank-local bytes for grouped cache peak allocation"
         in capsys.readouterr().err
     )
+
+
+@pytest.mark.parametrize("blocks", [490, 495], ids=["between_refused", "startup_count_admitted"])
+def test_plan_admits_a_glm_capacity_only_from_the_startup_count(tmp_path, capsys, blocks):
+    # One request at the 1,048,576-token context holds 482 attention blocks, one tail block and one block in each of
+    # the four KDA groups between block boundaries: 487 blocks. vLLM's startup check reserves 2 + c = 3 blocks in each
+    # KDA group of align mode (v0.33.0 kv_cache_interface.py:1135-1141): 495 blocks. A pool of 490 blocks lies between
+    # the two counts, and the plan refuses it.
+    checkpoint, _, request, _ = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    changed = _capacity_override(checkpoint, request, blocks * 13_516_800)
+    command = _plan_override(tmp_path, changed)
+    if blocks == 490:
+        with pytest.raises(SystemExit) as error:
+            cli.main(command)
+        assert error.value.code == 2
+        assert (
+            "observed FPM resources leave insufficient rank-local bytes for grouped cache peak allocation"
+            in capsys.readouterr().err
+        )
+    else:
+        assert cli.main(command) == 0
+        plan = json.loads((tmp_path / "collection" / "support-plan.json").read_text())
+        assert plan["resources"]["request_peak_cache_bytes"] == 495 * 13_516_800
+        assert plan["resources"]["total_kv_size_bytes"] == 495 * 13_516_800
+
+
+def test_glm_plan_saved_with_the_earlier_peak_bound_still_verifies(tmp_path, capsys):
+    from aisim.support.plan import check_plan
+
+    # The planner before the bound counted vLLM's startup blocks stored, for a request at the 1,048,576-token context,
+    # 482 attention blocks of 2,176 tokens and the blocks_per_request of each state group: 1 block of the 4-token tail
+    # ring (not one per 4 tokens of the context) and 1 block of each of the four KDA groups: 487 blocks.
+    _, _, _, files = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    root = tmp_path / "collection"
+    assert cli.main(["onboard", "plan", "--config", files["request"], "--output-dir", str(root)]) == 0
+    path = root / "support-plan.json"
+    saved = json.loads(path.read_text())
+    saved["resources"]["request_peak_cache_bytes"] = 487 * 13_516_800
+    path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    check_plan(SupportRequest.from_yaml(root / "request.yaml"), root)
 
 
 def test_profile_edit_preserves_measured_values_and_requires_fresh_probe_for_settings(tmp_path, capsys):
@@ -1648,19 +1730,17 @@ def test_a_session_planned_cold_before_vllm_0330_rules_still_finalizes(tmp_path,
         worker = yaml.safe_load((plan / name).read_text())["engine"]["workers"]["aggregated"]
         return worker["kv_cache"]["prefix_caching"]
 
-    def refuse(*_args, **_kwargs):
-        raise ValueError("no grouped rules for vLLM 0.33.0")
-
-    # `onboard plan` writes the plan as it did while replay had no grouped rules for vLLM 0.33.0: the grouped
-    # prefix-caching requirements refused the profile, so the plan is cold.
+    # The pre-prefix-caching planner also used the earlier cache peak.
+    original = support_plan._plan_documents
+    earlier = support_plan._PlannerVersion.BEFORE_GROUPED_PREFIX_CACHING
     with monkeypatch.context() as before:
-        before.setattr(support_plan, "grouped_prefix_caching_requirements", refuse)
+        before.setattr(support_plan, "_plan_documents", lambda *args, **kwargs: original(*args, planner=earlier))
         _, request, files, root = _completed_runtime_collection(tmp_path, capsys, layout="mamba_hybrid")
     saved = (root / "support-plan.json").read_bytes()
     assert not prefix_caching(root, "predict/pilot.yaml")
     # The cold plan and the plan with prefix caching on differ only in the two pilots and the plan manifest, so the
     # collection inputs of the saved session are those of the new plan too.
-    _, cold = support_plan._plan_documents(request, root, grouped_cold=True)
+    _, cold = support_plan._plan_documents(request, root, planner=earlier)
     _, warm = support_plan._plan_documents(request, root)
     assert sorted(str(path) for path in cold if cold[path] != warm.get(path)) == [
         "predict/pilot.yaml",
@@ -2524,6 +2604,205 @@ def test_capacity_revision_requires_acceptance_and_exact_formal_observations(tmp
         finalize(original, root, tmp_path / "superseded", memory_config=memory_config)
 
 
+def test_runtime_import_and_compact_finalization_bind_initialized_transfer_evidence(tmp_path, capsys):
+    from aisim.support.finalization import _merge_resources
+    from aisim.support.runtime import runtime_probe_manifest, verify_runtime_profile
+
+    _, _, request, _ = _imported(tmp_path, capsys, tp=4, layout="glm_tp4")
+    direct = verify_runtime_profile(request)
+    manifest = runtime_probe_manifest(request)
+    expected = direct["provenance"]["runtime_settings"]
+    settings = manifest["nixl_observation"]["runtime_settings"]
+    assert settings["model_config"]["model"] == expected["model_config"]["model"]
+    assert settings["cache_config"]["cache_dtype"] == expected["cache_config"]["cache_dtype"]
+    from aisim import _runtime
+
+    (Path(manifest["observations_index"]).parent / "review-notes.txt").write_text("outside the captured inventory")
+    manifest["source_artifacts"].reverse()
+    memory = request.profile_deployment().resources.runtime_memory
+    memory.provenance = json.dumps(manifest)
+    assert verify_runtime_profile(request)["status"] == "complete"
+    assert _runtime.observed_model_dtype(memory.provenance)
+    for schema in (None, "aisimulate-onboarding-runtime-probe/v1"):
+        edited = {**manifest, "schema_version": schema}
+        if schema is None:
+            del edited["schema_version"]
+        memory.provenance = json.dumps(edited)
+        with pytest.raises(ValueError, match="bound NIXL observation"):
+            verify_runtime_profile(request)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(memory.provenance)
+    for field in ("kind", "path", "sha256"):
+        edited = json.loads(json.dumps(manifest))
+        workers = [ref for ref in edited["source_artifacts"] if ref.get("kind") == "worker"]
+        a, b = workers[:2]
+        if field == "kind":
+            a[field] = "scheduler"
+        else:
+            a[field], b[field] = b[field], a[field]
+        memory.provenance = json.dumps(edited)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(memory.provenance)
+        with pytest.raises(ValueError, match="immutable source artifacts|source artifact changed"):
+            verify_runtime_profile(request)
+    for keep in (
+        [ref for ref in manifest["source_artifacts"] if ref.get("kind") != "launch"],
+        [ref for ref in manifest["source_artifacts"] if ref.get("kind") == "observations_index"],
+        [*manifest["source_artifacts"], manifest["source_artifacts"][0]],
+    ):
+        memory.provenance = json.dumps({**manifest, "source_artifacts": keep})
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(memory.provenance)
+    manifest["nixl_observation"]["runtime_settings"]["model_config"]["model"] += "/edited"
+    request.profile_deployment().resources.runtime_memory.provenance = json.dumps(manifest)
+    with pytest.raises(ValueError, match="saved NIXL settings differ"):
+        verify_runtime_profile(request)
+
+    del manifest["nixl_observation"]
+    request.profile_deployment().resources.runtime_memory.provenance = json.dumps(manifest)
+    with pytest.raises(ValueError, match="missing its NIXL observation"):
+        verify_runtime_profile(request)
+    manifest["schema_version"] = "aisimulate-onboarding-runtime-probe/v1"
+    request.profile_deployment().resources.runtime_memory.provenance = json.dumps(manifest)
+    assert verify_runtime_profile(request)["status"] == "complete"
+    request.profile_deployment().resources.runtime_memory.provenance = json.dumps(
+        {**manifest, "nixl_observation": None}
+    )
+    with pytest.raises(ValueError, match="invalid legacy NIXL observation"):
+        verify_runtime_profile(request)
+
+    observation = direct["resources"]
+    evidence = json.loads(observation["runtime_memory"]["provenance"])
+    workers = [item["evidence"] for item in evidence["artifacts"] if item["evidence"]["kind"] == "worker"]
+    for rank in workers:
+        rank["attention_backend"] = "FLASHINFER"
+    workers[-1]["attention_backend"] = ["FLASH_ATTN", "FLASHINFER"]
+    observation["runtime_memory"]["provenance"] = json.dumps(evidence)
+    bad = json.loads(observation["runtime_memory"]["provenance"])
+    bad["rank_capacities"][0]["available_cache_bytes"] *= 2
+    with pytest.raises(ValueError, match="kv_cache_bytes"):
+        _merge_resources(
+            [{**observation, "runtime_memory": {**observation["runtime_memory"], "provenance": json.dumps(bad)}}],
+            {},
+            source_references=True,
+        )
+    # Each phase's raw KVCacheConfig describes its own initialized pool and block sizes.
+    for item in evidence["artifacts"]:
+        record = item["evidence"]
+        cache = record["cache"]
+        record["raw_cache_config"] = {
+            "num_blocks": cache["num_blocks"],
+            "groups": [{"block_size": group["block_size_tokens"]} for group in cache["groups"]],
+        }
+    observation["runtime_memory"]["provenance"] = json.dumps(evidence)
+    # Finalization must check what the scheduler measured before replacing its record with a reference.
+    sparse = copy.deepcopy(evidence)
+    for row in sparse["rank_capacities"]:
+        row.pop("kv_cache_bytes")
+        row.pop("initial_free_blocks")
+    capacity = observation["runtime_memory"]["kv_cache_bytes"]
+    cell = {**observation, "runtime_memory": {**observation["runtime_memory"], "provenance": json.dumps(sparse)}}
+    assert _merge_resources([cell], {}, source_references=True)["runtime_memory"]["kv_cache_bytes"] == capacity
+    cell["runtime_memory"]["kv_cache_bytes"] += sparse["rank_capacities"][0]["page_size_bytes"]
+    with pytest.raises(ValueError, match="kv_cache_bytes"):
+        _merge_resources([cell], {}, source_references=True)
+    sparse["artifacts"] = [item for item in sparse["artifacts"] if item["evidence"]["kind"] != "scheduler"]
+    cell["runtime_memory"].update(kv_cache_bytes=capacity, provenance=json.dumps(sparse))
+    with pytest.raises(ValueError, match="worker roster"):
+        _merge_resources([cell], {}, source_references=True)
+    for version in ("source_references", "source_references_v2"):
+        saved = {}
+        _merge_resources([observation], saved, source_references=True, observation_format=version)
+        assert saved["observation_provenance"] == version
+        for field in ("cache_groups", "block_size_tokens"):
+            damaged = json.loads(json.dumps(saved))
+            if field == "cache_groups":
+                del damaged["cell_observations"][0][field]
+            else:
+                del damaged["cell_observations"][0]["cache_groups"][0][field]
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(damaged))
+        if version == "source_references_v2":
+            damaged = json.loads(json.dumps(saved))
+            damaged["cell_observations"][0]["cache_groups"][0]["block_size_tokens"] *= 2
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(damaged))
+        memory = saved["cell_observations"][0]["runtime_memory"]
+        compact = json.loads(memory["provenance"])
+        if version == "source_references":
+            assert all(set(artifact) == {"path", "sha256"} for artifact in compact["artifacts"])
+            assert "worker_observations" not in compact
+            assert "worker_observation_digests" not in saved
+            assert _runtime.observed_model_dtype(json.dumps(saved))
+            for incomplete in ([None], [{"path": "missing-sha256"}]):
+                memory["provenance"] = json.dumps({**compact, "artifacts": incomplete})
+                with pytest.raises(ValueError, match="worker roster"):
+                    _runtime.observed_model_dtype(json.dumps(saved))
+            for index in ({"path": "observations.json"}, {"path": "", "sha256": "0" * 64}):
+                memory["provenance"] = json.dumps({**compact, "observations_index": index})
+                with pytest.raises(ValueError, match="worker roster"):
+                    _runtime.observed_model_dtype(json.dumps(saved))
+            for key in ("rank_capacities", "source", "runtime_settings"):
+                memory["provenance"] = json.dumps({k: v for k, v in compact.items() if k != key})
+                with pytest.raises(ValueError, match="worker roster"):
+                    _runtime.observed_model_dtype(json.dumps(saved))
+            memory["provenance"] = "{"
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(saved))
+            continue
+        assert all(set(artifact) == {"kind", "path", "sha256"} for artifact in compact["artifacts"])
+        assert [(r["phase"], r["tp_rank"], r["dp_rank"]) for r in compact["worker_observations"]] == [
+            (r["phase"], r["tp_rank"], r["dp_rank"]) for r in workers
+        ]
+        assert compact["worker_observations"][-1]["backends"] == ["flash_attn", "flashinfer"]
+        assert saved["worker_observation_digests"] == [
+            _runtime.nixl_observation_digest(
+                json.dumps(compact),
+                compact["observations_index"]["sha256"],
+                "{}",
+                False,
+                json.dumps(saved["cell_observations"][0]),
+            )
+        ]
+        downgraded = {**saved, "observation_provenance": "source_references"}
+        del downgraded["worker_observation_digests"]
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(downgraded))
+        for section in ("instrumentation", "launch"):
+            edited = json.loads(json.dumps(compact))
+            if section == "instrumentation":
+                files = edited[section]["files"]
+                a, b = list(files)[:2]
+                files[a], files[b] = files[b], files[a]
+            else:
+                edited[section]["model_config"]["sha256"] = "0" * 64
+            memory["provenance"] = json.dumps(edited)
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(saved))
+        injected = json.loads(json.dumps(compact))
+        injected["artifacts"][0]["evidence"] = {"kind": "worker", "phase": "prefill"}
+        memory["provenance"] = json.dumps(injected)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(saved))
+        for key in ("artifacts", "runtime_artifacts", "launch_artifacts"):
+            edited = json.loads(json.dumps(compact))
+            if edited[key]:
+                edited[key][0]["sha256"] = "0" * 64
+            else:
+                edited[key].append({"path": "runtime.json", "sha256": "0" * 64})
+            memory["provenance"] = json.dumps(edited)
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(saved))
+        compact["artifacts"].reverse()
+        compact["worker_observations"].reverse()
+        memory["provenance"] = json.dumps(compact)
+        assert _runtime.observed_model_dtype(json.dumps(saved))
+        compact["worker_observations"][0]["backends"] = []
+        memory["provenance"] = json.dumps(compact)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(saved))
+
+
 def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_sources(tmp_path, capsys):
     from aisim.support.finalization import _merge_resources, _verify_collection, finalization_manifest
     from aisim.support.runtime import verify_runtime_profile
@@ -2555,13 +2834,59 @@ def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_so
     assert resolved.profile_deployment().tp == 8
     manifest = finalization_manifest(resolved)
     assert manifest == json.loads((target / "finalization.json").read_text())
-    assert manifest["observation_provenance"] == "source_references"
+    assert manifest["observation_provenance"] == "source_references_v2"
+    assert len(manifest["worker_observation_digests"]) == len(manifest["cell_observations"])
     observation = json.loads(manifest["cell_observations"][0]["runtime_memory"]["provenance"])
     assert len(observation["rank_capacities"]) == 16
     assert len(observation["artifacts"]) == 18
-    assert all(set(reference) == {"path", "sha256"} for reference in observation["artifacts"])
+    assert all(set(reference) == {"kind", "path", "sha256"} for reference in observation["artifacts"])
     for reference in manifest["source_artifacts"]:
         assert hashlib.sha256(Path(reference["path"]).read_bytes()).hexdigest() == reference["sha256"]
+    from aisim import _runtime
+
+    damaged = resolved.model_copy(deep=True)
+    memory = damaged.profile_deployment().resources.runtime_memory
+    for keys in ({"runtime_probe"}, {"runtime_compatibility"}, {"runtime_probe", "runtime_compatibility"}):
+        memory.provenance = json.dumps({k: v for k, v in manifest.items() if k not in keys})
+        with pytest.raises(ValueError, match="requires its source runtime probe"):
+            verify_runtime_profile(damaged)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(memory.provenance)
+    probe = {"schema_version": "aisimulate-onboarding-runtime-probe/v1"}
+    probe["observations_index"] = manifest["runtime_probe"]["observations_index"]
+    memory.provenance = json.dumps({**manifest, "runtime_probe": probe})
+    with pytest.raises(ValueError, match="invalid onboarding runtime probe"):
+        verify_runtime_profile(damaged)
+    with pytest.raises(ValueError, match="worker roster"):
+        _runtime.observed_model_dtype(memory.provenance)
+    memory.provenance = json.dumps({**manifest, "schema_version": "aisimulate-onboarding-finalization/v999"})
+    with pytest.raises(ValueError, match="finalization schema"):
+        verify_runtime_profile(damaged)
+    with pytest.raises(ValueError, match="finalization schema"):
+        _runtime.observed_model_dtype(memory.provenance)
+    memory.provenance = json.dumps({"source": "operator", "source_request_id": "job", "runtime_compatibility": None})
+    assert verify_runtime_profile(damaged) is None
+    assert _runtime.observed_model_dtype(memory.provenance) is None
+
+    reordered = resolved.model_copy(deep=True)
+    reordered_manifest = json.loads(json.dumps(manifest))
+    reordered_manifest["source_artifacts"].reverse()
+    child = reordered_manifest["cell_observations"][0]["runtime_memory"]
+    compact = json.loads(child["provenance"])
+    compact["artifacts"].reverse()
+    child["provenance"] = json.dumps(compact)
+    reordered.profile_deployment().resources.runtime_memory.provenance = json.dumps(reordered_manifest)
+    assert verify_runtime_profile(reordered) is None
+
+    for key, path_key in (("source_artifacts", "path"), ("formal_data", "relative_path")):
+        edited = json.loads(json.dumps(manifest))
+        edited[key].reverse()
+        assert _runtime.observed_model_dtype(json.dumps(edited))
+        a = edited[key][0]
+        b = next(ref for ref in edited[key] if ref["sha256"] != a["sha256"])
+        a[path_key], b[path_key] = b[path_key], a[path_key]
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(edited))
     output = tmp_path / "recommendation"
     result = subprocess.run(
         [
@@ -2591,6 +2916,45 @@ def test_large_runtime_provenance_reaches_supervised_recommendation_and_keeps_so
     assert any(event["event"] == "candidate_completed" for event in events)
     verify_runtime_profile(resolved)
     observations, legacy_manifest, _, _ = _verify_collection(original, root)
+    for form in ("source_references", "source_references_v2"):
+        archive = copy.deepcopy(legacy_manifest)
+        _merge_resources(observations, archive, source_references=True, observation_format=form)
+        assert _runtime.observed_model_dtype(json.dumps(archive))
+        inflated = copy.deepcopy(archive)
+        for cell in inflated["cell_observations"]:
+            cell["runtime_memory"]["kv_cache_bytes"] *= 100
+        with pytest.raises(ValueError, match="kv_cache_bytes"):
+            _runtime.observed_model_dtype(json.dumps(inflated))
+        if form == "source_references":
+            selected = resolved.profile_deployment().resources.runtime_memory.model_dump(exclude={"provenance"})
+            for field in ("kv_cache_bytes", "hash_block_size_tokens"):
+                if not selected.get(field):
+                    continue
+                omitted = copy.deepcopy(archive)
+                for cell in omitted["cell_observations"]:
+                    cell["runtime_memory"].pop(field, None)
+                evidence = (json.dumps(omitted), None, "auto")
+                _runtime.GroupedPdObservation("prefill", evidence, memory=json.dumps(selected))
+                with pytest.raises(ValueError, match=field):
+                    _runtime.GroupedPdObservation(
+                        "prefill", evidence, memory=json.dumps({**selected, field: selected[field] * 2})
+                    )
+        unreadable = copy.deepcopy(archive)
+        for key in ("runtime_probe", "runtime_compatibility"):
+            del unreadable[key]
+        unreadable["cell_observations"][0]["runtime_memory"]["provenance"] = "{"
+        saved_request = resolved.model_copy(deep=True)
+        saved_request.profile_deployment().resources.runtime_memory.provenance = json.dumps(unreadable)
+        with pytest.raises(ValueError, match="unreadable finalized runtime cell"):
+            verify_runtime_profile(saved_request)
+        for field, value in (
+            ("observations_index", archive["runtime_probe"]["observations_index"]),
+            ("observations_sha256", "5" * 64),
+        ):
+            edited = copy.deepcopy(archive)
+            edited["runtime_compatibility"][field] = value
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(edited))
     legacy = resolved.model_dump(mode="json")
     legacy["fpm_profile"]["deployments"][0]["resources"] = _merge_resources(observations, legacy_manifest)
     review = tmp_path / "resolved-checkpoint.json"
@@ -2987,8 +3351,16 @@ def _with_transfer_bytes(group):
     ids=["wrong_marker", "missing_other_key", "transfer_bytes_without_a_measurement"],
 )
 def test_a_saved_draft_with_other_group_differences_is_refused(tmp_path, capsys, monkeypatch, edit):
+    from aisim.support import runtime
     from aisim.support.runtime import verify_runtime_profile
 
+    # Reproduce the earlier draft writer: it projected workers without the selected groups.
+    project = runtime._worker_observations
+
+    def old_writer(*args, cache_groups, **kwargs):
+        return project(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_worker_observations", old_writer)
     _save_as(monkeypatch, edit)
     _, _, request, _ = _imported(tmp_path, capsys, layout="mamba_hybrid")
     monkeypatch.undo()

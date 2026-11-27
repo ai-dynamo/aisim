@@ -1510,6 +1510,128 @@ def test_vllm_032_layer_strided_plan_imports_every_layout(tmp_path, layout, grou
     assert {group.page_size_bytes for group in resources.cache_groups} == {512}
 
 
+@pytest.mark.parametrize("field", ["cache", "raw_cache_config"])
+@pytest.mark.parametrize("heads,named,valid", [(2, "LBHNC", False), (2, "LBNHC", True), (1, "LBHNC", True)])
+@pytest.mark.parametrize("prefix_lm", [False, True])
+def test_nixl_compaction_checks_named_and_physical_layouts(tmp_path, field, heads, named, valid, prefix_lm):
+    from aisim import _runtime
+    from aisim.support.finalization import _merge_resources
+
+    path, launch = _strided_fixture(tmp_path, layout="LBNHC", heads=heads)
+
+    def name_worker_layout(row):
+        if prefix_lm:
+            row["resolved_config"]["cache_config"]["enable_prefix_caching"] = False
+            row["resolved_config"]["scheduler_config"]["enable_chunked_prefill"] = False
+        if row["kind"] == "worker":
+            row.setdefault(field, {})["kv_cache_layout"] = named
+            if prefix_lm:
+                cls = "vllm.model_executor.layers.attention.prefill_prefix_lm_attention.PrefillPrefixLMAttention"
+                for group in row["cache"]["groups"]:
+                    group["layer_classes"] = dict.fromkeys(group["layer_names"], cls)
+
+    _mutate(path, name_worker_layout)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    memory = result["resources"]["runtime_memory"]
+    if valid:
+        _runtime.observed_model_dtype(memory["provenance"])
+        _merge_resources([result["resources"]], {}, source_references=True)
+    else:
+        with pytest.raises(ValueError, match="kv_cache_layout"):
+            _runtime.observed_model_dtype(memory["provenance"])
+        with pytest.raises(ValueError, match="kv_cache_layout"):
+            _merge_resources([result["resources"]], {}, source_references=True)
+
+
+def test_nixl_archive_checks_selected_groups_in_both_phases(tmp_path):
+    from aisim import _runtime
+    from aisim.support.finalization import _merge_resources
+
+    path, launch = _strided_fixture(tmp_path)
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = result["resources"]
+
+    def raw():
+        _runtime.GroupedPdObservation(
+            "decode",
+            (resources["runtime_memory"]["provenance"], None, "auto"),
+            groups=json.dumps(resources["cache_groups"]),
+        )
+
+    raw()
+    _merge_resources([resources], {}, source_references=True)
+    group = resources["cache_groups"][0]
+    original = group["block_size_tokens"]
+    group["block_size_tokens"] = 2 * original
+    with pytest.raises(ValueError, match="block_size_tokens"):
+        raw()
+    with pytest.raises(ValueError, match="block_size_tokens"):
+        _merge_resources([resources], {}, source_references=True)
+    group["block_size_tokens"] = original
+
+    evidence = result["provenance"]
+    for file in evidence["artifacts"]:
+        record = file["evidence"]
+        if record["phase"] == "decode":
+            group = record["cache"]["groups"][0]
+            group.update(spec_type="vllm.v1.kv_cache_interface.SlidingWindowSpec", sliding_window=32)
+    resources["runtime_memory"]["provenance"] = json.dumps(evidence)
+    with pytest.raises(ValueError, match="sliding_window"):
+        raw()
+    with pytest.raises(ValueError, match="sliding_window"):
+        _merge_resources([resources], {}, source_references=True)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["scheduler_raw_blocks", "worker_tp", "scheduler_dp", "allocation_offset", "second_layer_offset"],
+)
+def test_nixl_archive_checks_recorded_pool_topology_and_view_offsets(tmp_path, change):
+    from aisim import _runtime
+    from aisim.support.finalization import _merge_resources
+
+    # Two layers of one non-dense allocation use different byte offsets.
+    path, launch = _strided_fixture(tmp_path, layout="LHBNC")
+    result = validate_observations(path, launch)["tp2"]
+    assert result["status"] == "complete", result["diagnostics"]
+    resources = result["resources"]
+    _runtime.observed_model_dtype(resources["runtime_memory"]["provenance"])
+    _merge_resources([resources], {}, source_references=True)
+
+    def edit(record):
+        if record["phase"] != "decode" or record["dp_rank"] != 0:
+            return
+        cache = record["cache"]
+        if record["kind"] == "scheduler":
+            if change == "scheduler_raw_blocks":
+                record.setdefault("raw_cache_config", {})["num_blocks"] = cache["num_blocks"] - 1
+            elif change == "scheduler_dp":
+                record["resolved_config"]["parallel_config"]["data_parallel_size"] *= 2
+        elif record["tp_rank"] == 1:
+            if change == "worker_tp":
+                record["resolved_config"]["parallel_config"]["tensor_parallel_size"] *= 2
+            elif change == "allocation_offset":
+                cache["tensor_allocations"][0]["offset"] = cache["storages"][0]["size_bytes"]
+            elif change == "second_layer_offset":
+                # Keep the view inside the backing storage while moving it outside its layer.
+                cache["layer_tensors"]["layer1"]["storage_offset_bytes"] -= 2
+
+    if change != "scheduler_raw_blocks":
+        _mutate(path, edit)
+        assert validate_observations(path, launch)["tp2"]["status"] == "incomplete"
+    for file in result["provenance"]["artifacts"]:
+        edit(file["evidence"])
+    memory = resources["runtime_memory"]
+    memory["provenance"] = json.dumps(result["provenance"])
+    diagnostic = "worker roster" if change in ("worker_tp", "scheduler_dp") else "kv_cache_bytes"
+    with pytest.raises(ValueError, match=diagnostic):
+        _runtime.observed_model_dtype(memory["provenance"])
+    with pytest.raises(ValueError, match=diagnostic):
+        _merge_resources([resources], {}, source_references=True)
+
+
 @pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
 def test_vllm_032_kernel_block_subdivision_keeps_manager_block_stride(tmp_path, layout):
     path, launch = _strided_fixture(tmp_path, layout=layout, kernel=8)
@@ -2063,6 +2185,21 @@ def test_aggregated_phases_with_different_prefix_caching_import_the_prefill_valu
         "decode: runtime_group_1 block_size_tokens 4096 != 64",
         "decode: runtime_group_2 block_size_tokens 4096 != 64",
     ]
+    from aisim import _runtime
+
+    resources = result["resources"]
+    memory = resources["runtime_memory"]
+    _runtime.GroupedPdObservation(
+        "prefill",
+        (memory["provenance"], None, "auto"),
+        None,
+        2,
+        json.dumps(resources["cache_groups"]),
+        memory=json.dumps({key: val for key, val in memory.items() if key != "provenance"}),
+    )
+    from aisim.support.finalization import _merge_resources
+
+    _merge_resources([resources], {}, source_references=True)
     # The mode-dependent settings and the engine-core block size leave the compared runtime settings.
     cache = provenance["runtime_settings"]["cache_config"]
     assert not {
@@ -3747,11 +3884,13 @@ def test_import_records_the_vllm_version_of_the_cache_group_evidence(tmp_path):
 
     resources = _import(_campaign_from_fixture(tmp_path / "live", FIXTURES / "glm53flash_vllm_0330_probe"))["resources"]
     assert resources["runtime_memory"]["runtime_framework_version"] == "0.33.0"
+    assert resources["runtime_memory"]["model_dtype"] == "torch.bfloat16"
     # The import of a vLLM 0.28.0 record holds no prefix-caching evidence, and its result keeps its bytes.
     path, launches = observation_fixture(tmp_path / "attention", layout="attention")
     result = validate_observations(path, launches)["tp2"]
     assert result["status"] == "complete", result["diagnostics"]
     assert "runtime_framework_version" not in result["resources"]["runtime_memory"]
+    assert "model_dtype" not in result["resources"]["runtime_memory"]
     # A vLLM 0.33.0 record of one attention group has a linear layout. That layout has no cache groups, so it does not
     # hold the version of their evidence.
     path, launches = observation_fixture(tmp_path / "kernel", layout="kernel_view")
@@ -3760,6 +3899,7 @@ def test_import_records_the_vllm_version_of_the_cache_group_evidence(tmp_path):
     linear = linear_runtime_resources(result["resources"])
     assert linear is not None and "cache_groups" not in linear
     assert "runtime_framework_version" not in linear["runtime_memory"]
+    assert "model_dtype" not in linear["runtime_memory"]
 
 
 def test_the_live_glm53flash_record_of_vllm_0330_passes_the_grouped_prefix_caching_gate(tmp_path):

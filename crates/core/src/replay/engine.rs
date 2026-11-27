@@ -1,5 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
+// Modified grouped handoff validation follows vLLM's NIXL handshake at v0.31.0, v0.32.0 and v0.33.0.
+// https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+// https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+// https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 
 //! Default generalized-engine construction for offline replay.
 //!
@@ -14,7 +19,7 @@ use crate::engine::belady::BeladyOracle;
 use crate::engine::generalized::EngineIdentity;
 use crate::engine::{
     Backend, Engine, EngineConfig, EngineFactory, G2Binding, G2Registry, G2Scope, KvEvictionPolicy,
-    TimingModel, WorkerType,
+    TimingModel, TimingModelConfig, WorkerType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -109,6 +114,262 @@ impl Default for ReplayRoleConfig {
             num_gpu_blocks_is_explicit: None,
             rank: EngineConfig::default(),
         }
+    }
+}
+
+/// An injected timing model can carry either spelling from the canonical timing schema.
+fn timing_alias<'a>(
+    config: &'a Value,
+    name: &str,
+    legacy: &str,
+) -> anyhow::Result<Option<&'a Value>> {
+    let value = config.get(name).filter(|v| !v.is_null());
+    let fallback = config.get(legacy).filter(|v| !v.is_null());
+    if let (Some(a), Some(b)) = (value, fallback) {
+        let equal = a == b
+            || name.ends_with("_quant_mode")
+                && a.as_str()
+                    .zip(b.as_str())
+                    .is_some_and(|(x, y)| x.eq_ignore_ascii_case(y));
+        anyhow::ensure!(equal, "conflicting timing aliases {name} and {legacy}");
+    }
+    Ok(value.or(fallback))
+}
+
+impl ReplayRoleConfig {
+    /// Match the rank, estimator, and selected deployment before comparing NIXL's
+    /// model ID, KV dtype, attention backend and model dtype across the pair.
+    fn grouped_transfer_identity(
+        &self,
+    ) -> anyhow::Result<[crate::perfmodel::fpm::NixlIdentity; 2]> {
+        use crate::perfmodel::fpm::NixlIdentity;
+        use crate::perfmodel::{ForwardPassPerfModelConfig, FpmCacheGroup, FpmRuntimeMemoryConfig};
+        use anyhow::{Context, bail, ensure};
+
+        let empty = || {
+            let identity = || NixlIdentity {
+                phase_width: Some(u64::from(self.tensor_parallel_size) * u64::from(self.dp_size)),
+                tp_size: Some(u64::from(self.tensor_parallel_size)),
+                modeled_version: self.rank.vllm_version.clone(),
+                ..Default::default()
+            };
+            Ok([identity(), identity()])
+        };
+        let TimingModelConfig::External { provider, config } = &self.rank.timing_model else {
+            return empty();
+        };
+        if !matches!(provider.as_str(), "aic" | "ais") {
+            return empty();
+        }
+        // Duration may be supplied by the caller, bypassing the ordinary timing descriptor reader.
+        for (name, legacy) in [
+            ("gemm_quant_mode", "gemm_dtype"),
+            ("moe_quant_mode", "moe_dtype"),
+            ("fmha_quant_mode", "fmha_dtype"),
+            ("fpm_fmha_quant_mode", "fpm_fmha_dtype"),
+            ("comm_quant_mode", "comm_dtype"),
+            ("enable_shared_layer", "shared_layer"),
+        ] {
+            timing_alias(config, name, legacy)?;
+        }
+        let known = |value: &&str| {
+            !value.eq_ignore_ascii_case("auto") && !value.eq_ignore_ascii_case("unknown")
+        };
+        let role = serde_json::json!(self.rank.worker_type);
+        ensure!(
+            config["worker_type"].is_null() || config["worker_type"] == role,
+            "estimator worker_type does not match replay role"
+        );
+        // Injected providers may omit identity fields. Use the rank's geometry for
+        // those defaults; parse recorded sizes and their aliases with the FPM types.
+        let model = timing_alias(config, "model", "model_path")?.and_then(Value::as_str);
+        let mut selector = serde_json::json!({
+            "model": model.unwrap_or_default(), "system": config["system"].as_str().unwrap_or_default(),
+            "backend": config["backend"].as_str().unwrap_or("vllm"), "worker_type": role,
+            "backend_version": config["backend_version"], "tp": self.tensor_parallel_size,
+            "attention_dp": self.dp_size, "cp_size": config["cp_size"], "dcp": config["dcp"],
+            "moe_tp_size": config["moe_tp_size"], "moe_ep_size": config["moe_ep_size"]
+        });
+        for (key, legacy) in [
+            ("tp", "tp_size"),
+            ("pp", "pp_size"),
+            ("attention_dp", "attention_dp_size"),
+        ] {
+            if let Some(value) = timing_alias(config, key, legacy)? {
+                selector[key] = value.clone();
+            }
+        }
+        let timing: ForwardPassPerfModelConfig =
+            serde_json::from_value(selector).context("invalid grouped timing identity")?;
+        ensure!(
+            timing.backend == crate::BackendKind::Vllm,
+            "grouped rank requires timing backend=vllm"
+        );
+        for (field, recorded, rank) in [
+            ("tp", timing.tp, self.tensor_parallel_size),
+            ("pp", timing.pp, 1),
+            ("attention_dp", timing.attention_dp, self.dp_size),
+            (
+                "cp_size",
+                timing.cp_size.unwrap_or(1),
+                self.prefill_context_parallel_size,
+            ),
+        ] {
+            let unknown = field != "cp_size" && recorded == crate::UNKNOWN_SIZE;
+            ensure!(
+                unknown || recorded == rank,
+                "grouped timing {field} ({recorded}) must match the replay rank ({rank})"
+            );
+        }
+        let profile = config.get("fpm_profile").filter(|v| !v.is_null());
+        ensure!(
+            timing.dcp.is_none_or(|size| size == 1 && profile.is_none()),
+            "grouped replay does not model timing dcp for an FPM profile or a striped cache"
+        );
+        let deployment = match profile {
+            Some(value) => Some(timing.matching_fpm_deployment(
+                value.as_object().context("fpm_profile must be an object")?,
+            )?),
+            None => None,
+        };
+        let memory = deployment
+            .and_then(|d| d.pointer("/resources/runtime_memory"))
+            .filter(|v| !v.is_null());
+        for (field, version) in [
+            ("timing backend_version", timing.backend_version.as_deref()),
+            (
+                "runtime_memory.runtime_framework_version",
+                memory.and_then(|m| m["runtime_framework_version"].as_str()),
+            ),
+        ] {
+            if let Some(version) = version.filter(known)
+                && let Some(rank_version) = &self.rank.vllm_version
+                && !FpmRuntimeMemoryConfig::matches_grouped_version(
+                    version,
+                    rank_version,
+                    self.rank.enable_prefix_caching || field == "timing backend_version",
+                )
+            {
+                bail!("grouped rank vllm_version ({rank_version}) must match {field} ({version})");
+            }
+        }
+        if let Some(resources) = deployment.and_then(|d| d.get("resources")) {
+            ensure!(
+                resources["cache_layout"]
+                    .as_str()
+                    .is_none_or(|layout| layout == "grouped"),
+                "grouped rank requires a grouped selected deployment"
+            );
+            if let Some(groups) = resources.get("cache_groups") {
+                let measured: Vec<FpmCacheGroup> = serde_json::from_value(groups.clone())
+                    .context("invalid selected cache groups")?;
+                ensure!(
+                    measured == self.rank.kv_cache_groups,
+                    "grouped rank kv_cache_groups must match the selected deployment"
+                );
+            }
+        }
+        let source = |field, declared: Option<&str>, observed: Option<&str>| -> anyhow::Result<_> {
+            let declared = declared.filter(known);
+            let observed = observed.filter(known);
+            if let (Some(a), Some(b)) = (declared, observed)
+                && !a.eq_ignore_ascii_case(b)
+            {
+                bail!("grouped timing {field} ({a}) must match the selected deployment ({b})");
+            }
+            Ok(declared.or(observed).map(str::to_owned))
+        };
+        let model_dtype = config["model_dtype"]
+            .as_str()
+            .and_then(FpmRuntimeMemoryConfig::normalize_model_dtype);
+        let mut observed = NixlIdentity::observed(
+            memory.and_then(|m| m["model_dtype"].as_str()),
+            memory
+                .and_then(|m| m["provenance"].as_str())
+                .unwrap_or_default(),
+            Some(u64::from(self.tensor_parallel_size) * u64::from(self.dp_size)),
+            Some(u64::from(self.tensor_parallel_size)),
+            profile.and_then(|p| p["architecture"].as_str()),
+        )?;
+        if let (Some(memory), Some(resources)) =
+            (memory, deployment.and_then(|d| d.get("resources")))
+        {
+            for (key, rank) in [
+                ("max_num_tokens", self.rank.max_num_batched_tokens),
+                ("max_batch_size", self.rank.max_num_seqs),
+            ] {
+                if let Some(recorded) = resources[key].as_u64() {
+                    ensure!(
+                        rank as u64 == recorded,
+                        "grouped runtime memory requires the exact recorded rank-local {key}={recorded}, replay rank has {rank}"
+                    );
+                }
+            }
+            if let Some(limit) = memory["max_model_len"].as_u64() {
+                ensure!(
+                    self.rank
+                        .max_model_len
+                        .is_some_and(|context| context as u64 <= limit),
+                    "grouped replay rank max_model_len exceeds runtime memory max_model_len={limit}"
+                );
+            }
+            observed.selected_memory(
+                memory,
+                Some((
+                    resources["max_num_tokens"].as_u64(),
+                    resources["max_batch_size"].as_u64(),
+                )),
+            )?;
+        }
+        if profile.is_some() && self.rank.enable_prefix_caching {
+            ensure!(
+                memory.is_some_and(|m| m["enable_prefix_caching"] == true),
+                "warm grouped rank requires prefix caching in the selected runtime memory"
+            );
+            let unit = memory
+                .and_then(|m| m["hash_block_size_tokens"].as_u64())
+                .filter(|n| *n > 0)
+                .context("warm grouped rank requires a measured hash_block_size_tokens")?;
+            ensure!(
+                self.rank.prefix_match_unit.map(|n| n as u64) == Some(unit),
+                "grouped rank prefix_match_unit must match the selected hash_block_size_tokens ({unit})"
+            );
+        }
+        if let Some(groups) = deployment.and_then(|d| d.pointer("/resources/cache_groups")) {
+            observed.selected_groups(groups)?;
+        }
+        let backend = source(
+            "attention_backend",
+            config["attention_backend"].as_str(),
+            deployment.and_then(|d| d["attention_backend"].as_str()),
+        )?;
+        let labels = NixlIdentity {
+            model: model.map(str::to_owned),
+            kv_cache_dtype: source(
+                "kv_cache_dtype",
+                timing_alias(config, "kvcache_quant_mode", "kv_cache_dtype")?
+                    .and_then(Value::as_str),
+                deployment.and_then(|d| d["kv_cache_dtype"].as_str()),
+            )?
+            .map(|s| s.to_ascii_lowercase()),
+            attention_backend: backend.map(|s| s.to_ascii_lowercase()),
+            model_dtype,
+            ..NixlIdentity::default()
+        };
+        observed.model_dtype = source(
+            "model_dtype",
+            labels.model_dtype.as_deref(),
+            observed.model_dtype.as_deref(),
+        )?;
+        observed.select(
+            role.as_str().unwrap_or_default(),
+            labels.attention_backend.as_deref(),
+            labels.kv_cache_dtype.as_deref(),
+            self.rank.vllm_version.as_deref(),
+            memory.and_then(|m| m["runtime_framework_version"].as_str()),
+            self.rank.enable_prefix_caching,
+        )?;
+        Ok([labels, observed])
     }
 }
 
@@ -217,8 +478,9 @@ impl ReplayEngineConfig {
                 }
             }
             ReplayTopology::Disaggregated { .. } => {
-                let [prefill, decode] =
-                    [WorkerStage::Prefill, WorkerStage::Decode].map(|stage| self.role(stage).rank);
+                let [prefill_role, decode_role] =
+                    [WorkerStage::Prefill, WorkerStage::Decode].map(|stage| self.role(stage));
+                let (prefill, decode) = (&prefill_role.rank, &decode_role.rank);
                 if prefill.g3_offload.is_some() || decode.g3_offload.is_some() {
                     return Err(ReplayError::InvalidSpec(
                         "g3_offload supports only aggregated replay".to_string(),
@@ -229,6 +491,49 @@ impl ReplayEngineConfig {
                     return Err(ReplayError::InvalidSpec(
                         "state_cache must be set on both prefill and decode roles".to_string(),
                     ));
+                }
+                // A grouped rank counts the handoff in full-attention blocks of
+                // its groups and a linear rank in tokens, so both roles need
+                // the same groups. Two linear roles have none.
+                if prefill.kv_cache_groups != decode.kv_cache_groups {
+                    return Err(ReplayError::InvalidSpec(
+                        "kv_cache_groups must be identical on the prefill and decode roles"
+                            .to_string(),
+                    ));
+                }
+                if !prefill.kv_cache_groups.is_empty() {
+                    if prefill_role.prefill_context_parallel_size != 1
+                        || decode_role.prefill_context_parallel_size != 1
+                    {
+                        return Err(ReplayError::InvalidSpec(
+                            "grouped prefill and decode roles require prefill_context_parallel_size=1".into(),
+                        ));
+                    }
+                    // The handoff moves one TP rank's cache with one vLLM rule set.
+                    if prefill_role.tensor_parallel_size != decode_role.tensor_parallel_size {
+                        return Err(ReplayError::InvalidSpec(
+                            "grouped prefill and decode roles require equal tensor_parallel_size"
+                                .into(),
+                        ));
+                    }
+                    if prefill.vllm_version != decode.vllm_version {
+                        return Err(ReplayError::InvalidSpec(
+                            "vllm_version must be identical on the prefill and decode roles".into(),
+                        ));
+                    }
+                    let identity = |role: &ReplayRoleConfig| {
+                        role.grouped_transfer_identity()
+                            .map_err(|e| ReplayError::InvalidSpec(format!("{e:#}")))
+                    };
+                    let prefill_identity = identity(&prefill_role)?;
+                    let decode_identity = identity(&decode_role)?;
+                    for (prefill, decode) in prefill_identity.iter().zip(&decode_identity) {
+                        if let Some((field, p, d)) = prefill.mismatch(decode) {
+                            return Err(ReplayError::InvalidSpec(format!(
+                                "grouped prefill and decode roles require matching {field} ({p} and {d})"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -744,11 +1049,15 @@ fn pipeline_parallel_size(timing: &crate::engine::TimingModelConfig) -> Result<u
     if !matches!(provider.as_str(), "aic" | "ais") {
         return Ok(1);
     }
-    let Some((key, value)) = ["pp", "pp_size"]
-        .iter()
-        .find_map(|key| config.get(key).map(|value| (key, value)))
+    let Some(value) = timing_alias(config, "pp", "pp_size")
+        .map_err(|e| ReplayError::InvalidSpec(e.to_string()))?
     else {
         return Ok(1);
+    };
+    let key = if config["pp"].is_null() {
+        "pp_size"
+    } else {
+        "pp"
     };
     if value.as_str() == Some(crate::UNKNOWN_IDENTITY) {
         return Ok(1);
@@ -818,6 +1127,224 @@ mod disaggregated_tests {
             };
             assert!(matches!(error, ReplayError::InvalidSpec(_)), "{error}");
             assert!(error.to_string().contains("sglang.mamba_cache"), "{error}");
+        }
+    }
+
+    #[test]
+    fn grouped_handoff_compares_only_the_known_timing_identity_of_each_role() {
+        let topology: ReplayTopology = serde_json::from_value(serde_json::json!({
+            "kind": "disaggregated", "prefill": {"initial_workers": 1}, "decode": {"initial_workers": 1}
+        })).unwrap();
+        let rank: EngineConfig = serde_json::from_value(serde_json::json!({
+            "vllm_version": "0.32.0", "kv_cache_groups": [{
+                "name": "full", "kind": "attention", "num_layers": 1, "block_size_tokens": 16,
+                "page_size_bytes": 64, "prefix_cacheable": true, "transfer_bytes_per_block": 64
+            }]
+        }))
+        .unwrap();
+        let role = |timing_model| {
+            Some(ReplayRoleConfig {
+                rank: EngineConfig {
+                    timing_model,
+                    ..rank.clone()
+                },
+                ..Default::default()
+            })
+        };
+        let aic = |config| TimingModelConfig::External {
+            provider: "aic".into(),
+            config,
+        };
+        let mut config = ReplayEngineConfig {
+            prefill: role(aic(
+                serde_json::json!({"model_path":"org/Model", "kv_cache_dtype":"fp8", "attention_backend":"FLASHINFER"}),
+            )),
+            ..Default::default()
+        };
+        for timing in [
+            TimingModelConfig::Fixed {
+                prefill_ms: 1.0,
+                decode_ms: 1.0,
+            },
+            aic(
+                serde_json::json!({"model":"org/Model", "kvcache_quant_mode":"fp8", "attention_backend":"flashinfer"}),
+            ),
+            aic(serde_json::json!({"model":"org/Model", "attention_backend":"auto"})),
+        ] {
+            config.decode = role(timing);
+            config.validate_topology(&topology).unwrap();
+        }
+        config.decode = role(aic(serde_json::json!({"model":"org/model"})));
+        assert!(
+            config
+                .validate_topology(&topology)
+                .unwrap_err()
+                .to_string()
+                .contains("require matching model")
+        );
+        for role in [&mut config.prefill, &mut config.decode] {
+            role.as_mut().unwrap().rank.kv_cache_groups.clear();
+        }
+        config.validate_topology(&topology).unwrap();
+    }
+
+    #[test]
+    fn grouped_injected_replay_checks_each_rank_scheduler_envelope() {
+        use serde_json::json;
+        let groups = json!([{"name":"full","kind":"attention","num_layers":1,"block_size_tokens":4,
+            "page_size_bytes":64,"prefix_cacheable":true,"transfer_bytes_per_block":64}]);
+        let role = |phase| {
+            json!({"rank":{"worker_type":phase,"vllm_version":"0.33.0","enable_prefix_caching":false,
+            "max_num_batched_tokens":128,"max_num_seqs":32,"max_model_len":64,"kv_cache_groups":groups,
+            "kv_cache_capacity_bytes":2048, "timing_model":{"type":"external","provider":"ais","config":{
+                "system":"gpu","backend":"vllm","backend_version":"0.33.0","model":"model",
+                "fpm_profile":{"model":"model","deployments":[{"system":"gpu","backend":"vllm","backend_version":"0.33.0",
+                    "worker_type":phase,"tp":1,"pp":1,"dp":1,"moe_tp":1,"moe_ep":1,
+                    "resources":{"cache_layout":"grouped","cache_groups":groups,"max_num_tokens":128,"max_batch_size":32,
+                        "runtime_memory":{"max_model_len":128}}}]}}}}})
+        };
+        let spec: ReplaySpec = serde_json::from_value(json!({"topology":{"kind":"disaggregated",
+            "prefill":{"initial_workers":1},"decode":{"initial_workers":1}},
+            "engine":{"prefill":role("prefill"),"decode":role("decode")},
+            "requests":[{"id":"one","arrival_time_ms":0.0,"input_tokens":4,"output_tokens":2}]}))
+        .unwrap();
+        let timing = EngineConfig::default().built_in_timing_model().unwrap();
+        assert_eq!(
+            run_engine_replay_with_timing(spec.clone(), timing.clone())
+                .unwrap()
+                .request_counts
+                .completed_requests,
+            1
+        );
+        for (field, value, expected) in [
+            ("max_num_seqs", 64, "max_batch_size"),
+            ("max_num_batched_tokens", 256, "max_num_tokens"),
+            ("max_model_len", 256, "max_model_len"),
+        ] {
+            for phase in ["prefill", "decode"] {
+                let mut changed = spec.clone();
+                changed.engine[phase]["rank"][field] = json!(value);
+                let err = run_engine_replay_with_timing(changed, timing.clone()).unwrap_err();
+                assert!(err.to_string().contains(expected), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn warm_native_rank_uses_the_selected_hash_block_size() {
+        let mut role = ReplayRoleConfig::default();
+        role.rank.worker_type = WorkerType::Prefill;
+        role.rank.enable_prefix_caching = true;
+        role.rank.prefix_match_unit = Some(64);
+        role.rank.timing_model = TimingModelConfig::External {
+            provider: "ais".into(),
+            config: serde_json::json!({"model":"model","system":"gpu","worker_type":"prefill",
+                "backend":"vllm","backend_version":"0.33.0","fpm_profile":{"model":"model","deployments":[{
+                    "system":"gpu","worker_type":"prefill","backend":"vllm","backend_version":"0.33.0",
+                    "tp":1,"pp":1,"dp":1,"moe_tp":1,"moe_ep":1,
+                    "resources":{"cache_layout":"grouped","runtime_memory":{
+                        "enable_prefix_caching":true,"hash_block_size_tokens":64}}}]}}),
+        };
+        role.grouped_transfer_identity().map(|_| ()).unwrap();
+        role.rank.prefix_match_unit = Some(32);
+        assert!(
+            role.grouped_transfer_identity()
+                .is_err_and(|error| error.to_string().contains("hash_block_size_tokens"))
+        );
+        role.rank.prefix_match_unit = Some(64);
+        for (memory, reason) in [
+            (
+                Some(serde_json::json!({"hash_block_size_tokens":64})),
+                "prefix caching",
+            ),
+            (
+                Some(serde_json::json!({"enable_prefix_caching":true})),
+                "hash_block_size_tokens",
+            ),
+            (None, "prefix caching"),
+        ] {
+            let TimingModelConfig::External { config, .. } = &mut role.rank.timing_model else {
+                unreachable!()
+            };
+            let resources = config["fpm_profile"]["deployments"][0]["resources"]
+                .as_object_mut()
+                .unwrap();
+            if let Some(memory) = memory {
+                resources.insert("runtime_memory".into(), memory);
+            } else {
+                resources.remove("runtime_memory");
+            }
+            assert!(
+                role.grouped_transfer_identity()
+                    .is_err_and(|e| e.to_string().contains(reason))
+            );
+        }
+        role.rank.enable_prefix_caching = false;
+        role.rank.prefix_match_unit = None;
+        role.grouped_transfer_identity().map(|_| ()).unwrap();
+    }
+
+    #[test]
+    fn grouped_injected_providers_check_timing_aliases_before_selecting_a_spelling() {
+        let cases = [
+            ("tp", "tp_size", serde_json::json!(1), serde_json::json!(4)),
+            ("pp", "pp_size", serde_json::json!(1), serde_json::json!(2)),
+            (
+                "attention_dp",
+                "attention_dp_size",
+                serde_json::json!(1),
+                serde_json::json!(2),
+            ),
+            (
+                "model",
+                "model_path",
+                serde_json::json!("/mnt/M"),
+                serde_json::json!("/mnt/m"),
+            ),
+            (
+                "kvcache_quant_mode",
+                "kv_cache_dtype",
+                serde_json::json!("fp8"),
+                serde_json::json!("bf16"),
+            ),
+            (
+                "fmha_quant_mode",
+                "fmha_dtype",
+                serde_json::json!("fp8"),
+                serde_json::json!("bf16"),
+            ),
+        ];
+        for provider in ["ais", "aic"] {
+            for (name, alias, a, b) in &cases {
+                let read = |first: &Value, second: &Value| {
+                    let role = ReplayRoleConfig {
+                        rank: EngineConfig {
+                            timing_model: TimingModelConfig::External {
+                                provider: provider.to_owned(),
+                                config: serde_json::json!({ *name: first, *alias: second }),
+                            },
+                            ..EngineConfig::default()
+                        },
+                        ..ReplayRoleConfig::default()
+                    };
+                    role.grouped_transfer_identity().map(|_| ())
+                };
+                assert!(
+                    read(a, b)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("conflicting timing aliases")
+                );
+                assert!(
+                    read(b, a)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("conflicting timing aliases")
+                );
+                read(a, a).unwrap();
+                read(a, &Value::Null).unwrap();
+                read(&Value::Null, a).unwrap();
+            }
         }
     }
 

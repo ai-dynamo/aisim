@@ -112,6 +112,10 @@ class FpmCacheGroup(_ProfileModel):
     block for one or two steps. vLLM's startup sizing in that mode counts
     ``2 + k + c`` blocks for a Mamba group, where ``c`` is the spec's
     ``num_prefill_checkpoint_blocks``. It counts 1 block for a ring group.
+    The peak bound of the cache budget (``request_peak_cache_bytes``) counts
+    those ``2 + k + c`` blocks for a prefix-cacheable state group of a
+    profile that records ``mamba_cache_mode: align``. ``blocks_per_request``
+    stays the steady count.
 
     Four optional fields describe the group beyond its geometry.
     ``prefix_cacheable`` says whether vLLM's manager for the group takes part in
@@ -190,7 +194,9 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
     This capacity already accounts for runtime graph and workspace reservations.
     It is not a non-KV memory limit and must not be rescaled to another setting.
     The three optional prefix-caching fields record the settings that the probe
-    ran with. Selection and sizing do not read them. Grouped prefix caching
+    ran with. Selection does not read them. Sizing reads only
+    ``mamba_cache_mode``, and only for the peak bound of a state group
+    (``request_peak_cache_bytes``). Grouped prefix caching
     needs ``enable_prefix_caching`` true and ``hash_block_size_tokens``, and
     replay then hashes prompts in blocks of ``hash_block_size_tokens``. Replay models grouped prefix
     caching for vLLM 0.31.0, 0.32.0 and 0.33.0 only. For a linear profile, the
@@ -209,6 +215,9 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
     # backend_version, which is a dataset label.
     # _prefix_caching owns the validation order and error text shared with Rust; export its nonblank rule too.
     runtime_framework_version: Annotated[str, Field(json_schema_extra={"minLength": 1, "pattern": r"\S"})] | None = None
+
+    # The initialized vLLM ModelConfig.dtype, separate from the KV cache and FMHA precision.
+    model_dtype: _Nonempty | None = None
 
     @model_validator(mode="after")
     def _prefix_caching(self) -> FpmRuntimeMemoryProfile:
@@ -230,6 +239,7 @@ class FpmRuntimeMemoryProfile(_ProfileModel):
             "mamba_cache_mode",
             "hash_block_size_tokens",
             "runtime_framework_version",
+            "model_dtype",
         ):
             if getattr(self, name) is None:
                 result.pop(name, None)

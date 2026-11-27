@@ -1602,6 +1602,22 @@ def _configuration(
                 runtime_memory._resolved_cache_dtype(worker["resolved_config"]),
                 release,
             )
+            # v0.33 retains the source allocation plan separately from the bound tensor views.
+            bound = {
+                tuple(a["layers"]): a
+                for a in worker["cache"].get("tensor_allocations", [])
+                if isinstance(a.get("layers"), list)
+            }
+            for raw in worker.get("raw_cache_config", {}).get("tensor_allocations", []):
+                if isinstance(raw.get("layers"), list):
+                    allocation = bound.get(tuple(raw["layers"]))
+                    if allocation is None or any(
+                        raw[field] != allocation.get(field)
+                        for field in ("offset", "layer_stride", "block_stride", "size")
+                        if field in raw
+                    ):
+                        raise ValueError("raw cache allocation contradicts the bound tensor allocation")
+
             geometry = [
                 {key: value for key, value in group.items() if key != "pool_id"} for group in worker["cache"]["groups"]
             ]
@@ -1691,7 +1707,10 @@ def _configuration(
             # differ from the dataset label of the launch. Records without hybrid evidence, of vLLM 0.27.0, 0.28.0
             # and 0.32.0, keep their bytes.
             **(
-                {"runtime_framework_version": bundle.manifest["runtime"]["version"]}
+                {
+                    "runtime_framework_version": bundle.manifest["runtime"]["version"],
+                    "model_dtype": canonical_settings["model_config"]["dtype"],
+                }
                 if prefix_caching[record_phase] is not None
                 else {}
             ),

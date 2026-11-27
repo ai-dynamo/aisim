@@ -87,9 +87,21 @@ def finalization_manifest(request: SupportRequest) -> dict[str, Any] | None:
         value = json.loads(runtime.provenance)
     except ValueError:
         return None
-    if not isinstance(value, dict) or value.get("schema_version") != _SCHEMA:
+    if not isinstance(value, dict):
         return None
-    if "observation_provenance" in value and value["observation_provenance"] != "source_references":
+    if value.get("schema_version") != _SCHEMA:
+        schema = value.get("schema_version")
+        if (isinstance(schema, str) and schema.startswith("aisimulate-onboarding-finalization/")) or (
+            isinstance(value.get("source_request_id"), str)
+            and isinstance(value.get("source_collection_plan_sha256"), str)
+            and isinstance(value.get("cell_observations"), list)
+        ):
+            raise ValueError("invalid indexed finalization schema")
+        return None
+    if "observation_provenance" in value and value["observation_provenance"] not in (
+        "source_references",
+        "source_references_v2",
+    ):
         raise ValueError("unsupported finalized observation provenance format")
     try:
         profile_provenance = json.loads(request.fpm_profile.provenance)
@@ -182,7 +194,11 @@ def verify_finalized_data(request: SupportRequest, root: Path) -> None:
 
 
 def _merge_resources(
-    observations: list[dict[str, Any]], manifest: dict[str, Any], *, source_references: bool = False
+    observations: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    *,
+    source_references: bool = False,
+    observation_format: str = "source_references_v2",
 ) -> dict[str, Any]:
     if not observations:
         raise ValueError("collection has no runtime memory observations")
@@ -191,6 +207,10 @@ def _merge_resources(
     runtime_geometry = None
     minimum = None
     summaries = []
+    if source_references and observation_format not in ("source_references", "source_references_v2"):
+        raise ValueError("unsupported finalized observation provenance format")
+    worker_digests = []
+    formal_cells = set()
     for observation in observations:
         resources = FpmResourceProfile.model_validate(observation)
         if resources.memory_source != "runtime" or resources.cache_layout != "grouped":
@@ -233,10 +253,50 @@ def _merge_resources(
         if source_references:
             # Raw records remain immutable collection artifacts. Reference their
             # exact bytes instead of copying every rank/layer into each candidate.
+            current = observation_format == "source_references_v2"
+            if current:
+                from .runtime import LEGACY_PROVENANCE_SCHEMA, _worker_observation_digest, _worker_observations
+
+                if evidence.get("source") == "vllm_initialized_cache":
+                    cell = evidence.get("cell_id")
+                    if not isinstance(cell, str) or not cell or cell in formal_cells:
+                        raise ValueError("missing or duplicate formal cell in grouped worker roster")
+                    formal_cells.add(cell)
+                # Formal observations can retain the original relative launch path.
+                # The verified probe archives the matching checkpoint beside its index.
+                digest = ((evidence.get("launch") or {}).get("model_config") or {}).get("sha256")
+                probe = manifest.get("runtime_probe") or {}
+                legacy_path = None
+                if probe.get("schema_version") == LEGACY_PROVENANCE_SCHEMA and probe.get("observations_index"):
+                    legacy_path = Path(probe["observations_index"]).with_name("model-config.json")
+                staged = next(
+                    (
+                        Path(item["path"])
+                        for item in probe.get("source_artifacts", [])
+                        if digest
+                        and item.get("sha256") == digest
+                        and (
+                            item.get("kind") == "model_config"
+                            or ("kind" not in item and Path(item["path"]) == legacy_path)
+                        )
+                    ),
+                    None,
+                )
+                evidence["worker_observations"] = _worker_observations(
+                    evidence,
+                    checkpoint=staged if staged is not None and staged.is_file() else None,
+                    kv_cache_bytes=resources.runtime_memory.kv_cache_bytes,
+                    cache_groups=observation["cache_groups"],
+                )
             evidence["artifacts"] = [
-                {key: value for key, value in artifact.items() if key != "evidence"}
+                {
+                    **{key: value for key, value in artifact.items() if key != "evidence"},
+                    **({"kind": artifact["evidence"]["kind"]} if current else {}),
+                }
                 for artifact in evidence["artifacts"]
             ]
+            if current:
+                worker_digests.append(_worker_observation_digest(evidence, evidence, manifest, cell=observation))
             summaries.append(
                 {
                     **observation,
@@ -245,7 +305,11 @@ def _merge_resources(
             )
     assert canonical is not None and minimum is not None
     if source_references:
-        manifest["observation_provenance"] = "source_references"
+        if worker_digests:
+            from aisim import _runtime
+
+            manifest["worker_observation_digests"] = _runtime.nixl_bound_cell_digests(worker_digests)
+        manifest["observation_provenance"] = observation_format
     manifest["cell_observations"] = summaries if source_references else observations
     manifest["capacity_policy"] = "minimum observed request-usable rank-local capacity across compatible cells"
     provenance = _canonical(manifest)
@@ -267,6 +331,7 @@ def _finalized_resources(
     manifest: dict[str, Any],
     *,
     source_references: bool = False,
+    observation_format: str = "source_references_v2",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The finalized resources in the source profile's cache layout, and the merged grouped measurements.
 
@@ -281,7 +346,9 @@ def _finalized_resources(
         # A source imported before the later cache group fields existed keeps them out of its finalized groups and of
         # the cell observations that its provenance records.
         observations = [as_saved_resources(probe["observed_resources"], item) for item in observations]
-    merged = _merge_resources(observations, manifest, source_references=source_references)
+    merged = _merge_resources(
+        observations, manifest, source_references=source_references, observation_format=observation_format
+    )
     if source.profile_deployment().resources.cache_layout != "linear" or probe is None:
         return merged, merged
     linear = linear_runtime_resources(merged)

@@ -1029,6 +1029,116 @@ def test_new_versions_observe_and_finalize_layer_strided_memory(tmp_path, monkey
     assert resolved["runtime_memory"]["kv_cache_bytes"] == 88 * 128
 
 
+def test_sparse_formal_finalization_still_binds_its_installed_version_and_rank_roster(tmp_path, monkeypatch):
+    from aisim import _runtime
+    from aisim.support.finalization import _merge_resources
+
+    cell = _evidence(tmp_path, monkeypatch, version="0.32.0", initialized=_initialized_layer_strided)
+    resources = _resolve(cell, tmp_path, expected_backend_version="0.32.0")
+    saved = {}
+    _merge_resources([resources], saved, source_references=True, observation_format="source_references_v2")
+    assert saved["observation_provenance"] == "source_references_v2"
+    assert len(saved["worker_observation_digests"]) == 1
+    memory = saved["cell_observations"][0]["runtime_memory"]
+    portable = json.loads(memory["provenance"])
+    assert all(
+        not row["backends"] and row["kv_cache_layout"] is None for row in portable.get("worker_observations", [])
+    )
+    assert portable["worker_observations"]
+    captured = (json.dumps(saved), None, "auto")
+    recorded = ("bfloat16", "0.32.0", None, 4)
+    assert _runtime.grouped_observation_requirement(captured, captured, recorded, recorded, 2) is None
+    wrong_width = ("bfloat16", "0.32.0", None, 2)
+    with pytest.raises(ValueError, match="worker roster"):
+        _runtime.grouped_observation_requirement(captured, captured, wrong_width, wrong_width, 2)
+
+    legacy = {}
+    _merge_resources([resources], legacy, source_references=True, observation_format="source_references")
+    memory_copy = legacy["cell_observations"][0]["runtime_memory"]
+    archived = json.loads(memory_copy["provenance"])
+    runtime_model = archived["runtime_settings"]["model_config"]
+    assert runtime_model["model"] == archived["resolved_config"]["model_config"]["model"]
+    del runtime_model["model"]
+    other_model = (json.dumps({"runtime_settings": {"model_config": {"model": "different"}}}), None, "auto")
+    memory_copy["provenance"] = json.dumps(archived)
+    assert "matching model" in _runtime.grouped_observation_requirement((json.dumps(legacy), None, "auto"), other_model)
+    runtime_model["model"] = "different"
+    memory_copy["provenance"] = json.dumps(archived)
+    with pytest.raises(ValueError, match="model conflicts"):
+        _runtime.observed_model_dtype(json.dumps(legacy))
+
+    # A formal collection may contain a separate measurement for each selected cell.
+    second = json.loads(json.dumps(resources))
+    other = json.loads(second["runtime_memory"]["provenance"])
+    other["cell_id"] += "-second"
+    second["runtime_memory"]["provenance"] = json.dumps(other)
+    multi = {}
+    _merge_resources([resources, second], multi, source_references=True)
+    assert _runtime.observed_model_dtype(json.dumps(multi))
+    for i in (0, 1):
+        damaged = json.loads(json.dumps(multi))
+        damaged["cell_observations"].pop(i)
+        for digest in multi["worker_observation_digests"]:
+            damaged["worker_observation_digests"] = [digest]
+            with pytest.raises(ValueError, match="worker roster"):
+                _runtime.observed_model_dtype(json.dumps(damaged))
+    with pytest.raises(ValueError, match="worker roster"):
+        _merge_resources([resources, resources], {}, source_references=True)
+
+    portable["artifacts"].reverse()
+    memory["provenance"] = json.dumps(portable)
+    assert _runtime.observed_model_dtype(json.dumps(saved))
+    for key in ("kind", "path", "sha256"):
+        edited = json.loads(json.dumps(portable))
+        worker = next(ref for ref in edited["artifacts"] if ref["kind"] == "worker")
+        scheduler = next(ref for ref in edited["artifacts"] if ref["kind"] == "scheduler")
+        worker[key], scheduler[key] = scheduler[key], worker[key]
+        memory["provenance"] = json.dumps(edited)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(saved))
+    for key in ("backend_version", "rank_capacities", "artifacts"):
+        edited = json.loads(json.dumps(portable))
+        if key == "backend_version":
+            edited[key] = "0.33.0"
+        else:
+            edited[key].pop()
+        memory["provenance"] = json.dumps(edited)
+        with pytest.raises(ValueError, match="worker roster"):
+            _runtime.observed_model_dtype(json.dumps(saved))
+
+
+def test_grouped_pair_checks_the_full_observed_version_only_for_the_prefix_enabled_role(tmp_path, monkeypatch):
+    from aisim.config.engine import GroupedObservationError, grouped_pd_pair_requirement
+    from aisim_core.fpm_profile import FpmDeploymentProfile
+
+    cell = _evidence(tmp_path, monkeypatch, version="0.33.0", initialized=_initialized_layer_strided)
+    resources = _resolve(cell, tmp_path, expected_backend_version="0.33.0")
+
+    def deployment(version):
+        worker = {"kind": "worker", "runtime": {"version": version}}
+        return FpmDeploymentProfile.model_validate(
+            {
+                **_profile()["deployments"][0],
+                "backend_version": "0.33.0",
+                "kv_cache_dtype": "bfloat16",
+                "resources": {
+                    **resources,
+                    "runtime_memory": {
+                        **resources["runtime_memory"],
+                        "runtime_framework_version": None,
+                        "provenance": json.dumps({"artifacts": [{"evidence": worker}]}),
+                    },
+                },
+            }
+        )
+
+    measured, unknown = deployment("0.33.0+cu130"), deployment(None)
+    for p, d, on in [(measured, unknown, (True, False)), (unknown, measured, (False, True))]:
+        with pytest.raises(GroupedObservationError, match=r"observed vllm_version .*0.33.0\+cu130"):
+            grouped_pd_pair_requirement(p, d, prefix_caching=on)
+        assert grouped_pd_pair_requirement(p, d, prefix_caching=on[::-1]) is None
+
+
 @pytest.mark.parametrize("backend", ["uva", "prefetch"])
 def test_active_weight_offload_is_observed_and_cannot_resolve(tmp_path, monkeypatch, backend):
     original = _initialized

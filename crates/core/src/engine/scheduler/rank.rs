@@ -357,7 +357,11 @@ impl RankEngine for SchedulerRank {
             self.handoff_requests
                 .retain(|_, tracked_request| tracked_request != request_id);
         }
-        map_command_effects(effects, self.metrics(), suppressed_pending_output)
+        map_command_effects(
+            effects,
+            self.metrics_after_destination_retry(),
+            suppressed_pending_output,
+        )
     }
 
     fn is_ready(&self) -> bool {
@@ -493,7 +497,7 @@ impl RankEngine for SchedulerRank {
         // a later live adapter latches the last non-empty observation.
         let sglang_cache_hit_tokens = pending.effects.metrics.sglang_cache_hit_tokens;
         let sglang_cache_total_tokens = pending.effects.metrics.sglang_cache_total_tokens;
-        pending.effects.metrics = self.metrics();
+        pending.effects.metrics = self.metrics_after_destination_retry();
         pending.effects.metrics.sglang_cache_hit_tokens = sglang_cache_hit_tokens;
         pending.effects.metrics.sglang_cache_total_tokens = sglang_cache_total_tokens;
         // SGLang passes can include preselection write-back waits or end before
@@ -549,7 +553,7 @@ impl RankEngine for SchedulerRank {
         Ok(Some(PassCompletionEffects {
             lifecycle_events,
             kv_events,
-            metrics: self.metrics(),
+            metrics: self.metrics_after_destination_retry(),
             forward_pass_metrics: ForwardPassMetrics {
                 duration_ms: (telemetry_end_ms - started_at_ms).max(0.0),
                 ..Default::default()
@@ -619,6 +623,14 @@ enum HandoffTrackingUpdate {
 }
 
 impl SchedulerRank {
+    fn metrics_after_destination_retry(&mut self) -> Metrics {
+        let mut metrics = self.metrics();
+        if let EngineCore::Vllm(core) = &mut self.core {
+            metrics.g1_destination_lookup = core.destination_lookup.take();
+        }
+        metrics
+    }
+
     fn apply_handoff_tracking_update(&mut self, update: HandoffTrackingUpdate) {
         match update {
             HandoffTrackingUpdate::None => {}
@@ -843,10 +855,12 @@ fn map_lifecycle(event: CoreLifecycle) -> LifecycleEvent {
             handoff_id,
             request_id,
             transferable_prompt_tokens,
+            full_local_hit,
         } => LifecycleEvent::DestinationReserved {
             handoff_id,
             request_id,
             transferable_prompt_tokens,
+            full_local_hit,
         },
         CoreLifecycle::TtftMilestone {
             request_id,
@@ -874,6 +888,7 @@ fn map_metrics(metrics: MockerMetrics) -> Metrics {
         running_requests: metrics.running_requests,
         waiting_requests: metrics.waiting_requests,
         preemptions_total: metrics.vllm_preemptions_total,
+        g1_destination_lookup: None,
         sglang_cache_hit_tokens: metrics.sglang_cache_hit_tokens,
         sglang_cache_total_tokens: metrics.sglang_cache_total_tokens,
     }

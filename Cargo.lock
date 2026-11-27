@@ -44,6 +44,7 @@ dependencies = [
  "fixedbitset",
  "flate2",
  "indicatif",
+ "libc",
  "log",
  "parquet",
  "pep440_rs",

@@ -922,9 +922,9 @@ def test_grouped_profile_memory_keeps_byte_budget_and_context_bound(grouped_prof
     assert result["total_kv_size_tokens"] is None
     assert result["kv_size_per_token_bytes"] is None
     assert result["tolerance_adjusted"]["total_kv_size_tokens"] is None
-    # Full: four pages * 32B; local: <=four aligned pages *16B;
-    # conv: <=six pages spanning retained history plus the 16-token chunk *8B.
-    assert result["request_peak_cache_bytes"] == 240
+    # Full: four pages * 32B. A window group counts vLLM's startup count with two batches of 16 tokens:
+    # local cdiv(min(31 + 32, 64), 16) + 1 = 5 pages * 16B; conv cdiv(min(3 + 32, 64), 4) + 1 = 10 pages * 8B.
+    assert result["request_peak_cache_bytes"] == 288
     assert result["cache_groups"] == grouped_profile["deployments"][0]["resources"]["cache_groups"]
     assert result["memory_breakdown"]["cuda_graph_reserved_bytes"] == 20
     with pytest.raises(ValueError, match="context_length"):
@@ -1299,11 +1299,11 @@ def test_runtime_linear_memory_uses_observation_and_canonical_budget(runtime_pro
 
 
 def test_runtime_grouped_memory_keeps_layout_and_transient_pages(grouped_profile, runtime_profile, profile_memory):
-    # Reuse the hand-derived 240-byte per-request grouped footprint above.
+    # Reuse the hand-derived 288-byte per-request grouped footprint above.
     runtime_profile["deployments"][0]["resources"]["max_num_tokens"] = 16
     result = profile_memory(max_num_tokens=16, context_length=64)
     assert result["total_kv_size_bytes"] == 600
-    assert result["request_peak_cache_bytes"] == 240
+    assert result["request_peak_cache_bytes"] == 288
     assert result["memory_breakdown"] is None
     assert result["total_kv_size_tokens"] is None
     assert result["cache_groups"] == grouped_profile["deployments"][0]["resources"]["cache_groups"]
@@ -1726,7 +1726,7 @@ def test_grouped_budget_canonical_identity_and_bounds(grouped_profile):
     }
     estimate = RustForwardPassPerfModel.estimate_cache_budget(config, budget)
     assert estimate["total_kv_size_bytes"] == 600
-    assert estimate["request_peak_cache_bytes"] == 192  # 4*32 + 3*16 + 2*8.
+    assert estimate["request_peak_cache_bytes"] == 216  # 4*32 + 4*16 + 3*8.
     config["system"] = "another_gpu"
     with pytest.raises(ValueError, match="matching FPM deployment"):
         RustForwardPassPerfModel.estimate_cache_budget(config, budget)

@@ -35,6 +35,7 @@ mod learned;
 mod learned_online;
 mod metrics;
 mod model;
+mod nixl;
 mod options;
 mod quality_gate;
 mod regression;
@@ -77,6 +78,7 @@ pub use model::{
     ForwardPassStoreNotReadyReason, ForwardPassStoreReadiness, ForwardPassWorkerType,
     StateSnapshotOptions,
 };
+pub(crate) use nixl::NixlIdentity;
 pub use options::{CorrectionMode, ForwardPassPerfOptions};
 pub use regression::ForwardPassSplineDiagnostics;
 pub use resources::{

@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // SPDX-License-Identifier: Apache-2.0
 
-// Modified block-mode semantics derived from vLLM v0.31.0 and v0.32.0:
+// Modified block-mode semantics derived from vLLM v0.31.0, v0.32.0 and v0.33.0:
 // https://github.com/vllm-project/vllm/tree/db9527a46873454610df6dbedf79a36d6bf1a7f6
 // https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
+// https://github.com/vllm-project/vllm/tree/4ba787ec9959e566d3b587a796dff07673324da5
 // Exact upstream source paths and Apache-2.0 attribution: THIRD_PARTY_NOTICES.md.
 
 //! Request-owned cache groups sharing one rank-local physical budget. Byte
@@ -17,6 +18,7 @@ use crate::engine::cache::vllm_block_pool::{
 };
 use crate::engine::common::hashing::SequenceHash;
 use crate::perfmodel::{FpmCacheGroup, FpmCacheKind};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +32,11 @@ pub(crate) struct GroupedLease {
     bytes: u64,
     /// The copies of every group in block mode.
     pub(crate) block_lease: Option<GroupedBlockLease>,
+    /// What a destination load still needs for its whole prompt, as vLLM's
+    /// `_request_remaining_blocks` counts it: blocks in block mode, bytes in
+    /// byte mode. 0 once its first pass has allocated, and on every other
+    /// lease.
+    pub(crate) first_pass_need: u64,
 }
 
 impl GroupedLease {
@@ -41,7 +48,9 @@ impl GroupedLease {
     }
 
     /// Adds the blocks each group holds for a forward from `computed` to
-    /// `target` tokens, or `None` when the bytes overflow.
+    /// `target` tokens, or `None` when the bytes overflow. A window starts
+    /// from `computed`, which `GroupedKvPool::allocate` gets as the processed
+    /// count.
     fn charge(mut self, groups: &[FpmCacheGroup], computed: u64, target: u64) -> Option<Self> {
         for group in groups {
             // A forward must retain the history needed by its first query,
@@ -75,16 +84,15 @@ pub(crate) struct GroupedBlockLease {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GroupLease {
-    /// `copies[i]` holds logical block `i`. It is `None` for an expired
-    /// window block or a null block below a sliding-window hit. Such blocks
-    /// lie below `first_live`. `finalized` counts the blocks that the request
+    /// `copies[i]` holds logical block `first_live + i`. Skipped window
+    /// blocks occupy no storage. `finalized` counts the blocks that the request
     /// had completed at its last finalization. The next finalization visits
     /// only the full-attention blocks above it, as vLLM's `num_cached_block`
     /// does, and only the sliding-window retention positions above
     /// `finalized * block_size`. The window run that it publishes before such
     /// a position can include blocks below `finalized`.
     Attention {
-        copies: Vec<Option<BlockCopyId>>,
+        copies: VecDeque<BlockCopyId>,
         first_live: usize,
         finalized: usize,
     },
@@ -98,14 +106,7 @@ pub(crate) enum GroupLease {
 impl GroupLease {
     pub(super) fn live_copies(&self) -> usize {
         match self {
-            // The `None` copies lie exactly below `first_live`, so a count per
-            // step does not scan the whole context.
-            Self::Attention {
-                copies, first_live, ..
-            } => {
-                debug_assert_eq!(copies.iter().flatten().count(), copies.len() - first_live);
-                copies.len() - first_live
-            }
+            Self::Attention { copies, .. } => copies.len(),
             Self::State(state) => state.live_copies(),
             Self::Ring { copy } => usize::from(copy.is_some()),
         }
@@ -120,6 +121,10 @@ pub(crate) struct GroupedBlockPool {
     /// Unique among the pools of the process, so that a residency stamp of
     /// one pool never matches another pool.
     id: u64,
+    /// See `GroupedKvPool::retry_epoch`.
+    retry_epoch: u64,
+    #[cfg(test)]
+    pub(super) key_probes: std::cell::Cell<usize>,
     /// The most active blocks seen since the last reset, for tests that
     /// observe a step's peak after the step.
     #[cfg(test)]
@@ -155,6 +160,8 @@ impl GroupedBlockPool {
     }
 
     pub(crate) fn key_hit(&self, group: u16, hash: SequenceHash) -> Option<PrefixHit> {
+        #[cfg(test)]
+        self.key_probes.set(self.key_probes.get() + 1);
         self.pool.key_hit(CacheKey::Grouped { group, hash })
     }
 
@@ -191,7 +198,9 @@ impl GroupedBlockPool {
             matches!(key, CacheKey::Grouped { .. }),
             "a grouped pool caches grouped keys only"
         );
-        self.pool.cache_private_key(id, key)
+        let visible = self.pool.cache_private_key(id, key);
+        self.retry_epoch += u64::from(visible);
+        visible
     }
 
     /// [`Self::cache`] for a key that can lie inside a block of its group, at
@@ -202,7 +211,23 @@ impl GroupedBlockPool {
         key: CacheKey,
         at: Option<KeyInBlock>,
     ) -> bool {
-        self.pool.cache_private_key_at(id, key, at)
+        let visible = self.pool.cache_private_key_at(id, key, at);
+        self.retry_epoch += u64::from(visible);
+        visible
+    }
+
+    /// Give the cached block `id` one more key of its group, at `at` when the
+    /// key lies inside a block of the group. Nothing changes when the block
+    /// holds `key`. Returns whether `key` became visible.
+    pub(crate) fn cache_alias(
+        &mut self,
+        id: BlockCopyId,
+        key: CacheKey,
+        at: Option<KeyInBlock>,
+    ) -> bool {
+        let visible = self.pool.cache_grouped_alias(id, key, at);
+        self.retry_epoch += u64::from(visible);
+        visible
     }
 
     /// See [`VllmBlockPool::grouped_keys_in_block`].
@@ -241,6 +266,7 @@ impl GroupedBlockPool {
 
     pub(crate) fn release(&mut self, id: BlockCopyId) {
         self.pool.release(id);
+        self.retry_epoch += 1;
     }
 
     /// Whether `id` is a private block, which no key has published yet.
@@ -271,9 +297,23 @@ impl GroupedBlockPool {
         self.pool.num_inactive()
     }
 
-    fn bytes(&self, blocks: usize) -> u64 {
+    pub(crate) fn bytes(&self, blocks: usize) -> u64 {
         blocks as u64 * self.page_size_bytes
     }
+}
+
+/// The bytes in use and the active blocks of a grouped pool, the cached
+/// blocks that no request holds, and the count and the order-free
+/// fingerprint of the visible keys. In byte mode the groups can differ in
+/// page size, so the bytes in use can change while the active blocks stay
+/// equal. In block mode the bytes in use follow the active blocks. Byte mode
+/// caches nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GroupedPoolState {
+    used_bytes: u64,
+    active_blocks: usize,
+    cached_blocks: usize,
+    visible_keys: (usize, u64),
 }
 
 /// Byte mode backs `required_bytes`, `fixed_request_bytes`, `allocate` and
@@ -296,6 +336,8 @@ pub(crate) struct GroupedKvPool {
     used_bytes: u64,
     active_blocks: usize,
     mode: GroupedMode,
+    /// The byte-mode count of `retry_epoch`.
+    retry_epoch: u64,
 }
 
 impl GroupedKvPool {
@@ -313,6 +355,7 @@ impl GroupedKvPool {
             used_bytes: 0,
             active_blocks: 0,
             mode: GroupedMode::Bytes,
+            retry_epoch: 0,
         }
     }
 
@@ -339,8 +382,11 @@ impl GroupedKvPool {
                 pool,
                 page_size_bytes,
                 id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
+                retry_epoch: 0,
                 #[cfg(test)]
                 peak_active_blocks: std::cell::Cell::new(0),
+                #[cfg(test)]
+                key_probes: std::cell::Cell::new(0),
             }),
             ..Self::new(groups, capacity_bytes)
         }
@@ -402,6 +448,11 @@ impl GroupedKvPool {
 
     /// Reserve every group atomically. Expired blocks become reusable in this
     /// transition, but failed attempts leave both the lease and pool unchanged.
+    /// `computed_before` is the count that a window starts from: the caller
+    /// passes the processed count, `computed - num_in_flight_tokens` (v0.31
+    /// `mgr:549-556`, v0.32 `mgr:552-559`, v0.33 `mgr:561-568`). The lease
+    /// then holds the window of the step in flight and every token up to
+    /// `computed_after`.
     pub(crate) fn allocate(
         &mut self,
         lease: &mut Option<GroupedLease>,
@@ -420,6 +471,8 @@ impl GroupedKvPool {
         self.used_bytes = other_bytes + projected.bytes;
         self.active_blocks = self.active_blocks - lease.as_ref().map_or(0, GroupedLease::blocks)
             + projected.blocks();
+        // Window blocks that leave the window free bytes.
+        self.retry_epoch += u64::from(projected.bytes < previous_bytes);
         *lease = Some(projected);
         true
     }
@@ -429,6 +482,27 @@ impl GroupedKvPool {
         if let Some(lease) = lease.take() {
             self.used_bytes -= lease.bytes;
             self.active_blocks -= lease.blocks();
+            self.retry_epoch += 1;
+        }
+    }
+
+    /// Grows whenever the pool releases a block, a request's held bytes
+    /// fall, the pool publishes a key or, in block mode, it evicts the last
+    /// copy of a key. These are the pool's changes that can let a waiting
+    /// reservation succeed. A pass frees blocks without completing a
+    /// request, and an activation publishes blocks that it keeps, so the
+    /// active count alone misses both. An eviction can change the hit of a
+    /// waiting load and lower the blocks that its tests count, so block mode
+    /// adds the generation of the resident keys. In byte mode, a request
+    /// whose bytes grow can still free a window page, with no move of this
+    /// count. The scheduler also retries a waiting reservation when the
+    /// local prefills or the loads in flight need less.
+    pub(crate) fn retry_epoch(&self) -> u64 {
+        match &self.mode {
+            GroupedMode::Bytes => self.retry_epoch,
+            GroupedMode::Blocks(blocks) => {
+                blocks.retry_epoch + blocks.pool.grouped_key_generation()
+            }
         }
     }
 
@@ -453,12 +527,34 @@ impl GroupedKvPool {
         }
     }
 
+    pub(crate) fn state(&self) -> GroupedPoolState {
+        let used_bytes = self.used_bytes();
+        match &self.mode {
+            GroupedMode::Bytes => GroupedPoolState {
+                used_bytes,
+                active_blocks: self.active_blocks,
+                cached_blocks: 0,
+                visible_keys: (0, 0),
+            },
+            GroupedMode::Blocks(blocks) => GroupedPoolState {
+                used_bytes,
+                active_blocks: blocks.active_blocks(),
+                cached_blocks: blocks.inactive_cached_blocks(),
+                visible_keys: blocks.pool.grouped_keys(),
+            },
+        }
+    }
+
     /// Bytes of cached blocks that no request holds. Byte mode caches nothing.
     pub(crate) fn cached_bytes(&self) -> u64 {
         match &self.mode {
             GroupedMode::Bytes => 0,
             GroupedMode::Blocks(blocks) => blocks.bytes(blocks.inactive_cached_blocks()),
         }
+    }
+
+    pub(crate) fn groups(&self) -> &[FpmCacheGroup] {
+        &self.groups
     }
 
     pub(crate) fn block_pool(&self) -> Option<&GroupedBlockPool> {
@@ -615,6 +711,45 @@ mod tests {
     }
 
     #[test]
+    fn byte_pool_holds_the_window_of_the_step_in_flight() {
+        // The caller passes the processed count as the window start. With
+        // the step before in flight, that is its computed count before it
+        // (v0.33 mgr:561-568). Window 4, block 4, page 8: the window keeps
+        // the blocks from `(processed - 3) / 4` (v0.33 single:1148-1183,
+        // :682-720, where `extra_retained_tokens` is 0 without speculative
+        // decoding) to `cdiv(target, 4)`.
+        let mut pool = GroupedKvPool::new(
+            vec![FpmCacheGroup {
+                name: "window".into(),
+                kind: FpmCacheKind::Attention,
+                num_layers: 1,
+                block_size_tokens: 4,
+                page_size_bytes: 8,
+                sliding_window: Some(4),
+                blocks_per_request: None,
+                prefix_cacheable: None,
+                transfer_bytes_per_block: None,
+                prefill_checkpoint_blocks: None,
+                prefill_checkpoint_alignment: None,
+            }],
+            48,
+        );
+        let mut lease = None;
+        assert!(pool.allocate(&mut lease, 0, 8)); // blocks 0..2
+        assert_eq!(pool.used_bytes(), 16);
+        assert!(pool.allocate(&mut lease, 0, 16)); // step 1 in flight: 0..4
+        assert_eq!(pool.used_bytes(), 32);
+        assert!(pool.allocate(&mut lease, 8, 24)); // 5 / 4 = 1: 1..6
+        assert_eq!(pool.used_bytes(), 40);
+        assert!(pool.allocate(&mut lease, 16, 32)); // 13 / 4 = 3: 3..8
+        assert_eq!(pool.used_bytes(), 40);
+        assert!(pool.allocate(&mut lease, 24, 33)); // 21 / 4 = 5: 5..9
+        assert_eq!(pool.used_bytes(), 32);
+        assert!(pool.allocate(&mut lease, 32, 34)); // 29 / 4 = 7: 7..9
+        assert_eq!(pool.used_bytes(), 16);
+    }
+
+    #[test]
     fn block_mode_pins_hits_and_evicts_cached_blocks_in_lru_order() {
         let (h0, h1) = (10, 11);
         let hits = [
@@ -736,6 +871,103 @@ mod tests {
     }
 
     #[test]
+    fn block_mode_state_follows_the_set_of_visible_keys() {
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        // Publish `hashes` on fresh blocks, in order, and free them.
+        let publish = |pool: &mut GroupedKvPool, hashes: &[u64]| {
+            let blocks = pool.block_pool_mut().unwrap();
+            let mut reservation = blocks.reserve(&[], hashes.len()).unwrap();
+            for &hash in hashes {
+                let id = blocks.take_private(&mut reservation);
+                assert!(blocks.cache(id, key(hash)));
+                blocks.release(id);
+            }
+        };
+        let mut pool = GroupedKvPool::with_prefix_cache(three_groups(), 32, 8);
+        publish(&mut pool, &[10, 11]);
+        let first = pool.state();
+        // The order in which the keys became visible does not count.
+        let mut reversed = GroupedKvPool::with_prefix_cache(three_groups(), 32, 8);
+        publish(&mut reversed, &[11, 10]);
+        assert_eq!(reversed.state(), first);
+        // Three fresh blocks evict the older cached block, key 10. Publishing
+        // key 10 again restores the same set, the same counts and the same
+        // state.
+        let blocks = pool.block_pool_mut().unwrap();
+        let reservation = blocks.reserve(&[], 3).unwrap();
+        assert!(blocks.key_hit(0, 10).is_none());
+        blocks.cancel(reservation);
+        assert_ne!(pool.state(), first);
+        publish(&mut pool, &[10]);
+        assert_eq!(pool.state(), first);
+        // Another key in the place of key 11 keeps both counts but not the
+        // state.
+        let mut other = GroupedKvPool::with_prefix_cache(three_groups(), 32, 8);
+        publish(&mut other, &[10, 12]);
+        assert_ne!(other.state(), first);
+    }
+
+    #[test]
+    fn block_mode_publish_inside_a_block_moves_the_retry_epoch_as_any_publish() {
+        // A waiting load is tried again when a key becomes visible, also a key
+        // inside a block, such as a state at the prompt's partial tail.
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        let mut pool = GroupedKvPool::with_prefix_cache(three_groups(), 32, 8);
+        let blocks = pool.block_pool_mut().unwrap();
+        let mut reservation = blocks.reserve(&[], 2).unwrap();
+        let (at_end, inside) = (
+            blocks.take_private(&mut reservation),
+            blocks.take_private(&mut reservation),
+        );
+        blocks.cancel(reservation);
+        let start = pool.retry_epoch();
+        assert!(pool.block_pool_mut().unwrap().cache(at_end, key(10)));
+        let after_end = pool.retry_epoch();
+        let at = Some(KeyInBlock {
+            first: 7,
+            offset: 4,
+        });
+        assert!(pool.block_pool_mut().unwrap().cache_at(inside, key(11), at));
+        assert!(after_end > start);
+        assert_eq!(pool.retry_epoch() - after_end, after_end - start);
+    }
+
+    #[test]
+    fn block_mode_key_added_to_a_cached_block_moves_the_retry_epoch_as_any_publish() {
+        // A waiting load is tried again when a key becomes visible, also a
+        // key that a cached block gets beside its first key.
+        let key = |hash| CacheKey::Grouped { group: 0, hash };
+        let mut pool = GroupedKvPool::with_prefix_cache(three_groups(), 32, 8);
+        let blocks = pool.block_pool_mut().unwrap();
+        let mut reservation = blocks.reserve(&[], 1).unwrap();
+        let id = blocks.take_private(&mut reservation);
+        blocks.cancel(reservation);
+        let start = pool.retry_epoch();
+        assert!(pool.block_pool_mut().unwrap().cache(id, key(10)));
+        let after_first = pool.retry_epoch();
+        let at = Some(KeyInBlock {
+            first: 7,
+            offset: 4,
+        });
+        assert!(pool.block_pool_mut().unwrap().cache_alias(id, key(11), at));
+        assert!(after_first > start);
+        // A key that becomes visible moves the count by the same amount,
+        // whichever way it was published.
+        assert_eq!(pool.retry_epoch() - after_first, after_first - start);
+        // A key that the block holds changes nothing.
+        let after_alias = pool.retry_epoch();
+        assert!(!pool.block_pool_mut().unwrap().cache_alias(id, key(11), at));
+        assert!(
+            !pool
+                .block_pool_mut()
+                .unwrap()
+                .cache_alias(id, key(10), None)
+        );
+        assert_eq!(pool.retry_epoch(), after_alias);
+        assert!(pool.block_pool().unwrap().key_hit(0, 11).is_some());
+    }
+
+    #[test]
     fn block_lease_counts_the_live_copies_of_every_group() {
         let mut pool = GroupedKvPool::with_prefix_cache(three_groups(), 64, 8);
         let blocks = pool.block_pool_mut().unwrap();
@@ -748,7 +980,7 @@ mod tests {
                 groups: vec![
                     // A window group whose block 0 has expired.
                     GroupLease::Attention {
-                        copies: vec![None, Some(ids[0]), Some(ids[1])],
+                        copies: [ids[0], ids[1]].into(),
                         first_live: 1,
                         finalized: 0,
                     },
@@ -756,12 +988,15 @@ mod tests {
                     GroupLease::State(GroupStateLease {
                         blocks: super::super::state_cache_manager::StateLease {
                             working: Some(ids[3]),
-                            previous: Some(ids[5]),
+                            previous: vec![(
+                                ids[5],
+                                super::super::state_cache_manager::PreviousRelease::Above(4),
+                            )],
                             checkpoint: Some(ids[7]),
                             ..Default::default()
                         },
                         hit: Some((ids[4], 1)),
-                        copy: Some(ids[6]),
+                        copy: Some((ids[6], 8)),
                         checkpoint_position: 8,
                         ..Default::default()
                     }),

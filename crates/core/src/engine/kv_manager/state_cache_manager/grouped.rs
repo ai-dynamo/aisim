@@ -10,7 +10,9 @@
 //! - <https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py>
 //! - <https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py>
 
-use super::{StateAlignRules, StateCacheManager, StateLease, StatePlan, StateWrite};
+use super::{
+    PreviousRelease, StateAlignRules, StateCacheManager, StateLease, StatePlan, StateWrite,
+};
 use crate::engine::cache::vllm_block_pool::{
     BlockCopyId, BlockReservation, CacheKey, KeyInBlock, VllmBlockPool,
 };
@@ -24,7 +26,7 @@ pub(crate) struct GroupStateLease {
     /// its block. A partial hit transfers the reference to the pass.
     pub(in crate::engine::kv_manager) hit: Option<(BlockCopyId, usize)>,
     /// Separate destination when a partial-hit copy is below the new working block.
-    pub(in crate::engine::kv_manager) copy: Option<BlockCopyId>,
+    pub(in crate::engine::kv_manager) copy: Option<(BlockCopyId, usize)>,
     /// Valid while the checkpoint slot is occupied.
     pub(in crate::engine::kv_manager) checkpoint_position: usize,
     /// Replacing a published partial block hides its key for this pass.
@@ -34,7 +36,7 @@ pub(crate) struct GroupStateLease {
 impl GroupStateLease {
     pub(in crate::engine::kv_manager) fn live_copies(&self) -> usize {
         usize::from(self.blocks.working.is_some())
-            + usize::from(self.blocks.previous.is_some())
+            + self.blocks.previous.len()
             + usize::from(self.blocks.checkpoint.is_some())
             + usize::from(self.hit.is_some())
             + usize::from(self.copy.is_some())
@@ -57,13 +59,6 @@ impl GroupStateLease {
         self.blocks.working
     }
 
-    #[cfg(test)]
-    pub(in crate::engine::kv_manager) fn previous(&self) -> Option<(BlockCopyId, u64)> {
-        self.blocks
-            .previous
-            .map(|id| (id, self.blocks.previous_step))
-    }
-
     pub(in crate::engine::kv_manager) fn checkpoint(&self) -> Option<(BlockCopyId, usize)> {
         self.blocks
             .checkpoint
@@ -74,9 +69,9 @@ impl GroupStateLease {
         // A grouped manager frees in block-table order (tail first).
         releases.extend(self.blocks.working.take());
         releases.extend(self.blocks.checkpoint.take());
-        releases.extend(self.blocks.previous.take());
+        releases.extend(self.blocks.previous.drain(..).rev().map(|(id, _)| id));
         releases.extend(self.hit.take().map(|(id, _)| id));
-        releases.extend(self.copy.take());
+        releases.extend(self.copy.take().map(|(id, _)| id));
         self.blocks.working_cached = false;
         self.partial_hash = None;
     }
@@ -97,16 +92,47 @@ impl StateGroup {
     pub(in crate::engine::kv_manager) fn first_allocation_blocks(
         self,
         pool: &VllmBlockPool,
-        hit: Option<CacheKey>,
+        hit: Option<(CacheKey, usize)>,
+        local_hit: usize,
         computed: usize,
         target: usize,
         prefill_end: usize,
     ) -> usize {
-        let inactive = hit.is_some_and(|key| pool.key_hit(key).is_some_and(|hit| !hit.is_active));
+        let inactive =
+            hit.is_some_and(|(key, _)| pool.key_hit(key).is_some_and(|hit| !hit.is_active));
+        // A destination counts this group's own hit even when the load drops it.
+        // The common local hit controls the partial copy, and the loaded tokens
+        // count as computed for checkpoint allocation.
+        let covered = hit.map_or(0, |(_, own)| own);
         usize::from(inactive)
             + self
-                .plan_chunk(None, hit.is_some(), computed, target, prefill_end)
+                .plan_chunk(
+                    None,
+                    hit.map(|_| local_hit),
+                    covered,
+                    computed,
+                    target,
+                    prefill_end,
+                )
                 .fresh_states()
+    }
+
+    pub(in crate::engine::kv_manager) fn remaining_blocks(
+        self,
+        lease: &GroupStateLease,
+        computed: usize,
+        tokens: usize,
+        prompt: usize,
+    ) -> usize {
+        let new = tokens
+            .div_ceil(self.block)
+            .saturating_sub(computed.div_ceil(self.block));
+        let checkpoint = new >= 2
+            && self
+                .align
+                .checkpoint(computed, tokens, prompt, tokens)
+                .is_some();
+        new.min(1) + usize::from(checkpoint) + usize::from(lease.partial_hash.is_some())
     }
 
     pub(in crate::engine::kv_manager) fn pin(
@@ -118,27 +144,53 @@ impl StateGroup {
         lease.hit = Some((id, tokens.div_ceil(self.block) - 1));
     }
 
-    /// Release in main's aggregate eviction order: internal checkpoint,
-    /// separate copy destination, completed boundary hit, previous working block.
+    /// Aggregated replay retires its previous working block by scheduler step.
+    /// P/D frees skipped state on the processed count, newest previous block
+    /// first (v0.33 single_type_kv_cache_manager.py:1608-1657).
     pub(in crate::engine::kv_manager) fn release_before_allocation(
         self,
         lease: &mut GroupStateLease,
         first: bool,
         computed: usize,
-        step: u64,
+        processed: usize,
+        aggregate_step: Option<u64>,
         releases: &mut Vec<BlockCopyId>,
     ) {
-        releases.extend(lease.blocks.checkpoint.take());
-        if !first {
-            releases.extend(lease.copy.take());
+        let boundary = if aggregate_step.is_some() {
+            computed
+        } else {
+            processed
+        };
+        if aggregate_step.is_some() || processed > lease.checkpoint_position {
+            releases.extend(lease.blocks.checkpoint.take());
+        }
+        if aggregate_step.is_none() {
+            for i in (0..lease.blocks.previous.len()).rev() {
+                if matches!(lease.blocks.previous[i].1, PreviousRelease::Above(pos) if processed > pos)
+                {
+                    releases.push(lease.blocks.previous.remove(i).0);
+                }
+            }
+        }
+        if let Some((id, end)) = lease.copy
+            && if aggregate_step.is_some() {
+                !first
+            } else {
+                processed > end
+            }
+        {
+            releases.push(id);
+            lease.copy = None;
         }
         if let Some((id, index)) = lease.hit
-            && computed.div_ceil(self.block).saturating_sub(1) > index
+            && boundary.div_ceil(self.block).saturating_sub(1) > index
         {
             releases.push(id);
             lease.hit = None;
         }
-        lease.blocks.release_previous(step, |id| releases.push(id));
+        if let Some(step) = aggregate_step {
+            lease.blocks.release_previous(step, |id| releases.push(id));
+        }
     }
 
     pub(in crate::engine::kv_manager) fn plan(
@@ -151,7 +203,8 @@ impl StateGroup {
     ) -> StatePlan {
         self.plan_chunk(
             Some(lease),
-            first && lease.hit.is_some(),
+            (first && lease.hit.is_some()).then_some(computed),
+            computed,
             computed,
             target,
             prefill_end,
@@ -161,13 +214,14 @@ impl StateGroup {
     fn plan_chunk(
         self,
         lease: Option<&GroupStateLease>,
-        first_hit: bool,
+        local_hit: Option<usize>,
+        covered: usize,
         computed: usize,
         target: usize,
         prefill_end: usize,
     ) -> StatePlan {
-        let crossing = target.div_ceil(self.block) > computed.div_ceil(self.block);
-        let partial_hit = first_hit && !computed.is_multiple_of(self.block);
+        let crossing = target.div_ceil(self.block) > covered.div_ceil(self.block);
+        let partial_hit = local_hit.is_some_and(|hit| !hit.is_multiple_of(self.block));
         let write = match lease {
             Some(lease) => lease
                 .blocks
@@ -223,7 +277,7 @@ impl StateCacheManager {
                         group: g as u16,
                         hash,
                     };
-                    self.visible(key) && pool.pool.key_hit(key).is_some()
+                    self.visible(key) && pool.key_hit(g as u16, hash).is_some()
                 })
             })
         };
@@ -251,34 +305,46 @@ impl StateCacheManager {
         0
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::engine::kv_manager) fn apply_group(
         &mut self,
         pool: &mut VllmBlockPool,
-        group: usize,
+        group: StateGroup,
         lease: &mut GroupStateLease,
         plan: StatePlan,
-        step: u64,
+        computed: usize,
+        aggregate_step: Option<u64>,
         reservation: &mut BlockReservation,
     ) {
         if plan.copy_pinned_hit {
             let (id, _) = lease.hit.take().expect("pinned partial state");
-            self.retain_copy(group, id);
+            self.retain_copy(group.id, id);
         }
         if plan.write != StateWrite::Keep {
             if let Some(hash) = lease.partial_hash.take() {
                 self.mark_published(CacheKey::Grouped {
-                    group: group as u16,
+                    group: group.id as u16,
                     hash,
                 });
             }
-            debug_assert!(
-                lease.blocks.previous.is_none(),
-                "one state crossing per pass"
-            );
-            lease.blocks.rotate(pool, reservation, 1, step);
+            let until = aggregate_step.map(PreviousRelease::AfterStep).or_else(|| {
+                (plan.write == StateWrite::Rotate)
+                    .then(|| PreviousRelease::Above(computed.next_multiple_of(group.block)))
+            });
+            if until.is_none()
+                && let Some(id) = lease.blocks.working.take()
+            {
+                // A P/D write past a published state in the same block pins
+                // its source through the end of schedule().
+                self.retain_copy(group.id, id);
+            }
+            lease.blocks.rotate(pool, reservation, 1, until);
         }
         if plan.separate_copy {
-            lease.copy = Some(pool.allocate_private(reservation));
+            lease.copy = Some((
+                pool.allocate_private(reservation),
+                computed.next_multiple_of(group.block),
+            ));
         }
         if let Some(pos) = plan.checkpoint {
             lease.blocks.allocate_checkpoint(pool, reservation, 1);
@@ -295,7 +361,7 @@ impl StateCacheManager {
         prompt: usize,
         computed: usize,
         junction: Option<usize>,
-        step: u64,
+        aggregate_step: Option<u64>,
         key_at: impl Fn(usize) -> Option<(CacheKey, Option<KeyInBlock>)>,
     ) {
         if group.align.retains(prompt, computed, group.block, junction)
@@ -320,6 +386,8 @@ impl StateCacheManager {
                 at,
             );
         }
-        lease.blocks.release_previous(step, |id| pool.release(id));
+        if let Some(step) = aggregate_step {
+            lease.blocks.release_previous(step, |id| pool.release(id));
+        }
     }
 }

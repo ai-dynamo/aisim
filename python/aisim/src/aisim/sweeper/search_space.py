@@ -20,6 +20,7 @@ from __future__ import annotations
 import warnings
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field, replace
+from functools import cache
 from heapq import merge
 from typing import Any
 
@@ -71,6 +72,31 @@ _ROLE_OPTIONAL_ENGINE = ("block_size", "gpu_memory_utilization")
 
 
 @dataclass(frozen=True)
+class IntegerRangeUnion:
+    """Sorted disjoint intervals of feasible integer settings, stored without expanding them."""
+
+    intervals: tuple[range, ...]
+
+    def __len__(self) -> int:
+        return sum(len(interval) for interval in self.intervals)
+
+    def __getitem__(self, index: int) -> int:
+        if index < 0:
+            index += len(self)
+        for interval in self.intervals:
+            if 0 <= index < len(interval):
+                return interval[index]
+            index -= len(interval)
+        raise IndexError(index)
+
+    def nearest_index(self, value: float) -> int:
+        index = bisect_left(self, value)
+        if index and (index == len(self) or value - self[index - 1] <= self[index] - value):
+            return index - 1
+        return index
+
+
+@dataclass(frozen=True)
 class ConditionalDimensionSpace:
     """Namespaced selector and its conditionally active child dimensions."""
 
@@ -99,7 +125,7 @@ class BranchSpace:
     # Continuous workload dimensions. Currently only Pareto ``kv_load_ratio`` uses
     # this; list-valued component knobs remain discrete choices above.
     float_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
-    integer_ranges: dict[str, tuple[int, int]] = field(default_factory=dict)
+    integer_ranges: dict[str, tuple[int, int] | IntegerRangeUnion] = field(default_factory=dict)
     log_float_ranges: frozenset[str] = frozenset()
     log_integer_ranges: frozenset[str] = frozenset()
     log_discrete_choices: frozenset[str] = frozenset()
@@ -236,13 +262,51 @@ def _parse_parallel_entry(entry: dict[str, Any], deployment_mode: str):
     )
 
 
-def _fpm_parallel_configs(search_space, deployment_mode: str):
+def _fpm_parallel_configs(search_space, deployment_mode: str, *, validate_grouped_role=None):
     """Apply declared topology domains before grouped compatibility or resource checks."""
+    from aisim.config.engine import KvTransferConfig
     from aisim.fpm_profile import load_fpm_profile
 
     profile = load_fpm_profile(search_space.fpm_profile)
+    raw_pinned = search_space.parallel_configs_by_mode.get(deployment_mode, search_space.parallel_configs)
+    custom = search_space.parallel_custom_configs_by_mode.get(deployment_mode, {})
+    domains = search_space.parallel_independent_by_mode.get(deployment_mode, {})
+    bounds = search_space.parallel_independent_log_ranges_by_mode.get(deployment_mode, {})
+    role_choices = {role: {_replica_from_dict(entry) for entry in entries} for role, entries in custom.items()}
+
+    def replica_counts(role, shape, maximum, pinned):
+        prefix = "" if role == "agg" else f"{role}_"
+        role_domains = {k.removeprefix(prefix): v for k, v in domains.items() if k.startswith(prefix)}
+        role_bounds = {k.removeprefix(prefix): v for k, v in bounds.items() if k.startswith(prefix)}
+        counts = role_domains.pop("replicas", None)
+        if "replicas" in role_bounds:
+            # The search compiler stores a placeholder choice alongside a log range.
+            counts = None
+        lower, upper = role_bounds.pop("replicas", (1, maximum))
+        if not matches_parallel_domains(ReplicaParallelConfig(shape, 1), role_domains, role_bounds):
+            return ()
+        lower, upper = max(1, lower), min(maximum, upper)
+        if pinned is not None:
+            allowed = (
+                lower <= pinned <= upper
+                and (counts is None or pinned in counts)
+                and (role not in role_choices or ReplicaParallelConfig(shape, pinned) in role_choices[role])
+            )
+            return (pinned,) if allowed else ()
+        if role in role_choices:
+            choices = {r.replicas for r in role_choices[role] if r.shape == shape}
+            if counts is not None:
+                choices.intersection_update(counts)
+        elif counts is not None:
+            choices = set(counts)
+        else:
+            return range(lower, upper + 1)
+        return sorted(n for n in choices if lower <= n <= upper)
+
     configs = _profile_parallel_configs(
         profile,
+        prefix_caching=(search_space.prefill_enable_prefix_caching, search_space.decode_enable_prefix_caching),
+        max_batched_tokens_for=lambda role: _role_runtime(search_space, "vllm", role)[0],
         hardware_sku=search_space.hardware_sku_for("agg" if deployment_mode == "agg" else "prefill"),
         decode_hardware_sku=(search_space.hardware_sku_for("decode") if deployment_mode == "disagg" else None),
         backend="vllm",
@@ -250,26 +314,27 @@ def _fpm_parallel_configs(search_space, deployment_mode: str):
         gpu_budget=search_space.gpu_budget,
         min_gpu_budget=search_space.min_gpu_budget,
         deployment_mode=deployment_mode,
+        candidate_configs=[_parse_parallel_entry(entry, deployment_mode) for entry in raw_pinned]
+        if raw_pinned
+        else None,
+        require_pinned_pairs=bool(raw_pinned),
+        filter_warm_aggregate=(
+            deployment_mode == "agg"
+            and search_space.agg_enable_prefix_caching
+            and len(set(search_space.deployment_mode)) > 1
+            and not (raw_pinned or custom)
+        ),
+        validate_grouped_role=validate_grouped_role,
+        # SearchSpace validates every in-domain pair before warm filtering. Its later enumeration reuses that check.
+        validate_transfer=validate_grouped_role is not None,
+        kv_transfer=(
+            KvTransferConfig.model_construct(bytes_per_token=search_space.kv_transfer_bytes_per_token)
+            if search_space.kv_transfer_bytes_per_token is not None
+            else None
+        ),
+        replica_counts=replica_counts if custom or domains or bounds else None,
     )
-    raw_pinned = search_space.parallel_configs_by_mode.get(deployment_mode, search_space.parallel_configs)
-    if raw_pinned:
-        pinned = {_parse_parallel_entry(entry, deployment_mode) for entry in raw_pinned}
-        configs = [config for config in configs if config in pinned]
-    for role, entries in search_space.parallel_custom_configs_by_mode.get(deployment_mode, {}).items():
-        choices = {_replica_from_dict(entry) for entry in entries}
-        configs = [config for config in configs if _parallel_role(config, role) in choices]
-    domains = search_space.parallel_independent_by_mode.get(deployment_mode, {})
-    bounds = search_space.parallel_independent_log_ranges_by_mode.get(deployment_mode, {})
-    return [
-        config
-        for config in configs
-        if all(
-            bounds[name][0] <= value <= bounds[name][1]
-            if name in bounds
-            else domains.get(name) is None or value in domains[name]
-            for name, value in _parallel_leaf_values(config).items()
-        )
-    ]
+    return configs
 
 
 def branch_knob_choices(search_space, deployment_mode: str) -> dict[str, list[Any]]:
@@ -421,7 +486,15 @@ def _heterogeneous_disagg_configs(
                 ),
                 **_engine_memory_kwargs(search_space),
                 **_estimator_root_kwargs(search_space, role),
-                **({"fpm_profile": search_space.fpm_profile} if search_space.fpm_profile is not None else {}),
+                **(
+                    {
+                        "fpm_profile": search_space.fpm_profile,
+                        "prefill_enable_prefix_caching": search_space.prefill_enable_prefix_caching,
+                        "decode_enable_prefix_caching": search_space.decode_enable_prefix_caching,
+                    }
+                    if search_space.fpm_profile is not None
+                    else {}
+                ),
                 **(
                     {"candidate_configs": list(dict.fromkeys(getattr(config, role) for config in candidate_configs))}
                     if candidate_configs is not None
@@ -432,20 +505,111 @@ def _heterogeneous_disagg_configs(
             raise type(exc)(f"{role} hardware_sku={hardware!r}: {exc}") from exc
         per_role[role] = configs
 
-    configs = [
-        DisaggParallelConfig(prefill=prefill, decode=decode)
-        for prefill in per_role["prefill"]
-        for decode in per_role["decode"]
-        if prefill.total_gpus + decode.total_gpus <= search_space.gpu_budget
-        and (
-            search_space.min_gpu_budget is None or prefill.total_gpus + decode.total_gpus >= search_space.min_gpu_budget
-        )
-    ]
+    minimum = search_space.min_gpu_budget or 0
+    if candidate_configs is not None:
+        prefill, decode = set(per_role["prefill"]), set(per_role["decode"])
+        configs = [
+            config
+            for config in candidate_configs
+            if config.prefill in prefill
+            and config.decode in decode
+            and minimum <= config.total_gpus <= search_space.gpu_budget
+        ]
+    else:
+        configs = [
+            DisaggParallelConfig(prefill=prefill, decode=decode)
+            for prefill in per_role["prefill"]
+            for decode in per_role["decode"]
+            if minimum <= prefill.total_gpus + decode.total_gpus <= search_space.gpu_budget
+        ]
     if not configs:
         raise NoViableParallelConfig(
             f"heterogeneous P/D roles have no legal pair within gpu_budget={search_space.gpu_budget}"
         )
     return configs
+
+
+def _union_scheduler_ranges(ranges: list[range]) -> tuple[int, int] | IntegerRangeUnion:
+    """Combine allowed ranges in physical value order, keeping large contiguous spans compact."""
+    merged = []
+    for interval in sorted(set(ranges), key=lambda item: (item.start, item.stop)):
+        if merged and interval.start <= merged[-1].stop:
+            merged[-1] = range(merged[-1].start, max(merged[-1].stop, interval.stop))
+        else:
+            merged.append(interval)
+    if len(merged) == 1:
+        return (merged[0].start, merged[0][-1])
+    return IntegerRangeUnion(tuple(merged))
+
+
+def _fpm_scheduler_domains(space, mode, candidates):
+    """Intersect each selected deployment's measured scheduler settings or declared limits with the search domain."""
+    from aisim.fpm_profile import load_fpm_profile
+
+    if space.fpm_profile is None or not candidates:
+        return [(space, candidates, {})]
+    profile = load_fpm_profile(space.fpm_profile)
+    roles = ("agg",) if mode == "agg" else ("prefill", "decode")
+
+    @cache
+    def limits(role, shape):
+        deployment = profile.select(
+            model=space.model_name,
+            worker_type="aggregated" if role == "agg" else role,
+            system=space.hardware_sku_for(role),
+            backend="vllm",
+            backend_version=space.requested_backend_version("vllm"),
+            tp_size=shape.tp,
+            pp_size=shape.pp,
+            attention_dp_size=shape.dp,
+            moe_tp_size=shape.moe_tp,
+            moe_ep_size=shape.moe_ep,
+        )
+        resources = deployment.resources
+        measured = resources.runtime_memory is not None
+        return tuple(
+            (name, range(limit if measured else 1, limit + 1), measured)
+            for name, limit in (
+                (f"{role}_max_num_batched_tokens", resources.max_num_tokens),
+                (f"{role}_max_num_seqs", resources.max_batch_size),
+            )
+        )
+
+    groups = {}
+    for candidate in candidates:
+        settings = tuple(item for role in roles for item in limits(role, _parallel_role(candidate, role).shape))
+        groups.setdefault(settings, []).append(candidate)
+    result = []
+    mismatch = None
+    for settings, topologies in groups.items():
+        updates = {}
+        ranges = dict(space.engine_integer_log_ranges)
+        allowed = {}
+        for name, envelope, measured in settings:
+            if name in ranges:
+                low, high = ranges[name]
+                options = range(max(low, envelope.start), min(high + 1, envelope.stop))
+                if options:
+                    ranges[name] = [options.start, options[-1]]
+                    updates[name] = [options.start]
+            else:
+                options = tuple(n for n in getattr(space, name) if n in envelope)
+                updates[name] = list(options)
+            if not options:
+                limit = envelope.stop - 1
+                requirement = (
+                    "runtime memory requires the exact recorded" if measured else "resource envelope permits at most"
+                )
+                mismatch = f"{requirement} {name}={limit} in the search domain"
+                break
+            allowed[name] = options
+        else:
+            result.append(
+                (space.model_copy(update={**updates, "engine_integer_log_ranges": ranges}), topologies, allowed)
+            )
+    if not result:
+        raise NoViableParallelConfig(mismatch)
+    return result
 
 
 def _legal_parallel_configs(search_space, deployment_mode, backend, max_seq_len, candidate_configs):
@@ -473,7 +637,15 @@ def _legal_parallel_configs(search_space, deployment_mode, backend, max_seq_len,
         role_max_seq_len=_context_by_role(search_space, deployment_mode, max_seq_len),
         **_engine_memory_kwargs(search_space),
         **_estimator_root_kwargs(search_space, role),
-        **({"fpm_profile": search_space.fpm_profile} if search_space.fpm_profile is not None else {}),
+        **(
+            {
+                "fpm_profile": search_space.fpm_profile,
+                "prefill_enable_prefix_caching": search_space.prefill_enable_prefix_caching,
+                "decode_enable_prefix_caching": search_space.decode_enable_prefix_caching,
+            }
+            if search_space.fpm_profile is not None
+            else {}
+        ),
         **({"candidate_configs": candidate_configs} if candidate_configs is not None else {}),
     )
 
@@ -785,8 +957,24 @@ def enumerate_branches(
         custom_by_role = {
             role: tuple(_replica_from_dict(entry) for entry in entries) for role, entries in raw_custom.items()
         }
-        profile_configs = _fpm_parallel_configs(ss, deployment_mode) if ss.fpm_profile is not None else None
+        try:
+            profile_configs = _fpm_parallel_configs(ss, deployment_mode) if ss.fpm_profile is not None else None
+        except NoViableParallelConfig as exc:
+            # No prefill deployment of the profile can hand off to a decode deployment.
+            if pinned is not None or custom_by_role:
+                raise NoViableParallelConfig(f"deployment_mode={deployment_mode!r}: {exc}") from exc
+            skip_warnings.append(f"smart-sweep: deployment_mode={deployment_mode!r} skipped — {exc}")
+            skipped.append(deployment_mode)
+            continue
         candidate_configs = profile_configs if profile_configs is not None else pinned
+        try:
+            scheduler_domains = _fpm_scheduler_domains(ss, deployment_mode, candidate_configs)
+        except NoViableParallelConfig as error:
+            if len(deployment_modes) == 1 or pinned is not None or custom_by_role:
+                raise
+            skip_warnings.append(f"smart-sweep: deployment_mode={deployment_mode!r} skipped — {error}")
+            skipped.append(deployment_mode)
+            continue
 
         def matches_custom(config: _ParallelConfig) -> bool:
             return all(_parallel_role(config, role) in choices for role, choices in custom_by_role.items())
@@ -798,10 +986,12 @@ def enumerate_branches(
                 backend, deployment_mode
             ):
                 continue
-            try:
-                legal = _legal_parallel_configs(ss, deployment_mode, backend, max_seq_len, candidate_configs)
-            except (NoPerfDatabase, NoViableParallelConfig):
-                continue  # backend unusable for this mode -> drop it from the search
+            legal = []
+            for domain, topologies, _ in scheduler_domains:
+                try:
+                    legal.extend(_legal_parallel_configs(domain, deployment_mode, backend, max_seq_len, topologies))
+                except (NoPerfDatabase, NoViableParallelConfig):
+                    continue
             legal = [
                 cfg for cfg in legal if _runner_supports_parallel_config(runner_capabilities, deployment_mode, cfg)
             ]
@@ -817,7 +1007,7 @@ def enumerate_branches(
                 )
             ]
             legal_set = set(legal)
-            for cfg in pinned if pinned is not None else legal:
+            for cfg in candidate_configs if candidate_configs is not None else legal:
                 if cfg in legal_set:
                     support.setdefault(cfg, set()).add(backend)
 
@@ -902,7 +1092,7 @@ def enumerate_branches(
             # the constant path so every decoded selection carries the requested ratio.
             knob_choices["kv_load_ratio"] = [float(config.workload.kv_load_ratio)]
         log_float_ranges: set[str] = set()
-        integer_ranges: dict[str, tuple[int, int]] = {}
+        integer_ranges: dict[str, tuple[int, int] | IntegerRangeUnion] = {}
         log_integer_ranges: set[str] = set()
         log_discrete_choices = {name for name in ss.engine_log_discrete if name in knob_choices}
         active_roles = {"agg"} if deployment_mode == "agg" else {"prefill", "decode"}
@@ -912,12 +1102,25 @@ def enumerate_branches(
             float_ranges[name] = (float(bounds[0]), float(bounds[1]))
             if name in ss.engine_log_ranges:
                 log_float_ranges.add(name)
+        supported_domains = [
+            allowed
+            for _, topologies, allowed in scheduler_domains
+            if topologies and any(c in support for c in topologies)
+        ]
+        for name, choices in knob_choices.items():
+            if supported_domains and name in supported_domains[0] and name not in ss.engine_integer_log_ranges:
+                knob_choices[name] = [n for n in choices if any(n in domain[name] for domain in supported_domains)]
         for name, bounds in ss.engine_integer_log_ranges.items():
             if name.split("_", 1)[0] not in active_roles:
                 continue
             knob_choices.pop(name, None)
-            integer_ranges[name] = (int(bounds[0]), int(bounds[1]))
-            log_integer_ranges.add(name)
+            sampled = [domain[name] for domain in supported_domains if name in domain]
+            if sampled and all(len(values) == 1 for values in sampled):
+                knob_choices[name] = sorted({values[0] for values in sampled})
+                log_discrete_choices.add(name)
+            else:
+                integer_ranges[name] = _union_scheduler_ranges(sampled) if sampled else (int(bounds[0]), int(bounds[1]))
+                log_integer_ranges.add(name)
         if config.workload.load_choices is not None:
             knob_choices["traffic_load"] = list(config.workload.load_choices)
         elif config.workload.load_range is not None:

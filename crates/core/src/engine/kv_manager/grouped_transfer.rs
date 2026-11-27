@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Modified simulation of the vLLM v0.31.0 and v0.32.0 NIXL connector rules
-//! that decide the P/D transfer payload of each KV cache group, with the
+//! Modified simulation of the vLLM v0.31.0, v0.32.0 and v0.33.0 NIXL connector
+//! rules that decide the P/D transfer payload of each KV cache group, with the
 //! in-window block count of a decode rank from the KV cache manager. No
 //! speculative decoding, no HiSparse, no bounded replay window and no `all`
 //! Mamba cache mode. Copyright contributors to the vLLM project. Sources: the
-//! files below at `db9527a46873454610df6dbedf79a36d6bf1a7f6` and at
-//! `5df63a7203cdb9328d824a27b682e77c7b9928be`. See THIRD_PARTY_NOTICES.md.
+//! files below at `db9527a46873454610df6dbedf79a36d6bf1a7f6`, at
+//! `5df63a7203cdb9328d824a27b682e77c7b9928be` and at
+//! `4ba787ec9959e566d3b587a796dff07673324da5`. See THIRD_PARTY_NOTICES.md.
 //! Apache-2.0.
 //!
 //! - https://github.com/vllm-project/vllm/blob/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
@@ -25,6 +26,14 @@
 //! - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
 //! - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/single_type_kv_cache_manager.py
 //! - https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/kv_cache_interface.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/v1/nixl/tp_mapping.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/distributed/kv_transfer/kv_connector/utils.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/kv_cache_manager.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/core/single_type_kv_cache_manager.py
+//! - https://github.com/vllm-project/vllm/blob/4ba787ec9959e566d3b587a796dff07673324da5/vllm/v1/kv_cache_interface.py
 //!
 //! The payload of a request is, for each group, the blocks of the group that
 //! vLLM's NIXL connector transfers for one request on one TP rank times the
@@ -33,13 +42,15 @@
 //! rank moves its own copy (`nixl/tp_mapping.py:88-98`, the same in V31 and
 //! V32). The connector makes one region for each distinct layer address, and
 //! layers of different groups at one address share a region (V31
-//! `nixl/base_worker.py:1702-1724`, V32 `:1623-1645`). In a model with a Mamba
-//! state, it reads a block of an attention group in every region, a block of a
-//! `CircularBufferSpec` ring in its own regions only, and a block of a Mamba
-//! group in every Mamba region (V31 `nixl/base_worker.py:274-304`, V32
-//! `:236-266`), except that a `tp_replicated` state group reads its own region
-//! only (V31 `:616-633`, V32 `:581-598`). So the bytes of one block depend on the addresses that the
-//! layers of all groups share, and they can be more than the page of the group.
+//! `nixl/base_worker.py:1702-1724`, V32 `:1623-1645`, V33 `:1744-1766`). In a
+//! model with a Mamba state, it reads a block of an attention group in every
+//! region, a block of a `CircularBufferSpec` ring in its own regions only, and
+//! a block of a Mamba group in every Mamba region (V31
+//! `nixl/base_worker.py:274-304`, V32 `:236-266`, V33 `:242-272`), except that
+//! a `tp_replicated` state group reads its own region only (V31 `:616-633`,
+//! V32 `:581-598`, V33 `:680-697`). So the bytes of one block depend on the
+//! addresses that the layers of all groups share, and they can be more than
+//! the page of the group.
 //! In V31 the ring of GLM-5.3-Flash is a `KpoolTailSpec` and not a
 //! `CircularBufferSpec` (V31 `kvi:1015-1016`), so its block is read in every
 //! region. In V32 that model runs a block-outer layout (V32
@@ -47,30 +58,42 @@
 //! where the layers of other groups have addresses of their own in a block row,
 //! so a full-attention block is read in those regions too. The rules compute no
 //! bytes: they take them from the profile. For GLM-5.3-Flash at TP 4 the test
-//! profiles hold the values of a live run on both versions, and the rules give
+//! profiles hold the values of a live run on V31 and V32, and the rules give
 //! the bytes of every request of that run
 //! (`benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`).
 //!
-//! The rules hold for vLLM 0.31.0 (V31) and vLLM 0.32.0 (V32). They count the
-//! same blocks in both versions and take the bytes of a block from the
-//! profile, so they take no version. Two rules differ in code and give the
-//! same value for every request that replay sends. The V32
+//! The rules hold for vLLM 0.31.0 (V31), vLLM 0.32.0 (V32) and vLLM 0.33.0
+//! (V33). They count the same blocks in the three versions and take the bytes
+//! of a block from the profile, so they take no version. Two rules differ in
+//! code and give the same value for every request that replay sends. The V32
 //! backoff adds a term for a bounded replay window (V31
 //! `nixl/base_scheduler.py:385-398`, V32 `:379-394`), and GLM-5.3-Flash has
 //! none. The V32 truncation skips a request that skips reading the prefix
 //! cache (V32 `nixl/base_scheduler.py:421-423`), and replay sends no such
-//! request. A model with a bounded replay window, or a replay that skips the
-//! prefix cache, needs a version row here.
+//! request. Between V32 and V33 one more rule differs in code: V33
+//! `nixl/tp_mapping.py:104` computes `is_mla` with a parameter for a draft
+//! model, which `:107-108` read, and without speculative decoding the value is
+//! the V32 one. A model with a bounded replay window, or a replay that skips
+//! the prefix cache, needs a version row here.
+//! vLLM 0.33.0 counts the same blocks as vLLM 0.32.0: the clip of each group
+//! (V33 `nixl/base_scheduler.py:253-294`), the backoff and the truncation
+//! (V33 `:385-441`), the blocks that a decode rank pulls (V33
+//! `nixl/pull_scheduler.py:59-65`, `:149-156`) and the copy on each TP rank
+//! (V33 `nixl/tp_mapping.py:107-117`). For GLM-5.3-Flash at TP 4 with an fp8
+//! cache, a live run measured the bytes of one block of each group on V33,
+//! and they equal the V32 values
+//! ([0.33.0 measurements](https://github.com/ai-dynamo/aisim/blob/e347f817d4921f99010298cd9a0a63a4d395c092/benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md)).
 //!
-//! Grouped P/D uses four different blocks. These rules read two of them. The
+//! Grouped P/D uses five different blocks. These rules read two of them. The
 //! transfer unit of a full-attention group and the window count read the
 //! group's own `block_size_tokens`, because vLLM clips the block list of each
 //! group with that group's spec (V31 `nixl/base_scheduler.py:133-146`,
 //! `:282-297`, V32 `:138-151`, `:280-291`), and the decode rank allocates it
 //! with that group's manager (see `fixed_bytes`). The timing unit is the one
 //! block of the full-attention groups. `GroupedPrefixRules` reads the other
-//! two: the decode-side hit reads the hit alignment, and the checkpoint rule
-//! reads the cacheable block, `cache_config.block_size` in vLLM 0.32.0. For
+//! three: the decode-side hit reads the hit alignment and is floored to the
+//! scheduler block, and the checkpoint rule reads the cacheable block,
+//! `cache_config.block_size` in vLLM 0.32.0. For
 //! GLM-5.3-Flash at TP 4, the scheduler block (the least common multiple of
 //! the group blocks), `cache_config.block_size`, the hash block and the
 //! alignment are all 2,176 tokens.
@@ -142,8 +165,8 @@ impl GroupedTransferRules {
     /// 0 (V31 `vllm/config/vllm.py:668-670`, V32 `:655-657`) and its term
     /// does not count. Fails when a group fails `FpmCacheGroup::validate`,
     /// when a group lacks `prefix_cacheable` or `transfer_bytes_per_block`,
-    /// and when two full-attention groups differ in block, because the timing
-    /// has one unit.
+    /// when a ring has more than one block, or when two full-attention groups
+    /// differ in block, because the timing has one unit.
     pub(crate) fn new(groups: &[FpmCacheGroup]) -> anyhow::Result<Self> {
         // A zero block would divide by zero in `full_blocks` and `fixed_bytes`.
         for group in groups {
@@ -161,14 +184,20 @@ impl GroupedTransferRules {
         for (group, bytes_per_block) in groups.iter().zip(bytes) {
             let block = group.block_size_tokens;
             let kind = match (group.kind, group.sliding_window) {
-                (FpmCacheKind::State, _) => TransferKind::State,
+                (FpmCacheKind::State, _) => {
+                    ensure!(
+                        group.prefix_cacheable == Some(true) || group.blocks_per_request == Some(1),
+                        "grouped FPM cache P/D requires blocks_per_request=1 for a ring state group"
+                    );
+                    TransferKind::State
+                }
                 (FpmCacheKind::Attention | FpmCacheKind::Convolution, Some(window)) => {
                     TransferKind::Window { window }
                 }
                 (FpmCacheKind::Attention, None) => {
                     ensure!(
                         unit_block.is_none_or(|unit| unit == block),
-                        "full-attention groups must share one block_size_tokens"
+                        "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across full-attention groups"
                     );
                     unit_block = Some(block);
                     TransferKind::Full
@@ -197,26 +226,33 @@ impl GroupedTransferRules {
     /// The trailing prompt tokens that the prefill rank does not compute and
     /// the decode rank recomputes: 1 with a Mamba state, else 0 (V31
     /// `nixl/base_scheduler.py:385-398`, V32 `:379-394`).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "ReservedVllmDecode::activate reads it when a decode rank activates a grouped handoff"
-        )
-    )]
     pub(crate) fn backoff_tokens(&self) -> usize {
         self.backoff_tokens
+    }
+
+    /// The `block_size_tokens` of the full-attention groups, the transfer
+    /// unit. `None` without a full-attention group.
+    pub(crate) fn unit_block(&self) -> Option<usize> {
+        self.unit_block.map(|block| block as usize)
     }
 
     /// The prompt tokens that the prefill rank computes and the decode rank
     /// loads. Only a prompt longer than the backoff loses the backoff tokens
     /// (V31 `nixl/base_scheduler.py:400-407`, `:424`, V32 `:396-403`, `:420`).
     pub(crate) fn transfer_tokens(&self, prompt_tokens: usize) -> usize {
-        if prompt_tokens > self.backoff_tokens {
-            prompt_tokens - self.backoff_tokens
+        if prompt_tokens > self.backoff_tokens() {
+            prompt_tokens - self.backoff_tokens()
         } else {
             prompt_tokens
         }
+    }
+
+    /// After publishing the loaded blocks, a full load rolls the computed
+    /// count back one token to sample the first output (V31 `sched:3092-3096`,
+    /// V32 `sched:3168-3172`, v0.33 `sched:3512-3516`).
+    pub(crate) fn computed_after_load(&self, prompt_tokens: usize) -> usize {
+        self.transfer_tokens(prompt_tokens)
+            .min(prompt_tokens.saturating_sub(1))
     }
 
     /// The full-attention blocks of `transfer_tokens` tokens, a partly filled
@@ -254,8 +290,11 @@ impl GroupedTransferRules {
     /// The worker trims the prefill list to the decode count (V31
     /// `nixl/base_worker.py:3485-3490`, `:3529-3534`, V32 `:3450-3455`,
     /// `:3493-3498`). A state group moves one block (V31
-    /// `nixl/base_scheduler.py:286-295`, V32 `:284-289`). The bytes saturate
-    /// at `u64::MAX`, as in `bytes_per_full_block`.
+    /// `nixl/base_scheduler.py:286-295`, V32 `:284-289`). A source of zero
+    /// tokens owns no block and moves none, and vLLM refuses an empty prompt
+    /// (V31 `vllm/v1/engine/input_processor.py:516-517`, V32 and V33
+    /// `:565-566`).
+    /// The bytes saturate at `u64::MAX`, as in `bytes_per_full_block`.
     pub(crate) fn fixed_bytes(&self, transfer_tokens: usize) -> u64 {
         self.groups
             .iter()
@@ -272,7 +311,7 @@ impl GroupedTransferRules {
                         debug_assert!(blocks <= (window as usize).div_ceil(block) + 1);
                         blocks
                     }
-                    TransferKind::State => 1,
+                    TransferKind::State => usize::from(transfer_tokens > 0),
                 };
                 (blocks as u64).saturating_mul(group.bytes_per_block)
             })
@@ -283,11 +322,11 @@ impl GroupedTransferRules {
     /// `local_full_blocks` full-attention blocks: the missing full-attention
     /// blocks and the fixed bytes. The decode rank pulls only the blocks that
     /// its prefix cache lacks (`nixl/pull_scheduler.py:149-156`, the same in
-    /// V31 and V32), and the state moves with every transfer that moves a
-    /// token (V31 `nixl/base_worker.py:3507-3528`, V32 `:3472-3492`). When
-    /// the decode rank holds every block, vLLM moves nothing
-    /// (`nixl/pull_scheduler.py:59-65`), but this formula still counts the
-    /// fixed bytes, as the handoff timing does.
+    /// V31, V32 and v0.33), and the state moves with every transfer that
+    /// moves a token (V31 `nixl/base_worker.py:3507-3528`, V32 `:3472-3492`,
+    /// v0.33 `:3810-3830`). When the decode rank holds every block, vLLM
+    /// moves nothing (V31, V32 and v0.33 `nixl/pull_scheduler.py:59-65`).
+    /// The destination reports that case separately from the number of full blocks.
     #[cfg(test)]
     pub(crate) fn payload_bytes(&self, transfer_tokens: usize, local_full_blocks: usize) -> u64 {
         let missing = self
@@ -302,9 +341,9 @@ impl GroupedTransferRules {
     /// `state_bytes` holds the fixed bytes. The destination reports its
     /// missing full-attention blocks in the same unit, as vLLM pulls only the
     /// blocks that the decode rank lacks (`nixl/pull_scheduler.py:149-156`,
-    /// the same in V31 and V32). So the delay is the `payload_bytes` over the
-    /// bandwidth in both timing modes. The struct comes from the builder of
-    /// the linear path, which also maps the mode.
+    /// the same in V31, V32 and v0.33). A full local hit is reported separately:
+    /// a Pull notification needs no KV read. Other loads use this payload and
+    /// the configured bandwidth.
     pub(crate) fn handoff_transfer_timing(
         &self,
         transfer_tokens: usize,
@@ -367,13 +406,16 @@ mod tests {
     /// block, `11 * 71_808 + 19 * 1_114_112 + 10 * 2_048`, and the 11 own
     /// regions of the `CircularBufferSpec` ring, `71_808 + 10 * 2_048`. A KDA
     /// block is read in the 9 state regions on both versions:
-    /// `9 * (36_864 + 1_048_576)`, also for a group of 8 layers.
+    /// `9 * (36_864 + 1_048_576)`, also for a group of 8 layers. On vLLM
+    /// 0.33.0 a log of each group measured the six values, and the run moved
+    /// the rows of vLLM 0.32.0
+    /// ([0.33.0 measurements](https://github.com/ai-dynamo/aisim/blob/e347f817d4921f99010298cd9a0a63a4d395c092/benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md)).
     fn glm_transfer_bytes(version: &str) -> [u64; 6] {
         match version {
             "0.31.0" => [
                 13_045_120, 13_045_120, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
             ],
-            "0.32.0" => [
+            "0.32.0" | "0.33.0" => [
                 21_978_496, 92_288, 9_768_960, 9_768_960, 9_768_960, 9_768_960,
             ],
             _ => unreachable!("no measured GLM-5.3-Flash transfer bytes"),
@@ -419,7 +461,9 @@ mod tests {
     /// `benchmarks/evidence/nixl-pd-transfer-bytes-20261115/`: prompt tokens, the full-attention
     /// blocks that the decode rank already holds, and the bytes of one rank.
     /// The decode rank holds 2 blocks when the same prompt of 5,000 tokens
-    /// comes again.
+    /// comes again. On vLLM 0.33.0 a log of each group measured the six
+    /// values, and the run moved the rows of vLLM 0.32.0
+    /// ([0.33.0 measurements](https://github.com/ai-dynamo/aisim/blob/e347f817d4921f99010298cd9a0a63a4d395c092/benchmarks/evidence/nixl-pd-transfer-bytes-20261117/README.md)).
     fn measured_rows(version: &str) -> [(usize, usize, u64); 7] {
         match version {
             "0.31.0" => [
@@ -431,7 +475,7 @@ mod tests {
                 (30_000, 0, 234_752_640),
                 (130_000, 0, 834_828_160),
             ],
-            "0.32.0" => [
+            "0.32.0" | "0.33.0" => [
                 (1_000, 0, 61_146_624),
                 (2_176, 0, 61_146_624),
                 (2_177, 0, 61_146_624),
@@ -453,7 +497,11 @@ mod tests {
         // running block only (V32 `utils.py:37-44`), never the vLLM 0.32.0
         // FlashKDA checkpoint block, so the profile with it gives the same
         // rows.
-        for (version, checkpoints) in [("0.31.0", &[false][..]), ("0.32.0", &[false, true])] {
+        for (version, checkpoints) in [
+            ("0.31.0", &[false][..]),
+            ("0.32.0", &[false, true]),
+            ("0.33.0", &[false, true]),
+        ] {
             for &checkpoint in checkpoints {
                 let mut groups = glm_groups(version);
                 if checkpoint {
@@ -484,6 +532,7 @@ mod tests {
         for (version, block, fixed) in [
             ("0.31.0", 13_045_120, 52_120_960),
             ("0.32.0", 21_978_496, 39_168_128),
+            ("0.33.0", 21_978_496, 39_168_128),
         ] {
             let rules = rules(&glm_groups(version));
             // T 999 has 1 block and 5 are held: the missing count floors at 0.
@@ -500,10 +549,8 @@ mod tests {
                 Some(1.0),
                 KvTransferTimingMode::DestinationMissing,
             );
-            // This pins the arithmetic of the timing struct only. When no
-            // block is missing, vLLM moves nothing (`nixl/pull_scheduler.py:59-65`,
-            // `:149-153`), while this timing still charges the fixed bytes: a
-            // known difference that the run did not measure.
+            // Zero missing full-attention blocks still incur the fixed bytes if
+            // other groups need a read. A full local hit bypasses the KV read.
             assert!(close(missing.delay_ms(0), fixed as f64 / 1e6), "{version}");
             assert!(close(missing.delay_ms(1), row as f64 / 1e6), "{version}");
         }
@@ -514,7 +561,11 @@ mod tests {
         // With the hand-made page as the bytes of a block, the six groups give
         // `6 * 13_045_120 = 78_270_720` bytes for 999 tokens (computed), not
         // the measured 65,166,080 of vLLM 0.31.0 or 61,146,624 of vLLM 0.32.0.
-        for (version, measured) in [("0.31.0", 65_166_080), ("0.32.0", 61_146_624)] {
+        for (version, measured) in [
+            ("0.31.0", 65_166_080),
+            ("0.32.0", 61_146_624),
+            ("0.33.0", 61_146_624),
+        ] {
             let pages: Vec<_> = glm_groups(version)
                 .into_iter()
                 .map(|mut group| {
@@ -569,13 +620,13 @@ mod tests {
                 group(FpmCacheKind::State, 16, 50, None, mamba),
                 group(FpmCacheKind::State, 16, 50, None, false),
             ];
-            for group in &mut groups {
-                group.blocks_per_request = Some(2);
+            if mamba {
+                groups[0].blocks_per_request = Some(2);
             }
             rules(&groups)
         };
         let mamba = states(true);
-        // Each group moves its running block, not its second block.
+        // A Mamba group moves its running block, and a ring moves its single block.
         assert_eq!(mamba.fixed_bytes(1_000), 100);
         assert_eq!(mamba.backoff_tokens(), 1);
         assert_eq!(mamba.transfer_tokens(2), 1);
@@ -585,6 +636,31 @@ mod tests {
         let rings = states(false);
         assert_eq!(rings.backoff_tokens(), 0);
         assert_eq!(rings.transfer_tokens(1_000), 1_000);
+    }
+
+    #[test]
+    fn an_empty_source_moves_no_state_block() {
+        // A source of zero transfer tokens owns no block, so no group moves
+        // one. One token moves one attention block and one block of each
+        // state group. These numbers equal the fixed bytes and the measured
+        // row of 1,000 tokens in `glm_payload_matches_the_vllm_oracle`, which
+        // also fills one attention block.
+        for (version, fixed, payload) in [
+            ("0.31.0", 52_120_960, 65_166_080),
+            ("0.32.0", 39_168_128, 61_146_624),
+            ("0.33.0", 39_168_128, 61_146_624),
+        ] {
+            let rules = rules(&glm_groups(version));
+            assert_eq!(rules.fixed_bytes(0), 0, "{version}");
+            assert_eq!(rules.payload_bytes(0, 0), 0, "{version}");
+            let empty =
+                rules.handoff_transfer_timing(0, Some(1.0), KvTransferTimingMode::FullPrompt);
+            assert_eq!(empty.full_prompt_tokens, 0, "{version}");
+            assert_eq!(empty.state_bytes, 0, "{version}");
+            assert!(close(empty.delay_ms(0), 0.0), "{version}");
+            assert_eq!(rules.fixed_bytes(1), fixed, "{version}");
+            assert_eq!(rules.payload_bytes(1, 0), payload, "{version}");
+        }
     }
 
     #[test]
@@ -600,7 +676,7 @@ mod tests {
         let full = |block| group(FpmCacheKind::Attention, block, 100, None, true);
         assert_eq!(
             refusal(&[full(64), full(16)]),
-            "full-attention groups must share one block_size_tokens"
+            "kv_cache_groups with worker_type=prefill or decode require one block_size_tokens across full-attention groups"
         );
         // A missing marker is reported before mixed full blocks.
         let mut unmarked = full(16);
