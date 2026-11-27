@@ -95,8 +95,8 @@ the merges are the reviewed commits: `d4faab7fd` (classifier fix), `13ca8aa81`
 (non-integer expert metadata), `d0075f9bb` (host budget pin) and `b761646c0`
 (the Rust error mapping described next).
 
-Relative to `main` at `29104f537` the branch changes 26 files. Apart from
-this document, the other 25 add 1,582 lines and remove 62.
+Relative to `main` at `29104f537` the branch changes 38 files
+(`git diff --name-only 29104f537 HEAD | wc -l`, this document included).
 The branch's own edits are the reviewed commits above; the first merge also
 carries main's `5b6a8aca3` FPM-schema changes in
 `crates/core/src/perfmodel/fpm/model.rs` and
@@ -142,9 +142,11 @@ The request-wide re-raise exposed a pre-existing default in
 became `moe_tp_size=moe_ep_size=1`.
 
 Both shapes of that default conflict with
-`ModelConfig.resolve_moe_parallelism`, which requires
-`tp_size * attention_dp_size * cp_size == moe_tp_size * moe_ep_size`. Both
-layers now share one rule, including the width-one exception:
+`ModelConfig.resolve_moe_parallelism`, which has always enforced
+`tp_size * attention_dp_size * cp_size == moe_tp_size * moe_ep_size`. Only its
+docstring text omitted `cp_size` while the code's `attn_width` and comment
+included it; this branch corrects that text and shares one width-one rule across
+both layers:
 
 - Exactly one dimension omitted defeated the config's inference from the
   attention width, so a valid routed request such as `tp_size=4` with
@@ -342,6 +344,15 @@ dense. The generator therefore agrees with `check_is_moe` even where the
 checked-in rows do not. Those three stale rows, and the ten retired-version CLI
 `FAIL` rows, remain recorded debt rather than regenerated evidence; #1006 owns
 the campaign that replaces them.
+
+Both guards derive their combination set from the generator rather than a
+hardcoded list: the CLI guard uses
+`SupportMatrix().generate_combinations()` and the FPE guard calls the planner for
+every combination the op-level matrix still enumerates. A combination the
+generator starts emitting is therefore covered without editing either test.
+Widening them to historical rows would require the non-current state that #1006
+defines first, because today those rows fail the very condition a widened guard
+would assert.
 
 ## Exact-head verification at `8f3a62e0` (2026-11-18, historical)
 
