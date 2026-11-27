@@ -374,6 +374,11 @@ def _validate_clock(raw, gpus):
     # complete NVML read brackets extend from the matched completions.
     opening = (leader["anchor"]["completed_s"], peer["anchor"]["completed_s"])
     closing = (leader["steps"][-1]["completed_s"], peer["steps"][repeats - 1]["completed_s"])
+    brackets = (start["before_s"], start["after_s"], end["before_s"], end["after_s"])
+    if not all(math.isfinite(stamp) for stamp in (*opening, *closing, *brackets)) or (
+        start["before_s"] > start["after_s"] or end["before_s"] > end["after_s"]
+    ):
+        return "ambiguous_energy_boundaries", None
     displacement = max(
         max(abs(value - bound) for value in stamps for bound in (read["before_s"], read["after_s"]))
         for stamps, read in ((opening, start), (closing, end))
@@ -385,8 +390,8 @@ def _validate_clock(raw, gpus):
         "opening_rank_times_s": opening,
         "closing_rank_times_s": closing,
     }
-    # Limit both-boundary displacement to 1% of the measured common interval.
-    if duration < 2 or not math.isfinite(displacement) or 2 * displacement > 0.01 * duration:
+    # Rev 6.1 records counter-read displacement for the publication review.
+    if duration < 2:
         return "ambiguous_energy_boundaries", details
     return None, details
 

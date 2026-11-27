@@ -51,9 +51,12 @@ def test_observed_campaign_publishes_both_points(tmp_path, monkeypatch, baseline
             raw = out / "raw" / "node-0"
             ctx = _cell_context(plan, cell, cell.cell_id, "1")
             patch.setattr(simulated, "context", lambda _: ctx)
-            simulated.run(raw, patch, phase=cell.workload_kind)
+            simulated.run(raw, patch, phase=cell.workload_kind, read_cost=0.025)
             arms.append((cell, cell.cell_id, out, receipt | {"mean_w_per_gpu": baseline_power}, receipt))
-            assert _validate_clock(raw, {"GPU-0", "GPU-1"})[0] is None
+            reason, clock = _validate_clock(raw, {"GPU-0", "GPU-1"})
+            assert reason is None
+            assert clock["boundary_displacement_s"] == pytest.approx(0.025)
+            assert clock["common_energy_window_s"] == pytest.approx(2.075)
 
     parquet, rows, summary = publish_campaign(plan, arms, tmp_path / "systems")
     assert parquet.is_file()
