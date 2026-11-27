@@ -2288,11 +2288,11 @@ class NaiveKVCacheEstimator:
             else:
                 mode = _infer_quant_modes_from_raw_config(raw, self.architecture).get("kvcache_quant_mode")
         model_dtype_bytes = self.weight_dtype_bytes
-        if (self._transformers_wrapper and backend == "vllm") or (
-            backend == "sglang" and self._is_nested_decoder and model_dtype_bytes == 4
-        ):
-            # SGLang resolves dtype=auto on its text config before selecting the KV cache dtype.
+        if self._transformers_wrapper and backend == "vllm":
             model_dtype_bytes = 2
+        elif backend == "sglang" and self._is_nested_decoder and model_dtype_bytes == 4:
+            # SGLang loads the model at its automatic execution dtype before selecting the KV cache dtype.
+            model_dtype_bytes = self.weight_dtype_bytes = self._embedding_dtype_bytes = 2
         self._quantized_weights = bool(
             raw.get("quantization_config") or raw.get("hf_quant_config") or raw.get("quant_algo")
         )
@@ -2718,6 +2718,8 @@ class NaiveKVCacheEstimator:
         if qwen_sliding and "sliding_window" not in hf_config:
             hf_config = {**hf_config, "sliding_window": 4096}
         window = cache_window(hf_config)
+        if isinstance(extra, Gemma4MixConfig):
+            window = extra.sliding_window_size or None
         qwen_moe = hf_config.get("model_type") == "qwen2_moe"
         if qwen_sliding and not qwen_moe and hf_config["sliding_window"] is None:
             enabled = False

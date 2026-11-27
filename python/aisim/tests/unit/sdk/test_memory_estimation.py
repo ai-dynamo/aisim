@@ -2238,14 +2238,18 @@ def test_native_gemma4_capacity_uses_the_initialized_window(tmp_path, attention,
     text["use_bidirectional_attention"] = attention
     if serialized is None:
         del text["sliding_window"]
+    else:
+        text["sliding_window"] = serialized
     path = _write_config(tmp_path, document)
     config = build_model_config(tp_size=4, pp_size=1, attention_dp_size=1, moe_tp_size=4, moe_ep_size=1)
     native = get_model(path, config, "vllm", "0.33.0")
+    config_only = memory.NaiveKVCacheEstimator.from_hf_config(document, tp_size=4, pp_size=1, backend_version="0.33.0")
     # 25 sliding layers have 2 local heads of width 256. Five full layers have 1 of width 512.
-    for tokens in (1, 1024, 2048):
+    for tokens in (1, 1024, 8192):
         expected = (25 * 2 * 256 * min(window, tokens) + 5 * 512 * tokens) * 2 * 2
         assert native.get_kvcache_bytes_per_sequence(tokens) == expected
         assert native.get_kvcache_max_tokens(expected) == tokens
+        assert config_only.get_kvcache_max_tokens(expected) == tokens
 
 
 def test_registered_gemma4_flat_and_per_layer_release_selection(tmp_path):
@@ -3368,7 +3372,7 @@ def test_vllm_dispatches_the_first_available_text_decoder(tmp_path, classes, exp
     assert _compiled_vllm_transfer_widths(path, "0.32.0") == (expected, expected)
 
 
-@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
 def test_native_sglang_llava_uses_execution_dtype_for_both_transfer_workers(tmp_path, dtype):
     from aisim.capacity import estimate_kv_bytes_per_token
     from aisim.compiler import prediction_to_replay_spec
@@ -3379,6 +3383,12 @@ def test_native_sglang_llava_uses_execution_dtype_for_both_transfer_workers(tmp_
     path = _write_config(
         tmp_path, {"architectures": ["LlavaForConditionalGeneration"], "model_type": "llava", "text_config": text}
     )
+    estimator = memory.NaiveKVCacheEstimator.from_model_path(
+        path, tp_size=1, pp_size=1, backend="sglang", backend_version="0.5.23", allow_hf_config_download=False
+    )
+    # Llama embeddings and matrices, CLIP and projector matrices, and the FP32 vision and connector vectors.
+    weight_bytes = 2 * (6_738_673_664 + 324_154_368) + 4 * 440_320
+    assert estimator.weight_bytes() == weight_bytes
     worker = {
         "parallelism": {"tensor": 1},
         "timing": {"type": "fixed", "prefill_ms": 1, "decode_ms": 1},
@@ -3411,6 +3421,24 @@ def test_native_sglang_llava_uses_execution_dtype_for_both_transfer_workers(tmp_
             )
             == width
         )
+        capacity = memory.estimate_kv_cache(
+            path,
+            "missing",
+            "sglang",
+            "0.5.23",
+            systems_path=str(tmp_path),
+            tp_size=1,
+            pp_size=1,
+            max_num_tokens=2048,
+            max_batch_size=1,
+            memory_fraction_kind="of_total",
+            memory_fraction_value=0.88,
+            gpu_memory_capacity_bytes_override=24 * _GIB,
+            allow_naive_fallback=True,
+            kvcache_quant_mode=mode,
+        )
+        assert capacity["source"] == "naive_fallback"
+        assert capacity["total_kv_size_tokens"] == int(0.8 * (24 * _GIB - weight_bytes) / width)
 
 
 def _compiled_vllm_transfer_widths(path, version, *, kvcache_quant_mode=None, hardware="gb300", transfer_bytes="auto"):

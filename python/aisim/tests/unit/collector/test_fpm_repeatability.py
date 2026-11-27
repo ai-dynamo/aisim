@@ -2104,8 +2104,8 @@ def _dynamo_17_campaign(tmp_path, coordinate, phase="prefill"):
 def _producer_collection(tmp_path, *, walls=None, retained=None, shift_sample=None, phase="prefill", contract=True):
     """The Dynamo 1.7 artifact of one point whose measurement record the GLM-5.3-Flash producer wrote.
 
-    The producer runs its point on the fake of the native scheduler. Its measurement protocol, its retained wall time
-    and its raw samples replace the synthetic ones. A prefill point of one request after a 120-token prefix takes the
+    The producer runs its point on the fake of the native scheduler. Its protocol, warmup history, retained wall time
+    and raw samples replace the synthetic ones. A prefill point of one request after a 120-token prefix takes the
     measured wall times ``walls``. A decode point of three requests at context 201 takes the wall times of the fake.
     ``retained`` overrides the retained wall time, and ``shift_sample`` moves the start of that raw sample's timing
     interval by 0.1 s.
@@ -2139,10 +2139,13 @@ def _producer_collection(tmp_path, *, walls=None, retained=None, shift_sample=No
     if shift_sample is not None:
         samples[shift_sample]["benchmark_sample"]["timing"]["start_monotonic"] -= 0.1
     payload["measurement_protocol"] = protocol
+    payload["warmup_evidence"]["records"] = scheduler._bench_warmup_evidence
     for fpm in (row["fpms"][0], group["rank_results"][0]["fpms"][0]):
         assert (fpm["counter_id"], fpm["dp_rank"]) == (produced["counter_id"], produced["dp_rank"])
         fpm["wall_time"] = wall
-        fpm["benchmark_measurement"].update(
+        measurement = fpm["benchmark_measurement"]
+        measurement["preparation"]["warmup_records_before"] = record["preparation"]["warmup_records_before"]
+        measurement.update(
             expected_internal_samples=record["expected_internal_samples"],
             estimate=copy.deepcopy(record["estimate"]),
             raw_fpms=copy.deepcopy(samples),
