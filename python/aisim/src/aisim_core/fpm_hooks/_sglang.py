@@ -257,7 +257,8 @@ def _wrap_init_fpm(owner: type, attach_reporter: bool) -> None:
 
     def wrapped_init_fpm(self, *args, **kwargs):
         out = init_fpm(self, *args, **kwargs)
-        attach_device_time_reporter(self)
+        if _fpm_enabled(self):
+            attach_device_time_reporter(self)
         return out
 
     wrapped_init_fpm.__wrapped__ = init_fpm  # type: ignore[attr-defined]
@@ -273,7 +274,7 @@ def _wrap_emit(owner: type, attach_reporter: bool) -> None:
     def wrapped_emit(self, batch, *args, **kwargs):
         # Fallback when _init_fpm ran before the hook: the first record may
         # then miss the device time reported before this point.
-        if attach_reporter:
+        if attach_reporter and _fpm_enabled(self):
             attach_device_time_reporter(self)
         result = args[0] if args else kwargs.get("result")
         setattr(self, _STEP_CONTEXT, (result, time.monotonic()))
@@ -302,6 +303,11 @@ def _wrap_spec_snapshot(owner: type) -> None:
 
     wrapped_snapshot.__wrapped__ = snapshot  # type: ignore[attr-defined]
     owner.snapshot_spec_decode_metrics = wrapped_snapshot
+
+
+def _fpm_enabled(reporter) -> bool:
+    """SGLang's per-rank ``enable_fpm`` (only the publishing rank sets it); ``True`` when unknown."""
+    return bool(getattr(getattr(reporter, "scheduler", None), "enable_fpm", True))
 
 
 def record_presettle(batch, result) -> None:
@@ -333,7 +339,8 @@ def patch_sglang_batch_result_processor(module: ModuleType) -> bool:
 
     def wrapped_resolve(self, result, batch, *args, **kwargs):
         try:
-            record_presettle(batch, result)
+            if _fpm_enabled(getattr(self, "metrics_reporter", None)):
+                record_presettle(batch, result)
         except Exception:
             logger.debug("fpm_hooks: pre-settle state unavailable", exc_info=True)
         return resolve(self, result, batch, *args, **kwargs)
@@ -437,6 +444,10 @@ def patch_sglang_metrics_reporter(module: ModuleType) -> bool:
                 logger.exception("fpm_hooks: SGLang step diagnostics failed; emitting lists only")
                 diagnostics_failed = True
             step = {}
+        if pairs is None and not getattr(batch, "reqs", None):
+            # A timed forward with no local requests (an idle attention-DP rank)
+            # still carries its host times and device-time categories.
+            pairs = []
         if pairs is None:
             return metrics
         try:

@@ -33,7 +33,7 @@ STEP_FIELDS: dict[str, tuple[Any, Any]] = {
     "device_time_s_by_category": (dict[str, float], dict),
     # Host monotonic clock (seconds, per worker process) when the scheduler
     # started building this batch (0.0 on SGLang 0.5.23+, which has no
-    # ``fpm_start_time``), and when this record was emitted.
+    # ``fpm_start_time``), and when the metrics handler started for this record.
     "host_scheduled_at_s": (float, 0.0),
     "host_emitted_at_s": (float, 0.0),
 }

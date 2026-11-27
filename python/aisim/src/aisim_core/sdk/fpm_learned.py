@@ -224,8 +224,9 @@ def _open_text(path: str | os.PathLike[str]):
 def _unwrap_record(raw: dict[str, Any]) -> dict[str, Any] | None:
     """Accept a flat FPM record, a Dynamo trace envelope, or a sink record.
 
-    The trace sink's ``observed_at_unix_ms`` (envelope level) is copied onto the
-    FPM mapping so callers can window records by wall-clock time.
+    The trace sink's ``observed_at_unix_ms`` (envelope level) and the receive
+    time (``recv_ms``, or the FPM recorder's ``received_unix_s``) are copied onto
+    the FPM mapping so callers can window records by wall-clock time.
     """
     if "scheduled_requests" in raw:
         return raw
@@ -247,6 +248,10 @@ def _unwrap_record(raw: dict[str, Any]) -> dict[str, Any] | None:
         for key in ("observed_at_unix_ms", "recv_ms"):
             if key in holder and key not in fpm:
                 fpm[key] = holder[key]
+    # The aisim_core.fpm_hooks recorder keeps the receive time as Unix seconds.
+    received = raw.get("received_unix_s")
+    if isinstance(received, int | float) and "recv_ms" not in fpm:
+        fpm["recv_ms"] = round(received * 1000)
     return fpm
 
 

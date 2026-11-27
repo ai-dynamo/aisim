@@ -731,3 +731,33 @@ def test_sglang_spec_steps_follow_the_forward_result_width(fake_sglang):
     mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(speculative_num_draft_tokens=3, accept_lens=None))
     m = mixin.published[-1][1]
     assert (m.spec_num_steps, m.spec_num_draft_tokens) == (2, 3) and m.extend_lengths == [3]
+
+
+def test_sglang_idle_rank_record_keeps_step_fields(fake_sglang):
+    """A timed attention-DP forward with no local requests keeps the extended struct."""
+    _, reporter = fake_sglang
+    sglang.patch_sglang_metrics_reporter(reporter)
+    mixin = reporter.SchedulerMetricsReporter(spec=(3, 4))
+    batch = types.SimpleNamespace(forward_mode=_Mode("decode"), reqs=[], seq_lens_cpu=[])
+    mixin.forward_pass_device_timer.finish(0.02, "target_verify")
+    mixin._emit_forward_pass_metrics(batch, types.SimpleNamespace(accept_lens=None))
+    m = mixin.published[-1][1]
+    assert m.extend_lengths == [] and m.past_kv_lengths == []
+    assert m.host_emitted_at_s > 0 and m.device_time_s_by_category == {"target_verify": 0.02}
+
+
+def test_sglang_presettle_skipped_on_ranks_without_fpm():
+    processor = _fake_result_processor()
+    sglang.patch_sglang_batch_result_processor(processor)
+    worker = processor.BatchResultProcessor()
+    worker.metrics_reporter = types.SimpleNamespace(scheduler=types.SimpleNamespace(enable_fpm=False))
+    result = types.SimpleNamespace(accept_lens=_Lens([3]))
+    worker._resolve_spec_v2_tokens(result, types.SimpleNamespace(reqs=[_SpecReq(51)]))
+    assert not hasattr(result, sglang._PRESETTLE)
+
+
+def test_learned_loader_keeps_the_recorder_receive_time():
+    from aisim_core.sdk.fpm_learned import _unwrap_record
+
+    line = {"sequence": 7, "received_unix_s": 1700000000.25, "fpm": {"scheduled_requests": {}}}
+    assert _unwrap_record(line)["recv_ms"] == 1700000000250
