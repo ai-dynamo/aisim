@@ -433,7 +433,8 @@ unavailable. See [FPM power](../perf-model/power.md).
 └── afd-qualification.json         # only for AFD
 ```
 
-- `prediction.json` preserves the selected runner's existing full prediction report.
+- `prediction.json` preserves the selected runner's existing full prediction report. It is
+  indented JSON; with `--capture-per-request`, each `per_request` row is on one compact line.
 - `requests.jsonl` contains one record per request when explicitly enabled. SGLang workers with
   `host_loop` add `scheduler_received_ms`, `selected_ms` and `prefill_complete_ms` to each
   record; a worker with `frontend` or `host_profile` also adds `frontend_ready_ms`, and a native
