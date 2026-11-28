@@ -1038,7 +1038,9 @@ def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth
     least one decode-only request wider than 1; the stock SGLang decode hook lists 1 for every request. A
     decode-only step's every listed width must be allowed. A mixed step's lists do not mark which requests
     decode (vLLM sorts them by KV), so at least ``num_decode_requests`` of its widths must be allowed, and the
-    tokens beyond ``sum_prefill_tokens`` must fit that many decode requests at the allowed widths.
+    tokens beyond ``sum_prefill_tokens`` cannot exceed that many decode requests at the full width. Only this
+    upper bound is checked: SGLang's reporter can page-round ``sum_prefill_tokens`` above the logical lengths
+    the lists carry, which only lowers the remainder.
     Aggregate-only captures carry no widths.
     """
     low = depth + 1 if full else 1
@@ -1061,11 +1063,11 @@ def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth
                         "record or pass the depth the steps ran at"
                     )
                 decode_tokens = sum(widths) - int(sched.get("sum_prefill_tokens", 0))
-                if not decodes * low <= decode_tokens <= decodes * (depth + 1):
+                if decode_tokens > decodes * (depth + 1):
                     raise ValueError(
                         f"iteration {index}: the extend lengths {widths} leave {decode_tokens} tokens beyond "
-                        f"sum_prefill_tokens for {decodes} decode requests, but MTP depth {depth} verifies "
-                        f"{expected} tokens per request; record or pass the depth the steps ran at"
+                        f"sum_prefill_tokens for {decodes} decode requests, but MTP depth {depth} verifies at most "
+                        f"{depth + 1} tokens per request; record or pass the depth the steps ran at"
                     )
                 continue
             if bad := [width for width in widths if width not in allowed]:
@@ -1163,8 +1165,11 @@ def train(
     if not dataset:
         raise ValueError("no trainable iterations (all idle, zero wall_time, or role-incompatible)")
     # The depth and its widths describe exactly the rows the exported stores fit.
-    fitted = sorted(index for kind, indices in sources.items() if len(indices) >= min_store_rows for index in indices)
-    trained_nextn = training_nextn([iterations[index] for index in fitted], nextn, worker_type)
+    fitted = {index for indices in sources.values() if len(indices) >= min_store_rows for index in indices}
+    # A sequential pass: callers may stream a re-iterable source that does not support indexing.
+    trained_nextn = training_nextn(
+        [metrics for index, metrics in enumerate(iterations) if index in fitted], nextn, worker_type
+    )
     if checkpoint_identity is not None:
         _require_identity_depth(checkpoint_identity, trained_nextn)
     elif metadata and isinstance(metadata.get("identity"), dict):

@@ -859,10 +859,6 @@ struct DecodeBatch {
     /// Query tokens each of those requests computes: one plus its scheduled
     /// drafts, including native MTP's padded positions.
     widths: Vec<usize>,
-    /// Native MTP requests that also compute prompt tokens in this pass (a
-    /// re-admission after preemption), with the width their decode entry
-    /// takes from their one query; their prefill entry takes the rest.
-    shared_queries: Vec<(Uuid, usize)>,
 }
 
 impl DecodeBatch {
@@ -3830,19 +3826,13 @@ impl VllmCore {
             prefill: prefill.map(|totals| PrefillWork {
                 totals,
                 requests: scheduled
-                    .iter()
-                    .filter(|(_, work)| work.prompt_tokens > 0)
+                    .values()
+                    .filter(|work| work.prompt_tokens > 0)
                     // Native MTP computes its whole query, padding included,
-                    // as the batch totals count it, less any part its decode
-                    // entry prices, so each query counts once.
-                    .map(|(uuid, work)| {
+                    // as the batch totals and compute_fpm count it.
+                    .map(|work| {
                         let tokens = if work.native_mtp {
-                            let decoded = decode
-                                .shared_queries
-                                .iter()
-                                .find(|(shared, _)| shared == uuid)
-                                .map_or(0, |&(_, width)| width);
-                            work.total_tokens - decoded
+                            work.total_tokens
                         } else {
                             work.prompt_tokens
                         };
@@ -4954,10 +4944,8 @@ impl VllmCore {
             bursts.push(SpeculativeBurst {
                 uuid,
                 limit,
-                // A query that also computes prompt tokens is split: its
-                // prefill entry takes what this decode entry does not.
                 width: match work {
-                    Some(work) if native && work.prompt_tokens == 0 => work.total_tokens,
+                    Some(work) if native => work.total_tokens,
                     _ => limit,
                 },
                 remaining,
@@ -5052,14 +5040,14 @@ impl VllmCore {
         // A burst's physical query is the round's verification width; native
         // MTP padding computes positions the round cannot accept.
         for burst in &bursts {
-            if let Some(length) = burst.decode_length {
+            // A native MTP query that also computes prompt tokens (a
+            // re-admission after preemption) is one prefill request, as
+            // compute_fpm reports it; its prefill work prices the whole query.
+            let readmitted = scheduled
+                .get(&burst.uuid)
+                .is_some_and(|work| work.native_mtp && work.prompt_tokens > 0);
+            if let Some(length) = burst.decode_length.filter(|_| !readmitted) {
                 decode.push(length, burst.width, bursts.len());
-                if scheduled
-                    .get(&burst.uuid)
-                    .is_some_and(|work| work.native_mtp && work.prompt_tokens > 0)
-                {
-                    decode.shared_queries.push((burst.uuid, burst.width));
-                }
             }
         }
 

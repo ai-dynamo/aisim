@@ -856,6 +856,9 @@ def test_mixed_steps_must_list_a_verify_width_for_every_decode_request():
     with pytest.raises(ValueError, match=r"leave 5 tokens beyond sum_prefill_tokens for 1 decode requests"):
         fpm_learned.training_nextn([[decode], [_listed_mixed([2, 5], 1, prefill_tokens=2)]], nextn=3)
     assert fpm_learned.training_nextn([[decode], [_listed_mixed([2, 4], 1, prefill_tokens=2)]], nextn=3) == 3
+    # SGLang may page-round sum_prefill_tokens above the listed logical lengths: still trainable.
+    sglang = _listed_mixed([1, 31, 1, 19], 2, prefill_tokens=512)
+    assert fpm_learned.training_nextn([[sglang]]) == 0
     with pytest.raises(ValueError, match=r"only 1 of the extend lengths \[6, 6, 100\] fit|only 0 of"):
         fpm_learned.training_nextn([[decode], [_listed_mixed([6, 6, 100], 2)]], nextn=3)
     with pytest.raises(ValueError, match=r"only 1 of the extend lengths \[100, 4, 6\] fit MTP depth 3"):

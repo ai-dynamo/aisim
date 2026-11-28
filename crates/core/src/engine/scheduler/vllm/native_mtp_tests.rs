@@ -554,10 +554,10 @@ fn padded_waiting_query_reaches_fitted_timing_at_its_physical_width() {
 }
 
 #[test]
-fn readmitted_query_reaches_fitted_timing_once() {
+fn readmitted_query_reaches_fitted_timing_as_one_prefill() {
     // A preempted depth-2 request with a four-token prompt and one generated
-    // token recomputes all five known tokens in one query. Its prefill and
-    // decode entries split that query, so fitted timing counts it once.
+    // token recomputes all five known tokens in one query. Like the
+    // scheduler's own telemetry, fitted timing sees one five-token prefill.
     let mut config = args(2, 16, true, false);
     config.num_gpu_blocks = 5;
     let mut core = VllmCore::new(config);
@@ -581,8 +581,26 @@ fn readmitted_query_reaches_fitted_timing_once() {
 
     let work = core.schedule_pass(None, second.end_ms).unwrap();
     let prefill = work.prefill.as_ref().unwrap();
-    let widths = &work.decode.as_ref().unwrap().widths;
-    assert_eq!(prefill.requests, vec![(4, 0, 4)]);
-    assert_eq!(widths, &vec![1]);
-    core.resolve_pass(None).unwrap();
+    assert_eq!(prefill.requests, vec![(5, 0, 4)]);
+    assert_eq!(prefill.totals.batch_size, 1);
+    assert_eq!(prefill.totals.new_tokens, 5);
+    assert!(
+        work.decode.is_none(),
+        "no decode entry for the readmitted query"
+    );
+    let query = crate::engine::fitted_timing::fitted_rank_query(&work).unwrap();
+    let metrics = crate::engine::fitted_timing::detailed_rank_metrics(&query, &work).unwrap();
+    let scheduled = &metrics.scheduled_requests;
+    assert_eq!(scheduled.num_prefill_requests, 1);
+    assert_eq!(scheduled.num_decode_requests, 0);
+    assert_eq!(scheduled.extend_lengths.as_deref(), Some(&[5][..]));
+    assert_eq!(scheduled.past_kv_lengths.as_deref(), Some(&[0][..]));
+    let resolved = core.resolve_pass(None).unwrap();
+    assert!(
+        resolved
+            .output_signals
+            .iter()
+            .any(|signal| signal.uuid == second_id && signal.token_id.is_some()),
+        "the readmitted request still emits"
+    );
 }
