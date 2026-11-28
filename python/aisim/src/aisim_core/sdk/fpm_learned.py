@@ -674,7 +674,10 @@ def _require_identity_depth(identity: dict[str, Any], depth: int) -> None:
     Rust's identity projection already spells an MTP scheme as ``nextn``.
     """
     if identity.get("speculation") is not None:
-        raise ValueError("learned artifacts support only MTP speculation; the training identity names another scheme")
+        raise ValueError(
+            "the training identity names a speculation scheme; learned artifacts support only MTP, which the "
+            "canonical identity (RustForwardPassPerfModel.learned_identity) spells as nextn"
+        )
     if identity.get("nextn", 0) != depth:
         raise ValueError(
             f"training identity has MTP depth {identity.get('nextn', 0)}, but the steps ran at depth {depth}; "
@@ -938,6 +941,10 @@ def _write_training_checkpoint(
 _MAX_NEXTN = 2**32 - 1
 
 
+# Configuration validation accepts nextn (and MTP depth) 0..=5, so a deeper artifact could never be constructed.
+_MAX_TRAINED_NEXTN = 5
+
+
 def _is_nextn(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and 0 <= value <= _MAX_NEXTN
 
@@ -965,8 +972,8 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
     match a recorded depth. Without either, the steps ran without speculative
     decoding (depth 0).
     """
-    if nextn is not None and not _is_nextn(nextn):
-        raise ValueError(f"nextn must be an integer in [0, {_MAX_NEXTN}], got {nextn!r}")
+    if nextn is not None and not (_is_nextn(nextn) and nextn <= _MAX_TRAINED_NEXTN):
+        raise ValueError(f"nextn must be an integer in [0, {_MAX_TRAINED_NEXTN}], got {nextn!r}")
     recorded: set[int] = set()
     unrecorded = False
     for index, metrics_by_rank in enumerate(iterations):
@@ -998,8 +1005,10 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
             raise ValueError(f"nextn={nextn} does not match the steps' recorded spec_num_steps={depth}")
     else:
         depth = nextn or 0
-    if not _is_nextn(depth):
-        raise ValueError(f"recorded MTP depth {depth} is outside [0, {_MAX_NEXTN}]")
+    if depth > _MAX_TRAINED_NEXTN:
+        raise ValueError(
+            f"recorded MTP depth {depth} is outside [0, {_MAX_TRAINED_NEXTN}], the depths a configuration accepts"
+        )
     _require_verify_widths(iterations, depth, full=bool(recorded))
     return depth
 
@@ -1007,26 +1016,35 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
 def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth: int, *, full: bool) -> None:
     """Per-request decode widths must match the query replay sends at ``depth``.
 
-    Replay queries each decode request at its verify width: ``depth + 1``, or 1 without speculation. Each
-    decode-only step's listed extend lengths are checked against it. Steps that record the capture hook's
-    depth fields (SGLang, ``full``) must list the full width. vLLM may schedule a shorter width near token or
-    context limits, so other MTP captures may list 1 to ``depth + 1`` but need at least one request wider
-    than 1; the stock SGLang decode hook lists 1 for every request. Aggregate-only captures carry no widths.
+    Replay queries each decode request at its verify width: ``depth + 1``, or 1 without speculation. Steps
+    that record the capture hook's depth fields (SGLang, ``full``) must list the full width. vLLM may schedule
+    a shorter width near token or context limits, so other MTP captures may list 1 to ``depth + 1`` but need at
+    least one decode-only request wider than 1; the stock SGLang decode hook lists 1 for every request. A
+    decode-only step's every listed width must be allowed. A mixed step's lists do not mark which requests
+    decode (vLLM sorts them by KV), so at least ``num_decode_requests`` of its widths must be allowed.
+    Aggregate-only captures carry no widths.
     """
+    low = depth + 1 if full else 1
+    expected = f"{depth + 1}" if low == depth + 1 else f"1 to {depth + 1}"
     widest = None
     for index, metrics_by_rank in enumerate(iterations):
         for fpm in metrics_by_rank:
             sched = _sched(fpm)
-            if int(sched.get("num_prefill_requests", 0)) or not int(sched.get("num_decode_requests", 0)):
-                continue
+            decodes = int(sched.get("num_decode_requests", 0))
             pairs = _request_pairs(sched)
-            if pairs is None:
+            if not decodes or pairs is None:
                 continue
             widths = [extend for extend, _ in pairs]
-            low = depth + 1 if full else 1
-            bad = [width for width in widths if not low <= width <= depth + 1]
-            if bad:
-                expected = f"{depth + 1}" if low == depth + 1 else f"1 to {depth + 1}"
+            allowed = [width for width in widths if low <= width <= depth + 1]
+            if int(sched.get("num_prefill_requests", 0)):
+                if len(allowed) < decodes:
+                    raise ValueError(
+                        f"iteration {index}: only {len(allowed)} of the extend lengths {widths} fit MTP depth "
+                        f"{depth}'s verify width {expected}, but the step schedules {decodes} decode requests; "
+                        "record or pass the depth the steps ran at"
+                    )
+                continue
+            if bad := [width for width in widths if width not in allowed]:
                 raise ValueError(
                     f"iteration {index}: decode request extend lengths {bad} contradict MTP depth {depth}, which "
                     f"replay queries at verify width {expected}; record or pass the depth the steps ran at"
@@ -1088,6 +1106,9 @@ def train(
         raise ValueError("metadata.identity conflicts with the canonical training identity")
     if checkpoint_identity is not None:
         _require_identity_depth(checkpoint_identity, trained_nextn)
+    elif metadata and isinstance(metadata.get("identity"), dict):
+        # Rust compares a supplied metadata.identity with the configuration it loads at.
+        _require_identity_depth(metadata["identity"], trained_nextn)
     provenance: dict[str, list[tuple[int, str]]] = {}
     checkpoint_stores: dict[str, dict[str, Any]] = {}
     if online_checkpoint_dir is not None:
@@ -1446,7 +1467,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--nextn",
         type=int,
         default=None,
-        help="MTP draft depth of the steps, for telemetry that does not record spec_num_steps "
+        help="MTP draft depth of the steps (0 to 5), for telemetry that does not record spec_num_steps "
         "(default: read from the steps, else 0); recorded as metadata.nextn",
     )
     tr.add_argument(

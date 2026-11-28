@@ -64,19 +64,24 @@ trained without MTP is never used for MTP, and an MTP artifact is never used
 for plain decode or another depth. The trainer writes `metadata.nextn` from the
 steps' `spec_num_steps` (or `spec_num_draft_tokens - 1`), or from `--nextn`
 for telemetry without those fields (see
-[Train](learned-forward-pass-model.md#2-train)). It checks each decode-only
-step's per-request extend lengths against that depth, since replay queries a
-decode request at its verify width: 1 without MTP; exactly `nextn + 1` for
-steps that record the hook's depth fields (SGLang); and 1 to `nextn + 1` for
-other MTP steps (vLLM), of which at least one request must be wider than 1. The
-stock SGLang decode hook lists 1 for every request, so its MTP captures are
-rejected. Aggregate-only captures carry no widths. The depth, given or
-recorded, must fit in the loader's `u32`.
+[Train](learned-forward-pass-model.md#2-train)). It checks each step's
+per-request extend lengths against that depth, since replay queries a decode
+request at its verify width: 1 without MTP; exactly `nextn + 1` for steps that
+record the hook's depth fields (SGLang); and 1 to `nextn + 1` for other MTP
+steps (vLLM), of which at least one decode-only request must be wider than 1.
+Every width of a decode-only step must be allowed. A mixed step's lists do not
+mark which requests decode (vLLM sorts them by KV length), so at least
+`num_decode_requests` of its widths must be allowed. The stock SGLang decode
+hook lists 1 for every request, so its MTP captures are rejected.
+Aggregate-only captures carry no widths. The trained depth must be 0 to 5, the
+range a configuration accepts; `metadata.nextn` itself must fit in the
+loader's `u32`.
 
 `nextn: N` and an MTP scheme of depth N are one deployment identity: an
 artifact's `metadata.identity` and a checkpoint's identity record the scheme as
 `nextn`, so either spelling loads a source trained with the other. A training
-identity (`--identity`) must name the steps' depth.
+identity (`--identity`, or `metadata.identity` passed to `train`) must name the
+steps' depth.
 
 ## Estimator namespaces
 
