@@ -1,0 +1,254 @@
+{
+  "argv": [
+    "--out",
+    "/work/out/v0523-q8-tp2",
+    "--checks",
+    "1,2,3,4",
+    "--max-batch",
+    "128",
+    "--repeats",
+    "5",
+    "--",
+    "--model-path",
+    "/models/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+    "--tp-size",
+    "2"
+  ],
+  "sglang_argv": [
+    "--model-path",
+    "/models/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+    "--tp-size",
+    "2"
+  ],
+  "recorder_dir": "/work/out/v0523-q8-tp2/recorder/20261114-040757",
+  "headers": [
+    {
+      "file": "sched-4815.jsonl",
+      "type": "header",
+      "pid": 4815,
+      "sglang_version": "0.5.23",
+      "class": "RecorderScheduler",
+      "mro": [
+        "RecorderScheduler",
+        "Scheduler",
+        "SchedulerDisaggregationDecodeMixin"
+      ],
+      "install": "hook",
+      "ranks": {
+        "attn_tp_rank": 0,
+        "attn_dp_rank": 0,
+        "attn_cp_rank": 0,
+        "pp_rank": 0,
+        "tp_size": 2,
+        "attn_dp_enabled": false
+      },
+      "page_size": 1,
+      "enable_overlap": true,
+      "chunked_prefill_size": 8192,
+      "max_prefill_tokens": 16384,
+      "max_running_requests": 4096,
+      "max_total_num_tokens": 1698074,
+      "max_req_input_len": 40954,
+      "input_blocker": false
+    },
+    {
+      "file": "sched-4880.jsonl",
+      "type": "header",
+      "pid": 4880,
+      "sglang_version": "0.5.23",
+      "class": "RecorderScheduler",
+      "mro": [
+        "RecorderScheduler",
+        "Scheduler",
+        "SchedulerDisaggregationDecodeMixin"
+      ],
+      "install": "hook",
+      "ranks": {
+        "attn_tp_rank": 1,
+        "attn_dp_rank": 0,
+        "attn_cp_rank": 0,
+        "pp_rank": 0,
+        "tp_size": 2,
+        "attn_dp_enabled": false
+      },
+      "page_size": 1,
+      "enable_overlap": true,
+      "chunked_prefill_size": 8192,
+      "max_prefill_tokens": 16384,
+      "max_running_requests": 4096,
+      "max_total_num_tokens": 1698074,
+      "max_req_input_len": 40954,
+      "input_blocker": false
+    }
+  ],
+  "check_1": {
+    "name": "recorder headers",
+    "pass": true,
+    "scheduler_processes": 2,
+    "expected": 2,
+    "classes": [
+      "RecorderScheduler"
+    ],
+    "install": [
+      "hook"
+    ],
+    "sglang_version": [
+      "0.5.23"
+    ],
+    "page_size": 1,
+    "enable_overlap": true,
+    "faults": [],
+    "seconds": 0.0
+  },
+  "check_2": {
+    "name": "one batch call, one extend batch",
+    "pass": true,
+    "cases": [
+      {
+        "batch": 2,
+        "pass": true,
+        "extend_batches": [
+          [
+            6,
+            2
+          ]
+        ],
+        "modes": [
+          "EXTEND"
+        ]
+      },
+      {
+        "batch": 128,
+        "pass": true,
+        "extend_batches": [
+          [
+            7,
+            128
+          ]
+        ],
+        "modes": [
+          "EXTEND"
+        ]
+      }
+    ],
+    "seconds": 0.28
+  },
+  "check_3": {
+    "name": "page-size formulas",
+    "page_size": 1,
+    "cases": [
+      {
+        "case": "prefill aligned prefix, warm shot",
+        "cached_tokens": [
+          128,
+          128
+        ],
+        "expected": 128,
+        "pass": true
+      },
+      {
+        "case": "prefill aligned prefix, measured shot",
+        "cached_tokens": [
+          128,
+          128
+        ],
+        "expected": 128,
+        "pass": true
+      },
+      {
+        "case": "prefill unaligned prefix",
+        "cached_tokens": [
+          135,
+          135
+        ],
+        "expected": 135,
+        "pass": true
+      },
+      {
+        "case": "decode seed (cold)",
+        "cached_tokens": [
+          0,
+          0
+        ],
+        "expected": 0,
+        "pass": true
+      },
+      {
+        "case": "decode measured run",
+        "cached_tokens": [
+          1020,
+          1020
+        ],
+        "expected": 1020,
+        "pass": true
+      }
+    ],
+    "decode_prompt_tokens": [
+      1021,
+      1021
+    ],
+    "decode_extend_tokens": [
+      2
+    ],
+    "pass": true,
+    "seconds": 0.5
+  },
+  "check_4": {
+    "name": "decode steps",
+    "pass": true,
+    "cases": [
+      {
+        "batch": 2,
+        "context": 1024,
+        "pass": true,
+        "modes_seen": [
+          "EXTEND DECODE DECODE DECODE DECODE DECODE DECODE"
+        ],
+        "median_inter_output_ms_by_step": [
+          3.216,
+          3.592,
+          3.596,
+          3.594,
+          3.595,
+          3.591
+        ],
+        "median_launch_to_output_ms_by_step": [
+          4.433,
+          5.531,
+          6.571,
+          6.545,
+          6.579,
+          6.558
+        ],
+        "median_kept_ms": 3.596
+      },
+      {
+        "batch": 8,
+        "context": 1024,
+        "pass": true,
+        "modes_seen": [
+          "EXTEND DECODE DECODE DECODE DECODE DECODE DECODE"
+        ],
+        "median_inter_output_ms_by_step": [
+          3.411,
+          3.79,
+          3.802,
+          3.806,
+          3.793,
+          3.803
+        ],
+        "median_launch_to_output_ms_by_step": [
+          4.708,
+          5.101,
+          6.86,
+          6.851,
+          6.909,
+          6.831
+        ],
+        "median_kept_ms": 3.802
+      }
+    ],
+    "seconds": 1.66
+  },
+  "faults": []
+}

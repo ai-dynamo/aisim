@@ -2717,3 +2717,237 @@ https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6
 
 Modified for AISim's current layout and contracts; source links are
 preserved beside the adapted content.
+
+## Dynamo vLLM self-benchmark rules in the SGLang self-benchmark producer core
+
+Repository-root files `python/aisim/collector/fpm_forward/runtime/sglbench_grid.py` and
+`python/aisim/collector/fpm_forward/runtime/sglbench_artifact.py`, with the tests
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{grid,artifact,producer}.py`,
+re-implement rules of NVIDIA Dynamo's vLLM self-benchmark for an SGLang engine. They are
+modified re-implementations: no upstream function or block of source is copied; the flag,
+key and reason names and two short error-message phrases are upstream's.
+`python/aisim/collector/fpm_forward/runtime/sglbench_content.py`, with the test
+`python/aisim/tests/unit/collector/test_fpm_sglbench_content.py`, takes no code. Its
+docstring names Dynamo's content-seed variable and its default, and the caller passes the
+value in. It restates two rules of the same source at the same revision for prompts made
+of dataset text: which conversations of a ShareGPT-style dataset are kept and how the text
+of one is formed (`_kvwarm_load_texts`, restated in `conversation_texts`, with the pool
+name `conversation_sha256_even`), and the chain of whole conversations in a seeded order
+that a prompt is cut from (`_kvwarm_chain_token_ids`). No upstream function or block of
+source is copied. Changes: the order of a chain comes from the module's own SHA-256
+counter stream and not from `random.Random`, a chain belongs to one prompt part and not to
+a batch position, the conversations are tokenized before the plan is built into a pool
+that leaves out a token id the served model does not count, and the first token of every
+prompt part is allocated and is not text.
+
+`python/aisim/collector/fpm_forward/runtime/sglbench_driver.py` and
+`python/aisim/collector/fpm_forward/runtime/sglbench_launcher.py`, with the tests
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{driver,launcher}.py`, re-implement
+further parts of the same source at the same revision. From `instrumented_scheduler.py`:
+the run lifecycle and the point procedures of the driver (`_bench_step_warmup`,
+`_bench_realseed_stage_point`, `_bench_realseed_pending_step`,
+`_bench_stop_at_timeout_boundary`, `_bench_fpm_validation_failure`,
+`_bench_start_timing`) with five failure reason strings, and the environment variables
+the launcher reads (`_bench_init`, `_kvwarm_flag_on`, `_bench_realseed_on`). From
+`backend_args.py`: the names, defaults and `DYN_*` variables of the benchmark flags. No
+upstream function or block of source is copied. Changes: the driver stages every point
+through engine requests and takes batch times from a recorder log, where upstream steps
+its own scheduler; it also looks at the soft deadline before the first point; the
+launcher requires a benchmark mode and refuses the options this producer does not
+implement.
+
+For a run whose prompts are dataset text the launcher also restates, from
+`instrumented_scheduler.py` at the same revision, the resolution of the dataset
+(`_kvwarm_resolve_dataset`): the three variables `DYN_BENCH_KV_WARMUP_DATASET`,
+`DYN_BENCH_KV_WARMUP_CACHE_DIR` and `DYN_BENCH_KV_WARMUP_SHA256`, the default cache folder
+beside `HF_HOME`, the download with `urllib` into a part file that is hashed before it is
+moved into place, and three constants with upstream's values: the default dataset URL,
+its pinned SHA-256 and the download timeout. The driver and the launcher use the names of
+the four verdicts of upstream's content probe (`_kvwarm_probe_content`):
+`dataset_unavailable`, `dataset_empty`, `tokenizer_unavailable` and `content_too_shallow`.
+The record of the dataset that `sglbench_artifact.py` writes into the `kvwarm` block of a
+decode or agg artifact has the four keys upstream writes there (`_kvwarm_load_texts`):
+`path`, `sha256`, `collection_pool` and `conversations`;
+`python/aisim/tests/unit/collector/test_fpm_sglang_moe.py` types a record with these keys.
+The value `sharegpt_chain` of `DYN_BENCH_PREFILL_CONTENT` is upstream's name
+(`_bench_synthetic_token_ids`). No upstream function or block of source is copied.
+Changes: an empty variable counts as unset; the hash of a local file is compared with the
+expected one too; a dataset that cannot be had, is empty, cannot be tokenized or is too
+short fails the run, where upstream skips its warm-up; the launcher tokenizes with the
+engine's tokenizer in batches until a bounded pool is full; and in such a run every prompt
+is text, where upstream's variable changes its prefill prompts only. The dataset itself is
+not part of this repository or of its distributions: the pod reads a file the deployment
+provides, or downloads the file from the URL at run time.
+
+Source: https://github.com/ai-dynamo/dynamo/tree/b20fe6fe94021b854597965c7305931175e8f482
+
+Original paths and what follows them:
+
+- `components/src/dynamo/vllm/instrumented_scheduler.py`: the uniform axis cut
+  (`_uniformly_limit_axis`), the tail-protecting cut (`_limit_cudagraph_axis`), the
+  candidates of a graph-driven axis (`_cudagraph_axis_points`), the doubling ladder
+  (`_powers_of_two_up_to`), the composition, numbering and digest of the grid
+  (`_bench_build_grid`), its order (`_bench_generate_prefill_grid`,
+  `_kvwarm_order_decode_points`), the text of the infeasible-point error
+  (`_bench_raise_explicit_infeasible`), the key names and the status rule of the result
+  envelope, the upper median of the kept decode steps, the text of the failed-point
+  error (`_bench_skip_point`) and the name and default of the content seed
+  (`ENV_BENCH_CONTENT_SEED`). For dataset text: the dataset resolution
+  (`_kvwarm_resolve_dataset`) with the default URL (`_KVWARM_DEFAULT_DATASET_URL`), its
+  pinned SHA-256 (`_KVWARM_DEFAULT_DATASET_SHA256`) and the download timeout
+  (`_KVWARM_DOWNLOAD_TIMEOUT_S`), the text recipe and the dataset record
+  (`_kvwarm_load_texts`), the chain of conversations (`_kvwarm_chain_token_ids`), the
+  verdict names of the content probe (`_kvwarm_probe_content`) and the content word
+  `sharegpt_chain` (`_bench_synthetic_token_ids`).
+- `components/src/dynamo/vllm/backend_args.py`: the names and defaults of the five
+  sample-cap flags and of `--benchmark-max-batch-size`, and the bounds of the caps
+  (`_validate_benchmark_sampling`).
+- `components/src/dynamo/vllm/benchmark_points.py`: the benchmark modes, the points
+  manifest schema and the point checks (`validate_totals`).
+- `components/src/dynamo/vllm/worker_factory.py`: the merged result file
+  (`_merge_benchmark_rank_results`).
+- `components/src/dynamo/common/forward_pass_metrics.py`: the field names of a
+  forward-pass record.
+
+Closest to the upstream code are `limit_uniform`, `limit_graph_axis`, `_doubling`,
+`SampleCaps.__post_init__` and the digest expression in `sglbench_grid.py`, and the two
+error-message phrases.
+Changes: the cached-token axis is page aligned, decode contexts start at four tokens per
+request, a generated point that does not fit raises instead of being skipped, manifest
+totals that do not divide by the batch size are refused, a decode record keeps its six
+raw step times, and the modules use the standard library only.
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. Licensed
+under Apache-2.0. No upstream root NOTICE exists. Upstream license:
+https://github.com/ai-dynamo/dynamo/blob/b20fe6fe94021b854597965c7305931175e8f482/LICENSE
+
+## SGLang v0.5.22 and v0.5.23 admission rules in the SGLang self-benchmark producer core
+
+The feasibility rules and the first step of the prefill new-token axis in repository-root
+`python/aisim/collector/fpm_forward/runtime/sglbench_grid.py`, the admission,
+graph-size and graph-replay models in
+`python/aisim/tests/unit/collector/test_fpm_sglbench_grid.py`, whose graph sizes
+`python/aisim/tests/unit/collector/test_fpm_sglbench_producer.py` also uses, and the
+prefix-cache model `PageCacheModel` in
+`python/aisim/tests/unit/collector/test_fpm_sglbench_content.py`, which
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{driver,launcher}.py` also use, are
+modified behavioral adaptations of SGLang v0.5.22 at commit
+`baa9befa381511cd4d56f83980951e5a45fffc6d` and SGLang v0.5.23 at commit
+`297e54fd105e974cdf401e5b4d20253a22c16f90`:
+https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
+https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
+
+Upstream paths, under `python/sglang/srt/`:
+`managers/{tp_worker.py,utils.py,scheduler.py,schedule_policy.py,schedule_batch.py}`,
+`mem_cache/{prefill_budget.py,allocator/base.py,radix_cache.py,kv_cache_configurator.py,common.py}`,
+`model_executor/pool_configurator.py`,
+`model_executor/runner/{prefill_cuda_graph_runner.py,base_cuda_graph_runner.py}`,
+`arg_groups/{validation_hook.py,cuda_graph_hook.py}`,
+`hardware_backend/npu/utils.py` and `layers/attention/dsv4/metadata.py`.
+Copyright 2023-2026 SGLang Team. Licensed under Apache-2.0. No upstream root NOTICE
+exists. The upstream license is at
+https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/LICENSE
+
+Modified: the admission arithmetic is restated as closed forms over a record of engine
+limits, the rule by which a batch replays a captured prefill graph is restated as the
+smallest token count that runs with the smallest captured size, and the tests model one
+admission pass, the graph-size ladders, that replay rule and whole-page
+prefix matching. Nothing is imported from SGLang, no upstream function is copied and no
+serving implementation is vendored. `test_fpm_sglbench_grid.py` holds single upstream
+statements as strings and compares them with a local checkout of each release when one is
+given: the last five statements of `PrefillCudaGraphRunner.can_replay_locally`, the last
+two of `BaseCudaGraphRunner._pad_to_bucket`, two assignments of the prefill runner and two
+statements of `generate_prefill_cuda_graph_batch_sizes`. `sglbench_content.py` and
+`sglbench_artifact.py` name SGLang functions in comments and docstrings only.
+
+## SGLang v0.5.22 and v0.5.23 interfaces used by the SGLang self-benchmark launcher
+
+Repository-root files `python/aisim/collector/fpm_forward/runtime/sglbench_recorder.py`,
+`python/aisim/collector/fpm_forward/runtime/sglbench_compat.py`,
+`python/aisim/collector/fpm_forward/runtime/sglbench_driver.py` and
+`python/aisim/collector/fpm_forward/runtime/sglbench_launcher.py`, with the tests
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{recorder,compat,driver,launcher}.py`,
+are written against the interfaces of SGLang v0.5.22 at commit
+`baa9befa381511cd4d56f83980951e5a45fffc6d` and SGLang v0.5.23 at commit
+`297e54fd105e974cdf401e5b4d20253a22c16f90`:
+https://github.com/sgl-project/sglang/tree/baa9befa381511cd4d56f83980951e5a45fffc6d
+https://github.com/sgl-project/sglang/tree/297e54fd105e974cdf401e5b4d20253a22c16f90
+
+What follows SGLang: `sglbench_recorder.py` subclasses SGLang's `Scheduler` at run time,
+wraps `run_batch` and `process_batch_result`, and reads batch, limit and rank attributes
+and the KV-cache dtype of the model runner under SGLang's names. `sglbench_compat.py`
+imports SGLang inside its functions and calls
+its argument parser, engine, tokenizer and plugin loader; it follows the layout of the
+streamed response chunks. `sglbench_driver.py` checks the batch sequences SGLang's
+scheduler produces for one call, and `sglbench_launcher.py` tests SGLang's resolved
+arguments and environment variables under their upstream names and sets one of them
+(`SGLANG_ENABLE_COLOCATED_BATCH_GEN`) for a run with DP attention; these two import no
+SGLang. The tests model those interfaces with fakes. One test of
+`test_fpm_sglbench_launcher.py` also looks up, in a local checkout of each release when
+one is given, the SGLang names of the fields the launcher hides in its dump; it holds
+names only. `sglbench_recorder.py` and `sglbench_driver.py` name
+`configure_kv_cache_dtype` and `TpModelWorker` in comments and docstrings only.
+
+The collector path that starts the launcher follows the same two revisions.
+`python/aisim/collector/fpm_forward/sglang_fpm_builder.py`, with the test
+`python/aisim/tests/unit/collector/test_fpm_sglang_builder.py`, writes eleven of SGLang's
+command-line flags under their upstream names, among them `--ep-size` for the
+expert-parallel size of a MoE cell and `--attn-dp-size` for the data-parallel ranks of a
+DEP cell, and repeats the choice names of the `kv_cache_dtype` field; it imports no SGLang.
+`python/aisim/collector/fpm_forward/runtime/sglbench_preflight.py`, with the tests
+`python/aisim/tests/unit/collector/test_fpm_sglbench_{preflight,gate}.py`, types no SGLang
+name: it looks up the module, class, attribute and field names that `sglbench_compat.py`
+and `sglbench_recorder.py` list in `SGLANG_SEAM_NAMES`.
+`python/aisim/collector/fpm_forward/runtime/fpm_exec.sh` takes no code. Its comments say
+that SGLang kills the process tree of its engine when a scheduler process fails and again
+when the engine shuts down. The tests `python/aisim/tests/unit/collector/test_fpm_exec.py`
+and `python/aisim/tests/unit/collector/test_fpm_sglbench_gate.py` model that with a FAKE
+engine that lists and kills its own descendants.
+`python/aisim/collector/fpm_forward/native_artifact.py` holds two things a result file
+records against its cell: the sizes, under SGLang's meaning of `tp_size` and
+`attn_dp_size`, and the dtype of the KV pool, under the names of the torch dtypes SGLang
+stores and, for an NVFP4 KV cache, the name of SGLang's argument.
+`python/aisim/collector/README.md` describes SGLang's input blocker, its rules on the slice
+of an expert that one rank holds, the KV-cache dtype it stores for `auto` and how a failed
+engine build ends. Both name SGLang files in prose only, and the README quotes short texts
+of SGLang messages.
+
+Upstream paths, under `python/sglang/`: `__init__.py`, `launch_server.py`, `version.py`,
+`kernels/ops/attention/dsv4/unified_kv_kernels/env_gate.py` (v0.5.22 only)
+and, under `srt/`,
+`server_args.py`, `environ.py`, `runtime_context.py`,
+`arg_groups/{arg_utils.py,kv_cache_hook.py,memory_hook.py,model_override_base.py,moe_hook.py,overrides.py,parallel_hook.py,pipeline.py,serving_hook.py,validation_hook.py}`,
+`arg_groups/fields/{device.py,disagg.py,exec_.py,memory.py,model.py,parallel.py,schedule.py,serving.py,spec.py}`,
+`arg_groups/model_overrides/{minimax_m3.py,qwen3_moe.py}`,
+`configs/{glm5_next.py,model_config.py,step3_vl.py}`, `entrypoints/engine.py`, `eplb/expert_location.py`,
+`layers/attention/attention_registry.py`,
+`layers/attention/dsv4/unified_kv_gate.py` (v0.5.23 only),
+`layers/linear.py`, `layers/moe/{ep_moe/layer.py,fused_moe_triton/layer.py}`,
+`layers/quantization/{fp4_kv_cache_quant_method.py,fp8.py,modelopt_quant.py}`,
+`layers/quantization/compressed_tensors/compressed_tensors.py`,
+`layers/quantization/minimax_m3_nvfp4.py` (v0.5.23 only),
+`managers/{data_parallel_controller.py,detokenizer_manager.py,io_struct.py,min_free_slots_delayer.py,schedule_batch.py,schedule_policy.py,scheduler.py,scheduler_input_blocker.py,tokenizer_manager.py,tp_worker.py,utils.py}`,
+`managers/async_d2h_copy_worker.py` (v0.5.23 only),
+`managers/scheduler_components/{batch_result_processor.py,dp_attn.py,invariant_checker.py,ipc_channels.py,metrics_reporter.py,output_streamer.py,recv_skipper.py,request_receiver.py}`,
+`mem_cache/{common.py,kv_cache_builder.py,kv_cache_configurator.py,kv_cache_dtype.py,registry.py}`,
+`mem_cache/minimax_m3_nvfp4_pool.py` (v0.5.23 only),
+`mem_cache/storage/seaweedfs/seaweedfs_store.py`,
+`model_executor/{forward_batch_info.py,model_runner.py,pool_configurator.py}`,
+`model_executor/model_runner_components/moe_ep_setup.py`,
+`model_executor/runner/{decode_cuda_graph_runner.py,eager_runner.py,prefill_cuda_graph_runner.py}`,
+`model_loader/{loader.py,utils.py}`,
+`models/{dbrx.py,glm_image_vl.py,minimax_m2.py,qwen3_moe.py,step3_vl.py,step3p5.py,step3p7.py}`,
+`plugins/{__init__.py,hook_registry.py}`,
+`sampling/{sampling_params.py,watermarking/core.py}` and
+`utils/{common.py,poll_based_barrier.py,watchdog.py,hf_transformers/common.py}`.
+Copyright 2023-2026 SGLang Team. Licensed under Apache-2.0. No upstream root NOTICE
+exists. The upstream license is at
+https://github.com/sgl-project/sglang/blob/297e54fd105e974cdf401e5b4d20253a22c16f90/LICENSE
+
+No upstream function is copied and nothing is vendored. `test_fpm_sglang_builder.py`
+holds single expressions of `handle_data_parallelism` and `resolve_max_num_reqs` as
+strings and compares them with a local checkout of each release when one is given.
+`sglang_fpm_builder.py` and `sglbench_launcher.py` name `handle_deprecated_dp_attention`,
+`derive_attn_tp_size` and `derive_parallel_widths` in comments and docstrings only.
+SGLang is not a dependency of AISim:
+these files run inside an SGLang container, where SGLang is already installed.

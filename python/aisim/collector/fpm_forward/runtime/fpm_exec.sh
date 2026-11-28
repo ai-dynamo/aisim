@@ -55,6 +55,32 @@ if [[ ! "$finalization_timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
   exit 2
 fi
 
+# An SGLang self-benchmark cell is one sglbench_launcher.py process on one
+# node. It has no Dynamo runtime and so no discovery service. The Collector
+# writes this switch into collector-runtime-env.sh for such a cell only. In
+# the mode etcd is neither started nor awaited, ETCD_ENDPOINTS is not
+# exported, sglbench_preflight.py replaces preflight.py, and the result files
+# are read once more after the launcher has exited. Unset or empty, every
+# step below is the one of a Dynamo cell.
+sglbench_mode=0
+case "${AISIMULATE_SGLBENCH_GATE:-}" in
+  "") ;;
+  1)
+    # A headless follower takes the leader's etcd port as the leader's liveness
+    # signal, and the DP completion barrier exists to keep the leader's etcd up
+    # until every rank has finished, so the mode has no multinode form.
+    if [[ "${FPM_NODE_COUNT}" != "1" || "${FPM_NODE_RANK}" != "0" ]]; then
+      echo "AISIMULATE_SGLBENCH_GATE=1 requires FPM_NODE_COUNT=1 and FPM_NODE_RANK=0" >&2
+      exit 2
+    fi
+    sglbench_mode=1
+    ;;
+  *)
+    echo "AISIMULATE_SGLBENCH_GATE must be unset, empty or 1" >&2
+    exit 2
+    ;;
+esac
+
 if [[ -f "${workdir}/fpm_memory_worker.py" ]]; then
   # The wrappers are staged alongside this script and delegate all execution
   # to the image's installed vLLM/Dynamo classes. Supported execution or
@@ -83,12 +109,61 @@ terminate_engine() {
   wait "$pid" 2>/dev/null || true
 }
 
+# The two filters that copy the engine output are children of this script and
+# read the engine's streams from two named pipes (see the launch below). A
+# filter ends by itself once the last process that holds its stream has gone,
+# which terminate_engine has seen to for the engine's process group. Wait for
+# both, so that the engine's last lines are in the log files and in the exec
+# stream before this script ends. The wait is bounded, because a process that
+# left the engine's group can keep a stream open, and a filter that is still
+# there after it is killed: it holds this script's own output streams. A
+# filter whose pipe no engine job ever opened has read nothing and is killed
+# without a wait.
+engine_stream_dir=""
+engine_stream_drain_seconds=10
+engine_stdout_filter_pid=""
+engine_stderr_filter_pid=""
+engine_job_started=0
+drain_engine_streams() {
+  local drain_deadline=$((SECONDS + engine_stream_drain_seconds))
+  local pid
+  local noted=0
+  for pid in "$engine_stdout_filter_pid" "$engine_stderr_filter_pid"; do
+    if [[ -z "$pid" ]]; then
+      continue
+    fi
+    while kill -0 "$pid" 2>/dev/null; do
+      if (( ! engine_job_started )); then
+        kill -KILL "$pid" 2>/dev/null || true
+        break
+      fi
+      if (( SECONDS >= drain_deadline )); then
+        if (( ! noted )); then
+          echo "An engine output filter did not end within ${engine_stream_drain_seconds}s; the copies of the engine output may lack their last lines" >&2
+          noted=1
+        fi
+        kill -KILL "$pid" 2>/dev/null || true
+        break
+      fi
+      sleep 0.2 2>/dev/null || sleep 1
+    done
+    wait "$pid" 2>/dev/null || true
+  done
+  engine_stdout_filter_pid=""
+  engine_stderr_filter_pid=""
+  if [[ -n "${engine_stream_dir}" ]]; then
+    rm -rf "${engine_stream_dir}" 2>/dev/null || true
+    engine_stream_dir=""
+  fi
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
   if [[ -n "${engine_pid:-}" ]]; then
     terminate_engine "$engine_pid"
   fi
+  drain_engine_streams
   if [[ -n "${etcd_pid}" ]] && kill -0 "${etcd_pid}" 2>/dev/null; then
     kill -TERM "${etcd_pid}" 2>/dev/null || true
     wait "${etcd_pid}" 2>/dev/null || true
@@ -104,7 +179,7 @@ trap 'exit 143' TERM
 # after it: preflight imports vLLM/torch, whose cold-vs-warm page-cache delta
 # across nodes is unbounded. Start etcd first so the probe budget only has to
 # cover pod-exec skew.
-if [[ "${FPM_NODE_RANK}" == "0" ]]; then
+if (( ! sglbench_mode )) && [[ "${FPM_NODE_RANK}" == "0" ]]; then
   data_dir=/tmp/fpm-forward-etcd
   rm -rf "${data_dir}"
   etcd \
@@ -118,9 +193,18 @@ fi
 
 # Adapter activation and its import path have already been sourced from the
 # frozen startup settings; no image-specific path belongs in this wrapper.
-python3 "${workdir}/preflight.py"
+if (( sglbench_mode )); then
+  # Started by path, as the launcher is: Python then puts this directory on
+  # sys.path and the preflight finds its sglbench_* siblings without PYTHONPATH.
+  python3 "${workdir}/sglbench_preflight.py"
+else
+  python3 "${workdir}/preflight.py"
+fi
 
-if [[ "${FPM_NODE_RANK}" == "0" ]]; then
+if (( sglbench_mode )); then
+  # No etcd was started, so there is no port to wait for.
+  :
+elif [[ "${FPM_NODE_RANK}" == "0" ]]; then
   # The leader owns the etcd process, so its readiness wait is etcd-aware:
   # a dead etcd (missing binary, bound port, data-dir permissions) fails the
   # cell immediately with direct evidence instead of burning the configured probe
@@ -162,7 +246,9 @@ else:
 PY
 fi
 
-export ETCD_ENDPOINTS="${etcd_endpoint}"
+if (( ! sglbench_mode )); then
+  export ETCD_ENDPOINTS="${etcd_endpoint}"
+fi
 
 benchmark_path_for_dp_rank() {
   local dp_rank=$1
@@ -359,12 +445,45 @@ PY
 # keep the complete output; only the exec stream drops progress-bar lines.
 # One awk per stream writes both copies so a dead stream reader cannot
 # SIGPIPE the file writer.
+#
+# Each awk is started by this script and reads a named pipe, so it is a child
+# of this script and not of the engine. An engine that kills its own process
+# tree, as SGLang does when a scheduler process fails and again when it shuts
+# down, would otherwise kill the two filters with whatever they still held:
+# a filter started by a process substitution on the engine's command line is
+# a descendant of the engine's process.
+#
+# The two pipes are in a folder of this script alone on this node. ${workdir}
+# is no place for them: the Slurm transport mounts one folder there for every
+# node of a cell, and each node's script would make and remove the same names.
+# The folder is made under TMPDIR where that works. The variable can come from
+# the shell that started the cell and name a folder this container does not
+# have, so /tmp is tried next. A cell with neither place fails here, before
+# its engine starts.
+#
+# mawk, the awk of Debian and Ubuntu images, fills its buffer from a pipe
+# before it looks for lines, so its two copies run behind the engine and are
+# complete only once the stream has ended; the wait for the filters covers
+# that. Do not give it -W interactive to read a line at a time: mawk 1.3.4
+# then cut an SGLang line of 19 KB at 4096 bytes and passed nothing on after
+# it.
 engine_stream_noise='[0-9]+%[|]|[|] *[0-9]+/[0-9]+ [[]'
 engine_stream_filter='{ print > logfile; fflush(logfile); if ($0 !~ noise) { print; fflush() } }'
-bash "${workdir}/run.sh" \
-  > >(awk -v logfile=/results/engine.stdout.log -v noise="${engine_stream_noise}" "${engine_stream_filter}") \
-  2> >(awk -v logfile=/results/engine.stderr.log -v noise="${engine_stream_noise}" "${engine_stream_filter}" >&2) &
+engine_stream_dir="$(mktemp -d "${TMPDIR:-/tmp}/fpm-engine-streams.XXXXXX" 2>/dev/null)" ||
+  engine_stream_dir="$(mktemp -d /tmp/fpm-engine-streams.XXXXXX)" || {
+    echo "Cannot make a folder for the engine output pipes under TMPDIR (${TMPDIR:-not set}) or under /tmp" >&2
+    exit 1
+  }
+mkfifo "${engine_stream_dir}/stdout" "${engine_stream_dir}/stderr"
+awk -v logfile=/results/engine.stdout.log -v noise="${engine_stream_noise}" \
+  "${engine_stream_filter}" < "${engine_stream_dir}/stdout" &
+engine_stdout_filter_pid=$!
+awk -v logfile=/results/engine.stderr.log -v noise="${engine_stream_noise}" \
+  "${engine_stream_filter}" < "${engine_stream_dir}/stderr" >&2 &
+engine_stderr_filter_pid=$!
+bash "${workdir}/run.sh" > "${engine_stream_dir}/stdout" 2> "${engine_stream_dir}/stderr" &
 engine_pid=$!
+engine_job_started=1
 
 if (( fpm_is_follower )); then
   # Headless followers never write results and normally exit only when the
@@ -443,6 +562,26 @@ while true; do
     wait "$engine_pid"
     engine_status=$?
     set -e
+    if (( sglbench_mode )); then
+      # The launcher ends by itself once its files are in place. The check
+      # above may have started before its last rename, so the files are read
+      # once more before the exit counts as a failure. This stays in the
+      # mode: a Dynamo worker that exits by itself is a failure even when its
+      # files are complete.
+      set +e
+      check_result_files
+      result_status=$?
+      set -e
+      if (( result_status == 0 )); then
+        break
+      fi
+      if (( result_status == 20 )); then
+        # The rule of the loop above: files that are there and are not
+        # complete give 1, whatever status the launcher ended with. The EXIT
+        # trap clears what is left of the launcher's process group.
+        exit 1
+      fi
+    fi
     terminate_engine "$engine_pid"
     engine_pid=""
     echo "Engine exited before writing all FPM benchmark outputs (rank, merged, and advertised worker probe)" >&2

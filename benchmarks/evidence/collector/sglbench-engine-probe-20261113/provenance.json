@@ -1,0 +1,331 @@
+{
+  "id": "collector/sglbench-engine-probe-20261113",
+  "summary": [
+    "Probe of running SGLang 0.5.22 and 0.5.23 engines with a recording subclass of the scheduler,",
+    "run before the producer core of the SGLang self-benchmark was written. The build notes call it",
+    "phase 0."
+  ],
+  "gpu_or_model_execution": true,
+  "recorded_in_the_result_files": {
+    "sglang_versions": [
+      "0.5.22",
+      "0.5.23"
+    ],
+    "models": {
+      "Qwen/Qwen3-0.6B": {
+        "snapshot": "c1899de289a04d12100db370d81485cdf75e47ca"
+      },
+      "Qwen/Qwen3-8B": {
+        "snapshot": "b968826d9c46dd6066d109eabc6255188de91218"
+      }
+    },
+    "sglang_server_arguments": "the model path alone, or with --page-size 64, or with --tp-size 2",
+    "reported_by_every_scheduler": {
+      "enable_overlap": true,
+      "attn_dp_enabled": false,
+      "chunked_prefill_size": 8192,
+      "max_prefill_tokens": 16384,
+      "max_running_requests": 4096,
+      "max_req_input_len": 40954
+    },
+    "first_recorder_stamp": "20261114-035605",
+    "last_recorder_stamp": "20261114-041305",
+    "recorder_stamp_note": [
+      "The stamp is the start of a run on the clock of the pod. Each saved result file is 32 to 87",
+      "seconds newer than its stamp read as UTC."
+    ]
+  },
+  "stated_by_the_operator": {
+    "source": "the operator's session record of 2026-11-14 03:54 UTC; none of this is in a result file",
+    "gpu": "nvidia-smi in the pod printed two NVIDIA H200, 143771 MiB",
+    "images": [
+      "lmsysorg/sglang:v0.5.22-cu130-runtime",
+      "lmsysorg/sglang:v0.5.23-cu130-runtime"
+    ],
+    "torch": "the v0.5.23 pod reported torch 2.14.1+cu130"
+  },
+  "file_times_note": [
+    "Every saved_file_time_utc is the modification time of the saved copy on the operator's disk. It",
+    "is not in any result file and git does not keep it."
+  ],
+  "sglang_source": {
+    "repository": "https://github.com/sgl-project/sglang",
+    "v0.5.22": "baa9befa381511cd4d56f83980951e5a45fffc6d",
+    "v0.5.23": "297e54fd105e974cdf401e5b4d20253a22c16f90",
+    "note": [
+      "The commits of the two tags, as the producer core cites them. A result file records the package",
+      "version only. Whether the images were built from these commits is not recorded."
+    ]
+  },
+  "scripts": {
+    "phase0_spike.py": {
+      "role": "the probe driver",
+      "saved_sha256": "a2f723421f7d46d0d31eb793f81fa46d419ae1e24e4d3a30d3eb9edf7497f3e5",
+      "saved_bytes": 32682,
+      "saved_file_time_utc": "2026-11-14T04:12:19Z",
+      "committed_sha256": "daa644749cc4fa9233381c798c8b39de7912675cba09db00de6bf483327eb6c9",
+      "committed_bytes": 34073,
+      "syntax_tree_equal_to_saved": true,
+      "changes_from_saved": [
+        "the NVIDIA SPDX header pair, placed after the shebang line",
+        "four comment lines below the header that say what was added",
+        "the layout of ruff format",
+        "lint marks on six lines: UP015, C420, B905 (four times), RUF007 (twice); each has a reason comment"
+      ]
+    },
+    "phase0_recorder.py": {
+      "role": "the recorder that runs in every scheduler process; the driver imports it by this name",
+      "saved_sha256": "f5a604e731148c2bca14e3947cb8dedc1b4d4173df0c14d5ca41c63c7561aee5",
+      "saved_bytes": 6844,
+      "saved_file_time_utc": "2026-11-14T01:14:28Z",
+      "committed_sha256": "191c187f205eff7fd507f7fe3763996db6ab6a6fb065983260edc39379ad143c",
+      "committed_bytes": 7369,
+      "syntax_tree_equal_to_saved": true,
+      "changes_from_saved": [
+        "the NVIDIA SPDX header pair",
+        "three comment lines below the header that say what was added",
+        "the layout of ruff format",
+        "one lint mark (SIM115) with a comment that gives the reason"
+      ]
+    }
+  },
+  "scripts_note": [
+    "The syntax trees were compared with ast.dump, docstrings included, under Python 3.12.13 and",
+    "3.14.6. The layout is that of ruff 0.14.1 with python/aisim/pyproject.toml."
+  ],
+  "result_files": {
+    "v0522-q06-p1": {
+      "path": "results/v0522-q06-p1/results.json",
+      "bytes": 11438,
+      "sglang_version": "0.5.22",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 1,
+      "tp_size": 1,
+      "checks": "1,2,3,4,5,6",
+      "recorder_stamp": "20261114-040434",
+      "saved_file_time_utc": "2026-11-14T04:06:00Z"
+    },
+    "v0522-q06-p64": {
+      "path": "results/v0522-q06-p64/results.json",
+      "bytes": 11548,
+      "sglang_version": "0.5.22",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 64,
+      "tp_size": 1,
+      "checks": "1,2,3,4,5,6",
+      "recorder_stamp": "20261114-040603",
+      "saved_file_time_utc": "2026-11-14T04:06:43Z"
+    },
+    "v0522-q06-p1-over": {
+      "path": "results/v0522-q06-p1-over/results.json",
+      "bytes": 2062,
+      "sglang_version": "0.5.22",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 1,
+      "tp_size": 1,
+      "checks": "1,9",
+      "recorder_stamp": "20261114-040722",
+      "saved_file_time_utc": "2026-11-14T04:07:54Z"
+    },
+    "v0522-q06-p64-over": {
+      "path": "results/v0522-q06-p64-over/results.json",
+      "bytes": 2603,
+      "sglang_version": "0.5.22",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 64,
+      "tp_size": 1,
+      "checks": "1,9",
+      "recorder_stamp": "20261114-040645",
+      "saved_file_time_utc": "2026-11-14T04:07:19Z"
+    },
+    "v0522-q06-p64-over2": {
+      "path": "results/v0522-q06-p64-over2/results.json",
+      "bytes": 6627,
+      "sglang_version": "0.5.22",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 64,
+      "tp_size": 1,
+      "checks": "1,9",
+      "recorder_stamp": "20261114-041228",
+      "saved_file_time_utc": "2026-11-14T04:13:03Z"
+    },
+    "v0522-q8-p1": {
+      "path": "results/v0522-q8-p1/results.json",
+      "bytes": 12341,
+      "sglang_version": "0.5.22",
+      "model": "Qwen/Qwen3-8B",
+      "page_size": 1,
+      "tp_size": 1,
+      "checks": "1,2,3,4,5,6,8",
+      "recorder_stamp": "20261114-040757",
+      "saved_file_time_utc": "2026-11-14T04:09:23Z"
+    },
+    "v0522-q8-p64": {
+      "path": "results/v0522-q8-p64/results.json",
+      "bytes": 11823,
+      "sglang_version": "0.5.22",
+      "model": "Qwen/Qwen3-8B",
+      "page_size": 64,
+      "tp_size": 1,
+      "checks": "1,2,3,4,5,8",
+      "recorder_stamp": "20261114-040925",
+      "saved_file_time_utc": "2026-11-14T04:10:43Z"
+    },
+    "v0522-q8-tp2": {
+      "path": "results/v0522-q8-tp2/results.json",
+      "bytes": 5199,
+      "sglang_version": "0.5.22",
+      "model": "Qwen/Qwen3-8B",
+      "page_size": 1,
+      "tp_size": 2,
+      "checks": "1,2,3,4",
+      "recorder_stamp": "20261114-041305",
+      "saved_file_time_utc": "2026-11-14T04:14:16Z"
+    },
+    "v0523-q06-p1-a": {
+      "path": "results/v0523-q06-p1-a/results.json",
+      "bytes": 3189,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 1,
+      "tp_size": 1,
+      "checks": "1,2,3",
+      "recorder_stamp": "20261114-035605",
+      "saved_file_time_utc": "2026-11-14T03:57:15Z"
+    },
+    "v0523-q06-p1-b": {
+      "path": "results/v0523-q06-p1-b/results.json",
+      "bytes": 9804,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 1,
+      "tp_size": 1,
+      "checks": "1,4,5,6",
+      "recorder_stamp": "20261114-035757",
+      "saved_file_time_utc": "2026-11-14T03:58:37Z"
+    },
+    "v0523-q06-p64": {
+      "path": "results/v0523-q06-p64/results.json",
+      "bytes": 11551,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 64,
+      "tp_size": 1,
+      "checks": "1,2,3,4,5,6",
+      "recorder_stamp": "20261114-035840",
+      "saved_file_time_utc": "2026-11-14T03:59:21Z"
+    },
+    "v0523-q06-p1-over": {
+      "path": "results/v0523-q06-p1-over/results.json",
+      "bytes": 2062,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 1,
+      "tp_size": 1,
+      "checks": "1,9",
+      "recorder_stamp": "20261114-040150",
+      "saved_file_time_utc": "2026-11-14T04:02:23Z"
+    },
+    "v0523-q06-p64-over": {
+      "path": "results/v0523-q06-p64-over/results.json",
+      "bytes": 2603,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 64,
+      "tp_size": 1,
+      "checks": "1,9",
+      "recorder_stamp": "20261114-040113",
+      "saved_file_time_utc": "2026-11-14T04:01:47Z"
+    },
+    "v0523-q06-p64-over2": {
+      "path": "results/v0523-q06-p64-over2/results.json",
+      "bytes": 6624,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-0.6B",
+      "page_size": 64,
+      "tp_size": 1,
+      "checks": "1,9",
+      "recorder_stamp": "20261114-040718",
+      "saved_file_time_utc": "2026-11-14T04:07:55Z"
+    },
+    "v0523-q8-p1": {
+      "path": "results/v0523-q8-p1/results.json",
+      "bytes": 12353,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-8B",
+      "page_size": 1,
+      "tp_size": 1,
+      "checks": "1,2,3,4,5,6,8",
+      "recorder_stamp": "20261114-040226",
+      "saved_file_time_utc": "2026-11-14T04:03:53Z"
+    },
+    "v0523-q8-p64": {
+      "path": "results/v0523-q8-p64/results.json",
+      "bytes": 11832,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-8B",
+      "page_size": 64,
+      "tp_size": 1,
+      "checks": "1,2,3,4,5,8",
+      "recorder_stamp": "20261114-040356",
+      "saved_file_time_utc": "2026-11-14T04:05:14Z"
+    },
+    "v0523-q8-tp2": {
+      "path": "results/v0523-q8-tp2/results.json",
+      "bytes": 5204,
+      "sglang_version": "0.5.23",
+      "model": "Qwen/Qwen3-8B",
+      "page_size": 1,
+      "tp_size": 2,
+      "checks": "1,2,3,4",
+      "recorder_stamp": "20261114-040757",
+      "saved_file_time_utc": "2026-11-14T04:09:11Z"
+    }
+  },
+  "limits": [
+    [
+      "The saved driver is its last revision. By file time 15 of the 17 result files are older than it;",
+      "v0522-q06-p64-over2 and v0522-q8-tp2 are newer. No result file holds a hash of the script that",
+      "wrote it. So the saved scripts are not shown to be the exact ones that produced every file."
+    ],
+    [
+      "v0522-q06-p64-over and v0523-q06-p64-over hold check_9.decode in a shape the saved driver no",
+      "longer writes, with sequence_ok false; README.md says what that field means there."
+    ],
+    [
+      "The GPU model, the images and the torch version are in no result file."
+    ],
+    [
+      "The raw recorder lines were not kept."
+    ],
+    [
+      "Not covered: the KV pool and max_prefill_tokens boundaries, a request cut by the chunk budget,",
+      "chunked prefill off, overlap scheduling off, page size 16, which radix-tree core was active,",
+      "captured graph sizes, what a finished seven-token run stores beyond its prompt."
+    ]
+  ],
+  "sha256_note": "Every file of this folder except provenance.json itself. verify.py checks them.",
+  "sha256": {
+    "README.md": "1152833185b094f7db08715a561e6fbadb4f2564b357611a7d4da92135fd6100",
+    "phase0_recorder.py": "191c187f205eff7fd507f7fe3763996db6ab6a6fb065983260edc39379ad143c",
+    "phase0_spike.py": "daa644749cc4fa9233381c798c8b39de7912675cba09db00de6bf483327eb6c9",
+    "results/v0522-q06-p1-over/results.json": "c57452444171f014ca00be5a2f8b81f3fd44f041d6087f64ceb6f8597d883c47",
+    "results/v0522-q06-p1/results.json": "0c5c0d0e9a41b826f4e1eae865917fc7679443db158db21fd9f031d28ef01b0a",
+    "results/v0522-q06-p64-over/results.json": "5b1f2c08cacd1f49cce86629ababd441697cccbbae0f31b2a0ea920c35457194",
+    "results/v0522-q06-p64-over2/results.json": "d3ce5c0ae74770aa847ce0b90807462a2bb0907ad2c6a07039b64ee66c282057",
+    "results/v0522-q06-p64/results.json": "bf7cd68ae56c04ab69b295a68381881fe5274d4f40a348c629d44ecf7948e187",
+    "results/v0522-q8-p1/results.json": "d38b2dee9fcebd6e47de62e129517f64826ee7bff08e37e2b3b6228f9927c3d3",
+    "results/v0522-q8-p64/results.json": "cfcc44f99ab3a7ae29f9b91e75136d30a397918ae50addb18b928d69d9b6ff0e",
+    "results/v0522-q8-tp2/results.json": "c8d1bcaa7cbf7c90eb54480ca9403875b9e7ef78c9bb0a0b587399ac8d284ff2",
+    "results/v0523-q06-p1-a/results.json": "7a4a8b8a2e0e8eaa1424954a0f43ffff7842921464215a526ab7efc5787e2750",
+    "results/v0523-q06-p1-b/results.json": "a1624fe65c24f624dd6d553e747db0895a382125fe999e0a1c34ad162b33b871",
+    "results/v0523-q06-p1-over/results.json": "6a27c1ca6baaf5785f6a4987877a75dee713fa06c7a26e2d5e2455f3337a87f9",
+    "results/v0523-q06-p64-over/results.json": "8cd2696c17b68adffaacb18e9bf8c35ec4b61b87f23229cefce5894d10c83185",
+    "results/v0523-q06-p64-over2/results.json": "2c1158d3f1cb105500a5e3d41458589f6cfca5e5994e9ba4e5e39c2163c48e92",
+    "results/v0523-q06-p64/results.json": "7c764386b4fd91f683f63ea113480b4a781882070e1d12198dc480538fb9e85d",
+    "results/v0523-q8-p1/results.json": "21da0ed75202a021feb964f255b6590436a9fcac5ca31e7afcdc76f7a1b12dbf",
+    "results/v0523-q8-p64/results.json": "57eecdea730c79e75bf4b7098707232d79de0bd66481d5c79b39b7215b1e1578",
+    "results/v0523-q8-tp2/results.json": "5c86482ff819f4e97dc5b9b4faecb66bf76a73d2747da788d2d4317b05cb80e1",
+    "verify.py": "cab32eed53bcb11ded71a8bff372086ac1d9f1e18a089e9aa09c6df65ee034de"
+  }
+}

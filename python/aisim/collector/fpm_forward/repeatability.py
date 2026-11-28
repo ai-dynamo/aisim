@@ -91,6 +91,11 @@ def load_repeatability_source(source_campaign_dir: str | Path) -> FPMCollectionP
     path = Path(source_campaign_dir).expanduser().resolve() / "collection-plan.json"
     saved = json.loads(path.read_text())
     validate_saved_plan(saved)
+    if saved["backend"] != "vllm":
+        # The comparison reads Dynamo's vLLM measurement and execution evidence, which no other producer writes.
+        raise ValueError(
+            f"repeatability validation supports only vLLM campaigns; the source has backend {saved['backend']!r}"
+        )
     if saved["schema_version"] != 11:
         raise ValueError(
             "repeatability execution requires a schema-v11 source campaign; historical data stays readable"

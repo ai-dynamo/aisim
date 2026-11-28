@@ -393,7 +393,8 @@ class FPMCollectionOptions:
     enforce_eager: bool = False
     # Request Dynamo's per-point power window (never rendered for smoke runs,
     # which share the formal plan). False preserves legacy saved-plan
-    # identity; fresh CLI plans enable it unless --no-fpm-measure-power.
+    # identity; fresh CLI plans enable it unless --no-fpm-measure-power, and
+    # never for SGLang (from_args).
     measure_power: bool = False
     benchmark_points_json: str | None = None
     benchmark_points_sha256: str | None = None
@@ -647,6 +648,13 @@ class FPMCollectionOptions:
                 raise ValueError("--fpm-benchmark-points-file cannot be combined with --smoke")
             points_json, points_sha256 = _freeze_benchmark_points(points_path)
         measure_power = getattr(args, "fpm_measure_power", None)
+        # On unless it is switched off, except for SGLang: its launcher has no power window, so an SGLang
+        # plan measures no power. Asking for it is carried as True from here, so that planner.py
+        # (_require_sglang_launcher_inputs) can refuse the request by name.
+        if getattr(args, "backend", None) == "sglang":
+            measure_power = measure_power is True
+        else:
+            measure_power = measure_power is not False
 
         return cls(
             benchmark_points_json=points_json,
@@ -697,7 +705,7 @@ class FPMCollectionOptions:
             gpu_memory_utilization=getattr(args, "fpm_gpu_memory_utilization", None),
             decoder_replay=bool(getattr(args, "fpm_decoder_replay", False)),
             enforce_eager=bool(getattr(args, "fpm_enforce_eager", False)),
-            measure_power=measure_power is not False,
+            measure_power=measure_power,
             executor=executor,
             slurm_container_image=image,
             slurm_container_mounts=mounts,
@@ -826,7 +834,9 @@ def add_fpm_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Measure each point's GPU power over a separate window after its latency sample (Dynamo "
-            "--benchmark-power-window-s); on by default, included in the frozen plan, never run by --smoke."
+            "--benchmark-power-window-s); on by default, included in the frozen plan, never run by --smoke. "
+            "Off with --backend sglang, whose plans measure no power: the option is refused there, and "
+            "--no-fpm-measure-power changes nothing."
         ),
     )
     group.add_argument(

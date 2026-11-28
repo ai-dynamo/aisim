@@ -1,0 +1,134 @@
+{
+  "argv": [
+    "--out",
+    "/work/out/v0523-q06-p64-over",
+    "--checks",
+    "1,9",
+    "--",
+    "--model-path",
+    "/models/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+    "--page-size",
+    "64"
+  ],
+  "sglang_argv": [
+    "--model-path",
+    "/models/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+    "--page-size",
+    "64"
+  ],
+  "recorder_dir": "/work/out/v0523-q06-p64-over/recorder/20261114-040113",
+  "headers": [
+    {
+      "file": "sched-2439.jsonl",
+      "type": "header",
+      "pid": 2439,
+      "sglang_version": "0.5.23",
+      "class": "RecorderScheduler",
+      "mro": [
+        "RecorderScheduler",
+        "Scheduler",
+        "SchedulerDisaggregationDecodeMixin"
+      ],
+      "install": "hook",
+      "ranks": {
+        "attn_tp_rank": 0,
+        "attn_dp_rank": 0,
+        "attn_cp_rank": 0,
+        "pp_rank": 0,
+        "tp_size": 1,
+        "attn_dp_enabled": false
+      },
+      "page_size": 64,
+      "enable_overlap": true,
+      "chunked_prefill_size": 8192,
+      "max_prefill_tokens": 16384,
+      "max_running_requests": 4096,
+      "max_total_num_tokens": 1160896,
+      "max_req_input_len": 40954,
+      "input_blocker": false
+    }
+  ],
+  "check_1": {
+    "name": "recorder headers",
+    "pass": true,
+    "scheduler_processes": 1,
+    "expected": 1,
+    "classes": [
+      "RecorderScheduler"
+    ],
+    "install": [
+      "hook"
+    ],
+    "sglang_version": [
+      "0.5.23"
+    ],
+    "page_size": 64,
+    "enable_overlap": true,
+    "faults": [],
+    "seconds": 0.0
+  },
+  "check_9": {
+    "name": "batch above the step budget",
+    "pass": null,
+    "step_budget": 8192,
+    "page_size": 64,
+    "prefill": {
+      "batch": 136,
+      "largest_batch_that_fits": 128,
+      "new_tokens_each": 64,
+      "extend_batches": [
+        [
+          6,
+          128,
+          8192
+        ],
+        [
+          7,
+          8,
+          512
+        ]
+      ]
+    },
+    "decode": {
+      "batch": 136,
+      "largest_batch_that_fits": 128,
+      "batches": [
+        [
+          "EXTEND",
+          128
+        ],
+        [
+          "EXTEND",
+          8
+        ],
+        [
+          "DECODE",
+          136
+        ],
+        [
+          "DECODE",
+          136
+        ],
+        [
+          "DECODE",
+          136
+        ],
+        [
+          "DECODE",
+          136
+        ],
+        [
+          "DECODE",
+          136
+        ],
+        [
+          "DECODE",
+          136
+        ]
+      ],
+      "sequence_ok": false
+    },
+    "seconds": 0.66
+  },
+  "faults": []
+}

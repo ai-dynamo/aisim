@@ -57,7 +57,7 @@ from .glm53flash_points import (
     glm_measured_context,
     glm_smoke_subset,
 )
-from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, validate_native_collection
+from .native_artifact import COLLECTOR_PROVENANCE_FILENAME, plan_is_moe, validate_native_collection
 from .planner import FPMCell, FPMCollectionPlan
 from .runtime.fpm_memory_observer import (
     EXECUTION_SUPPORTED_VERSIONS,
@@ -150,11 +150,21 @@ REMOTE_WORKDIR = "/tmp/fpm-bench"
 _MEMORY_OBSERVER_FILES = ("fpm_memory_observer.py", "fpm_memory_worker.py", "fpm_memory_scheduler.py")
 # The source-pinned runtime adapters under runtime/, by model architecture.
 _ADAPTER_DIRS = {"DeepseekV41ForCausalLM": "dsv41", GLM_ARCHITECTURE: "glm53flash"}
+# What an SGLang cell stages from runtime/ in the place of preflight.py: the flat modules of the launcher and its own
+# preflight. A pattern and not a list of names, so a module added to the launcher is staged with it.
+_SGLANG_RUNTIME_GLOB = "sglbench_*.py"
+# The distribution whose installed version a pod records as its runtime, by plan backend.
+_PROVENANCE_DISTRIBUTIONS = {"vllm": "vllm", "sglang": "sglang"}
 
 
 def _observe_runtime_memory(plan: FPMCollectionPlan, cell: FPMCell) -> bool:
+    # Instrumentation exists for vLLM plans only: the planner refuses it for another backend.
     if getattr(plan, "runtime_instrumentation", None) is not None:
         return True
+    # The observers are vLLM worker and scheduler classes. Without this guard only the version string keeps another
+    # backend out: an SGLang release numbered like an audited vLLM release would switch them on.
+    if getattr(plan, "backend", "vllm") != "vllm":
+        return False
     if getattr(plan, "fpm_profile", None) is None:
         return False
     deployment = plan.deployment_profile(cell)
@@ -167,6 +177,8 @@ def _observe_runtime_memory(plan: FPMCollectionPlan, cell: FPMCell) -> bool:
 
 def _observe_runtime_execution(plan: FPMCollectionPlan, cell: FPMCell) -> bool:
     if getattr(plan, "runtime_instrumentation", None) is not None:
+        return False
+    if getattr(plan, "backend", "vllm") != "vllm":
         return False
     return (
         audited_release(getattr(plan, "runtime_backend_version", None), EXECUTION_SUPPORTED_VERSIONS) is not None
@@ -516,9 +528,14 @@ def _attempt_provenance_command(
     expected_backend_version: str | None = None,
     dynamo_version: str | None = None,
     runtime_backend_version: str | None = None,
+    backend: str = "vllm",
 ) -> list[str]:
     """Record runtime versions independently of the user-selected data label."""
 
+    # The name goes into the text of a program, so it comes from this closed table and never from a caller.
+    distribution = _PROVENANCE_DISTRIBUTIONS.get(backend)
+    if distribution is None:
+        raise ValueError(f"FPM provenance knows no runtime distribution for backend {backend!r}")
     payload = json.dumps(
         {
             "schema_name": "aic_fpm_collector_provenance",
@@ -535,8 +552,8 @@ def _attempt_provenance_command(
     script = (
         "import importlib.metadata, json, pathlib, sys; "
         "payload = json.loads(sys.argv[1]); "
-        "payload['runtime'] = {'backend': 'vllm', "
-        "'backend_version': importlib.metadata.version('vllm')}; "
+        f"payload['runtime'] = {{'backend': '{backend}', "
+        f"'backend_version': importlib.metadata.version('{distribution}')}}; "
         f"path = pathlib.Path('{FPM_RESULTS_DIR}') / sys.argv[2]; "
         "\ntry:\n"
         "    payload['runtime']['dynamo_version'] = importlib.metadata.version('ai-dynamo')\n"
@@ -776,6 +793,7 @@ class KubernetesCellRunner:
         attempt_id: str,
         expected_backend_version: str | None = None,
         runtime_backend_version: str | None = None,
+        backend: str = "vllm",
     ) -> None:
         """Clear stale results and bind every Pod to this Collector attempt."""
 
@@ -785,6 +803,7 @@ class KubernetesCellRunner:
             attempt_id=attempt_id,
             expected_backend_version=expected_backend_version,
             runtime_backend_version=runtime_backend_version,
+            backend=backend,
         )
         for pod in pods:
             self._exec_checked(
@@ -1697,12 +1716,40 @@ def _decode_prefix_caching_mode(plan: FPMCollectionPlan, cell: FPMCell) -> str:
     return "disabled"
 
 
+def _sglang_sampling_metadata(plan: FPMCollectionPlan, cell: FPMCell, *, smoke: bool) -> dict[str, int | str | None]:
+    """Record what an SGLang cell was given.
+
+    An SGLang engine captures its own CUDA graph sizes and the launcher reads them from it, so the record holds no
+    vLLM capture count and no host-side axis count.
+    """
+    points = _cell_points(plan, cell, smoke=smoke)
+    metadata: dict[str, int | str | None] = {}
+    if points is not None:
+        metadata["benchmark_points_sha256"] = points[1]
+        metadata["requested_point_count"] = len(json.loads(points[0])[cell.workload_kind])
+    if cell.workload_kind != "prefill":
+        # The launcher seeds every decode context through SGLang's radix cache and refuses a run without it. The
+        # cell's command never switches it off.
+        metadata["decode_radix_cache"] = "enabled"
+    elif points is None:
+        sampling = plan.options.prefill_sampling
+        # The two caps of the cell's command. The new-token cap is the cell's token budget
+        # (sglang_fpm_builder.py): the axis holds distinct values up to that budget, so the cap cuts nothing. A
+        # smoke cell keeps the 2 and 2 of _cell_generator_overrides.
+        metadata["prefill_max_new_token_samples"] = 2 if smoke else sampling.max_total_prefill_tokens
+        metadata["prefill_max_kv_read_token_samples"] = 2 if smoke else sampling.max_kv_read_token_samples
+        metadata["prefill_new_token_axis_source"] = "sglang_engine_cuda_graph_sizes"
+    return metadata
+
+
 def _configured_sampling_metadata(
     plan: FPMCollectionPlan,
     cell: FPMCell,
     *,
     smoke: bool,
 ) -> dict[str, int | str | None]:
+    if getattr(plan, "backend", "vllm") == "sglang":
+        return _sglang_sampling_metadata(plan, cell, smoke=smoke)
     points = _cell_points(plan, cell, smoke=smoke)
     if points is not None:
         metadata: dict[str, int | str | None] = {
@@ -1784,6 +1831,14 @@ def _render_cell(
     *,
     smoke: bool = False,
 ) -> dict[str, Any]:
+    if getattr(plan, "backend", "vllm") == "sglang":
+        # The Generator's FPM target renders Dynamo vLLM cells only. The SGLang builder asks this function for the
+        # vLLM render of the same cell and translates it.
+        from . import sglang_fpm_builder
+
+        return sglang_fpm_builder.render_cell(
+            plan, cell, cell_dir, generator_overrides, smoke=smoke, render_vllm_cell=_render_cell
+        )
     from aisim.generator.api import generate_from_request
     from aisim.generator.naive import build_naive_generator_params
     from aisim.generator.request import from_legacy_params
@@ -1862,14 +1917,21 @@ def _runtime_collection_summary(
     *,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
+    backend: str = "vllm",
+    is_moe: bool | None = None,
 ) -> dict[str, Any]:
-    """Return auditable unique-axis counts from a validated native grid."""
+    """Return auditable unique-axis counts from a validated native grid.
+
+    ``backend`` and ``is_moe`` are those of the plan the cell belongs to (``validate_native_collection``).
+    """
 
     collection = validate_native_collection(
         cell,
         raw_root,
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
+        expected_backend=backend,
+        expected_moe=is_moe,
     )
     points = tuple(measurement.point for measurement in collection.points)
     summary = {
@@ -2028,6 +2090,8 @@ def _recover_completed_attempt(
             cell_dir / "raw",
             expected_plan_sha256=plan.sha256,
             expected_attempt_id=attempt_id,
+            backend=getattr(plan, "backend", "vllm"),
+            is_moe=plan_is_moe(plan),
         )
     except (OSError, TypeError, ValueError) as error:
         logger.info(
@@ -2245,6 +2309,10 @@ def _run_collection_impl(
 
     runtime_exec = Path(__file__).resolve().parent / "runtime" / "fpm_exec.sh"
     runtime_preflight = Path(__file__).resolve().parent / "runtime" / "preflight.py"
+    # An SGLang cell runs under the same gate, which then starts sglbench_preflight.py and no etcd. preflight.py
+    # checks a Dynamo vLLM image and is not staged for it.
+    sglang_plan = getattr(plan, "backend", "vllm") == "sglang"
+    sglang_runtime = sorted(runtime_exec.parent.glob(_SGLANG_RUNTIME_GLOB)) if sglang_plan else []
     adapter = _ADAPTER_DIRS.get(getattr(getattr(plan, "capability", None), "architecture", None))
     target_cells = plan.cells[: (cell_limit or (1 if smoke else len(plan.cells)))]
 
@@ -2345,6 +2413,8 @@ def _run_collection_impl(
                     root / "cells" / cell.cell_id / "raw",
                     expected_plan_sha256=plan.sha256,
                     expected_attempt_id=_required_attempt_id(entry, cell.cell_id),
+                    backend=getattr(plan, "backend", "vllm"),
+                    is_moe=plan_is_moe(plan),
                 )
             )
         except (OSError, TypeError, ValueError) as error:
@@ -2486,7 +2556,7 @@ def _run_collection_impl(
                     env_script,
                     runtime_env,
                     runtime_exec,
-                    runtime_preflight,
+                    *([] if sglang_plan else [runtime_preflight]),
                     *[
                         runtime_exec.parent / filename
                         for filename in _MEMORY_OBSERVER_FILES
@@ -2508,6 +2578,7 @@ def _run_collection_impl(
                         if adapter == "dsv41" or _glm_collection(plan)
                         else []
                     ),
+                    *sglang_runtime,
                 ],
             )
             profile_version = (
@@ -2525,6 +2596,8 @@ def _run_collection_impl(
                 plan_sha256=plan.sha256,
                 attempt_id=attempt_id,
                 **profile_version,
+                # The pod records vLLM unless told otherwise, so only an SGLang plan passes the keyword.
+                **({"backend": "sglang"} if sglang_plan else {}),
             )
             _record_points_receipts(resource, pods, plan, cell, attempt_id, phase="before", smoke=smoke)
             phase_marks["stage_s"] = round(time.monotonic() - mark, 3)
@@ -2541,6 +2614,8 @@ def _run_collection_impl(
                 cell_dir / "raw",
                 expected_plan_sha256=plan.sha256,
                 expected_attempt_id=attempt_id,
+                backend=getattr(plan, "backend", "vllm"),
+                is_moe=plan_is_moe(plan),
             )
             checkpoint["cells"][cell.cell_id] = {
                 **base_record,

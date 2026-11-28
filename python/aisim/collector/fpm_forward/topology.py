@@ -38,7 +38,7 @@ def _requested_presets(options: FPMCollectionOptions, *, is_moe: bool, allow_pur
     if not is_moe and any(value != "tp" for value in requested):
         raise ValueError(f"dense models support only the TP typical preset, got {list(requested)}")
     if is_moe and "tp" in requested:
-        raise ValueError("MoE models use TEP or DEP; plain TP is not an independent typical preset")
+        raise ValueError("MoE models use pure TP, TEP or DEP; plain TP is not an independent typical preset")
     if "pure_tp" in requested and not allow_pure_tp:
         raise ValueError(
             "pure TP was requested, but the AIC model/runtime capability profile does not explicitly admit it"
