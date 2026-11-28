@@ -22,7 +22,8 @@ use super::phase::{
     AgenticPhaseEvidence, AgenticPreparation, AgenticPreparationTransition, AgenticWarmupPolicy,
 };
 use super::profile::{
-    AgenticIdleShift, AgenticProfileOptions, AgenticProfileReport, AgenticProfileState,
+    AgenticIdleScan, AgenticIdleShift, AgenticProfileOptions, AgenticProfileReport,
+    AgenticProfileState,
 };
 use super::trace::{
     extend_validated_trace_tokens, synthesize_validated_trace_tokens,
@@ -1001,6 +1002,7 @@ impl WorkloadDriver {
             replacements_at_ms: (None, 0),
             tree_idle_since_ms: vec![None; play_count],
             global_idle_since_ms: None,
+            idle_scan: None,
             issued_requests: 0,
             successful_responses: 0,
             canceled_requests: 0,
@@ -1142,6 +1144,11 @@ impl WorkloadDriver {
                 profile.global_idle_since_ms,
             )
         };
+        // No tree is at its cap until the earliest idle stamp is, so the lanes
+        // are skipped until then.
+        let earliest_idle = self.agentic_idle_scan().earliest_idle_ms;
+        let tree_due = earliest_idle.is_some_and(|idle| now_ms >= idle + tree_cap);
+        let lanes = if tree_due { lanes } else { 0 };
         for lane in 0..lanes {
             let profile = self.agentic_profile.as_ref().unwrap();
             let play = profile.active_plays[lane];
@@ -1323,6 +1330,7 @@ impl WorkloadDriver {
         profile.replacements_at_ms = (Some(now_ms), replacements);
         profile.active_plays[lane] = play_index;
         profile.tree_idle_since_ms.push(Some(now_ms));
+        profile.idle_scan = None;
     }
 
     fn shift_agentic_timers(&mut self, only_play: Option<usize>, now_ms: f64) -> bool {
@@ -1431,7 +1439,7 @@ impl WorkloadDriver {
         })
     }
 
-    fn agentic_profile_next_control_ms(&self) -> Option<f64> {
+    fn agentic_profile_next_control_ms(&mut self) -> Option<f64> {
         let profile = self.agentic_profile.as_ref()?;
         if self.live_warmup_active() {
             let SchedulingPolicy::Agentic(state) = &self.policy else {
@@ -1477,37 +1485,64 @@ impl WorkloadDriver {
             return Some(finished_ms.max(profile.last_advanced_ms));
         }
         // A pending timer contributes only its play's tree-idle deadline and the
-        // global one, so each play is checked once, not request by request.
+        // global one. A deadline never decreases as its idle stamp grows, so
+        // the earliest stamp among the plays with a timer gives the earliest
+        // tree deadline.
+        let scan = self.agentic_idle_scan();
+        let profile = self.agentic_profile.as_ref().unwrap();
         let idle_deadline = |since: Option<f64>, cap_seconds: f64| {
             since.map(|idle| (idle + cap_seconds * 1000.0).max(profile.last_advanced_ms))
         };
-        let pending = |play: usize| {
-            let pending = state.ready_nodes[play] > 0;
-            debug_assert_eq!(
-                pending,
-                state.plays[play]
-                    .nodes
-                    .iter()
-                    .any(|&index| self.sessions[index].next_ready_at_ms.is_some()),
-                "ready-node count must match the play's scheduled timers"
-            );
-            pending
-        };
+        let tree = idle_deadline(
+            scan.earliest_pending_idle_ms,
+            profile.options.tree_idle_cap_seconds,
+        );
         let global = idle_deadline(
-            profile.global_idle_since_ms,
+            profile.global_idle_since_ms.filter(|_| scan.any_pending),
             profile.options.global_idle_cap_seconds,
         );
-        let mut next = cutoff;
-        for &play in &profile.active_plays {
-            let tree = idle_deadline(
-                profile.tree_idle_since_ms[play],
-                profile.options.tree_idle_cap_seconds,
-            );
-            if (tree.is_some() || global.is_some()) && pending(play) {
-                next = [tree, global].into_iter().flatten().fold(next, f64::min);
+        Some([tree, global].into_iter().flatten().fold(cutoff, f64::min))
+    }
+
+    // One pass over the active plays for both idle guards. Its inputs (the
+    // active plays, their idle stamps and their ready-node counts) change only
+    // on a dispatch, a terminal or a replacement, and each clears the cached
+    // scan. Nothing reads it before the profile opens or after the cutoff.
+    fn agentic_idle_scan(&mut self) -> AgenticIdleScan {
+        let SchedulingPolicy::Agentic(state) = &self.policy else {
+            unreachable!()
+        };
+        let sessions = &self.sessions;
+        let profile = self.agentic_profile.as_mut().unwrap();
+        let scan = || {
+            let earlier = |seen: Option<f64>, idle: Option<f64>| {
+                [seen, idle].into_iter().flatten().reduce(f64::min)
+            };
+            let mut scan = AgenticIdleScan::default();
+            for &play in &profile.active_plays {
+                let idle = profile.tree_idle_since_ms[play];
+                let pending = state.ready_nodes[play] > 0;
+                debug_assert_eq!(
+                    pending,
+                    state.plays[play]
+                        .nodes
+                        .iter()
+                        .any(|&index| sessions[index].next_ready_at_ms.is_some()),
+                    "ready-node count must match the play's scheduled timers"
+                );
+                scan.earliest_idle_ms = earlier(scan.earliest_idle_ms, idle);
+                if pending {
+                    scan.earliest_pending_idle_ms = earlier(scan.earliest_pending_idle_ms, idle);
+                    scan.any_pending = true;
+                }
             }
-        }
-        Some(next)
+            scan
+        };
+        debug_assert!(
+            profile.idle_scan.is_none_or(|cached| cached == scan()),
+            "cached idle scan must match the active plays"
+        );
+        *profile.idle_scan.get_or_insert_with(scan)
     }
 
     /// Warm full snapshot prefixes without advancing the saved request graph.
@@ -3111,6 +3146,7 @@ impl WorkloadDriver {
                     profile.first_request_ms.get_or_insert(now_ms);
                     profile.global_idle_since_ms = None;
                     profile.tree_idle_since_ms[state.node_to_play[session_index]] = None;
+                    profile.idle_scan = None;
                 }
                 state.release_dispatch_dependents(
                     &mut self.sessions,
@@ -3574,6 +3610,11 @@ impl WorkloadDriver {
                     now_ms,
                     resolution.outcome,
                 );
+                // A terminal changes ready-node counts here and the play's
+                // idle stamp in the caller.
+                if let Some(profile) = &mut self.agentic_profile {
+                    profile.idle_scan = None;
+                }
             }
         }
     }
