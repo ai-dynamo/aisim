@@ -17,6 +17,7 @@ from aisim_core.data.loaders import (
     LOADERS,
     E2eLoader,
     FpmLoader,
+    HostCostLoader,
     LoaderError,
     OpLatencyLoader,
 )
@@ -129,7 +130,10 @@ def test_select_builds_catalog_selections():
     assert E2eLoader().select(CONFIG).category == "e2e"
     with pytest.raises(SelectionError):
         FpmLoader().select({"system": "h200_sxm"})  # fpm needs a model
-    assert set(LOADERS) == {"op-latency", "fpm", "e2e"}
+    host = HostCostLoader().select(CONFIG)
+    assert (host.category, host.hardware, host.framework) == ("host-cost", "h200_sxm", "vllm")
+    assert host.framework_version is None  # the closest collected version is chosen after the catalog is read
+    assert set(LOADERS) == {"op-latency", "fpm", "e2e", "host-cost"}
 
 
 # ------------------------------------------------------------------ op-latency

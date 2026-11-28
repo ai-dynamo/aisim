@@ -110,7 +110,7 @@ pub(super) enum StepKind {
 /// SGLang `ScheduleBatch.retract_decode`.
 fn retraction_ratio_estimate(running: &[SglangRequest]) -> f64 {
     let total_decoded: usize = running.iter().map(|req| req.output_len()).sum();
-    let total_max_new: usize = running.iter().map(|req| req.max_output_tokens).sum();
+    let total_max_new: usize = running.iter().map(|req| req.budget_max_output_tokens).sum();
     let estimate = (total_decoded as f64 + RETRACT_DECODE_STEPS as f64 * running.len() as f64)
         / (total_max_new as f64 + 1.0);
     estimate.min(1.0)

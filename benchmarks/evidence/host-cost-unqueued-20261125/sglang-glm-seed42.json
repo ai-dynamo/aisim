@@ -1,0 +1,17 @@
+{
+  "requests": 163,
+  "matched": 163,
+  "median_input_tokens": 133775.0,
+  "before_engine_median_ms": 213.21582794189453,
+  "after_engine_median_ms": 2.138853073120117,
+  "outside_engine_fit": {
+    "base_ms": 19.45650887252463,
+    "us_per_token": 1.5303177849174638,
+    "r2": 0.8081329032176013
+  },
+  "tokenizer_us_per_token": 1.217,
+  "extra_cpu_overhead": {
+    "base_ms": 19.45650887252463,
+    "per_input_token_us": 0.31331778491746376
+  }
+}

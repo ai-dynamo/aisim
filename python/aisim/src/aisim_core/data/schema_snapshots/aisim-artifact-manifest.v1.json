@@ -303,7 +303,8 @@
         "e2e-configuration",
         "evaluation-record",
         "system-spec",
-        "host-cost-profile"
+        "host-cost-profile",
+        "host-cost-unqueued"
       ],
       "title": "Purpose",
       "type": "string"
