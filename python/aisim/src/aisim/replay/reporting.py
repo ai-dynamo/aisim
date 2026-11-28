@@ -5,10 +5,7 @@
 
 from __future__ import annotations
 
-import json
 import math
-from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from ..power import normalize_power_summary, power_unavailable_reason
@@ -16,39 +13,6 @@ from ..power import normalize_power_summary, power_unavailable_reason
 TITLE = "NVIDIA AIPerf | LLM Metrics"
 STAT_COLUMNS = ("avg", "min", "max", "p99", "p90", "p75", "std")
 POWER_DIAGNOSTICS_TITLE = "AISim active forward-pass energy diagnostics (per GPU)"
-
-
-def default_report_path(prefix: str = "aisim_replay_report") -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path.cwd() / f"{prefix}_{timestamp}.json"
-
-
-def write_report_json(
-    report: dict[str, Any],
-    output_path: str | Path | None,
-    *,
-    default_prefix: str = "aisim_replay_report",
-) -> Path:
-    path = Path(output_path) if output_path is not None else default_report_path(default_prefix)
-    if path.exists() and path.is_dir():
-        path = path / default_report_path(default_prefix).name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return path
-
-
-def write_per_request_jsonl(
-    output_path: str | Path,
-    records: list[dict[str, Any]] | None,
-) -> None:
-    if records is None:
-        raise ValueError("replay report did not provide per_request records")
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as output:
-        for record in records:
-            output.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
-            output.write("\n")
 
 
 def format_report_table(report: dict[str, Any]) -> str:
