@@ -2304,6 +2304,139 @@ mod destination_lifecycle {
         }
         assert!(destination.is_drained());
     }
+
+    /// A decode rank of four 4-token blocks. With `nextn`, every draft token
+    /// is accepted.
+    fn small_decode(nextn: Option<usize>) -> VllmCore {
+        let mut args = destination_args(EngineType::Vllm, 4);
+        args.aic_nextn = nextn;
+        args.aic_nextn_accept_rates = nextn.map(|nextn| vec!["1"; nextn].join(","));
+        VllmCore::new(args)
+    }
+
+    /// Reserve G1 for the handoff of request `id` and name it by that id.
+    fn reserve(core: &mut VllmCore, id: u128, prompt: usize, outputs: usize) -> HandoffId {
+        let (uuid, tokens) = (Uuid::from_u128(id), vec![id as u32; prompt]);
+        reserve_destination(core, HandoffId::from(uuid), uuid, &tokens, outputs).unwrap();
+        HandoffId::from(uuid)
+    }
+
+    /// Complete the KV transfer of a reserved handoff.
+    fn activate(core: &mut VllmCore, handoff_id: HandoffId) {
+        core.apply_command(SchedulerCommand::ActivateDestination { handoff_id })
+            .unwrap();
+    }
+
+    /// vLLM schedules `skipped_waiting`, the requests that received remote
+    /// KV, before `waiting`, where a preempted request waits. It resumes a
+    /// request only with room for its next token, which speculative emission
+    /// takes in the pass that samples it.
+    #[rstest]
+    fn a_preempted_request_waits_behind_the_handoffs_that_hold_g1(
+        #[values(None, Some(1))] nextn: Option<usize>,
+    ) {
+        let mut core = small_decode(nextn);
+        let (holder, grows) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        // `grows` holds two blocks and a later handoff in transfer the other
+        // two, so `grows` is preempted for its third.
+        let ready = reserve(&mut core, 2, 8, 6);
+        let in_transfer = reserve(&mut core, 1, 8, 1);
+        activate(&mut core, ready);
+        for _ in 0..2 {
+            if core.state.requests[&grows].num_preemptions == 0 {
+                execute(&mut core, 0.0);
+            }
+        }
+        assert_eq!(core.state.requests[&grows].num_preemptions, 1);
+        // Two free blocks do not hold what it needs to resume.
+        let waiting = execute(&mut core, 0.0);
+        assert!(waiting.admissions.is_empty() && waiting.pressure_events.is_empty());
+        // One-block handoffs pass it and leave no entries in the queue.
+        for id in 10..42 {
+            let passing = reserve(&mut core, id, 4, 1);
+            activate(&mut core, passing);
+            execute(&mut core, 0.0);
+        }
+        assert!(core.state.waiting.len() < 16);
+        // The handoff in transfer runs first once it completes, and leaves.
+        activate(&mut core, in_transfer);
+        for expected in [holder, grows] {
+            let pass = execute(&mut core, 0.0);
+            let admitted = pass.admissions.iter().map(|a| a.uuid).collect::<Vec<_>>();
+            assert_eq!(admitted, [expected]);
+        }
+    }
+
+    /// vLLM refuses to start with a `max_model_len` its KV cache cannot
+    /// hold, so no request outgrows it there. Speculative emission preempts
+    /// the request one token short of outgrowing the pool.
+    #[rstest]
+    fn a_request_that_outgrows_g1_is_rejected(#[values(None, Some(1))] nextn: Option<usize>) {
+        let mut core = small_decode(nextn);
+        // 9 prompt tokens and 9 outputs need five blocks.
+        let ready = reserve(&mut core, 1, 9, 9);
+        activate(&mut core, ready);
+        let ended = (0..24)
+            .flat_map(|_| execute(&mut core, 0.0).output_signals)
+            .filter(|signal| signal.completed)
+            .map(|signal| signal.rejected)
+            .collect::<Vec<_>>();
+        assert_eq!(ended, [true]);
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    }
+
+    #[rstest]
+    #[case::cannot_fit(4, true)]
+    #[case::exact_fit(5, false)]
+    fn speculative_prefill_emission_capacity(#[case] blocks: usize, #[case] rejected: bool) {
+        let mut config = args(WorkerType::Prefill);
+        config.num_gpu_blocks = blocks;
+        config.max_num_batched_tokens = Some(16);
+        config.aic_nextn = Some(1);
+        config.aic_nextn_accept_rates = Some("1".into());
+        crate::engine::EngineConfig {
+            num_gpu_blocks: blocks,
+            block_size: config.block_size,
+            max_num_batched_tokens: 16,
+            worker_type: crate::engine::WorkerType::Prefill,
+            aic_nextn: config.aic_nextn,
+            aic_nextn_accept_rates: config.aic_nextn_accept_rates.clone(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        let mut core = VllmCore::new(config);
+        let id = core.receive(request(Uuid::from_u128(10_501), (0..16).collect(), 1));
+        let mut terminal = Vec::new();
+        for _ in 0..4 {
+            let pass = execute(&mut core, 0.0);
+            terminal.extend(pass.output_signals.into_iter().filter(|s| s.completed));
+            if core.state.requests.is_empty() {
+                break;
+            }
+        }
+        // The prompt needs four blocks, and its sampled token needs a fifth.
+        // Without that fifth block, the first pass preempts before emission.
+        assert_eq!(core.state.preemptions_total, u64::from(rejected));
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].uuid, id);
+        assert_eq!(terminal[0].rejected, rejected);
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    }
+
+    /// TensorRT-LLM never preempts, so its decode rank keeps arrival order.
+    #[test]
+    fn a_trtllm_decode_rank_admits_in_arrival_order() {
+        let mut args = destination_args(EngineType::Trtllm, 8);
+        args.max_num_seqs = Some(1);
+        let mut core = VllmCore::new(args);
+        let first = core.receive(request(Uuid::from_u128(1), vec![1; 4], 1));
+        let handoff = reserve(&mut core, 2, 4, 1);
+        activate(&mut core, handoff);
+        let admitted = execute(&mut core, 0.0).admissions;
+        assert_eq!(admitted.iter().map(|a| a.uuid).collect::<Vec<_>>(), [first]);
+    }
 }
 
 mod core_behavior {

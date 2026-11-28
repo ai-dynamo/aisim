@@ -341,6 +341,14 @@ impl SchedulerState {
             return;
         }
         self.record_queued_length(uuid);
+        // A handoff admitted from behind a waiting head leaves its entry in
+        // the queue until that head moves. Drop such entries once they
+        // outnumber the waiting requests, so this search stays proportional
+        // to them.
+        if self.waiting.len() > 2 * self.waiting_members.len() + 8 {
+            let members = &self.waiting_members;
+            self.waiting.retain(|queued| members.contains(queued));
+        }
         let waiting_index =
             self.insertion_index_for_waiting_order(&self.waiting, waiting_order, false);
         self.waiting.insert(waiting_index, uuid);
@@ -2708,25 +2716,31 @@ impl VllmCore {
         }
     }
 
-    /// Whether a preempted request would resume without the blocks its
-    /// emission takes. vLLM resumes a request only with room for the token it
-    /// sampled last, and speculative emission takes that token's blocks in the
-    /// pass that samples it. Resumed without them, the request is preempted by
-    /// the same pass and resumed again at the same instant, without end while
-    /// the stores of a shared pool hold the blocks. Only a rank with a host
-    /// pool waits: its queue serves the handoffs and restores that own G1
-    /// blocks first, so the waiting request cannot keep them from finishing.
-    fn resumed_emission_lacks_blocks(&self, uuid: Uuid, cost: &PrefillCost) -> bool {
-        if self.native_host_offload.is_none()
-            || self.speculative_sampler.is_none()
-            || self.native_mtp_depth.is_some()
-        {
-            return false;
+    /// The decision for a preempted request that would resume without the
+    /// blocks its emission takes, if it would. vLLM resumes a request only
+    /// with room for the token it sampled last, and speculative emission
+    /// takes that token's blocks in the pass that samples it. Resumed without
+    /// them, the request is preempted by the same pass and resumed again at
+    /// the same instant, without end while a handoff in transfer or the
+    /// stores of a shared pool hold the blocks. Only a decode rank and a rank
+    /// with a host pool wait: their queues serve the handoffs and restores
+    /// that own G1 blocks first, so the waiting request cannot keep them
+    /// from finishing. A request that could not hold that token even alone
+    /// in G1 can never resume and is rejected, also when a host load
+    /// restores it: emission preempts it before its sequence grows, so the
+    /// cap on the known sequence does not see it.
+    fn resumed_without_emission_blocks(
+        &self,
+        uuid: Uuid,
+        cost: &PrefillCost,
+        host_hit: bool,
+    ) -> Option<AdmissionDecision> {
+        if self.speculative_sampler.is_none() || self.native_mtp_depth.is_some() {
+            return None;
         }
         let request = &self.state.requests[&uuid];
-        if request.status != RequestStatus::Preempted || request.sequence.num_allocated_tokens() > 0
-        {
-            return false;
+        if request.status != RequestStatus::Preempted {
+            return None;
         }
         let remaining =
             policy::remaining_generation_tokens(&request.sequence, self.args.max_model_len);
@@ -2740,22 +2754,49 @@ impl VllmCore {
                 remaining.min(1),
             ),
         ) else {
-            return false;
+            return None;
         };
+        // Its own tokens and the next one exceed G1 whatever restores them.
+        if request.sequence.current_known_blocks() + emitted > self.args.num_gpu_blocks {
+            return Some(AdmissionDecision::Reject);
+        }
+        if host_hit || request.sequence.num_allocated_tokens() > 0 {
+            return None;
+        }
         let free = self
             .args
             .num_gpu_blocks
             .saturating_sub(self.kv_manager.num_active_blocks());
-        resumed + emitted > free
+        if resumed + emitted <= free {
+            return None;
+        }
+        // Resume allocation also includes working state and prefill checkpoint
+        // blocks. Keep the known-token bound when active prefix reuse discounts
+        // that allocation, but never omit the state footprint from rejection.
+        let alone = request.sequence.current_known_blocks().max(resumed) + emitted;
+        if alone > self.args.num_gpu_blocks {
+            Some(AdmissionDecision::Reject)
+        } else if self.native_host_offload.is_some() || self.args.worker_type == WorkerType::Decode
+        {
+            Some(AdmissionDecision::Wait)
+        } else {
+            None
+        }
     }
 
-    fn host_inflight_tail_blocks(&self) -> usize {
+    /// The blocks that host loads in flight and landed still need, and
+    /// whether a request waits with a landed load.
+    fn host_load_demand(&self) -> (usize, bool) {
         self.state
             .requests
             .values()
             .filter_map(|request| request.host_offload.as_deref())
-            .map(VllmHostRequestState::unreserved_tail_blocks)
-            .sum()
+            .fold((0, false), |(tail_blocks, load_landed), host| {
+                (
+                    tail_blocks + host.unreserved_tail_blocks(),
+                    load_landed || host.has_activated_load(),
+                )
+            })
     }
 
     /// This request's contribution to pass-local headroom for running
@@ -3138,16 +3179,23 @@ impl VllmCore {
         // Agent-style workloads can keep many requests in both collections.
         // Scan once, then update only the selected request's contribution as
         // this pass queues/consumes a host load or admits a new prefill.
-        let mut pass_prefill_reserved_blocks = if self.native_host_offload.is_some() {
-            self.running_prefill_remaining_blocks()
-                .saturating_add(self.host_inflight_tail_blocks())
+        // The same walk says whether a request waits with a landed load: a
+        // waiter that must wait, and a pending destination, yield only then.
+        let (mut pass_prefill_reserved_blocks, load_landed) = if self.native_host_offload.is_some()
+        {
+            let (tail_blocks, load_landed) = self.host_load_demand();
+            (
+                self.running_prefill_remaining_blocks()
+                    .saturating_add(tail_blocks),
+                load_landed,
+            )
         } else {
-            0
+            (0, false)
         };
         let mut admit_queued_arrivals = false;
         let mut stopped_at_queued_arrival = false;
-        // Set once a window restore waits for room: the rest of the pass
-        // serves only waiters that already hold G1 for their load.
+        // Set once a waiter that holds no G1 waits for room: the rest of the
+        // pass serves only waiters that already hold G1 for their load.
         let mut g1_owners_only = false;
         while !preempted_any
             && self.state.running.len() < max_num_running
@@ -3156,31 +3204,38 @@ impl VllmCore {
             && (self.native_host_offload.is_none() || token_budget > 0)
         {
             // A decode worker's activated handoffs already own their KV; a
-            // restore that is waiting for capacity must not starve them. This
+            // preempted request or a restore that is waiting for capacity
+            // must not starve them: they hold the blocks it waits for. This
             // is modeled on native FCFS `_select_waiting_queue_for_scheduling`,
             // which serves `skipped_waiting` (received remote KV) before
-            // `waiting`, and applies only to decode ranks with G2, in either
-            // scope.
+            // `waiting`, where a preempted request waits.
             // Native PRIORITY instead compares the two queue heads by
             // (priority, arrival); this engine models only FCFS and never
-            // reads request `priority`, so it has no PRIORITY branch.
-            let prefer_materialized = matches!(
+            // reads request `priority`, so it has no PRIORITY branch. A policy
+            // that never preempts keeps the order its requests arrived in.
+            let pending_destination = matches!(
                 admission.stage_for(false),
                 AdmissionStage::PendingDestinationHead
-            ) || (self.args.worker_type == WorkerType::Decode
-                && self.native_host_offload.is_some()
-                && self.state.has_materialized_waiting());
+            );
+            let prefer_materialized = pending_destination
+                || (self.args.worker_type == WorkerType::Decode
+                    && policy::allows_preemption(scheduling_policy)
+                    && self.state.has_materialized_waiting());
             let prioritize_connector_waiting = self.native_host_offload.is_some();
             // A connector waiter that holds no G1 can queue ahead of one that
             // already holds reserved G1 for its load; serve that owner first
-            // so the head cannot block the space it waits for. A window
-            // restore waiting for room also requires draining G1 owners.
-            // Activated handoffs still go first: a pending destination
-            // forbids fresh admission even after its G2 load has landed.
-            let g1_owner = if !prefer_materialized
-                && (kv_holders_first || g1_owners_only)
-                && self.state.has_ready_connector_waiter()
-            {
+            // so the head cannot block the space it waits for. Any head
+            // waiting for room also requires draining G1 owners.
+            // Activated handoffs still go first. A pending destination
+            // forbids fresh admission, and a landed load is not fresh: it
+            // holds G1, which the destination may be waiting for, so it is
+            // served once no activated handoff waits.
+            let serve_g1_owner = if prefer_materialized {
+                pending_destination && load_landed && !self.state.has_materialized_waiting()
+            } else {
+                kv_holders_first || g1_owners_only
+            };
+            let g1_owner = if serve_g1_owner && self.state.has_ready_connector_waiter() {
                 self.state.connector_waiting.iter().copied().find(|uuid| {
                     self.state.connector_waiting_members.contains(uuid)
                         && !self.state.connector_deadline_waiting_members.contains(uuid)
@@ -3189,7 +3244,12 @@ impl VllmCore {
                             .requests
                             .get(uuid)
                             .and_then(|r| r.host_offload.as_deref())
-                            .is_some_and(|h| h.reserved_blocks() > 0)
+                            // Out of queue order, only a landed load can be
+                            // admitted: one in flight is skipped again.
+                            .is_some_and(|h| match kv_holders_first {
+                                true => h.reserved_blocks() > 0,
+                                false => h.has_activated_load(),
+                            })
                 })
             } else {
                 None
@@ -3220,7 +3280,12 @@ impl VllmCore {
                         || !self
                             .kv_manager
                             .accepts_sequence_length(request.sequence.len()),
-                    admission.stage_for(request.prompt_is_prebuilt()),
+                    match admission.stage_for(request.prompt_is_prebuilt()) {
+                        AdmissionStage::PendingDestinationHead if g1_owner.is_some() => {
+                            AdmissionStage::FreshKv
+                        }
+                        stage => stage,
+                    },
                     request.admissible_from_pass,
                     request.arrival_ms,
                 )
@@ -3497,23 +3562,32 @@ impl VllmCore {
                 decision
             };
             let decision = match decision {
-                AdmissionDecision::Admit { prefill_cost }
-                    if host_hit.is_none()
-                        && self.resumed_emission_lacks_blocks(uuid, &prefill_cost) =>
-                {
-                    AdmissionDecision::Wait
-                }
+                AdmissionDecision::Admit { prefill_cost } => self
+                    .resumed_without_emission_blocks(uuid, &prefill_cost, host_hit.is_some())
+                    .unwrap_or(AdmissionDecision::Admit { prefill_cost }),
                 decision => decision,
             };
             let prefill_cost = match decision {
                 AdmissionDecision::Admit { prefill_cost } => prefill_cost,
                 AdmissionDecision::Wait => {
                     // vLLM starts a load whose blocks fit and steps past the
-                    // request. Replay holds a window restore back until the
+                    // request. Replay holds a restore back until the
                     // request's whole footprint fits beside the loads in
-                    // flight, so a waiter behind it that already holds G1 for
-                    // its load goes first: it frees that room.
-                    if restores_window && !g1_owners_only {
+                    // flight, and counts the blocks a landed load still needs
+                    // against every waiter with a hit. A waiter behind this
+                    // one whose load has landed therefore goes first: it
+                    // frees that room, and this one would otherwise wait for
+                    // it without end. vLLM schedules such requests first from
+                    // v0.31.0 on (`kv_holding_waiting`); a rank that already
+                    // does has none left behind this waiter.
+                    if !g1_owners_only
+                        && !kv_holders_first
+                        && load_landed
+                        && !self.state.requests[&uuid]
+                            .host_offload
+                            .as_deref()
+                            .is_some_and(VllmHostRequestState::has_activated_load)
+                    {
                         g1_owners_only = true;
                         continue;
                     }
@@ -5310,7 +5384,7 @@ mod waiting_queue_tests {
     }
 
     #[test]
-    fn a_landed_connector_load_cannot_block_a_materialized_handoff() {
+    fn a_pending_destination_stops_only_requests_that_hold_no_kv() {
         use crate::engine::G2Connector;
 
         let args = MockEngineArgs::builder()
@@ -5358,7 +5432,8 @@ mod waiting_queue_tests {
 
         // Commands can reserve and activate remote KV on an aggregated
         // rank too. A second, larger handoff cannot reserve beside the
-        // landed G2 load; it blocks fresh admission, not activated KV.
+        // landed G2 load; it blocks fresh admission, not requests that hold
+        // KV: the activated handoff, then the owner of the landed load.
         let ready_handoff = HandoffId::from(Uuid::from_u128(4));
         let ready = Uuid::from_u128(5);
         core.apply_command(SchedulerCommand::ReserveDestination {
@@ -5380,9 +5455,12 @@ mod waiting_queue_tests {
         let pass = core.try_execute_hidden_pass(deadline).unwrap();
         assert_eq!(
             pass.admissions.iter().map(|a| a.uuid).collect::<Vec<_>>(),
-            [ready]
+            [ready, owner]
         );
-        assert!(core.state.requests.contains_key(&owner));
+        // Both leave, and the larger handoff reserves the blocks they held.
+        core.complete_engine_boundary(pass.end_ms);
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.retry_pending_destinations().len(), 1);
     }
 
     fn core(blocks: usize) -> VllmCore {
@@ -5600,6 +5678,55 @@ mod waiting_queue_tests {
 mod state_cache_tests {
     use super::*;
     use crate::engine::{HandoffTransferTiming, StateCacheConfig};
+
+    #[rstest::rstest]
+    #[case::cannot_fit(6, true)]
+    #[case::state_headroom(8, false)]
+    fn speculative_resume_counts_state_checkpoint_blocks(
+        #[case] capacity: usize,
+        #[case] rejected: bool,
+    ) {
+        let mut config = args(capacity, true, Some(1));
+        config.worker_type = WorkerType::Decode;
+        config.max_num_batched_tokens = Some(8);
+        config.aic_nextn_accept_rates = Some("1".into());
+        config.prefix_match_unit = Some(4);
+        config.state_cache.as_mut().unwrap().prefill_checkpoint = true;
+        crate::engine::EngineConfig {
+            num_gpu_blocks: capacity,
+            block_size: config.block_size,
+            max_num_batched_tokens: 8,
+            worker_type: crate::engine::WorkerType::Decode,
+            aic_nextn: config.aic_nextn,
+            aic_nextn_accept_rates: config.aic_nextn_accept_rates.clone(),
+            kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
+            state_cache: config.state_cache,
+            prefix_match_unit: config.prefix_match_unit,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 91_250, 16, 1);
+        let mut terminal = Vec::new();
+        for _ in 0..8 {
+            let pass = step(&mut core);
+            terminal.extend(pass.output_signals.into_iter().filter(|s| s.completed));
+            if core.state.requests.is_empty() {
+                break;
+            }
+        }
+        // Four token blocks, a working state and an internal checkpoint fill
+        // six blocks. Emitting the first token needs another block. The
+        // six-block case preempts once, then must reject rather than wait
+        // forever; eight blocks also cover checkpoint preservation at emission.
+        assert_eq!(core.state.preemptions_total, u64::from(rejected));
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].uuid, id);
+        assert_eq!(terminal[0].rejected, rejected);
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    }
 
     fn args(capacity: usize, prefix_caching: bool, nextn: Option<usize>) -> MockEngineArgs {
         MockEngineArgs::builder()

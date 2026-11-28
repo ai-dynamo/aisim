@@ -131,6 +131,14 @@ requested count, `R - P - 1`, and `K - ceil(P / B) * B - B - 1`.
 This can shorten generation even when the configured context is larger than
 the prompt plus the requested outputs.
 
+vLLM refuses to start with a context limit its KV cache cannot hold. Replay
+accepts one, or none, and then treats the pool as the limit: a prompt longer
+than the pool is rejected at admission, and a request whose decode outgrows
+the pool is rejected once it has preempted itself and can never resume. With
+MTP the token a request samples next counts toward that, and so do the copies
+of a sliding-window state it resumes from. A `context_length` within the pool
+ends generation at the limit instead.
+
 ## Parallelism
 
 ### GPU count

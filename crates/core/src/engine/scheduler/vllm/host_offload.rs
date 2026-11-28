@@ -622,7 +622,7 @@ impl VllmHostOffloadAdapter {
 
     /// Whether a waiting request that holds G1 for a load is admitted before
     /// the others: the connector's rule, or any rank that G3 or a KVCR pull
-    /// can wake.
+    /// can wake. On other ranks it goes before a waiter that must wait.
     pub(super) fn admits_kv_holders_first(&self) -> bool {
         self.rules.admits_kv_holders_first || self.retry_epoch().is_some()
     }
