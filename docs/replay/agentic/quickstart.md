@@ -22,8 +22,7 @@ See [agentic load controls](../workloads.md#agentic-load-controls) for every opt
 
 ## 1. Install from source
 
-You need Python 3.11–3.13, `uv`, Rust/Cargo, and a C/C++ compiler and linker.
-See [source installation](../../getting-started/installation.md#use-current-source) for platform details.
+You need Python 3.11–3.14, `uv`, Rust/Cargo, and a C/C++ compiler and linker. See [source installation](../../getting-started/installation.md#use-current-source) for platform details.
 
 ```bash
 uv sync --project python/aisim --extra dev

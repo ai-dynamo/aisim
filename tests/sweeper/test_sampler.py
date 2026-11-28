@@ -122,6 +122,29 @@ def test_seeded_bayesian_uses_float64_from_an_fp32_runtime() -> None:
         jax.config.update("jax_enable_x64", previous)
 
 
+@pytest.mark.parametrize("multi_objective", [False, True])
+def test_seeded_bayesian_fits_and_suggests_after_observation(multi_objective: bool) -> None:
+    """Exercise GP fitting and scalarization beyond the initial seed proposal."""
+    branch = _branch()
+    branch = BranchSpace(
+        deployment_mode=branch.deployment_mode,
+        parallel_configs=(branch.parallel_configs[0],),
+        supported_backends=branch.supported_backends,
+        knob_choices={"backend": ["trtllm"]},
+        float_ranges={"kv_load_ratio": (0.0, 1.0)},
+    )
+    objectives = [("throughput", True), ("latency", False)] if multi_objective else None
+    sampler = SeededBayesianBranchSampler(branch, objectives=objectives, seed=13)
+    for _ in range(3):
+        suggestion = sampler.suggest(1)[0]
+        ratio = suggestion.selection["kv_load_ratio"]
+        assert 0.0 <= ratio <= 1.0
+        assert suggestion.parallel_config == branch.parallel_configs[0]
+        metrics = {"throughput": 1.0 + ratio, "latency": 1.0 + ratio**2} if multi_objective else {"objective": ratio}
+        sampler.observe(suggestion, metrics)
+        assert not sampler._active
+
+
 @pytest.mark.parametrize(
     ("parameter", "value"),
     [

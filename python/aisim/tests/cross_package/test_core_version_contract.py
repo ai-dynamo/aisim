@@ -16,7 +16,7 @@ APPLICATION_ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 RUST_CRATE = REPOSITORY_ROOT / "crates" / "core"
 RUST_CONFIG = RUST_CRATE / "src" / "perfmodel" / "config.rs"
-SUPPORTED_PYTHON = ">=3.11,<3.14"
+SUPPORTED_PYTHON = ">=3.11,<3.15"
 SUPPORTED_NUMPY = "numpy>=2.1,<3"
 SUPPORTED_PLOTEXT = "plotext>=5.3.2,<6"
 

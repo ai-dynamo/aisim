@@ -1016,7 +1016,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1035,6 +1035,10 @@ jobs:
         run: >-
           python -m pytest -q
           python/aisim/tests/cross_package
+      - name: Test the Vizier Bayesian sampler
+        run: >-
+          python -m pytest -q
+          tests/sweeper/test_sampler.py tests/sweeper/test_quiet.py
 
   engine-golden-regression:
     name: Engine Golden Regression

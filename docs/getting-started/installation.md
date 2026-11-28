@@ -5,9 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Install AISim
 
-Use Python **3.11–3.13** in an isolated environment. Simulation runs on the
-host CPU; `engine.hardware` selects the GPU being modeled. A GPU serving
-environment is required for collection and deployment benchmarks.
+Use Python **3.11–3.14** in an isolated environment. Simulation runs on the host CPU; `engine.hardware` selects the GPU being modeled. A GPU serving environment is required for collection and deployment benchmarks.
+
+Python 3.14 support requires this source revision or a release that includes the updated Vizier/JAX dependencies; `aisim==0.14.0b1` requires Python 3.11–3.13. The Bayesian sweeper uses an exact `google-vizier-dev` pin because stable Vizier still pins an Equinox version incompatible with the required newer JAX.
+
+Prefer a fresh environment for this upgrade. When reusing an environment, uninstall `google-vizier` before installing the updated AISim wheel: `google-vizier` and `google-vizier-dev` own the same `vizier` package, and the old distribution retains incompatible dependency requirements. Run `python -m pip check` after installation.
 
 ## Choose a package and matching documentation
 
@@ -65,12 +67,7 @@ commands. Python imports use `aisim` and `aisim_core`; see
 | macOS Apple Silicon | macOS ARM64, deployment target 11.0 |
 | macOS Intel, native Windows, musl-based Linux | No corresponding platform-wheel job |
 
-The native wheels use `cp311-abi3`; the complete package still requires
-Python 3.11–3.13 and compatible dependency wheels. A source build target does
-not establish which artifacts were published or which dependency combinations
-were tested. The [platform-wheel workflow](../../.github/workflows/validate-platform-wheels.yml)
-defines build validation. Check the filenames of the release you select;
-source build changes do not alter previously published wheels.
+The native wheels use `cp311-abi3`; the complete package still requires Python 3.11–3.14 and compatible dependency wheels. A source build target does not establish which artifacts were published or which dependency combinations were tested. The [platform-wheel workflow](../../.github/workflows/validate-platform-wheels.yml) defines build validation. Check the filenames of the release you select; source build changes do not alter previously published wheels.
 
 On Linux, check `uname -m` and `ldd --version`; on macOS, check `uname -m` and
 `sw_vers`. To check wheel availability without compiling AISim:
