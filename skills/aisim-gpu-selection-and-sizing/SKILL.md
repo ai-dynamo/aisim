@@ -2,7 +2,7 @@
 name: aisim-gpu-selection-and-sizing
 description: Sizes how many GPUs of which type serve a model's request rate within a latency SLA (AISim on CPU). To tune GPUs already chosen, use aisim-deployment-search.
 license: Apache-2.0
-compatibility: "Python 3.11-3.13; aisim 0.14.x (targets 0.14.0; full evals pending); CPU only; PyYAML (installed with aisim)"
+compatibility: "Python 3.11-3.13; aisim 0.14.x (targets 0.14.0); CPU only; PyYAML (installed with aisim)"
 allowed-tools: Bash Read Write
 permissions: [env, file_read, file_write, network, shell]
 metadata:
