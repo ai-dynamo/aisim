@@ -392,6 +392,12 @@ impl AgenticPreparation {
         self.transition
     }
 
+    pub(super) fn burst_primers(&mut self) {
+        for lane in &mut self.lanes {
+            lane.primer_times_ms.fill(0.0);
+        }
+    }
+
     pub(super) fn next_ready_time_ms(&self) -> Option<f64> {
         if self.live_started || self.failure_request_id.is_some() || self.transition.is_some() {
             return None;
@@ -1126,6 +1132,74 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn burst_profile_sends_all_live_warmup_primers_at_once() {
+        let mut driver = WorkloadDriver::new_agentic_warmup_with_policy(
+            prepared(2, 50.0),
+            64,
+            true,
+            1.0,
+            AgenticWarmupPolicy::LiveTrajectoryV1,
+            10_000.0,
+        )
+        .unwrap();
+        driver
+            .enable_agentic_profile(super::super::AgenticProfileOptions {
+                burst_phase_starts: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let primers = driver.pop_ready(0.0, 100);
+        assert_eq!(primers.len(), 4);
+        assert!(
+            primers
+                .iter()
+                .all(|turn| turn.request.arrival_timestamp_ms == Some(0.0))
+        );
+    }
+
+    #[test]
+    fn burst_profile_without_warmup_preserves_each_lanes_relative_offsets() {
+        let source = prepared(2, 50.0);
+        let context = source.context();
+        let plays = [50.0, 70.0]
+            .into_iter()
+            .enumerate()
+            .map(|(lane, cut)| context.prepare_play(lane, 0, Some(cut)).unwrap())
+            .collect();
+        let mut driver = WorkloadDriver::new_agentic_snapshots(
+            PreparedAgenticSnapshots::from_plays(plays).unwrap(),
+            64,
+            true,
+            1.0,
+        )
+        .unwrap();
+        driver
+            .enable_agentic_profile(super::super::AgenticProfileOptions {
+                burst_phase_starts: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // The two lanes first wait 50 ms and 30 ms in the authored trace.
+        // Each has a second stream due 40 ms after its own first request.
+        let first = driver.pop_ready(0.0, 4);
+        assert_eq!(first.len(), 2);
+        assert!(
+            first
+                .iter()
+                .all(|turn| turn.authored_request_id.as_deref() == Some("a-future"))
+        );
+        assert_eq!(driver.next_ready_time_ms(), Some(40.0));
+        let second = driver.pop_ready(40.0, 4);
+        assert_eq!(second.len(), 2);
+        assert!(
+            second
+                .iter()
+                .all(|turn| turn.authored_request_id.as_deref() == Some("b-future"))
+        );
+    }
+
     fn primers_only_driver(cut: f64, cap_ms: f64) -> WorkloadDriver {
         WorkloadDriver::new_agentic_warmup_with_policy(
             prepared(1, cut),
@@ -1297,6 +1371,7 @@ mod tests {
         lanes: usize,
         cut: f64,
         speedup: f64,
+        burst_phase_starts: bool,
     ) -> WorkloadDriver {
         let graph = ValidatedAgenticGraph::from_agentic_mooncake_rows(
             AgenticMooncakeHeader {
@@ -1328,7 +1403,10 @@ mod tests {
         )
         .unwrap();
         driver
-            .enable_agentic_profile(super::super::AgenticProfileOptions::default())
+            .enable_agentic_profile(super::super::AgenticProfileOptions {
+                burst_phase_starts,
+                ..Default::default()
+            })
             .unwrap();
         driver
     }
@@ -1339,6 +1417,7 @@ mod tests {
             1,
             if rootless { 0.5 } else { 0.0 },
             1.0,
+            false,
         )
     }
 
@@ -1374,7 +1453,7 @@ mod tests {
         rows[11].dependencies[0].delay_ms = 600_000.0;
         rows[12].not_before_ms = 605_001.0;
         rows[12].dependencies[0].delay_ms = 4_000.0;
-        let mut driver = rows_live_driver(rows, 2, 0.0, 1.0);
+        let mut driver = rows_live_driver(rows, 2, 0.0, 1.0, false);
         let start = finish_ten_live_rounds(&mut driver, 2);
         let frontier = driver.pop_ready(start, 2);
         assert_eq!(frontier.len(), 2);
@@ -1448,7 +1527,7 @@ mod tests {
         child.dependencies[0].delay_ms = 2_000.0;
         rows.push(child);
 
-        let mut driver = rows_live_driver(rows, 1, 0.0, 1.0);
+        let mut driver = rows_live_driver(rows, 1, 0.0, 1.0, false);
         let start = finish_ten_live_rounds(&mut driver, 1);
         let ready = driver.pop_ready(start, 1).pop().unwrap();
         assert_eq!(ready.authored_request_id.as_deref(), Some("child"));
@@ -1483,8 +1562,13 @@ mod tests {
         assert_eq!(spawned.authored_request_id.as_deref(), Some("future-child"));
     }
 
-    #[test]
-    fn live_handoff_fresh_root_preserves_other_lanes_scaled_frontier_offset() {
+    #[rstest::rstest]
+    #[case::spread(false, 5.0)]
+    #[case::burst(true, 0.0)]
+    fn live_handoff_reanchors_the_frontier_and_preserves_later_delays(
+        #[case] burst: bool,
+        #[case] frontier_offset: f64,
+    ) {
         let mut rows = linear_live_rows(10, false);
         let mut other = linear_live_rows(12, false);
         for row in &mut other {
@@ -1495,17 +1579,44 @@ mod tests {
             }
         }
         rows.extend(other);
-        let mut driver = rows_live_driver(rows, 2, 0.0, 2.0);
+        let mut driver = rows_live_driver(rows, 2, 0.0, 2.0, burst);
         let start = finish_ten_live_rounds(&mut driver, 2);
-        // One lane finished exactly at its quota. Its new incarnation anchors
-        // the phase at zero, without also bursting the other lane's frontier.
-        let root = driver.pop_ready(start, 2);
-        assert_eq!(root.len(), 1);
-        assert_eq!(root[0].authored_request_id.as_deref(), Some("n0"));
-        assert_eq!(driver.next_ready_time_ms(), Some(start + 5.0));
-        let other = driver.pop_ready(start + 5.0, 2);
-        assert_eq!(other.len(), 1);
-        assert_eq!(other[0].authored_request_id.as_deref(), Some("other-n10"));
+        // The recycled lane starts at zero. The surviving lane is due after
+        // 10 authored milliseconds divided by the speedup, or at zero in burst mode.
+        let at = start + frontier_offset;
+        let other = if burst {
+            let initial = driver.pop_ready(start, 2);
+            assert_eq!(initial.len(), 2);
+            assert!(
+                initial
+                    .iter()
+                    .any(|turn| turn.authored_request_id.as_deref() == Some("n0"))
+            );
+            initial
+                .into_iter()
+                .find(|turn| turn.authored_request_id.as_deref() == Some("other-n10"))
+                .unwrap()
+        } else {
+            let root = driver.pop_ready(start, 1).pop().unwrap();
+            assert_eq!(root.authored_request_id.as_deref(), Some("n0"));
+            assert_eq!(driver.next_ready_time_ms(), Some(at));
+            let other = driver.pop_ready(at, 1).pop().unwrap();
+            assert_eq!(other.authored_request_id.as_deref(), Some("other-n10"));
+            other
+        };
+
+        // The next turn still waits 100 authored milliseconds / 2 after completion.
+        driver.on_output_token(other.request_uuid, 0).unwrap();
+        driver
+            .on_terminal(
+                other.request_uuid,
+                at + 1.0,
+                ReplayTerminalStatus::Completed,
+            )
+            .unwrap();
+        assert_eq!(driver.next_ready_time_ms(), Some(at + 51.0));
+        let next = driver.pop_ready(at + 51.0, 1).pop().unwrap();
+        assert_eq!(next.authored_request_id.as_deref(), Some("other-n11"));
     }
 
     #[test]

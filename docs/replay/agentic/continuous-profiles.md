@@ -24,9 +24,10 @@ traffic:
       cancel_drain_seconds: 10
       tree_idle_cap_seconds: 300
       global_idle_cap_seconds: 10
+      burst_phase_starts: false
 ```
 
-All five values have the defaults shown above, so `agentic_profile: {}` enables
+All values have the defaults shown above, so `agentic_profile: {}` enables
 that configuration. Duration and idle caps must be finite and positive. Response
 and cancellation grace periods may be zero. Values whose millisecond deadlines
 overflow are rejected. Do not combine the profile with

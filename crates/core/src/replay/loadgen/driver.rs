@@ -990,6 +990,12 @@ impl WorkloadDriver {
         let cursor = context.initial_corpus_cursor();
         let play_count = state.plays.len();
         self.release_live_dependents_by_events()?;
+        if options.burst_phase_starts {
+            if let Some(preparation) = &mut self.agentic_preparation {
+                preparation.burst_primers();
+            }
+            self.burst_initial_frontier();
+        }
         self.agentic_profile = Some(AgenticProfileState {
             options,
             start_ms: None,
@@ -1672,9 +1678,41 @@ impl WorkloadDriver {
         Ok(())
     }
 
+    // Shift each saved frontier by its first ready turn. Live warmup
+    // recomputes this anchor at the profiling handoff.
+    fn burst_initial_frontier(&mut self) {
+        let SchedulingPolicy::Agentic(state) = &mut self.policy else {
+            unreachable!()
+        };
+        let mut first_by_play = vec![f64::INFINITY; state.plays.len()];
+        for ready in &self.ready_sessions {
+            let first = &mut first_by_play[state.node_to_play[ready.session_index]];
+            *first = first.min(ready.ready_at_ms);
+        }
+        for (index, at) in state.ready_after_ms.iter_mut().enumerate() {
+            let first = first_by_play[state.node_to_play[index]];
+            if first.is_finite() {
+                *at = (*at - first).max(0.0);
+            }
+        }
+        self.ready_sessions = std::mem::take(&mut self.ready_sessions)
+            .into_iter()
+            .map(|mut ready| {
+                ready.ready_at_ms = state.ready_after_ms[ready.session_index];
+                self.sessions[ready.session_index].next_ready_at_ms = Some(ready.ready_at_ms);
+                ready
+            })
+            .collect();
+    }
+
     // Reconstruct source-clock offsets, not warmup wall time. This is computed
     // before reset_measurements so any error leaves the phase retryable.
-    fn live_handoff_times(&self, now_ms: f64, fresh_origin: bool) -> Result<Vec<(usize, f64)>> {
+    fn live_handoff_times(
+        &self,
+        now_ms: f64,
+        fresh_origin: bool,
+        burst: bool,
+    ) -> Result<Vec<(usize, f64)>> {
         let SchedulingPolicy::Agentic(state) = &self.policy else {
             unreachable!()
         };
@@ -1705,6 +1743,7 @@ impl WorkloadDriver {
             .collect::<Result<_>>()?;
         let mut offsets = Vec::new();
         let mut first = if fresh_origin { 0.0 } else { f64::INFINITY };
+        let mut first_by_play = burst.then(|| vec![f64::INFINITY; state.plays.len()]);
         for (index, node) in state.node_states.iter().enumerate() {
             if !matches!(node, AgenticNodeState::Ready | AgenticNodeState::Blocked) {
                 continue;
@@ -1737,14 +1776,25 @@ impl WorkloadDriver {
                 / self.agentic_speedup;
             if *node == AgenticNodeState::Ready {
                 first = first.min(offset);
+                if let Some(first_by_play) = &mut first_by_play {
+                    let first = &mut first_by_play[state.node_to_play[index]];
+                    *first = first.min(offset);
+                }
             }
             offsets.push((index, offset));
         }
         if !first.is_finite() {
             first = 0.0;
         }
-        for (_, at) in &mut offsets {
-            *at = now_ms + (*at - first).max(0.0);
+        for (index, at) in &mut offsets {
+            let anchor = if let Some(first_by_play) = &first_by_play {
+                let first = first_by_play[state.node_to_play[*index]];
+                // A lane with only blocked work has no eligible phase anchor.
+                if first.is_finite() { first } else { 0.0 }
+            } else {
+                first
+            };
+            *at = now_ms + (*at - anchor).max(0.0);
             if !at.is_finite() {
                 bail!("live warmup handoff timer overflow");
             }
@@ -1864,14 +1914,18 @@ impl WorkloadDriver {
         let Some(transition) = preparation.ready_transition(now_ms)? else {
             return Ok(None);
         };
+        let burst = self
+            .agentic_profile
+            .as_ref()
+            .is_some_and(|profile| profile.options.burst_phase_starts);
         let mut handoff_times = (transition == AgenticPreparationTransition::OpenProfile
             && preparation.live_active())
-        .then(|| self.live_handoff_times(now_ms, !handoff_plays.is_empty()))
+        .then(|| self.live_handoff_times(now_ms, !handoff_plays.is_empty(), burst))
         .transpose()?;
         if let Some(times) = &mut handoff_times {
             let mut node_offset = self.sessions.len();
             for plan in &handoff_plays {
-                for (index, at) in plan.appended.live_handoff_times(now_ms, true)? {
+                for (index, at) in plan.appended.live_handoff_times(now_ms, true, burst)? {
                     times.push((
                         node_offset
                             .checked_add(index)

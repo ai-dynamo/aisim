@@ -191,11 +191,25 @@ class AgenticProfileOptions(StrictModel):
     cancel_drain_seconds: NonNegativeFloat = 10.0
     tree_idle_cap_seconds: PositiveFloat = 300.0
     global_idle_cap_seconds: PositiveFloat = 10.0
+    burst_phase_starts: bool = Field(default=False, strict=True)
+
+    @model_serializer(mode="wrap")
+    def _omit_default_burst(self, handler):
+        result = handler(self)
+        if not self.burst_phase_starts:
+            result.pop("burst_phase_starts", None)
+        return result
 
     @model_validator(mode="after")
     def _validate_millisecond_deadlines(self) -> AgenticProfileOptions:
-        values = self.model_dump()
-        if any(not math.isfinite(value * 1000.0) for value in values.values()) or not math.isfinite(
+        deadlines = (
+            self.duration_seconds,
+            self.response_grace_seconds,
+            self.cancel_drain_seconds,
+            self.tree_idle_cap_seconds,
+            self.global_idle_cap_seconds,
+        )
+        if any(not math.isfinite(value * 1000.0) for value in deadlines) or not math.isfinite(
             (self.duration_seconds + self.response_grace_seconds + self.cancel_drain_seconds) * 1000.0
         ):
             raise ValueError("agentic_profile deadlines overflow")

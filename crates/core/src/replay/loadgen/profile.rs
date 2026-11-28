@@ -19,6 +19,8 @@ pub struct AgenticProfileOptions {
     pub cancel_drain_seconds: f64,
     pub tree_idle_cap_seconds: f64,
     pub global_idle_cap_seconds: f64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub burst_phase_starts: bool,
 }
 
 impl Default for AgenticProfileOptions {
@@ -29,6 +31,7 @@ impl Default for AgenticProfileOptions {
             cancel_drain_seconds: 10.0,
             tree_idle_cap_seconds: 300.0,
             global_idle_cap_seconds: 10.0,
+            burst_phase_starts: false,
         }
     }
 }
