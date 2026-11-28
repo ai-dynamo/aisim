@@ -452,7 +452,17 @@ def test_prepare_preserves_v13_summary_details_and_history(tmp_path, public_scen
 
 @pytest.mark.parametrize("with_scenarios", [False, True])
 @pytest.mark.parametrize(
-    "mode", ["hub", "local", "smoke", "hf_revision_mismatch", "evaluation_failure", "oversized", "mixed_statuses"]
+    "mode",
+    [
+        "hub",
+        "local",
+        "smoke",
+        "op_level_smoke",
+        "hf_revision_mismatch",
+        "evaluation_failure",
+        "oversized",
+        "mixed_statuses",
+    ],
 )
 def test_cli_qualifies_only_complete_pinned_snapshots(
     tmp_path, source_case, recording, monkeypatch, with_scenarios, mode
@@ -466,6 +476,8 @@ def test_cli_qualifies_only_complete_pinned_snapshots(
     wheel.write_bytes(b"test wheel for exporter contract")
     wheel_hash = hashlib.sha256(wheel.read_bytes()).hexdigest()
     output = tmp_path / "export"
+    op_level_config = tmp_path / "op-level.json"
+    op_level_config.write_text(json.dumps({"system": "b300_sxm"}))
     revision = "a" * 40
     cases = [source_case, *_non_ready_cases(source_case)] if mode == "mixed_statuses" else [source_case]
     cases_by_path = {case.configuration.configuration_path: case for case in cases}
@@ -535,7 +547,8 @@ def test_cli_qualifies_only_complete_pinned_snapshots(
             "--output",
             str(output),
             *(["--local-dataset", str(tmp_path)] if mode == "local" else []),
-            *(["--configuration", source_case.configuration.configuration_path] if mode == "smoke" else []),
+            *(["--configuration", source_case.configuration.configuration_path] if "smoke" in mode else []),
+            *(["--op-level-config", str(op_level_config)] if mode == "op_level_smoke" else []),
             *(["--scenarios"] if with_scenarios else []),
         ],
     )
@@ -548,7 +561,7 @@ def test_cli_qualifies_only_complete_pinned_snapshots(
     selection = {
         "models": None,
         "hardware": None,
-        "configuration_paths": [source_case.configuration.configuration_path] if mode == "smoke" else None,
+        "configuration_paths": [source_case.configuration.configuration_path] if "smoke" in mode else None,
     }
     expected = (
         ((tmp_path,), {"revision": revision, "repo_id": cli.HF_REPO, **selection})
@@ -557,9 +570,13 @@ def test_cli_qualifies_only_complete_pinned_snapshots(
     )
     assert source_calls == [expected]
     files = {file.name: file.read_bytes() for file in output.iterdir()}
-    if mode == "smoke":
+    if "smoke" in mode:
         assert "SMOKE_ONLY.txt" in files
         assert "qualification.json" not in files
+        # A smoke run records its op-level overrides like a full local run.
+        assert ("op-level-config.json" in files) is (mode == "op_level_smoke")
+        if mode == "op_level_smoke":
+            assert json.loads(files["op-level-config.json"]) == {"system": "b300_sxm"}
         return
     assert json.loads(files["qualification.json"])["schema_version"] == (3 if with_scenarios else 2)
     assert ("scenarios.json" in files) is with_scenarios

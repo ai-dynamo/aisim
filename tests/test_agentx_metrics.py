@@ -66,6 +66,20 @@ def test_request_errors_are_unsigned_and_exclude_burst_tpot():
     assert point_metrics([pair(10.0, 5.0)], "tpot_ms")["e2e"] == pytest.approx(50.0)
 
 
+def test_zero_predictions_score_and_zero_silicon_tpot_is_burst():
+    # Replay emits zero ITL when tokens share a timestamp; both formulas give 50% here, not 0%.
+    pairs = [pair(10.0, 0.0), pair(10.0, 10.0)]
+    pairs[0]["tpot_ms_ape"] = 100.0
+    tpot = point_metrics(pairs, "tpot_ms")
+    assert tpot["n"] == 2 and tpot["excluded"] == 0
+    assert tpot["e2e"] == pytest.approx(50.0) and tpot["quantile"] == pytest.approx(50.0)
+    # Silicon zero TPOT has no APE but is still matched burst delivery, so it is counted.
+    burst = {**pair(10.0, 3.0), "silicon_tpot_ms": 0.0, "tpot_ms_ape": None}
+    assert point_metrics([burst, pair(10.0, 10.0)], "tpot_ms")["excluded"] == 1
+    unmatched = {**burst, "status": "output_length_mismatch"}
+    assert point_metrics([unmatched], "tpot_ms")["excluded"] == 0
+
+
 def test_request_metrics_bootstrap_is_deterministic_and_skips_unmatched():
     pairs = [pair(10.0 + i, 11.0 + i * 1.1) for i in range(30)] + [
         {**pair(10.0, 10.0), "tpot_ms_ape": None, "ttft_ms_ape": None}
@@ -168,6 +182,32 @@ def test_learned_models_run_only_where_step_captures_are_pinned(monkeypatch):
     assert performance_models({"model": "nvidia/GLM-5.3-NVFP4"}) == ("op_level",)
     # Release wheels without the learned FPM still produce every op-based result.
     assert performance_models({"model": "Qwen/Qwen3.5-397B-A17B"}, learned=False) == ("op_level",)
+    # A wheel that rejects a learned FPM with speculative decoding omits only the MTP model's learned entries.
+    monkeypatch.setattr(runner, "STEP_CAPTURES", {"dense": {"speculative": False}, "mtp": {"speculative": True}})
+    assert performance_models({"model": "dense"}, speculative=False) == ("op_level", "fpm_learned")
+    assert performance_models({"model": "mtp"}, speculative=False) == ("op_level",)
+    assert performance_models({"model": "mtp"}) == ("op_level", "fpm_learned")
+
+
+def test_speculative_support_probe_separates_the_wheels(monkeypatch):
+    def rejecting(config):
+        assert config["nextn"] == 1 and config["estimation_mode"] == "fpm_learned"
+        raise ValueError("invalid engine config: fpm_learned does not support speculative decoding")
+
+    def accepting(config):
+        path = config["estimator_config"]["fpm_learned"]["artifact_path"]
+        raise RuntimeError(f"I/O error at {path}: No such file or directory")
+
+    def malformed(config):
+        raise ValueError("invalid forward-pass config at missing field `model`")
+
+    monkeypatch.setattr(agentx_learned, "_estimator", rejecting)
+    assert agentx_learned.speculative_supported() is False
+    monkeypatch.setattr(agentx_learned, "_estimator", accepting)
+    assert agentx_learned.speculative_supported() is True
+    monkeypatch.setattr(agentx_learned, "_estimator", malformed)
+    with pytest.raises(ValueError, match="missing field"):
+        agentx_learned.speculative_supported()
 
 
 def test_learned_support_follows_the_evaluated_wheel(monkeypatch):
@@ -284,12 +324,12 @@ def test_qualification_requires_every_performance_model(tmp_path, monkeypatch):
     args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
     for selected in ([op], [op, op], [learned, learned]):
         (tmp_path / "shard-0.json").write_bytes(
-            canonical({"snapshot": snapshot, "learned_fpm": True, "runs": selected})
+            canonical({"snapshot": snapshot, "learned_fpm": True, "learned_speculative": True, "runs": selected})
         )
         with pytest.raises(ValueError):
             runner.qualify(args)
     (tmp_path / "shard-0.json").write_bytes(
-        canonical({"snapshot": snapshot, "learned_fpm": True, "runs": [op, learned]})
+        canonical({"snapshot": snapshot, "learned_fpm": True, "learned_speculative": True, "runs": [op, learned]})
     )
     runner.qualify(args)
     summary = json.loads((args.output / "summary.json").read_bytes())
@@ -302,8 +342,15 @@ def test_qualification_requires_every_performance_model(tmp_path, monkeypatch):
     files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
     assert len(validate_bundle(files)["runs"]) == 2
     # A wheel without the learned FPM qualifies on op-based results alone, and only then.
-    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "learned_fpm": False, "runs": [op]}))
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": False, "learned_speculative": False, "runs": [op]})
+    )
     runner.qualify(Namespace(**{**vars(args), "output": tmp_path / "op-only"}))
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": False, "learned_speculative": True, "runs": [op]})
+    )
+    with pytest.raises(ValueError, match="learned-FPM support"):
+        runner.qualify(Namespace(**{**vars(args), "output": tmp_path / "inconsistent"}))
     (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [op]}))
     with pytest.raises(KeyError):
         runner.qualify(Namespace(**{**vars(args), "output": tmp_path / "unrecorded"}))

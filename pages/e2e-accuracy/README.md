@@ -761,8 +761,12 @@ metrics show "Not computed". Learned models retrain with the evaluated wheel on
 every campaign in a removed temporary directory outside the sealed shard tree;
 `--learned-workdir` keeps only the immutable step-capture downloads. A wheel
 without the learned FPM publishes op-based entries only; each shard records
-`learned_fpm` and qualification expects exactly those. A wheel that rejects a
-learned FPM with speculative decoding publishes no step metrics for that model.
+`learned_fpm` and `learned_speculative`, and qualification expects exactly
+those entries. A wheel that rejects a learned FPM with speculative decoding
+(probed by configuration validation before any replay) omits the learned
+entries of models whose step captures use speculative decoding (GLM MTP); it
+does not publish them as failed. Their op-based entries then have no step
+metrics, because GLM's shifted-step reference is the learned model.
 
 - All errors are unsigned percentages over uniquely matched requests.
   e2e error is `100 * abs(mean AISim / mean silicon - 1)` of request TTFT or TPOT.
@@ -771,11 +775,15 @@ learned FPM with speculative decoding publishes no step metrics for that model.
 - ± is a standard error: a 1,000-resample bootstrap over requests (fixed seed)
   for request metrics. Entries average run values equally and combine standard
   errors as `sqrt(sum se^2) / runs`.
-- Silicon TPOT under 1 ms is burst delivery, not decode pacing. Those requests
-  are excluded from TPOT and counted under the TPOT e2e cell.
+- Silicon TPOT under 1 ms, including zero, is burst delivery, not decode
+  pacing. Those matched requests are excluded from TPOT and counted under the
+  TPOT e2e cell. A zero AISim TPOT is kept: replay emits zero ITL when tokens
+  share a timestamp.
 - Step error is the MAPE of predicted versus measured forward-pass time on the
   held-out seed-7 step capture at the same lane count, ± std/√n. Runs publish
-  `n`, `sum_ape` and `sum_sq_ape` so entries pool steps exactly. Both performance
+  `n`, `sum_ape` and `sum_sq_ape` so entries pool steps exactly. Variants at one
+  lane count score the same capture, so an entry pools each capture once per
+  lane and performance model. Both performance
   models price steps through `RustForwardPassPerfModel.best_available` with the
   replay's compiled timing configuration. Op-based decode steps are packed by
   verification width `nextn + 1` (`B*v` requests, `B*v*s` KV tokens), as replay

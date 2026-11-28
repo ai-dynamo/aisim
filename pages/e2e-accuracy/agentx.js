@@ -69,7 +69,10 @@ window.AgentX = (() => {
     return out;
   }
   function stepAggregate(runs){
-    const steps=runs.map(r=>r.accuracy_metrics?.step).filter(Boolean);
+    // Variants at one lane count score the same held-out captures; pool each capture set once per estimator.
+    const unique=new Map();
+    for(const r of runs){const s=r.accuracy_metrics?.step;if(s)unique.set(JSON.stringify([r.model,r.lanes,estimationOf(r)||"op_level",s]),s);}
+    const steps=[...unique.values()];
     const out={dropped:steps.reduce((s,x)=>s+x.dropped_shifted,0)};
     for(const kind of ["decode","prefill"]){
       const n=steps.reduce((s,x)=>s+x[kind].n,0),sum=steps.reduce((s,x)=>s+x[kind].sum_ape,0),sq=steps.reduce((s,x)=>s+x[kind].sum_sq_ape,0);
@@ -185,8 +188,15 @@ window.AgentX = (() => {
     return run.category === "agentx" ? `<a href="${esc(run.benchmark_url)}" target="_blank" rel="noopener">AgentX benchmark ↗</a> · <a href="${esc(run.source_run_url)}" target="_blank" rel="noopener">Source run ↗</a>` :
       "AISim self-collected dataset: coming soon"; // TODO: link the public self-collected E2E HF dataset after migration.
   }
+  function pointRuns(runs, params) {
+    // Match the dashboard row identity; older links without it must still name one configuration.
+    const selected=runs.filter(r=>r.category===params.get("category") && r.model===params.get("model") && ["hardware","backend","precision"].every(k=>!params.has(k)||r[k]===params.get(k)) && (!params.has("tp")||r.tensor_parallel===Number(params.get("tp"))) && r.lanes===Number(params.get("lanes")) && (estimationOf(r)||"op_level")===(params.get("perf")||"op_level"));
+    if(!selected.length) throw new Error("This concurrency was not evaluated.");
+    if(new Set(selected.map(r=>JSON.stringify([r.hardware,r.backend,r.precision,r.tensor_parallel]))).size>1) throw new Error("This link matches more than one configuration.");
+    return selected;
+  }
   function pointUrl(run, branch) {
-    const params = new URLSearchParams({branch,category:run.category,model:run.model,lanes:run.lanes,perf:estimationOf(run)||""});
+    const params = new URLSearchParams({branch,category:run.category,model:run.model,hardware:run.hardware,backend:run.backend,precision:run.precision,tp:run.tensor_parallel,lanes:run.lanes,perf:estimationOf(run)||""});
     const campaign=new URL(location.href).searchParams.get("campaign");
     if(campaign) params.set("campaign",campaign);
     return `./agentx/point.html?${params}#view=point&stage=profile&variant=observed`;
@@ -271,7 +281,7 @@ window.AgentX = (() => {
 
   const githubIcon = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38v-1.49c-2.23.48-2.69-.95-2.69-.95-.36-.92-.89-1.17-.89-1.17-.73-.5.06-.49.06-.49.8.06 1.22.82 1.22.82.71 1.22 1.87.87 2.33.67.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.03 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.74.54 1.49v2.21c0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>`;
   function methodology() {
-    return `<ul class="agentx-notes"><li>Errors are unsigned percentages over uniquely matched requests. e2e error is 100 × |mean AISim / mean silicon − 1| of request TTFT or TPOT. Per-request quantile error averages 100 × |AISim pN / silicon pN − 1| over p5, p10, …, p95.</li><li>± is the standard error: a 1,000-resample bootstrap over requests for request metrics, std/√n over steps for step error. Request metrics average an entry's runs equally, combining stderr as √(Σse²)/runs; step error pools the individual steps of all runs.</li><li>Silicon TPOT under 1 ms is burst delivery, not decode pacing; those requests are excluded from TPOT and counted.</li><li>Step error prices held-out seed-7 step captures at the same lane count. The learned FPM row replays a model retrained from pinned seed-42 and seed-7 captures with a fixed seed and frozen adaptation; its step error uses a seed-42-only model.</li><li>Preparation and warmup are unscored. Missing measurements and zero denominators remain unavailable. No timing calibration.</li></ul>`;
+    return `<ul class="agentx-notes"><li>Errors are unsigned percentages over uniquely matched requests. e2e error is 100 × |mean AISim / mean silicon − 1| of request TTFT or TPOT. Per-request quantile error averages 100 × |AISim pN / silicon pN − 1| over p5, p10, …, p95.</li><li>± is the standard error: a 1,000-resample bootstrap over requests for request metrics, std/√n over steps for step error. Request metrics average an entry's runs equally, combining stderr as √(Σse²)/runs; step error pools the individual steps of each held-out capture once per lane count and performance model.</li><li>Silicon TPOT under 1 ms, including zero, is burst delivery, not decode pacing; those requests are excluded from TPOT and counted. A zero AISim TPOT is kept.</li><li>Step error prices held-out seed-7 step captures at the same lane count. The learned FPM row replays a model retrained from pinned seed-42 and seed-7 captures with a fixed seed and frozen adaptation; its step error uses a seed-42-only model.</li><li>Preparation and warmup are unscored. Missing measurements and zero denominators remain unavailable. No timing calibration.</li></ul>`;
   }
   function provenance(snapshot,runs) {
     return `<ul class="agentx-notes provenance"><li>${githubIcon} <strong>AISim repository commit:</strong> <a href="https://github.com/ai-dynamo/aisim/commit/${esc(snapshot.commit_sha)}" target="_blank" rel="noopener"><code>${esc(snapshot.commit_sha)}</code></a></li><li><span role="img" aria-label="Hugging Face">🤗</span> <strong>Silicon dataset revision:</strong> <code>${esc(snapshot.dataset_revision)}</code></li><li><strong>Measured framework:</strong> ${[...new Set(runs.map(r=>`${r.backend} ${r.measured_backend_version}`))].map(esc).join("; ")}</li><li><strong>Prediction database:</strong> ${[...new Set(runs.map(r=>`${r.backend} ${r.prediction_backend_version||"unavailable"}`))].map(esc).join("; ")}</li><li><strong>Evaluated:</strong> ${esc(snapshot.completed_at)}${snapshot.preview?" · Preview":""}${snapshot.measurement_campaign_status==="partial"?" · Partial silicon campaign; dataset remains unscored and ineligible for promotion.":""}</li><li><strong>Wheel SHA256:</strong> <code>${esc(snapshot.wheel_sha256)}</code></li>${[...new Map(runs.flatMap(r=>(r.op_data||[]).map(d=>[d.file,d]))).values()].map(d=>`<li>${githubIcon} <strong>Op data:</strong> <a href="https://github.com/ai-dynamo/aisim/blob/${esc(snapshot.commit_sha)}/python/aisim/src/aisim_core/systems/data/${esc(d.file)}">${esc(d.file)}</a><br><code>${esc(d.sha256)}</code></li>`).join("")}</ul>`;
@@ -309,8 +319,7 @@ window.AgentX = (() => {
       if(!params.has("campaign") && params.get("category")==="self_collected" && ["length","cache","repeat"].some(k=>params.has(k)) && loaded.data.runs.some(r=>r.category==="self_collected"&&r.boundary==="successful_profile_span")) {
         const archived=new URL(location.href);archived.searchParams.set("campaign","finite-v1");location.replace(archived);return;
       }
-      const runs=loaded.data.runs.filter(r=>r.category===params.get("category") && r.model===params.get("model") && r.lanes===Number(params.get("lanes")) && (estimationOf(r)||"op_level")===(params.get("perf")||"op_level"));
-      if(!runs.length) throw new Error("This concurrency was not evaluated.");
+      const runs=pointRuns(loaded.data.runs,params);
       const first=runs[0];
       document.getElementById("point-title").textContent=`${first.model} · ${first.lanes} lane${first.lanes===1?"":"s"} · ${performanceModel([first],true)}`;
       root.innerHTML=`<p class="agentx-identity"><span class="source-tag">${first.category==="agentx"?"AgentX official":"Self-collected"}</span> ${esc(first.hardware)} · ${esc(first.backend)} · ${esc(first.precision)} · TP${first.tensor_parallel} · ${source(first)}</p><div id="variant-controls" class="filter-toolbar"></div><p id="selected-run-label" class="evidence-brief"></p><div id="selected-run"></div>`;
@@ -361,5 +370,5 @@ window.AgentX = (() => {
       await select();
     }catch(error){root.innerHTML=`<p role="alert">${esc(error.message)}</p>`;}
   }
-  return {load,detail,aggregate,performanceModel,requestAggregate,stepAggregate,specDec,cells,featureChecklist,validateFeatureEvidence};
+  return {load,detail,aggregate,performanceModel,requestAggregate,stepAggregate,specDec,cells,pointRuns,pointUrl,featureChecklist,validateFeatureEvidence};
 })();

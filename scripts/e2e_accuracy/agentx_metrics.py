@@ -6,6 +6,7 @@ Request metrics use the uniquely matched requests of one run. ``e2e`` compares m
 ``|mean AISim / mean silicon - 1|``; ``quantile`` averages ``|AISim pN / silicon pN - 1|`` over
 p5, p10, ..., p95. Both are percentages with a bootstrap standard error over resampled requests.
 Silicon TPOT under 1 ms is burst delivery, not decode pacing, so it is excluded and counted.
+A zero AISim prediction is kept: replay emits zero ITL when tokens share a timestamp.
 
 Step metrics are the MAPE of predicted versus measured forward-pass time, kept as sums so lanes pool
 exactly; the standard error is std/sqrt(n) over steps.
@@ -45,16 +46,27 @@ def _stderr(values):
 
 
 def scored_pairs(pairs, metric):
-    """Matched pairs with both values positive; TPOT drops silicon burst delivery under 1 ms."""
-    rows = [
-        (p["silicon_" + metric], p["predicted_" + metric])
-        for p in pairs
-        if p.get(metric + "_ape") is not None and p["silicon_" + metric] > 0 and p["predicted_" + metric] > 0
-    ]
-    if metric != "tpot_ms":
-        return rows, 0
-    kept = [row for row in rows if row[0] >= MIN_SILICON_TPOT_MS]
-    return kept, len(rows) - len(kept)
+    """Matched pairs with finite, non-negative values and a positive silicon denominator.
+
+    A zero prediction is valid (replay emits zero ITL when tokens share a timestamp). TPOT first excludes
+    and counts silicon burst delivery under 1 ms, including zero, before requiring the denominator.
+    """
+    rows, excluded = [], 0
+    for p in pairs:
+        silicon, predicted = p["silicon_" + metric], p["predicted_" + metric]
+        if p.get("status", "matched") != "matched" or not (_finite(silicon) and _finite(predicted)):
+            continue
+        if silicon < 0 or predicted < 0:
+            continue
+        if metric == "tpot_ms" and silicon < MIN_SILICON_TPOT_MS:
+            excluded += 1
+        elif p.get(metric + "_ape") is not None:
+            rows.append((silicon, predicted))
+    return rows, excluded
+
+
+def _finite(value):
+    return type(value) in (int, float) and math.isfinite(value)
 
 
 def point_metrics(pairs, metric):

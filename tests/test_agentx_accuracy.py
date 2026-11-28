@@ -753,11 +753,13 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
     args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
     for selected in ([], [run, run], [{**run, "model": "wrong/model"}]):
         (tmp_path / "shard-0.json").write_bytes(
-            canonical({"snapshot": snapshot, "learned_fpm": True, "runs": selected})
+            canonical({"snapshot": snapshot, "learned_fpm": True, "learned_speculative": True, "runs": selected})
         )
         with pytest.raises(ValueError):
             qualify(args)
-    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "learned_fpm": True, "runs": [run]}))
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": True, "learned_speculative": True, "runs": [run]})
+    )
     qualify(args)
     files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
     assert validate_bundle(files)["runs"][0]["id"] == run["id"]
@@ -848,7 +850,9 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
     snapshot = json.loads(bundle()["summary.json"])["snapshot"]
     snapshot.update(cohort_sha256=catalog["snapshot_id"], driver_sha256=driver_digest())
     args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
-    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "learned_fpm": True, "runs": [run]}))
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": True, "learned_speculative": True, "runs": [run]})
+    )
     if problem is not None:
         with pytest.raises(ValueError):
             qualify(args)

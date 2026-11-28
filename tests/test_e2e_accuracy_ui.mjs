@@ -1400,3 +1400,27 @@ test("AgentX metric cells label historical results and keep exclusions without a
   assert.doesNotMatch(burst,/Not computed/);
   assert.match(burst,/3 excluded &lt;1 ms/);
 });
+
+test("AgentX step error pools each capture set once across variants", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const step={seed:7,dropped_shifted:1,decode:{n:2,sum_ape:4,sum_sq_ape:10},prefill:{n:0,sum_ape:0,sum_sq_ape:0}};
+  const variant=(lanes,perf)=>({model:"m",lanes,performance_model:perf,accuracy_metrics:{step}});
+  context.runs=[variant(8,"op_level"),variant(8,"op_level"),variant(8,"fpm_learned"),variant(14,"op_level")];
+  const steps=vm.runInContext("window.AgentX.stepAggregate(runs)",context);
+  assert.equal(steps.decode.n,6);
+  assert.equal(steps.dropped,3);
+});
+
+test("AgentX detail links select one dashboard configuration", () => {
+  const context=vm.createContext({window:{},URL,URLSearchParams,location:{href:"https://example.test/e2e-accuracy/"}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const run=(id,hardware,backend)=>({id,category:"agentx",model:"m",hardware,backend,precision:"fp4",tensor_parallel:8,lanes:8,performance_model:"op_level"});
+  context.runs=[run("b300","B300","sglang"),run("h200","H200","sglang")];
+  const select=query=>{context.params=new URLSearchParams(query);return vm.runInContext("window.AgentX.pointRuns(runs,params).map(r=>r.id)",context);};
+  const url=new URL(vm.runInContext("window.AgentX.pointUrl(runs[1],'main')",context),"https://example.test/");
+  assert.deepEqual([...select(url.search)],["h200"]);
+  // A link without the identity, as older dashboards wrote, is rejected when it spans configurations.
+  assert.throws(()=>select("category=agentx&model=m&lanes=8"),/more than one configuration/);
+  assert.deepEqual([...select("category=agentx&model=m&lanes=8&hardware=B300")],["b300"]);
+});

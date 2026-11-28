@@ -200,12 +200,14 @@ def main():
         if len(scenario_data) > MAX_FILE:
             raise ValueError("scenario artifact exceeds the public asset size limit; campaign cannot qualify")
         (args.output / "scenarios.json").write_bytes(scenario_data)
+    if op_level_config is not None:
+        # Requested overrides only; each configuration's remaining settings come from its measured engine config.
+        (args.output / "op-level-config.json").write_text(json.dumps(op_level_config, indent=2, sort_keys=True) + "\n")
     if smoke:
         (args.output / "SMOKE_ONLY.txt").write_text("Partial dataset smoke; not qualified for publication.\n")
     elif op_level_config is not None:
         # The public overview accepts only the published method lists; the op-level baseline stays local.
         (args.output / "LOCAL_ONLY.txt").write_text("Local op-level baseline; not qualified for publication.\n")
-        (args.output / "op-level-config.json").write_text(json.dumps(op_level_config, indent=2, sort_keys=True) + "\n")
     else:
         qualification = {
             "schema_version": 3 if scenario_data is not None else 2,

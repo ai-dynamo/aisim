@@ -465,7 +465,7 @@ async def check():
                     ]
                 )
                 await expect(metrics_table.locator('tr[data-metric="step-decode"] td')).to_have_text(
-                    ["22.00%", "± 0.42%", "24 steps"]
+                    ["22.00%", "± 2.00%", "2 steps"]
                 )
                 # Point links published before performance models existed omit perf: they mean op-based.
                 point_url = page.url
@@ -474,11 +474,11 @@ async def check():
                 assert len(legacy) < len(parse_qsl(parts.query))
                 await page.goto(urlunsplit(parts._replace(query=urlencode(legacy))))
                 await expect(metrics_table.locator('tr[data-metric="step-decode"] td')).to_have_text(
-                    ["22.00%", "± 0.42%", "24 steps"]
+                    ["22.00%", "± 2.00%", "2 steps"]
                 )
                 await page.goto(point_url)
                 await expect(metrics_table.locator('tr[data-metric="step-decode"] td')).to_have_text(
-                    ["22.00%", "± 0.42%", "24 steps"]
+                    ["22.00%", "± 2.00%", "2 steps"]
                 )
                 await expect(metrics_table.locator('tr[data-metric="e2e-tpot_ms"] td')).to_have_text(
                     ["50.00%", "—", "12 requests"]

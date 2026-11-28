@@ -43,7 +43,7 @@ from scripts.e2e_accuracy.agentx_inputs import (
     replay_config,
     safe_path,
 )
-from scripts.e2e_accuracy.agentx_learned import LEARNED, OP_LEVEL, STEP_CAPTURES, score_steps
+from scripts.e2e_accuracy.agentx_learned import LEARNED, OP_LEVEL, STEP_CAPTURES, score_steps, speculative_supported
 from scripts.e2e_accuracy.agentx_learned import artifacts as learned_artifacts
 from scripts.e2e_accuracy.agentx_learned import supported as learned_supported
 from scripts.e2e_accuracy.agentx_metrics import request_metrics
@@ -374,9 +374,15 @@ def public_report(payload, observations, category, boundary="complete_finite_coh
     )
 
 
-def performance_models(run, learned=True):
-    """Op-based for every run; the learned FPM where pinned step captures exist and the wheel supports it."""
-    return (OP_LEVEL, LEARNED) if learned and run["model"] in STEP_CAPTURES else (OP_LEVEL,)
+def performance_models(run, learned=True, speculative=True):
+    """Op-based for every run; the learned FPM where pinned step captures exist and the wheel supports it.
+
+    A wheel that rejects a learned FPM with speculative decoding omits that model's learned entries.
+    """
+    spec = STEP_CAPTURES.get(run["model"])
+    if not learned or spec is None or (spec.get("speculative") and not speculative):
+        return (OP_LEVEL,)
+    return (OP_LEVEL, LEARNED)
 
 
 def apply_performance_model(config, performance_model, artifact_path=None):
@@ -497,6 +503,12 @@ def run_one(root, run, directory, timeout, context, performance_model=OP_LEVEL, 
     timing = deployment["agg_engine_args"]["timing_model"]["config"] if deployment else None
     if timing is not None and timing["estimation_mode"] != performance_model:
         raise ValueError("Compiled replay timing differs from the requested performance model")
+    if (
+        timing is not None
+        and performance_model == LEARNED
+        and bool(timing.get("nextn")) != bool(STEP_CAPTURES.get(run["model"], {}).get("speculative"))
+    ):
+        raise ValueError("Learned step captures differ from the replayed speculative decoding")
     step = None
     if timing is not None and workdir is not None and learned is not None:
         # Step error is held out: the seed-42 learned model prices the seed-7 steps, and it is also the
@@ -582,13 +594,14 @@ def campaign(args):
     # Training inputs and models stay outside the sealed shard tree: the Hub cache holds symlinks.
     # Models are retrained per evaluation; only --learned-workdir's immutable downloads persist.
     learned = learned_supported()
+    speculative = learned and speculative_supported()
     trained = {}
     results = []
     with tempfile.TemporaryDirectory(prefix="agentx-learned-") as scratch:
         scratch = Path(scratch)
         workdir = args.learned_workdir or scratch
         for run in selected:
-            for performance_model in performance_models(run, learned):
+            for performance_model in performance_models(run, learned, speculative):
                 if learned and run["model"] not in trained:
                     trained[run["model"]] = learned_artifacts(run["model"], workdir, scratch / "models")
                 results.append(
@@ -624,23 +637,27 @@ def campaign(args):
             raise ValueError("Partial measurement campaigns cannot publish")
         snapshot.update(read(status))
     (args.output / f"shard-{args.shard_index}.json").write_bytes(
-        canonical({"snapshot": snapshot, "learned_fpm": learned, "runs": results})
+        canonical({"snapshot": snapshot, "learned_fpm": learned, "learned_speculative": speculative, "runs": results})
     )
 
 
 def qualify(args):
     catalog = validate_catalog(read(args.inputs / INDEX))
-    runs, snapshot, learned = [], None, None
+    runs, snapshot, support = [], None, None
     for index in range(args.shard_count):
         shard = read(args.shards / f"shard-{index}.json")
-        if snapshot is not None and (snapshot != shard["snapshot"] or learned != shard["learned_fpm"]):
+        shard_support = (shard["learned_fpm"], shard["learned_speculative"])
+        if snapshot is not None and (snapshot != shard["snapshot"] or support != shard_support):
             raise ValueError("AgentX shards evaluated different revisions")
-        snapshot, learned = shard["snapshot"], shard["learned_fpm"]
+        snapshot, support = shard["snapshot"], shard_support
         runs.extend(shard["runs"])
-    if type(learned) is not bool:
+    learned, speculative = support
+    if type(learned) is not bool or type(speculative) is not bool or (speculative and not learned):
         raise ValueError("AgentX shards must record learned-FPM support")
     sources = {r["id"]: r for r in load_runs(args.inputs, catalog)}
-    expected = {(run["id"], model) for run in sources.values() for model in performance_models(run, learned)}
+    expected = {
+        (run["id"], model) for run in sources.values() for model in performance_models(run, learned, speculative)
+    }
     keys = [result_key(r) for r in runs]
     if len(set(keys)) != len(keys) or set(keys) != expected:
         raise ValueError("Incomplete or duplicate AgentX cohort")

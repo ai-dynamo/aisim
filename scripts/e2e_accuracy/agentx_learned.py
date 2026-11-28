@@ -39,6 +39,7 @@ STEP_CAPTURES = {
         "layout": "dynamo_native",
         "features": "fpm5",
         "drop_unattributed": False,
+        "speculative": False,
     },
     "nvidia/GLM-5.3-NVFP4": {
         "repository": "ai-dynamo/aisim-data",
@@ -47,6 +48,7 @@ STEP_CAPTURES = {
         "layout": "sglang_hook",
         "features": "sglang18",
         "drop_unattributed": True,
+        "speculative": True,
     },
 }
 
@@ -245,6 +247,33 @@ def op_level_query(fpm, width):
     elif kind == "prefill" and isinstance(source.get("past_kv_lengths"), list):
         s["sum_prefill_kv_tokens"] = sum(source["past_kv_lengths"])
     return {**fpm, "scheduled_requests": s}
+
+
+def speculative_supported():
+    """Whether the evaluated wheel prices a learned FPM with speculative decoding.
+
+    Configuration validation runs before the artifact loads, so a missing artifact separates the two wheels.
+    """
+    missing = "/nonexistent/agentx-learned-probe.json"
+    probe = {
+        "model": "probe",
+        "system": "probe",
+        "backend": "sglang",
+        "worker_type": "aggregated",
+        "nextn": 1,
+        "estimation_mode": LEARNED,
+        "fallback_policy": "deny",
+        "estimator_config": {"fpm_learned": {"artifact_path": missing, "adaptation": "frozen"}},
+    }
+    try:
+        _estimator(probe)
+    except Exception as error:
+        if LEARNED_MTP_REJECTION in str(error):
+            return False
+        if missing in str(error):
+            return True
+        raise
+    raise ValueError("Learned-FPM probe loaded a missing artifact")
 
 
 def _available(timing_config):
