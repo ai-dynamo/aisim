@@ -1386,6 +1386,8 @@ test("AgentX SpecDec shows None only for a recorded disabled state", () => {
   assert.equal(spec(undefined),"Unrecorded");
   assert.equal(spec({state:"failed_to_record",parameters:{method:null}}),"Unrecorded");
   assert.equal(spec({state:"disabled",parameters:{method:"off"}}),"None");
+  assert.equal(spec({state:"enabled",parameters:{method:null,draft_length:3}}),"Unrecorded");
+  assert.equal(spec({state:"enabled",parameters:{method:"off"}}),"None");
   assert.match(spec({state:"enabled",parameters:{method:"mtp",draft_length:3}}),/^MTP<small>3 draft tokens/);
 });
 

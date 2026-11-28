@@ -52,7 +52,8 @@ window.AgentX = (() => {
     // "None" only for a recorded disabled state; missing or failed evidence is unrecorded.
     if(!f||!["enabled","disabled","not_applicable"].includes(f.state))return "Unrecorded";
     const m=f.parameters?.method;
-    if(!m||m==="off"||f.state!=="enabled")return "None";
+    if(f.state!=="enabled"||m==="off")return "None";
+    if(!m)return "Unrecorded";  // Enabled without a recorded method is not disabled speculation.
     const d=f.parameters.draft_length;
     return `${esc(m.toUpperCase())}${d?`<small>${esc(d)} draft tokens</small>`:""}`;
   }
