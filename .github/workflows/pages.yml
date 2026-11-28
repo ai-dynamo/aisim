@@ -110,7 +110,7 @@ jobs:
       contents: read
       actions: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           # workflow_run payloads never choose executable repository content.
           ref: ${{ github.event_name == 'pull_request' && github.ref || 'main' }}
