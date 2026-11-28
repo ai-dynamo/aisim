@@ -668,6 +668,20 @@ def _checkpoint_identity(identity: dict[str, Any] | None, worker_type: str) -> d
     return resolved
 
 
+def _require_identity_depth(identity: dict[str, Any], depth: int) -> None:
+    """The deployment identity must name the depth the steps ran at, or the artifact loads nowhere.
+
+    Rust's identity projection already spells an MTP scheme as ``nextn``.
+    """
+    if identity.get("speculation") is not None:
+        raise ValueError("learned artifacts support only MTP speculation; the training identity names another scheme")
+    if identity.get("nextn", 0) != depth:
+        raise ValueError(
+            f"training identity has MTP depth {identity.get('nextn', 0)}, but the steps ran at depth {depth}; "
+            "set the identity's nextn (or MTP depth) to the capture depth"
+        )
+
+
 def write_original_a_manifest(
     path: str | os.PathLike[str],
     iterations: Sequence[Sequence[dict[str, Any]]],
@@ -984,6 +998,8 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
             raise ValueError(f"nextn={nextn} does not match the steps' recorded spec_num_steps={depth}")
     else:
         depth = nextn or 0
+    if not _is_nextn(depth):
+        raise ValueError(f"recorded MTP depth {depth} is outside [0, {_MAX_NEXTN}]")
     _require_verify_widths(iterations, depth, full=bool(recorded))
     return depth
 
@@ -1070,6 +1086,8 @@ def train(
         and metadata["identity"] != checkpoint_identity
     ):
         raise ValueError("metadata.identity conflicts with the canonical training identity")
+    if checkpoint_identity is not None:
+        _require_identity_depth(checkpoint_identity, trained_nextn)
     provenance: dict[str, list[tuple[int, str]]] = {}
     checkpoint_stores: dict[str, dict[str, Any]] = {}
     if online_checkpoint_dir is not None:

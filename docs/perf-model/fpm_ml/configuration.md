@@ -70,8 +70,13 @@ decode request at its verify width: 1 without MTP; exactly `nextn + 1` for
 steps that record the hook's depth fields (SGLang); and 1 to `nextn + 1` for
 other MTP steps (vLLM), of which at least one request must be wider than 1. The
 stock SGLang decode hook lists 1 for every request, so its MTP captures are
-rejected. Aggregate-only captures carry no widths. `nextn` must fit in the
-loader's `u32`.
+rejected. Aggregate-only captures carry no widths. The depth, given or
+recorded, must fit in the loader's `u32`.
+
+`nextn: N` and an MTP scheme of depth N are one deployment identity: an
+artifact's `metadata.identity` and a checkpoint's identity record the scheme as
+`nextn`, so either spelling loads a source trained with the other. A training
+identity (`--identity`) must name the steps' depth.
 
 ## Estimator namespaces
 

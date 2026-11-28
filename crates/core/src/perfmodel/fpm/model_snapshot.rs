@@ -419,7 +419,18 @@ fn mtp_as_nextn(mut config: ForwardPassPerfModelConfig) -> ForwardPassPerfModelC
     if matches!(
         config.estimation_mode,
         EstimationMode::FpmRegression | EstimationMode::FpmLearned
-    ) && let Some(depth) = config
+    ) && let Some(depth) = mtp_scheme_depth(&config)
+    {
+        config.nextn = depth;
+        config.speculation = None;
+    }
+    config
+}
+
+/// Depth of an MTP speculation scheme, which a regression or learned model
+/// treats as the same identity as `nextn` at that depth.
+pub(crate) fn mtp_scheme_depth(config: &ForwardPassPerfModelConfig) -> Option<u32> {
+    config
         .speculation
         .as_ref()
         .filter(|speculation| speculation.kind == "mtp")
@@ -428,11 +439,6 @@ fn mtp_as_nextn(mut config: ForwardPassPerfModelConfig) -> ForwardPassPerfModelC
         .and_then(|speculation| speculation.params.get("depth")?.as_f64())
         .filter(|depth| depth.fract() == 0.0 && (1.0..=f64::from(u32::MAX)).contains(depth))
         .map(|depth| depth as u32)
-    {
-        config.nextn = depth;
-        config.speculation = None;
-    }
-    config
 }
 
 /// First differing JSON path, for actionable identity-mismatch errors.

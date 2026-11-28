@@ -288,7 +288,18 @@ pub(crate) fn checkpoint_model_for_config(
 pub(crate) fn canonical_learned_identity(
     config: &ForwardPassPerfModelConfig,
 ) -> Result<serde_json::Value, AicError> {
-    let mut value = serde_json::to_value(config).map_err(|e| invalid(e.to_string()))?;
+    // `kind: mtp` at depth N and `nextn: N` are one identity, so an artifact
+    // or checkpoint trained with either spelling loads with the other.
+    let mut value = match crate::perfmodel::fpm::model::mtp_scheme_depth(config) {
+        Some(depth) => {
+            let mut config = config.clone();
+            config.nextn = depth;
+            config.speculation = None;
+            serde_json::to_value(&config)
+        }
+        None => serde_json::to_value(config),
+    }
+    .map_err(|e| invalid(e.to_string()))?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| invalid("invalid canonical identity"))?;

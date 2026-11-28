@@ -777,6 +777,40 @@ def test_nextn_must_fit_the_rust_loader_u32():
         fpm_learned.training_nextn([[_decode_fpm(1, 50, 0.01)]], 2**32)
 
 
+@pytest.mark.parametrize("width_only", [False, True])
+def test_recorded_depth_must_fit_the_rust_loader_u32(width_only):
+    fpm = _mtp_fpm(1, 50, 0.01, steps=2**32)
+    if width_only:
+        del fpm["scheduled_requests"]["spec_num_steps"]
+    with pytest.raises(ValueError, match=r"recorded MTP depth 4294967296 is outside \[0, 4294967295\]"):
+        fpm_learned.training_nextn([[fpm]])
+    assert fpm_learned.training_nextn([[_mtp_fpm(1, 50, 0.01, steps=2**32 - 1)]]) == 2**32 - 1
+
+
+def test_train_rejects_an_identity_at_another_depth(monkeypatch):
+    """An identity naming another depth would bind the artifact to a configuration it cannot load at."""
+    pytest.importorskip("sklearn")
+    iterations = [[_mtp_fpm(n, 100 * n, 0.01 + 0.001 * n, steps=1)] for n in range(1, 31)]
+    identity = {"worker_type": "decode", "nextn": 0, "speculation": None}
+    monkeypatch.setattr(fpm_learned, "_checkpoint_identity", lambda supplied, worker_type: dict(supplied))
+    with pytest.raises(ValueError, match="training identity has MTP depth 0, but the steps ran at depth 1"):
+        fpm_learned.train(iterations, "decode", max_iter=5, identity=identity)
+    other = {**identity, "nextn": 1, "speculation": {"kind": "eagle", "params": {}}}
+    with pytest.raises(ValueError, match="support only MTP speculation"):
+        fpm_learned.train(iterations, "decode", max_iter=5, identity=other)
+    artifact = fpm_learned.train(iterations, "decode", max_iter=5, identity={**identity, "nextn": 1})
+    assert artifact["metadata"]["identity"]["nextn"] == 1
+
+
+def test_learned_identity_spells_an_mtp_scheme_as_nextn():
+    from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
+
+    base = {"model": "m", "system": "s", "backend": "vllm", "worker_type": "decode"}
+    scheme = RustForwardPassPerfModel.learned_identity({**base, "speculation": {"kind": "mtp", "params": {"depth": 2}}})
+    assert scheme == RustForwardPassPerfModel.learned_identity({**base, "nextn": 2})
+    assert scheme["nextn"] == 2
+
+
 def test_train_records_nextn_and_validate_checks_it():
     pytest.importorskip("sklearn")
     iterations = [[_mtp_fpm(n, 100 * n, 0.01 + 0.001 * n, steps=3)] for n in range(1, 31)]

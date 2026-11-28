@@ -922,8 +922,10 @@ pooled ten-run training time are in `design.md` §8. Artifacts are 100–450 KB 
 - Learned mode uses explicit `estimation_mode: fpm_learned` through
   `best_available(config)`. Its callers provide complete iteration telemetry;
   engine replay, engine CLI and Sweeper build it per pass from the scheduled
-  requests and never tune the model. Speculative decoding is unsupported by
-  learned mode.
+  requests and never tune the model. Of the speculative decoding schemes,
+  learned mode prices only MTP, and only with an artifact trained on MTP
+  rounds at the configured depth (`metadata.nextn`). See
+  [MTP speculative decoding](configuration.md#mtp-speculative-decoding) for the rules.
 
 - Stock Dynamo FPM v1 carries aggregates only (counts, sums, variances). The
   per-request `extend_lengths` / `past_kv_lengths` lists are an additive
