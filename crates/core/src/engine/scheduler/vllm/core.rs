@@ -212,7 +212,11 @@ const _: () = assert!(std::mem::size_of::<ScheduledWork>() == 7 * std::mem::size
 /// One ready request's speculative burst inputs for a pass.
 struct SpeculativeBurst {
     uuid: Uuid,
+    /// Most tokens the round can accept: one plus its valid drafts.
     limit: usize,
+    /// Query tokens the forward computes for the request: `limit`, or more
+    /// when native MTP pads a waiting request with invalid draft positions.
+    width: usize,
     remaining: usize,
     records_acceptance: bool,
     /// Sequence length priced as decode work; `None` when the first token
@@ -852,7 +856,8 @@ struct ForwardWork {
 struct DecodeBatch {
     /// Context length of each request priced as decode work.
     lengths: Vec<usize>,
-    /// Tokens each of those requests verifies: one plus its scheduled drafts.
+    /// Query tokens each of those requests computes: one plus its scheduled
+    /// drafts, including native MTP's padded positions.
     widths: Vec<usize>,
 }
 
@@ -3823,7 +3828,16 @@ impl VllmCore {
                 requests: scheduled
                     .values()
                     .filter(|work| work.prompt_tokens > 0)
-                    .map(|work| (work.prompt_tokens, work.prefix_tokens, work.prompt_len))
+                    // Native MTP computes its whole query, padding included,
+                    // as the batch totals count it.
+                    .map(|work| {
+                        let tokens = if work.native_mtp {
+                            work.total_tokens
+                        } else {
+                            work.prompt_tokens
+                        };
+                        (tokens, work.prefix_tokens, work.prompt_len)
+                    })
                     .collect(),
             }),
             decode: (forward.decode_count > 0).then(|| DecodeWork {
@@ -4930,6 +4944,10 @@ impl VllmCore {
             bursts.push(SpeculativeBurst {
                 uuid,
                 limit,
+                width: match work {
+                    Some(work) if native => work.total_tokens,
+                    _ => limit,
+                },
                 remaining,
                 // Record only surviving decode work, after reservation succeeds.
                 // FPM demand can still contain requests preempted before then.
@@ -5019,10 +5037,11 @@ impl VllmCore {
         };
 
         let mut decode = DecodeBatch::default();
-        // A burst's limit is the round's verification width.
+        // A burst's physical query is the round's verification width; native
+        // MTP padding computes positions the round cannot accept.
         for burst in &bursts {
             if let Some(length) = burst.decode_length {
-                decode.push(length, burst.limit, bursts.len());
+                decode.push(length, burst.width, bursts.len());
             }
         }
 

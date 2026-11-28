@@ -53,8 +53,12 @@ draft tail or STP scaling is added, and a query with `draft_length` is
 rejected, including for an artifact loaded directly with `from_learned`. Replay
 queries the artifact with each decode request's verify width as its extend
 length: `nextn + 1` on SGLang, as the SGLang step-capture hook records it, and
-each request's scheduled width on vLLM, which can be smaller at token or
-context limits. A temporary mixed composition does not support MTP.
+each request's scheduled query width on vLLM, which can be smaller at token or
+context limits. On vLLM, a waiting request with one token left that joins an
+MTP batch is padded to `nextn + 1` query tokens, which it computes but cannot
+accept; replay queries the padded width, as the capture hook's
+`num_scheduled_tokens` records it. A temporary mixed composition does not
+support MTP.
 
 The artifact records the MTP draft depth of its training steps in
 `metadata.nextn`; an absent field means steps without speculative decoding
@@ -63,7 +67,8 @@ speculative depth (`nextn`, or the MTP scheme's `depth`), so an artifact
 trained without MTP is never used for MTP, and an MTP artifact is never used
 for plain decode or another depth. The trainer writes `metadata.nextn` from the
 steps' `spec_num_steps` (or `spec_num_draft_tokens - 1`), or from `--nextn`
-for telemetry without those fields (see
+for telemetry without those fields, reading only the steps the trained
+worker role uses (see
 [Train](learned-forward-pass-model.md#2-train)). It checks each step's
 per-request extend lengths against that depth, since replay queries a decode
 request at its verify width: 1 without MTP; exactly `nextn + 1` for steps that
@@ -71,7 +76,9 @@ record the hook's depth fields (SGLang); and 1 to `nextn + 1` for other MTP
 steps (vLLM), of which at least one decode-only request must be wider than 1.
 Every width of a decode-only step must be allowed. A mixed step's lists do not
 mark which requests decode (vLLM sorts them by KV length), so at least
-`num_decode_requests` of its widths must be allowed. The stock SGLang decode
+`num_decode_requests` of its widths must be allowed, and the tokens beyond
+`sum_prefill_tokens` must fit that many decode requests at the allowed
+widths. The stock SGLang decode
 hook lists 1 for every request, so its MTP captures are rejected.
 Aggregate-only captures carry no widths. The trained depth must be 0 to 5, the
 range a configuration accepts; `metadata.nextn` itself must fit in the

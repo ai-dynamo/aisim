@@ -806,12 +806,24 @@ def test_train_rejects_an_identity_at_another_depth(monkeypatch):
     assert bound["metadata"]["identity"]["nextn"] == 1
 
 
-def _listed_mixed(widths: list[int], decodes: int, *, steps: int | None = None) -> dict:
+def _listed_mixed(widths: list[int], decodes: int, *, steps: int | None = None, prefill_tokens: int = 100) -> dict:
     fpm = _listed_decode(widths, steps=steps)
     fpm["scheduled_requests"].update(
-        num_prefill_requests=len(widths) - decodes, num_decode_requests=decodes, sum_prefill_tokens=100
+        num_prefill_requests=len(widths) - decodes, num_decode_requests=decodes, sum_prefill_tokens=prefill_tokens
     )
     return fpm
+
+
+def test_depth_reads_only_the_iterations_the_role_trains_on():
+    """A prefill trainer skips decode rows, so their depth and widths do not label its artifact."""
+    prefill = [[_prefill_fpm(1, 64 + n, 0, 0.01 + 0.001 * n)] for n in range(30)]
+    decode = [[_listed_decode([4, 4], steps=3)]]
+    assert fpm_learned.training_nextn(prefill + decode, worker_type="prefill") == 0
+    with pytest.raises(ValueError, match="mix speculative depths"):
+        fpm_learned.training_nextn(prefill + decode)
+    pytest.importorskip("sklearn")
+    artifact = fpm_learned.train(prefill + decode, "prefill", max_iter=5)
+    assert artifact["metadata"]["nextn"] == 0
 
 
 def test_mixed_steps_must_list_a_verify_width_for_every_decode_request():
@@ -820,6 +832,10 @@ def test_mixed_steps_must_list_a_verify_width_for_every_decode_request():
     # vLLM lists requests sorted by KV, so the prefill may sit anywhere.
     for widths in ([4, 4, 100], [100, 2, 4], [4, 100, 1]):
         assert fpm_learned.training_nextn([[decode], [_listed_mixed(widths, 2)]], nextn=3) == 3
+    # The prefill total bounds the decode tokens: a short prefill cannot hide a too-wide decode.
+    with pytest.raises(ValueError, match=r"leave 5 tokens beyond sum_prefill_tokens for 1 decode requests"):
+        fpm_learned.training_nextn([[decode], [_listed_mixed([2, 5], 1, prefill_tokens=2)]], nextn=3)
+    assert fpm_learned.training_nextn([[decode], [_listed_mixed([2, 4], 1, prefill_tokens=2)]], nextn=3) == 3
     with pytest.raises(ValueError, match=r"only 1 of the extend lengths \[6, 6, 100\] fit|only 0 of"):
         fpm_learned.training_nextn([[decode], [_listed_mixed([6, 6, 100], 2)]], nextn=3)
     with pytest.raises(ValueError, match=r"only 1 of the extend lengths \[100, 4, 6\] fit MTP depth 3"):

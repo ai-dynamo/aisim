@@ -133,7 +133,8 @@ prices each speculative decode step as one measured round and requires the
 artifact's recorded training depth (`metadata.nextn`) to equal N; an artifact
 trained without MTP is rejected. Each decode request is queried at its verify
 width: SGLang supplies `nextn + 1` for every request, while vLLM supplies each
-request's scheduled width, which can be smaller at token or context limits.
+request's scheduled query width, which can be smaller at token or context
+limits, and includes the padding a one-token waiting request computes.
 Such a model also rejects `draft_length` scaling, since the round is already
 measured. See
 [learned MTP](../../perf-model/fpm_ml/configuration.md#mtp-speculative-decoding).

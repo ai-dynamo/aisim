@@ -961,7 +961,17 @@ def _telemetry_count(sched: dict[str, Any], key: str, index: int) -> int | None:
     return value
 
 
-def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | None = None) -> int:
+def _role_eligible(metrics_by_rank: Sequence[dict[str, Any]], worker_type: str) -> bool:
+    try:
+        classify_workload(metrics_by_rank, worker_type)
+    except ValueError:
+        return False
+    return True
+
+
+def training_nextn(
+    iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | None = None, worker_type: str | None = None
+) -> int:
     """MTP draft depth of the training steps, recorded as artifact ``metadata.nextn``.
 
     The SGLang step-capture hook records ``spec_num_steps`` (draft depth) and
@@ -970,8 +980,11 @@ def training_nextn(iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | 
     records depth ``width - 1``. Steps must agree on one depth.
     ``nextn`` declares the depth for telemetry without these fields and must
     match a recorded depth. Without either, the steps ran without speculative
-    decoding (depth 0).
+    decoding (depth 0). With ``worker_type``, only iterations that role trains
+    on count, as :func:`train` skips the others.
     """
+    if worker_type is not None:
+        iterations = [it for it in iterations if _role_eligible(it, worker_type)]
     if nextn is not None and not (_is_nextn(nextn) and nextn <= _MAX_TRAINED_NEXTN):
         raise ValueError(f"nextn must be an integer in [0, {_MAX_TRAINED_NEXTN}], got {nextn!r}")
     recorded: set[int] = set()
@@ -1021,7 +1034,8 @@ def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth
     a shorter width near token or context limits, so other MTP captures may list 1 to ``depth + 1`` but need at
     least one decode-only request wider than 1; the stock SGLang decode hook lists 1 for every request. A
     decode-only step's every listed width must be allowed. A mixed step's lists do not mark which requests
-    decode (vLLM sorts them by KV), so at least ``num_decode_requests`` of its widths must be allowed.
+    decode (vLLM sorts them by KV), so at least ``num_decode_requests`` of its widths must be allowed, and the
+    tokens beyond ``sum_prefill_tokens`` must fit that many decode requests at the allowed widths.
     Aggregate-only captures carry no widths.
     """
     low = depth + 1 if full else 1
@@ -1042,6 +1056,13 @@ def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth
                         f"iteration {index}: only {len(allowed)} of the extend lengths {widths} fit MTP depth "
                         f"{depth}'s verify width {expected}, but the step schedules {decodes} decode requests; "
                         "record or pass the depth the steps ran at"
+                    )
+                decode_tokens = sum(widths) - int(sched.get("sum_prefill_tokens", 0))
+                if not decodes * low <= decode_tokens <= decodes * (depth + 1):
+                    raise ValueError(
+                        f"iteration {index}: the extend lengths {widths} leave {decode_tokens} tokens beyond "
+                        f"sum_prefill_tokens for {decodes} decode requests, but MTP depth {depth} verifies "
+                        f"{expected} tokens per request; record or pass the depth the steps ran at"
                     )
                 continue
             if bad := [width for width in widths if width not in allowed]:
@@ -1095,7 +1116,7 @@ def train(
         raise ValueError(f"target must be one of {TARGETS}, got {target!r}")
     if metadata and "nextn" in metadata:
         raise ValueError("metadata cannot set nextn; pass nextn= or let the trainer read it from the steps")
-    trained_nextn = training_nextn(iterations, nextn)
+    trained_nextn = training_nextn(iterations, nextn, worker_type)
     checkpoint_identity = _checkpoint_identity(identity, worker_type) if identity is not None else None
     if (
         checkpoint_identity is not None

@@ -533,3 +533,22 @@ fn warm_host_prefix_cannot_reject_a_request_that_fits_cold(
     );
     assert!(core.is_drained());
 }
+
+#[test]
+fn padded_waiting_query_reaches_fitted_timing_at_its_physical_width() {
+    // Fitted (learned) timing prices the per-request query widths the
+    // capture hook records as num_scheduled_tokens: the padding a one-token
+    // waiting request computes counts, though it cannot be accepted.
+    let mut core = VllmCore::new(args(2, 8, false, false));
+    submit(&mut core, 105, 4, 16);
+    let mut collector = crate::engine::trace::TraceCollector::default();
+    let first = core.execute_pass(&mut collector, 0.0);
+    submit(&mut core, 106, 1, 8);
+    let work = core.schedule_pass(None, first.end_ms).unwrap();
+    let prefill = work.prefill.as_ref().unwrap();
+    assert_eq!(prefill.requests, vec![(3, 0, 1)]);
+    assert_eq!(prefill.totals.new_tokens, 3);
+    assert_eq!(work.decode.as_ref().unwrap().widths, vec![3]);
+    let padded = core.resolve_pass(None).unwrap();
+    assert_eq!(padded.output_signals.len(), 4, "padding is never accepted");
+}
