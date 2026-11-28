@@ -480,6 +480,7 @@ def _role_search_space(
         result[f"{legacy_role}_enable_prefix_caching"] = cache.get("prefix_caching", True)
         if legacy_role == "decode":
             result["decode_radix_cache"] = cache.get("decode_radix_cache", False)
+            result["decode_reserved_decode_tokens"] = scheduler.get("reserved_decode_tokens")
         result[f"{legacy_role}_kv_bytes_per_token"] = cache.get("bytes_per_token", "auto")
         result[f"{legacy_role}_native_host_offload"] = deepcopy(cache.get("host_offload"))
         capacity_type = capacity.get("type", "default")
@@ -1115,6 +1116,8 @@ def _candidate_prediction(
             if sample.get(f"{role}_startup_time") is not None
             else raw_worker.get("startup_seconds", 0),
         }
+        if role == "decode" and (reserve := sample.get("decode_reserved_decode_tokens")) is not None:
+            worker_config["scheduler"]["reserved_decode_tokens"] = reserve
         if role != "agg" and sample.get(f"{role}_context_length") is not None:
             worker_config["context_length"] = sample[f"{role}_context_length"]
         engine["workers"][public_role] = worker_config

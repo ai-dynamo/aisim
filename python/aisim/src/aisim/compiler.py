@@ -1004,6 +1004,8 @@ def _worker_engine_args(
         payload["wait_power_w"] = worker.wait_power_w
     if backend == "sglang" and role == "decode" and cache.decode_radix_cache:
         payload["sglang"] = {"disaggregation_decode_enable_radix_cache": True}
+    if backend == "sglang" and role == "decode" and worker.scheduler.reserved_decode_tokens is not None:
+        payload.setdefault("sglang", {})["num_reserved_decode_tokens"] = worker.scheduler.reserved_decode_tokens
     if worker.scheduler.async_scheduling is not None:
         payload["async_scheduling"] = worker.scheduler.async_scheduling
     if worker.scheduler.launch is not None:

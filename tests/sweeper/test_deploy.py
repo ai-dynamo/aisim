@@ -131,6 +131,40 @@ def test_disagg_backend_deployment_preserves_both_roles():
 
 
 @pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"backend": "vllm"}, id="vllm"),
+        pytest.param({"deployment_mode": "agg"}, id="aggregated"),
+        pytest.param(
+            {"afd_roles": {"prefill": {"n_a_nodes": 1, "n_f_nodes": 1, "tp_a": 1, "a_batch_size": 8}}},
+            id="afd",
+        ),
+    ],
+)
+def test_decode_engine_payload_rejects_reserve_outside_native_sglang_disagg(overrides):
+    replica = ReplicaParallelConfig(ParallelShape(tp=1, dp=1, moe_tp=1, moe_ep=1), 1)
+    sample = unroll_sample(
+        search_space=_space(backend=["sglang"], deployment_mode=["disagg"], decode_reserved_decode_tokens=0),
+        selection=_agg_selection(
+            backend="sglang",
+            deployment_mode="disagg",
+            prefill_max_num_batched_tokens=8192,
+            prefill_max_num_seqs=4,
+            decode_max_num_batched_tokens=8192,
+            decode_max_num_seqs=256,
+        ),
+        parallel_config=DisaggParallelConfig(replica, replica),
+    )
+    assert deploy_module._engine_args_payload(sample, "decode", backend_version=BACKEND_VERSION)["sglang"] == {
+        "num_reserved_decode_tokens": 0
+    }
+    # Check the payload builder's defensive contract for direct sample inputs.
+    sample.update(overrides)
+    with pytest.raises(ValueError, match="decode_reserved_decode_tokens requires native disaggregated decode"):
+        deploy_module._engine_args_payload(sample, "decode", backend_version=BACKEND_VERSION)
+
+
+@pytest.mark.parametrize(
     ("backend", "enabled", "prefix_caching", "nextn", "expected"),
     [
         ("sglang", False, False, 0, None),

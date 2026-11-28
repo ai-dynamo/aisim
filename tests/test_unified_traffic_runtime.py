@@ -507,6 +507,56 @@ def test_engine_stack_runs_ordered_synthetic_sessions() -> None:
     assert [row["input_length"] for row in records[:3]] == [8, 18, 28]
 
 
+@pytest.mark.parametrize(("reserve", "initial_admissions"), [(None, 1), (0, 3), (384, 2)])
+def test_sglang_reserved_decode_tokens_reaches_native_admission(tmp_path, reserve, initial_admissions):
+    trace = tmp_path / "headroom.jsonl"
+    trace.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "request_id": f"r{i}",
+                    "timestamp": 0,
+                    "input_length": 8,
+                    "output_length": 2,
+                    "hash_ids": [i + 1],
+                }
+            )
+            + "\n"
+            for i in range(3)
+        ),
+        encoding="utf-8",
+    )
+    engine = _engine("disaggregated")
+    engine["backend"] = "sglang"
+    # Each 8-token transfer takes 10 ms, so all prefills finish before the
+    # first decode activation. In the 1,024-token pool, the number of initial
+    # reservations is limited by 8 prompt tokens plus the reserve per request.
+    engine["kv_transfer"] = {"bytes_per_token": 1_000_000, "bandwidth_gb_per_second": 0.8}
+    for worker in engine["workers"].values():
+        worker["kv_cache"] = {
+            "block_size": 4,
+            "prefix_caching": False,
+            "capacity": {"type": "fixed", "blocks": 256},
+        }
+    if reserve is not None:
+        engine["workers"]["decode"]["scheduler"] = {"reserved_decode_tokens": reserve}
+    report = _run(
+        {
+            "engine": engine,
+            "traffic": {
+                "source": {"type": "trace", "paths": [str(trace)], "format": "mooncake", "block_size": 8},
+                "load": {"type": "trace_timestamps"},
+            },
+        }
+    )
+
+    assert report.metrics["completed_requests"] == 3
+    rows = report.metadata["native_report"]["per_request"]
+    first_activation = min(row["destination_activated_ms"] for row in rows)
+    assert sum(row["destination_reserved_ms"] < first_activation for row in rows) == initial_admissions
+    assert sum(row["output_length"] for row in rows) == 6
+
+
 @pytest.mark.parametrize("interval", [None, 0, 2], ids=["default", "disabled", "two_rounds"])
 def test_sglang_prefill_decode_interval_reaches_native_scheduler(tmp_path, interval) -> None:
     trace = tmp_path / "interval.jsonl"
