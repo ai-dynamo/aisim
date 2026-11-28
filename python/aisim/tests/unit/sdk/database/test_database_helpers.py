@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import ast
+import io
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -592,3 +595,76 @@ def test_unload_database_removes_matching_database_and_clears_runtime_cache(perf
     finally:
         perf_database.databases_cache.clear()
         perf_database.databases_cache.update(cache_snapshot)
+
+
+# ----------------------------- system spec YAML reads -----------------------------
+
+PERF_DATABASE_SOURCE = Path(__file__).resolve().parents[4] / "src" / "aisim_core" / "sdk" / "perf_database.py"
+
+# The shared system spec reader and the loaders of the three files that are not
+# system specs. Any other YAML parse in perf_database.py is a new copy of the
+# system spec read.
+YAML_READERS = {
+    "_read_system_yaml",
+    "_load_query_slots_doc",  # query_versions.yaml
+    "_parse_reuse_yaml",  # reuse.yaml
+    "_load_collection_meta_yaml",  # collection_meta.yaml
+}
+
+
+def _yaml_load_references(node: ast.AST, owner: str = "<module>") -> dict[str, list[int]]:
+    """Lines that reference ``yaml.*load*``, keyed by the innermost enclosing def."""
+    found: dict[str, list[int]] = defaultdict(list)
+    for child in ast.iter_child_nodes(node):
+        child_owner = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else owner
+        if (
+            isinstance(child, ast.Attribute)
+            and isinstance(child.value, ast.Name)
+            and child.value.id == "yaml"
+            and child.attr.endswith(("load", "load_all"))
+        ):
+            found[owner].append(child.lineno)
+        for name, lines in _yaml_load_references(child, child_owner).items():
+            found[name].extend(lines)
+    return found
+
+
+def test_perf_database_parses_yaml_only_in_named_readers():
+    assert PERF_DATABASE_SOURCE.is_file(), f"source expected at {PERF_DATABASE_SOURCE}"
+    tree = ast.parse(PERF_DATABASE_SOURCE.read_text(encoding="utf-8"))
+
+    hidden = [
+        node.lineno
+        for node in ast.walk(tree)
+        if (isinstance(node, ast.ImportFrom) and node.module == "yaml")
+        or (isinstance(node, ast.Import) and any(alias.name == "yaml" and alias.asname for alias in node.names))
+    ]
+    assert not hidden, f"import yaml without an alias so every parse stays visible here (lines {hidden})"
+
+    sites = _yaml_load_references(tree)
+    stray = {owner: lines for owner, lines in sites.items() if owner not in YAML_READERS}
+    assert not stray, f"read system YAML through _read_system_yaml(path), not a new parse: {stray}"
+    assert set(sites) == YAML_READERS, f"named readers without a YAML parse: {YAML_READERS - set(sites)}"
+    assert len(sites["_read_system_yaml"]) == 1
+
+
+def test_read_system_yaml_looks_up_open_and_yaml_load_at_call_time(perf_database, monkeypatch):
+    """Database tests patch ``builtins.open`` and ``yaml.load`` (one with a
+    keyword-only ``Loader``); the shared reader must honour both patches."""
+    opened = []
+    parsed = {"data_dir": "data"}
+
+    def fake_open(*args, **kwargs):
+        opened.append((args, kwargs))
+        return io.StringIO("data_dir: unpatched\n")
+
+    def fake_load(stream, *, Loader):  # noqa: N803
+        return parsed if Loader is yaml.SafeLoader else None
+
+    with monkeypatch.context() as patched:
+        patched.setattr("builtins.open", fake_open)
+        patched.setattr("yaml.load", fake_load)
+        result = perf_database._read_system_yaml("sys.yaml")
+
+    assert result is parsed
+    assert opened == [(("sys.yaml",), {"encoding": "utf-8"})]
