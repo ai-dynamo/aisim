@@ -23,6 +23,14 @@ timing and graph remain available during migration. Pure operation-level
 speculative decoding remains supported. Ordinary autoregressive FPM and n-gram
 FPM verification without a draft network are outside this deprecation.
 
+The aggregate scheduler translates its prompt-token budget to scheduled fresh
+prefill tokens before querying the target FPM and any draft operations. A batch
+of two requests with `isl=4096`, `prefix=3000` and a 4096-token budget schedules
+one decoder and one prefill of 1096 fresh tokens, so a qualified draft scan pays
+one recurrent-state read/write pair. XPU reserves decode slots before this
+translation. Direct mixed-step calls still consume the caller's fresh-token
+count; 4096 explicitly scheduled fresh tokens represent four such prefills.
+
 Choose the replacement according to the evidence and caller you have:
 
 | Route | Migration use | Current readiness |
@@ -382,7 +390,7 @@ uncorrected native timings, in milliseconds:
 | Method | Coordinate contract |
 | --- | --- |
 | `predict_prefill_latency(batch_size, isl, prefix)` | Full input length and cached-prefix length per request; direct-FPM totals are `(batch_size, batch_size * (isl - prefix), batch_size * prefix)`. |
-| `predict_prefill_latency_total(batch_size, total_prefill_tokens, total_kv_read_tokens)` | Exact tokens computed and cached or earlier-chunk KV read across the prefill batch. Whole-forward FPM without operation-level draft tails queries these totals directly, so a ragged batch is never priced above its scheduled token count. Other graphs use the integer means of `predict_prefill_latency`; execution profiles reject totals that do not divide evenly across the batch. |
+| `predict_prefill_latency_total(batch_size, total_prefill_tokens, total_kv_read_tokens)` | Exact tokens computed and cached or earlier-chunk KV read across the prefill batch. Whole-forward FPM without operation-level draft tails queries these totals directly when `nextn == 0` or a measured-round binding is present, preserving a ragged batch's scheduled token count. With `nextn > 0` and no measured-round binding, it uses the integer means of `predict_prefill_latency`, which can reconstruct a different token total. Other graphs also use those integer means, except that qualified Mamba ops split a ragged total into two balanced request lengths; schema-v1 execution profiles reject totals that do not divide evenly across the batch. |
 | `predict_decode_latency_total(batch_size, total_past_kv_tokens)` | Exact total past-KV across the decode batch, preserving the native FPM coordinate without a mean-context conversion. |
 | `fpm_decode_kv_ceiling()` | Largest collected decode KV total, or `None`; reading this bound does not record a timing lookup or prove shape-specific coverage. |
 

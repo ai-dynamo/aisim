@@ -45,6 +45,106 @@ logger = logging.getLogger(__name__)
 _MODEL_REGISTRY: dict[str, type] = {}
 
 
+class _OperationList(list):
+    """A model-owned list that versions structural edits without walking the graph.
+
+    Both phase lists share the counter. It has no back-reference to the model,
+    and deepcopy/pickle preserve the sharing in a restored model.
+    Callback-capable edits invalidate before and after the change so reentrant
+    estimates cannot retain an intermediate graph.
+    """
+
+    def __init__(self, values, revision):
+        super().__init__(values)
+        self._revision = revision
+
+    def _changed(self):
+        # Copy/unpickle may populate the list before restoring its attributes.
+        if (revision := getattr(self, "_revision", None)) is not None:
+            revision[0] += 1
+
+    def __setitem__(self, key, value):
+        self._changed()
+        try:
+            return super().__setitem__(key, value)
+        finally:
+            self._changed()
+
+    def __delitem__(self, key):
+        self._changed()
+        try:
+            return super().__delitem__(key)
+        finally:
+            self._changed()
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
+
+    def __imul__(self, count):
+        self._changed()
+        try:
+            return super().__imul__(count)
+        finally:
+            self._changed()
+
+    def append(self, value):
+        self._changed()
+        return super().append(value)
+
+    def extend(self, values):
+        # Iteration can estimate an intermediate graph, then yield more or raise.
+        self._changed()
+        try:
+            # Snapshot self-extension, as list.extend does, without copying
+            # ordinary iterables or hiding their reentrant estimates.
+            if values is self:
+                values = list(self)
+            for value in values:
+                self.append(value)
+        finally:
+            self._changed()
+
+    def insert(self, index, value):
+        self._changed()
+        try:
+            return super().insert(index, value)
+        finally:
+            self._changed()
+
+    def pop(self, index=-1):
+        self._changed()
+        try:
+            return super().pop(index)
+        finally:
+            self._changed()
+
+    def remove(self, value):
+        self._changed()
+        try:
+            return super().remove(value)
+        finally:
+            self._changed()
+
+    def clear(self):
+        self._changed()
+        try:
+            return super().clear()
+        finally:
+            self._changed()
+
+    def reverse(self):
+        self._changed()
+        return super().reverse()
+
+    def sort(self, *, key=None, reverse=False):
+        self._changed()
+        try:
+            return super().sort(key=key, reverse=reverse)
+        finally:
+            self._changed()
+
+
 def register_model(*families: str):
     """Decorator: register ``cls`` as the implementation of one or more families.
 
@@ -107,6 +207,7 @@ class BaseModel:
         self.config = model_config
         self.extra_params = extra_params
         self._use_qk_norm = bool(extra_params.get("use_qk_norm", False)) if isinstance(extra_params, dict) else False
+        self._aic_op_list_revision = [0]
         self.encoder_ops = []
         self.context_ops = []
         self.generation_ops = []
@@ -151,6 +252,34 @@ class BaseModel:
         # with _nextn for directly-constructed models (tests, tools): nextn>0
         # has always meant MTP semantics (verify width nextn+1).
         self.spec_scheme = NullScheme() if self._nextn == 0 else MTPScheme(depth=self._nextn)
+
+    @property
+    def context_ops(self):
+        return self.__dict__["context_ops"]
+
+    @context_ops.setter
+    def context_ops(self, value):
+        if value is self.__dict__.get("context_ops"):
+            return
+        replacement = _OperationList(value, self._aic_op_list_revision)
+        self.__dict__["context_ops"] = replacement
+        self._aic_op_list_revision[0] += 1
+        # Materialization may estimate the old graph before installation.
+        self.__dict__.pop("_aic_engine_identity_memo", None)
+
+    @property
+    def generation_ops(self):
+        return self.__dict__["generation_ops"]
+
+    @generation_ops.setter
+    def generation_ops(self, value):
+        if value is self.__dict__.get("generation_ops"):
+            return
+        replacement = _OperationList(value, self._aic_op_list_revision)
+        self.__dict__["generation_ops"] = replacement
+        self._aic_op_list_revision[0] += 1
+        # Materialization may estimate the old graph before installation.
+        self.__dict__.pop("_aic_engine_identity_memo", None)
 
     @property
     def verify_width(self) -> int:

@@ -1,0 +1,442 @@
+{
+  "baseline": "1173b040d1539fb316b764ac718b004c14063fb5",
+  "candidate": "56591a7deb2a9b3ff45813614ccc6146383f061b",
+  "baseline_backend_sha256": "8af662a88c1b2a3f8852497f2ba06063d30a24c45b22c63a093bf62f590135b4",
+  "candidate_backend_sha256": "324e8619a69d0d02d9c18b5f15f8696e60646f39562741234d3a19898bfb511a",
+  "driver_sha256": "2be9e104d6e8f27f50e52d102aab3997d3b30662d6cc4025d2412bafedb84304",
+  "native_sha256": "c8b950150445b3751ab034e9e4d28211cf18c84793629bda00a74f37c8ba588b",
+  "python": "3.12.12",
+  "inputs": {
+    "system": "b200_sxm",
+    "backend": "vllm",
+    "version": "0.24.0",
+    "mode": "SOL",
+    "batch_size": 4,
+    "isl": 4096,
+    "osl": 64,
+    "ctx_tokens": 512
+  },
+  "scope": "aggregate miss (warm native handle) and aggregate hit, excluding result formatting",
+  "cases": {
+    "mtp_prefix3072": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "nextn": 3,
+      "prefix": 3072,
+      "rounds": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 139.094,
+            "hit_us": 2.9760875
+          },
+          "candidate": {
+            "miss_us": 262.0435,
+            "hit_us": 3.0026200000000003
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 252.9225,
+            "hit_us": 3.0148425000000003
+          },
+          "baseline": {
+            "miss_us": 129.0645,
+            "hit_us": 2.9459625000000003
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 130.652,
+            "hit_us": 2.960075
+          },
+          "candidate": {
+            "miss_us": 254.0685,
+            "hit_us": 3.0234975
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 250.531,
+            "hit_us": 3.0087925
+          },
+          "baseline": {
+            "miss_us": 127.924,
+            "hit_us": 2.9576125
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 131.089,
+            "hit_us": 2.95021
+          },
+          "candidate": {
+            "miss_us": 256.0905,
+            "hit_us": 3.0317375
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 267.541,
+            "hit_us": 3.030685
+          },
+          "baseline": {
+            "miss_us": 143.483,
+            "hit_us": 2.9664525
+          }
+        }
+      ],
+      "baseline": {
+        "mixed_steps": 32.0,
+        "weighted_mamba_ms": 22.658748279330272,
+        "ttft_ms": 142.18243374826432,
+        "tpot_ms": 7.892728544556073,
+        "tokens_s": 394.1044895648532
+      },
+      "candidate": {
+        "mixed_steps": 8.0,
+        "weighted_mamba_ms": 5.664687069832568,
+        "ttft_ms": 74.69596685242608,
+        "tpot_ms": 7.056110342621304,
+        "tokens_s": 485.3331938673837
+      }
+    },
+    "mtp_prefix3000_tail72": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "nextn": 3,
+      "prefix": 3000,
+      "rounds": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 134.339,
+            "hit_us": 2.91248
+          },
+          "candidate": {
+            "miss_us": 297.1965,
+            "hit_us": 2.99444
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 308.1705,
+            "hit_us": 3.01897
+          },
+          "baseline": {
+            "miss_us": 138.3155,
+            "hit_us": 2.9343475
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 151.7,
+            "hit_us": 2.9748975
+          },
+          "candidate": {
+            "miss_us": 322.605,
+            "hit_us": 3.0472
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 322.472,
+            "hit_us": 3.0654275
+          },
+          "baseline": {
+            "miss_us": 149.5515,
+            "hit_us": 2.97612
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 138.185,
+            "hit_us": 2.9736599999999997
+          },
+          "candidate": {
+            "miss_us": 309.712,
+            "hit_us": 3.0151525
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 296.81,
+            "hit_us": 2.997925
+          },
+          "baseline": {
+            "miss_us": 132.3,
+            "hit_us": 2.945575
+          }
+        }
+      ],
+      "baseline": {
+        "mixed_steps": 32.0,
+        "weighted_mamba_ms": 22.658748279330272,
+        "ttft_ms": 142.19437178602433,
+        "tpot_ms": 7.893325446444074,
+        "tokens_s": 394.0739565547977
+      },
+      "candidate": {
+        "mixed_steps": 12.0,
+        "weighted_mamba_ms": 7.19402654315924,
+        "ttft_ms": 85.14671641498128,
+        "tpot_ms": 7.155696963606207,
+        "tokens_s": 470.1881801176282
+      }
+    },
+    "mtp_cold_control": {
+      "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+      "nextn": 3,
+      "prefix": 0,
+      "rounds": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 131.873,
+            "hit_us": 2.921145
+          },
+          "candidate": {
+            "miss_us": 138.154,
+            "hit_us": 2.96227
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 141.0435,
+            "hit_us": 2.96843
+          },
+          "baseline": {
+            "miss_us": 124.32849999999999,
+            "hit_us": 2.94775
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 116.691,
+            "hit_us": 2.9322999999999997
+          },
+          "candidate": {
+            "miss_us": 127.814,
+            "hit_us": 2.9473525
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 158.764,
+            "hit_us": 2.9667700000000004
+          },
+          "baseline": {
+            "miss_us": 139.35399999999998,
+            "hit_us": 2.952215
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 130.93599999999998,
+            "hit_us": 2.9599475
+          },
+          "candidate": {
+            "miss_us": 146.05349999999999,
+            "hit_us": 2.9899225
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 127.91499999999999,
+            "hit_us": 2.93783
+          },
+          "baseline": {
+            "miss_us": 115.997,
+            "hit_us": 2.8951675000000003
+          }
+        }
+      ],
+      "baseline": {
+        "mixed_steps": 32.0,
+        "weighted_mamba_ms": 22.658748279330272,
+        "ttft_ms": 142.44013178602432,
+        "tpot_ms": 7.9056134464440735,
+        "tokens_s": 393.44644444177015
+      },
+      "candidate": {
+        "mixed_steps": 32.0,
+        "weighted_mamba_ms": 22.658748279330272,
+        "ttft_ms": 142.44013178602432,
+        "tpot_ms": 7.9056134464440735,
+        "tokens_s": 393.44644444177015
+      }
+    },
+    "non_mamba_control": {
+      "model": "Qwen/Qwen3-0.6B",
+      "nextn": 0,
+      "prefix": 3072,
+      "rounds": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 98.84100000000001,
+            "hit_us": 2.9182750000000004
+          },
+          "candidate": {
+            "miss_us": 99.826,
+            "hit_us": 2.9156325
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 98.1005,
+            "hit_us": 2.9151425
+          },
+          "baseline": {
+            "miss_us": 96.205,
+            "hit_us": 2.885205
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 94.1215,
+            "hit_us": 2.875305
+          },
+          "candidate": {
+            "miss_us": 95.67150000000001,
+            "hit_us": 2.9369449999999997
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 98.486,
+            "hit_us": 2.9359349999999997
+          },
+          "baseline": {
+            "miss_us": 95.53649999999999,
+            "hit_us": 2.943105
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "baseline": {
+            "miss_us": 100.3415,
+            "hit_us": 2.92904
+          },
+          "candidate": {
+            "miss_us": 102.565,
+            "hit_us": 2.9299025
+          }
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "candidate": {
+            "miss_us": 94.19,
+            "hit_us": 2.89824
+          },
+          "baseline": {
+            "miss_us": 92.1845,
+            "hit_us": 2.8628375
+          }
+        }
+      ],
+      "baseline": {
+        "mixed_steps": 32.0,
+        "weighted_mamba_ms": 0,
+        "ttft_ms": 33.3882444494721,
+        "tpot_ms": 0.4705070846034748,
+        "tokens_s": 3998.084043274016
+      },
+      "candidate": {
+        "mixed_steps": 32.0,
+        "weighted_mamba_ms": 0,
+        "ttft_ms": 33.3882444494721,
+        "tpot_ms": 0.4705070846034748,
+        "tokens_s": 3998.084043274016
+      }
+    }
+  }
+}

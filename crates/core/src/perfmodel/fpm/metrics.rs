@@ -23,6 +23,17 @@ pub const FPM_VERSION: u32 = 1;
 /// AIC owns this Rust copy so AIC does not depend on Dynamo crates.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ScheduledRequestMetrics {
+    /// Exact prefill groups `[requests, new_tokens_per_request, prefix_tokens_per_request]`.
+    /// Optional: op-level qualified Mamba uses these instead of balanced totals.
+    /// Supplying groups also makes token-major ops use the full `sum_prefill_tokens`,
+    /// including scheduled padding, while qualified Mamba uses only the prompt chunks.
+    /// Together with explicit query padding, these must agree with prefill totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_chunks: Option<Vec<[u32; 3]>>,
+    /// Scheduled query positions beyond the actual prompt chunks (e.g. vLLM MTP
+    /// padding). Included in `sum_prefill_tokens`, excluded from `prefill_chunks`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sum_prefill_padding_tokens: u32,
     /// Optional regression features: freshly computed tokens for each scheduled
     /// request (one for ordinary decode), aligned with `past_kv_lengths`.
     /// These additive fields are unnecessary for the default attention/MoE fit.
@@ -126,6 +137,13 @@ pub(crate) fn validate_forward_pass_metrics(metrics: &ForwardPassMetrics) -> Res
         });
     }
     let scheduled = &metrics.scheduled_requests;
+    if scheduled.sum_prefill_padding_tokens > scheduled.sum_prefill_tokens
+        || (scheduled.sum_prefill_padding_tokens > 0 && scheduled.prefill_chunks.is_none())
+    {
+        return Err(AicError::InvalidForwardPassMetrics(
+            "prefill padding requires exact chunks and cannot exceed total prefill tokens".into(),
+        ));
+    }
     if scheduled.num_prefill_requests == 0
         && (scheduled.sum_prefill_tokens > 0 || scheduled.sum_prefill_kv_tokens > 0)
     {
@@ -137,6 +155,36 @@ pub(crate) fn validate_forward_pass_metrics(metrics: &ForwardPassMetrics) -> Res
         return Err(AicError::InvalidForwardPassMetrics(
             "decode KV token sum requires num_decode_requests > 0".to_string(),
         ));
+    }
+    if let Some(groups) = &scheduled.prefill_chunks {
+        let mut totals = [0_u64; 3];
+        for &[count, new, prefix] in groups {
+            if count == 0 || new == 0 {
+                return Err(AicError::InvalidForwardPassMetrics(
+                    "prefill_chunks groups need positive request and new-token counts".into(),
+                ));
+            }
+            for (total, value) in totals.iter_mut().zip([
+                u64::from(count),
+                u64::from(count) * u64::from(new),
+                u64::from(count) * u64::from(prefix),
+            ]) {
+                *total = total.checked_add(value).ok_or_else(|| {
+                    AicError::InvalidForwardPassMetrics("prefill_chunks totals overflow".into())
+                })?;
+            }
+        }
+        if totals
+            != [
+                u64::from(scheduled.num_prefill_requests),
+                u64::from(scheduled.sum_prefill_tokens - scheduled.sum_prefill_padding_tokens),
+                u64::from(scheduled.sum_prefill_kv_tokens),
+            ]
+        {
+            return Err(AicError::InvalidForwardPassMetrics(
+                "prefill_chunks must match prefill request, new-token and prefix totals".into(),
+            ));
+        }
     }
     match (&scheduled.extend_lengths, &scheduled.past_kv_lengths) {
         (None, None) => {}
@@ -162,4 +210,38 @@ pub(crate) fn validate_forward_pass_metrics(metrics: &ForwardPassMetrics) -> Res
 
 fn default_fpm_version() -> u32 {
     FPM_VERSION
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+
+    #[test]
+    fn prefill_padding_keeps_exact_prompt_validation() {
+        let mut metrics = ForwardPassMetrics {
+            scheduled_requests: ScheduledRequestMetrics {
+                num_prefill_requests: 1,
+                sum_prefill_tokens: 4,
+                sum_prefill_kv_tokens: 16,
+                prefill_chunks: Some(vec![[1, 1, 16]]),
+                sum_prefill_padding_tokens: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        validate_forward_pass_metrics(&metrics).unwrap();
+        let restored = serde_json::from_str(&serde_json::to_string(&metrics).unwrap()).unwrap();
+        assert_eq!(metrics, restored);
+        for padding in [0, 2, 4, 5] {
+            metrics.scheduled_requests.sum_prefill_padding_tokens = padding;
+            assert!(validate_forward_pass_metrics(&metrics).is_err());
+        }
+        metrics.scheduled_requests.sum_prefill_padding_tokens = 3;
+        metrics.scheduled_requests.prefill_chunks = None;
+        assert!(validate_forward_pass_metrics(&metrics).is_err());
+    }
 }

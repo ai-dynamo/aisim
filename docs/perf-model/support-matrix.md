@@ -61,6 +61,76 @@ marks every row of this checkpoint `FAIL` with `ENCODER_UNSUPPORTED`,
 because the export declares a vision encoder that AISim does not
 model; the SDK tests cover the text path.
 
+A Mamba2 operation reads measured `mamba2_perf` rows only in `SILICON` and
+`HYBRID` modes. Once constructed, a model uses the analytic SOL estimate for a
+query-time shape miss. `SILICON` op-level construction still requires rows for
+each Mamba kernel, including width-four decode kernels that use SOL at query
+time; SOL does not bypass that construction check. A
+measured decode row prices one token per request. A qualified Mamba2
+operation records its state dtype. Under MTP, its decode `token_width` is
+above one, because it verifies several tokens per request. No measured row
+covers that step, so the operation always uses the SOL estimate. This rule
+applies to the convolution update and to the state scan. The estimate
+counts every verified token, and its source is `sol`. For a state-scan
+operation, it also counts each request's recurrent-state traffic. The
+convolution update has no recurrent-state term. A decode batch must hold
+whole requests, so its token count must be a multiple of `token_width`.
+Qualified Mamba2 generation requires `beam_width: 1`; native static generation
+rejects other beam widths because its recurrent-state estimate does not model
+beam expansion. Legacy operations with an unrecorded state dtype retain their
+existing behavior.
+Native op-level Replay packs every decode request at the configured width,
+`nextn + 1`. If its scheduler verifies fewer tokens for a request, the
+estimate counts more tokens than that request verifies.
+
+Built-in Nemotron-H MTP graphs record the resolved `mamba_ssm_cache_dtype`
+and `nextn + 1` decode width during normal construction through
+`RustForwardPassPerfModel.best_available`. Both `nextn` and explicit
+`speculation.kind: mtp` use this path. Context operations retain width one.
+Non-MTP built-in graphs retain legacy accounting, including schemes that
+assign their verification width and wrap draft operations after construction;
+this MTP integration does not qualify those graphs.
+
+A qualified Mamba2 operation cannot use the name `context_attention` or
+`context_attention (scaled)`. The SDK reports those names as context
+attention that is amortized over prefill chunks, but a qualified Mamba2 row is
+not amortized. The engine build rejects such an operation with an
+invalid-configuration error.
+
+With `token_width` one, an operation can read a measured row when the state
+dtype allows it and the table covers its shape. The collected state-scan
+rows use a BF16 state. A qualified scan operation with any other state
+dtype, `float16` or `float32`, uses the SOL estimate. Convolution rows do not
+depend on the state dtype, so this rule does not apply to convolution,
+under either its logical or its physical TensorRT-LLM label. No collected
+data qualifies Mamba2 timing under MTP.
+
+Within a matching kernel, phase and model geometry, a prefill lookup uses the
+batch size and the new-token count. The collected scan rows start from a cold
+state, so they do not measure a prefill that restores a cached prefix. A
+qualified scan operation with a cached prefix therefore uses the SOL estimate,
+which counts the restored recurrent state. The collected convolution rows are
+cold too. A qualified convolution with a cached prefix uses a matching cold row
+as a proxy, labeled `estimated`, only when that lookup succeeds. If no matching
+row exists, it returns `sol` in both `SILICON` and `HYBRID`. A legacy operation,
+one with no recorded state dtype, still looks up the cold row. In `SILICON` or `HYBRID`
+mode, a successful lookup labels its result `silicon`. A `HYBRID` lookup that
+misses the model geometry gives `sol`, and `SOL` mode reads no row.
+Native op-level Replay supplies the observed prefill chunk lengths and prefixes
+as `scheduled_requests.prefill_chunks`. Qualified Mamba operations group and
+price those actual shapes, so cold scans keep their measured rows beside warm
+SOL scans. A caller with only prefill totals omits this field: qualified Mamba
+then distributes new tokens evenly across the requests. If such a totals-only
+step has any cached prefill token, every qualified prefill scan in it uses SOL;
+its measured-row eligibility is approximate. The regression feature fields
+`extend_lengths` and `past_kv_lengths` have no phase ordering contract and are
+not substituted for exact prefill groups. Each prefill
+request must compute at least one new token. Take a graph with a qualified
+context Mamba2 operation. If a packed step has new prefill tokens, but fewer
+than prefill requests, its estimate fails. Decode work does not change this.
+A qualified decode operation alone does not apply this check. A step with no
+new prefill token skips prefill. It prices only its decode work, or zero.
+
 The bundled `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` export has the same text
 configuration as `nvidia/Qwen3.5-397B-A17B-NVFP4` and a different
 quantization recipe. Its routed experts are NVFP4. Its Gated DeltaNet (GDN)

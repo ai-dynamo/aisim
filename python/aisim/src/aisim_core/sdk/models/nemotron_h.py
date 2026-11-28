@@ -75,6 +75,12 @@ class NemotronHModel(BaseModel):
         # deep models). Not worth modeling an explicit attn+moe MTP block for
         # sub-1% gain.
         self._mtp_scale_factor = mtp_scale_factor(self._nextn, self._num_layers)
+        # MTP's width is resolved before construction, so its Mamba ops can
+        # record state precision and per-request checkpoints here. Keep the
+        # non-MTP graph legacy: other schemes materialize widths and draft
+        # TokenScale wrappers after construction, which qualified Mamba does
+        # not support. Both legacy nextn and explicit MTP use this same path.
+        self._mamba_mtp_depth = self._nextn
 
     def set_hybrid_config(self, hybrid_config: common.NemotronHConfig) -> None:
         """
@@ -219,6 +225,11 @@ class NemotronHModel(BaseModel):
                         d_conv=cfg.conv_kernel,
                         n_groups=n_groups_per_gpu,
                         chunk_size=cfg.chunk_size,
+                        **(
+                            {"state_dtype": cfg.mamba_ssm_cache_dtype, "token_width": 1}
+                            if self._mamba_mtp_depth
+                            else {}
+                        ),
                     ),
                     ops.Mamba2Kernel(
                         "context_mamba_ssm",
@@ -232,6 +243,11 @@ class NemotronHModel(BaseModel):
                         d_conv=cfg.conv_kernel,
                         n_groups=n_groups_per_gpu,
                         chunk_size=cfg.chunk_size,
+                        **(
+                            {"state_dtype": cfg.mamba_ssm_cache_dtype, "token_width": 1}
+                            if self._mamba_mtp_depth
+                            else {}
+                        ),
                     ),
                     ops.GEMM(
                         "context_mamba_out_proj_gemm",
@@ -514,6 +530,11 @@ class NemotronHModel(BaseModel):
                         d_conv=cfg.conv_kernel,
                         n_groups=n_groups_per_gpu,
                         chunk_size=cfg.chunk_size,
+                        **(
+                            {"state_dtype": cfg.mamba_ssm_cache_dtype, "token_width": self._mamba_mtp_depth + 1}
+                            if self._mamba_mtp_depth
+                            else {}
+                        ),
                     ),
                     ops.Mamba2Kernel(
                         "generation_mamba_ssm",
@@ -527,6 +548,11 @@ class NemotronHModel(BaseModel):
                         d_conv=cfg.conv_kernel,
                         n_groups=n_groups_per_gpu,
                         chunk_size=cfg.chunk_size,
+                        **(
+                            {"state_dtype": cfg.mamba_ssm_cache_dtype, "token_width": self._mamba_mtp_depth + 1}
+                            if self._mamba_mtp_depth
+                            else {}
+                        ),
                     ),
                     ops.GEMM(
                         "generation_mamba_out_proj_gemm",

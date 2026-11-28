@@ -405,15 +405,14 @@ def test_mixed_and_decode_helpers_pass_raw_step_args(monkeypatch) -> None:
             mixed_calls.append((args, kwargs))
             return 8.5
 
-        def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
+        def _mixed_step_breakdown_per_op_with_decode_coverage(self, *args, **kwargs):
             breakdown_calls.append((args, kwargs))
             return (
-                (
-                    [("context_mlp", 5.0, 50.0, "estimated", _CONTEXT_FALLBACK_PAYLOAD)],
-                    [("context_attention", 2.0, 20.0, "silicon")],
-                    [("generation_attention", 1.5, 15.0, "silicon")],
-                ),
-                None,
+                [("context_mlp", 5.0, 50.0, "estimated", _CONTEXT_FALLBACK_PAYLOAD)],
+                [("context_attention", 2.0, 20.0, "silicon")],
+                [("generation_attention", 1.5, 15.0, "silicon")],
+                8.5,
+                1.5,
             )
 
         def decode_step_latency(self, *args, **kwargs):
@@ -495,14 +494,13 @@ def test_mixed_step_breakdown_bridge_shapes_missing_attention_passes(monkeypatch
     the Python branch's default ``"silicon"`` source."""
 
     class _FakeHandle:
-        def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
+        def _mixed_step_breakdown_per_op_with_decode_coverage(self, *args, **kwargs):
             return (
-                (
-                    [("qkv_gemm", 3.0, 30.0, "silicon"), ("mlp", 2.0, 0.0, "empirical")],
-                    [("context_attention", 4.0, 8.0, "empirical")],
-                    [],  # no decode requests scheduled: pass 3 is absent
-                ),
-                None,
+                [("qkv_gemm", 3.0, 30.0, "silicon"), ("mlp", 2.0, 0.0, "empirical")],
+                [("context_attention", 4.0, 8.0, "empirical")],
+                [],  # no decode requests scheduled: pass 3 is absent
+                7.0,
+                0.0,
             )
 
         def last_provenance(self):
@@ -546,6 +544,261 @@ def test_mixed_step_breakdown_bridge_shapes_missing_attention_passes(monkeypatch
     assert components["energy_wms"] == 38.0
 
 
+@pytest.mark.parametrize(
+    "native,public,decode",
+    [("context_attention", "context_attention (scaled)", False), ("fpm_forward_decode", "generation_attention", True)],
+)
+def test_mixed_display_alias_preserves_literal_rows(monkeypatch, native, public, decode):
+    class Handle:
+        def _mixed_step_breakdown_per_op_with_decode_coverage(self, *args, **kwargs):
+            row = [(native, 2.0, 20.0, "silicon")]
+            return (
+                [(public, 3.0, 30.0, "estimated"), (f"{public} (operation)", 5.0, 50.0, "silicon")],
+                [] if decode else row,
+                row if decode else [],
+                10.0,
+                2.0 if decode else 0.0,
+            )
+
+        def last_provenance(self):
+            return None
+
+    monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *_: Handle())
+    result = rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+        None,
+        None,
+        ctx_tokens=16,
+        gen_tokens=int(decode),
+        isl=16,
+        osl=1,
+        prefix=0,
+    )
+    assert result["per_op_latency_ms"][public] == 2.0
+    assert result["per_op_latency_ms"][f"{public} (operation)"] == 5.0
+    assert result["per_op_latency_ms"][f"{public} (operation) (operation)"] == 3.0
+    assert result["per_op_energy_wms"][public] == 20.0
+    assert result["per_op_energy_wms"][f"{public} (operation)"] == 50.0
+    assert result["per_op_energy_wms"][f"{public} (operation) (operation)"] == 30.0
+    assert result["per_op_source"][public] == "silicon"
+    assert result["per_op_source"][f"{public} (operation)"] == "silicon"
+    assert result["per_op_source"][f"{public} (operation) (operation)"] == "estimated"
+    assert sum(result["per_op_latency_ms"].values()) == result["latency_ms"] == 10.0
+    assert sum(result["per_op_energy_wms"].values()) == result["energy_wms"] == 100.0
+    component = "decode_attention" if decode else "context_attention"
+    assert result["component_latency_ms"][component] == 2.0
+    assert result["component_energy_wms"][component] == 20.0
+
+
+def test_mixed_display_alias_matches_native_total(monkeypatch):
+    from collections import OrderedDict
+
+    from aisim_core.sdk import operations
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    monkeypatch.setattr(rust_engine_step, "_ENGINE_HANDLE_CACHE", OrderedDict())
+    model = get_model("Qwen/Qwen3-32B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops.append(operations.GEMM("context_attention (scaled)", 1, 64, 64, common.GEMMQuantMode.bfloat16))
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    args = dict(ctx_tokens=128, gen_tokens=1, isl=128, osl=2, prefix=0)
+    result = rust_engine_step.estimate_mixed_step_breakdown_with_rust(model, database, **args)
+    native = rust_engine_step.estimate_mixed_step_latency_with_rust(model, database, **args)
+    assert result["per_op_latency_ms"]["context_attention (scaled)"] > 0
+    assert result["per_op_latency_ms"]["context_attention (scaled) (operation)"] > 0
+    assert sum(result["per_op_latency_ms"].values()) == pytest.approx(native)
+    assert sum(result["per_op_energy_wms"].values()) == pytest.approx(result["energy_wms"])
+
+
+@pytest.mark.parametrize("model_name", ["stepfun-ai/Step-3.7-Flash", "XiaomiMiMo/MiMo-V2-Flash"])
+def test_non_mamba_hybrid_rebuild_refreshes_engine_identity(model_name):
+    from dataclasses import replace
+
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = get_model(model_name, ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "trtllm")
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
+    original = model._hybrid_config
+    key = rust_engine_step.engine_identity(model, database)
+    model.set_hybrid_config(replace(original, sliding_window_size=original.sliding_window_size + 16))
+    assert rust_engine_step.engine_identity(model, database) != key
+    model.set_hybrid_config(original)
+    assert rust_engine_step.engine_identity(model, database) == key
+
+
+def test_plain_graph_identity_serializes_specs_only_on_memo_miss(monkeypatch):
+    from aisim_core.sdk import engine, operations
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    convert = engine._as_engine_op
+    converted = []
+
+    def record_conversion(op):
+        converted.append(op)
+        return convert(op)
+
+    monkeypatch.setattr(engine, "_as_engine_op", record_conversion)
+    key = rust_engine_step.engine_identity(model, database)
+    count = len(converted)
+    assert count == len(model.context_ops) + len(model.generation_ops)
+    assert rust_engine_step.engine_identity(model, database) == key
+    assert len(converted) == count
+    # Also cover directly constructed native leaves, not just SDK shells.
+    import aisim_core
+
+    model = SimpleNamespace(
+        context_ops=[aisim_core.op_from_spec_json(operations.ElementWise("norm", 1, 8, 8, 1)._spec_json())]
+    )
+    identity = rust_engine_step._operation_graph_identity(model)
+    assert identity == [["context_ops", 0, model.context_ops[0]._spec_json()]]
+
+
+@pytest.mark.parametrize("composite", [False, True])
+def test_qualification_identity_keeps_native_and_nested_mamba(composite):
+    import aisim_core
+    from aisim_core.sdk import operations
+
+    scan = operations.Mamba2Kernel(
+        "context_scan",
+        1,
+        "mamba_chunk_scan_combined",
+        "context",
+        4096,
+        64,
+        64,
+        128,
+        4,
+        4,
+        128,
+        state_dtype="bfloat16",
+    )
+    native = aisim_core.op_from_spec_json(scan._spec_json())
+    op = operations.OverlapOp("context_nested", [native], []) if composite else native
+    model = SimpleNamespace(context_ops=[op])
+    identity = rust_engine_step._operation_graph_identity(model)
+    assert len(identity) == 1
+    assert '"Mamba2"' in identity[0][2]
+
+
+def test_decode_bridge_retains_native_coverage_of_a_folded_name(monkeypatch):
+    class Handle:
+        def _decode_step_per_op_with_metadata(self, *args, **kwargs):
+            # Native queries of 3 ms with power and 7 ms without power have
+            # already folded into one row. Positive folded energy covers 3 ms.
+            return [("shared", 10.0, 30.0, "mixed")], 3.0
+
+        def last_provenance(self):
+            return None
+
+    monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *_: Handle())
+    result = rust_engine_step._estimate_decode_step_with_rust(None, None, gen_tokens=2, isl=64, osl=4)
+    assert result.latency_ms == 10.0
+    assert result.energy_wms == 30.0
+    assert result.per_op_latency_ms == {"shared": 10.0}
+    assert result.covered_latency_ms == 3.0
+
+
+def test_native_decode_bridge_retains_coverage_of_folded_powered_pair():
+    from aisim_core.sdk import operations
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.22.0", database_mode="HYBRID", allow_unlisted_version=True)
+    # The checked-in vLLM attention row carries measured power; the norm's
+    # empirical estimate has none. Calibrate repetitions with independent
+    # single-op native queries to obtain the requested exact 3/7 ms split.
+    powered = next(op for op in model.generation_ops if isinstance(op, operations.GenerationAttention))
+    powered._name = "same"
+    unpowered = operations.ElementWise("same", 1, 4096, 4096)
+    model.context_ops = []
+    model.generation_ops = [powered, unpowered]
+    handle = rust_engine_step._cached_engine_handle(model, database)
+    powered_query = handle.evaluate_generation_ops([0], batch_size=8, s=2050)[0]
+    unpowered_query = handle.evaluate_generation_ops([1], batch_size=8, s=2050)[0]
+    assert powered_query[2] > 0 and unpowered_query[2] == 0
+    powered._scale_factor *= 3.0 / powered_query[1]
+    unpowered._scale_factor *= 7.0 / unpowered_query[1]
+    result = rust_engine_step._estimate_decode_step_with_rust(model, database, gen_tokens=8, isl=2048, osl=2)
+    assert result.latency_ms == pytest.approx(10.0)
+    assert result.covered_latency_ms == pytest.approx(3.0)
+    assert result.per_op_latency_ms == {"same": pytest.approx(10.0)}
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_draft_width_edit_invalidates_warm_identity_and_handle(phase):
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import Mamba2Kernel
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1), "vllm")
+    scan = Mamba2Kernel(
+        f"{phase}_scan",
+        1,
+        "mamba_chunk_scan_combined" if phase == "context" else "selective_state_update",
+        phase,
+        4096,
+        64,
+        64,
+        128,
+        4,
+        4,
+        128,
+    )
+    model.context_ops = [scan] if phase == "context" else []
+    model.generation_ops = [scan] if phase == "generation" else []
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    original = rust_engine_step.engine_identity(model, database)
+    handle = rust_engine_step._cached_engine_handle(model, database)
+    scan._draft_token_width = (1, 4)
+    changed = rust_engine_step.engine_identity(model, database)
+    assert changed != original
+    assert rust_engine_step._cached_engine_handle(model, database) is not handle
+    epoch = scan._mutation_epoch()
+    scan._draft_token_width = (1, 4)
+    assert scan._mutation_epoch() == epoch
+    assert rust_engine_step.engine_identity(model, database) is changed
+    del scan._draft_token_width
+    assert rust_engine_step.engine_identity(model, database) == original
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_mamba_engine_spec_fields_survive_native_bincode_roundtrip(explicit):
+    import aisim_core
+    from aisim_core.sdk import engine
+    from aisim_core.sdk.operations import Mamba2Kernel
+
+    model = _dense_model()
+    model.context_ops = []
+    scan = Mamba2Kernel("scan", 1, "selective_state_update", "generation", 4096, 64, 64, 128, 4, 4, 128)
+    model.generation_ops = [scan]
+    spec = json.loads(
+        engine.build_engine_spec_json(
+            model,
+            model_path=model.model_path,
+            system="b200_sxm",
+            backend="vllm",
+            backend_version="0.24.0",
+            kv_block_size=None,
+            systems_path=None,
+            nextn=3 if explicit else 0,
+            database=None,
+        )
+    )
+    fields = spec["generation_ops"][0]["Mamba2"]
+    if explicit:
+        fields.update(state_dtype="float32", token_width=4)
+    else:
+        del fields["state_dtype"], fields["token_width"]
+    encoded = aisim_core.engine_spec_bincode_from_json(json.dumps(spec))
+    restored = json.loads(aisim_core._native.engine_spec_json_from_bincode(encoded))
+    fields = restored["generation_ops"][0]["Mamba2"]
+    assert (fields["state_dtype"], fields["token_width"]) == (("float32", 4) if explicit else ("unrecorded", 1))
+
+
 def test_decode_step_breakdown_folds_per_op_entries(monkeypatch) -> None:
     """The decode bridge returns latency, energy, per-op data, and executed
     fallback provenance from ``EngineHandle.decode_step_per_op``."""
@@ -557,7 +810,7 @@ def test_decode_step_breakdown_folds_per_op_entries(monkeypatch) -> None:
             return [
                 ("generation_attention", 2.0, 20.0, "silicon"),
                 ("generation_mlp", 1.0, 4.0, "estimated", _GENERATION_FALLBACK_PAYLOAD),
-            ]
+            ], 3.0
 
         def last_provenance(self):
             return None
@@ -2407,7 +2660,7 @@ def test_shipped_gb200_ep32_node8_reports_executed_fallback_to_api_and_cli(cli_p
         assert {payload[0] for payload in _fallback_payloads(metadata_generation)} == {"generation"}
 
         public_shared, _, _ = handle.mixed_step_breakdown_per_op(1024, 1, 1024, 32)
-        (metadata_shared, metadata_context_attention, metadata_decode_attention), _ = (
+        metadata_shared, metadata_context_attention, metadata_decode_attention, _ = (
             handle._mixed_step_breakdown_per_op_with_metadata(1024, 1, 1024, 32)
         )
         assert all(len(entry) == 4 for entry in public_shared)
@@ -2415,7 +2668,7 @@ def test_shipped_gb200_ep32_node8_reports_executed_fallback_to_api_and_cli(cli_p
         assert not any(entry[4] is not None for entry in (*metadata_context_attention, *metadata_decode_attention))
 
         public_decode = handle.decode_step_per_op(1, 1024, 32)
-        metadata_decode = handle._decode_step_per_op_with_metadata(1, 1024, 32)
+        metadata_decode, _ = handle._decode_step_per_op_with_metadata(1, 1024, 32)
         assert all(len(entry) == 4 for entry in public_decode)
         assert {payload[0] for payload in _fallback_payloads(metadata_decode)} == {"generation"}
 
@@ -2600,15 +2853,27 @@ def test_default_config_wideep_mla_spec_survives_the_real_bincode_decode():
     assert spec["context_ops"][0]["WideEpContextMla"]["attn_backend"] == "flashinfer"
     assert spec["generation_ops"][0]["WideEpGenerationMla"]["attn_backend"] == "flashinfer"
 
-    # The JSON -> bincode conversion is NOT schema-gated (the version check lives
-    # in `from_bincode`), so this exercises field validation on today's tree.
-    assert len(aisim_core.engine_spec_bincode_from_json(spec_json)) > 0
+    # Current-schema JSON still validates fields and round-trips. Stale JSON
+    # must fail at conversion rather than yielding bytes the engine rejects.
+    from aisim_core import _native
+
+    encoded = aisim_core.engine_spec_bincode_from_json(spec_json)
+    restored = _native.engine_spec_json_from_bincode(encoded)
+    assert aisim_core.engine_spec_bincode_from_json(restored) == encoded
+    for version in (30, spec["schema_version"] + 1):
+        stale = dict(spec, schema_version=version)
+        with pytest.raises(ValueError, match=f"got {version}, expected .*recompile with this engine"):
+            aisim_core.engine_spec_bincode_from_json(json.dumps(stale))
+        # Keep the independently enforced binary version gate strict too.
+        stale_bytes = version.to_bytes(4, "little") + encoded[4:]
+        with pytest.raises(ValueError, match=f"got {version}, expected .*recompile with this engine"):
+            _native.engine_spec_json_from_bincode(stale_bytes)
 
 
 def test_mixed_energy_coverage_keeps_missing_contributions_with_repeated_names(monkeypatch):
     class Handle:
-        def _mixed_step_breakdown_per_op_with_metadata(self, *args, **kwargs):
-            return ([("draft", 3.0, 30.0, "silicon")], [("draft", 7.0, 0.0, "missing")], []), None
+        def _mixed_step_breakdown_per_op_with_decode_coverage(self, *args, **kwargs):
+            return ([("draft", 3.0, 30.0, "silicon")], [("draft", 7.0, 0.0, "missing")], [], 3.0, 0.0)
 
         def last_provenance(self):
             return None
@@ -2631,7 +2896,7 @@ def test_mixed_energy_coverage_keeps_missing_contributions_with_repeated_names(m
 def test_decode_estimate_retains_energy_and_partial_coverage(monkeypatch):
     class Handle:
         def _decode_step_per_op_with_metadata(self, *args, **kwargs):
-            return [("covered", 3.0, 30.0, "silicon"), ("missing", 7.0, 0.0, "empirical")]
+            return [("covered", 3.0, 30.0, "silicon"), ("missing", 7.0, 0.0, "empirical")], 3.0
 
         def last_provenance(self):
             return None

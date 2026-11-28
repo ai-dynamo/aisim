@@ -1,0 +1,2171 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Mamba mixed-step accounting
+
+These are simulator predictions for the modeled `b200_sxm` platform, for
+Nemotron-3-Nano-30B-A3B BF16 at TP1. They are accounting diagnostics. They are
+not silicon measurements, calibration or accuracy claims.
+
+## Setup
+
+| Variant | Commit | Content |
+| --- | --- | --- |
+| Candidate | `686275e7350e4b4a39e88dec55c135312b671038` | The fix. |
+| Baseline | `49d93f5a4aec1ec6033ae63228548348167b4e12` (not published, rebuilt by the recipe below) | The Candidate with `session.rs` and the mixed-step hunks of `runtime.rs` reverted. |
+| Main | `bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c` | Unqualified control only. |
+
+Baseline and Candidate share all qualification code. The accounting code is the
+only difference. The Candidate is fetchable from the PR fork. To rebuild the
+Baseline, take the Main versions of the two accounting files and add back the
+`nextn + 1` width check:
+
+```bash
+git fetch https://github.com/milesial/aisimulate-public.git 686275e7350e4b4a39e88dec55c135312b671038
+git fetch https://github.com/ai-dynamo/aisim.git bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c
+git cat-file -e 686275e7350e4b4a39e88dec55c135312b671038^{commit}  # stop if either is missing
+git cat-file -e bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c^{commit}
+git checkout 686275e7350e4b4a39e88dec55c135312b671038
+git checkout bf373a132b6ce72e9fdd2a5d1b5124cefb84ed0c -- \
+  crates/core/src/perfmodel/session.rs crates/core/src/perfmodel/engine/runtime.rs
+git apply baseline-width-check.patch   # the patch below
+git hash-object crates/core/src/perfmodel/session.rs        # 58952aa6
+git hash-object crates/core/src/perfmodel/engine/runtime.rs  # 28d8d759
+```
+
+`baseline-width-check.patch` against `bf373a13`'s `runtime.rs`:
+
+```diff
+--- a/crates/core/src/perfmodel/engine/runtime.rs
++++ b/crates/core/src/perfmodel/engine/runtime.rs
+@@ -495,6 +495,21 @@ impl Engine {
+             .as_ref()
+             .and_then(|s| s.nextn)
+             .unwrap_or(0);
++        // Generation Mamba queries carry `requests * (nextn + 1)` flattened
++        // tokens and the op divides by its own width; the two must agree.
++        for op in &spec.generation_ops {
++            if let Op::Mamba2(m) = op
++                && op.is_qualified_mamba()
++                && m.token_width != nextn.saturating_add(1)
++            {
++                return Err(AicError::InvalidEngineConfig(format!(
++                    "qualified Mamba op {} has token_width {} but speculative nextn+1 is {}",
++                    m.name,
++                    m.token_width,
++                    nextn.saturating_add(1)
++                )));
++            }
++        }
+         super::readiness::validate_glm53_kv(
+             &db,
+             spec.context_ops.iter().chain(&spec.generation_ops),
+@@ -6276,6 +6291,8 @@ pub(crate) mod tests {
+             head_dim: 64,
+             n_groups: 8,
+             chunk_size: 256,
++            state_dtype: "unrecorded".into(),
++            token_width: 1,
+         })];
+         let ops_json = serde_json::to_string(&ops).unwrap();
+         let err = engine
+```
+
+Before the canonical MTP integration below, built-in models did not set
+`state_dtype` or `token_width`. The original Baseline-to-Candidate runs (`agg.py`, `phases.py` and the historical telemetry
+table) applied this `float16` wrapper (`qual_patch.py`) before they built the
+model:
+
+```python
+def apply(nextn):
+    """Same wrapper in every variant: record the recurrent-state dtype and the decode width."""
+    import aisimulate_core.sdk.models.nemotron_h as nh
+    real = nh.ops.Mamba2Kernel
+    def wrapped(name, scale, kernel, phase, *args, **kw):
+        kw.setdefault("state_dtype", "float16")
+        kw.setdefault("token_width", (nextn + 1) if phase == "generation" else 1)
+        return real(name, scale, kernel, phase, *args, **kw)
+    class _Shim:
+        def __init__(self): self._o = nh.ops
+        def __getattr__(self, n): return wrapped if n == "Mamba2Kernel" else getattr(self._o, n)
+    nh.ops = _Shim()
+```
+
+The later comparisons use their own scripts, `telem.py` and `agg_caller.py`,
+which give each qualified op a `bfloat16` state.
+
+## Operation sources
+
+| Data | Context conv1d | Context scan | Generation |
+| --- | --- | --- | --- |
+| TensorRT-LLM `1.3.0rc20` | Measured table, exact shape key | Analytical bound | Analytical bound |
+| vLLM `0.24.0` | Analytical bound | Analytical bound | Analytical bound |
+
+`fallback_policy: deny` does not prove measured Mamba coverage, because the
+analytical bound is an allowed result.
+
+## Results
+
+Qualified Baseline to qualified Candidate.
+
+`InferenceSession.run_agg`, TensorRT-LLM. The script below (`agg.py`) ran
+each case at each commit, from the commit's `python/aisimulate` package
+environment, with `qual_patch.py` beside it. The commands were
+`python agg.py OUT0.json --qual 1 --nextn 0` and
+`python agg.py OUT3.json --qual 1 --nextn 3`. The
+measured runs reused one session for all cases. This version builds a fresh
+session per case, because `run_agg` caches results by a key that omits
+`prefix`:
+
+```python
+import argparse, json, os, sys
+ap = argparse.ArgumentParser(); ap.add_argument("out"); ap.add_argument("--qual", type=int, default=0)
+ap.add_argument("--nextn", type=int, default=0); ap.add_argument("--backend", default="trtllm")
+ap.add_argument("--version", default="1.3.0rc20")
+ap.add_argument("--model", default="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+a = ap.parse_args()
+if a.qual:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import qual_patch; qual_patch.apply(a.nextn)
+from aisimulate_core.sdk import config
+from aisimulate_core.sdk.models import get_model
+from aisimulate_core.sdk.perf_database import get_database
+from aisimulate_core.sdk.backends.factory import get_backend
+from aisimulate.sdk.inference_session import InferenceSession
+mc = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1, nextn=a.nextn,
+                        nextn_accept_rates=([0.8, 0.7, 0.6][:a.nextn] if a.nextn else None))
+out = {}
+# (batch, isl, osl, prefix, ctx_tokens): ctx_tokens is the prefill budget per step.
+for name, (b, isl, osl, px, ctx) in {
+    "chunked_uncached": (16, 6000, 64, 0, 2048),
+    "chunked_partial_cached": (16, 6000, 64, 3000, 2048),
+    "split_budget_cached": (16, 4096, 64, 1024, 8128),
+}.items():
+    sess = InferenceSession(get_model(a.model, mc, a.backend), get_database("b200_sxm", a.backend, a.version),
+                            get_backend(a.backend, "b200_sxm"))
+    kw = {"ctx_tokens": ctx}
+    if a.nextn: kw["decode_tokens_per_iteration"] = 1 + 0.8 + 0.8 * 0.7 + 0.8 * 0.7 * 0.6
+    s = sess.run_agg(config.RuntimeConfig(batch_size=b, isl=isl, osl=osl, prefix=px), **kw)
+    d = s.get_summary_df().iloc[0].to_dict()
+    out[name] = {k: float(d[k]) for k in ("ttft", "tpot", "tokens/s/gpu")}
+json.dump({"qual": a.qual, "nextn": a.nextn, "backend": a.backend, "runs": out}, open(a.out, "w"), indent=1)
+```
+
+`chunked` is `chunked_uncached` and `split budget` is `split_budget_cached`.
+`--backend vllm --version 0.24.0` gives the vLLM rows.
+
+| MTP | Case | TTFT ms | tok/s/GPU |
+| --- | --- | --- | --- |
+| 0 | chunked, 6000 input | 249.54 to 250.68 (+0.46%) | 930.2 to 926.4 (-0.41%) |
+| 0 | split budget, 1024 cached | 100.69 to 101.24 (+0.54%) | 1370.2 to 1366.2 (-0.29%) |
+| 3 | chunked, 6000 input | 251.95 to 253.57 (+0.64%) | 1021.5 to 1015.0 (-0.64%) |
+| 3 | split budget, 1024 cached | 101.51 to 102.40 (+0.87%) | 1820.7 to 1809.4 (-0.62%) |
+
+On vLLM, TTFT changes by +0.11% to +0.75% and tok/s/GPU by -0.12% to -1.28%.
+The measured runs did not measure `chunked_partial_cached`. The shared session
+returned the cached `chunked_uncached` summary for it, because the `run_agg`
+cache key omits `prefix`. The per-phase result below covers a cached prefix.
+
+Packed telemetry (`RustForwardPassPerfModel.estimate_forward_pass_time_ms`),
+both backends:
+
+| Shape | MTP0 | MTP3 |
+| --- | --- | --- |
+| Pure prefill | 0% | 0% |
+| Pure decode, 8 requests | 0% | +2.03% to +2.14% |
+| Mixed, 1x2048 + 8 decode | +0.25% to +0.27% | +0.68% to +0.75% |
+| Mixed, 2 requests of 1500 tokens + 8 decode | +0.24% to +0.36% | +0.62% to +0.71% |
+
+These percentages are transcribed observations from `686275e7` and its
+Baseline. Their full `ForwardPassMetrics` payloads, decode KV totals included,
+and their commands and raw outputs were not saved, so they cannot be
+reproduced. `telem.py` below uses another revision pair, MTP3 and BF16 states,
+so it does not reproduce them either. The reproducible checks of the MTP0
+packed path are `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`,
+which prices width-one packed mixed steps against exact bytes, and the
+hand-derived oracle sections below.
+
+The MTP3 column is historical and not valid for the current code.
+`num_decode_requests` counts packed decode slots, not logical requests: 8
+logical requests at width 4 fill 32 slots. Commit `686275e7` multiplied that
+slot count by the width again before the Mamba query, so it priced 32
+logical requests and 128 tokens. The current code divides the 32 slots by
+the width once, which gives 8 requests and 32 tokens. The original qualified Baseline-to-Candidate comparison has no
+corrected MTP3 delta. Exact-value tests check the current path instead, and the
+width-only comparison below isolates the width correction. `qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`
+prices packed mixed steps, for example `num_prefill_requests: 1`,
+`sum_prefill_tokens: 512`, `num_decode_requests: 8` at width four, against
+their expected bytes. `op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase`
+compares replay's pure-decode and mixed iterations with the static decode
+cost. The width correction does not apply to the MTP0 column, because its
+decode width is one. Its mixed-shape deltas come from the per-phase accounting.
+Both variants give every qualified op the same `float16` state. The operation
+sources table lists every scan as an analytical bound for both data sets.
+Therefore the state dtype does not change a source in either variant. The `run_agg`,
+per-phase and replay results above and below do not use packed telemetry.
+
+Width-only packed-telemetry comparison, TensorRT-LLM, MTP3, `HYBRID` mode.
+This compares `35944ae4` (before: the width applied twice) with `c3ed1513`
+(after). Both revisions already contain the per-phase accounting, so this is
+not a rerun of the Baseline-to-Candidate comparison. It measures only the width
+correction.
+Both commits sit on main `bf1b539f`. Each ran
+`python telem.py OUT.json` from its own `python/aisim` build, with the
+packaged performance data of that build. The `systems` data trees of the
+two commits are identical: `git diff 35944ae4 c3ed1513 --
+python/aisim/src/aisim_core/systems` is empty. The script is
+[`telem.py`](mamba-mixed-step-accounting/telem.py). It gives every Mamba2 op
+a `bfloat16` state. Generation ops get `token_width` 4, and context ops get
+`token_width` 1. Its inputs use the packed
+decode convention: 8 requests at width 4 give `num_decode_requests: 32` and
+`sum_decode_kv_tokens: 32800` (1025 tokens each). The mixed case adds
+`num_prefill_requests: 1` and `sum_prefill_tokens: 2048`.
+
+| Case | Before ms | After ms | Change |
+| --- | --- | --- | --- |
+| Pure decode, 8 requests | 9.459918 | 9.033769 | -0.426149 (-4.50%) |
+| Mixed, 1x2048 + 8 requests | 21.171992 | 20.745843 | -0.426149 (-2.01%) |
+
+The outputs record each Mamba row and one sum of all non-Mamba rows. Of the
+recorded values, only the two generation Mamba rows change, both with source
+`sol`. `generation_mamba_conv1d` falls from 0.029815 to 0.007454 ms, and
+`generation_mamba_ssm` falls from 0.538383 to 0.134596 ms. Each is exactly
+four times smaller. Their sum is the 0.426149 ms total change. The context
+Mamba rows and the non-Mamba sum stay the same. The outputs do not show
+whether each non-Mamba row stays the same. The raw outputs are
+[`35944ae4.json`](mamba-mixed-step-accounting/35944ae4.json) and
+[`c3ed1513.json`](mamba-mixed-step-accounting/c3ed1513.json). These are
+simulated latencies. Host runtime was not measured.
+
+### Current evidence against a hand-derived oracle
+
+The values below come from the current code. Each changed value is checked
+against bytes moved divided by memory bandwidth, computed by hand. The oracle
+does not use the pricing code. These are simulated latencies, not prediction
+accuracy or host runtime.
+
+For Nemotron Nano, a qualified scan moves `(4096 + 2 * 8 * 128 + 64) * 2 +
+4096 * 2 = 20,608` bytes per token. One BF16 state is `4096 * 128 * 2 = 1 MiB`.
+The model has 23 Mamba layers, and `b200_sxm` has 7.7e12 B/s.
+
+**Width-only telemetry rows.** At MTP3, 8 decode requests verify 4 tokens
+each, so 32 tokens. Each request reads its state once and writes 4
+checkpoints. One layer of `generation_mamba_ssm` therefore moves
+`32 * 20,608 + 8 * 1 MiB * 5 = 42,602,496` bytes. AISim scales decode work by
+`(nextn + L) / L = 55 / 52` for the MTP layer. The result is 0.134596 ms, the
+`c3ed1513` value above. The convolution update moves
+`32 * 6144 * 5 * 2 + 32 * 6144 * 2 = 2,359,296` bytes per layer, which gives
+0.007454 ms. Before the fix, each term counted 32 requests instead of 8, so
+both rows were exactly four times larger.
+
+**`run_agg` caller.** `InferenceSession.run_agg` passes its per-step prefill
+budget `ctx_tokens` to the mixed step. It does not pass a prefill request
+count. In that contract, a step holds `ceil(ctx_tokens / isl)` requests, the
+same count that context attention prices. Commit `668e98fd` split a budget
+remainder longer than `isl - prefix` into extra requests. Commit `62293977`
+prices one partial request, capped at `isl - prefix` new tokens.
+These runs used the four-case version of `agg_caller.py`, published in commit
+`6511a26d`. The checked-in [`agg_caller.py`](mamba-mixed-step-accounting/agg_caller.py)
+adds later cases, so it does not reproduce these two outputs. Extract the
+four-case driver, then run it from each commit's `python/aisim` build. It uses
+`HYBRID` mode at MTP0 with BF16 states:
+
+```bash
+git show 6511a26d:benchmarks/evidence/mamba-mixed-step-accounting/agg_caller.py > agg_caller_4.py
+python agg_caller_4.py OUT.json
+```
+
+The raw outputs are
+[`agg-668e98fd.json`](mamba-mixed-step-accounting/agg-668e98fd.json) and
+[`agg-62293977.json`](mamba-mixed-step-accounting/agg-62293977.json).
+
+| Case (batch, isl, prefix, budget) | Requests and new tokens | `context_mamba_ssm` before ms | After ms | Oracle ms |
+| --- | --- | --- | --- | --- |
+| One request (1, 4096, 3000, 2048) | 2 and 2048 to 1 and 1096 | 0.138596 | 0.073730 | 0.073730 |
+| Split budget (16, 4096, 1024, 8128) | 3 and 7104 to 2 and 6144 | 0.456089 | 0.390731 | 0.390731 |
+| Two complete requests (16, 4096, 3000, 8192) | 2 and 2192, unchanged | 0.147460 | 0.147460 | 0.147460 |
+| Chunked, uncached (16, 6000, 0, 2048) | 1 and 2048, unchanged | 0.132332 | 0.132332 | 0.132332 |
+
+Each request reads and writes its state once, so a context layer moves
+`tokens * 20,608 + requests * 2 MiB`. The context convolution reads a measured
+table, so the oracle does not cover it. It changes with the same request
+shapes, from 0.670842 to 0.348105 ms and from 1.493353 to 1.338048 ms. The
+non-Mamba sum is identical in every case. TTFT changes from 79.355 to 77.844 ms
+for one request and from 101.272 to 100.765 ms for the split budget. The other
+cases do not change. The `run_agg` regression
+`test_run_agg_prices_scheduled_prefill_requests_not_budget` checks the first and
+third rows. It fails on `668e98fd` with 0.138596 ms.
+
+**Native Replay.** The regression
+`op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase` runs the
+op-level Replay timing path, with and without diagnostic capture. Its fixture
+has one qualified scan per phase, with `n_groups` 4, so a token moves 18,560
+bytes. A pure-decode iteration holds 2 requests at width 4, which Replay packs
+as 8 decode requests. The decode moves `8 * 18,560 + 2 * 1 MiB * 5 =
+10,634,240` bytes, 0.001381 ms at 7.7e12 B/s. A mixed iteration adds one
+16-token prefill, `16 * 18,560 + 2 * 1 MiB = 2,394,112` bytes or 0.000311 ms,
+for a total of 0.001692 ms. Replay must report the prefill bytes as prefill
+evidence and the decode bytes as decode evidence. The test asserts each value
+against these bytes. At `35944ae4`, the pure decode gave 0.005524 ms. That is
+the oracle for 8 requests and 32 tokens, `42,536,960` bytes, so the width was
+applied twice.
+
+The embedded Replay test, the public API, engine-step parity (305), the golden
+set (121) and the Python qualification tests (54 with the new regression) passed
+at `62293977`. `telem.py` at `62293977` gave output identical to
+`c3ed1513.json`. At `9a2bde6b`, `agg_caller.py` gave output identical to
+`agg-62293977.json` for all four cases, the split budget included, and the same
+suites passed (56 Python tests).
+
+### `run_agg` caller corrections
+
+These two fixes change the `run_agg` caller, not the Mamba formulas above. They
+apply to every operation of every model.
+
+- **One request under a large budget.** With one request, `run_agg` passed
+  its whole prefill budget to the mixed step. A budget above one prompt then
+  priced extra requests. Commit `19e8daf6` schedules at most one packed
+  prompt, `min(ctx_tokens, isl)`.
+- **Cache identity.** The `run_agg` result cache omitted the prefix. A second
+  call on the same session with a different prefix returned the first result.
+  Commit `19e8daf6` adds the prefix to the cache key.
+
+`agg_caller.py` gained the large-budget case and a same-session prefix
+sequence in commit `19e8daf6`, then the exact 4096-token control in commit
+`df8a4277`. `caller-19e8daf6.json` comes from the `19e8daf6` driver. The
+other `caller-*.json` outputs come from the `df8a4277` driver, which is the
+checked-in version. To run an earlier driver, extract it with
+`git show <commit>:benchmarks/evidence/mamba-mixed-step-accounting/agg_caller.py`.
+The drivers ran from the `9a2bde6b`, `19e8daf6` and `70a8ea00` builds. The raw outputs are
+[`caller-9a2bde6b.json`](mamba-mixed-step-accounting/caller-9a2bde6b.json),
+[`caller-19e8daf6.json`](mamba-mixed-step-accounting/caller-19e8daf6.json) and
+[`caller-70a8ea00.json`](mamba-mixed-step-accounting/caller-70a8ea00.json). The
+`19e8daf6` run predates the control. `70a8ea00` gives the same values for
+every case the two share.
+
+| Case | Value | `9a2bde6b` | `19e8daf6` and `70a8ea00` | Oracle |
+| --- | --- | --- | --- | --- |
+| One request (1, 4096, 3000, 8192) | `context_mamba_ssm` ms | 0.147460 | 0.073730 | 0.073730 |
+| One request (1, 4096, 3000, 8192) | Non-Mamba sum ms | 18.053611 | 13.180794 | 13.180794, the control |
+| One request (1, 4096, 3000, 8192) | TTFT ms | 41.048 | 29.010 | 29.010, the control |
+| Control (1, 4096, 3000, 4096) | `context_mamba_ssm`, non-Mamba sum, TTFT | 0.073730, 13.180794, 29.010 | Same | Unchanged by the fix |
+| Same session, prefix 0, then 3000 | `context_mamba_ssm` ms | 0.132332, 0.132332 | 0.132332, 0.073730 | 0.132332, 0.073730 |
+| Same session, prefix 0, then 3000 | TTFT ms | 79.852, 79.852 | 79.852, 77.844 | Second call equal to a fresh session |
+
+Before the fix, the large budget priced two requests and 2192 new tokens, as
+two complete prompts would. After it, the step prices one request and 1096
+new tokens. The saved outputs then record the same Mamba rows, the same
+non-Mamba sum and the same TTFT for the 8192- and 4096-token budgets. They do
+not record each non-Mamba row. The regression
+`test_run_agg_lone_request_ignores_unused_budget` compares the whole per-operation
+mixed-step dictionary of the two budgets and finds every row equal. Among the Mamba rows, the context
+convolution, both projection GEMMs and the norm also fall. Separately, the
+recorded sum of the operations without `mamba` in their names falls by 27%,
+from 18.053611 to 13.180794 ms. The saved outputs do not show which of those
+operations change, or at which coordinates. In the
+same-session sequence, the repeated third call returns the cached second
+result. The four earlier cases give output identical to `agg-62293977.json`.
+
+The regressions `test_run_agg_lone_request_ignores_unused_budget`,
+`test_run_agg_cache_separates_prefixes` and the large-budget case of
+`test_run_agg_prices_scheduled_prefill_requests_not_budget` fail on `9a2bde6b`
+and pass on `19e8daf6`. At `19e8daf6`, 727 Python tests in the backend,
+session, speculation, single-oracle and Mamba suites passed, with engine-step
+parity (305) and the golden set (121).
+
+Commit `70a8ea00` prices a qualified scan with a cached prefix with the SOL
+estimate, because measured scan rows start from a cold state. The `1.3.0rc20`
+data has no scan rows, so every scan above already used SOL. At `70a8ea00`,
+`agg_caller.py` and `telem.py` reproduce the earlier outputs exactly, and 727
+Python tests, the public API (28) and the embedded Replay tests (9) passed.
+
+### Prefill step count and reuse scope
+
+Two more caller fixes, in commits `55d2821b` and `35e632cb`, also apply to
+every model:
+
+- **Prefill steps in TTFT.** With one request, `run_agg` counted
+  `ceil(isl / ctx_tokens)` prefill steps, the cached prefix included. If the
+  uncached tokens fit the budget (`0 < isl - prefix <= ctx_tokens`), the step
+  now schedules the whole request and TTFT counts one step. This changes
+  every one-request result with a prefix, an uncached part that fits the
+  budget and a budget below `isl`. Results without a prefix, with a budget of
+  at least `isl`, or with more than one request do not change. Commit
+  `59c4575a` also passes that one step to the TensorRT-LLM queuing factor
+  (qf), so the result no longer depends on the budget. The qf formula and
+  its coefficients do not change. This is not a general cached-prefix TTFT
+  fix. If the uncached tokens exceed
+  the budget, TTFT still counts `ceil(isl / ctx_tokens)` steps, the cached
+  prefix included. The count is too high whenever
+  `ceil(isl / ctx_tokens) > ceil((isl - prefix) / ctx_tokens)`, for one
+  request or more. For one legacy Nano request with isl 8192, prefix 3000
+  and a 2048-token budget, TTFT is `20.636 * 4 * 2.05 = 169.214` ms. With
+  the step latency held fixed, the 3 chunks of uncached tokens and the
+  three-step `qf = 2.00` give `20.636 * 3 * 2.00 = 123.815` ms. This remains
+  unresolved at that revision. The repair below now prices the full
+  single-text-request schedule; multi-request mean-field behavior is unchanged.
+- **Reuse scope.** The result cache key held neither the model graph nor the
+  database mode, and the compiled-handle identity did not hold the Mamba
+  qualification fields. A legacy and a qualified Nano graph on one backend,
+  or over one handle cache, returned each other's TTFT. A database mode
+  changed in place, from `HYBRID` to `SOL`, kept the `HYBRID` result. The
+  result key now carries the compiled-engine identity. That identity lists
+  the constructor arguments of each Mamba2 operation, legacy operations
+  included. Its memo is reused only for the same database mode and transfer
+  policy.
+
+`agg_caller.py` ran from the `55d2821b` build and from `35e632cb`. Both runs
+gave the same output,
+[`caller-55d2821b.json`](mamba-mixed-step-accounting/caller-55d2821b.json).
+At `59c4575a` it gave
+[`caller-59c4575a.json`](mamba-mixed-step-accounting/caller-59c4575a.json).
+Against `caller-70a8ea00.json`, only the cases below change:
+
+| Case (batch, isl, prefix, budget) | Value | `70a8ea00` | `55d2821b` | `59c4575a` |
+| --- | --- | --- | --- | --- |
+| One request (1, 4096, 3000, 2048) | Non-Mamba sum ms | 16.855182 | 13.180794 | 13.180794 |
+| One request (1, 4096, 3000, 2048) | TTFT ms | 77.844 | 29.773 | 29.010 |
+| Same session, prefix 0, then 3000 | TTFT ms | 79.852, 77.844 | 79.852, 29.773 | 79.852, 29.010 |
+
+The context-phase Mamba GEMMs and norm in that case also fall. The step now
+holds the 4096-token request, not a 2048-token chunk with 2048 cached
+tokens. `context_mamba_ssm` stays 0.073730 ms. TTFT is
+`step * chunks * qf`, with `qf = 2 + (steps - 3) / 20`. The step is the
+per-operation sum, 15.268 ms. At `55d2821b`, qf still read the budget steps,
+`ceil(4096 / 2048) = 2`, so TTFT was `15.268 * 1 * 1.95 = 29.773` ms, one
+chunk instead of two. At `59c4575a`, qf reads the one step the request
+takes, so TTFT is `15.268 * 1 * 1.90 = 29.010` ms, the same as the
+exact-prompt control (budget 4096). The uncached chunked case keeps two
+chunks, `qf = 1.95` and 79.852 ms. A fully cached prompt
+(prefix 4096) still fails with `isl must be greater than`.
+
+The regressions ran against earlier builds:
+
+| Regression | Earlier build | Failure |
+| --- | --- | --- |
+| `test_run_agg_ttft_counts_uncached_prefill_steps[3000-1]` | `9eaa66e8` | TTFT 77.844 ms, expected 38.922 ms from that build's step |
+| `test_run_agg_reuses_results_only_for_the_same_graph_and_database_mode` | `9eaa66e8` | Second graph TTFT 78.669 ms, cold 77.868 ms |
+| `test_run_agg_reuse_keeps_each_mamba_op_state_dtype` | `55d2821b` | Swapped dtypes TTFT 29.786 ms, cold 29.773 ms |
+| `test_run_agg_reuse_keeps_the_partial_qualification_rejection` | `55d2821b` | Partially qualified graph did not raise |
+| `test_run_agg_ttft_counts_uncached_prefill_steps[3000-1-1.9]` | `1ea0211c` | TTFT 29.773 ms, expected 29.010 ms |
+| `test_run_agg_one_step_ttft_does_not_depend_on_the_budget` | `1ea0211c` | Prefix 3968: budget 128 TTFT 33.735 ms, budget 4096 18.579 ms |
+| `test_run_agg_reuse_keeps_a_wrapped_mamba_op_distinct` | `1ea0211c` | Wrapped graph did not raise |
+| `test_run_agg_reuse_keeps_a_nested_mamba_op_distinct` | `1db9b803` | Nested qualified scan did not raise after a warm cache |
+| `test_run_agg_b1_fully_cached_fpm_prompt_reaches_the_prefix_check` | `1db9b803` | `MixedStepInput` rejected a zero budget |
+| `test_compute_ttft_single_request_feeds_the_step_its_model_tokens[fpm-1096]` | `1db9b803` | XPU step got 4096 tokens, expected 1096 |
+
+The uncached case `[0-2]` and `test_run_agg_rejects_a_fully_cached_prompt`
+also passed on `9eaa66e8`. They pin behavior that did not change. At
+`35e632cb`, the Python qualification, backend and session suites (734 tests)
+passed.
+
+### Review fixes after `35e632cb`
+
+Commits `79a9e652` and `1ea0211c` add four fixes:
+
+- **Whole-model FPM input.** An FPM reads the mixed-step budget as new
+  tokens. With one request, `run_agg` passed the prompt with its prefix, so
+  isl 4096 and prefix 3000 priced `ceil(4096 / 1096) = 4` requests. The FPM
+  now receives at most `isl - prefix` new tokens, one request. Op-level
+  pricing keeps the full prompt. No comparison used measured FPM data. The
+  synthetic-anchor comparison below runs the compiled estimator. The
+  regression `test_run_agg_b1_schedules_one_request_and_sizes_its_new_tokens`
+  checks the scheduled input.
+- **One-request activations.** The activation estimate now uses the new
+  tokens of the step, `min(isl - prefix, ctx_tokens)`, as the memory
+  helper's default does. TensorRT-LLM keeps its `max_num_tokens`
+  reservation, so `agg_caller.py` and `telem.py` give the same output.
+- **Kernel labels.** A qualified Mamba2 op must use a collected kernel
+  label in its own phase. A misspelled label now fails at build time.
+  Legacy ops keep any label.
+- **Exact-total prefill.** `predict_prefill_latency_total` passes whether
+  any token is cached, as the packed metrics path does. Two 16-token
+  prefills with one cached token now skip the cold scan row.
+
+Commit `108835ac` closes three gaps in the same paths. The XPU vLLM TTFT
+hook now feeds a whole-model FPM at most `isl - prefix` new tokens per
+request instead of the prompt with its prefix. Op-level pricing there is
+unchanged. A fully cached one-request FPM prompt again reaches the engine's
+prefix check instead of a zero step budget. The engine identity now reads
+the compiled spec of each op that holds a Mamba2 op, so a qualified scan
+nested in a composite fails cold and warm. At `108835ac`, the Python suites
+(744 tests), engine-step parity (305), the golden set (121), the public API
+(28) and the embedded Replay tests (9) passed. `agg_caller.py`, `telem.py`,
+`mem.py` and `fpm_caller.py` give the same values as before.
+
+Commit `59c4575a` adds two more checks. The compiled-engine identity
+records a Mamba2 op's draft query width, which compiles the op inside a
+`TokenScale` wrapper, so a wrapped qualified graph fails cold and warm
+instead of reusing the plain graph's engine. A qualified prefill query with
+no new token now fails instead of pricing state traffic.
+
+Commits `71fcef7b` and `bf03c37d` add three more fixes:
+
+- **Equal-length extends.** In the mixed step, a partial extend as long as
+  one request's new tokens now joins the batch of complete requests. Two
+  1096-token requests price as one `(2, 1096)` query, as packed telemetry
+  prices them, not as two `(1, 1096)` queries. A shorter extend keeps its own
+  query. SOL rows scale with the batch, so only measured rows change. In
+  `agg_caller.py`, the split budget `(16, 4096, 1024, 8128)` holds two
+  3072-token requests. Its measured TensorRT-LLM context convolution falls
+  from 1.338048 to 1.169136 ms, and its TTFT from 100.765 to 100.376 ms. Its
+  TPOT falls from 9.984 to 9.968 ms. No other case changes. The output is
+  [`caller-71fcef7b.json`](mamba-mixed-step-accounting/caller-71fcef7b.json).
+- **XPU FPM chunks.** With one vLLM XPU request, a whole-model FPM step
+  smaller than the request prices the mean of its chunks. The TTFT hook now
+  multiplies that mean by the chunk count, `ceil(new tokens / budget)`. For
+  isl 4096, prefix 1096 and a 2048 budget, the step averages a 2048- and a
+  952-token chunk. Commit `108835ac` scaled it by `3000 / 2048`. The
+  regression `test_compute_ttft_single_request_counts_a_short_final_fpm_chunk`
+  fails on `108835ac` with 61.59 ms instead of 83.0 ms.
+- **Zero-work prefills.** With a qualified Mamba2 operation, a packed step
+  with fewer new prefill tokens than prefill requests now fails in the mixed
+  path too, as it already did in the pure-prefill path.
+
+At `71fcef7b`, `mem.py`, `fpm_caller.py` and `telem.py` reproduce their
+earlier values. At `bf03c37d`, `agg_caller.py` and `telem.py` give the same
+output as at `71fcef7b`. These suites passed at both commits:
+
+- Python suites: 955 tests.
+- Engine-step parity: 305 tests. Golden set: 121 tests.
+- Rust Mamba tests: 31. Public API: 28. Embedded Replay tests: 9.
+
+[`mem.py`](mamba-mixed-step-accounting/mem.py) ran from the `35e632cb` and
+`1ea0211c` builds. It prices one vLLM `0.24.0` Nano request with isl 4096
+and osl 64. The script imports the SDK of the active environment, not of the
+checkout. Run it with the interpreter of each build's own environment, for
+example `BUILD_VENV/bin/python mem.py > mem-COMMIT.json`. Its `build` entry
+records the SHA-256 of the imported `base_backend.py`, which holds the
+activation estimate, and of the compiled `aisim._runtime` extension. The raw outputs are
+[`mem-35e632cb.json`](mamba-mixed-step-accounting/mem-35e632cb.json) and
+[`mem-1ea0211c.json`](mamba-mixed-step-accounting/mem-1ea0211c.json).
+They come from the build-stamped script, rerun on each build. The values
+match the first runs exactly, and the two `base_backend.py` hashes differ.
+Values are in GiB:
+
+| Prefix and budget | Activations before | After | Total before | After |
+| --- | --- | --- | --- | --- |
+| 3000, 2048 | 0.156250 | 0.083618 | 62.542492 | 62.469860 |
+| 3000, 4096 | 0.312500 | 0.083618 | 62.698742 | 62.469860 |
+| 3000, 8192 | 0.312500 | 0.083618 | 62.698742 | 62.469860 |
+| 0, 2048 | 0.156250 | 0.156250 | 62.542492 | 62.542492 |
+
+The activations scale with the tokens: `0.15625 * 1096 / 2048 = 0.083618`.
+Weights, KV cache and the other terms do not change.
+
+This activation correction intentionally applies to legacy, unqualified graphs
+too: the Nano model in this table has no MTP qualification. The regression
+`test_legacy_aggregate_memory_matches_recorded_suffix_evidence` checks these
+historical values through current `run_agg`, reconstructs the former memory
+input separately, and checks both OOM and KV-budget decisions. All four points
+fit the bundled B200 capacity before and after; neither decision changes.
+A capacity threshold between the old and new totals can intentionally change
+an OOM decision, because cached tokens no longer reserve live activations for
+work absent from the step. TensorRT-LLM's separate build-budget reservation
+continues to use `max_num_tokens`.
+
+[`fpm_caller.py`](mamba-mixed-step-accounting/fpm_caller.py) checks the FPM
+input through the compiled whole-model estimator. It builds a Qwen3-0.6B FPM
+model and a synthetic vLLM table with the FPM unit-test helpers, with one
+anchor at each coordinate a caller queries. `run_agg` compiles every
+whole-model op with `interpolation: sol`, so this is the only FPM method
+that it reaches. Direct interpolation needs an `fpm_profile`, which
+`run_agg` does not pass. The script ran from the `35e632cb` and `1ea0211c`
+builds as `python fpm_caller.py REPO_ROOT OUT.json`. Both runs used the
+same table (SHA-256 prefix `2071e1799556`). The raw outputs are
+[`fpm-35e632cb.json`](mamba-mixed-step-accounting/fpm-35e632cb.json) and
+[`fpm-1ea0211c.json`](mamba-mixed-step-accounting/fpm-1ea0211c.json).
+Those historical artifacts record a native binary hash, without validating
+the imported Python packages against the named revision. For new runs, use
+`BUILD_VENV/bin/python fpm_caller.py BUILD_CHECKOUT OUT.json` with each build's
+own interpreter and clean checkout. The script now checks every imported
+`aisim` and `aisim_core` Python source and the native build-time source inventory
+against that checkout, failing before estimation on a mismatch. It also
+rejects a hashed source file that the revision's tree does not contain, such
+as an untracked or ignored file
+([`test_committed_sources.py`](mamba-mixed-step-accounting/test_committed_sources.py)). Its `build`
+record includes the verified revision, package paths and source fingerprints.
+Compare new artifacts only after both runs pass this check.
+The FPM derives `ceil(context_tokens / (isl - prefix))` requests:
+
+| Case (isl 512, budget 512) | Build | Caller input | Requests | Step ms | TTFT ms |
+| --- | --- | --- | --- | --- | --- |
+| Prefix 256 | `35e632cb` | 512 | 2 | 30.0, anchor (2, 512, 512) | 52.4 |
+| Prefix 256 | `1ea0211c` | 256 | 1 | 12.0, anchor (1, 256, 256) | 34.4 |
+| Prefix 0 | Both | 512 | 1 | 22.0, anchor (1, 512, 0) | 44.4 |
+
+For one vLLM request, the queuing factor is 1 and the dispatch overhead is
+`28 layers * 0.8 = 22.4` ms, so TTFT is the step plus 22.4 ms. The script
+also prices both inputs directly in each build and gets the same anchors.
+The values are synthetic. They show that the estimator receives one request
+instead of two, not a latency on real hardware. The estimator comes from
+the active environment, not from `REPO_ROOT`. So the script now also records
+the SHA-256 of the compiled `aisim._runtime` extension that priced the run.
+An earlier version hashed the `aisim_core._native` module instead, which is
+a Python shim with the same bytes in every build. At
+`108835ac` it reproduces the `1ea0211c` values,
+[`fpm-108835ac.json`](mamba-mixed-step-accounting/fpm-108835ac.json). The deprecated hybrid FPM
+path with draft ops takes the same input, and its draft ops use the same
+request count, but no fixture with draft-op data exercises it here.
+
+The input regression fails on
+`35e632cb` for the 8-token budget, with 8 scheduled tokens instead of 6, and
+passes on `1ea0211c`. At `1ea0211c`, `agg_caller.py` and `telem.py` give
+output identical to `caller-55d2821b.json` and `c3ed1513.json`. The Python
+suites (738 tests), the public API (28) and the embedded Replay tests (9)
+passed, and `cargo test -p aisim-core --lib` passed locally (3269, 2 ignored).
+The whole `-m unit` Python suite ran from a tarball of each build, which has
+no Git metadata. At `1ea0211c`, its failures are a subset of the `9eaa66e8`
+failures (286 against 287). The shared failures come from the tarball
+environment, for example a collector source revision that needs Git.
+
+The two parity suites ran from the repository root of each build, with that
+build's `python/aisim` environment:
+
+```bash
+python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
+  crates/core/parity_tests/perfmodel/test_engine_step_parity.py
+python -m pytest -q -rx -n 4 -c python/aisim/pytest.ini -p no:cacheprovider \
+  crates/core/parity_tests/perfmodel/test_compile_engine_parity.py \
+  crates/core/parity_tests/perfmodel/test_afd_parity.py \
+  crates/core/parity_tests/perfmodel/test_afd_execution_plan_parity.py
+```
+
+| Code revision | Later heads with no product-code change | Engine-step parity | Golden set |
+| --- | --- | --- | --- |
+| `62293977` | `6511a26d` | 305 passed | 121 passed |
+| `9a2bde6b` | `d321defd` | 305 passed | 121 passed |
+| `19e8daf6` | `879aebde`, `35a323d6` | 305 passed | 121 passed |
+| `70a8ea00` | `df8a4277` | 305 passed | 121 passed |
+| `9eaa66e8` | `663344ae` | 305 passed | 121 passed |
+| `35e632cb` | None | 305 passed | 121 passed |
+| `1ea0211c` | `7cbe9c48`, `14ffdb4c` | 305 passed | 121 passed |
+| `59c4575a` | None | 305 passed | 121 passed |
+| `1db9b803` | None | 305 passed | 121 passed |
+| `108835ac` | `5edfa0d9`, `d69b2bc7`, `7b93131d` | 305 passed | 121 passed |
+| `71fcef7b` | None | 305 passed | 121 passed |
+| `bf03c37d` | None | 305 passed | 121 passed |
+
+Each result applies to the code revision in the first column. The later
+heads add only tests, documentation or evidence, but the parity suites were
+not rerun at those heads. Their exact-head results are the published head's
+CI, not this table.
+
+Per-phase `mixed_step_latency`, TensorRT-LLM, MTP3, with `ctx_tokens=6000`,
+`gen_tokens=8`, `isl=4096`, `osl=64` and `prefix=3000`: the total rises 1.21%
+(26.013 to 26.328 ms) from Baseline to Candidate. The decode component rises
+from 0.20 to 0.35 ms because decode Mamba now runs at decode coordinates. Pure
+prefill does not change. Each revision ran `python phases.py` from its
+`python/aisimulate` environment, with `qual_patch.py` beside it:
+
+```python
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qual_patch; qual_patch.apply(3)
+from aisimulate_core import AicEngine
+from aisimulate_core.sdk.engine import compile_engine
+spec = compile_engine("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "b200_sxm", "trtllm",
+                      "1.3.0rc20", tp_size=1, nextn=3, moe_tp_size=1, moe_ep_size=1)
+eng = AicEngine.from_spec(spec)
+args = (6000, 8, 4096, 64, 3000)  # ctx_tokens, gen_tokens, isl, osl, prefix
+_, _, decode = eng.mixed_step_breakdown_per_op(*args)
+print(eng.mixed_step_latency(*args), sum(row[1] for row in decode))
+```
+
+The same script at commit `50ded579`, with the `aisim_core` package names,
+gives 26.294 ms and a 0.345 ms decode component. That value is not a
+before/after delta, because main changed between the revisions. That commit
+also splits this shape's 1904-token remainder into two request chunks.
+Commit `62293977` prices that remainder as one request capped at
+`isl - prefix = 1096` new tokens.
+
+## Controls
+
+- Replay (`predict --stack engine`) did not change between Baseline `49d93f5a`
+  and Candidate `686275e7`. At those revisions, Replay priced prefill and
+  decode as separate per-rank phase passes. Over 14 configurations, requests,
+  output tokens, cache reuse and per-request status matched. Latency metrics
+  differed only by rounding, about 1e-16. Current op-level Replay prices a
+  mixed rank as one mix-step iteration. It then splits the evidence by phase,
+  so this control does not describe the current code. The native Replay
+  oracle above covers the current path.
+- At the measured revisions, Main, Baseline and Candidate gave identical
+  results for unqualified ops. The later `run_agg` caller corrections change
+  unqualified results too. See [`run_agg` caller corrections](#run_agg-caller-corrections)
+  and [Prefill step count and reuse scope](#prefill-step-count-and-reuse-scope).
+- Qualified and unqualified runs differ without the fix, because the analytical
+  bound adds recurrent-state bytes. Compare Baseline with Candidate only.
+- Nemotron-3-Super-120B-A12B FP8 on TensorRT-LLM fails in both variants with a
+  missing MoE row. No other estimate replaces it.
+
+## Request-count fix
+
+Commit `b2b489d999e97749c2932c3f91b1dddb544c81a8` spreads the telemetry prefill
+token sum over the observed request count. Before it, an uneven sum added a
+request. The shapes above divide evenly, so they do not change.
+The reproducible check is
+`qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes`: it prices
+`num_prefill_requests: 2` and `sum_prefill_tokens: 17` against 17 token rows
+plus 2 state pairs, never 3. Its synthetic oracle has 18,560 activation
+bytes/token and a 1 MiB state; the prefill scan transfers
+`17 * 18,560 + 2 * 2 * 1,048,576 = 4,509,824` bytes. The historical vLLM
+latency observations previously transcribed here lacked their full inputs
+and are withdrawn as numerical evidence. They are not used to establish
+this correction.
+
+### Scoped exact-total and shared-token corrections
+
+The qualified exact-total prefill query now preserves the new-token sum even
+when cached-token rounding changes the mean. For
+`predict_prefill_latency_total(2, 17, 1)`, the old walk priced two 9-token
+scans; the corrected walk prices lengths 8 and 9. In the Rust fixture, each
+token moves 18,560 activation bytes, and each request reads and writes a
+1 MiB state. The scan therefore moves 4,509,824 bytes instead of 4,528,384,
+a reduction of 18,560 bytes, or 0.00000241039 ms at 7.7e12 B/s. Other
+operations retain their mean coordinates. Evenly divided scans still use one
+batch query. `qualified_mamba_exact_totals_preserve_new_tokens` checks these
+byte counts, cached and cold cases, and the number of scan queries.
+
+For a qualified mixed step with `ctx_tokens=6000`, `isl=4096`, `prefix=3000`
+and two width-four decode requests, both prefill suffixes cap at 1,096 tokens.
+Shared token-major operations now see `2192 + 8 = 2200` tokens instead of
+`6000 - 3000 + 8 = 3008`. A 2-byte-per-token elementwise operation moves
+4,400 bytes instead of 6,016. The regression
+`mixed_step_shared_ops_follow_qualified_mamba_prefill_chunks` checks this
+independent linear oracle, partial extends, pure decode, and legacy routing.
+The classification is prepared once per compiled graph and the chunks once
+per mixed query; the change adds no allocation or growing cache. Attention
+keeps its existing geometry. These are accounting checks, not measurements
+of serving accuracy.
+
+New `telem.py` artifacts also record `model.diagnostics()` and the native
+snapshot's performance-data fingerprint (`performance_data`). The snapshot
+references the loaded data without copying tables and rejects changes since
+load. Compare width runs only when their fingerprint method, system and
+SHA-256 agree; the resolved systems root remains visible in the diagnostics.
+Historical telemetry artifacts predate these provenance fields.
+
+### Validation at `d462dab8`
+
+These results come from a clean checkout of `d462dab8`, the head with the
+scoped corrections above. A fresh Python 3.13 environment installed
+`./python/aisim[dev]` from that checkout on a local macOS arm64 host.
+
+`fpm_caller.py` passed its build check. The imported `aisim` and
+`aisim_core` sources, the native source inventory and the committed-source
+check all matched `d462dab8`. The output is
+[`fpm-d462dab8.json`](mamba-mixed-step-accounting/fpm-d462dab8.json). Its
+`build` record holds the package fingerprints (`9123b44f3e2a` and
+`e44a59b9bd02`). It also holds the native source fingerprint
+(`baa6c328dd21`) and the extension hash (`ffda0496ea69`).
+Apart from these build fields, its output is identical to `fpm-1ea0211c.json`.
+
+`telem.py` gave cases identical to `c3ed1513.json`. Its new provenance fields
+are in [`telem-d462dab8.json`](mamba-mixed-step-accounting/telem-d462dab8.json).
+The performance-data fingerprint is `systems_tree_sha256_v1` over 340
+`b200_sxm` files, with SHA-256 prefix `0babf8aeb427`.
+
+`agg_caller.py` changed one case against `caller-71fcef7b.json`, the last
+published caller output. The output is
+[`caller-d462dab8.json`](mamba-mixed-step-accounting/caller-d462dab8.json).
+The split budget `(16, 4096, 1024, 8128)` holds one complete request and a
+4032-token remainder. The remainder is longer than `isl - prefix = 3072`
+new tokens, so qualified Mamba caps it at 3072 tokens. The shared
+token-major operations now see 6144 prefill tokens instead of
+`8128 - 1024 = 7104`:
+
+| Value (ms) | `71fcef7b` | `d462dab8` |
+| --- | --- | --- |
+| `context_mamba_in_proj_gemm` | 6.233198 | 5.378181 |
+| `context_mamba_norm` | 0.640511 | 0.563431 |
+| `context_mamba_out_proj_gemm` | 2.587059 | 2.320700 |
+| `context_mamba_conv1d`, `context_mamba_ssm` | 1.169136, 0.390731 | Same |
+| Non-Mamba sum | 32.445532 | 29.977341 |
+| TTFT | 100.376 | 91.943 |
+| TPOT | 9.968 | 9.607 |
+
+The three changed rows are shared projections and a norm, not Mamba2
+kernels. The other five cases and the same-session block are identical. Each
+of those cases has no remainder longer than `isl - prefix`. `run_agg` gives a
+single request its whole prompt, `8192` is an exact multiple of `isl`, and
+with no prefix the cap equals `isl`.
+
+[`shared_tokens.py`](mamba-mixed-step-accounting/shared_tokens.py) checks the
+6144-token count against an independent route. It prices the same step with
+13 decode requests three times: a qualified graph at budget 8128, a legacy
+graph at budget 8192 (`8192 - 2 * 1024 = 6144` shared tokens) and a legacy
+graph at budget 8128 (7104). Every shared operation of the qualified step
+equals the legacy 6144-token value and differs from the 7104-token value.
+Examples are `context_moe` (21.368810 against 22.994450 ms) and
+`context_mamba_in_proj_gemm` (5.377290 against 6.232308 ms). Attention and
+the logits GEMM are the same in all three runs. Only the Mamba2 kernels
+differ, because they keep their own chunk geometry.
+
+These suites passed at `d462dab8`:
+
+- The affected Python suites: 960 tests, including the four new constructor
+  checks.
+- Engine-step parity (305), the golden set (121) and the public API (28).
+- `cargo test -p aisim-core --lib`: 3273 passed and 2 ignored, including
+  `qualified_mamba_exact_totals_preserve_new_tokens`,
+  `mixed_step_shared_ops_follow_qualified_mamba_prefill_chunks` and
+  `physical_vllm_scan_label_is_context_only`.
+- The embedded Replay tests (9) and `test_committed_sources.py` (4).
+
+This run did not measure host time. Full CI and the forward-prediction
+performance gate did not run on this head.
+
+### Fixes after `d462dab8`
+
+Commits `d9da2c60` to `c51eceaf` address review findings:
+
+- **Power coverage.** If a query's own energy is positive, its latency
+  counts as power-covered. The decode walk, the mixed and static per-op endpoints
+  and Replay's rank evidence now sum this per query before rows fold by name.
+  Before, a folded row with positive energy counted all of its latency as
+  covered. `fpm_decode_coverage_counts_each_same_name_draft_query` fails on
+  `274d0515` with 0.013189 ms covered instead of the powered query's
+  0.010178 ms. If evidence derives coverage from folded energy,
+  `op_level_replay_counts_split_mamba_power_coverage_per_query` fails.
+- **Pure-prefill remainder.** A packed pure-prefill step passes its exact
+  new-token total, so qualified Mamba splits a ragged total into two request
+  lengths, as the mixed step and `predict_prefill_latency_total` do. Two
+  prefills of 17 tokens scan 8 and 9 tokens, not two of 8.
+- **Cached convolution.** A qualified context convolution with a cached prefix
+  keeps its cold measured row as a proxy, labeled `estimated`.
+- **Guards.** A DSv4.1 stage in either phase is rejected beside qualified
+  Mamba. The SDK rejects a native operation named like a reported attention
+  row (`context_attention (scaled)` or `generation_attention`).
+  `fpm_caller.py` also checks its fixture helper, `test_fpm_forward.py`.
+
+The ragged split prices each request group as a uniform-batch query. This is
+a proxy for one ragged launch, not a measurement of it. The example uses Nano
+on the HYBRID TensorRT-LLM 1.3.0rc20 `b200_sxm` data. Two prefill requests with
+4096 new tokens price `context_mamba_conv1d` from the measured `(2, 2048)` row,
+at 0.853834 ms. With 4097 tokens, the split prices the measured `(1, 2048)` and
+`(1, 2049)` rows, 1.014955 ms in total. The SOL scan adds one token's bytes
+(0.264663 to 0.264725 ms). The step rises from 29.019380 to 29.180562 ms
+(+0.56%). The two queries have different batch shapes. The difference is
+therefore not a split into launch and token costs. It is also not an upper
+bound for other shapes.
+
+## Host cost
+
+Six alternating Baseline and Candidate pairs ran. The retained replay results
+record the in-process runner time (`wall_s`) and the process peak memory
+(`maxrss_kb`):
+
+| Field | Baseline | Candidate |
+| --- | --- | --- |
+| `wall_s` | median 1.627 s (1.622 to 1.660) | median 1.637 s (1.635 to 1.645) |
+| `maxrss_kb` | median 171 MiB (162 to 198) | median 162 MiB (162 to 198) |
+
+Six samples cannot separate the variants. The whole-process times (1.70 s and
+2.37 s) and the `run_agg` memory (about 700 MB) are transcribed observations.
+Their raw log was not saved. No speed, memory or significance claim is made.
+
+### Forward-prediction host time
+
+The advisory Forward Prediction Performance gate compared main `bf1b539f`
+with `14ffdb4c` and found 81 regressions among 89 stable comparisons. For
+example, Qwen3-32B SILICON context at batch 1 and isl 1024 went from 20.48
+to 24.23 us warm. The gate times `InferenceSession.run_static_latency_only`.
+Each query checks the compiled-engine identity memo once. Commit `55d2821b`
+made that check rebuild the database mode key and sort the transfer policy
+on every query. On the workstation, `engine_identity` took 0.30 us per call,
+against 0.10 us for main's object-only check. Commit `59c4575a` compares
+the mode and the policy by object identity, and `1db9b803` reads their
+stored attributes directly, which takes 0.17 us. The setters replace both
+values, so the check still detects a mode or policy change.
+
+The gate's own `worker.py` ran each build on the 13 SILICON cases of
+Qwen3-32B and Nemotron-3-Super-120B FP8. Each case ran 10 warm-up and 100
+timed queries. This local comparison is separate from the CI gate. The
+driver is [`host_perf.py`](mamba-mixed-step-accounting/host_perf.py). Put each
+build's checkout in `ROOT/BUILD/src` and its environment in
+`ROOT/BUILD/venv`, then run
+`python host_perf.py ROOT 6 OUT.json rbf1b539f r1db9b803 rbf03c37d`. The case
+list comes from the gate's `expand_cases`. Round `r` rotates the build order
+by `r`, so in six rounds each build runs twice in each position. The output
+records each round's order and the per-round cold and warm medians of every
+case:
+[`host-perf-bf03c37d.json`](mamba-mixed-step-accounting/host-perf-bf03c37d.json).
+Warm medians over the rounds, in microseconds, with the range of the round
+medians:
+
+| Case | `bf1b539f` (main) | `bf03c37d` | Change |
+| --- | --- | --- | --- |
+| Qwen3-32B context, batch 1, isl 1024 | 14.11 (13.80 to 14.27) | 14.57 (14.24 to 16.12) | +3.3% |
+| Qwen3-32B context, batch 1, isl 32768 | 15.59 (15.29 to 15.98) | 16.13 (15.80 to 18.09) | +3.5% |
+| Qwen3-32B generation, batch 1, isl 1024 | 24.83 (24.52 to 25.26) | 25.20 (24.75 to 25.95) | +1.5% |
+| Qwen3-32B generation, batch 128, isl 1024 | 24.83 (24.57 to 25.20) | 25.30 (24.87 to 27.77) | +1.9% |
+| Nemotron Super context, batch 1, isl 1024 | 20.83 (20.61 to 21.01) | 21.68 (21.24 to 23.92) | +4.1% |
+| Nemotron Super generation, batch 128, isl 1024 | 42.47 (42.06 to 43.17) | 43.24 (43.12 to 44.28) | +1.8% |
+
+`bf03c37d` is slower than main in all 13 cases, by +0.3% to +4.1% (median
++1.9%), about 0.07 to 0.86 us per query. The round ranges overlap in 11 cases.
+`1db9b803`, the code of the earlier comparison, gives +1.4% to +14.7%
+(median +2.1%). The compiled-engine handle lookup accounts for about 0.1 us:
+it takes 0.34 us on main and 0.45 us at `bf03c37d`. The rest of the
+difference has no change in Python function calls under cProfile. Inlining
+the lookup saved less than 0.04 us, so it was not kept.
+
+An earlier five-round run, in
+[`host-perf-1db9b803.json`](mamba-mixed-step-accounting/host-perf-1db9b803.json),
+ran the builds in the same order every round, `1db9b803` last. It gave -7.4%
+to +2.3%. Because the order was fixed, it does not control for build
+position, and the rotated run replaces it. It also replaces an earlier three-round fixed-order run, in
+[`host-perf-1ea0211c.json`](mamba-mixed-step-accounting/host-perf-1ea0211c.json).
+That run measured `1ea0211c` at 17.08 us for the first case, against
+14.08 us for main.
+
+The CI gate on `c425c61a` found one confirmed regression among 101 stable
+comparisons, DeepSeek-V3.2 TP8 generation from a cold query (+14.7%
+geometric mean). The rotated driver also ran the six DeepSeek-V3.2 gate
+cases. At `bf03c37d`, the two TP8 generation cold queries change by +0.2%
+and +3.2%, and all six by -1.6% to +3.3%. So it does not reproduce that
+result. That run used the `bc84a5fd` driver with its model filter replaced
+by `model_id.startswith("deepseek-v3.2")`. The checked-in driver selects
+the same six cases with
+`HOST_PERF_MODELS=deepseek-v3.2 python host_perf.py ROOT 6 OUT.json rbf1b539f r1db9b803 rbf03c37d`.
+The raw rounds are in
+[`host-perf-deepseek-bf03c37d.json`](mamba-mixed-step-accounting/host-perf-deepseek-bf03c37d.json). These are simulator host timings, not predicted
+serving latency. The paired CI gate on the published head remains the
+exact-head result.
+
+The CI gate on `5cd7655d` against `bf1b539f` reported one stable regression in
+128 comparisons: `qwen3-32b/empirical/context/bs1-isl8192` from a cold query,
+46.97 to 48.06 us (+2.3%, 4 of 5 rounds). It also reported 28 faster, 79
+unchanged and 20 noisy comparisons. Its DeepSeek-V3.2 TP8 generation cold
+cell was stable at -3.5%, so the earlier `c425c61a` result did not repeat.
+A paired workstation run of `bf1b539f` and `5cd7655d` over the 20 Qwen3-32B
+EMPIRICAL and SILICON gate cases, with six rotated rounds, does not confirm a
+consistent regression. The gated case changes by +1.6% (45.10 to 45.82 us),
+with the head slower in 2 of 6 rounds. The other EMPIRICAL context cold
+cases change by -1.7% to +2.3%, and every cold case by -4.2% to +2.3%. The
+cause of the gate's cold result is not identified. The run used
+`HOST_PERF_MODELS=qwen3-32b HOST_PERF_MODES=EMPIRICAL,SILICON python host_perf.py ROOT 6 OUT.json rbf1b539f r5cd7655d`.
+The raw rounds are in
+[`host-perf-qwen-5cd7655d.json`](mamba-mixed-step-accounting/host-perf-qwen-5cd7655d.json).
+
+### Host time of the fixes after `d462dab8`
+
+The `d462dab8` and `d6b02759` builds ran on the workstation, with each build
+first in alternate rounds. This pair isolates `d9da2c60` to `d6b02759`. It
+does not cover the earlier maintainer changes.
+[`affected_perf.py`](mamba-mixed-step-accounting/affected_perf.py) times the
+changed native entry points in fresh processes. It primes each handle with
+another shape, then times one unseen query (cold) and the median of 100
+repeats (warm). In 12 rounds, warm medians changed by -9.5% to +2.5%. Cold
+medians changed by -10.9% to +6.5%:
+
+| Entry point | Cold `d462dab8` | Cold `d6b02759` |
+| --- | --- | --- |
+| Qualified pure prefill, 2 requests, 4097 tokens | 107.6 us | 114.6 us |
+| Qualified pure prefill, 4096 tokens (even control) | 9.9 us | 9.7 us |
+| Qwen3-32B pure prefill, 4097 tokens (non-Mamba control) | 25.8 us | 25.5 us |
+| Qualified Nano static per-op coverage | 179.0 us | 186.8 us |
+| Qwen3-32B static per-op coverage | 74.8 us | 77.1 us |
+| Whole-model FPM mixed coverage | 8.0 us | 7.7 us |
+
+The ragged qualified prefill adds a second scan query and convolution query,
+which keep the remainder token. Its simulated latency changes as described
+above. The other entry points return identical values. The 13 SILICON cases
+of the forward-prediction gate changed by -1.2% to +1.6% warm. A 12-round
+rerun of the 11 Qwen3-32B cases gave -1.8% to +4.1% cold, at most 2.1 us.
+The raw rounds are in
+[`affected-perf-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/affected-perf-d462dab8-d6b02759.json),
+[`host-perf-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/host-perf-d462dab8-d6b02759.json)
+and
+[`host-perf-qwen-d462dab8-d6b02759.json`](mamba-mixed-step-accounting/host-perf-qwen-d462dab8-d6b02759.json).
+
+The Qwen artifact predates `worker_runs` and retains only `orders` and
+`results`. The original command, exact `HOST_PERF_MODELS` and
+`HOST_PERF_MODES` environment values, and revision supplying `host_perf.py`
+are not preserved in the available run records. Its Qwen-only SILICON case
+set does not establish those environment values or the driver revision.
+The historical measurements above remain unchanged; reproducing their
+original invocation requires the author's run records.
+
+`c51eceaf` adds one covered-latency value per folded operation and per
+query, with no new traversal, query or cache. Native Replay ran
+`aisim predict --stack engine` with `d6b02759` and `c51eceaf` in 6 alternating
+rounds. Each run served 2000 synthetic requests (2048 input tokens, 512 cached,
+128 output) at concurrency 64 on `b200_sxm` TensorRT-LLM 1.3.0rc20. Both
+builds completed every request with identical TTFT and power coverage. Each
+cell gives the `d6b02759` median, then the `c51eceaf` median:
+
+| Model | CLI time | Peak RSS | `wall_time_ms` |
+| --- | --- | --- | --- |
+| Nemotron-3-Nano (Mamba, unqualified) | 1.96 s to 1.99 s | 225.4 to 227.8 MiB | 191.5 to 189.7 ms |
+| Qwen3-0.6B (control) | 1.64 s to 1.65 s | 195.9 to 196.7 MiB | 199.9 to 196.2 ms |
+
+One candidate Nano run took 3.53 s, and every other run
+stayed within the baseline range. These unqualified graphs do not exercise the
+qualified split. The raw runs are in
+[`replay-host-d6b02759-c51eceaf.csv`](mamba-mixed-step-accounting/replay-host-d6b02759-c51eceaf.csv).
+
+## Limits
+
+- Summing uniform-batch queries can overcount launch overhead for
+  variable-length batches. A qualified Mamba ragged split uses this proxy
+  (see the 4096- and 4097-token example above).
+- Replay evidence from a model with `temporary_mixed_composition` reads public
+  estimates, so it still derives each folded operation's coverage from its
+  energy.
+- One model family, one modeled platform, synthetic shapes.
+- Whole-model FPM mixed steps retain uniform request lengths for unqualified
+  draft context operations. Qualified Mamba draft scans instead price the
+  scheduled full requests and final partial request separately, as checked
+  below.
+- A pure-prefill packed step prices every operation except qualified Mamba
+  at the integer mean of its new tokens per request, as main does. Two
+  prefills of 8 and 9 new tokens price those operations as two of 8. The
+  pure-prefill and mixed packed steps and the exact-total query
+  `predict_prefill_latency_total` keep the remainder for qualified Mamba
+  operations.
+- Totals-only `ForwardPassMetrics` still balance qualified Mamba prefill
+  lengths and cannot identify the cold request. Native Replay now supplies exact
+  `prefill_chunks`; the repair validation below covers the observed-shape path.
+- The compiled-engine identity is computed once per model object, database
+  object, query mode and transfer policy, as main computes it per model and
+  database object. Changing a model's operation lists after its first
+  estimate is not detected. Build a new model object instead.
+- In the mixed step of a legacy graph, shared token-major operations take
+  `ctx_tokens - prefix * floor(ctx_tokens / isl)` prefill tokens, as main
+  does. A remainder longer than `isl - prefix` therefore prices more shared
+  tokens than context attention prices. For example, `ctx_tokens = 6000`,
+  `isl = 4096` and `prefix = 3000` give 3000 shared prefill tokens, but 2
+  requests of 1096 tokens for attention. A qualified graph takes the capped
+  Mamba chunks instead, 2192 tokens here (see the scoped corrections above),
+  so a Mamba qualification changes the price of non-Mamba operations.
+
+
+### Selected-review repair validation
+
+The repair after `3fb31295` changes single-text-request aggregate scheduling
+and qualified Mamba Replay geometry. `run_agg` now prices every uncached
+prefill chunk, with the already processed tokens as the next prefix, and keeps
+the final partial chunk. TTFT's queue input is the uncached chunk count. Its
+throughput and energy totals include the complete schedule. The summary still
+exposes a mean mix step, weighted by that count. This scheduling correction
+also affects legacy graphs and whole-model FPM; it does not change their
+per-operation formulas. Visual context retains mean-field step pricing.
+
+`test_run_agg_single_request_counts_every_prefill_chunk` uses an independent
+synthetic launch-and-token oracle: each prefill chunk costs `1 + 0.01 * new`
+ms and `10 + 0.2 * new` W-ms, then one decode costs 3 ms and 90 W-ms.
+For ISL 4096 and prefix 2048, budget 1024 gives two chunks, 22.48 ms and
+429.6 W-ms of prefill, and TTFT `22.48 * 1.95 = 43.836` ms. Prefix 1792
+adds a final 256-token chunk: three launches and 2304 new tokens give
+26.04 ms, with TTFT `26.04 * 2 = 52.08` ms. Prefix 3000 fits one chunk
+under budget 2048: 11.96 ms, with TTFT `11.96 * 1.90 = 22.724` ms.
+The test also checks throughput, active latency, covered latency and power.
+Chunk evidence is folded as it arrives, retaining O(operations) evidence
+rather than every chunk's complete dictionaries.
+
+Native Replay now groups its observed `(new length, cached prefix)` pairs
+before pricing qualified Mamba, and keys its memo by those groups. Rank
+pricing does the same. Totals-only telemetry keeps the documented balanced
+approximation. Grouping costs O(requests * log(distinct shapes)); pure decode
+and graphs without qualified Mamba keep their existing path. Memo entries
+with more than 256 distinct groups are not retained.
+
+The synthetic measured-row fixture in
+`qualified_mamba_uses_exact_prefill_groups_and_keys_the_rank_memo` deliberately
+sets `(batch=1, length=500)` to 2 ms, `(1,1000)` to 3 ms and `(2,750)` to
+11 ms. Actual `[1000,500]` chunks therefore cost 5 ms, instead of the
+balanced row's 11 ms. For two 16-token chunks with prefixes 0 and 64,
+the cold row contributes 5 ms with source `silicon`; the warm chunk contributes
+`2,394,112 / 7.7e12 * 1000` ms with source `sol`. The fixture checks both
+mixed and pure-prefill queries, source selection, cache separation and invalid
+group totals. `op_level_replay_preserves_observed_mamba_chunks_and_prefixes`
+checks those values through native iteration pricing, with and without
+captured diagnostics and with width-four decode. These are synthetic
+accounting oracles, not silicon accuracy measurements.
+
+
+At corrective source commit `70f971d4df4725b7a9224f13852e9b6529384af3`,
+39 native Mamba tests passed. Against its optimized wheel, 729 Python checks
+passed: the base/XPU backend suites, Mamba qualification, FPM forward,
+`test_engine_step_parity.py`, `test_compile_engine_parity.py` and the
+single-oracle contract. Goldens were unchanged. Earlier attempts hit disk or
+memory limits; the new measured fixture initially dropped its lazy table root
+too soon, and earlier Python setup/queue-factor expectations were corrected.
+The passing runs retain the normal assertions and timeouts. Build/test logs
+are retained by the repair run, outside the source tree.
+
+The current `telem.py` invocation still returns 9.033768855441256 ms for
+pure decode and 20.74584264890688 ms for mixed MTP3, identical to the corrected
+`c3ed1513` artifacts and the phase byte oracles above. The full current output,
+configuration, packed metrics and data fingerprint are in
+[`telem-70f971d4.json`](mamba-mixed-step-accounting/telem-70f971d4.json).
+The op-level convention remains context **including** the current token;
+`telem.py` is not a whole-model FPM past-only-KV input.
+
+For the refreshed host-cost check, the baseline is
+`3fb31295a29497869bef1a2b0081bb36aab9e13a`, and the corrective source is
+`4e940e38d2ba667c2905e5d5453b28110cb881d1`. Both native extensions used Rust
+1.91.1, release optimization level 3, thin LTO, one codegen unit,
+`CARGO_BUILD_JOBS=2`, and features `extension-module,jemalloc`. Python was
+3.12.12 on Linux x86_64, Intel i9-14900K, with a
+5 GiB container memory limit. The native embedded source inventories were
+verified against each exact commit, including dereferenced tracked symlinks.
+The report records their source and binary hashes.
+
+The driver is
+[`repair_replay_perf.py`](mamba-mixed-step-accounting/repair_replay_perf.py).
+With a candidate wheel installed in `PYTHON` and a baseline SDK installation
+in `BASE_SDK`, run:
+
+```bash
+python repair_replay_perf.py PYTHON BASE_SDK 6 OUT.json
+```
+
+It calls `PYTHON -m aisim predict --stack engine` in six balanced build-order
+rounds. Each case completes 1000 synthetic requests of 2048 input and 32 output
+tokens at concurrency 64, with 512 cached-prefix tokens, a 4096-token scheduler
+budget and 64 request slots. Full configurations, verified build identities,
+the driver command and raw rounds are in
+[`repair-replay-4e940e38.json`](mamba-mixed-step-accounting/repair-replay-4e940e38.json).
+Nano uses a test-only BF16 width-one constructor shim, as `telem.py` does;
+the driver asserts that the child actually constructed qualified operations.
+Each Nano run records eight shim calls in the simulation process and zero
+in its supervisor, retaining both identities. The baseline constructor
+accepts both qualification kwargs, and both builds complete with the shim.
+This fixture does not change built-in production defaults.
+Qwen3-0.6B is the control. The fixed capacity, TP/DP/MoE parallelism, backend/version and
+all workload inputs are shared between builds.
+
+The earlier
+[`repair-replay-70f971d4.json`](mamba-mixed-step-accounting/repair-replay-70f971d4.json)
+is explicitly superseded: its driver hash differed and its recorded shim
+counts were all zero. Its qualification and host-cost claims are withdrawn;
+the following numbers come only from the refreshed, verified run. No source
+or native build changes occur between the corrective source and the evidence
+commit that adds these reports.
+
+| Case | Full CLI median (baseline to candidate) | Native `wall_time_ms` median | Peak RSS median |
+| --- | --- | --- | --- |
+| Qualified Nano | 3.158 to 3.201 s | 86.315 to 84.930 ms | 296.6 to 297.3 MiB |
+| Qwen3-0.6B control | 2.995 to 2.993 s | 93.317 to 89.421 ms | 258.4 to 277.0 MiB |
+
+Full CLI timing includes startup, model construction, report aggregation and
+serialization. Native `wall_time_ms` has the narrower Replay boundary described
+in the performance skill: it excludes model construction and final evidence
+aggregation. RSS is the supervisor's peak observed process-tree memory. Nano's
+RSS ranges overlap (296.1–310.7 versus 296.0–304.8 MiB). CLI ranges are
+3.038–3.318 versus 3.026–3.271 s, and native ranges are
+83.082–88.576 versus 80.438–85.906 ms. These samples do not demonstrate a material host-runtime regression.
+They do not establish a speedup or a universal overhead bound. Every run
+completed all input and output tokens. Nano's modeled mean TTFT changes from
+56.580465 to 56.870103 ms, and TPOT from 24.988958 to 25.072246 ms as the
+actual chunk/prefix groups replace balanced coordinates. The control's
+modeled results are identical. These are functional and cost checks, not
+silicon accuracy qualification.
+
+### Qualified FPM draft-scan chunk correction
+
+Against starting head `51934c0eb98bb8490163eb304cff080c631b4ea8`,
+`fpm_hybrid_qualified_draft_scan_uses_scheduled_chunks` reproduces the
+remaining draft-tail overcount. Its valid hybrid graph has a whole-model
+FPM target and a top-level qualified BF16 context scan. Synthetic target
+rows cover the exact queries; they are fixture inputs, not measurements.
+
+For `isl=512`, `prefix=256`, `ctx_tokens=384`, the target keeps one query
+for two requests and 384 new tokens (plus eight verification tokens from
+one decoder). The scan now queries `(1,256)` and `(1,128)`, instead of
+`(2,256)`. The hand-derived scan traffic is 18,560 activation bytes per new
+token plus 2,097,152 bytes for one recurrent-state read/write pair per
+request. Traffic therefore falls from 13,697,024 to 11,321,344 bytes;
+at the fixture's 7.7 TB/s bandwidth, the scan falls from
+0.001778834286 to 0.001470304416 ms. Both requests still pay their state
+traffic. These are accounting oracles, not silicon accuracy results.
+
+The regression also covers 512 tokens as one `(2,256)` query, 640 tokens
+as `(2,256)` plus `(1,128)`, and 1500 tokens as `(1,1096)` plus `(1,404)`
+with a 3000-token prefix. It checks each scan query, the unchanged target
+fixture latency, scalar/per-op totals, SOL source and zero power coverage.
+The existing context walker receives at most two stack-allocated groups:
+one query for full requests and at most one for the partial request per
+qualified scan. There is no per-request allocation, new cache or retained
+state; target and unqualified draft operations keep their existing queries.
+Hybrid FPM graphs remain rejected by native Replay's rank dispatch, so this
+correction changes aggregate mixed-step prediction rather than scheduler
+execution or Replay accounting.
+
+
+## Canonical MTP construction
+
+The scoped constructor repair exposes qualified Mamba accounting through
+`RustForwardPassPerfModel.best_available` for built-in Nemotron-H MTP graphs.
+Legacy `nextn` and explicit `speculation.kind: mtp` both resolve the width
+before construction. Context kernels receive width one and generation kernels
+receive `nextn + 1`; both receive the checkpoint's resolved
+`mamba_ssm_cache_dtype`. No execution-profile override or constructor shim is
+needed. Non-MTP graphs keep their existing legacy construction, including
+schemes that assign widths and materialize draft wrappers after construction.
+Their qualification is outside this MTP repair.
+
+The regression `test_canonical_mtp_prices_resolved_mamba_state_and_width`
+checks both TensorRT-LLM 1.3.0rc20 and vLLM 0.24.0 at MTP1, MTP3 and explicit
+MTP3, including canonical saved-state restoration. Nano declares an FP32
+state: 64 heads x 64 elements x 128 state elements x 4 bytes = 2 MiB per
+request. A scan moves 20,608 activation bytes per token. Two prefills totaling
+17 tokens therefore move 8,738,944 bytes, including two state read/write
+pairs. Eight width-four decodes move 84,545,536 bytes, including one state
+read and four checkpoint writes per request. Multiply by 23 Mamba layers,
+by `55/52` for generation's existing MTP layer scale, and divide by B200's
+7.7e12 B/s. The expected context scan is 0.026103339221 ms and generation
+scan is 0.267108149451 ms. The generation convolution moves 73,728 bytes per
+verified token with no recurrent-state term, giving 0.007453819780 ms.
+These independent byte oracles explain the new accounting; they do not
+qualify silicon accuracy. The pinned constructor returned only
+0.002083446154 ms for the generation scan. Its unknown state dtype omitted
+state traffic. Its width-one convolution could also use a measured one-token
+row for a batch of packed slots; the qualified MTP convolution uses SOL.
+
+All six new regression cases failed on the exact pinned constructor from
+`22a3fec3c24613fd68cf056a83ede789bd74cf8d` and pass with the repair. The full
+Mamba, Nemotron, MTP, speculation and single-oracle subset passed 374 tests;
+the two native parity suites passed 390 with unchanged goldens. The optimized
+native source inventory matched all 269 recorded checkout files. The
+historical `telem.py` BF16 diagnostic explicitly overrides the newly supplied
+FP32 dtype, and still reproduces every case in `telem-70f971d4.json` exactly.
+Its packed KV values are unchanged.
+
+### Matched host measurements
+
+Baseline is `22a3fec3c24613fd68cf056a83ede789bd74cf8d`. Candidate is identified
+by the constructor SHA-256
+`187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc`;
+the baseline constructor hash is
+`233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2`.
+Only Python construction changes, so both variants use the same optimized
+native binary, SHA-256
+`d2f17d96386ed8622aad9fccaf54c40bf95725d69c6f0bb55f590949b57d2937`.
+The baseline SDK was copied with its constructor restored byte-for-byte from
+the pinned commit; all other SDK files, native code, dependencies and packaged
+performance data are identical. Both wheels were built with
+`maturin build --release --locked --auditwheel skip`, Rust 1.91.1, the repository's
+release profile (thin LTO, one codegen unit) and `CARGO_BUILD_JOBS=2`.
+Host: Linux x86_64, Intel i9-14900K, Python 3.12.12, 5 GiB container memory limit.
+
+The forward driver uses the existing forward gate's `measure_cold_and_warm`:
+after construction and one 64-token prefill prime, it measures the first
+unseen query, then 100 repeats after 10 warmups. Each of six alternating
+baseline/candidate rounds uses a fresh process. This separates construction,
+first-use data loading and warm query caching. Per-round summaries and full
+inputs are in
+[canonical-mtp-forward-perf.json](mamba-mixed-step-accounting/canonical-mtp-forward-perf.json).
+This historical record is summary-only: it does not retain the underlying warm
+samples, so its means, medians and percentiles cannot be independently
+recomputed. The complete remeasurement below retains those samples.
+Run [canonical_mtp_forward.py](mamba-mixed-step-accounting/canonical_mtp_forward.py)
+with the corresponding installed SDK; `PYTHONPATH=BASE_SDK` selects the pinned
+baseline, and an unset `PYTHONPATH` selects the candidate:
+
+```bash
+AIC_ALLOW_UNLISTED_VERSIONS=1 python canonical_mtp_forward.py OUT.json
+```
+
+The committed [round launcher](mamba-mixed-step-accounting/canonical_mtp_forward_rounds.py)
+reconstructs the six-round schedule and writes the same `rounds` / `order` /
+`results` envelope. Round 1 runs baseline then candidate, round 2 candidate then
+baseline, repeated three times. Each of the twelve invocations starts a new
+interpreter with `PYTHONPATH` set to that SDK's package directory. It rejects a
+constructor or native extension imported from outside the selected directory.
+New records include both loaded paths alongside the existing source hashes;
+the historical JSON above is retained as measured, without invented provenance.
+Run from the repository root with the common dependency environment's Python:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/canonical_mtp_forward_rounds.py \
+  /absolute/path/to/baseline/site-packages /absolute/path/to/candidate/site-packages \
+  /absolute/path/to/new-forward-rounds.json
+```
+
+Nano model construction medians were 388.1 / 374.9 ms (baseline / candidate).
+Its first decode query, including lazy data loading, was 12.355 / 12.485 ms.
+Warm query medians across the six rounds were:
+
+| Nano MTP3 query | Baseline us | Candidate us |
+| --- | --- | --- |
+| Pure decode | 2.263 | 2.257 |
+| Mixed, two prefills totaling 17 tokens | 2.658 | 2.648 |
+| Two prefills totaling 4096 tokens | 2.249 | 2.247 |
+| Two prefills totaling 4097 tokens | 2.260 | 2.262 |
+
+The per-round median ranges for mixed Nano were 2.649–4.900 / 2.580–2.701 us;
+for the Qwen control they were 2.654–5.003 / 2.531–2.720 us. All control
+predictions were identical. The repair supplies two qualification kwargs on each of four kernels
+and activates existing qualified walks. It adds no cache or retained per-request
+state; ragged prefills use the existing two-group queries required to retain
+both token and state counts.
+
+The native replay driver
+[canonical_mtp_perf.py](mamba-mixed-step-accounting/canonical_mtp_perf.py)
+uses no constructor shim. Run:
+
+```bash
+python canonical_mtp_perf.py PYTHON BASE_SDK 6 OUT.json REPO BASE_REV CANDIDATE_REV
+```
+
+It runs `PYTHON -m aisim predict --stack engine` in six balanced build-order
+rounds. Nano uses canonical `nextn: 3`, `nextn_accepted: 2.2`, FP32 state;
+Qwen3-0.6B without MTP is the control. Each case completes 1000 requests,
+2,048,000 input tokens and 32,000 output tokens. Configuration, verified
+Python revisions, build hashes, host identity, exact CLI commands and all
+rounds are in
+[canonical-mtp-perf.json](mamba-mixed-step-accounting/canonical-mtp-perf.json).
+The [compressed companion](mamba-mixed-step-accounting/canonical-mtp-perf.requests.json.gz)
+contains all 24,000 raw request records, bound to each result by SHA256. The
+report also records the companion's checksum. The retained-sample regression
+recomputes the completion/token totals and mean TTFT/TPOT from those records.
+
+This refresh compares Python baseline `22a3fec3c24613fd68cf056a83ede789bd74cf8d`
+with corrective source `4e940e38d2ba667c2905e5d5453b28110cb881d1`. Both use
+the latter's optimized native extension; it isolates the Python constructor
+integration, rather than comparing two complete historical builds. Before
+each run the driver verifies both complete imported Python source trees
+against the recorded Git revisions. Linux x86_64, Intel i9-14900K, Python
+3.12.12 and the matched native build settings above apply. This is CPU simulation of
+B200, not an accelerator measurement. The following values replace the
+earlier report without raw samples.
+
+| Case | Full CLI median seconds | Native `wall_time_ms` median | Peak RSS median MiB |
+| --- | --- | --- | --- |
+| Nano MTP3 | 3.237 / 3.244 | 85.639 / 84.072 | 297.3 / 297.0 |
+| Qwen control | 3.097 / 3.110 | 89.770 / 89.711 | 269.7 / 261.1 |
+
+Nano CLI ranges were 3.146–4.008 / 3.148–3.271 seconds. Native time ranges
+were 79.185–88.047 / 80.769–85.187 ms. Full CLI timing includes startup,
+construction and output serialization. Native time covers the interval in
+`Replayer::run_inner` through collector finalization and excludes model
+construction and final aggregation. Predicted Nano mean TTFT changes from
+444.293 to 463.764 ms and TPOT from 9.070 to 9.473 ms as state and checkpoint
+accounting becomes reachable. Every control serving metric is unchanged.
+The timing ranges overlap and do not establish a speedup or an overhead
+bound. They show no material host-cost regression in this constructor
+integration and are not serving-accuracy measurements.
+
+The canonical driver's untimed preflight verifies imported Python sources.
+It repeats that verification at child shutdown, so full CLI time includes
+the shutdown checks in both builds; native `wall_time_ms` excludes them.
+
+### Diagnostic and aggregate model limits
+
+The packed op-level diagnostic in `telem.py` uses 32800 KV tokens for
+32 rows at sequence length 1025. Its consumer divides by the row count and
+does not add a current token. A past-only convention would require a
+coordinated telemetry-contract migration; whole-model FPM uses that distinct
+convention already.
+The native regression `op_level_packed_decode_kv_includes_current_token`
+checks both pure decode and a mixed step at 32 packed rows, using explicit
+attention queries at sequence lengths 1024, 1025 and 1026 as coordinate
+references. It uses a synthetic SOL system without downloaded tables and
+distinguishes both off-by-one alternatives. This verifies input translation,
+not prediction accuracy. The diagnostic's inputs and historical outputs
+remain unchanged.
+
+Qualified draft scans in a whole-model FPM aggregate still inherit the
+target's fractional mean-field schedule. At batch 4, ISL 4096, prefix 3000
+and a 2000-fresh-token query, that schedule weights two state pairs by
+`4384 / 2000`, or 4.384 state pairs. A densely packed stream instead has
+piece lengths `[1096, 904]`, `[192, 1096, 712]`, `[384]` and six state
+pairs. Modeling that stream requires a contract decision between target
+stream queries and a separate draft correction. The existing per-query
+draft correction does not claim stream-level accounting.
+
+### Fractional visual overlays and packed XPU admission
+
+The repair based on `7df29a6519595ac33a181e620375bd92e4f5ecf5` addresses
+`PRRT_kwDOT0t9uc66w65v` by matching the visual overlay's expected request count
+to the FPM aggregate. A query with `1 + 904/1096` fresh-token requests now
+mixes native visual prices at batches 1 and 2 with weights `192/1096` and
+`904/1096`. Multiplying by `4384/2000` mixed steps accounts for exactly four
+requests. Each integer batch keeps its own native price; cost is not assumed
+linear. The aggregate regression uses a deliberately nonlinear synthetic
+price of batch squared: total overlay latency falls from 8.768 to 7.616 ms,
+and its 100 W energy from 876.8 to 761.6 W-ms. At 2192 fresh tokens the
+two-request price and 8 ms aggregate are unchanged. These are orchestration
+fixtures, not silicon measurements. Only fractional visual FPM aggregate
+queries add a second native overlay call; work and retained evidence remain
+O(visual ops). Direct scheduled queries retain whole overlay requests.
+
+For `PRRT_kwDOT0t9uc66w653`, XPU aggregate admission now caps decoders at
+`floor((total_budget - 1) / (nextn + 1))`, in addition to the existing
+occupancy and KV limits. It can admit zero decoders and always leaves a
+positive prefill budget. For example, capacity 8 admits one width-four
+decoder and four prefill tokens, instead of pricing twelve decode tokens
+and a fabricated one-token prefill. A real native SOL norm fixture checks
+that the engine prices exactly the admitted token total. The additional
+admission arithmetic is constant time and does not change direct scheduled
+`run_mixed` calls. `MixedStepInput` now also documents the existing native
+oversized-remainder rejection separately from aggregate capacity trimming
+(`PRRT_kwDOT0t9uc66w66I`).
+
+Verification used Python 3.12.12 and a Rust 1.91.1 optimized wheel, built
+with `maturin build --release --locked --auditwheel skip`, the repository's
+thin-LTO release profile, `extension-module,jemalloc` and two Cargo jobs.
+The six scoped backend/FPM/Mamba/single-oracle modules passed **610 tests**;
+both required parity modules passed **390 tests**, with unchanged goldens.
+The capacity-translation regression also checks total work for the already
+corrected `PRRT_kwDOT0t9uc66w5Cj`: four 1096-token suffixes and four state
+pairs, for either representative prefill batch size. Full Python lint/format,
+source/legal policy, syntax compilation and the evidence page's links pass.
+An earlier concurrent run had two FPM replay checks return `resource_limited`
+while Rust compiled; the serial 610-test rerun passed with normal memory
+admission, assertions and timeouts intact. Initial formatter, system-Python
+documentation-dependency and wrong-directory wheel-repack attempts were
+corrected. Attempt logs remain in this repair run's scratch directory.
+
+### Scoped review corrections after `0cfbdb55`
+
+Exact `prefill_chunks` now coalesce equal `(new tokens, prefix)` shapes
+before either the pure-prefill or mixed Mamba walk. In the synthetic measured
+fixture, `[[2, 750, 0]]` and `[[1, 750, 0], [1, 750, 0]]` both select the
+batch-two 11 ms row; previously the latter selected two batch-one 7 ms rows
+and totaled 14 ms. Different lengths and prefixes remain separate. The native
+`qualified_mamba_uses_exact_prefill_groups_and_keys_the_rank_memo` regression
+checks both payloads with zero and eight packed decode tokens, with and without
+diagnostics. These fixture timings are accounting oracles, not measurements.
+Already sorted, unique groups from Replay borrow without allocation. Other
+payloads sort and fold once per walk in O(groups log groups), instead of once
+per operation. The added normal-path shape check is O(groups); queries already
+visit those groups for every qualified operation. Totals-only and pure-decode
+walks do not allocate groups. Successful SDK identities retain their constant-time
+memo hit; failed nested conversions are retried without inventing a partial
+cache key, and ordinary unsupported neighbors use the existing rejection cache.
+
+The XPU scheduler now reserves decoders from the full capacity before capping
+prefill demand. Its burst fit again divides by full prompt length, as the
+pre-FPM-correction implementation (`108835ac^`) and the `ctx/isl` calibration
+comment specify. No coefficients have been refitted. The uncached suffix still
+sets native FPM query coordinates and the capped demand in the ratio's numerator.
+
+The following table is a **historical** synthetic snapshot of candidate
+`49ee01957177268bb5889f1bb058eeb0f867d101` against
+`0cfbdb5535583493e4ab073241e1f74d707acdde`. Its candidate XPU source SHA-256
+is `b033596de269fd446a7a958618a95b4129f3f076ceab9d18fc236272befb0c5d`.
+It does not describe the current driver/backend combination. The original
+numeric rows and driver fingerprint are preserved in
+[xpu-scoped-repair.json](mamba-mixed-step-accounting/xpu-scoped-repair.json).
+
+To reproduce the historical calculation, install that candidate's Python
+backends, then run the current driver from the repository root:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py \
+  --candidate-revision 49ee01957177268bb5889f1bb058eeb0f867d101 OUT.json
+```
+
+The driver reads the baseline class from
+`0cfbdb5535583493e4ab073241e1f74d707acdde` and imports the candidate class.
+It verifies both imported XPU and base backend sources against the specified
+revision; a current wheel cannot stand in for the historical candidate.
+It runs the actual XPU budget conversion, own-prefill scaling and burst formula
+over an explicitly synthetic FPM pricing seam: 1 ms per launch, 0.01 ms per new
+token and 0.1 ms per decoder. It holds decode growth at one and admits all 16
+requests. This isolates caller and fit behavior; it does not execute a native
+FPM table or establish XPU serving accuracy. Full inputs, shapes and outputs are
+in the historical snapshot linked above. A separate current result and its
+command are recorded in the scoped repair section below.
+
+| Prefix / token capacity | Pricing input (prefill, decode), before / after | TTFT ms, before / after |
+| --- | --- | --- |
+| 3000 / 2048 | (2033, 15) / (2033, 15) | 58.574076 / 37.688541 |
+| 4088 / 4096 | (124, 4) / (128, 15) | 29.390882 / 4.419143 |
+| 0 / 2048 control | (2033, 15) / (2033, 15) | 176.012263 / 176.012263 |
+
+All points use batch 16, ISL 4096 and OSL 128. In the second baseline point,
+capping the scheduler budget to 128 also incorrectly limits decoders to four;
+the corrected path uses the full 4096-token capacity and retains all 15.
+The SDK regression separately checks an op-level demand cap and a capacity-bound
+control. The repair also preserves `mixed` provenance across two or three
+heterogeneous chunks, retains every process record in new replay-driver reports,
+and makes the power-coverage scan fixture FP16 so measured BF16 scan rows cannot
+accidentally supply its intentionally absent power.
+
+### Cached visual aggregate repair
+
+The baseline for this repair is `9cf0096bf14ca70a49911d996b1696c5b4d1ffc6`.
+The corrected `base_backend.py` has Git blob
+`14c8cb5f262e3b47c66138e162e7427e58c29b35`.
+Single-request visual op-level aggregates retain the existing mean-field
+query. Its attention and visual-mask prices are divided by
+`ceil(effective_isl / budget)`, so aggregate weighting now uses that same
+count. The queue heuristic still reads the uncached chunk count. Shared
+work retains the legacy mean-field approximation; this does not establish
+exact visual chunk scheduling. Text chunk folding and whole-model FPM
+keep their uncached schedules.
+
+`test_run_agg_visual_fallback_preserves_whole_prefill_attention` uses
+synthetic whole-prefill prices of 12 ms / 1200 W-ms for native attention
+and 4 ms / 400 W-ms for visual-mask work, plus 2 ms / 200 W-ms of shared
+work per mean-field step. Effective ISL is 4096 (3072 text + 1024 visual).
+These are accounting fixtures, not silicon measurements. For prefix 2048
+and budget 1024, four mean-field weights restore 16 ms of attention and
+8 ms of shared work: TTFT is `24 * 1.95 = 46.8` ms. The baseline instead
+uses two weights and reports 23.4 ms. Energy is weighted identically.
+The regression also checks throughput, per-op energy and covered latency;
+uncached, single-step and whole-model FPM controls remain unchanged.
+
+The native regression isolates context attention from the bundled
+`Qwen/Qwen3-32B` graph in B200/vLLM SOL mode and compares the aggregate
+against an unamortized static query. No model weights or measured rows are
+required. The executed baseline results were:
+
+| Prefix / budget | Baseline aggregate attention ms | Static whole-prefill reference ms |
+| --- | ---: | ---: |
+| 2048 / 1024 | 2.932555295403 | 5.865110590805 |
+| 2816 / 512 | 1.546581442560 | 4.124217180160 |
+
+The new regressions first gave five expected failures and four passing
+controls on the baseline release wheel. On the corrected release wheel,
+the complete base-backend, XPU-backend, FPM-forward and single-oracle-contract
+suites pass: 332 tests. Reproduce with an installed release wheel:
+
+```bash
+python -m pytest -c python/aisim/pytest.ini \
+  python/aisim/tests/unit/sdk/backends/test_base_backend.py \
+  python/aisim/tests/unit/sdk/backends/test_vllm_xpu_backend.py \
+  python/aisim/tests/unit/sdk/test_fpm_forward.py \
+  python/aisim/tests/cross_package/test_single_oracle_contract.py
+```
+
+That repair recorded 390 passes in the two-module parity subset below, with
+no golden changes. It did not run the AFD modules; the complete four-module
+verification is recorded in the scoped repair section below.
+
+```bash
+python -m pytest -c python/aisim/pytest.ini \
+  crates/core/parity_tests/perfmodel/test_engine_step_parity.py \
+  crates/core/parity_tests/perfmodel/test_compile_engine_parity.py
+```
+
+Host-cost assessment: this adds one bounded branch and one scalar division
+on an aggregate-cache miss. Visual queries still make one mixed-step call,
+with unchanged preparation, native binary and retained memory. Cache hits
+return before the branch. This is a source-level cost bound, not a timing
+benchmark or a serving-accuracy qualification.
+
+### Cold qualified-Mamba XPU chunks
+
+`test_batched_ttft_prices_native_uncached_chunks` also covers cold text
+prompts in both burst and admission regimes. At batch 4, ISL 4096, prefix 0
+and capacity 1002, two admitted decoders leave 1000 prefill tokens per step.
+The qualified scan needs chunks of 1000, 1000, 1000, 1000 and 96 tokens.
+Previously XPU multiplied the first scan by 4.096, charging only 4.096 state
+pairs. Exact native chunk queries now charge five state pairs and retain the
+two concurrent decoders on every chunk. With the fixture's 1 MiB FP16 state,
+the prefill scan alone increases by
+`(5 - 4.096) * 2 * 1048576 / 7.7e12 * 1000 = 0.000246211092` ms before the
+unchanged burst or admission factor. This is an accounting oracle, not a
+silicon measurement. The divisible 512-token case remains a control.
+`test_batched_cold_unqualified_mamba_keeps_calibrated_scaling` preserves the
+legacy unqualified graph's linear fit, including a short final chunk.
+
+The change reuses the existing cached-text chunk walker. On a batched cold
+aggregate cache miss, qualification detection visits at most the context-op
+list once and constructs kwargs only for Mamba ops. Besides the existing mixed
+query, qualified graphs make one native query per actual chunk unless the
+initial query already prices one complete request. The walker retains constant
+runtime state; other cold graphs keep one native mixed-step query. Aggregate
+cache hits return before this work. Chunk prices still come only from Rust. This bound identifies
+the necessary added query cost; it is not a host-timing or replay qualification.
+
+The XPU comparison driver now rejects an imported backend whose source differs
+from the checkout before running either comparison. It hashes the verified
+imported bytes, including for a byte-identical installed wheel copy.
+`test_fingerprint_binds_imported_source` exercises distinct installed/checkout
+versions and the accepted identical-copy case. The new round-launcher tests
+exercise twelve fresh interpreters, alternating SDK selection despite an
+ambient `PYTHONPATH`, and rejection of a result imported from the wrong SDK.
+
+### Scoped review repair from `095985d3`
+
+The pinned input is `095985d3c9e8b414165d60383027914cb261bc00`.
+The corrected `base_backend.py` has Git blob
+`5f951cd2280e32f28c5909a260298789ffc86b6e`; the corrected
+`affected_perf.py` has blob `6bbae4632ac173ca0f48efde5e9a45988bb66ff5`.
+Native sources are unchanged from the pinned input. Verification used an
+installed optimized wheel built with `maturin build --release --locked
+--auditwheel skip`, Rust 1.91.1, Python 3.12.12 and `CARGO_BUILD_JOBS=2`.
+The installed native binary matched that wheel byte-for-byte, all 269 embedded
+native source hashes matched the checkout, and the installed backend matched
+the corrected Python source.
+
+For `PRRT_kwDOT0t9uc66TbgK`, scheduling now separates the input
+`mix_context_token_budget` from `mix_context_tokens`, which comes from the
+executed `StepEstimate` for a single priced shape. Batch two, ISL 4096,
+prefix 3000 and budget 4096 therefore report budget 4096 and execution 1096.
+The 512-token budget still prices chunks of 512, 512 and 72 fresh tokens,
+with six mixed-step weights for the batch. Such means omit a single-query
+coordinate and raw `mixed` entry, including when native FPM performs the
+averaging internally. Aggregate energy evidence leaves the mean's context
+coordinate at zero. The execution flow, latency, energy and chunk weights
+are unchanged. The regressions exercise both vLLM and TRT-LLM, plus
+single-request op-level chunks and the one-step control.
+
+For `PRRT_kwDOT0t9uc66TbgG`, `affected_perf.py` retains the returned
+`warm_samples_us` in its worker response and in each build/case/round of the
+parent output. The measured calls, warmups and median fields are unchanged.
+A real two-round run covered nine cases and retained 1,800 samples; every
+100-sample median recomputed exactly. The historical
+`affected-perf-d462dab8-d6b02759.json` lacks these samples, so its warm medians
+cannot be independently recomputed. No historical samples were invented.
+The new regression also checks that rotation keeps each round's samples
+associated with its original median.
+
+On the starting wheel, the new sample-retention regression failed once and
+all five new scheduling cases failed as expected. An expanded run started
+before the corrected wheel installation completed also used the starting
+wheel (347 passed, five failed). After installing and verifying the corrected
+wheel, the following final checks passed. Logs remain in the repair scratch
+directory; the earlier failed invocations are retained there as well.
+
+Backend/FPM/single-oracle coverage: **352 passed**.
+
+```bash
+python -m pytest -c python/aisim/pytest.ini -o cache_dir="$TMPDIR/pytest-cache" \
+  python/aisim/tests/unit/sdk/backends/test_base_backend.py \
+  python/aisim/tests/unit/sdk/backends/test_vllm_xpu_backend.py \
+  python/aisim/tests/unit/sdk/test_fpm_forward.py \
+  python/aisim/tests/cross_package/test_single_oracle_contract.py
+```
+
+Complete parity coverage for `PRRT_kwDOT0t9uc66TbgE`: **426 passed**, with
+no golden changes. This includes both previously omitted AFD modules.
+
+```bash
+python -m pytest -q -n 2 -c python/aisim/pytest.ini -p no:cacheprovider \
+  crates/core/parity_tests/perfmodel/test_engine_step_parity.py \
+  crates/core/parity_tests/perfmodel/test_compile_engine_parity.py \
+  crates/core/parity_tests/perfmodel/test_afd_parity.py \
+  crates/core/parity_tests/perfmodel/test_afd_execution_plan_parity.py
+```
+
+Sample-retention regression: **1 passed**.
+
+```bash
+python -m pytest -q -o cache_dir="$TMPDIR/pytest-cache" \
+  benchmarks/evidence/mamba-mixed-step-accounting/test_affected_perf.py
+```
+
+The real worker/parent smoke run used the driver's normal directory layout:
+`affected-smoke/head/src` points to this checkout and `head/venv` to the installed
+wheel's environment, all under the repair scratch directory. Exact invocation:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/affected_perf.py \
+  "$(dirname "$TMPDIR")/affected-smoke" 2 "$TMPDIR/affected-smoke.json" head
+```
+
+Full Python lint and formatting, changed-file compilation, Rust formatting,
+copyright, packaged legal files, local documentation links and whitespace
+checks also passed. This correction adds bounded scalar metadata work and
+one shallow dataclass replacement for a native chunk mean on an aggregate
+cache miss; it adds no model queries, cache or per-token state. Retaining the
+already-returned timing samples adds output storage outside the timed calls.
+This is a source-level cost assessment, not a new host-speed or serving-accuracy
+claim. The two outstanding evidence/contract requests above remain open.
+
+### Scoped review repair from `76921733`
+
+Backend and JSON-converter source is pinned by corrective commit
+`18f10f7bb8e7c8a71208bf3e9bdcd900c2c8ec11`. The separately recorded current
+XPU fixture is
+[xpu-scoped-repair-18f10f7b.json](mamba-mixed-step-accounting/xpu-scoped-repair-18f10f7b.json).
+With that commit's Python backends installed, reproduce from the repository root:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/xpu_scoped_repair.py \
+  --candidate-revision 18f10f7bb8e7c8a71208bf3e9bdcd900c2c8ec11 OUT.json
+```
+
+Both reports identify the candidate revision and command. The current report
+also fingerprints both imported backend files and the driver. The historical
+rows above were reproduced exactly using the historical Python backend files
+and the current driver in a separate interpreter. This synthetic seam never
+calls native pricing, so that check does not qualify a historical native wheel.
+The original snapshot's numeric rows and original driver hash remain unchanged.
+
+| Prefix / capacity | Current pricing input (prefill, decode) | Current synthetic TTFT ms |
+| --- | --- | ---: |
+| 3000 / 2048 | (1096, 15) | 40.525414 |
+| 4088 / 4096 | (8, 15) | 7.619566 |
+| 0 / 2048 control | (2033, 15) | 176.012263 |
+
+These replace neither the historical observations nor the outstanding
+uneven-prefill request. They expose the current fresh-suffix cap: each cached
+case has just one available prefill slot. The launch/token/decode fixture,
+full inputs, baseline revision and unchanged burst coefficients are the same
+as in the historical comparison.
+
+Visual FPM overlays now use the same uncached schedule as the native FPM
+query. The regression executes `run_mixed` through the aggregate summary with
+an independent synthetic 5 ms / 500 W-ms FPM mean and a 4 ms / 400 W-ms
+whole-request visual overlay. With effective ISL 4096, prefix 3000 and budget
+4096, one 1096-token query retains the whole overlay: prefill rises from the
+source-derived 6 ms to 9 ms, and TTFT from 11.4 ms to 17.1 ms. Budget 512
+needs three chunks; the folded overlay is still exactly 4 ms / 400 W-ms,
+and prefill is 19 ms. The test checks latency, energy and covered latency.
+
+Single-request op-level visual aggregates with qualified Mamba and multiple
+uncached chunks now fail before pricing. Their mean-field attention weight
+cannot price exact recurrent-state transfers; no exact visual scheduler is
+claimed. Text XPU TTFT recognizes native and SDK Mamba in either phase.
+The byte oracle now checks both representations and generation-only graphs
+in burst and admission regimes, including the cold 96-token tail and the
+unqualified control. Generation-only graphs pay five whole decode-state
+contributions for a 4096-token prompt with 1000 prefill slots, rather than
+4.096. Schema-30 JSON now raises the same recompile error at conversion as
+schema-30 bincode does at decode; current-schema JSON still round-trips.
+
+Host-cost bound: qualification detection visits the two small phase lists
+once on an affected aggregate miss, short-circuiting on the first qualified
+Mamba. It retains no new state and makes no additional pricing queries beyond
+the existing exact text chunk walker. The visual FPM correction adds scalar
+schedule arithmetic to the existing overlay call. JSON version validation is
+constant-time at conversion. Native estimation math and golden values are
+unchanged; no simulator-speed or serving-accuracy claim is made.
+
+Verification used an optimized wheel built first with `maturin build --release
+--locked --auditwheel skip`, Rust 1.91.1, Python 3.12.12,
+`CARGO_PROFILE_RELEASE_LTO=false`, `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`
+and `CARGO_BUILD_JOBS=2`. The six targeted backend/FPM/Mamba/single-oracle
+modules passed 550 cases; both engine-step parity modules passed 390 cases
+with unchanged goldens. The two driver fingerprint regressions, full Python
+lint/format, Rust formatting and documentation-link checks passed.
+The isolated optimized Rust `--lib` schema-30/Mamba round-trip regression
+also passed (one test).
+An initial new schema assertion used an unexported convenience name; the
+corrected test uses the native export. A subsequent concurrent verification
+attempt exhausted the 5 GiB host budget: two CLI tests returned
+`resource_limited`, and a redundant Rust library build was killed. The full
+550-case run passed when executed alone, with assertions and timeouts intact.
+The Rust test passed when built separately with `cargo test --release
+--locked -p aisim-core --lib
+qualified_mamba_round_trips_and_schema_30_layout_is_rejected`.
+Detailed attempt logs remain outside the checkout in the repair scratch area.
+The two outstanding evidence/contract decisions above remain open.
+
+## Scoped review repair after 25c42411
+
+Source correction: `4177ff01a63823f787949fcf854d8a8fd426069d`.
+The baseline is the published starting head
+`25c424119adaa47ad6c748d982719384e8a16b04`.
+[scoped-xpu-width-4177ff01.json](mamba-mixed-step-accounting/scoped-xpu-width-4177ff01.json)
+records an isolated native SOL scan graph, with both Python XPU caller versions
+using the candidate native engine. It is a caller-accounting comparison, not
+a complete historical replay, silicon measurement, calibration or host-speed
+measurement. Occupancy is fixed at two decoders and four admitted requests.
+The artifact fingerprints the loaded Python sources and its driver.
+
+Reproduce with an optimized wheel containing the source correction:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/scoped_xpu_width.py \
+  --candidate-revision 4177ff01a63823f787949fcf854d8a8fd426069d OUT.json
+```
+
+For ISL 4096, OSL 64, capacity 514 and two width-four decoders:
+
+| Quantity | Before | After |
+| --- | ---: | ---: |
+| Fresh prefill tokens in the first mixed step | 512 | 506 |
+| Decode query tokens | 8 | 8 |
+| Total scheduled tokens | 520 | 514 |
+| First mixed latency, ms (cold or prefix 3000) | 0.003025853506493506 | 0.0030097953246753244 |
+| Cold TTFT, ms | 0.43498884088462564 | 0.43721010221964446 |
+| Prefix-3000 TTFT, ms | 0.4131098895712664 | 0.4131098895712664 |
+
+The cold prompt now needs nine chunks (eight 506-token chunks and a 48-token
+tail) instead of eight 512-token chunks. That extra native scan/state and
+concurrent decode contribution explains the increased cold TTFT despite the
+smaller first step. The cached suffix still needs three chunks, so its total
+work and TTFT stay unchanged. The native regression
+`test_speculative_xpu_ttft_reserves_packed_decode_width_for_every_native_chunk`
+checks the chunk coordinates and a hand-derived traffic oracle. The FPM
+target/draft regression also uses a validated ngram configuration with
+`nextn=3`, retains the width-one control and checks capacity after translation.
+
+For the SGLang FPM case (batch 4, ISL 4096, prefix 3000, OSL 2, capacity 8192),
+the native query schedules one 1096-token suffix and three decoders. Result
+counts change from two/two to one/three; the synthetic exact-row prediction
+remains 13 ms. Capacity-based memory reservation remains 8194 tokens with two
+MTP-scaled reservation slots, independently checked by the memory-hook test.
+For qualified op-level Mamba, an overlong scheduled partial extend now raises
+before querying any operation. Aggregate capacity is explicitly translated
+first: 2048 becomes 1096 and 6000 becomes 5192 at prefix 3000 / ISL 4096,
+retaining the previously priced 1096/2192 fresh tokens and state counts.
+
+The 412 affected Python tests and both required parity modules plus the
+single-oracle contract (400 cases) passed with unchanged numerical goldens.
+Full Python lint/format and documentation-link checks passed. The optimized
+wheel was built before parity testing with Rust 1.91.1 and Python 3.12.12.
+The final Python-only qualification filter was copied into that isolated
+environment; source fingerprints verify the imported files against the source
+correction. The later Rust fixture edit changes test-only code.
+A subsequent Rust test build with thin LTO exceeded this container's 5 GiB
+memory limit. A lower-memory rerun exposed a SOL/SILICON mismatch in the new
+Rust boundary-test fixture; the fixture now uses SOL consistently. The final rerun passed all 127 runtime tests using `CARGO_PROFILE_RELEASE_LTO=false`,
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`, and `CARGO_BUILD_JOBS=2`.
+Strict crate-wide Rustdoc validation still reports nine unresolved links on
+unchanged baseline text, including feature-gated Python names and `Op` aliases.
+The scoped `run_context_ops` links are gone and the referenced planned walker
+exists. These broader Rustdoc errors were not repaired in this comment scope.
+On verification recovery, the runtime module gained a
+`deny(rustdoc::broken_intra_doc_links)` lint when its `python` embedding API is
+enabled. `cargo doc --release --locked --features python --lib --no-deps`
+passes with that scoped denial active. A negative control temporarily restored
+the reviewed `run_context_ops` link and confirmed Rustdoc rejected it; the
+corrected source was restored before the passing final run. Unrelated baseline
+warnings remain visible. This follow-up changes documentation validation only;
+the numerical source and the native binary used by the passing suites above
+are unchanged.
+A concurrent Python verification attempt hit the CLI host-memory guard in two
+cases; the final run executes separately from native compilation. Four stale
+expectations in the generation-only control were also corrected to retain its
+legacy coordinates. Detailed commands and attempt logs remain in the repair
+scratch area.
+Full CI has not run on this corrective head; workflow-list access returned 403
+through the read-only facade. Fresh CI, reviews and reapproval remain controller
+responsibilities. The two earlier evidence/contract decisions remain open.
+
+Host-cost assessment: validation and request-count arithmetic are constant
+work per call. Aggregate translation scans the context phase list for qualified
+Mamba on a cache miss, retains no new state, and adds no pricing query. Exact
+XPU prefill may require an additional chunk when the correct decode reservation
+crosses a boundary; that is necessary modeled work, not redundant host work.
+
+## Scoped aggregate repair after `1173b040`
+
+Source correction: `56591a7deb2a9b3ff45813614ccc6146383f061b`, compared with
+`1173b040d1539fb316b764ac718b004c14063fb5`. The three aggregate findings
+(`PRRT_kwDOT0t9uc66ibwo`, `PRRT_kwDOT0t9uc66ibwq`, and
+`PRRT_kwDOT0t9uc66ibwr`) are addressed independently of the unavailable Qwen
+run provenance (`PRRT_kwDOT0t9uc66ibwn`, qualified beside its original link).
+
+- Qualified aggregate prefill is capped by request slots left after decode,
+  including the boundary where the generic heuristic would assign every
+  request to decode. Direct mixed calls can still schedule two full prefills.
+- Aggregate summary reuse includes the Mamba state-cache dtype. A real
+  non-MTP Nano FP32-to-FP16 rebuild reuses its compiled timing handle, but its
+  warm FP16 memory equals a cold FP16 result and its OOM verdict is recomputed.
+- Cached batched text prefill counts uncached chunks and their state transfers.
+  Exact chunk pricing retains fixed decode KV lengths for the other requests,
+  including native per-op energy, sources and power coverage. Uniform cold
+  chunks keep their original amortized query and 32-step control.
+
+The native scan/norm micrograph regression has an independent traffic oracle:
+18,560 activation bytes per fresh scan token, 2,097,152 bytes per state
+read/write pair, and two bytes per shared norm token, divided by system memory
+bandwidth. For batch four and suffix 1024 with budget 512, eight mixed steps
+process 4096 fresh tokens and eight state transfers; the old 32-step weight
+processed 16,384 tokens and 32 transfers. Prefix 3000 instead requires twelve
+steps, including each request's 72-token tail. The regression also checks the
+existing vLLM queue/dispatch calibration and resulting public throughput.
+
+Reproducible full-graph SOL comparisons and paired host measurements are in
+[`scoped-aggregate-56591a7d.json`](mamba-mixed-step-accounting/scoped-aggregate-56591a7d.json).
+These are analytical predictions and local host timings, not serving accuracy.
+For built-in Nano MTP3, batch four, ISL 4096, OSL 64 and budget 512:
+
+| Prefix | Mixed steps, before → after | Weighted Mamba ms | Output tokens/s |
+| --- | --- | --- | --- |
+| 3072 | 32 → 8 | 22.658748 → 5.664687 | 394.104490 → 485.333194 |
+| 3000 | 32 → 12 | 22.658748 → 7.194027 | 394.073957 → 470.188180 |
+| 0, cold control | 32 → 32 | 22.658748 → 22.658748 | 393.446444 → 393.446444 |
+
+Both cold MTP and non-Mamba control predictions are unchanged. The driver's
+diagnostic Mamba sum normalizes numpy/Python scalar types before accumulation;
+its initial exact comparison exposed a one-ulp diagnostic difference, while
+TTFT, TPOT and throughput were already identical.
+
+The driver loads the three changed baseline `BaseBackend` methods from the
+pinned source into the same installed optimized wheel. Native code and all
+other dependencies are shared; this is a caller comparison, not two independently
+built wheel revisions. The artifact records source/driver/native SHA256 values,
+explicit case inputs and all six alternating round orders. Each round uses
+30 paired aggregate misses with warm native handles and 200 cache hits per
+miss. Timers exclude setup, native compilation and result formatting. Run:
+
+```bash
+git show 1173b040d1539fb316b764ac718b004c14063fb5:python/aisim/src/aisim_core/sdk/backends/base_backend.py > "$TMPDIR/baseline-base_backend.py"
+python benchmarks/evidence/mamba-mixed-step-accounting/scoped_aggregate_perf.py \
+  "$TMPDIR/baseline-base_backend.py" \
+  1173b040d1539fb316b764ac718b004c14063fb5 \
+  56591a7deb2a9b3ff45813614ccc6146383f061b "$TMPDIR/scoped-aggregate.json"
+```
+
+Median aggregate miss cost changes from 130.9 to 255.1 us for prefix 3072
+(candidate round medians 250.5–267.5 us), and 138.3 to 308.9 us for the
+three-chunk prefix-3000 case (296.8–322.6 us). Exact per-prefix native queries
+and one fixed-decode pass account for this necessary cold-summary work.
+The earlier implementation also repriced uniform cold chunks unnecessarily;
+retaining their original query reduced that candidate cost from about 521 us
+to 139.6 us (127.8–158.8 us), versus 127.6 us baseline (116.0–139.4 us).
+Non-Mamba misses are 95.9 to 98.3 us. Aggregate hits change by at most 0.06 us
+in these medians (about 3 us total), with no additional memoization cache or
+retained chunk history. Chunk processing retains O(operations) evidence and prices one
+request's chunk sequence, independent of batch size. Native Replay does not
+call this aggregate summary path; no simulator event-loop code changed.
+
+Final local checks use Python 3.12.12, locked Python dependencies and a Rust
+1.96.0 `maturin build --release --locked` wheel with the repository's optimized
+release profile, extension-module and jemalloc features. The imported Python
+sources match the committed correction. Results: 91 base-backend tests,
+271 related XPU/adapter/model/single-oracle tests, and 390 engine-step/compile
+parity tests pass. The existing forward-perf worker also executes its Qwen3-32B
+SILICON context and generation controls successfully. Repository Python lint,
+format and whitespace checks pass; no numerical goldens changed.
+
+The pinned baseline reproduced five regression failures and one passing cold
+control. An intermediate adapter test caught an extra default dictionary key;
+metadata capture is now opt-in, and the original assertion passes unchanged.
+Root-directory wheel/format setup invocations and one evidence-driver lint
+invocation were corrected before the successful final checks. Attempt logs and
+`verification-history.json` remain in the repair scratch directory. Fast/Full
+CI, fresh bot reviews, technical reapproval and human approval remain controller
+or maintainer responsibilities; these local results do not satisfy those gates.
+
+### Scoped comment repair after `d32fb0aa`
+
+Corrective code commit `32d50c27d31f63c124e9eb042853cf46ecb05847`
+addresses two independent cache/sweep defects:
+
+- Native operation setters advance a process-wide mutation epoch. The Python
+  engine-identity memo checks it before reusing a serialized graph, so an edit
+  through either a Python shell or a raw native operation cannot reuse an old
+  aggregate summary or compiled handle. Native operation construction does
+  not advance the epoch. An edit conservatively expires other models' identity memos, but
+  unchanged serialized identities still reuse their handles and summaries.
+  The name-edit regressions warm both caches, rename a context or generation
+  scan to the reserved `context_attention (scaled)` name, and require the same
+  rejection as a cold graph at both the old and a new workload. Scale and GEMM
+  field edits also compare the repriced result with a cold copy.
+  Follow-up `2d873da1a173b0c9576f71bc67476955d6cb5bbc` resolves compiler-owned
+  attention lanes before taking the identity and skips equal-value lane writes.
+  This retains both first-summary reuse and negative-handle caching. Those
+  existing assertions initially failed under the new epoch and pass with the
+  preparation correction; neither assertion was changed.
+- An aggregate sweep skips the same single-request qualified visual chunks
+  that `run_agg` rejects, before pricing or recording candidates. Direct calls
+  retain that rejection. With effective ISL 4096, prefix 3000 and stride 512,
+  the sweep reaches budget 1536 after excluding 512 and 1024. Without a cached
+  prefix it reaches 4096. The regression exercises the real sweep and native
+  scan pricing, with only the unrelated memory estimate replaced.
+
+#### Complete canonical forward remeasurement
+
+The original canonical forward record remains unchanged and is labeled
+summary-only above. Its missing warm samples have not been reconstructed.
+[canonical-mtp-forward-refresh-32d50c27.json](mamba-mixed-step-accounting/canonical-mtp-forward-refresh-32d50c27.json)
+is a new complete six-round measurement using the existing
+[`canonical_mtp_forward_rounds.py`](mamba-mixed-step-accounting/canonical_mtp_forward_rounds.py)
+and [`canonical_mtp_forward.py`](mamba-mixed-step-accounting/canonical_mtp_forward.py).
+Every round alternates which side runs first, with a fresh interpreter for
+each side. All 96 query records retain their 100 individual warm samples:
+9600 samples in total. The regression in
+[`test_canonical_mtp_forward_samples.py`](mamba-mixed-step-accounting/test_canonical_mtp_forward_samples.py)
+recomputes every mean, median, percentile and range, checks the loaded source
+identities, and requires unchanged non-Mamba control predictions.
+
+As in the original constructor comparison, restore only `nemotron_h.py`
+byte-for-byte from `22a3fec3c24613fd68cf056a83ede789bd74cf8d` in a copy of
+the installed candidate SDK. The baseline and candidate constructor SHA-256
+values are respectively
+`233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2` and
+`187a7c4c3bee1494ec90d9177ee1810af525e0ee45ca3574bd770e538ba9cfcc`.
+All other SDK files, dependencies and packaged performance data are identical.
+Both sides use the `32d50c27` native binary, SHA-256
+`01c3f6422a18fadcd1b8341068922efc581195baa3db0b33253b9e95a6e5c712`.
+It was built with Rust 1.91.1 and `maturin build --release --locked` from
+`python/aisim`, with extension-module/jemalloc features, optimization level 3,
+thin LTO, one codegen unit and `CARGO_BUILD_JOBS=2`. All 269 native source
+inventory entries matched the checkout. The host was an i9-14900K under
+Linux/WSL2, Python 3.12.12, with a 5 GiB container memory limit. Full build,
+driver and source fingerprints are recorded alongside the new rounds.
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/canonical_mtp_forward_rounds.py \
+  BASE_SDK CANDIDATE_SDK OUT.json
+```
+
+Here `BASE_SDK` and `CANDIDATE_SDK` contain the installed `aisim` and
+`aisim_core` packages; the runner verifies both loaded paths. The record adds
+build provenance to the unmodified round output. Construction time, the
+first unseen query after the 64-token prime, and warm queries after ten
+warmups retain their original separate timing boundaries. Across the eight
+model/query cells, medians of round warm medians change by -1.9% to +1.2%
+(at most 0.046 us). Some individual baseline/control rounds reached
+5.5–6.0 us, versus typical 2.3–2.9 us. These are host timing observations
+for the constructor comparison, not a reconstruction of the historical
+native build, a full-PR performance qualification or serving-accuracy evidence.
+
+#### Mutation-check host cost
+
+[`cache_identity_perf.py`](mamba-mixed-step-accounting/cache_identity_perf.py)
+compares the exact pinned `d32fb0aa` Python bridge with the `2d873da1` bridge,
+on the same candidate native extension and model constructors. Restore only
+`aisim_core/sdk/rust_engine_step.py` from the pinned revision in another copy
+of the installed SDK. Run from the repository root:
+
+```bash
+python benchmarks/evidence/mamba-mixed-step-accounting/cache_identity_perf.py \
+  BASE_SDK CANDIDATE_SDK OUT.json
+```
+
+[cache-identity-perf-2d873da1.json](mamba-mixed-step-accounting/cache-identity-perf-2d873da1.json)
+retains six alternating fresh-process rounds, identities, setup and first-query
+times, and all 7200 warm samples after 1000 warmups per cell. It requires equal
+predictions, native/compiler hashes and constructors, and different bridge hashes. Both
+models use vLLM 0.24.0, B200 SOL, TP1, effective ISL 4096, prefix 3000, OSL64,
+budget 512 and batch four; Nano is MTP3 and Qwen3-0.6B is the MTP0 control.
+The direct mixed call uses three decoders. Aggregate misses clear only the
+summary cache; they reuse the warmed compiled handle. Setup covers model and
+database preparation, excluding imports. The table gives medians of round
+warm medians, pinned bridge / corrected bridge, in microseconds:
+
+| Caller | Nano MTP3 | Qwen control |
+| --- | --- | --- |
+| SDK mixed step, warm native memo | 1.855 / 1.899 | 1.633 / 1.712 |
+| Aggregate summary miss | 317.359 / 322.995 | 101.722 / 101.388 |
+| Aggregate summary hit | 3.245 / 3.316 | 3.167 / 3.289 |
+
+The direct Nano helper increases by 0.044 us (+2.4%); the Qwen helper by
+0.079 us (+4.8%). The identity check itself adds one atomic read/native call
+and one scalar comparison, independent of graph size, with one additional
+memo field and no graph scan or retained graph copy. An isolated six-pair,
+100,000-call `timeit` comparison of the exact old/new identity functions on
+the same warmed graph measured 0.128–0.152 / 0.157–0.184 us. The native epoch
+call alone was 0.015–0.016 us. Process-level timings also varied: Nano miss
+medians ranged 309–334 / 304–351 us, and one baseline control hit cell reached
+6.7 us. Initial runs before the lane-preparation correction were noisier and
+showed a larger Nano helper delta; their records remain in repair scratch.
+
+The constant-time check is necessary to observe edits through raw native
+setters; serializing every operation per query would scale with graph size,
+while tracking every operation owner adds ownership machinery to rare edits.
+The measured bounded check is retained. The sweep filter runs once per sweep
+and only tests eligible budgets; nonvisual graphs do not scan qualifications.
+Native Replay's scheduler and iteration execution are unchanged, and the
+canonical compiled model does not re-enter this Python identity check on each
+query. These measurements cover SDK caller cost, not serving prediction accuracy.
+
+
+### Reproducing historical XPU comparisons
+
+To reproduce `xpu_scoped_repair.py --candidate-revision REV`, first check out
+`REV` and reinstall that revision's SDK into the selected interpreter. The
+driver compares the imported backend bytes with that commit. A current
+installation cannot reproduce an older revision merely by passing its SHA.
+
+The refreshed [XPU width fixture](mamba-mixed-step-accounting/scoped-xpu-4e940e38.json)
+records all five backend stub returns and the fixed `_compute_ttft` inputs.
+Its token counts and mixed latency come from native SOL queries; its TTFT
+combines that result with the recorded synthetic constants. It is neither a
+complete historical replay nor a host-cost or accuracy measurement.
+
+### Scoped review correction
+
+Completed qualified prefills now use full-prompt coordinates at the native
+boundary. With batch 4, ISL 4096, prefix 3000 and a 2048-token budget, each
+1096-token suffix completes one request. Four iterations therefore pay four
+whole-request attention queries, matching the 4096-budget run, while Mamba
+still transfers four suffixes and four state pairs. Previously those queries
+were divided by `ceil(4096/1096) = 4`, charging only one attention query in
+total. `test_completed_qualified_prefill_retains_whole_request_attention`
+checks latency, iteration counts and TTFT at budgets 1096, 2048 and 4096.
+
+The private mixed-step metadata additionally retains native decode covered
+latency before folding names. Replacing a shortened decode pass uses that
+subtotal, so a powered query sharing a name with an unpowered query never
+turns the latter into covered work. This adds one scalar accumulator per
+decode pass and no retained per-request state. The completed-prefill fix
+changes query coordinates without adding native calls; count reporting and
+list alias preservation add constant-time work only.
+
+### November 25 scoped review repair
+
+The scoped correction starts at `c97486d4a4331aa926c0fcd994d686a0b2f671b9`
+and integrates main `2fa6dc1b9c51c3c698103b261c803712188760e3`.
+The additional boundary cases establish these independently explained results:
+
+- Batch two, ISL 16, OSL 8 and verification width four at total budget four
+  admit no mixed decoders. All seven remaining decode iterations run after
+  prefill; the aggregate no longer charges zero generation work.
+- At cold prefill budget 4097, a width-four decoder leaves 4093 fresh slots.
+  The native anchors are `(4093, prefix 0)` and `(3, prefix 4093)`, priced by
+  invented exact FPM rows at 22 and 6 ms. Their mean is 14 ms. Width one
+  completes all 4096 tokens in one chunk at the same budget.
+- Qualification in either phase selects the bounded prefill split. For
+  ISL 100, prefix 60, capacity 140 and two width-four decoders, shared work
+  covers 40 + 40 + 8 = 88 positions. A scheduled partial extend of 50
+  tokens is rejected because the suffix has only 40. Aggregate capacity
+  is normalized before pricing, including generation-only qualification;
+  the earlier generation-only legacy-coordinate control is superseded.
+- A native powered 3 ms attention query and unpowered 7 ms norm with the
+  same name fold to 10 ms, while native coverage remains 3 ms through the
+  Python bridge. Separate native single-op queries calibrate repetitions;
+  the coverage scalar is not supplied by a fake.
+
+Replay rejects non-unit `decode_speedup_ratio` for qualified prefill graphs
+at construction. The AR regression checks rejection independently of MTP's
+existing restriction, and checks the unit-ratio price of heterogeneous
+one-token and sixteen-token chunks against 17 activation transfers and two
+physical state transfers. Invalid qualified recurrent-state dimensions fail
+validation, and the unused balanced group at `u32::MAX` cannot overflow.
+
+Cache invalidation still uses a constant-time native epoch check on warm
+queries. Draft-width assignment/deletion advances that clock only when the
+marker changes. Iterable graph edits advance the list revision for each
+installed item, retaining linear edit cost and a final invalidation on failure;
+only self-extension needs a snapshot. These edits happen during graph changes,
+not unchanged predictions. Aggregate count/provenance fixes add scalar work
+per summary miss. Extending qualified capacity normalization to the generation
+phase scans that phase during scheduling, retains no additional graph copy,
+and avoids pricing invalid partial chunks. These are source-level cost bounds,
+not new host-speed or serving-accuracy measurements.
+
+The timing driver now performs all 200 cache-hit calls even with optimized
+Python, and the canonical replay driver rejects ambient model-config overrides
+before collecting provenance. Historical replay samples retain their original
+hashes: their audit reconstructs the exact pre-guard driver bytes and verifies
+the recorded digest, rather than relabeling the old measurement as a new run.
+
+Validation used Python 3.12.12 and Rust 1.91.1. The optimized wheel was built
+before native parity with `maturin build --profile ci --locked`, inheriting
+release optimization with LTO disabled and 16 codegen units to fit the 5 GiB
+container. Its 277 embedded native-source digests and installed SDK Python
+files match the corrected source. Native SHA256:
+`071c11c4d74d08ecdffb8de9def9e8296ba880f37f67f1643ae77087f191105a`.
+
+The seven affected SDK modules and evidence tests passed all 817 cases.
+Both required parity modules plus the single-oracle contract passed all 400
+cases without changing numerical goldens. Rust `cargo test --lib --locked
+--features embed-python mamba` passed 72 cases with overflow checks enabled;
+the merged mixed-composite coverage and powered FPM evidence regressions each
+passed separately. Ruff, formatting, documentation links, packaged legal
+files and copyright checks passed.
+
+All data stayed local. Explicit historical-version SDK tests used tables
+archived from the starting commit. Parity used main's last committed tables
+at `1e321d5848ffc09dc7686cbc819eaf3dc5f52eac`, before their externalization,
+converted with the repository's local publisher and verified offline loader.
+This includes the updated vLLM 0.32.0, SGLang 0.5.23 and TRT-LLM 1.4.0rc2
+coordinates that main's goldens require. No model weights were downloaded.
+
+Earlier attempts are retained in repair scratch: concurrent native builds
+exceeded memory; a first collection attempted the unavailable external data
+endpoint; stale merged fixtures and interfaces failed before correction;
+and parity against the starting commit's older data drifted. The final
+optimized build, offline fixtures and passing reruns above supersede those
+attempts. The source inventory explicitly lists the three draft-width marker
+accessors: they invalidate cache identity and compute no performance values.
+Local verification does not replace Full CI, fresh reviews or technical
+reapproval after a Full CI failure.

@@ -88,6 +88,7 @@ def model():
     model.model_path = "test-model"
     model.model_name = "test-model"
     model.forward_model = "op_level"
+    model.architecture = "test-arch"  # run_agg keys its result cache by the engine identity
     model._nextn = 0
     model.get_resident_weights_bytes.return_value = 0.0
     model.get_additional_activation_bytes.return_value = 0.0
@@ -513,7 +514,7 @@ def test_run_agg_with_osl_one_does_not_divide_by_zero(
     )
 
     row = summary.get_summary_df().iloc[0]
-    assert row["tpot"] > 0.0
+    assert row["tpot"] == 0.0  # no generated tokens after the prefill token
     assert row["tokens/s/user"] == 0.0
 
 
@@ -572,6 +573,65 @@ def test_run_agg_b1_uses_scheduled_activation_peak(
 
     assert [(call["num_tokens"], call["mtp_scaled_tokens"]) for call in memory_calls] == expected_memory_calls
     assert summary.get_memory()["activations"] == pytest.approx(expected_activations)
+
+
+@pytest.mark.parametrize(
+    ("forward_model", "ctx_tokens", "context_tokens", "activation_tokens"),
+    [
+        # Op-level pricing reads prompt tokens: the whole 8-token prompt fits.
+        ("op_level", 8, [8], 6),
+        ("op_level", 4, [6, 8], 4),
+        # A whole-model FPM reads new tokens: 6 is one request, not two.
+        ("fpm", 8, [6], 6),
+        ("fpm", 4, [4, 2], 4),
+    ],
+)
+def test_run_agg_b1_schedules_one_request_and_sizes_its_new_tokens(
+    monkeypatch, backend, model, database, forward_model, ctx_tokens, context_tokens, activation_tokens
+) -> None:
+    # isl 8 with 2 cached tokens: the step schedules 6 new tokens, at most the budget.
+    model.forward_model = forward_model
+    steps: list[MixedStepInput] = []
+    memory_calls: list[dict] = []
+
+    def run_mixed(_model, _database, _runtime, step):
+        steps.append(step)
+        return StepEstimate(latency_ms=1.0, energy_wms=1.0)
+
+    monkeypatch.setattr(backend, "run_mixed", run_mixed)
+    monkeypatch.setattr(
+        backend, "_get_genonly_step_estimate", lambda *_: _decode_step(1.0, 1.0, {"decode": 1.0}, {"decode": "sol"}, ())
+    )
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *_, **kw: memory_calls.append(kw) or {"total": 1.0})
+    backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(batch_size=1, isl=8, osl=1, prefix=2, engine_step_backend="rust"),
+        ctx_tokens=ctx_tokens,
+    )
+    assert [step.context_tokens for step in steps] == context_tokens
+    assert [call["num_tokens"] for call in memory_calls] == [activation_tokens]
+
+
+def test_run_agg_b1_fully_cached_fpm_prompt_reaches_the_prefix_check(monkeypatch, backend, model, database) -> None:
+    # No new token to schedule: the step keeps a positive budget, so the engine's
+    # prefix check (not MixedStepInput) rejects the point, as for op-level graphs.
+    model.forward_model = "fpm"
+    steps: list[MixedStepInput] = []
+
+    def run_mixed(_model, _database, _runtime, step):
+        steps.append(step)
+        raise RuntimeError("isl must be greater than prefix")
+
+    monkeypatch.setattr(backend, "run_mixed", run_mixed)
+    with pytest.raises(RuntimeError, match="isl must be greater than prefix"):
+        backend.run_agg(
+            model,
+            database,
+            RuntimeConfig(batch_size=1, isl=8, osl=1, prefix=8, engine_step_backend="rust"),
+            ctx_tokens=4,
+        )
+    assert [step.context_tokens for step in steps] == [4]
 
 
 def test_run_mixed_returns_components_and_counts_speculative_query_tokens(
@@ -1204,6 +1264,8 @@ def test_run_agg_retains_schedule_weighted_energy_for_publication(
     mixed = StepEstimate(
         latency_ms=10.0,
         energy_wms=9000.0,
+        context_tokens=8,
+        num_decode_requests=1,
         covered_latency_ms=9.0,
         per_op_latency_ms={"gemm": 9.0, "missing": 1.0},
         per_op_energy_wms={"gemm": 9000.0, "missing": 0.0},
@@ -1258,3 +1320,1159 @@ def test_run_agg_zero_decode_steps_do_not_change_energy_coverage(
     assert summary.get_aggregate_energy_breakdown()["genonly_step"].latency_ms == 0
     assert summary.get_power_data_coverage() == pytest.approx(expected)
     assert (_apply_power_coverage_gate(summary, summary.get_result_dict())["power_w"] is not None) is published
+
+
+@pytest.mark.parametrize(
+    "prefix,budget,expected_chunks,qf",
+    [
+        (2048, 1024, [(3072, 2048), (4096, 3072)], 1.95),
+        (1792, 1024, [(2816, 1792), (3840, 2816), (4096, 3840)], 2.00),
+        (3000, 2048, [(4096, 3000)], 1.90),
+    ],
+)
+def test_run_agg_single_request_counts_every_prefill_chunk(
+    backend, model, database, monkeypatch, prefix, budget, expected_chunks, qf
+):
+    # A synthetic per-chunk oracle: 1 ms launch + 0.01 ms/new token, with
+    # 10 W-ms launch + 0.2 W-ms/new token. Decode is one 3 ms, 90 W-ms step.
+    # The last partial chunk pays its own launch and only its remaining tokens.
+    calls = []
+    raw_steps = []
+
+    def prefill(_model, _database, runtime, step):
+        calls.append((runtime.isl, runtime.prefix))
+        tokens = runtime.isl - runtime.prefix
+        latency, energy = 1 + tokens * 0.01, 10 + tokens * 0.2
+        estimate = StepEstimate(
+            latency_ms=latency,
+            energy_wms=energy,
+            covered_latency_ms=latency,
+            per_op_latency_ms={"prefill": latency},
+            per_op_energy_wms={"prefill": energy},
+            per_op_source={"prefill": "silicon"},
+            context_tokens=step.context_tokens,
+        )
+        raw_steps.append(estimate)
+        return estimate
+
+    monkeypatch.setattr(backend, "run_mixed", prefill)
+    monkeypatch.setattr(
+        backend,
+        "_get_genonly_step_estimate",
+        lambda *_: _decode_step(3.0, 90.0, {"decode": 3.0}, {"decode": "silicon"}, ()),
+    )
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(batch_size=1, isl=4096, prefix=prefix, osl=2, engine_step_backend="rust"),
+        ctx_tokens=budget,
+    )
+    assert calls == expected_chunks
+    count = len(expected_chunks)
+    prefill_ms, prefill_energy = count + (4096 - prefix) * 0.01, count * 10 + (4096 - prefix) * 0.2
+    result = summary.get_result_dict()
+    assert result["ttft"] == pytest.approx(
+        prefill_ms * qf
+    )  # unchanged base queue heuristic, at the uncached step count
+    assert result["tokens/s"] == pytest.approx(1000 / (prefill_ms + 3))
+    groups = summary.get_aggregate_energy_breakdown()
+    assert groups["mix_step"].latency_ms == pytest.approx(prefill_ms)
+    assert groups["mix_step"].energy_wms == pytest.approx(prefill_energy)
+    assert groups["mix_step"].covered_latency_ms == pytest.approx(prefill_ms)
+    evidence = summary.get_step_estimates()
+    assert evidence["scheduling"]["mix_context_token_budget"] == budget
+    assert evidence["scheduling"]["mix_step_latency_ms"] == pytest.approx(prefill_ms / count)
+    assert evidence["scheduling"]["mix_step_energy_wms"] == pytest.approx(prefill_energy / count)
+    if count > 1:
+        assert "mixed" not in evidence
+        assert "mix_context_tokens" not in evidence["scheduling"]
+        assert groups["mix_step"].context_tokens == 0
+        assert [step.context_tokens for step in raw_steps] == [isl for isl, _ in expected_chunks]
+    else:
+        assert evidence["mixed"] is raw_steps[0]
+        assert evidence["mixed"].context_tokens == 4096
+        assert evidence["scheduling"]["mix_context_tokens"] == 4096
+    assert result["power_w"] == pytest.approx((prefill_energy + 90) / (prefill_ms + 3))
+
+
+@pytest.mark.parametrize("sources", [("silicon", "sol"), ("silicon", "sol", "silicon"), ("sol", "sol")])
+def test_run_agg_chunk_sources_preserve_mixed_provenance(backend, model, database, monkeypatch, sources):
+    labels = iter(sources)
+
+    def prefill(*_):
+        return StepEstimate(
+            latency_ms=1.0,
+            energy_wms=0.0,
+            per_op_latency_ms={"context_prefill": 1.0},
+            per_op_source={"context_prefill": next(labels)},
+        )
+
+    monkeypatch.setattr(backend, "run_mixed", prefill)
+    monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: _decode_step(1, 0, {}, {}, ()))
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(batch_size=1, isl=1024 * len(sources), osl=2, engine_step_backend="rust"),
+        ctx_tokens=1024,
+    )
+    assert summary.get_per_ops_source()["mix_step"]["context_prefill"] == ("sol" if len(set(sources)) == 1 else "mixed")
+
+
+@pytest.mark.parametrize(
+    "prefix,budget,expected_steps,qf",
+    [
+        (2048, 1024, 4, 1.95),
+        (1792, 1024, 4, 2.00),  # partial final uncached chunk
+        (2816, 512, 8, 2.00),
+        (0, 1024, 4, 2.05),
+        (3000, 2048, 1, 1.90),  # all uncached tokens fit
+        (2048, 4096, 1, 1.90),
+    ],
+)
+def test_run_agg_visual_fallback_preserves_whole_prefill_attention(
+    backend, model, database, monkeypatch, prefix, budget, expected_steps, qf
+):
+    from aisim.sdk.backends import base_backend as base_backend_module
+
+    # Effective ISL is 4096: 3072 text + 1024 image tokens. The unchanged
+    # native mean-field contract amortizes a whole-prefill attention price
+    # over ceil(effective ISL / budget), even with a cached prefix. Use an
+    # independent synthetic price of 12 ms / 1200 W-ms for that whole query,
+    # 4 ms / 400 W-ms of visual-mask work, and 2 ms / 200 W-ms shared per step.
+    model.encoder_config = _vision_encoder_config()
+    model.visual_context_ops = [_StaticOp("visual_attention", 4.0, 400.0)]
+    calls = []
+
+    def native_breakdown(_model, _database, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["isl"] == 4096
+        scale = -(-4096 // kwargs["ctx_tokens"])
+        latency = {"shared_non_attention": 2.0, "context_attention": 12.0 / scale}
+        energy = {"shared_non_attention": 200.0, "context_attention": 1200.0 / scale}
+        return {
+            "latency_ms": sum(latency.values()),
+            "energy_wms": sum(energy.values()),
+            "component_latency_ms": latency,
+            "component_energy_wms": energy,
+            "per_op_latency_ms": {"shared": 2.0, "context_attention (scaled)": 12.0 / scale},
+            "per_op_energy_wms": {"shared": 200.0, "context_attention (scaled)": 1200.0 / scale},
+            "per_op_source": {"shared": "silicon", "context_attention (scaled)": "silicon"},
+            "covered_latency_ms": sum(latency.values()),
+            "moe_comm_fallbacks": (),
+        }
+
+    monkeypatch.setattr(base_backend_module, "estimate_mixed_step_breakdown_with_rust", native_breakdown)
+    monkeypatch.setattr(
+        backend,
+        "_run_visual_context_phase",
+        lambda *_: ({"visual_attention": 4.0}, {"visual_attention": 400.0}, {"visual_attention": "silicon"}),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get_genonly_step_estimate",
+        lambda *_: _decode_step(3.0, 90.0, {"decode": 3.0}, {"decode": "silicon"}, ()),
+    )
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=1,
+            isl=3072,
+            prefix=prefix,
+            osl=2,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+            engine_step_backend="rust",
+        ),
+        ctx_tokens=budget,
+    )
+    assert len(calls) == 1  # retain the visual mean-field fallback
+    prefill_ms = 16.0 + 2.0 * expected_steps
+    prefill_energy = 1600.0 + 200.0 * expected_steps
+    result = summary.get_result_dict()
+    assert result["ttft"] == pytest.approx(prefill_ms * qf)
+    assert result["tokens/s"] == pytest.approx(1000 / (prefill_ms + 3))
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    assert group.per_op_latency_ms["context_attention (scaled)"] == pytest.approx(12.0)
+    assert group.per_op_latency_ms["visual_attention"] == pytest.approx(4.0)
+    assert group.per_op_energy_wms["context_attention (scaled)"] == pytest.approx(1200.0)
+    assert group.per_op_energy_wms["visual_attention"] == pytest.approx(400.0)
+    assert group.latency_ms == pytest.approx(prefill_ms)
+    assert group.energy_wms == pytest.approx(prefill_energy)
+    assert group.covered_latency_ms == pytest.approx(prefill_ms)
+    assert result["power_w"] == pytest.approx((prefill_energy + 90) / (prefill_ms + 3))
+
+
+@pytest.mark.parametrize("prefix,budget", [(2048, 1024), (2816, 512)])
+def test_run_agg_visual_fallback_retains_native_attention(backend, prefix, budget, monkeypatch):
+    from collections import OrderedDict
+
+    from aisim_core.sdk import rust_engine_step
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+    from aisim_core.sdk.rust_engine_step import estimate_static_latency_breakdown_with_rust
+
+    monkeypatch.setattr(rust_engine_step, "_ENGINE_HANDLE_CACHE", OrderedDict())
+
+    # Isolate real native attention from a bundled graph; no weights or
+    # measured data are needed. Its static whole-prefill query is the
+    # independent, unamortized reference for the aggregate consumer.
+    model = get_model("Qwen/Qwen3-32B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops = [op for op in model.context_ops if op._name == "context_attention"]
+    assert model.context_ops
+    model.encoder_config = _vision_encoder_config()
+    model.encoder_ops = []
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    reference = estimate_static_latency_breakdown_with_rust(
+        model, database, RuntimeConfig(batch_size=1, isl=4096, prefix=prefix, osl=1), "static_ctx", 1, 1.0
+    )
+    attention_ms = sum(reference[0].values())
+    assert attention_ms > 0
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=1,
+            isl=3072,
+            prefix=prefix,
+            osl=1,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+        ),
+        ctx_tokens=budget,
+    )
+    assert summary.get_aggregate_energy_breakdown()["mix_step"].latency_ms == pytest.approx(attention_ms)
+
+
+@pytest.mark.parametrize("visual_tokens", [0, 1000])
+def test_xpu_aggregate_exact_ttft_total_is_text_only(monkeypatch, visual_tokens):
+    from aisim.sdk.backends import base_backend as base_backend_module
+    from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = VLLMXPUBackend()
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    model._num_layers = 0
+    model.encoder_config = _vision_encoder_config()
+    model.visual_context_ops = []
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 2)
+    monkeypatch.setattr(
+        backend,
+        "_run_encoder_phase",
+        lambda *_: ({"encoder": 3.0}, {"encoder": 0.0}, {"encoder": "estimated"}, visual_tokens),
+    )
+    monkeypatch.setattr(backend, "_get_encoder_component_memory_for_runtime", lambda *_: {})
+    monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: StepEstimate(0.0, 0.0))
+
+    def native_breakdown(_model, _database, **kwargs):
+        scale = -(-kwargs["isl"] // kwargs["ctx_tokens"])
+        return {
+            "latency_ms": 2.0 + 12.0 / scale,
+            "energy_wms": 0.0,
+            "component_latency_ms": {"shared_non_attention": 2.0, "context_attention": 12.0 / scale},
+            "component_energy_wms": {},
+            "per_op_latency_ms": {"shared": 2.0, "context_attention (scaled)": 12.0 / scale},
+            "per_op_source": {},
+            "moe_comm_fallbacks": (),
+        }
+
+    monkeypatch.setattr(base_backend_module, "estimate_mixed_step_breakdown_with_rust", native_breakdown)
+    totals = []
+    compute_ttft = backend._compute_ttft
+
+    def record_ttft(*args, **kwargs):
+        totals.append(kwargs.get("prefill_total_ms"))
+        return compute_ttft(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_compute_ttft", record_ttft)
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=1,
+            isl=3000 - visual_tokens,
+            osl=1,
+            num_images_per_request=int(visual_tokens > 0),
+            num_image_tokens=visual_tokens,
+        ),
+        ctx_tokens=2048,
+    )
+    # Invented attention price = 12 ms per query, shared work = 2 ms per
+    # step, encoder = 3 ms. Visual mean-field attention undoes the /2 and
+    # shared work scales by 3000/2048. Exact text pays two 14 ms queries,
+    # including the short final chunk, without applying that scaling.
+    prefill_ms = 12.0 + 2.0 * 3000 / 2048 if visual_tokens else 28.0
+    assert summary.get_result_dict()["ttft"] == pytest.approx(3.0 + prefill_ms, abs=1e-3)
+    assert totals == ([None] if visual_tokens else [prefill_ms])
+
+
+@pytest.mark.parametrize("prefix,budget,chunks,qf", [(3000, 4096, 1, 1.9), (3000, 512, 3, 2.0), (2048, 1024, 2, 1.95)])
+def test_run_agg_visual_fpm_keeps_uncached_step_count(
+    backend, model, database, monkeypatch, prefix, budget, chunks, qf
+):
+    from aisim.sdk.backends import base_backend as base_backend_module
+
+    # FPM's synthetic 5 ms/500 W-ms mean prices the fresh suffix. A nonzero
+    # 4 ms/400 W-ms whole-request visual overlay must survive the real
+    # run_mixed -> run_agg -> summary path exactly once, including a short tail.
+    model.forward_model = "fpm"
+    model.encoder_config = _vision_encoder_config()
+    model.visual_context_ops = [_StaticOp("visual_attention", 4.0, 400.0)]
+    seen = []
+
+    def native_breakdown(_model, _database, **kwargs):
+        seen.append(kwargs["ctx_tokens"])
+        return {
+            "latency_ms": 5.0,
+            "energy_wms": 500.0,
+            "component_latency_ms": {"shared_non_attention": 5.0},
+            "component_energy_wms": {"shared_non_attention": 500.0},
+            "per_op_latency_ms": {"fpm": 5.0},
+            "per_op_energy_wms": {"fpm": 500.0},
+            "per_op_source": {"fpm": "silicon"},
+            "covered_latency_ms": 5.0,
+            "moe_comm_fallbacks": (),
+        }
+
+    monkeypatch.setattr(base_backend_module, "estimate_mixed_step_breakdown_with_rust", native_breakdown)
+    monkeypatch.setattr(
+        backend,
+        "_run_visual_context_phase",
+        lambda *_: ({"visual_attention": 4.0}, {"visual_attention": 400.0}, {"visual_attention": "silicon"}),
+    )
+    monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: StepEstimate(latency_ms=0.0, energy_wms=0.0))
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=1,
+            isl=3072,
+            prefix=prefix,
+            osl=1,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+            engine_step_backend="rust",
+        ),
+        ctx_tokens=budget,
+    )
+    assert seen == [min(budget, 4096 - prefix)]
+    total_ms = 5.0 * chunks + 4.0
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    assert summary.get_result_dict()["ttft"] == pytest.approx(total_ms * qf)
+    assert group.latency_ms == pytest.approx(total_ms)
+    assert group.energy_wms == pytest.approx(total_ms * 100)
+    assert group.covered_latency_ms == pytest.approx(total_ms)
+    assert group.per_op_latency_ms["visual_attention"] == pytest.approx(4.0)
+    assert group.per_op_energy_wms["visual_attention"] == pytest.approx(400.0)
+
+
+@pytest.mark.parametrize("fresh_tokens", [2000, 2192])
+@pytest.mark.parametrize("xpu", [False, True])
+def test_batched_fpm_visual_overlay_preserves_fractional_requests(
+    backend, model, database, monkeypatch, fresh_tokens, xpu
+):
+    from aisim.sdk.backends import base_backend as base_backend_module
+
+    if xpu:
+        from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+
+        backend = VLLMXPUBackend()
+        monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
+        monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+        # Isolate aggregate overlay accounting from XPU's calibrated TTFT
+        # queries, which add their own independently scheduled overlays.
+        monkeypatch.setattr(backend, "_compute_ttft", lambda *a, **k: 1.0)
+    model.forward_model = "fpm"
+    model.encoder_config = _vision_encoder_config()
+    model.visual_context_ops = [_StaticOp("visual_attention", 1.0, 100.0)]
+    # Admit two prefills alongside two decoders; isolate the native visual
+    # pricing seam with a deliberately nonlinear batch price (batch squared).
+    monkeypatch.setattr(backend, "_mix_step_gen_tokens", lambda *_: 2)
+    monkeypatch.setattr(backend, "_get_genonly_step_estimate", lambda *_: StepEstimate(0.0, 0.0))
+    monkeypatch.setattr(
+        base_backend_module,
+        "estimate_mixed_step_breakdown_with_rust",
+        lambda *a, **kw: {
+            "latency_ms": 5.0,
+            "energy_wms": 0.0,
+            "component_latency_ms": {"shared_non_attention": 5.0},
+            "component_energy_wms": {},
+            "per_op_latency_ms": {"fpm": 5.0},
+            "per_op_source": {"fpm": "silicon"},
+            "moe_comm_fallbacks": (),
+        },
+    )
+    batches = []
+
+    def visual_phase(_model, _database, _runtime, batch):
+        batches.append(batch)
+        return (
+            {"visual_attention": float(batch**2)},
+            {"visual_attention": float(100 * batch**2)},
+            {"visual_attention": "silicon"},
+        )
+
+    monkeypatch.setattr(backend, "_run_visual_context_phase", visual_phase)
+    # The aggregate accepts prompt capacity: 4096 + 904 -> 2000 fresh
+    # tokens, or two full 4096-token prompts -> 2192 fresh tokens.
+    budget = 4096 + fresh_tokens - 1096 if fresh_tokens < 2192 else 8192
+    if xpu:
+        budget += 2  # Reserve the two width-one decoders before translation.
+    summary = backend.run_agg(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=4,
+            isl=3072,
+            prefix=3000,
+            osl=64,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+            engine_step_backend="rust",
+        ),
+        ctx_tokens=budget,
+    )
+    steps = summary.get_step_estimates()["scheduling"]["num_mix_steps"]
+    # The representative query holds 1 + 904/1096 requests, or exactly 2.
+    # A mixture of batch 1 and 2 prices 1 + 3*904/1096 ms (not 4 ms).
+    fraction = (fresh_tokens - 1096) / 1096
+    assert steps * ((1 - fraction) + 2 * fraction) == pytest.approx(4)
+    expected = steps * (1 + 3 * fraction)
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    assert group.per_op_latency_ms["visual_attention"] == pytest.approx(expected)
+    assert group.per_op_energy_wms["visual_attention"] == pytest.approx(100 * expected)
+    assert group.covered_latency_ms == pytest.approx(expected)
+    assert batches == ([1, 2] if fresh_tokens == 2000 else [2])
+    evidence = summary.get_step_estimates()
+    assert ("mixed" in evidence) == (fresh_tokens == 2192)
+    assert ("mix_context_tokens" in evidence["scheduling"]) == (fresh_tokens == 2192)
+    if fresh_tokens == 2192:
+        assert evidence["mixed"].context_tokens == 2192
+    # A public scheduled query has ceil(fresh/suffix) real requests. It must
+    # retain the native batch-two overlay rather than aggregate weighting.
+    direct = backend.run_mixed(
+        model,
+        database,
+        RuntimeConfig(
+            batch_size=4,
+            isl=3072,
+            prefix=3000,
+            osl=64,
+            num_images_per_request=1,
+            num_image_tokens=1024,
+            engine_step_backend="rust",
+        ),
+        MixedStepInput(fresh_tokens, 2),
+    )
+    assert direct.per_op_latency_ms["visual_attention"] == pytest.approx(4.0)
+    assert batches[-1] == 2
+
+
+@pytest.mark.parametrize("native_op", [False, True])
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("prefix", [0, 3000])
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_run_agg_rejects_chunked_visual_qualified_mamba(
+    backend, model, database, monkeypatch, native_op, phase, prefix, batch_size
+):
+    from aisim_core import _native
+    from aisim_core.sdk.operations import Mamba2Kernel
+
+    mamba_type = _native.Mamba2Kernel if native_op else Mamba2Kernel
+    scan = mamba_type(
+        f"{phase}_mamba_ssm",
+        1,
+        "mamba_chunk_scan_combined" if phase == "context" else "selective_state_update",
+        phase,
+        4096,
+        64,
+        64,
+        128,
+        4,
+        8,
+        128,
+        state_dtype="float16",
+    )
+    getattr(model, f"{phase}_ops").append(scan)
+    model.encoder_config = _vision_encoder_config()
+    # Fail before any native prediction or encoder work: the visual mean-field
+    # weight cannot price 512, 512, 72 fresh tokens as three scan state pairs.
+    monkeypatch.setattr(backend, "run_mixed", lambda *_: pytest.fail("unsupported graph was priced"))
+    with pytest.raises(ValueError, match="qualified Mamba with chunked visual prefill is unsupported"):
+        backend.run_agg(
+            model,
+            database,
+            RuntimeConfig(
+                batch_size=batch_size, isl=3072, prefix=prefix, osl=1, num_images_per_request=1, num_image_tokens=1024
+            ),
+            ctx_tokens=512,
+        )
+
+
+@pytest.mark.parametrize("xpu", [False, True])
+@pytest.mark.parametrize("budget,scheduled,new_tokens,prefills", [(2048, 4096, 1096, 1), (6000, 8192, 2192, 2)])
+def test_qualified_mamba_aggregate_translates_capacity_before_native_validation(
+    monkeypatch, xpu, budget, scheduled, new_tokens, prefills
+):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import ElementWise, Mamba2Kernel
+    from aisim_core.sdk.perf_database import get_database_view
+
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops = [
+        Mamba2Kernel(
+            "context_scan",
+            1,
+            "mamba_chunk_scan_combined",
+            "context",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            4,
+            128,
+            state_dtype="float16",
+        ),
+        ElementWise("norm", 1, 1, 0),
+    ]
+    model.generation_ops = []
+    backend = VLLMXPUBackend() if xpu else get_backend("vllm")
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    if xpu:
+        monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
+    runtime = RuntimeConfig(batch_size=4, isl=4096, prefix=3000, osl=128)
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    mixed = summary.get_step_estimates()["mixed"]
+    assert mixed.context_tokens == scheduled
+    assert summary.get_step_estimates()["scheduling"]["mix_context_token_budget"] == budget
+    # Hand-derived SOL traffic: 18,560 activation bytes per new token,
+    # one 1 MiB state read/write per prefill, and 2 bytes per norm token.
+    bw = database.system_spec["gpu"]["mem_bw"]
+    assert mixed.per_op_latency_ms["context_scan"] == pytest.approx(
+        (new_tokens * 18_560 + prefills * 2_097_152) / bw * 1000
+    )
+    assert mixed.per_op_latency_ms["norm"] == pytest.approx(
+        (new_tokens + mixed.num_decode_query_tokens) * 2 / bw * 1000
+    )
+    # Capacity translation must also reweight the complete aggregate: four
+    # uncached suffixes, each with one state read/write, irrespective of how
+    # many prefills fit the representative query.
+    scheduling = summary.get_step_estimates()["scheduling"]
+    assert scheduling["num_mix_steps"] == 4 / prefills
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    assert group.per_op_latency_ms["context_scan"] == pytest.approx((4 * 1096 * 18_560 + 4 * 2_097_152) / bw * 1000)
+    # Public scheduled input keeps the strict boundary instead of silently
+    # converting the same invalid shape as if it were scheduler capacity.
+    with pytest.raises(ValueError, match="partial prefill extend"):
+        backend.run_mixed(model, database, runtime, MixedStepInput(budget, 2))
+
+
+def test_generation_only_mamba_qualification_uses_bounded_prefill_coordinates(backend):
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import ElementWise, Mamba2Kernel
+    from aisim_core.sdk.perf_database import get_database_view
+
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL", allow_unlisted_version=True)
+    assert database is not None
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops = [ElementWise("norm", 1, 1, 0)]
+    model.generation_ops = [
+        Mamba2Kernel(
+            "generation_scan",
+            1,
+            "selective_state_update",
+            "generation",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            4,
+            128,
+            state_dtype="float16",
+        )
+    ]
+    runtime = RuntimeConfig(batch_size=4, isl=100, prefix=60, osl=128)
+    mixed = backend._run_agg_mixed_step(model, database, runtime, MixedStepInput(150, 2))
+    # Both phases select the strict split. Aggregate capacity 150 completes
+    # two 40-token suffixes, encoded as two whole 100-token prompts, plus
+    # two decoders: exactly 82 new positions, never 92 from an overlong chunk.
+    assert mixed.context_tokens == 200
+    assert mixed.per_op_latency_ms["norm"] == pytest.approx(82 * 2 / database.system_spec["gpu"]["mem_bw"] * 1000)
+    with pytest.raises(ValueError, match="partial prefill extend"):
+        backend.run_mixed(model, database, runtime, MixedStepInput(150, 2))
+
+
+def _qualified_scan_model(backend_name):
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations import ElementWise, Mamba2Kernel
+
+    model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), backend_name)
+    # A native micrograph isolates recurrent-state traffic and shared tokens.
+    # Its scan reads/writes 18,560 B/token and 2 MiB/state; norm uses 2 B/token.
+    model.context_ops = [
+        Mamba2Kernel(
+            "context_scan",
+            1,
+            "mamba_chunk_scan_combined",
+            "context",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            4,
+            128,
+            state_dtype="float16",
+        ),
+        ElementWise("norm", 1, 1, 0),
+    ]
+    model.generation_ops = [ElementWise("generation_norm", 1, 1, 0)]
+    return model
+
+
+@pytest.mark.parametrize("prefix,first_supported_budget", [(0, 4096), (3000, 1536)])
+def test_visual_qualified_sweep_reaches_a_budget_that_fits_the_suffix(monkeypatch, prefix, first_supported_budget):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = get_backend("trtllm")
+    model = _qualified_scan_model("trtllm")
+    model.encoder_config = _vision_encoder_config()
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL", allow_unlisted_version=True)
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(
+        batch_size=1,
+        isl=3072,
+        prefix=prefix,
+        osl=2,
+        ttft=float("inf"),
+        tpot=float("inf"),
+        num_images_per_request=1,
+        num_image_tokens=1024,
+    )
+    with pytest.raises(ValueError, match="qualified Mamba with chunked visual prefill is unsupported"):
+        backend.run_agg(model, database, runtime, ctx_tokens=512)
+    calls = []
+    run_agg = backend.run_agg
+
+    def record_candidate(**kwargs):
+        calls.append(kwargs["ctx_tokens"])
+        return run_agg(**kwargs)
+
+    monkeypatch.setattr(backend, "run_agg", record_candidate)
+    summary = backend.find_best_agg_result_under_constraints(
+        model, database, runtime, max_batch_size=1, ctx_stride=512, enable_chunked_prefill=True, top_k=0
+    )
+    assert calls[0] == first_supported_budget
+    assert all(budget >= 4096 - prefix for budget in calls)
+    assert not summary.get_summary_df().empty
+    assert not summary.check_oom()
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_batched_visual_mamba_sweep_continues_after_xpu_decode_reservation(monkeypatch, phase):
+    from aisim_core.sdk.backends.vllm_backend import VLLMBackend
+    from aisim_core.sdk.backends.vllm_backend_xpu import VLLMXPUBackend
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = VLLMXPUBackend()
+    model = _qualified_scan_model("vllm")
+    if phase == "generation":
+        # The unsupported visual chunk contract also covers decode-only
+        # qualification, including the native prefill-coordinate bound.
+        from aisim_core.sdk.operations import Mamba2Kernel
+
+        model.context_ops = []
+        model.generation_ops = [
+            Mamba2Kernel(
+                "generation_scan",
+                1,
+                "selective_state_update",
+                "generation",
+                4096,
+                64,
+                64,
+                128,
+                4,
+                4,
+                128,
+                state_dtype="float16",
+            )
+        ]
+    model.encoder_config = _vision_encoder_config()
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    monkeypatch.setattr(backend, "_mix_step_gen_tokens", lambda *a: 2)
+    monkeypatch.setattr(backend, "_max_kv_slots", lambda *a, **k: 100)
+    # The 1096-token total budget fits the suffix before decode reservation.
+    # Two admitted decoders leave only 1094 tokens; 1536 is a fitting control.
+    monkeypatch.setattr(backend, "_get_ctx_tokens_list_for_agg_sweep", lambda *a: [1096, 1536, 4096])
+    runtime = RuntimeConfig(
+        batch_size=4,
+        isl=3072,
+        prefix=3000,
+        osl=64,
+        ttft=float("inf"),
+        tpot=float("inf"),
+        num_images_per_request=1,
+        num_image_tokens=1024,
+    )
+    calls, priced = [], []
+    run_agg, run_mixed = backend.run_agg, VLLMBackend.run_mixed
+
+    def record_candidate(**kwargs):
+        calls.append((kwargs["runtime_config"].batch_size, kwargs["ctx_tokens"]))
+        return run_agg(**kwargs)
+
+    def record_native(self, model, database, runtime, step):
+        priced.append((step.context_tokens, step.num_decode_requests))
+        assert step.context_tokens >= 1096
+        return run_mixed(self, model, database, runtime, step)
+
+    monkeypatch.setattr(backend, "run_agg", record_candidate)
+    monkeypatch.setattr(VLLMBackend, "run_mixed", record_native)
+    summary = backend.find_best_agg_result_under_constraints(
+        model, database, runtime, max_batch_size=4, enable_chunked_prefill=True, top_k=0
+    )
+    assert (4, 1096) in calls and (4, 1536) in calls
+    assert calls.index((4, 1536)) > calls.index((4, 1096))
+    assert any(decoders == 2 for _, decoders in priced)
+    assert not summary.get_summary_df().empty
+    assert not summary.check_oom()
+
+
+@pytest.mark.parametrize("prefix", [0, 3000])
+def test_qualified_aggregate_caps_prefill_at_remaining_request_slots(monkeypatch, prefix):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = get_backend("trtllm")
+    model = _qualified_scan_model("trtllm")
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL")
+    assert database is not None
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(batch_size=2, isl=4096, prefix=prefix, osl=128)
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=8192)
+    mixed = summary.get_step_estimates()["mixed"]
+    assert mixed.num_decode_requests == 1
+    assert mixed.context_tokens == 4096
+    row = summary.get_result_dict()
+    assert (row["num_ctx_reqs"], row["num_gen_reqs"], row["gen_tokens"]) == (1, 1, 1)
+    bw = database.system_spec["gpu"]["mem_bw"]
+    scan_ms = ((4096 - prefix) * 18_560 + 2_097_152) / bw * 1000
+    assert mixed.per_op_latency_ms["context_scan"] == pytest.approx(scan_ms)
+    assert mixed.per_op_latency_ms["norm"] == pytest.approx((4096 - prefix + 1) * 2 / bw * 1000)
+    # Direct mixed-step inputs describe scheduled work, not aggregate capacity:
+    # two complete prefills remain valid even beside a decoder.
+    direct = backend.run_mixed(model, database, runtime, MixedStepInput(8192, 1))
+    assert direct.per_op_latency_ms["context_scan"] == pytest.approx(2 * scan_ms)
+    assert direct.per_op_latency_ms["norm"] == pytest.approx((2 * (4096 - prefix) + 1) * 2 / bw * 1000)
+
+
+@pytest.mark.parametrize("prefix,budget,chunks", [(3072, 512, 2), (3000, 512, 3), (3000, 1096, 1), (0, 512, 8)])
+def test_qualified_batched_aggregate_weights_uncached_chunks(monkeypatch, prefix, budget, chunks):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = get_backend("vllm")
+    model = _qualified_scan_model("vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    assert database is not None
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    summary = backend.run_agg(
+        model, database, RuntimeConfig(batch_size=4, isl=4096, prefix=prefix, osl=64), ctx_tokens=budget
+    )
+    scheduling = summary.get_step_estimates()["scheduling"]
+    assert scheduling["num_mix_steps"] == 4 * chunks
+    assert scheduling["num_genonly_steps"] == 64 - 4 * chunks
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    bw = database.system_spec["gpu"]["mem_bw"]
+    # Four suffixes, one recurrent-state transfer per chunk (including the
+    # 72-token tail at prefix=3000), and three decoders in every mixed step.
+    scan_ms = (4 * (4096 - prefix) * 18_560 + 4 * chunks * 2_097_152) / bw * 1000
+    shared_ms = (4 * (4096 - prefix) + 4 * chunks * 3) * 2 / bw * 1000
+    assert group.per_op_latency_ms["context_scan"] == pytest.approx(scan_ms)
+    assert group.per_op_latency_ms["norm"] == pytest.approx(shared_ms)
+    mixed_total = scan_ms + shared_ms
+    decode_ms = 4 * 2 / bw * 1000
+    total_ms = mixed_total + (64 - 4 * chunks) * decode_ms
+    tpot = total_ms / 64
+    # vLLM's existing dispatch and queue calibration, followed by Little's law.
+    ttft = (mixed_total / 4 + model._num_layers * 0.8) * 1.25
+    expected_rate = min(4 * 63 * 1000 / total_ms, 4 * 63 * 1000 / (ttft + 63 * tpot))
+    result = summary.get_result_dict()
+    assert result["ttft"] == pytest.approx(ttft)
+    assert result["tpot"] == pytest.approx(tpot)
+    assert result["tokens/s"] == pytest.approx(expected_rate)
+    row = summary.get_summary_df().iloc[0]
+    assert row["num_ctx_reqs"] == 1
+    assert row["num_gen_reqs"] == 3
+
+
+def test_aggregate_cache_tracks_memory_only_mamba_config(monkeypatch):
+    import dataclasses
+
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+    from aisim_core.sdk.rust_engine_step import _cached_engine_handle, engine_identity
+
+    backend = get_backend("vllm")
+    model = get_model(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm"
+    )
+    assert model._nextn == 0
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    assert database is not None
+    runtime = RuntimeConfig(batch_size=2, isl=1024, osl=2)
+    fp32 = backend.run_agg(model, database, runtime, ctx_tokens=1024)
+    assert backend.run_agg(model, database, runtime, ctx_tokens=1024) is fp32
+    timing_key = engine_identity(model, database)
+    timing_handle = _cached_engine_handle(model, database)
+    model.set_hybrid_config(dataclasses.replace(model._hybrid_config, mamba_ssm_cache_dtype="float16"))
+    assert engine_identity(model, database) == timing_key
+    assert _cached_engine_handle(model, database) is timing_handle
+    fp16 = backend.run_agg(model, database, runtime, ctx_tokens=1024)
+    cold_fp16 = get_backend("vllm").run_agg(model, database, runtime, ctx_tokens=1024)
+    assert fp16 is not fp32
+    assert fp16.get_memory() == cold_fp16.get_memory()
+    assert fp16.get_memory()["kvcache"] < fp32.get_memory()["kvcache"]
+    assert backend.run_agg(model, database, runtime, ctx_tokens=1024) is fp16
+
+    # A capacity between the two real footprints makes the stale verdict
+    # observable. Keep each database's capacity fixed throughout its run.
+    capacity = int((fp16.get_memory()["total"] + fp32.get_memory()["total"]) * (1 << 29))
+    monkeypatch.setitem(database.system_spec["gpu"], "mem_capacity", capacity)
+    backend = get_backend("vllm")
+    model.set_hybrid_config(dataclasses.replace(model._hybrid_config, mamba_ssm_cache_dtype="float32"))
+    assert backend.run_agg(model, database, runtime, ctx_tokens=1024).check_oom()
+    model.set_hybrid_config(dataclasses.replace(model._hybrid_config, mamba_ssm_cache_dtype="float16"))
+    assert not backend.run_agg(model, database, runtime, ctx_tokens=1024).check_oom()
+
+
+def test_qualified_chunk_averaging_keeps_other_requests_decode_kv(monkeypatch):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = get_backend("vllm")
+    model = _qualified_scan_model("vllm")
+    attention_model = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.generation_ops += [op for op in attention_model.generation_ops if op._name == "generation_attention"]
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    assert database is not None
+    runtime = RuntimeConfig(batch_size=4, isl=4096, prefix=3000, osl=64)
+    # All twelve mixed iterations contain the same three decoders. Their KV
+    # lengths are independent of the prefilling request's 512/512/72 progress.
+    reference = backend.run_mixed(model, database, runtime, MixedStepInput(512, 3))
+    assert reference.per_op_latency_ms["generation_attention"] > 0
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    group = backend.run_agg(model, database, runtime, ctx_tokens=512).get_aggregate_energy_breakdown()["mix_step"]
+    assert group.per_op_latency_ms["generation_attention"] == pytest.approx(
+        12 * reference.per_op_latency_ms["generation_attention"]
+    )
+
+
+def test_qualified_aggregate_keeps_a_prefill_slot_at_equal_phase_lengths(monkeypatch):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.perf_database import get_database_view
+
+    backend = get_backend("trtllm")
+    model = _qualified_scan_model("trtllm")
+    database = get_database_view("b200_sxm", "trtllm", "1.3.0rc20", database_mode="SOL")
+    assert database is not None
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    # Both phases take 128 iterations. The generic throughput heuristic would
+    # admit both requests as decoders, leaving no slot for scheduled prefill.
+    summary = backend.run_agg(model, database, RuntimeConfig(batch_size=2, isl=4096, osl=128), ctx_tokens=64)
+    scheduling = summary.get_step_estimates()["scheduling"]
+    assert scheduling["mix_decode_requests"] == 1
+    assert scheduling["num_mix_steps"] == 128
+    norm_ms = summary.get_aggregate_energy_breakdown()["mix_step"].per_op_latency_ms["norm"]
+    assert norm_ms == pytest.approx((2 * 4096 + 128) * 2 / database.system_spec["gpu"]["mem_bw"] * 1000)
+
+
+@pytest.mark.parametrize("osl,decoders", [(1, 0), (2, 1)])
+def test_qualified_aggregate_only_mixes_requested_decode_work(monkeypatch, tmp_path, osl, decoders):
+    from pathlib import Path
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import aisim_core
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.operations import Mamba2Kernel
+    from aisim_core.sdk.perf_database import PerfDatabase
+
+    backend = get_backend("vllm")
+    model = _qualified_scan_model("vllm")
+    model.generation_ops.append(
+        Mamba2Kernel(
+            "generation_scan",
+            1,
+            "selective_state_update",
+            "generation",
+            4096,
+            64,
+            64,
+            128,
+            4,
+            4,
+            128,
+            state_dtype="float16",
+        )
+    )
+    # Synthetic powered rows make accidental decode work visible in energy
+    # as well as latency: prefill is 3 ms * 100 W, decode is 7 ms * 200 W.
+    spec = Path(aisim_core.__file__).parent / "systems/b200_sxm.yaml"
+    (tmp_path / spec.name).write_text(spec.read_text())
+    data = tmp_path / "data/b200_sxm/linear_attention/vllm/0.24.0"
+    data.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "kernel_source": ["causal_conv1d_fn", "causal_conv1d_update"],
+                "phase": ["context", "generation"],
+                "batch_size": [1, 1],
+                "seq_len": [4096, 1],
+                "d_model": [4096, 4096],
+                "d_state": [128, 128],
+                "d_conv": [4, 4],
+                "nheads": [64, 64],
+                "head_dim": [64, 64],
+                "n_groups": [4, 4],
+                "chunk_size": [128, 128],
+                "latency": [3.0, 7.0],
+                "power": [100.0, 200.0],
+            }
+        ),
+        data / "mamba2_perf.parquet",
+    )
+    for phase, ops, kernel in (
+        ("context", model.context_ops, "causal_conv1d_fn"),
+        ("generation", model.generation_ops, "causal_conv1d_update"),
+    ):
+        ops.append(Mamba2Kernel(f"{phase}_conv", 1, kernel, phase, 4096, 64, 64, 128, 4, 4, 128, state_dtype="float16"))
+    database = PerfDatabase(
+        "b200_sxm", "vllm", "0.24.0", str(tmp_path), database_mode="HYBRID", strict_provenance=False
+    )
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(batch_size=2, isl=4096, osl=osl)
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=4096)
+    estimates = summary.get_step_estimates()
+    scheduling = estimates["scheduling"]
+    assert scheduling["mix_decode_requests"] == decoders
+    assert scheduling["num_mix_steps"] == 2
+    assert scheduling["num_genonly_steps"] == 0
+    assert estimates["mixed"].num_decode_requests == decoders
+    # Both requests prefill once. At osl=1 there is no generation scan and
+    # the shared norm processes exactly 8192 tokens, rather than 8194.
+    reference = backend.run_mixed(model, database, runtime, MixedStepInput(4096, decoders))
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    # HYBRID uses the packaged B200 memory calibration: two 3 us
+    # launches, with 2 B/token transferred at 80% of peak bandwidth.
+    bw = database.system_spec["gpu"]["mem_bw"]
+    assert group.per_op_latency_ms["norm"] == pytest.approx(0.006 + (8192 + 2 * decoders) * 2 / (0.8 * bw) * 1000)
+    assert group.per_op_latency_ms.get("generation_scan", 0.0) == pytest.approx(
+        2 * reference.per_op_latency_ms.get("generation_scan", 0.0)
+    )
+    assert (group.per_op_latency_ms.get("generation_scan", 0.0) > 0) == bool(decoders)
+    assert group.latency_ms == pytest.approx(2 * reference.latency_ms)
+    assert reference.energy_wms == pytest.approx(300 + decoders * 1400)
+    assert group.energy_wms == pytest.approx(2 * reference.energy_wms)
+    # vLLM adds 0.8 ms/layer and queues b=2 with 1 + log2(2)/8 = 1.125.
+    assert summary.get_result_dict()["ttft"] == pytest.approx((reference.latency_ms + model._num_layers * 0.8) * 1.125)
+
+
+def test_fixed_native_decode_pass_keeps_folded_energy_and_coverage(monkeypatch):
+    from aisim_core.sdk import rust_engine_step
+
+    # Native pass entries: name, ms, W-ms, source. The prefilling request
+    # advances, but a different decode request keeps its original 3 ms / 30
+    # W-ms price. A zero-energy 5 ms op stays outside power coverage.
+    handle = SimpleNamespace(
+        _mixed_step_breakdown_per_op_with_decode_coverage=lambda *a, **k: (
+            [("shared", 2.0, 20.0, "silicon"), ("uncovered", 5.0, 0.0, "sol")],
+            [("context_scan", 1.0, 10.0, "silicon")],
+            [("same_name", 0.25, 2.5, "sol")],
+            3.25,
+            0.25,
+        )
+    )
+    monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *_: handle)
+    monkeypatch.setattr(rust_engine_step, "_note_rust_provenance", lambda *_: None)
+    result = rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+        None,
+        None,
+        ctx_tokens=512,
+        gen_tokens=3,
+        isl=3512,
+        osl=64,
+        prefix=3000,
+        _decode_ops=([("same_name", 3.0, 30.0, "silicon")], 3.0),
+    )
+    assert result["latency_ms"] == 11.0
+    assert result["energy_wms"] == 60.0
+    assert result["covered_latency_ms"] == 6.0
+    assert result["per_op_latency_ms"]["same_name"] == 3.0
+    assert result["per_op_energy_wms"]["same_name"] == 30.0
+    assert result["per_op_source"]["same_name"] == "silicon"
+
+
+@pytest.mark.parametrize(
+    "prefix,budget,old_activation,new_activation,old_total,new_total",
+    [
+        (3000, 2048, 0.156250, 0.083618, 62.542492, 62.469860),
+        (3000, 4096, 0.312500, 0.083618, 62.698742, 62.469860),
+        (3000, 8192, 0.312500, 0.083618, 62.698742, 62.469860),
+        (0, 2048, 0.156250, 0.156250, 62.542492, 62.542492),
+    ],
+)
+def test_legacy_aggregate_memory_matches_recorded_suffix_evidence(
+    prefix, budget, old_activation, new_activation, old_total, new_total
+):
+    # Historical values from mem-35e632cb.json and mem-1ea0211c.json.
+    # This unqualified Nano has 81,920 activation bytes/token; cached work
+    # changes from a budget-sized 2048/4096 tokens to the 1096-token suffix.
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.config import ModelConfig, RuntimeConfig
+    from aisim_core.sdk.inference_summary import InferenceSummary
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="HYBRID", allow_unlisted_version=True)
+    model = get_model(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        "vllm",
+    )
+    backend = get_backend("vllm", "b200_sxm")
+    runtime = RuntimeConfig(batch_size=1, isl=4096, osl=64, prefix=prefix)
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    current = summary.get_memory()
+    assert current["activations"] == pytest.approx(new_activation, abs=1e-6)
+    assert current["total"] == pytest.approx(new_total, abs=1e-6)
+    # Reconstruct only the old memory input, leaving latency prediction alone.
+    previous = backend._get_memory_usage(
+        model, database, 1, 1, 4096, 64, prefix=prefix, num_tokens=min(4096, budget), mtp_scaled_tokens=0
+    )
+    assert previous["activations"] == pytest.approx(old_activation, abs=1e-6)
+    assert previous["total"] == pytest.approx(old_total, abs=1e-6)
+    for key in ("weights", "kvcache", "nccl", "others"):
+        assert previous[key] == current[key]
+    capacity = database.system_spec["gpu"]["mem_capacity"]
+    old_summary = InferenceSummary(runtime)
+    old_summary.set_memory_and_check_oom(previous, capacity, **backend._oom_check_kwargs({}))
+    assert not old_summary.check_oom() and not summary.check_oom()
+    assert not old_summary.check_kv_cache_oom() and not summary.check_kv_cache_oom()
+
+
+@pytest.mark.parametrize("budget", [1096, 2048, 4096])
+def test_completed_qualified_prefill_retains_whole_request_attention(monkeypatch, budget):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = _qualified_scan_model("vllm")
+    attention = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    model.context_ops += [op for op in attention.context_ops if op._name == "context_attention"]
+    backend = get_backend("vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(batch_size=4, isl=4096, prefix=3000, osl=64)
+    reference = backend.run_mixed(model, database, runtime, MixedStepInput(4096, 3))
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    scheduling = summary.get_step_estimates()["scheduling"]
+    assert scheduling["num_mix_steps"] == 4
+    assert summary.get_step_estimates()["mixed"].context_tokens == 4096
+    expected = 4 * reference.per_op_latency_ms["context_attention (scaled)"]
+    assert expected > 0
+    group = summary.get_aggregate_energy_breakdown()["mix_step"]
+    # Four completed requests each pay the full attention A, not A/ceil(4096/1096).
+    assert group.per_op_latency_ms["context_attention (scaled)"] == pytest.approx(expected)
+    full = backend.run_agg(model, database, runtime, ctx_tokens=4096)
+    assert summary.get_result_dict()["ttft"] == pytest.approx(full.get_result_dict()["ttft"])
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+@pytest.mark.parametrize("budget", [512, 2048, 4096])
+def test_cached_batched_attention_counts_qualified_chunks_and_preserves_legacy(monkeypatch, qualified, budget):
+    from aisim_core.sdk.backends.factory import get_backend
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.perf_database import get_database_view
+
+    model = _qualified_scan_model("vllm")
+    attention = get_model("Qwen/Qwen3-0.6B", ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1), "vllm")
+    if not qualified:
+        model.context_ops = []
+    model.context_ops += [op for op in attention.context_ops if op._name == "context_attention"]
+    backend = get_backend("vllm")
+    database = get_database_view("b200_sxm", "vllm", "0.24.0", database_mode="SOL")
+    monkeypatch.setattr(backend, "_get_memory_usage", lambda *a, **k: {"total": 1.0})
+    runtime = RuntimeConfig(batch_size=4, isl=4096, prefix=3000, osl=64)
+    name = "context_attention (scaled)"
+    if qualified and budget < 1096:
+        # Independent native queries for the 512, 512, 72 suffix walk. Each
+        # full chunk coordinate prices that extend's attention without a divisor.
+        expected = 0.0
+        for past, end in [(3000, 3512), (3512, 4024), (4024, 4096)]:
+            chunk = RuntimeConfig(batch_size=1, isl=end, prefix=past, osl=64)
+            expected += 4 * backend.run_mixed(model, database, chunk, MixedStepInput(end, 3)).per_op_latency_ms[name]
+        steps = 12
+    else:
+        full = backend.run_mixed(model, database, runtime, MixedStepInput(4096, 3))
+        # Qualified one-step suffixes pay four full attention queries. Legacy
+        # mean-field attention still cancels ceil(isl/budget) against its full-
+        # prompt iteration count: (4*isl/budget)/(isl/budget) = four requests.
+        expected = 4 * full.per_op_latency_ms[name]
+        steps = 4 if qualified else 4 * 4096 / budget
+    summary = backend.run_agg(model, database, runtime, ctx_tokens=budget)
+    assert summary.get_step_estimates()["scheduling"]["num_mix_steps"] == steps
+    assert summary.get_aggregate_energy_breakdown()["mix_step"].per_op_latency_ms[name] == pytest.approx(expected)
+
+
+def test_fixed_decode_coverage_uses_native_subtotals_before_name_fold(monkeypatch):
+    from aisim_core.sdk import rust_engine_step
+
+    # 10 powered + 5 unpowered ms fold to 15 ms with positive energy.
+    # The original decode shape is 10 powered + 15 unpowered ms. Coverage
+    # remains 10 ms although the folded latency grows by 10 ms.
+    handle = SimpleNamespace(
+        _mixed_step_breakdown_per_op_with_decode_coverage=lambda *a, **k: (
+            [],
+            [],
+            [("same_name", 15.0, 100.0, "mixed")],
+            10.0,
+            10.0,
+        )
+    )
+    monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *_: handle)
+    monkeypatch.setattr(rust_engine_step, "_note_rust_provenance", lambda *_: None)
+    captured = rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+        None, None, ctx_tokens=512, gen_tokens=1, isl=3512, osl=64, prefix=3000, _capture_decode_ops=True
+    )
+    assert captured["_decode_ops"][1] == 10.0
+    values = rust_engine_step.estimate_mixed_step_breakdown_with_rust(
+        None,
+        None,
+        ctx_tokens=512,
+        gen_tokens=1,
+        isl=3512,
+        osl=64,
+        prefix=3000,
+        _decode_ops=([("same_name", 25.0, 100.0, "mixed")], 10.0),
+    )
+    assert values["latency_ms"] == 25.0
+    assert values["energy_wms"] == 100.0
+    assert values["covered_latency_ms"] == 10.0

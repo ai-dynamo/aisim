@@ -21,6 +21,30 @@ use crate::operators::op::MemoField;
 use crate::operators::{Dsv41StageOp, Op, RuntimeContext};
 use crate::perf_database::PerfDatabase;
 
+/// Canonicalize exact groups once per walk, before any per-operation queries.
+/// Replay already supplies sorted unique shapes, which borrow without allocating.
+fn coalesced_prefill_chunks(groups: &[[u32; 3]]) -> Result<Cow<'_, [[u32; 3]]>, AicError> {
+    if groups.windows(2).all(|pair| pair[0][1..] < pair[1][1..]) {
+        return Ok(Cow::Borrowed(groups));
+    }
+    let mut groups = groups.to_vec();
+    groups.sort_unstable_by_key(|&[_, new, prefix]| (new, prefix));
+    let mut kept = 0;
+    for index in 0..groups.len() {
+        let [count, new, prefix] = groups[index];
+        if kept > 0 && groups[kept - 1][1..] == [new, prefix] {
+            groups[kept - 1][0] = groups[kept - 1][0].checked_add(count).ok_or_else(|| {
+                AicError::InvalidForwardPassMetrics("prefill_chunks request count overflows".into())
+            })?;
+        } else {
+            groups[kept] = [count, new, prefix];
+            kept += 1;
+        }
+    }
+    groups.truncate(kept);
+    Ok(Cow::Owned(groups))
+}
+
 /// The engine op list an [`OpMemo`] entry belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpList {
@@ -375,13 +399,23 @@ pub(crate) fn run_context_ops_with<'a>(
         prefix,
         seq_imbalance_correction_scale,
         filter,
-        |_, op, result| on_op(op, result.into_owned()),
+        false,
+        None,
+        None,
+        |_, op, _, result| on_op(op, result.into_owned()),
     )
 }
 
 /// [`run_context_ops_with`] over an op list with its [`OpListPlan`], reusing
 /// `op_memo`'s results when given one. The sink also receives each op's index
-/// in `ops`.
+/// in `ops` and the runtime context it was priced at. `any_cached` marks a
+/// walk whose integer mean `prefix` can round a cached prefill down to zero;
+/// qualified Mamba ops then see at least one cached token
+/// ([`mamba_cached_prefix`]), and every other op keeps `prefix`.
+/// `total_new_tokens` preserves an exact-total query's token sum for qualified
+/// Mamba, whose two balanced chunk lengths cannot be replaced by a mean.
+/// With exact prefill groups, token-major ops also retain scheduled padding
+/// positions rather than truncating their total to an integer request mean.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_context_ops_planned<'a>(
     ops: &'a [Op],
@@ -393,9 +427,13 @@ pub(crate) fn run_context_ops_planned<'a>(
     prefix: u32,
     seq_imbalance_correction_scale: f64,
     filter: ContextOpFilter,
-    mut on_op: impl FnMut(usize, &'a Op, Cow<'_, PerformanceResult>),
+    any_cached: bool,
+    total_new_tokens: Option<u32>,
+    prefill_chunks: Option<&[[u32; 3]]>,
+    mut on_op: impl FnMut(usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>),
 ) -> Result<f64, AicError> {
     let mut memo = QueryMemo::new(plan, ops);
+    let prefill_chunks = prefill_chunks.map(coalesced_prefill_chunks).transpose()?;
     let mut total = 0.0_f64;
     for (index, op) in ops.iter().enumerate() {
         match filter {
@@ -404,21 +442,80 @@ pub(crate) fn run_context_ops_planned<'a>(
             ContextOpFilter::OnlyContextAttention if !op.is_context_attention() => continue,
             _ => {}
         }
+        if let Some(groups) = prefill_chunks.as_deref()
+            && op.is_qualified_mamba()
+        {
+            for &[batch, length, past] in groups {
+                let ctx = context_op_runtime(
+                    op,
+                    batch,
+                    length,
+                    past,
+                    seq_imbalance_correction_scale,
+                    None,
+                );
+                let result = op.query(db, &ctx)?;
+                total += result.latency_ms;
+                on_op(index, op, &ctx, Cow::Owned(result));
+            }
+            continue;
+        }
+        if let Some(tokens) = total_new_tokens
+            && op.is_qualified_mamba()
+            && tokens % batch_size != 0
+        {
+            let (q, r) = (tokens / batch_size, tokens % batch_size);
+            let prefix = mamba_cached_prefix(op, prefix, any_cached);
+            for (batch, length) in [(batch_size - r, q), (r, q + 1)] {
+                let ctx = context_op_runtime(
+                    op,
+                    batch,
+                    length,
+                    prefix,
+                    seq_imbalance_correction_scale,
+                    None,
+                );
+                let result = op.query(db, &ctx)?;
+                total += result.latency_ms;
+                on_op(index, op, &ctx, Cow::Owned(result));
+            }
+            continue;
+        }
+        let ctx = context_op_runtime(
+            op,
+            batch_size,
+            effective_isl,
+            mamba_cached_prefix(op, prefix, any_cached),
+            seq_imbalance_correction_scale,
+            total_new_tokens.filter(|_| {
+                prefill_chunks.is_some() && !op.is_context_attention() && !op.is_logits_gemm()
+            }),
+        );
         let result = memo.query(index, || {
-            let ctx = context_op_runtime(
-                op,
-                batch_size,
-                effective_isl,
-                prefix,
-                seq_imbalance_correction_scale,
-                None,
-            );
             shared_query(op_memo, db, OpList::Context, index, op, &ctx)
         })?;
         total += result.latency_ms;
-        on_op(index, op, result);
+        on_op(index, op, &ctx, result);
     }
     Ok(total)
+}
+
+/// Whether a context op runs in the packed step's context-attention pass.
+/// A qualified Mamba scan has its own branch in the first pass, whatever its
+/// name, so the walk and its slot plan must not also count it here.
+pub(crate) fn in_packed_attention_pass(op: &Op) -> bool {
+    op.is_context_attention() && !op.is_qualified_mamba()
+}
+
+/// The prefix a context op sees in a packed walk: a qualified Mamba scan must
+/// not read cold-state rows when any prefill token is cached, even when the
+/// integer mean `prefix` rounds to zero. Other ops keep `prefix`.
+pub(crate) fn mamba_cached_prefix(op: &Op, prefix: u32, any_cached: bool) -> u32 {
+    if any_cached && op.is_qualified_mamba() {
+        prefix.max(1)
+    } else {
+        prefix
+    }
 }
 
 /// One context op at the context-phase shape — the single query body every
@@ -696,9 +793,11 @@ pub(crate) fn get_mix_step_ops<'a>(
     combined_prefix: u32,
     kv_per_decode_req: u32,
     decode_batch: u32,
+    prefill_chunks: Option<&[[u32; 3]]>,
     mut on_op: impl FnMut(bool, usize, &'a Op, &RuntimeContext, Cow<'_, PerformanceResult>, f64),
 ) -> Result<f64, AicError> {
     // ---- Pass 1: combined non-attention work (batch=1, isl=ctx+gen) ----
+    let prefill_chunks = prefill_chunks.map(coalesced_prefill_chunks).transpose()?;
     // Python: `run_static` is called with `isl = num_tokens_combined`
     // and `prefix = prefix * floor(ctx_tokens / isl)`, which makes
     // `effective_isl = isl - prefix = ctx_new + gen` (same as
@@ -715,10 +814,58 @@ pub(crate) fn get_mix_step_ops<'a>(
     // produce the same `(full_s, prefix_correction)` Python applies.
     // For non-attention ops (GEMM, MoE, etc.) the prefix field is
     // ignored, so threading it through is harmless.
-    let effective_isl_combined = (ctx_tokens + gen_tokens).max(1);
+    let effective_isl_combined = ctx_tokens
+        .checked_add(gen_tokens)
+        .ok_or_else(|| {
+            AicError::InvalidEngineConfig(format!(
+                "{gen_tokens} decode tokens beside {ctx_tokens} prefill tokens \
+                 overflow the u32 mixed-step token count"
+            ))
+        })?
+        .max(1);
     let mut total = 0.0_f64;
     let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
+        if op.is_qualified_mamba() {
+            // Spread the token sum over exactly the observed request count:
+            // `r` requests carry one extra token. Never invent extra states.
+            let n = prefill_batch.max(1);
+            let (q, r) = (ctx_tokens / n, ctx_tokens % n);
+            // Every prefill request computes a token, as in the pure-prefill walk
+            // and `predict_prefill_latency_total`: reject, never price a zero chunk.
+            if q == 0 {
+                return Err(AicError::InvalidEngineConfig(format!(
+                    "Mamba op {}: each qualified prefill request needs a new token, but \
+                     {n} requests carry {ctx_tokens}",
+                    op.name()
+                )));
+            }
+            // Totals cannot say which request is cold, so any cached token in
+            // the step keeps every chunk off cold-state scan rows, even when
+            // the integer mean prefix rounds to zero.
+            let prefix = mamba_cached_prefix(op, prefix_per_req, combined_prefix > 0);
+            // q can be u32::MAX when n=1. The second group is then empty.
+            let balanced = [[n - r, q, prefix], [r, q.saturating_add(1), prefix]];
+            for &[batch, tokens, prefix] in prefill_chunks.as_deref().unwrap_or(&balanced) {
+                if batch == 0 {
+                    continue;
+                }
+                let ctx = RuntimeContext {
+                    batch_size: batch,
+                    beam_width: 1,
+                    s: tokens,
+                    prefix,
+                    num_tokens: batch * tokens,
+                    seq_imbalance_correction_scale: 1.0,
+                    gen_seq_imbalance_correction_scale: 1.0,
+                    num_image_tokens: 0,
+                };
+                let result = op.query(db, &ctx)?;
+                total += result.latency_ms;
+                on_op(true, index, op, &ctx, Cow::Owned(result), 1.0);
+            }
+            continue;
+        }
         if op.is_context_attention() {
             continue;
         }
@@ -760,10 +907,10 @@ pub(crate) fn get_mix_step_ops<'a>(
     // whenever the count does not divide `ctx_tokens`.
     let isl_eff_pass2 = new_tokens_per_prefill_req.max(1);
     let ctx_attn_batch = prefill_batch.max(1);
-    let scale_factor = ((isl_eff_pass2 + ctx_tokens - 1) / ctx_tokens.max(1)).max(1) as f64;
+    let scale_factor = isl_eff_pass2.div_ceil(ctx_tokens.max(1)).max(1) as f64;
     let mut memo = QueryMemo::new(context_plan, context_ops);
     for (index, op) in context_ops.iter().enumerate() {
-        if !op.is_context_attention() {
+        if !in_packed_attention_pass(op) {
             continue;
         }
         let ctx = RuntimeContext {
@@ -793,7 +940,7 @@ pub(crate) fn get_mix_step_ops<'a>(
     if decode_batch > 0 {
         let mut memo = QueryMemo::new(generation_plan, generation_ops);
         for (index, op) in generation_ops.iter().enumerate() {
-            if !op.is_generation_attention() {
+            if !op.is_generation_attention() && !op.is_qualified_mamba() {
                 continue;
             }
             let ctx = RuntimeContext {

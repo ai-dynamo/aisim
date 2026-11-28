@@ -78,13 +78,21 @@ def _model_config(speculation=None) -> ModelConfig:
     )
 
 
-def _fake_model(nextn: int = 0, spec_scheme=None, speculation=None):
+def _fake_model(nextn: int = 0, spec_scheme=None, speculation=None, *, native_ops=False):
     model = SimpleNamespace()
     model.model_path = "test-model"
     model._nextn = nextn
     model.encoder_ops = []
     model.context_ops = [_RecordingOp("context_attention", 11.0)]
     model.generation_ops = [_RecordingOp("generation_attention", 2.0)]
+    if native_ops:
+        # Identity includes the compiled graph. Use independently allocated,
+        # serializable ops to test content equality, rather than unsupported
+        # recording doubles whose identities deliberately include object ids.
+        from aisim_core.sdk.operations import ElementWise
+
+        model.context_ops = [ElementWise("context_attention", 1, 11, 0)]
+        model.generation_ops = [ElementWise("generation_attention", 1, 2, 0)]
     model.get_resident_weights_bytes = lambda: sum(op.get_weights() for op in model.context_ops)
     model.get_additional_activation_bytes = lambda num_tokens: 0.0
     model.config = _model_config(speculation=speculation)
@@ -141,11 +149,12 @@ class _FakeDraftScheme(NullScheme):
 @pytest.mark.unit
 class TestGoldenEquivalence:
     def test_legacy_and_explicit_mtp_share_engine_state(self):
-        legacy = _fake_model(nextn=2)  # spec_scheme derived: MTPScheme(2)
+        legacy = _fake_model(nextn=2, native_ops=True)  # spec_scheme derived: MTPScheme(2)
         explicit = _fake_model(
             nextn=2,
             spec_scheme=MTPScheme(depth=2),
             speculation=SpeculationConfig(kind="mtp", params={"depth": 2}),
+            native_ops=True,
         )
 
         # Materialization must be a no-op for MTP: the legacy nextn contract
@@ -311,11 +320,12 @@ class TestMemoryAndRouting:
 
     def test_engine_identity_keyed_by_speculation_config(self):
         db = _database()
-        plain = _fake_model(nextn=0)
+        plain = _fake_model(nextn=0, native_ops=True)
         eagle = _fake_model(
             nextn=0,
             spec_scheme=NullScheme(),  # identity comes from the config, not the scheme object
             speculation=SpeculationConfig(kind="eagle3", params={"num_speculative_tokens": 5}),
+            native_ops=True,
         )
         # Same widths, different speculation content -> different engines.
         assert _engine_config_json(plain, db) != _engine_config_json(eagle, db)
@@ -325,6 +335,7 @@ class TestMemoryAndRouting:
             nextn=0,
             spec_scheme=NullScheme(),
             speculation=SpeculationConfig(kind="eagle3", params={"num_speculative_tokens": 5}),
+            native_ops=True,
         )
         assert _engine_config_json(eagle, db) == _engine_config_json(eagle2, db)
         payload = json.loads(_engine_config_json(eagle, db))
@@ -672,6 +683,7 @@ def test_mixed_draft_native_phases_match_independent_queries(real_database, ctx_
 
 def _assert_public_mixed_rows(estimate, native):
     """Compare the public report with executed native rows, without repricing."""
+    native = native[:3]
     rows = [row for group in native for row in group]
     names = {row[0] for row in rows} | {"context_attention", "generation_attention"}
     public_names = {"context_attention (scaled)" if name == "context_attention" else name for name in names}
@@ -714,7 +726,7 @@ def test_public_mixed_draft_names_values_and_sources_match_native(draft, databas
     target = "Qwen/Qwen3.5-35B-A3B" if draft == "Qwen/Qwen3-0.6B" else "Qwen/Qwen3-8B"
     model = get_model(target, _model_config(speculation), "vllm")
     database = get_database_view("h100_sxm", "vllm", "0.24.0", database_mode=database_mode)
-    native, _ = _cached_engine_handle(model, database)._mixed_step_breakdown_per_op_with_metadata(
+    native = _cached_engine_handle(model, database)._mixed_step_breakdown_per_op_with_metadata(
         128, gen_requests, 4000, 64, 64
     )
     estimate = InferenceSession(model, database, get_backend("vllm")).run_mixed(
@@ -743,7 +755,7 @@ def test_public_mixed_ar_and_mtp_keep_legacy_names_and_defaults(real_database, g
     config = _model_config()
     config.nextn = depth
     model = get_model("Qwen/Qwen3-8B", config, "vllm")
-    native, _ = _cached_engine_handle(model, real_database)._mixed_step_breakdown_per_op_with_metadata(
+    native = _cached_engine_handle(model, real_database)._mixed_step_breakdown_per_op_with_metadata(
         128, gen_requests, 4000, 64, 0
     )
     estimate = InferenceSession(model, real_database, get_backend("vllm")).run_mixed(
@@ -778,12 +790,15 @@ def test_public_mixed_duplicate_draft_names_merge_sources_and_metadata(real_data
         ],
         [
             ("generation_attention", 7.0, 70.0, "silicon"),
-            ("draft_eagle_fc", 11.0, 110.0, "sol", (generation_fallback, [])),
-            ("draft_eagle_fc", 13.0, 130.0, "silicon", (generation_fallback, [])),
+            # Native folding combines powered 11 ms and unpowered 13 ms
+            # queries. Coverage must retain only the powered contribution.
+            ("draft_eagle_fc", 24.0, 110.0, "mixed", (generation_fallback, [])),
         ],
+        28.0,
     )
     handle = SimpleNamespace(
-        _mixed_step_breakdown_per_op_with_metadata=lambda *args, **kwargs: (native, None), last_provenance=lambda: None
+        _mixed_step_breakdown_per_op_with_decode_coverage=lambda *args, **kwargs: (*native, 18.0),
+        last_provenance=lambda: None,
     )
     monkeypatch.setattr(rust_engine_step, "_cached_engine_handle", lambda *args: handle)
     model = get_model("Qwen/Qwen3-8B", _model_config(), "vllm")
@@ -793,6 +808,8 @@ def test_public_mixed_duplicate_draft_names_merge_sources_and_metadata(real_data
     _assert_public_mixed_rows(estimate, native)
     assert estimate.per_op_latency_ms["draft_eagle_fc"] == 27.0
     assert estimate.per_op_source["draft_eagle_fc"] == "mixed"
+    # The native per-query coverage, not one recomputed from the folded rows (41 ms).
+    assert estimate.covered_latency_ms == 28.0
     assert estimate.moe_comm_fallbacks == (MoECommFallback(*context_fallback), MoECommFallback(*generation_fallback))
 
 
@@ -837,7 +854,7 @@ def test_public_mixed_draft_reports_only_executed_native_fallbacks(gen_requests)
     database = get_database_view("gb200", "sglang", "0.5.14")
     _engine_handle_cache_clear()
     try:
-        native, _ = _cached_engine_handle(model, database)._mixed_step_breakdown_per_op_with_metadata(
+        native = _cached_engine_handle(model, database)._mixed_step_breakdown_per_op_with_metadata(
             128, gen_requests, 1024, 32, 0
         )
         estimate = InferenceSession(model, database, get_backend("sglang")).run_mixed(

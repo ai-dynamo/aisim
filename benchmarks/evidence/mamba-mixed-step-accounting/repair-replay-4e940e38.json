@@ -1,0 +1,898 @@
+{
+ "config": {
+  "traffic": {
+   "source": {
+    "type": "synthetic",
+    "input_tokens": 2048,
+    "cached_prefix_tokens": 512,
+    "output_tokens": 32
+   },
+   "load": {
+    "type": "concurrency",
+    "concurrency": 64
+   },
+   "stop": {
+    "requests": 1000
+   }
+  },
+  "engine": {
+   "mode": "aggregated",
+   "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+   "hardware": "b200_sxm",
+   "backend": "trtllm",
+   "backend_version": "1.3.0rc20",
+   "context_length": 8192,
+   "ais_perf_model": {
+    "estimation_mode": "op_level",
+    "fallback_policy": "deny",
+    "database_mode": "HYBRID"
+   },
+   "workers": {
+    "aggregated": {
+     "parallelism": {
+      "replicas": 1,
+      "tensor": 1,
+      "pipeline": 1,
+      "attention_data": 1,
+      "moe_tensor": 1,
+      "moe_expert": 1
+     },
+     "scheduler": {
+      "max_batched_tokens": 4096,
+      "max_sequences": 64
+     },
+     "kv_cache": {
+      "block_size": 64,
+      "prefix_caching": true,
+      "capacity": {
+       "type": "fixed",
+       "blocks": 8192
+      }
+     }
+    }
+   }
+  }
+ },
+ "qualification": "test-only BF16, width one",
+ "rounds": [
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.58046513000075,
+      "mean_tpot_ms": 24.98895838596769,
+      "duration_ms": 13099.24947199994,
+      "wall_time_ms": 88.009057,
+      "cli_seconds": 3.3167034400394186,
+      "peak_rss_bytes": 310935552,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 93.285826,
+      "cli_seconds": 3.109506713983137,
+      "peak_rss_bytes": 268746752,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     }
+    },
+    "candidate": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.870103496000304,
+      "mean_tpot_ms": 25.072245924612947,
+      "duration_ms": 13144.117472999958,
+      "wall_time_ms": 85.894502,
+      "cli_seconds": 3.2120229870197363,
+      "peak_rss_bytes": 311975936,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 91.684649,
+      "cli_seconds": 3.052341069036629,
+      "peak_rss_bytes": 268681216,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.870103496000304,
+      "mean_tpot_ms": 25.072245924612947,
+      "duration_ms": 13144.117472999958,
+      "wall_time_ms": 85.57372500000001,
+      "cli_seconds": 3.237385095038917,
+      "peak_rss_bytes": 311570432,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 89.67693,
+      "cli_seconds": 3.0187065829522908,
+      "peak_rss_bytes": 293908480,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     }
+    },
+    "baseline": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.58046513000075,
+      "mean_tpot_ms": 24.98895838596769,
+      "duration_ms": 13099.24947199994,
+      "wall_time_ms": 85.739216,
+      "cli_seconds": 3.0946516710100695,
+      "peak_rss_bytes": 310493184,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 90.831304,
+      "cli_seconds": 2.9456462639500387,
+      "peak_rss_bytes": 268689408,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.58046513000075,
+      "mean_tpot_ms": 24.98895838596769,
+      "duration_ms": 13099.24947199994,
+      "wall_time_ms": 86.891312,
+      "cli_seconds": 3.1928637560340576,
+      "peak_rss_bytes": 311156736,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 93.347655,
+      "cli_seconds": 2.960892156988848,
+      "peak_rss_bytes": 278429696,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     }
+    },
+    "candidate": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.870103496000304,
+      "mean_tpot_ms": 25.072245924612947,
+      "duration_ms": 13144.117472999958,
+      "wall_time_ms": 84.258697,
+      "cli_seconds": 3.166483620996587,
+      "peak_rss_bytes": 311472128,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 89.165148,
+      "cli_seconds": 2.9680472949985415,
+      "peak_rss_bytes": 285863936,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.870103496000304,
+      "mean_tpot_ms": 25.072245924612947,
+      "duration_ms": 13144.117472999958,
+      "wall_time_ms": 84.286109,
+      "cli_seconds": 3.2713364220107906,
+      "peak_rss_bytes": 310382592,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 93.884312,
+      "cli_seconds": 3.143584434990771,
+      "peak_rss_bytes": 287068160,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     }
+    },
+    "baseline": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.58046513000075,
+      "mean_tpot_ms": 24.98895838596769,
+      "duration_ms": 13099.24947199994,
+      "wall_time_ms": 88.575973,
+      "cli_seconds": 3.3175685899914242,
+      "peak_rss_bytes": 311418880,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 96.434676,
+      "cli_seconds": 3.0665335179655813,
+      "peak_rss_bytes": 271200256,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.58046513000075,
+      "mean_tpot_ms": 24.98895838596769,
+      "duration_ms": 13099.24947199994,
+      "wall_time_ms": 83.081779,
+      "cli_seconds": 3.1222513249958865,
+      "peak_rss_bytes": 325820416,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 94.65274799999999,
+      "cli_seconds": 3.030083721037954,
+      "peak_rss_bytes": 271388672,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     }
+    },
+    "candidate": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.870103496000304,
+      "mean_tpot_ms": 25.072245924612947,
+      "duration_ms": 13144.117472999958,
+      "wall_time_ms": 85.906338,
+      "cli_seconds": 3.1901597140240483,
+      "peak_rss_bytes": 319614976,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 86.774112,
+      "cli_seconds": 2.8554328570025973,
+      "peak_rss_bytes": 293740544,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.870103496000304,
+      "mean_tpot_ms": 25.072245924612947,
+      "duration_ms": 13144.117472999958,
+      "wall_time_ms": 80.438108,
+      "cli_seconds": 3.026398463989608,
+      "peak_rss_bytes": 312397824,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 86.426987,
+      "cli_seconds": 2.8186882809968665,
+      "peak_rss_bytes": 293883904,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+        "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+        "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+       }
+      ]
+     }
+    },
+    "baseline": {
+     "nano": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 56.58046513000075,
+      "mean_tpot_ms": 24.98895838596769,
+      "duration_ms": 13099.24947199994,
+      "wall_time_ms": 84.577202,
+      "cli_seconds": 3.0382390120066702,
+      "peak_rss_bytes": 310804480,
+      "build": [
+       {
+        "calls": 8,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     },
+     "control": {
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 88.10369399999999,
+      "cli_seconds": 2.830909537966363,
+      "peak_rss_bytes": 270700544,
+      "build": [
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       },
+       {
+        "calls": 0,
+        "package_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/__init__.py",
+        "constructor_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core/sdk/models/nemotron_h.py",
+        "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+        "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+        "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640"
+       }
+      ]
+     }
+    }
+   }
+  }
+ ],
+ "driver_sha256": "d854f55545ce13f9e7eb73d1c316838f03084a848e582d30a566d681614a3b9d",
+ "build_verification": {
+  "baseline": "3fb31295a29497869bef1a2b0081bb36aab9e13a",
+  "candidate": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "python": "3.12.12",
+  "flags": {
+   "profile": "release",
+   "opt_level": 3,
+   "lto": "thin",
+   "codegen_units": 1,
+   "cargo_build_jobs": 2,
+   "features": [
+    "extension-module",
+    "jemalloc"
+   ]
+  },
+  "host": {
+   "system": "Linux",
+   "machine": "x86_64",
+   "cpu_model": "Intel(R) Core(TM) i9-14900K",
+   "cgroup_memory_bytes": 5368709120
+  },
+  "verification": "Complete Python file sets and native embedded input inventories were compared with immutable Git archives, dereferencing tracked symlinks.",
+  "verified_builds": {
+   "baseline": {
+    "native_sources_sha256": "422cdbc81c656a727904380acb9eab6a702a5e41b5c72daeb9f61e56dda59640",
+    "native_sha256": "d6ab77100482240534cf0de5ab87195a5a6265f8e09f219fadac13ae0da5aef0",
+    "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim/_runtime.abi3.so",
+    "roots": {
+     "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim",
+     "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core"
+    },
+    "native_input_count": 269,
+    "revision": "3fb31295a29497869bef1a2b0081bb36aab9e13a",
+    "package_paths": {
+     "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim",
+     "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk/aisim_core"
+    },
+    "python_sources_sha256": "e2b0b8f7bf0df4de497f4141c1165e82f13b12bd6698c336656afa356371742b"
+   },
+   "candidate": {
+    "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be",
+    "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+    "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+    "roots": {
+     "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+     "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+    },
+    "native_input_count": 269,
+    "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+    "package_paths": {
+     "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+     "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+    },
+    "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de"
+   }
+  }
+ },
+ "command": [
+  "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+  "benchmarks/evidence/mamba-mixed-step-accounting/repair_replay_perf.py",
+  "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+  "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/replay-baseline-sdk",
+  "6",
+  "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/repair-replay-4e940e38.json"
+ ],
+ "env_overrides": {
+  "AIC_ALLOW_UNLISTED_VERSIONS": "1"
+ },
+ "mode": "CPU native engine simulation of B200, not accelerator measurements"
+}

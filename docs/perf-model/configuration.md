@@ -283,6 +283,29 @@ This OP telemetry convention is distinct from the [STP FPM speculative approxima
 that per-query `draft_length` option takes logical decode request counts and
 total past KV, widens the former and preserves the latter.
 
+Optional scheduled-work detail for qualified Mamba operations:
+
+| Field | Default | Behavior |
+| --- | --- | --- |
+| `scheduled_requests.prefill_chunks` | absent | Exact prompt groups as `[request_count, new_tokens_per_request, prefix_tokens_per_request]`. Counts and new-token lengths must be positive; weighted request and prefix totals must match the counters. Weighted new tokens plus explicit query padding must equal `sum_prefill_tokens`. |
+| `scheduled_requests.sum_prefill_padding_tokens` | `0` | Query positions beyond the actual prompt chunks, included in `sum_prefill_tokens`. Requires exact `prefill_chunks`; cannot exceed the scheduled prefill total. |
+
+Native op-level Replay supplies these groups from its observed chunks. Qualified
+Mamba operations use each group's actual length and cached prefix, preserving
+cold measured rows beside warm SOL scans. Other operations keep their aggregate
+coordinates. Without groups, qualified Mamba distributes new tokens evenly over
+the reported prefill requests and treats all chunks as cached when any prefill
+prefix is present. A nonempty totals-only qualified prefill requires at least
+one new token per reported prefill request (`sum_prefill_tokens >=
+num_prefill_requests`); otherwise the even split assigns a request zero tokens
+and pricing fails. The groups are part of the pricing cache identity. For example,
+`[[1, 1000, 0], [1, 500, 64]]` represents two prefills with 1500 new tokens
+and 64 cached tokens. Whole-model FPM and regression keep their existing inputs.
+For a 17-token prompt with a 16-token cache hit, vLLM MTP3 can schedule
+four query positions. Replay retains `prefill_chunks: [[1, 1, 16]]`,
+`sum_prefill_tokens: 4` and `sum_prefill_padding_tokens: 3`: Mamba processes
+one prompt token while shared token-major operations retain four query positions.
+
 The canonical constructor currently supports explicit speculative schemes with
 OP/SOL timing. FPM interpolation and regression are unsupported candidates for
 these schemes, except that an explicit vLLM `fpm_regression` request prices an
@@ -844,7 +867,10 @@ both runs as one forward and takes the correction of that mixed iteration.
 
 Replay prices a pass this way only while `decode_speedup_ratio` is 1, its
 default and the only value MTP (`nextn > 0`) accepts: the shared time then
-takes `speedup_ratio` whatever work it holds. With another decode speedup,
+takes `speedup_ratio` whatever work it holds. Qualified Mamba prefill graphs
+also require `decode_speedup_ratio: 1`; Replay rejects another value during
+construction because phase fallback cannot preserve their observed chunk
+shapes. With another decode speedup on supported graphs,
 each rank prices its own phases, prefill at `speedup_ratio` and decode at
 `speedup_ratio * decode_speedup_ratio`, and the pass ends with the slowest
 rank, exactly as before the canonical query. A pass on which no rank computes

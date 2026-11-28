@@ -9,6 +9,9 @@ Python resolves the model's phase operations, dimensions, precision, and
 parallel placement into an `EngineSpec`. Rust loads the resolved performance
 database and evaluates that specification without re-entering Python on the hot
 path. Compilation produces a versioned operation plan, not a native executable.
+Saved `EngineSpec` JSON and bincode must use the current schema version.
+JSON conversion rejects old versions immediately with a request to recompile;
+it does not migrate an old plan by filling new operation fields with defaults.
 Use the [canonical estimator configuration](../configuration.md); low-level
 compiled-engine entry points are documented in the [Python](../api/python.md)
 and [Rust](../api/rust.md) references.
@@ -32,6 +35,82 @@ means missing energy evidence, not a zero-power operation.
 Data-source inheritance and empirical transfer are different. A row inherited
 from an approved measured donor is still collected data. An estimated
 cross-shape or cross-precision transfer must retain its transfer provenance.
+
+For qualified Mamba context graphs, aggregate prefill capacity is limited to
+the request slots left after decode admission. Direct `run_mixed` inputs
+describe already scheduled work and retain their explicit prefill count.
+Batched text aggregates weight the actual uncached chunks, including the short
+final chunk and one recurrent-state transfer per chunk. For batch four,
+ISL 4096, prefix 3072 and a 512-token prefill budget, this means eight mixed
+steps; the cold control still needs 32 and retains its original amortized query.
+Cached or ragged text chunks include the concurrent decoders and the prefix
+accumulated by each request's earlier chunks. The other requests' decode KV
+lengths stay fixed throughout that prefill progress.
+Aggregate result caching also distinguishes Nemotron-H state-cache precision,
+even when non-MTP graphs can reuse the same compiled timing handle.
+
+For cached-prefix text requests, the XPU vLLM aggregate TTFT estimate prices
+one request's uncached chunks explicitly before applying its burst or admission
+factor. Full prompt tokens remain the native op-level budget coordinates;
+they do not mean that cached tokens are recomputed. For example, a 4096-token
+prompt with 3000 cached tokens and 512 prefill slots after decode reservation
+prices chunks of 512, 512 and 72 new tokens, with prefixes 3000, 3512 and 4024.
+Each chunk retains the mixed step's concurrent decoders. Qualified Mamba
+therefore pays three recurrent-state charges and processes 1096 new prefill
+tokens, rather than scaling one chunk eight times. Per-request dispatch is
+added once. Batched cold text requests use the same exact chunk pricing when
+either phase graph contains qualified Mamba operations, including operations
+constructed directly through the native API, so a short final chunk
+pays a full recurrent-state charge. Unqualified batched cold graphs retain the
+existing XPU scaling heuristic. For a single text request, `run_agg` already
+sums its actual chunk prices and XPU TTFT uses that total directly.
+The aggregate scheduler reserves `nextn + 1` query-token slots per decoder from the full token capacity
+before capping prefill by the batch's demand. Whole-model FPM demand counts
+uncached tokens; op-level demand uses full prompt coordinates. Unqualified
+op-level graphs retain the calibrated mean-field demand for the whole batch,
+even beside concurrent decoders; that estimate is not a physical request-slot
+schedule. FPM and qualified Mamba prefill instead respect the request slots
+left after decode. The fitted XPU
+burst factor keeps its full-prompt denominator (`isl`), including for FPM:
+changing the query's token coordinates does not recalibrate the fit.
+Qualified Mamba mixed-step queries reject a partial prefill extend longer than
+one request's uncached suffix instead of dropping its excess tokens. Aggregate
+callers first translate their capacity to a scheduled shape, leaving excess
+space unused. Complete prompts retain their packed prefix coordinates.
+
+Op-level aggregates with visual tokens reject chunked prefill at every batch size
+when either phase contains qualified Mamba. The visual mean-field schedule
+amortizes whole-prefill attention; multiplying its scan price by that weight
+would overcount fresh tokens and recurrent-state transfers. Use a budget that
+fits the uncached suffix after any backend decode reservation, or a text-only
+workload.
+Budget sweeps skip unsupported chunked candidates and continue to larger budgets.
+Whole-model FPM visual overlays follow the uncached chunk schedule and sum to one
+whole overlay.
+
+Single-request op-level aggregates with visual tokens retain mean-field pricing
+when the uncached prompt exceeds the prefill budget. Native context attention
+and the visual-mask overlay amortize a whole-prefill query over
+`ceil(effective_isl / ctx_tokens)` steps, where `effective_isl` includes visual
+tokens. Base-backend TTFT, throughput and energy use that same weight to retain
+the full contribution. XPU TTFT restores whole-prefill attention but scales
+shared work by `effective_isl / ctx_tokens`, retaining its calibrated heuristic;
+it receives exact chunk totals only for text requests. The queuing factor still
+uses the uncached step count.
+This fallback does not model the exact placement of visual tokens in chunks;
+shared operations retain the existing mean-field approximation. Whole-model
+FPM instead retains its average over uncached chunks.
+
+Aggregate scheduling evidence records the caller's `ctx_tokens` capacity as
+`mix_context_token_budget`. For a single priced shape, `mix_context_tokens`
+comes from the executed `StepEstimate`, after budget translation (for example,
+1096 fresh FPM tokens for ISL 4096 and prefix 3000). A mean over distinct chunks
+retains its scheduling weights and latency, but omits `mix_context_tokens` and
+the raw `mixed` step entry: the mean has no single query coordinate. Its
+aggregate energy step likewise leaves `context_tokens` at zero.
+FPM result rows report `num_ctx_reqs` and `num_gen_reqs` from that executed
+schedule. The input `ctx_tokens` capacity and activation-memory reservation
+remain separate from those execution counts.
 
 ### Context-attention measurement boundaries
 

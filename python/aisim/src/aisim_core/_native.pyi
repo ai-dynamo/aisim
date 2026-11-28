@@ -144,8 +144,26 @@ class AicEngine:
         seq_imbalance_correction_scale: float = 1.0,
         gen_seq_imbalance_correction_scale: float = 1.0,
     ) -> tuple[
-        tuple[list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata]],
-        float | None,
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        float,
+    ]: ...
+    def _mixed_step_breakdown_per_op_with_decode_coverage(
+        self,
+        ctx_tokens: int,
+        gen_tokens: int,
+        isl: int,
+        osl: int,
+        prefix: int = 0,
+        seq_imbalance_correction_scale: float = 1.0,
+        gen_seq_imbalance_correction_scale: float = 1.0,
+    ) -> tuple[
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        float,
+        float,
     ]: ...
     def decode_step_per_op(
         self,
@@ -160,7 +178,7 @@ class AicEngine:
         isl: int,
         osl: int,
         gen_seq_imbalance_correction_scale: float = 1.0,
-    ) -> list[_PerOpValueWithMetadata]: ...
+    ) -> tuple[list[_PerOpValueWithMetadata], float]: ...
     def evaluate_context_ops(
         self,
         indices: list[int],

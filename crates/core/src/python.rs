@@ -645,6 +645,7 @@ type FpmEvidenceKey = (FpmEvidencePhase, u32, u32, u32, u64);
 
 /// A group iteration: every rank's query in DP order.
 type IterationKey = Vec<RankQuery>;
+type PrefillIterationKey = (IterationKey, Vec<Vec<[u32; 3]>>, bool);
 
 /// A recorded rank estimate's kind, the rank's query and the bits of the
 /// iteration's correction.
@@ -665,6 +666,9 @@ struct IterationPricing {
     /// the phase memo's does. Absent while the model collects lookup coverage,
     /// which counts every invocation.
     memo: Option<Memo<IterationKey, Arc<PricedIteration>>>,
+    /// Qualified Mamba additionally keys pricing by observed prefill groups.
+    prefill_memo: Option<Memo<PrefillIterationKey, Arc<PricedIteration>>>,
+    uses_prefill_chunks: bool,
     /// How a mixed operation-graph rank's operations split into prefill and
     /// decode evidence, per operation-name list the model reports.
     mixed_splits: Mutex<Vec<Arc<MixedSplit>>>,
@@ -776,6 +780,9 @@ impl IterationPricing {
                 .fpm_query_coverage()?
                 .is_none()
                 .then(|| Memo::clock(256)),
+            prefill_memo: (native.uses_prefill_chunks() && model.fpm_query_coverage()?.is_none())
+                .then(|| Memo::clock(256)),
+            uses_prefill_chunks: native.uses_prefill_chunks(),
             mixed_splits: Mutex::default(),
         }))
     }
@@ -1044,6 +1051,18 @@ impl AicTimingModel {
 
     fn is_fitted(&self) -> bool {
         self.fitted().is_some()
+    }
+
+    fn require_decode_speedup(&self, ratio: f64) -> Result<()> {
+        ensure!(
+            ratio == 1.0
+                || !self
+                    .iteration
+                    .as_ref()
+                    .is_some_and(|pricing| pricing.uses_prefill_chunks),
+            "qualified Mamba replay requires decode_speedup_ratio=1.0 to preserve per-request prefill chunks"
+        );
+        Ok(())
     }
 
     /// Phase pricing is never a fallback for an estimator fitted to whole
@@ -1509,10 +1528,35 @@ impl AicTimingModel {
         pricing: &IterationPricing,
         queries: &[RankQuery],
         capture: bool,
+        prefill_chunks: &[Vec<[u32; 3]>],
     ) -> Result<PricedIteration> {
         let dispatch = pricing.dispatch;
         let model = &pricing.model;
-        let metrics: Vec<_> = queries.iter().map(rank_metrics).collect();
+        let metrics: Vec<_> = queries
+            .iter()
+            .enumerate()
+            .map(|(index, query)| {
+                let mut metrics = rank_metrics(query);
+                if let Some(groups) = prefill_chunks
+                    .get(index)
+                    .filter(|groups| !groups.is_empty())
+                {
+                    let prompt_tokens = groups
+                        .iter()
+                        .try_fold(0_u32, |total, &[count, new, _]| {
+                            count
+                                .checked_mul(new)
+                                .and_then(|tokens| total.checked_add(tokens))
+                        })
+                        .context("prefill chunk token total overflow")?;
+                    metrics.scheduled_requests.sum_prefill_padding_tokens = query[1]
+                        .checked_sub(prompt_tokens)
+                        .context("prefill prompt chunks exceed scheduled query tokens")?;
+                    metrics.scheduled_requests.prefill_chunks = Some(groups.clone());
+                }
+                Ok(metrics)
+            })
+            .collect::<Result<_>>()?;
         let whole_model = matches!(dispatch, IterationDispatch::WholeModel { .. });
         if whole_model && !capture && !self.fpm_power {
             let total_ms = model
@@ -1645,7 +1689,11 @@ impl AicTimingModel {
                 let fractions = prefill_fractions
                     .iter()
                     .map(|&fraction| if prefill { fraction } else { 1.0 - fraction });
-                if let Some(phase) = self.operation_part_evidence(&rank.operations, fractions)? {
+                // Public estimates carry no per-query coverage; each folded
+                // operation's energy decides it.
+                if let Some(phase) =
+                    self.operation_part_evidence(&rank.operations, None, fractions)?
+                {
                     evidence.push((Self::corrected_phase(Arc::new(phase), correction)?, prefill));
                 }
             }
@@ -1711,6 +1759,11 @@ impl AicTimingModel {
             !operations.is_empty(),
             "canonical model reported no operations for rank {index}'s work"
         );
+        let covered = rank.diagnostic_covered.as_deref();
+        ensure!(
+            covered.is_some_and(|covered| covered.len() == operations.len()),
+            "canonical model reported no covered latency for rank {index}'s operations"
+        );
         let prefill_fractions =
             Self::prefill_fractions(kind, query, operations, pricing.mix_step_passes.as_ref());
         let mut parts = Vec::with_capacity(2);
@@ -1718,7 +1771,7 @@ impl AicTimingModel {
             let fractions = prefill_fractions
                 .iter()
                 .map(|&fraction| if prefill { fraction } else { 1.0 - fraction });
-            if let Some(phase) = self.operation_part_evidence(operations, fractions)? {
+            if let Some(phase) = self.operation_part_evidence(operations, covered, fractions)? {
                 parts.push((Arc::new(phase), prefill));
             }
         }
@@ -1742,10 +1795,12 @@ impl AicTimingModel {
         let Some(operations) = operations else {
             bail!("canonical model reported no operations for rank {index}'s work");
         };
-        let value = |&(latency_ms, energy_wms, source): &PerOpSlotValue, fraction: f64| {
+        let value = |&(latency_ms, energy_wms, covered_ms, source): &PerOpSlotValue,
+                     fraction: f64| {
             Ok((
                 latency_ms * fraction,
                 Some(energy_wms * fraction),
+                covered_ms * fraction,
                 TimingEvidenceSource::from_native(source),
             ))
         };
@@ -1754,10 +1809,11 @@ impl AicTimingModel {
             let phase = ValidatedTimingPhase::from_slot_values(
                 &operations.names,
                 operations.values.iter().map(|value| {
-                    let (latency_ms, energy_wms, source) = *value;
+                    let (latency_ms, energy_wms, covered_ms, source) = *value;
                     Ok((
                         latency_ms,
                         Some(energy_wms),
+                        covered_ms,
                         TimingEvidenceSource::from_native(source),
                     ))
                 }),
@@ -1852,22 +1908,28 @@ impl AicTimingModel {
     /// latency, energy and SOL times its fraction, and an operation with none
     /// left out. `None` when no operation has a part. Details are kept only
     /// while diagnostics are captured, as for phase evidence.
+    /// `covered` holds each operation's power-covered latency, summed per
+    /// query before the name fold; without it, each operation's energy decides.
     fn operation_part_evidence(
         &self,
         operations: &[crate::perfmodel::engine::diagnostics::StaticOperationDiagnostics],
+        covered: Option<&[f64]>,
         fractions: impl Iterator<Item = f64> + Clone,
     ) -> Result<Option<ValidatedTimingPhase>> {
         let entries = operations
             .iter()
+            .enumerate()
             .zip(fractions)
             .filter(|(_, fraction)| *fraction > 0.0);
-        // A rank-memo entry keeps this list: size it once, to what it holds.
+        // Rank-memo entries retain this list; allocate its final size once.
         let mut operations = Vec::with_capacity(entries.clone().count());
-        for (entry, fraction) in entries {
-            let mut operation = TimingOperationEvidence::new(
+        for ((index, entry), fraction) in entries {
+            let covered_ms = covered.map_or(entry.latency_ms, |covered| covered[index]);
+            let mut operation = TimingOperationEvidence::with_covered(
                 entry.name.clone(),
                 entry.latency_ms * fraction,
                 Some(entry.energy_wms * fraction),
+                covered_ms * fraction,
                 TimingEvidenceSource::from_native(&entry.source),
             )?;
             if self.diagnostic_model.is_some() {
@@ -2079,7 +2141,7 @@ fn phase_evidence_from_native_slots(
         names
             .iter()
             .zip(values)
-            .map(|(name, (latency_ms, energy_wms, source))| {
+            .map(|(name, (latency_ms, energy_wms, covered_ms, source))| {
                 ensure!(
                     energy_wms.is_finite() && energy_wms >= 0.0,
                     "AIC operation {name:?} returned invalid energy {energy_wms}W-ms"
@@ -2087,6 +2149,7 @@ fn phase_evidence_from_native_slots(
                 Ok((
                     latency_ms,
                     Some(energy_wms),
+                    covered_ms,
                     TimingEvidenceSource::from_native(source),
                 ))
             }),
@@ -2096,9 +2159,12 @@ fn phase_evidence_from_native_slots(
 fn phase_evidence_from_native_entries(
     entries: Vec<crate::perfmodel::engine::PerOpValue>,
 ) -> Result<ValidatedTimingPhase> {
+    // Each named entry is one result, so its energy decides its coverage.
     let (names, values): (Vec<_>, Vec<_>) = entries
         .into_iter()
-        .map(|(name, latency_ms, energy_wms, source)| (name, (latency_ms, energy_wms, source)))
+        .map(|(name, latency_ms, energy_wms, source)| {
+            (name, (latency_ms, energy_wms, latency_ms, source))
+        })
         .unzip();
     phase_evidence_from_native_slots(&names.into(), values)
 }
@@ -2169,14 +2235,49 @@ impl TimingModel for AicTimingModel {
         }
         let capture = self.diagnostic_model.is_some();
         let price = || {
-            self.price_iteration(pricing, &queries, capture)
+            self.price_iteration(pricing, &queries, capture, &[])
                 .map(Arc::new)
         };
-        let priced = match &pricing.memo {
-            Some(memo) => {
-                memo.get_or_price_by(&OnThread, queries.as_slice(), <[RankQuery]>::to_vec, price)?
+        let priced = if pricing.uses_prefill_chunks && queries.iter().any(|query| query[1] > 0) {
+            // Group once per rank, outside the operation walk. Query shape is
+            // part of both this iteration memo and the native rank memo.
+            let groups = ranks
+                .iter()
+                .map(|rank| -> Result<Vec<[u32; 3]>> {
+                    let mut grouped = std::collections::BTreeMap::new();
+                    if let Some(prefill) = &rank.prefill {
+                        for &(new, past, _) in &prefill.requests {
+                            let new = checked_u32(new, "prefill chunk tokens")?;
+                            let past = checked_u32(past, "prefill chunk prefix")?;
+                            *grouped.entry((new, past)).or_insert(0_u32) += 1;
+                        }
+                    }
+                    Ok(grouped
+                        .into_iter()
+                        .map(|((new, past), count)| [count, new, past])
+                        .collect())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let keep = groups.iter().map(Vec::len).sum::<usize>() <= 256;
+            let key = (queries.clone(), groups, capture);
+            let price = || {
+                self.price_iteration(pricing, &queries, capture, &key.1)
+                    .map(Arc::new)
+            };
+            match &pricing.prefill_memo {
+                Some(memo) if keep => memo.get_or_price_by(&OnThread, &key, Clone::clone, price)?,
+                _ => price()?,
             }
-            None => price()?,
+        } else {
+            match &pricing.memo {
+                Some(memo) => memo.get_or_price_by(
+                    &OnThread,
+                    queries.as_slice(),
+                    <[RankQuery]>::to_vec,
+                    price,
+                )?,
+                None => price()?,
+            }
         };
         self.record_iteration(&priced, &queries)?;
         Ok(Some(IterationMs {
@@ -3294,6 +3395,7 @@ fn resolve_role_timing(
         resources.require_memory()?;
     }
     let mut timing = AicTimingModel::build(&mut config, worker_type, role.rank.vision)?;
+    timing.require_decode_speedup(role.rank.decode_speedup_ratio)?;
     if let Some(fitted) = timing.fitted() {
         // The identity may not record attention DP; the engine's width decides.
         fitted.require_replay_role(role.dp_size, role.rank.decode_speedup_ratio)?;
@@ -9467,7 +9569,9 @@ mod tests {
         // detailed route. Both must satisfy these values independently.
         for capture in [false, true] {
             for _ in 0..2 {
-                let priced = timing.price_iteration(pricing, &queries, capture).unwrap();
+                let priced = timing
+                    .price_iteration(pricing, &queries, capture, &[])
+                    .unwrap();
                 assert!(close(priced.total_ms, 25.5), "{}", priced.total_ms);
                 assert!(close(priced.wait_ms, 40.5), "{}", priced.wait_ms);
                 assert_eq!(priced.estimate.is_some(), capture);
@@ -10315,6 +10419,428 @@ mod tests {
     }
 
     #[test]
+    fn qualified_mamba_replay_rejects_phase_fallback_for_heterogeneous_chunks() {
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        Python::initialize();
+        // AR, so this rejection is independent of the existing MTP guard.
+        let native = Arc::new(crate::perfmodel::engine::runtime::tests::qualified_mamba_engine(0));
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::attach(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        let mut rank = prefill_work(0, 2, 17, 64);
+        rank.prefill.as_mut().unwrap().requests = vec![(1, 0, 1), (16, 64, 80)];
+        for ratio in [0.0, 0.5, 2.0] {
+            let error = timing
+                .require_decode_speedup(ratio)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("qualified Mamba replay requires decode_speedup_ratio=1.0"));
+        }
+        timing.require_decode_speedup(1.0).unwrap();
+        // Unit speedup preserves both physical states and all 17 new tokens.
+        let expected = (17.0 * 18_560.0 + 2.0 * 2_097_152.0)
+            / native.database().system_spec.gpu.mem_bw
+            * 1000.0;
+        assert!(close(iteration_ms(&timing, &[rank]), expected));
+        // Providers without a qualified prefill graph retain phase fallback.
+        let mut legacy = timing;
+        legacy.iteration = None;
+        legacy.require_decode_speedup(0.5).unwrap();
+    }
+
+    #[test]
+    fn op_level_replay_prices_qualified_mamba_once_per_request_and_by_phase() {
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        Python::initialize();
+        // MTP3: two requests verify four tokens each.
+        let native = Arc::new(crate::perfmodel::engine::runtime::tests::qualified_mamba_engine(3));
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::attach(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let mut timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        let decode = RankWork {
+            dp_rank: 0,
+            prefill: None,
+            decode: Some(crate::engine::DecodeWork {
+                batch_size: 2,
+                active_kv_tokens: 32,
+                mean_context_length: 16,
+                kv_bound_tokens: 1 << 20,
+                lengths: Vec::new(),
+                widths: Vec::new(),
+                verify_width: 4,
+            }),
+        };
+        let mixed = mixed_work(prefill_work(0, 1, 16, 0), decode.clone());
+        // Replay packs decode as 2 * 4 requests; the width applies once.
+        let static_decode = native.decode_step_latency(2, 16, 1, 1.0).unwrap();
+        let static_mixed = native
+            .mixed_step_latency(16, 2, 16, 1, 0, 1.0, 1.0)
+            .unwrap();
+        // Independent oracle: bytes moved / memory bandwidth. Per token the scan
+        // moves (4096 + 2 * 4 * 128 + 64) * 2 + 4096 * 2 = 18,560 bytes, and one
+        // BF16 state is 4096 * 128 * 2 = 1 MiB. Pure decode: 2 requests verify
+        // 4 tokens each (8 tokens); each reads its state once and writes 4
+        // checkpoints. Mixed: one 16-token prefill reads and writes its state
+        // once, beside the same decode.
+        let ms = |bytes: f64| bytes / native.database().system_spec.gpu.mem_bw * 1000.0;
+        let decode_bytes = 8.0 * 18_560.0 + 2.0 * 1_048_576.0 * 5.0;
+        let prefill_bytes = 16.0 * 18_560.0 + 2.0 * 1_048_576.0;
+        assert!(close(static_decode, ms(decode_bytes)));
+        assert!(close(static_mixed, ms(prefill_bytes + decode_bytes)));
+        let find = |phase: &TimingPhaseEvidence, name: &str| {
+            phase
+                .operations
+                .iter()
+                .find(|operation| operation.name == name)
+                .map(|operation| operation.latency_ms)
+        };
+        for capture in [false, true] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            timing.phase_memo.clear();
+            timing
+                .iteration
+                .as_ref()
+                .unwrap()
+                .memo
+                .as_ref()
+                .unwrap()
+                .clear();
+            let (pure, _) = priced_with_evidence(&timing, |timing| {
+                iteration_ms(timing, std::slice::from_ref(&decode))
+            });
+            assert!(close(pure, static_decode), "{pure} {static_decode}");
+            let (iteration, evidence) =
+                priced_with_evidence(&timing, |timing| iteration_ms(timing, &[mixed.clone()]));
+            assert!(close(iteration, static_mixed), "{iteration} {static_mixed}");
+            // Each qualified op prices only its phase, so it is wholly that
+            // phase's evidence.
+            assert_eq!(find(&evidence.prefill, "generation_ssm"), None);
+            assert_eq!(find(&evidence.decode, "context_ssm"), None);
+            assert!(close(
+                find(&evidence.decode, "generation_ssm").unwrap(),
+                static_decode
+            ));
+            assert!(close(
+                find(&evidence.prefill, "context_ssm").unwrap(),
+                static_mixed - static_decode
+            ));
+            assert!(close(pure, ms(decode_bytes)), "{pure}");
+            assert!(close(iteration, ms(prefill_bytes + decode_bytes)));
+            assert!(close(
+                find(&evidence.decode, "generation_ssm").unwrap(),
+                ms(decode_bytes)
+            ));
+            assert!(close(
+                find(&evidence.prefill, "context_ssm").unwrap(),
+                ms(prefill_bytes)
+            ));
+        }
+    }
+
+    #[test]
+    fn op_level_replay_keeps_mtp_padding_separate_from_prompt_chunks() {
+        use crate::engine::{DirectRequest, MockEngineArgs, VllmCore};
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        Python::initialize();
+        let (native, _root) = crate::perfmodel::engine::runtime::tests::measured_mamba_engine();
+        let native = Arc::new(native);
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::attach(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let mut timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        for capture in [false, true] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            for running_decode in [false, true] {
+                let mut core = VllmCore::new(
+                    MockEngineArgs::builder()
+                        .block_size(16)
+                        .num_gpu_blocks(64)
+                        .max_num_batched_tokens(Some(64))
+                        .max_num_seqs(Some(4))
+                        .enable_chunked_prefill(true)
+                        .enable_prefix_caching(true)
+                        // Native MTP's documented prefix-cache mode keeps the
+                        // last full block, allowing the 16-token cache hit.
+                        .disable_eagle_block_drop(true)
+                        .speedup_ratio(1.0)
+                        .aic_nextn(Some(3))
+                        .aic_nextn_accept_rates(Some("1,1,1".into()))
+                        .build()
+                        .unwrap(),
+                );
+                let seed_output = if running_decode { 16 } else { 1 };
+                core.receive(DirectRequest {
+                    tokens: (0..17).collect(),
+                    max_output_tokens: seed_output,
+                    uuid: Some(uuid::Uuid::from_u128(1)),
+                    ..Default::default()
+                });
+                let first = core.schedule_pass(None, 0.0).unwrap();
+                let price = timing.predict_iteration_ms(&[first]).unwrap().unwrap();
+                let first = core.resolve_pass(Some(&price)).unwrap();
+                // A no-logits prefill is the unpadded control; requesting
+                // output makes this same cached suffix pay MTP query padding.
+                let follower_output = if running_decode { 8 } else { 0 };
+                core.receive(DirectRequest {
+                    tokens: (0..17).collect(),
+                    max_output_tokens: follower_output,
+                    uuid: Some(uuid::Uuid::from_u128(2)),
+                    ..Default::default()
+                });
+                let rank = core.schedule_pass(None, first.end_ms).unwrap();
+                let prefill = rank.prefill.as_ref().unwrap();
+                assert_eq!(prefill.requests, vec![(1, 16, 17)]);
+                assert_eq!(
+                    prefill.totals.new_tokens,
+                    if running_decode { 4 } else { 1 }
+                );
+                let (latency, evidence) = priced_with_evidence(&timing, |timing| {
+                    iteration_ms(timing, std::slice::from_ref(&rank))
+                });
+                // One actual token (18,560 activation bytes), one 1 MiB
+                // recurrent-state read and write, at B200's 7.7 TB/s.
+                let expected = 2_115_712.0 / 7.7e12 * 1000.0;
+                assert!((evidence.prefill.latency_ms - expected).abs() < 1e-9);
+                let pass = core
+                    .resolve_pass(Some(&IterationMs { total_ms: latency }))
+                    .unwrap();
+                let mut now = pass.end_ms;
+                let mut outputs = first
+                    .output_signals
+                    .iter()
+                    .chain(&pass.output_signals)
+                    .filter(|signal| signal.token_id.is_some())
+                    .count();
+                let mut completed = first.completed_requests + pass.completed_requests;
+                for _ in 0..32 {
+                    if core.is_empty() {
+                        break;
+                    }
+                    let rank = core.schedule_pass(None, now).unwrap();
+                    let price = timing.predict_iteration_ms(&[rank]).unwrap().unwrap();
+                    let pass = core.resolve_pass(Some(&price)).unwrap();
+                    assert!(pass.output_signals.iter().all(|signal| !signal.rejected));
+                    now = pass.end_ms;
+                    outputs += pass
+                        .output_signals
+                        .iter()
+                        .filter(|signal| signal.token_id.is_some())
+                        .count();
+                    completed += pass.completed_requests;
+                }
+                assert!(core.is_drained());
+                assert_eq!(completed, 2);
+                assert_eq!(outputs, seed_output + follower_output);
+            }
+        }
+    }
+
+    #[test]
+    fn op_level_replay_preserves_observed_mamba_chunks_and_prefixes() {
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        Python::initialize();
+        let (native, _root) = crate::perfmodel::engine::runtime::tests::measured_mamba_engine();
+        let native = Arc::new(native);
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::attach(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let mut timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        let ragged = fitted_work(0, Some(&[(1000, 0), (500, 0)]), None);
+        let balanced = fitted_work(0, Some(&[(750, 0), (750, 0)]), None);
+        let cold_warm = fitted_work(0, Some(&[(16, 0), (16, 64)]), None);
+        // Fixture rows: (1,1000)=3 ms, (1,500)=2 ms, (2,750)=11 ms,
+        // and cold (1,16)=5 ms. Warm (1,16) moves 2,394,112 bytes.
+        let warm_ms = 2_394_112.0 / 7.7e12 * 1000.0;
+        for capture in [false, true] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            for (rank, expected) in [
+                (&ragged, 5.0),
+                (&balanced, 11.0),
+                (&ragged, 5.0),
+                (&cold_warm, 5.0 + warm_ms),
+            ] {
+                for mixed in [false, true] {
+                    let mut rank = rank.clone();
+                    let decode_ms = if mixed {
+                        let mut decode = fitted_work(0, None, Some(&[16, 16])).decode.unwrap();
+                        decode.verify_width = 4;
+                        decode.widths = vec![4, 4];
+                        rank.decode = Some(decode);
+                        10_634_240.0 / 7.7e12 * 1000.0
+                    } else {
+                        0.0
+                    };
+                    let (latency, evidence) =
+                        priced_with_evidence(&timing, |timing| iteration_ms(timing, &[rank]));
+                    assert!(
+                        close(latency, expected + decode_ms),
+                        "{latency} != {}",
+                        expected + decode_ms
+                    );
+                    assert!(close(
+                        evidence
+                            .prefill
+                            .operations
+                            .iter()
+                            .map(|op| op.latency_ms)
+                            .sum(),
+                        expected
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn op_level_replay_counts_split_mamba_power_coverage_per_query() {
+        use crate::common::enums::{DatabaseMode, TransferPolicy};
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        use crate::perfmodel::fpm::ForwardPassPerfOptions;
+        Python::initialize();
+        // Batch-2 scan rows carry power; batch-1 rows do not.
+        let root = tempfile::tempdir().unwrap();
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).unwrap();
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["mamba_chunk_scan_combined"; 4]),
+                Col::Str("phase", vec!["context"; 4]),
+                Col::I64("batch_size", vec![1, 1, 2, 2]),
+                Col::I64("seq_len", vec![8, 16, 8, 16]),
+                Col::I64("d_model", vec![4096; 4]),
+                Col::I64("d_state", vec![128; 4]),
+                Col::I64("d_conv", vec![4; 4]),
+                Col::I64("nheads", vec![64; 4]),
+                Col::I64("head_dim", vec![64; 4]),
+                Col::I64("n_groups", vec![4; 4]),
+                Col::I64("chunk_size", vec![128; 4]),
+                Col::F64("latency", vec![0.1, 0.2, 0.2, 0.4]),
+                Col::F64("power", vec![0.0, 0.0, 500.0, 500.0]),
+            ],
+        );
+        let db = crate::perf_database::PerfDatabase::load(root.path(), "testsys", "test", "1.0")
+            .unwrap()
+            .with_mode(DatabaseMode::Hybrid, TransferPolicy::ALL);
+        let native =
+            Arc::new(crate::perfmodel::engine::runtime::tests::qualified_mamba_engine_over(db, 0));
+        // Independent queries: the split of 25 tokens over 3 requests prices
+        // (2, 8) on a powered row and (1, 9) on unpowered rows.
+        let crate::operators::Op::Mamba2(scan) =
+            crate::perfmodel::engine::runtime::tests::qualified_mamba(true, 1)
+        else {
+            unreachable!()
+        };
+        let query = |batch, tokens| {
+            scan.query_with_prefix(native.database(), batch, tokens, 0)
+                .unwrap()
+        };
+        let (powered, unpowered) = (query(2, 8), query(1, 9));
+        assert!(powered.energy_wms > 0.0 && unpowered.energy_wms == 0.0);
+        let model = Arc::new(ForwardPassPerfModel::from_engine(
+            Arc::clone(&native),
+            ForwardPassPerfOptions::default(),
+        ));
+        let engine = Python::attach(|py| {
+            Py::new(
+                py,
+                crate::AicEngine::from_shared_engine(Arc::clone(&native)),
+            )
+            .unwrap()
+            .into_any()
+        });
+        let mut timing = with_iteration_pricing(python_timing_model(engine, false), &model);
+        let scan_evidence = |timing: &AicTimingModel, rank: RankWork| {
+            let (_, evidence) =
+                priced_with_evidence(timing, |timing| iteration_ms(timing, &[rank]));
+            let phase = evidence.prefill;
+            let op = phase
+                .operations
+                .iter()
+                .find(|operation| operation.name == "context_ssm")
+                .unwrap()
+                .clone();
+            (op, phase)
+        };
+        let decode = decode_work(0, 2, 32, 1 << 20);
+        for capture in [false, true] {
+            timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+            timing.phase_memo.clear();
+            let memo = timing.iteration.as_ref().unwrap().memo.as_ref().unwrap();
+            memo.clear();
+            for rank in [
+                prefill_work(0, 3, 25, 0),
+                mixed_work(prefill_work(0, 3, 25, 0), decode.clone()),
+            ] {
+                let (op, phase) = scan_evidence(&timing, rank);
+                // One folded row with positive energy, but only the powered
+                // query's latency is covered.
+                assert!(close(
+                    op.latency_ms,
+                    powered.latency_ms + unpowered.latency_ms
+                ));
+                assert!(close(op.energy_wms.unwrap(), powered.energy_wms));
+                assert!(
+                    close(op.covered_latency_ms, powered.latency_ms),
+                    "{capture}"
+                );
+                assert!(close(phase.covered_latency_ms, powered.latency_ms));
+                assert!(
+                    phase.covered_latency_ms / phase.latency_ms < POWER_DATA_COVERAGE_THRESHOLD,
+                    "{capture}: the folded row must not pass the publication gate"
+                );
+            }
+            // Controls: one powered (2, 8) query is fully covered; one
+            // unpowered (1, 9) query covers nothing.
+            let (op, _) = scan_evidence(&timing, prefill_work(0, 2, 16, 0));
+            assert!(op.covered_latency_ms > 0.0 && close(op.covered_latency_ms, op.latency_ms));
+            let (op, _) = scan_evidence(&timing, prefill_work(0, 1, 9, 0));
+            assert_eq!(op.covered_latency_ms, 0.0);
+        }
+    }
+
+    #[test]
     fn tuned_op_level_decode_takes_its_correction_at_the_packed_coordinates() {
         pyo3::Python::initialize();
         let Some(mut timing) = packaged_op_level_timing(
@@ -10714,7 +11240,7 @@ mod tests {
                 .map(|rank| AicTimingModel::rank_query(dispatch, rank).unwrap().unwrap())
                 .collect();
             let evidence = timing
-                .price_iteration(pricing, &queries, capture)
+                .price_iteration(pricing, &queries, capture, &[])
                 .unwrap()
                 .evidence;
             // One part per pure rank, in rank order; each rank's memo entry

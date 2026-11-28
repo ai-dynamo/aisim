@@ -922,19 +922,23 @@ def _resolve_attention_lane_orders(
 
     for op in ops:
         if isinstance(op, ContextAttention):
-            op._lane_order = resolved_lane_order_for_op(
+            order = resolved_lane_order_for_op(
                 database,
                 "_context_attention_data",
                 override,
                 architecture,
             )
+            if op._lane_order != order:
+                op._lane_order = order
         elif isinstance(op, GenerationAttention):
-            op._lane_order = resolved_lane_order_for_op(
+            order = resolved_lane_order_for_op(
                 database,
                 "_generation_attention_data",
                 override,
                 architecture,
             )
+            if op._lane_order != order:
+                op._lane_order = order
         elif isinstance(op, FPMForwardOp):
             _resolve_attention_lane_orders(op._sol_ops, database, override, architecture)
 
@@ -1500,11 +1504,42 @@ class EngineHandle:
         seq_imbalance_correction_scale: float = 1.0,
         gen_seq_imbalance_correction_scale: float = 1.0,
     ) -> tuple[
-        tuple[list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata], list[_PerOpValueWithMetadata]],
-        float | None,
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        float,
     ]:
-        """Internal mixed-step per-op stream with fallback metadata and optional native coverage."""
+        """Internal mixed-step per-op stream with inline-first fallback metadata,
+        plus the step's power-covered latency, decided per query before name folding."""
         return self._engine._mixed_step_breakdown_per_op_with_metadata(
+            int(ctx_tokens),
+            int(gen_tokens),
+            int(isl),
+            int(osl),
+            int(prefix),
+            float(seq_imbalance_correction_scale),
+            float(gen_seq_imbalance_correction_scale),
+        )
+
+    def _mixed_step_breakdown_per_op_with_decode_coverage(
+        self,
+        ctx_tokens: int,
+        gen_tokens: int,
+        isl: int,
+        osl: int,
+        prefix: int = 0,
+        seq_imbalance_correction_scale: float = 1.0,
+        gen_seq_imbalance_correction_scale: float = 1.0,
+    ) -> tuple[
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        list[_PerOpValueWithMetadata],
+        float,
+        float,
+    ]:
+        """Internal mixed-step per-op stream with inline-first fallback metadata,
+        plus total and decode-only covered latency, decided before name folding."""
+        return self._engine._mixed_step_breakdown_per_op_with_decode_coverage(
             int(ctx_tokens),
             int(gen_tokens),
             int(isl),
@@ -1532,8 +1567,8 @@ class EngineHandle:
         isl: int,
         osl: int,
         gen_seq_imbalance_correction_scale: float = 1.0,
-    ) -> list[_PerOpValueWithMetadata]:
-        """Internal decode per-op stream with inline-first fallback metadata."""
+    ) -> tuple[list[_PerOpValueWithMetadata], float]:
+        """Internal decode per-op stream and coverage summed before name folding."""
         return self._engine._decode_step_per_op_with_metadata(
             int(gen_tokens), int(isl), int(osl), float(gen_seq_imbalance_correction_scale)
         )

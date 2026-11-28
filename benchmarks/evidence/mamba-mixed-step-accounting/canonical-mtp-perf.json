@@ -1,0 +1,2447 @@
+{
+ "config": {
+  "traffic": {
+   "source": {
+    "type": "synthetic",
+    "input_tokens": 2048,
+    "cached_prefix_tokens": 512,
+    "output_tokens": 32
+   },
+   "load": {
+    "type": "concurrency",
+    "concurrency": 64
+   },
+   "stop": {
+    "requests": 1000
+   }
+  },
+  "engine": {
+   "mode": "aggregated",
+   "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+   "hardware": "b200_sxm",
+   "backend": "trtllm",
+   "backend_version": "1.3.0rc20",
+   "context_length": 8192,
+   "ais_perf_model": {
+    "estimation_mode": "op_level",
+    "fallback_policy": "deny",
+    "database_mode": "HYBRID"
+   },
+   "workers": {
+    "aggregated": {
+     "parallelism": {
+      "replicas": 1,
+      "tensor": 1,
+      "pipeline": 1,
+      "attention_data": 1,
+      "moe_tensor": 1,
+      "moe_expert": 1
+     },
+     "scheduler": {
+      "max_batched_tokens": 4096,
+      "max_sequences": 64
+     },
+     "kv_cache": {
+      "block_size": 64,
+      "prefix_caching": true,
+      "capacity": {
+       "type": "fixed",
+       "blocks": 8192
+      }
+     }
+    }
+   }
+  }
+ },
+ "qualification": "canonical MTP3, checkpoint-declared FP32 state; control has no MTP",
+ "python_revisions": {
+  "baseline": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+  "candidate": "4e940e38d2ba667c2905e5d5453b28110cb881d1"
+ },
+ "native_scope": "Both Python revisions share the candidate native oracle; its hashes are recorded separately.",
+ "host": {
+  "system": "Linux",
+  "machine": "x86_64",
+  "cpu": "Intel(R) Core(TM) i9-14900K",
+  "python": "3.12.12",
+  "cpu_count": 32
+ },
+ "mode": "CPU native engine simulation, not accelerator measurements",
+ "env_overrides": {
+  "AIC_ALLOW_UNLISTED_VERSIONS": "1"
+ },
+ "rounds": [
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/0-baseline-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "c25000715d8d1707c9998617197517d1677c40a95161f49f39b76207234f7c30",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 86.003491,
+      "cli_seconds": 4.008112480980344,
+      "peak_rss_bytes": 310808576,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/0-baseline-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "6e05bda753f53d150d50f9e479193d5f0f20fa862ea71973c4bbbd1aa8ec1c5f",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 92.952546,
+      "cli_seconds": 3.142133571964223,
+      "peak_rss_bytes": 273391616,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    },
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/0-candidate-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "553326c3c1009e179db3accd7900ba6256c3ce0a062ecb906be9d21194682d72",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 85.186864,
+      "cli_seconds": 3.250857262988575,
+      "peak_rss_bytes": 311517184,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/0-candidate-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "3f925403a242c9241de0fef21041311d4b9e84fd58e626e802f3fa7d60ea99ac",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 98.129456,
+      "cli_seconds": 3.191662523022387,
+      "peak_rss_bytes": 273801216,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/1-candidate-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "2beea272c89635ff9832bd811cd8f9457b09cce042a30cccaec5e6c670a51a5d",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 84.520066,
+      "cli_seconds": 3.271188678976614,
+      "peak_rss_bytes": 324952064,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/1-candidate-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "0a64d2636e06853a4d0a4f6a6fed43c1c5dc9ec925edbf2a9f4eb8ec98e72f6e",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 92.945128,
+      "cli_seconds": 3.151851519010961,
+      "peak_rss_bytes": 274358272,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    },
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/1-baseline-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "2dbd2d4ad1ae6b866a2c93546d452495e1ced1fdadb998baf3dfde3d682caf1d",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 88.046519,
+      "cli_seconds": 3.3178102069650777,
+      "peak_rss_bytes": 311787520,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/1-baseline-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "954520fce7329ef4da5e0399457d51f96e3da17cba56b0664d3b25b23d94d299",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 91.323555,
+      "cli_seconds": 3.139042889000848,
+      "peak_rss_bytes": 272498688,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/2-baseline-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "81723bb715f8949e7360c086f2e1cfda533ca5f61c0ea42b70f38833aef9e9df",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 85.545317,
+      "cli_seconds": 3.317708648974076,
+      "peak_rss_bytes": 328437760,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/2-baseline-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "a97913019602aaa91d9d47c8de73f33783b864adad9c8f3e4bd2e746dc66b942",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 91.30204499999999,
+      "cli_seconds": 3.115185789996758,
+      "peak_rss_bytes": 273063936,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    },
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/2-candidate-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "38aa9dc9f8903124759c5592c59edc349c30df254c5b3edb602c6d3ef8106e1e",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 80.768642,
+      "cli_seconds": 3.172091963002458,
+      "peak_rss_bytes": 310587392,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/2-candidate-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "159ed220b9adc2c2d7de7629d4767738f0f9fec8653b768453a28c038c2126e0",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 90.687293,
+      "cli_seconds": 3.0671928550000302,
+      "peak_rss_bytes": 296923136,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/3-candidate-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "374d93c2b3e937587fcf05ac8af35141463b4fa94311c6d212f9c5df910f9ada",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 83.00340800000001,
+      "cli_seconds": 3.14795337599935,
+      "peak_rss_bytes": 311091200,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/3-candidate-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "09c9313f2028cfc8b3061d3c903a3d949d5987832e013a8faf61246454a34d0c",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 88.734098,
+      "cli_seconds": 2.9486462880158797,
+      "peak_rss_bytes": 273854464,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    },
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/3-baseline-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "3c0cc09ed8987fa6604e8d2abe913a2c131beeda5f52f1695af8b72db140d8cf",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 79.184798,
+      "cli_seconds": 3.146345246990677,
+      "peak_rss_bytes": 311607296,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/3-baseline-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "8bfd8d7e92ac120c5078670a429b6f4c96adfc4416e6447f0407831c38111296",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 88.238312,
+      "cli_seconds": 2.896857042971533,
+      "peak_rss_bytes": 297504768,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "baseline",
+    "candidate"
+   ],
+   "results": {
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/4-baseline-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "54b20a7a8fa90297837e0ad2a361d5aaf82f8f187bd3b31f4b5a37283fce4ebe",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 80.49782900000001,
+      "cli_seconds": 3.153402250027284,
+      "peak_rss_bytes": 311451648,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/4-baseline-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "0b6621dc3c62df3f48cdb705014f84d147826a9a897b9123a7ed86c795ed644c",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 87.695498,
+      "cli_seconds": 3.029322337009944,
+      "peak_rss_bytes": 297869312,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    },
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/4-candidate-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "692643826f0e9eba1c09771e96ce8a59eee6302b18e7df469fcb3eb96cefeb33",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 84.332064,
+      "cli_seconds": 3.240887471009046,
+      "peak_rss_bytes": 311791616,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/4-candidate-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "fbe6e2987753464dd834f525d09a3476f395debcba20873d590080f476e17aa7",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 88.345664,
+      "cli_seconds": 3.1063202929799445,
+      "peak_rss_bytes": 273293312,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    }
+   }
+  },
+  {
+   "order": [
+    "candidate",
+    "baseline"
+   ],
+   "results": {
+    "candidate": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/5-candidate-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "6c20766bfac7a49f16a9cec6ac2e772d9a83ac70d31155adc7f1d91ef669ba76",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 463.764468423,
+      "mean_tpot_ms": 9.47266338158065,
+      "duration_ms": 12034.808389999997,
+      "wall_time_ms": 83.812673,
+      "cli_seconds": 3.247695820988156,
+      "peak_rss_bytes": 311271424,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/5-candidate-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "34254a4da6e0c7b190d73f679c794f9699a7840d7c5a6e062bcafdcd31e29b7e",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 88.168729,
+      "cli_seconds": 3.1128181230160408,
+      "peak_rss_bytes": 273145856,
+      "build": {
+       "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+       },
+       "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de",
+       "constructor_sha256": "352a558e6d437f5255e0c3aa36f60a7dd9fdb04f83757462bb29f5a08745ae7c",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    },
+    "baseline": {
+     "nano": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        },
+        "nextn": 3,
+        "nextn_accepted": 2.2
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/5-baseline-nano",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "db334d21b833f614238f187a34adb5716da35f66abae72fa37bde2acb85fbbc2",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 444.293219733,
+      "mean_tpot_ms": 9.070313617322585,
+      "duration_ms": 11527.582345,
+      "wall_time_ms": 85.733009,
+      "cli_seconds": 3.156652061967179,
+      "peak_rss_bytes": 320856064,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     },
+     "control": {
+      "config": {
+       "traffic": {
+        "source": {
+         "type": "synthetic",
+         "input_tokens": 2048,
+         "cached_prefix_tokens": 512,
+         "output_tokens": 32
+        },
+        "load": {
+         "type": "concurrency",
+         "concurrency": 64
+        },
+        "stop": {
+         "requests": 1000
+        }
+       },
+       "engine": {
+        "mode": "aggregated",
+        "model": "Qwen/Qwen3-0.6B",
+        "hardware": "b200_sxm",
+        "backend": "trtllm",
+        "backend_version": "1.3.0rc20",
+        "context_length": 8192,
+        "ais_perf_model": {
+         "estimation_mode": "op_level",
+         "fallback_policy": "deny",
+         "database_mode": "HYBRID"
+        },
+        "workers": {
+         "aggregated": {
+          "parallelism": {
+           "replicas": 1,
+           "tensor": 1,
+           "pipeline": 1,
+           "attention_data": 1,
+           "moe_tensor": 1,
+           "moe_expert": 1
+          },
+          "scheduler": {
+           "max_batched_tokens": 4096,
+           "max_sequences": 64
+          },
+          "kv_cache": {
+           "block_size": 64,
+           "prefix_caching": true,
+           "capacity": {
+            "type": "fixed",
+            "blocks": 8192
+           }
+          }
+         }
+        }
+       }
+      },
+      "command": [
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/bin/python",
+       "-m",
+       "aisim",
+       "predict",
+       "--stack",
+       "engine",
+       "-c",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/config.json",
+       "--output-dir",
+       "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/tmp/mamba-repair-replay-mi4ierrx/5-baseline-control",
+       "--format",
+       "json",
+       "--capture-per-request"
+      ],
+      "correctness": "1000 completions; input/output totals match; control duration equal",
+      "requests_sha256": "e4c0eb0efeb34cfc9a0c829df1bafbca79a9311b6e75ac1cb85e63b77ec3fbf8",
+      "completed_requests": 1000,
+      "total_input_tokens": 2048000,
+      "total_output_tokens": 32000,
+      "mean_ttft_ms": 17.891959472000142,
+      "mean_tpot_ms": 8.4848847729677,
+      "duration_ms": 4431.993944999998,
+      "wall_time_ms": 87.96973,
+      "cli_seconds": 3.0786434300243855,
+      "peak_rss_bytes": 292179968,
+      "build": {
+       "revision": "22a3fec3c24613fd68cf056a83ede789bd74cf8d",
+       "package_paths": {
+        "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim",
+        "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/canonical-baseline/python/aisim/src/aisim_core"
+       },
+       "python_sources_sha256": "3ac58b1ce50c17ac01f5394065e22ee4dd496b5e1fa69466dc8e3726108e1b7d",
+       "constructor_sha256": "233e0bedc4f9fa3a8f18956b980f2f11e7858c5ef40684adad2b40726668fdd2",
+       "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+       "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be"
+      }
+     }
+    }
+   }
+  }
+ ],
+ "driver_sha256": "7c873b296ed287a9dc17207ee318850b1271996fab0b15711dfa5f28d89ed4b6",
+ "raw_requests": {
+  "path": "canonical-mtp-perf.requests.json.gz",
+  "sha256": "5908ae92c7a1156934d18b85c280966da11a163e8f89ee0b119ee145881c3a5c",
+  "format": "gzip JSON mapping requests.jsonl SHA256 to complete per-request records"
+ },
+ "build_verification": {
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "python": "3.12.12",
+  "flags": {
+   "profile": "release",
+   "opt_level": 3,
+   "lto": "thin",
+   "codegen_units": 1,
+   "cargo_build_jobs": 2,
+   "features": [
+    "extension-module",
+    "jemalloc"
+   ]
+  },
+  "host": {
+   "system": "Linux",
+   "machine": "x86_64",
+   "cpu_model": "Intel(R) Core(TM) i9-14900K",
+   "cgroup_memory_bytes": 5368709120
+  },
+  "verification": "Complete Python file sets and native embedded input inventories were compared with immutable Git archives, dereferencing tracked symlinks.",
+  "shared_native": {
+   "native_sources_sha256": "d101d933c7f9a1f092cbac12ad87200baa2c5c9279416660e7818433fe00c0be",
+   "native_sha256": "c78635fbba878b110e5d9cd1e10cd42e12756838c22afc397827afd72bd59ced",
+   "native_path": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim/_runtime.abi3.so",
+   "roots": {
+    "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+    "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+   },
+   "native_input_count": 269,
+   "revision": "4e940e38d2ba667c2905e5d5453b28110cb881d1",
+   "package_paths": {
+    "aisim": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim",
+    "aisim_core": "/home/jasonzho/.local/state/aisimulate-pr-review/merge-babysit/repair/runs/pr-619-20261124T193207738058Z/scratch/venv/lib/python3.12/site-packages/aisim_core"
+   },
+   "python_sources_sha256": "f66aace432f712f324b60e4f9d5c05d119a5a90d4259ccac1c5fc19032f6c2de"
+  }
+ }
+}

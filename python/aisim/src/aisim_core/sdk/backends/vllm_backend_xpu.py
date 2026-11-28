@@ -6,10 +6,12 @@ TTFT: prefill time x a fitted burst factor when the batch fits the running-batch
 TPOT: mixed prefill/decode steps counted per-request, instead of averaged in the base.
 """
 
+import copy
 import logging
 import math
 from dataclasses import replace
 
+from aisim_core.sdk.backends.base_backend import _has_qualified_mamba
 from aisim_core.sdk.backends.vllm_backend import VLLMBackend
 from aisim_core.sdk.config import RuntimeConfig
 from aisim_core.sdk.models import BaseModel
@@ -53,16 +55,37 @@ class VLLMXPUBackend(VLLMBackend):
         encoder_latency_ms: float,
         steps_to_finish_ctx: float,
         decode_iterations: float,
+        prefill_total_ms: float | None = None,
     ) -> float:
         """encoder + own_prefill, x burst factor (eff_bs==b) or + admission wait (eff_bs<b); raw for b<=1."""
+        if b == 1 and prefill_total_ms is not None:
+            # run_agg already summed the actual sequential chunk prices.
+            return encoder_latency_ms + prefill_total_ms + self._prefill_dispatch_overhead_ms(model)
         d = 0 if b <= 1 else self._mix_step_gen_tokens(b, ctx_tokens, isl, decode_iterations)
-        # a batch of b provides at most b*isl prefill tokens, so it can't fill more of the ctx
-        # budget than that; using the raw ctx over-prices the step and the factor when b*isl < ctx.
-        prefill_ctx = min(ctx_tokens, max(1, b) * isl)
+        # Native budget coordinates: op-level includes the cached prefix, while
+        # whole-model FPM uses new tokens. Neither recomputes the cached prefix.
+        request_tokens = isl
+        is_fpm = getattr(model, "forward_model", "op_level") == "fpm"
+        if is_fpm:
+            request_tokens = max(1, isl - prefix)
+        # Cap demand after run_mixed reserves decode slots from the total
+        # scheduler budget. The burst fit still reads the capped demand below.
+        prefill_ctx = min(ctx_tokens, max(1, b) * request_tokens)
         step = self.run_mixed(
-            model, database, runtime_config, MixedStepInput(context_tokens=prefill_ctx, num_decode_requests=d)
+            model,
+            database,
+            runtime_config,
+            MixedStepInput(context_tokens=ctx_tokens if b > 1 else prefill_ctx, num_decode_requests=d),
         )
-        own_prefill_ms = self._own_prefill_ms(step, model, isl)
+        exact_text_prefill = (
+            b > 1 and not is_fpm and isl == runtime_config.isl and (prefix > 0 or _has_qualified_mamba(model))
+        )
+        if exact_text_prefill:
+            # A packed prompt budget is not a multiplier for already-priced
+            # uncached work, especially Mamba's per-chunk recurrent-state cost.
+            own_prefill_ms = self._own_cached_prefill_ms(step, model, database, runtime_config, isl, prefix)
+        else:
+            own_prefill_ms = self._own_prefill_ms(step, model, request_tokens)
         if b <= 1:
             logger.debug(f"ttft(xpu): own_prefill={own_prefill_ms:.2f}ms b<=1 (no queuing)")
             return encoder_latency_ms + own_prefill_ms
@@ -93,6 +116,46 @@ class VLLMXPUBackend(VLLMBackend):
         logger.debug(f"ttft(xpu): own_prefill={own_prefill_ms:.2f}ms eff_bs={eff_bs} {regime} ttft={ttft:.2f}ms")
         return encoder_latency_ms + ttft
 
+    def _own_cached_prefill_ms(
+        self,
+        step: StepEstimate,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+        isl: int,
+        prefix: int,
+    ) -> float:
+        """Price one text request's uncached chunks, retaining the mixed step's decoders.
+
+        The native op-level budget includes each chunk's already processed
+        prefix. Rust removes that prefix and prices the actual new tokens and
+        one recurrent-state charge per chunk, including a short final chunk.
+        """
+        if step.context_tokens == isl:
+            return step.latency_ms + self._prefill_dispatch_overhead_ms(model)
+        chunk_runtime = copy.copy(runtime_config)
+        chunk_runtime.batch_size = 1
+        total_ms = 0.0
+        for past in range(prefix, isl, step.context_tokens):
+            chunk_runtime.prefix = past
+            chunk_runtime.isl = min(isl, past + step.context_tokens)
+            # These shapes are already scheduled: bypass the aggregate XPU
+            # budget conversion so decoders do not shrink the chunk again.
+            chunk = super().run_mixed(
+                model,
+                database,
+                chunk_runtime,
+                MixedStepInput(chunk_runtime.isl, step.num_decode_requests),
+            )
+            # Other requests' decode KV does not change with this request's
+            # prefill progress. Reuse its original native decode component.
+            total_ms += (
+                chunk.component_latency_ms["shared_non_attention"]
+                + chunk.component_latency_ms["context_attention"]
+                + step.component_latency_ms["decode_attention"]
+            )
+        return total_ms + self._prefill_dispatch_overhead_ms(model)
+
     def _own_prefill_ms(self, step: StepEstimate, model: BaseModel, isl: int) -> float:
         """One request's chunked prefill from the mixed step: full attention (undo run_mixed's
         /ceil) + gemm/decode scaled by isl/ctx_eff, plus per-request dispatch. The empirical burst
@@ -100,7 +163,11 @@ class VLLMXPUBackend(VLLMBackend):
         ctx_eff = step.context_tokens
         ctx_attn = step.per_op_latency_ms.get("context_attention (scaled)", 0.0)
         full_attn = ctx_attn * math.ceil(isl / ctx_eff)
-        return full_attn + (step.latency_ms - ctx_attn) * (isl / ctx_eff) + self._prefill_dispatch_overhead_ms(model)
+        scale = isl / ctx_eff
+        if getattr(model, "forward_model", "op_level") == "fpm" and ctx_eff < isl:
+            # A whole-model FPM prices the mean of one request's chunks: count every chunk.
+            scale = math.ceil(scale)
+        return full_attn + (step.latency_ms - ctx_attn) * scale + self._prefill_dispatch_overhead_ms(model)
 
     @staticmethod
     def _decode_tpot_ms(mix_lat, genonly_lat, b, isl, osl, ctx_tokens, steps_to_finish_ctx, all_mix=False) -> float:
@@ -277,6 +344,11 @@ class VLLMXPUBackend(VLLMBackend):
 
     # ==================== MIX-STEP LATENCY (shared) ====================
 
+    def _run_agg_mixed_step(self, model, database, runtime_config, step: MixedStepInput) -> StepEstimate:
+        # XPU consumes a total scheduler budget: reserve decode slots before
+        # translating the remaining prompt budget to FPM fresh tokens.
+        return self.run_mixed(model, database, runtime_config, step)
+
     def run_mixed(
         self,
         model: BaseModel,
@@ -302,6 +374,32 @@ class VLLMXPUBackend(VLLMBackend):
             if step.num_decode_requests > cap:
                 step = replace(step, num_decode_requests=cap)
 
+        # Admission already reduces occupancy to the available capacity. Apply
+        # the same rule to packed tokens, keeping at least one prefill token.
+        width = model._nextn + 1
+        decode_cap = (step.context_tokens - 1) // width
+        if step.num_decode_requests > decode_cap:
+            step = replace(step, num_decode_requests=decode_cap)
+
         # total budget -> prefill tokens: subtract the reserved decode slots.
-        step = replace(step, context_tokens=max(1, step.context_tokens - step.num_decode_requests))
+        request_tokens = isl
+        if getattr(model, "forward_model", "op_level") == "fpm":
+            request_tokens = max(1, isl - int(runtime_config.prefix or 0))
+        demand = max(1, int(getattr(runtime_config, "batch_size", 1) or 1)) * request_tokens
+        budget = step.context_tokens - step.num_decode_requests * width
+        if getattr(model, "forward_model", "op_level") == "fpm" and runtime_config.batch_size > 1:
+            budget = self._fpm_aggregate_prefill_tokens(
+                budget,
+                isl,
+                int(runtime_config.prefix or 0),
+                max(1, runtime_config.batch_size - step.num_decode_requests),
+            )
+        step = replace(step, context_tokens=max(1, min(demand, budget)))
+        step = self._schedule_qualified_mamba_prefill(model, runtime_config, step)
+        if (
+            getattr(model, "forward_model", "op_level") == "fpm"
+            and runtime_config.batch_size > 1
+            and self._has_visual_context_work(model, runtime_config)
+        ):
+            return super().run_mixed(model, database, runtime_config, step, _aggregate_visual_requests=True)
         return super().run_mixed(model, database, runtime_config, step)

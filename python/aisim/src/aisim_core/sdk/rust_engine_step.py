@@ -28,6 +28,7 @@ from importlib import resources as pkg_resources
 from pathlib import Path
 from typing import Any
 
+from aisim_core._native import Operation
 from aisim_core.sdk.config import RuntimeConfig
 from aisim_core.sdk.performance_result import MoECommFallback, merge_moe_comm_fallbacks
 from aisim_core.sdk.step_estimate import StepEstimate
@@ -801,6 +802,16 @@ class RustForwardPassPerfModel:
         otherwise they return ``None`` even inside retained raw-feature bounds.
         Empty scheduled work returns ``0.0``.
 
+        Qualified Mamba op-level estimates accept optional
+        ``scheduled_requests.prefill_chunks`` groups of
+        ``[requests, new_tokens_per_request, prefix_tokens_per_request]``.
+        Each group's request and new-token counts must be positive; its prefix
+        may be zero. Weighted request and prefix totals must match the counters;
+        weighted new tokens plus ``sum_prefill_padding_tokens`` must match
+        ``sum_prefill_tokens``. Native Replay
+        supplies observed groups; callers without groups retain balanced
+        aggregate pricing.
+
         On an ordinary STP FPM estimator, supplying a positive ``draft_length=d``
         estimates a complete SD decode iteration as
         ``(1.25 + 0.08*d) * F_STP((d+1)*B, K_total)``. B is each rank's logical
@@ -1544,6 +1555,8 @@ def estimate_mixed_step_breakdown_with_rust(
     prefix: int,
     seq_imbalance_correction_scale: float = 1.0,
     gen_seq_imbalance_correction_scale: float = 1.0,
+    _decode_ops: Any = None,
+    _capture_decode_ops: bool = False,
 ) -> dict[str, Any]:
     """Estimate one mixed step with per-op and per-component values retained.
 
@@ -1557,8 +1570,8 @@ def estimate_mixed_step_breakdown_with_rust(
     """
     handle = _cached_engine_handle(model, database)
     try:
-        (shared_ops, ctx_attn_ops, decode_attn_ops), covered_latency_ms = (
-            handle._mixed_step_breakdown_per_op_with_metadata(
+        shared_ops, ctx_attn_ops, decode_attn_ops, covered_latency_ms, decode_covered_ms = (
+            handle._mixed_step_breakdown_per_op_with_decode_coverage(
                 int(ctx_tokens),
                 int(gen_tokens),
                 int(isl),
@@ -1572,6 +1585,15 @@ def estimate_mixed_step_breakdown_with_rust(
         _reraise_engine_error(exc)
     _note_rust_provenance(handle)
 
+    if _decode_ops is not None:
+        # Aggregate chunks advance one request's prefix. Other requests keep
+        # their original decode KV lengths. Reuse their native pass entries
+        # before name folding, including energy, sources, and fallback metadata.
+        original_decode_ops, original_decode_covered_ms = _decode_ops
+        covered_latency_ms += original_decode_covered_ms - decode_covered_ms
+        decode_attn_ops = original_decode_ops
+        decode_covered_ms = original_decode_covered_ms
+
     shared_latency, shared_energy, _, _ = _fold_per_op(shared_ops)
     ctx_latency, ctx_energy, _, _ = _fold_per_op(ctx_attn_ops)
     dec_latency, dec_energy, _, _ = _fold_per_op(decode_attn_ops)
@@ -1582,6 +1604,15 @@ def estimate_mixed_step_breakdown_with_rust(
         "context_attention": "context_attention (scaled)",
         "fpm_forward_decode": "generation_attention",
     }
+    native_names = {entry[0] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group}
+    for native, public in tuple(public_names.items()):
+        # Keep attention's legacy display alias and preserve a literal-name
+        # neighbor under a unique key, including when that key also exists.
+        if native in native_names and public in native_names:
+            distinct = f"{public} (operation)"
+            while distinct in native_names or distinct in public_names.values():
+                distinct += " (operation)"
+            public_names[public] = distinct
     per_op_latency_ms, per_op_energy_wms, per_op_source, fallbacks = _fold_per_op(
         (public_names.get(entry[0], entry[0]), *entry[1:])
         for group in (shared_ops, ctx_attn_ops, decode_attn_ops)
@@ -1606,21 +1637,21 @@ def estimate_mixed_step_breakdown_with_rust(
         "context_attention": ctx_attention_energy,
         "decode_attention": dec_attention_energy,
     }
-    if covered_latency_ms is None:
-        covered_latency_ms = sum(
-            entry[1] for group in (shared_ops, ctx_attn_ops, decode_attn_ops) for entry in group if entry[2] > 0
-        )
-    return {
+    result = {
         "latency_ms": sum(component_latency_ms.values()),
         "energy_wms": sum(component_energy_wms.values()),
         "component_latency_ms": component_latency_ms,
         "component_energy_wms": component_energy_wms,
         "per_op_latency_ms": per_op_latency_ms,
         "per_op_energy_wms": per_op_energy_wms,
+        # Decided per query before the name fold, as the static path does.
         "covered_latency_ms": covered_latency_ms,
         "per_op_source": per_op_source,
         "moe_comm_fallbacks": fallbacks,
     }
+    if _capture_decode_ops:
+        result["_decode_ops"] = (decode_attn_ops, decode_covered_ms)
+    return result
 
 
 def estimate_decode_step_latency_with_rust(
@@ -1694,7 +1725,7 @@ def _estimate_decode_step_with_rust(
     """Retain native decode energy and covered latency for aggregate reporting."""
     handle = _cached_engine_handle(model, database)
     try:
-        entries = handle._decode_step_per_op_with_metadata(
+        entries, covered_latency_ms = handle._decode_step_per_op_with_metadata(
             int(gen_tokens),
             int(isl),
             int(osl),
@@ -1711,7 +1742,7 @@ def _estimate_decode_step_with_rust(
         per_op_energy_wms=energy,
         per_op_source=source,
         moe_comm_fallbacks=fallbacks,
-        covered_latency_ms=sum(entry[1] for entry in entries if entry[2] > 0),
+        covered_latency_ms=covered_latency_ms,
         num_decode_requests=gen_tokens,
     )
 
@@ -1898,6 +1929,95 @@ def _engine_handle_cache_put(key: str, value: Any) -> None:
             _ENGINE_HANDLE_CACHE.popitem(last=False)
 
 
+def engine_identity(model: Any, database: Any) -> str:
+    """The compiled-engine identity of ``(model, database)``, memoized on the model.
+
+    The memo is reused only for the same database object in the same query
+    mode and transfer policy: ``set_default_database_mode`` changes both in
+    place, and the compiled engine bakes them into its query dispatch. The
+    setters replace the mode member and the frozen policy instead of mutating
+    them, so identity checks detect a change without rebuilding either key on
+    this per-query path.
+    Structural edits to either model operation list advance a shared revision;
+    checking it invalidates the memo. On a miss, operation specs from both lists
+    enter the key for every graph, including non-Mamba graphs, so an edited graph
+    cannot reuse a handle compiled from its earlier contents. Equivalent graphs
+    still share a handle.
+    Native spec setters advance a process-wide clock, including edits through
+    raw native objects. Check it in constant time rather than scanning the graph.
+    """
+    # The stored attributes behind ``get_default_database_mode`` and
+    # ``transfer_policy``; reading them directly keeps the check near main's
+    # single identity test.
+    mode = getattr(database, "_default_database_mode", None)
+    policy = getattr(database, "_transfer_policy", None)
+    memo = getattr(model, "_aic_engine_identity_memo", None)
+    revision = getattr(model, "_aic_op_list_revision", None)
+    graph_version = revision[0] if revision is not None else None
+    mutation_epoch = Operation._mutation_epoch()
+    if (
+        memo is not None
+        and memo[0] is database
+        and memo[1] is mode
+        and memo[2] is policy
+        and memo[4] == graph_version
+        and memo[5] == mutation_epoch
+    ):
+        return memo[3]
+    from aisim_core.sdk.engine import OpConversionError, _resolve_attention_lane_orders
+
+    try:
+        # Compilation resolves these fields on the source graph. Normalize
+        # them before taking its identity, and don't mistake that preparation
+        # for an edit made after publication. The resolver skips equal values.
+        override = getattr(getattr(model, "config", None), "attention_backend", None)
+        architecture = getattr(model, "architecture", None)
+        for phase in ("context_ops", "generation_ops"):
+            _resolve_attention_lane_orders(getattr(model, phase, ()), database, override, architecture)
+        mutation_epoch = Operation._mutation_epoch()
+        key = _engine_config_json(model, database)
+    except OpConversionError as exc:
+        # There is no conversion-independent graph key for a rejected identity.
+        # Retry conversion on later calls; successful identities remain memoized.
+        raise RustEngineUnsupportedError(str(exc)) from exc
+    try:
+        model._aic_engine_identity_memo = (database, mode, policy, key, graph_version, mutation_epoch)
+    except (AttributeError, TypeError):
+        pass  # slotted/frozen model objects: recompute per call
+    return key
+
+
+def _operation_graph_identity(model: Any) -> list[list[Any]]:
+    """The compiled spec of every op, by phase list and position.
+
+    The model config does not carry the qualification fields: one config can
+    compile qualified or legacy ops, or assign different state dtypes to each
+    op. The spec is the representation ``Engine::build`` validates, so it keeps
+    a legacy op explicit, a draft query width's ``TokenScale`` wrapper, and a
+    Mamba2 op nested in a composite. Non-Mamba specs also participate so edits
+    to any compiled graph cannot reuse a stale handle. Serialization runs only
+    when the identity memo misses, never on an unchanged warm query.
+    """
+    # Lazy import: ``sdk.engine`` imports from this module at top level.
+    from aisim_core.sdk.engine import _as_engine_op
+    from aisim_core.sdk.operations import FPMForwardOp
+    from aisim_core.sdk.operations.base import Operation
+
+    entries = []
+    for ops_name in ("context_ops", "generation_ops"):
+        for index, op in enumerate(getattr(model, ops_name, ())):
+            if isinstance(op, (Operation, FPMForwardOp)):
+                # A whole-model FPM op also serializes its op-level graph.
+                spec = _as_engine_op(op)._spec_json()
+            else:
+                # Keep unsupported neighbors in the graph's key so a warm
+                # valid handle cannot hide them. Normal compilation will reject
+                # and cache this identity.
+                spec = json.dumps({"unsupported_op": [type(op).__module__, type(op).__qualname__, id(op)]})
+            entries.append([ops_name, index, spec])
+    return entries
+
+
 def _cached_engine_handle(model: Any, database: Any) -> Any:
     """Return a cached ``EngineHandle`` for ``(model, database)``.
 
@@ -1914,18 +2034,9 @@ def _cached_engine_handle(model: Any, database: Any) -> Any:
     # The identity JSON is a hot-path cost: the engine-step helpers call this
     # per step and `_engine_config_json` runs ~2-3us of getattr + json.dumps
     # (which the perf regression gate measures against a ~20us step). The
-    # identity is immutable for a given (model, database) pair, so memoize the
-    # computed key on the model object and only recompute when the database
-    # object changes.
-    memo = getattr(model, "_aic_engine_identity_memo", None)
-    if memo is not None and memo[0] is database:
-        key = memo[1]
-    else:
-        key = _engine_config_json(model, database)
-        try:
-            model._aic_engine_identity_memo = (database, key)
-        except (AttributeError, TypeError):
-            pass  # slotted/frozen model objects: recompute per call
+    # memo keeps unchanged (model, database) lookups constant-time; graph edits
+    # and changes to database mode/transfer policy invalidate it.
+    key = engine_identity(model, database)
     entry = _engine_handle_cache_get(key)
     if isinstance(entry, _CachedUnsupported):
         # Compilation already failed for this engine identity; raise a fresh
@@ -2093,6 +2204,7 @@ def _engine_config_json(model: Any, database: Any) -> str:
                         "enable_shared_layer": bool(getattr(database, "enable_shared_layer", False)),
                         "strict_provenance": bool(getattr(database, "strict_provenance", False)),
                     },
+                    "operation_graph": _operation_graph_identity(model),
                 },
                 sort_keys=True,
                 separators=(",", ":"),

@@ -39,8 +39,8 @@ use pyo3::types::PyType;
 use crate::common::error::AicError;
 use crate::perfmodel::EngineConfig;
 use crate::perfmodel::engine::runtime::{
-    DEFAULT_STATIC_STRIDE, Engine, MixedStepPerOpValuesWithMetadata, PerOpSolValue, PerOpValue,
-    PerOpValueWithMetadata, RuntimeConfig, StaticMode, StaticPerOpValuesWithCoverage, StaticResult,
+    DEFAULT_STATIC_STRIDE, Engine, PerOpSolValue, PerOpValue, PerOpValueWithMetadata,
+    RuntimeConfig, StaticMode, StaticPerOpValuesWithCoverage, StaticResult,
 };
 use crate::{BackendKind, DataType, DatabaseMode, ENGINE_CONFIG_SCHEMA_VERSION};
 
@@ -764,7 +764,8 @@ impl AicEngine {
 
     /// Internal metadata-bearing counterpart of `mixed_step_breakdown_per_op`;
     /// each fifth field is `None` or `(first_record, additional_records)` in
-    /// deterministic encounter order. Includes pre-fold coverage for FPM chunks.
+    /// deterministic encounter order. The fourth value is the step's
+    /// power-covered latency, decided per query before the name fold.
     #[pyo3(signature = (ctx_tokens, gen_tokens, isl, osl, prefix=0,
                         seq_imbalance_correction_scale=1.0,
                         gen_seq_imbalance_correction_scale=1.0))]
@@ -779,7 +780,54 @@ impl AicEngine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> PyResult<(MixedStepPerOpValuesWithMetadata, Option<f64>)> {
+    ) -> PyResult<(
+        Vec<PerOpValueWithMetadata>,
+        Vec<PerOpValueWithMetadata>,
+        Vec<PerOpValueWithMetadata>,
+        f64,
+    )> {
+        self.inner.reset_provenance();
+        py.detach(|| {
+            self.inner.mixed_step_breakdown_per_op_with_metadata(
+                ctx_tokens,
+                gen_tokens,
+                isl,
+                osl,
+                prefix,
+                seq_imbalance_correction_scale,
+                gen_seq_imbalance_correction_scale,
+            )
+        })
+        .map(|(shared, context, decode, covered, _)| (shared, context, decode, covered))
+        .map_err(aic_to_py)
+    }
+
+    /// Internal metadata-bearing counterpart of `mixed_step_breakdown_per_op`;
+    /// each fifth field is `None` or `(first_record, additional_records)` in
+    /// deterministic encounter order. The fourth value is the step's
+    /// power-covered latency; the fifth is its decode-only subtotal.
+    /// Both are decided per query before the name fold.
+    #[pyo3(signature = (ctx_tokens, gen_tokens, isl, osl, prefix=0,
+                        seq_imbalance_correction_scale=1.0,
+                        gen_seq_imbalance_correction_scale=1.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn _mixed_step_breakdown_per_op_with_decode_coverage(
+        &self,
+        py: Python<'_>,
+        ctx_tokens: u32,
+        gen_tokens: u32,
+        isl: u32,
+        osl: u32,
+        prefix: u32,
+        seq_imbalance_correction_scale: f64,
+        gen_seq_imbalance_correction_scale: f64,
+    ) -> PyResult<(
+        Vec<PerOpValueWithMetadata>,
+        Vec<PerOpValueWithMetadata>,
+        Vec<PerOpValueWithMetadata>,
+        f64,
+        f64,
+    )> {
         self.inner.reset_provenance();
         py.detach(|| {
             self.inner.mixed_step_breakdown_per_op_with_metadata(
@@ -817,7 +865,8 @@ impl AicEngine {
 
     /// Internal metadata-bearing counterpart of `decode_step_per_op`; each
     /// fifth field is `None` or `(first_record, additional_records)` in
-    /// deterministic encounter order.
+    /// deterministic encounter order. Returns the entries and power-covered
+    /// latency summed per query before name folding.
     #[pyo3(signature = (gen_tokens, isl, osl, gen_seq_imbalance_correction_scale=1.0))]
     fn _decode_step_per_op_with_metadata(
         &self,
@@ -826,7 +875,7 @@ impl AicEngine {
         isl: u32,
         osl: u32,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> PyResult<Vec<PerOpValueWithMetadata>> {
+    ) -> PyResult<(Vec<PerOpValueWithMetadata>, f64)> {
         self.inner.reset_provenance();
         py.detach(|| {
             self.inner.decode_step_per_op_with_metadata(
@@ -1072,6 +1121,13 @@ fn engine_spec_json_from_bincode(bytes: &[u8]) -> PyResult<String> {
 fn engine_spec_bincode_from_json(spec_json: &str) -> PyResult<Vec<u8>> {
     let spec: crate::perfmodel::engine::spec::EngineSpec = serde_json::from_str(spec_json)
         .map_err(|e| PyValueError::new_err(format!("engine spec JSON decode: {e}")))?;
+    if spec.schema_version != crate::ENGINE_SPEC_SCHEMA_VERSION {
+        return Err(aic_to_py(AicError::UnsupportedSchemaVersion {
+            kind: "EngineSpec",
+            got: spec.schema_version,
+            expected: crate::ENGINE_SPEC_SCHEMA_VERSION,
+        }));
+    }
     spec.to_bincode().map_err(aic_to_py)
 }
 

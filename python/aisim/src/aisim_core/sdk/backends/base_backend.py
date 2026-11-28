@@ -31,6 +31,7 @@ from aisim_core.sdk.perf_database import PerfDatabase
 from aisim_core.sdk.performance_result import MoECommFallback, merge_moe_comm_fallbacks
 from aisim_core.sdk.rust_engine_step import (
     _estimate_decode_step_with_rust,
+    engine_identity,
     estimate_decode_step_breakdown_with_rust,
     estimate_mixed_step_breakdown_with_rust,
     estimate_static_breakdown_with_power_coverage_with_rust,
@@ -43,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 
 QWEN_SMART_RESIZE_MAX_RATIO = 200
+
+
+class _UnsupportedVisualMambaPrefill(ValueError):
+    """An aggregate candidate needs visual chunk geometry we cannot price."""
 
 
 def _has_draft_scheme(model: BaseModel) -> bool:
@@ -60,6 +65,17 @@ def _has_draft_scheme(model: BaseModel) -> bool:
 def _is_fpm_model(model: BaseModel) -> bool:
     """Whether ``model`` was constructed with ``forward_model == "fpm"``."""
     return getattr(model, "forward_model", "op_level") == "fpm"
+
+
+def _has_qualified_mamba(model: BaseModel, *, phases: tuple[str, ...] = ("context_ops", "generation_ops")) -> bool:
+    """Recognize both native operations and SDK subclasses in either phase."""
+    from aisim_core._native import Mamba2Kernel
+
+    return any(
+        isinstance(op, Mamba2Kernel) and op.__getnewargs_ex__()[1].get("state_dtype", "unrecorded") != "unrecorded"
+        for phase in phases
+        for op in getattr(model, phase, ())
+    )
 
 
 def _qwen_smart_resize(height: int, width: int, enc_cfg: common.VisionEncoderConfig) -> tuple[int, int]:
@@ -359,13 +375,19 @@ class BaseBackend:
         encoder_latency_ms: float,
         steps_to_finish_ctx: float,
         decode_iterations: float,
+        prefill_total_ms: float | None = None,
     ) -> float:
         """TTFT (ms) for an agg point. Default: per-request prefill time
         (chunk count x mix step) x queuing factor + dispatch + encoder. Subclasses
         with a different queue model override this whole computation."""
         qf = self._ttft_queuing_factor(b, steps_to_finish_ctx)
         logger.debug(f"ttft: prefill_step={prefill_step_ms:.2f}ms qf={qf:.2f}")
-        ttft_per_request = prefill_step_ms * np.ceil(isl / ctx_tokens) + self._prefill_dispatch_overhead_ms(model)
+        visual_mean_field = self._visual_context_tokens(model, runtime_config) > 0 and not _is_fpm_model(model)
+        prefill_tokens = isl - prefix if b == 1 and not visual_mean_field else isl
+        prefill_ms = (
+            prefill_total_ms if prefill_total_ms is not None else prefill_step_ms * np.ceil(prefill_tokens / ctx_tokens)
+        )
+        ttft_per_request = prefill_ms + self._prefill_dispatch_overhead_ms(model)
         return encoder_latency_ms + ttft_per_request * qf
 
     def _compute_tpot(
@@ -1762,6 +1784,9 @@ class BaseBackend:
         database: PerfDatabase,
         runtime_config: RuntimeConfig,
         step: MixedStepInput,
+        *,
+        _decode_ops=None,
+        _aggregate_visual_requests: bool = False,
     ) -> StepEstimate:
         """Estimate one scheduled mixed prefill/decode forward pass.
 
@@ -1796,6 +1821,7 @@ class BaseBackend:
             prefix=prefix,
             seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
             gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+            **({"_decode_ops": _decode_ops} if _decode_ops is not None else {}),
         )
         component_latency_ms = dict(components["component_latency_ms"])
         component_energy_wms = dict(components["component_energy_wms"])
@@ -1806,19 +1832,37 @@ class BaseBackend:
         latency_ms = float(components["latency_ms"])
         energy_wms = float(components["energy_wms"])
         if self._has_visual_context_work(model, runtime_config):
-            visual_batch = int(np.ceil(step.context_tokens / isl))
-            visual_scale = float(np.ceil(isl / step.context_tokens))
-            visual_latency, visual_energy, visual_source = self._run_visual_context_phase(
-                model,
-                database,
-                runtime_config,
-                visual_batch,
-            )
-            visual_latency = {name: value / visual_scale for name, value in visual_latency.items()}
-            visual_energy = {name: value / visual_scale for name, value in visual_energy.items()}
+            # FPM consumes fresh tokens and averages uncached chunks. Its
+            # visual overlay must use the same schedule, including when the
+            # entire suffix fits in a single step.
+            visual_request_tokens = isl - prefix if _is_fpm_model(model) else isl
+            visual_batch = int(np.ceil(step.context_tokens / visual_request_tokens))
+            visual_scale = float(np.ceil(visual_request_tokens / step.context_tokens))
+            visual_batches = [(visual_batch, 1.0)]
+            if _aggregate_visual_requests and step.context_tokens > visual_request_tokens:
+                full, remainder = divmod(step.context_tokens, visual_request_tokens)
+                if remainder:
+                    # Match the aggregate's fractional request count with a
+                    # mixture of integer native queries. Each batch retains
+                    # its own price; overlay cost need not be linear in batch.
+                    fraction = remainder / visual_request_tokens
+                    visual_batches = [(full, 1.0 - fraction), (full + 1, fraction)]
+            visual_latency, visual_energy, visual_source = defaultdict(float), defaultdict(float), {}
+            visual_covered_ms = 0.0
+            for batch, weight in visual_batches:
+                latencies, energies, sources = self._run_visual_context_phase(model, database, runtime_config, batch)
+                for name, value in latencies.items():
+                    scaled = value / visual_scale * weight
+                    visual_latency[name] += scaled
+                    visual_energy[name] += energies[name] / visual_scale * weight
+                    if energies[name] > 0:
+                        visual_covered_ms += scaled
+                    source = sources[name]
+                    previous = visual_source.get(name, source)
+                    visual_source[name] = source if source == previous else "mixed"
             visual_latency_total = sum(visual_latency.values())
             visual_energy_total = sum(visual_energy.values())
-            covered_latency_ms += sum(value for name, value in visual_latency.items() if visual_energy[name] > 0)
+            covered_latency_ms += visual_covered_ms
             latency_ms += visual_latency_total
             energy_wms += visual_energy_total
             component_latency_ms["context_attention"] = (
@@ -1965,6 +2009,135 @@ class BaseBackend:
         embed_tokens = total_visuals * workload.output_tokens_per_image
         return self._get_encoder_component_memory(model, num_tokens, embed_tokens)
 
+    @staticmethod
+    def _fpm_aggregate_prefill_tokens(budget: int, isl: int, prefix: int, prefill_requests: int) -> int:
+        """Translate a prompt-token scheduler budget to scheduled fresh tokens.
+
+        Each complete prompt and the capped trailing chunk schedules its own
+        uncached suffix. Preserve a positive budget for fully cached prompts
+        so the native engine still rejects their invalid prefill geometry.
+        """
+        full, remainder = divmod(min(budget, prefill_requests * isl), isl)
+        new_tokens = max(0, isl - prefix)
+        return max(1, full * new_tokens + min(remainder, new_tokens))
+
+    def _run_agg_mixed_step(self, model, database, runtime_config, step: MixedStepInput) -> StepEstimate:
+        if runtime_config.batch_size > 1 and _is_fpm_model(model):
+            isl = runtime_config.isl + self._visual_context_tokens(model, runtime_config)
+            step = dataclasses.replace(
+                step,
+                context_tokens=self._fpm_aggregate_prefill_tokens(
+                    step.context_tokens,
+                    isl,
+                    runtime_config.prefix,
+                    max(1, runtime_config.batch_size - step.num_decode_requests),
+                ),
+            )
+        else:
+            step = self._schedule_qualified_mamba_prefill(model, runtime_config, step)
+        if (
+            _is_fpm_model(model)
+            and runtime_config.batch_size > 1
+            and self._has_visual_context_work(model, runtime_config)
+        ):
+            # Only aggregate mean-field weights contain fractional requests.
+            # Direct scheduled FPM calls retain ceil(new tokens / suffix).
+            return self.run_mixed(model, database, runtime_config, step, _aggregate_visual_requests=True)
+        return self.run_mixed(model, database, runtime_config, step)
+
+    def _schedule_qualified_mamba_prefill(self, model, runtime_config, step: MixedStepInput) -> MixedStepInput:
+        """Drop unused aggregate capacity before querying a scheduled Mamba step."""
+        if not _is_fpm_model(model) and isinstance(getattr(model, "encoder_config", None), common.VisionEncoderConfig):
+            visual_tokens = self._visual_context_tokens(model, runtime_config)
+            if (
+                visual_tokens > 0
+                and 0 < step.context_tokens < runtime_config.isl + visual_tokens - runtime_config.prefix
+                and _has_qualified_mamba(model)
+            ):
+                # XPU admission may reserve decode tokens after run_agg's initial
+                # budget check. Validate the resolved prefill shape as well.
+                raise _UnsupportedVisualMambaPrefill(
+                    "qualified Mamba with chunked visual prefill is unsupported in run_agg"
+                )
+        if not _is_fpm_model(model) and _has_qualified_mamba(model):
+            isl = runtime_config.isl + self._visual_context_tokens(model, runtime_config)
+            if isl > runtime_config.prefix:
+                prefill_slots = max(1, runtime_config.batch_size - step.num_decode_requests)
+                full, partial = divmod(min(step.context_tokens, prefill_slots * isl), isl)
+                suffix = isl - runtime_config.prefix
+                # A completed suffix uses whole-prompt coordinates, so native
+                # attention is charged once rather than amortized over chunks.
+                if partial >= suffix:
+                    full, partial = full + 1, 0
+                step = dataclasses.replace(step, context_tokens=full * isl + partial)
+        return step
+
+    def _average_agg_text_chunks(self, model, database, runtime_config, chunk_tokens, num_decode_requests=0):
+        """Average one request's exact chunks, retaining only O(operations) evidence.
+
+        Batched chunks have already passed backend admission. Price their
+        scheduled coordinates directly, without reserving decode capacity twice.
+        The work scales with one suffix's chunk count, not the batch size.
+        """
+        isl, prefix = runtime_config.isl, runtime_config.prefix
+        chunks = math.ceil((isl - prefix) / chunk_tokens)
+        scalar_totals = dict.fromkeys(("latency_ms", "energy_wms", "covered_latency_ms"), 0.0)
+        maps = {
+            field: defaultdict(float)
+            for field in (
+                "per_op_latency_ms",
+                "per_op_energy_wms",
+                "component_latency_ms",
+                "component_energy_wms",
+            )
+        }
+        sources = {}
+        fallbacks = ()
+        decode_ops = None
+        if num_decode_requests:
+            decode_ops = estimate_mixed_step_breakdown_with_rust(
+                model,
+                database,
+                ctx_tokens=0,
+                gen_tokens=num_decode_requests,
+                isl=isl,
+                osl=runtime_config.osl,
+                prefix=prefix,
+                seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
+                gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+                _capture_decode_ops=True,
+            )["_decode_ops"]
+        for done in range(0, isl - prefix, chunk_tokens):
+            length = min(chunk_tokens, isl - prefix - done)
+            past = prefix + done
+            chunk_runtime = copy.copy(runtime_config)
+            chunk_runtime.isl = past + length
+            chunk_runtime.prefix = past
+            budget = length if _is_fpm_model(model) else past + length
+            step = MixedStepInput(budget, num_decode_requests)
+            chunk = (
+                BaseBackend.run_mixed(self, model, database, chunk_runtime, step, _decode_ops=decode_ops)
+                if num_decode_requests
+                else self.run_mixed(model, database, chunk_runtime, step)
+            )
+            for field in scalar_totals:
+                scalar_totals[field] += getattr(chunk, field)
+            for field, totals in maps.items():
+                for name, value in getattr(chunk, field).items():
+                    totals[name] += value
+            for name, source in chunk.per_op_source.items():
+                sources[name] = source if name not in sources or sources[name] == source else "mixed"
+            fallbacks = merge_moe_comm_fallbacks(fallbacks, chunk.moe_comm_fallbacks)
+        # A mean has no individual iteration's context coordinates.
+        return StepEstimate(
+            **{field: total / chunks for field, total in scalar_totals.items()},
+            **{field: {name: value / chunks for name, value in totals.items()} for field, totals in maps.items()},
+            per_op_source=sources,
+            moe_comm_fallbacks=fallbacks,
+            num_decode_requests=num_decode_requests,
+            num_decode_query_tokens=num_decode_requests * (model._nextn + 1),
+        )
+
     def run_agg(
         self, model: BaseModel, database: PerfDatabase, runtime_config: RuntimeConfig, **kwargs
     ) -> InferenceSummary:
@@ -1977,6 +2150,18 @@ class BaseBackend:
         isl = text_isl + img_ctx_tokens
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
+        if (
+            img_ctx_tokens > 0
+            and not _is_fpm_model(model)
+            and 0 < ctx_tokens < isl - prefix
+            and _has_qualified_mamba(model)
+        ):
+            # The visual mean-field weight restores amortized attention, but
+            # cannot multiply a qualified scan's per-chunk state transfer.
+            # Exact visual chunk geometry is not represented by this path.
+            raise _UnsupportedVisualMambaPrefill(
+                "qualified Mamba with chunked visual prefill is unsupported in run_agg"
+            )
         # None (or an omitted kwarg) means the caller did not model speculative
         # progress here; the summary then stays eligible for the upper-layer
         # post-hoc projection (SpeculativeDecodingProfile.project_summary).
@@ -2012,6 +2197,8 @@ class BaseBackend:
         )
         cache_key = (
             self._make_agg_cache_key(isl, osl, b, ctx_tokens, agg_extra),
+            # The cached prefix changes the uncached prefill work.
+            prefix,
             visual_cache_key,
             getattr(model, "forward_model", "op_level"),
             # Explicit progress and an omitted kwarg schedule identically at
@@ -2024,6 +2211,18 @@ class BaseBackend:
         # unknown values must still raise, ``python`` must still warn, and a
         # synthetic database must not inherit a prior PerfDatabase result.
         self._require_rust_engine_step(runtime_config, database, surface="aggregate")
+        # The compiled-engine identity scopes reuse to this model graph and
+        # this database in its current mode; it is memoized on the model.
+        hybrid_config = getattr(model, "_hybrid_config", None)
+        cache_key = (
+            cache_key,
+            engine_identity(model, database),
+            # State precision also controls resident Mamba memory. The other
+            # geometry is already recorded by the compiled operation graph.
+            # Non-MTP timing graphs omit its cache dtype and may share a handle,
+            # but their memory footprints and OOM verdicts must stay distinct.
+            hybrid_config.mamba_ssm_cache_dtype if isinstance(hybrid_config, common.NemotronHConfig) else None,
+        )
         cached = self._agg_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -2039,28 +2238,59 @@ class BaseBackend:
         # Compute the mean-field number of engine iterations needed to consume
         # all context and commit the requested output tokens.
         steps_to_finish_ctx = np.ceil(isl * b / ctx_tokens)
+        # Budget whose ``ceil(isl / budget)`` counts one request's prefill
+        # steps, and the step count the TTFT queuing factor reads.
+        ttft_ctx_tokens = ctx_tokens
+        ttft_steps_to_finish_ctx = steps_to_finish_ctx
+        prefill_chunks = None
+        qualified_prefill = b > 1 and not _is_fpm_model(model) and _has_qualified_mamba(model)
         num_mix_steps = num_genonly_steps = 0
         num_mix_steps_for_tpot_calc = 0  # correction for tpot calc only
         if b > 1:
-            num_mix_gen_tokens = self._mix_step_gen_tokens(b, ctx_tokens, isl, decode_iterations)
-            assert num_mix_gen_tokens >= 1, (
+            scheduling_ctx_tokens = ctx_tokens
+            if _is_fpm_model(model) and isl > prefix:
+                # The native FPM query averages the actual uncached chunks.
+                # Express that work in prompt coordinates for the backend's
+                # decode-share policy, with at least one prefill/decode slot.
+                fresh_tokens = self._fpm_aggregate_prefill_tokens(ctx_tokens, isl, prefix, b - 1)
+                chunks = math.ceil((isl - prefix) / fresh_tokens)
+                requests = max(1.0, fresh_tokens / (isl - prefix))
+                scheduling_ctx_tokens = isl * requests / chunks
+            num_mix_gen_tokens = self._mix_step_gen_tokens(b, scheduling_ctx_tokens, isl, decode_iterations)
+            if (_is_fpm_model(model) or qualified_prefill) and isl > prefix:
+                num_mix_gen_tokens = min(b - 1, num_mix_gen_tokens)
+            # The first output token comes from prefill. Qualified osl=1
+            # requests therefore have no decode work to mix into those steps.
+            no_post_prefill_decode = qualified_prefill and osl == 1
+            if no_post_prefill_decode:
+                num_mix_gen_tokens = 0
+            assert num_mix_gen_tokens >= 1 or no_post_prefill_decode, (
                 f"num_mix_gen_tokens: {num_mix_gen_tokens}, b: {b}, ctx_tokens: {ctx_tokens}, isl: {isl}"
             )
             num_mix_ctx_tokens = ctx_tokens
-            if steps_to_finish_ctx >= decode_iterations:
-                num_mix_steps = steps_to_finish_ctx
-                num_genonly_steps = 0
-                num_genonly_tokens = 0
-                num_mix_steps_for_tpot_calc = num_mix_steps
-            else:
-                num_mix_steps = steps_to_finish_ctx
-                num_genonly_steps = decode_iterations - num_mix_steps
-                num_genonly_tokens = b
-                num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
         elif b == 1:
-            # special case for b=1
-            num_mix_steps = 1
-            num_mix_ctx_tokens = ctx_tokens
+            # special case for b=1: the packed budget holds at most this one
+            # request, never unused budget. Op-level pricing reads prompt
+            # tokens (prefix included); a whole-model FPM reads new tokens.
+            num_mix_steps = max(1, math.ceil((isl - prefix) / ctx_tokens))
+            ttft_steps_to_finish_ctx = num_mix_steps
+            fits = 0 < isl - prefix <= ctx_tokens
+            if getattr(model, "forward_model", "op_level") == "fpm" and isl > prefix:
+                num_mix_ctx_tokens = min(ctx_tokens, isl - prefix)
+            else:
+                num_mix_ctx_tokens = isl if fits else min(ctx_tokens, isl)
+            if fits:
+                # The uncached prompt fits the budget: one step schedules the
+                # whole request, and TTFT counts that one prefill step, in its
+                # chunk count and in the queuing factor's input.
+                ttft_ctx_tokens = isl
+                ttft_steps_to_finish_ctx = 1
+            if img_ctx_tokens > 0 and num_mix_steps > 1 and not _is_fpm_model(model):
+                # Visual op-level pricing retains the mean-field step: native
+                # attention and the visual-mask overlay divide whole-prefill
+                # work by ceil(isl / budget). Match that weight in every
+                # aggregate total; the queue still counts uncached steps.
+                num_mix_steps = math.ceil(isl / num_mix_ctx_tokens)
             num_mix_gen_tokens = 0
             num_genonly_steps = max(decode_iterations - 1.0, 0.0)
             num_genonly_tokens = 1
@@ -2070,18 +2300,95 @@ class BaseBackend:
         per_ops_data: dict[str, dict] = {}
         per_ops_source: dict[str, dict] = {}
 
-        # run_mixed derives the image-augmented effective isl from the config's
-        # own image fields, so the raw runtime_config is passed unchanged (no
-        # pre-adjustment here, or the visual tokens would be counted twice).
-        mix_step_estimate = self.run_mixed(
-            model,
-            database,
-            runtime_config,
-            MixedStepInput(
-                context_tokens=num_mix_ctx_tokens,
-                num_decode_requests=num_mix_gen_tokens,
-            ),
+        # Text chunks have exact sequential shapes. Visual context retains the
+        # existing mean-field step, with every prefill iteration counted below;
+        # its image fields stay intact so run_mixed adds them exactly once.
+        averages_text_chunks = b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0
+        if averages_text_chunks:
+            mix_step_estimate = self._average_agg_text_chunks(model, database, runtime_config, ctx_tokens)
+        else:
+            mix_step_estimate = self._run_agg_mixed_step(
+                model, database, runtime_config, MixedStepInput(num_mix_ctx_tokens, num_mix_gen_tokens)
+            )
+        if b > 1:
+            # Preserve admitted coordinates before replacing a chunk walk
+            # with its coordinate-free mean.
+            qualified_request_counts = (
+                math.ceil(mix_step_estimate.context_tokens / isl),
+                mix_step_estimate.num_decode_requests,
+            )
+            if (_is_fpm_model(model) or qualified_prefill) and isl > prefix:
+                # Read the actual fresh-token query after backend scheduling
+                # (including XPU decode caps and budget reservation). A query
+                # below one suffix averages ceil(suffix/fresh) chunks; larger
+                # queries price their fraction of the batch's fresh work.
+                fresh_tokens = mix_step_estimate.context_tokens
+                if qualified_prefill:
+                    full, partial = divmod(fresh_tokens, isl)
+                    fresh_tokens = full * (isl - prefix) + partial
+                chunks = math.ceil((isl - prefix) / fresh_tokens)
+                requests = max(1.0, fresh_tokens / (isl - prefix))
+                steps_to_finish_ctx = b * chunks / requests
+                if (
+                    qualified_prefill
+                    and chunks > 1
+                    and img_ctx_tokens == 0
+                    and (prefix > 0 or (isl - prefix) % fresh_tokens != 0)
+                ):
+                    # Include the short final chunk and its state transfer;
+                    # charging a full-budget scan `chunks` times invents tokens.
+                    # Uniform cold chunks retain the existing amortized query:
+                    # its scan/shared work and iteration count are already exact.
+                    mix_step_estimate = self._average_agg_text_chunks(
+                        model, database, runtime_config, fresh_tokens, mix_step_estimate.num_decode_requests
+                    )
+                    averages_text_chunks = True
+                prefill_chunks = chunks
+                ttft_steps_to_finish_ctx = steps_to_finish_ctx
+            num_mix_steps = steps_to_finish_ctx
+            if mix_step_estimate.num_decode_requests == 0:
+                # Prefill-only steps commit no decode progress, even when
+                # their count exceeds the number of decode iterations.
+                num_genonly_steps = max(decode_iterations - 1.0, 0.0)
+                num_genonly_tokens = b
+                num_mix_steps_for_tpot_calc = 0
+            elif steps_to_finish_ctx >= decode_iterations:
+                num_genonly_steps = 0
+                num_genonly_tokens = 0
+                num_mix_steps_for_tpot_calc = num_mix_steps
+            else:
+                num_genonly_steps = decode_iterations - num_mix_steps
+                num_genonly_tokens = b
+                num_mix_steps_for_tpot_calc = self._tpot_mix_steps(num_mix_steps)
+        # FPM prices fresh-token requests, rather than ceil(input budget/isl).
+        # Save the executed counts before an averaged query loses its coordinate.
+        scheduled_request_counts = None
+        if _is_fpm_model(model) and isl > prefix:
+            scheduled_request_counts = (
+                (1, 0)
+                if b == 1
+                else (
+                    math.ceil(mix_step_estimate.context_tokens / (isl - prefix)),
+                    mix_step_estimate.num_decode_requests,
+                )
+            )
+        if qualified_prefill:
+            scheduled_request_counts = qualified_request_counts
+        # Native FPM may also average several uncached chunks inside one
+        # run_mixed call. Neither kind of mean is a single query coordinate.
+        averages_mixed_shapes = averages_text_chunks or (
+            _is_fpm_model(model)
+            and (
+                0 < mix_step_estimate.context_tokens < isl - prefix
+                or (
+                    b > 1
+                    and self._has_visual_context_work(model, runtime_config)
+                    and mix_step_estimate.context_tokens % (isl - prefix) != 0
+                )
+            )
         )
+        if averages_mixed_shapes and mix_step_estimate.context_tokens:
+            mix_step_estimate = dataclasses.replace(mix_step_estimate, context_tokens=0)
         mix_step_latency_ms = mix_step_estimate.latency_ms
         mix_step_energy_wms = mix_step_estimate.energy_wms
         mix_per_ops = mix_step_estimate.per_op_latency_ms
@@ -2120,13 +2427,22 @@ class BaseBackend:
             b,
             isl,
             osl,
-            ctx_tokens,
+            ttft_ctx_tokens,
             prefix,
             prefill_step_ms=_prefill_step_ms,
             genonly_step_latency_ms=genonly_step_latency_ms,
             encoder_latency_ms=encoder_latency_ms,
-            steps_to_finish_ctx=steps_to_finish_ctx,
+            steps_to_finish_ctx=ttft_steps_to_finish_ctx,
             decode_iterations=decode_iterations,
+            **(
+                {"prefill_total_ms": _prefill_step_ms * num_mix_steps}
+                if b == 1 and num_mix_steps > 1 and img_ctx_tokens == 0
+                # Base TTFT counts one request's native chunk sequence. Keep
+                # the scheduler budget available to backend queue calibration.
+                else {"prefill_total_ms": _prefill_step_ms * prefill_chunks}
+                if prefill_chunks is not None
+                else {}
+            ),
         )
 
         # Guard against osl == 1 (no-decode), which makes both denominators zero.
@@ -2180,6 +2496,7 @@ class BaseBackend:
         if b == 1:
             num_ctx_requests = 1
             num_gen_requests = 1
+        reported_ctx_requests, reported_gen_requests = scheduled_request_counts or (num_ctx_requests, num_gen_requests)
 
         # correct output_throughput and concurrency for attention dp (global batch)
         scale_factor = model.config.pp_size * model.config.attention_dp_size
@@ -2197,8 +2514,9 @@ class BaseBackend:
             mtp_scaled_tokens = int(num_gen_requests)
         else:
             # b == 1 starts with a context-only step; the later decode peak is
-            # compared below when the workload schedules output tokens.
-            num_tokens = ctx_tokens
+            # compared below when the workload schedules output tokens. Its
+            # activations follow the new tokens it schedules, at most the budget.
+            num_tokens = min(isl - prefix, ctx_tokens)
             mtp_scaled_tokens = 0
 
         memory = self._get_memory_usage(
@@ -2293,11 +2611,11 @@ class BaseBackend:
             "comm": comm,
             "memory": mem,
             "balance_score": balance_score,
-            "num_ctx_reqs": num_ctx_requests,
-            "num_gen_reqs": num_gen_requests,
+            "num_ctx_reqs": reported_ctx_requests,
+            "num_gen_reqs": reported_gen_requests,
             "num_tokens": num_tokens,
             "ctx_tokens": ctx_tokens,
-            "gen_tokens": num_gen_requests,
+            "gen_tokens": reported_gen_requests,
             "backend": database.backend,
             "version": database.version,
             "system": database.system,
@@ -2369,8 +2687,9 @@ class BaseBackend:
             "genonly_step_energy_wms": float(genonly_step_energy_wms),
             "mix_efficiency": float(mix_efficiency),
             "decode_iterations": decode_iterations,
-            "mix_context_tokens": float(num_mix_ctx_tokens),
-            "mix_decode_requests": float(num_mix_gen_tokens),
+            "mix_context_token_budget": float(ctx_tokens),
+            **({} if averages_mixed_shapes else {"mix_context_tokens": float(mix_step_estimate.context_tokens)}),
+            "mix_decode_requests": float(mix_step_estimate.num_decode_requests),
             "mix_decode_query_tokens": float(mix_step_estimate.num_decode_query_tokens),
         }
         if speculative_scheduling:
@@ -2395,7 +2714,9 @@ class BaseBackend:
                 # Raw run_mixed output (pre-mix_efficiency); the authoritative
                 # scheduled latency is scheduling["mix_step_latency_ms"], which
                 # already includes the mix_efficiency scale.
-                "mixed": mix_step_estimate,
+                # Chunk means are exposed in scheduling and weighted in the
+                # aggregate breakdown, rather than labeled as a raw iteration.
+                **({} if averages_mixed_shapes else {"mixed": mix_step_estimate}),
                 "scheduling": dict(per_ops_data["scheduling"]),
             }
         )
@@ -2465,6 +2786,13 @@ class BaseBackend:
         # inner loop when the system is oom.
         b_list = [b for b in b_list_default if b <= max_batch_size]
         ctx_tokens_list = self._get_ctx_tokens_list_for_agg_sweep(isl_eff, ctx_stride, enable_chunked_prefill)
+        # run_agg rejects qualified visual chunks. Skip those
+        # budgets before pricing so a later budget can fit the fresh suffix.
+        min_visual_ctx_tokens = (
+            isl_eff - runtime_config.prefix
+            if isl_eff > isl and not _is_fpm_model(model) and _has_qualified_mamba(model)
+            else 0
+        )
 
         results_df = pd.DataFrame(columns=common.ColumnsAgg)
         results_dict_list: list[dict] = []
@@ -2473,6 +2801,8 @@ class BaseBackend:
         all_oom = True
         for b in b_list:
             for ctx_tokens in ctx_tokens_list:
+                if 0 < ctx_tokens < min_visual_ctx_tokens:
+                    continue
                 if b - np.ceil(ctx_tokens / isl_eff) < 0:  # allow b==1
                     break
 
@@ -2483,20 +2813,28 @@ class BaseBackend:
 
                 # filter out repeated records for balance score correction
                 balance_score = isl_eff * b / ctx_tokens / osl
+                pending_capped_b = None
                 if balance_score > 1:
                     gen_tokens = b // balance_score
                     if gen_tokens > 1 and gen_tokens in capped_b:
                         continue
                     else:
-                        capped_b.append(gen_tokens)
+                        pending_capped_b = gen_tokens
 
-                summary = self.run_agg(
-                    model=model,
-                    database=database,
-                    runtime_config=self._runtime_config_for_agg_candidate(runtime_config, b),
-                    ctx_tokens=ctx_tokens,
-                    **sweep_extra,
-                )
+                try:
+                    summary = self.run_agg(
+                        model=model,
+                        database=database,
+                        runtime_config=self._runtime_config_for_agg_candidate(runtime_config, b),
+                        ctx_tokens=ctx_tokens,
+                        **sweep_extra,
+                    )
+                except _UnsupportedVisualMambaPrefill:
+                    # Backend decode reservations can turn an otherwise fitting
+                    # budget into a chunk. A later budget may still fit.
+                    continue
+                if pending_capped_b is not None:
+                    capped_b.append(pending_capped_b)
 
                 if summary.check_oom() or summary.check_kv_cache_oom():
                     break  # larger ctx tokens will cause oom

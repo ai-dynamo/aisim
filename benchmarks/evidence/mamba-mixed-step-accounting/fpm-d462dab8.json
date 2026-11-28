@@ -1,0 +1,75 @@
+{
+ "model": "Qwen/Qwen3-0.6B",
+ "forward_model": "fpm",
+ "interpolation": "sol (run_agg compiles every FpmForward op with it)",
+ "system": "h200_sxm",
+ "backend": "vllm",
+ "version": "test-fpm-version",
+ "table_sha256": "2071e17995569f17500acdec83fc28a0d92cd2a5a82ce2e6385f0f6fe3816849",
+ "build": {
+  "revision": "d462dab8a323af3d78394bc80457e5d0451a9c81",
+  "packages": {
+   "aisim": {
+    "path": "/private/tmp/ais6-d462/venv/lib/python3.13/site-packages/aisim",
+    "source_sha256": "9123b44f3e2a67373ffa9cb911d50a5f1ae11150a2ff55e276d92774300392bb"
+   },
+   "aisim_core": {
+    "path": "/private/tmp/ais6-d462/venv/lib/python3.13/site-packages/aisim_core",
+    "source_sha256": "e44a59b9bd0233e38e5bc0b159e535dddeda108f4ecc22b1e840a5b9cacef7e9"
+   }
+  },
+  "native_extension_path": "/tmp/ais6-d462/venv/lib/python3.13/site-packages/aisim/_runtime.abi3.so",
+  "native_extension_sha256": "ffda0496ea692cab966e92d55af79def66924be9ffb6592005a837ec31ea1cdd",
+  "native_source_sha256": "baa6c328dd21ee87f37c95d4651b0c4169407bbb14c46fd16a806eb12367c959"
+ },
+ "native_extension_sha256": "ffda0496ea692cab966e92d55af79def66924be9ffb6592005a837ec31ea1cdd",
+ "dispatch_ms": 22.400000000000002,
+ "cases": {
+  "cached": {
+   "inputs": {
+    "batch_size": 1,
+    "isl": 512,
+    "osl": 2,
+    "prefix": 256,
+    "ctx_tokens": 512
+   },
+   "steps": {
+    "old_caller": {
+     "context_tokens": 512,
+     "expected_requests": 2,
+     "step_ms": 30.0
+    },
+    "corrected_caller": {
+     "context_tokens": 256,
+     "expected_requests": 1,
+     "step_ms": 12.0
+    }
+   },
+   "run_agg_mix_step_ms": 12.0,
+   "run_agg_ttft_ms": 34.4
+  },
+  "uncached": {
+   "inputs": {
+    "batch_size": 1,
+    "isl": 512,
+    "osl": 2,
+    "prefix": 0,
+    "ctx_tokens": 512
+   },
+   "steps": {
+    "old_caller": {
+     "context_tokens": 512,
+     "expected_requests": 1,
+     "step_ms": 22.0
+    },
+    "corrected_caller": {
+     "context_tokens": 512,
+     "expected_requests": 1,
+     "step_ms": 22.0
+    }
+   },
+   "run_agg_mix_step_ms": 22.0,
+   "run_agg_ttft_ms": 44.4
+  }
+ }
+}

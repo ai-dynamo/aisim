@@ -575,6 +575,12 @@ impl Op {
         }
     }
 
+    /// Mamba2 op with a recorded state dtype. Mixed steps price it with
+    /// per-phase request/token coordinates instead of the token-major pass.
+    pub fn is_qualified_mamba(&self) -> bool {
+        matches!(self, Op::Mamba2(m) if m.state_dtype != "unrecorded")
+    }
+
     /// True if this op's name matches Python's mix-step filter for the
     /// context-attention bucket. Python uses literal string equality on
     /// `"context_attention"` — that's the LLAMA / MOE attention op name.
@@ -723,7 +729,16 @@ impl Op {
             Op::Dsv4Context(op) => op.query_context(db, ctx.batch_size, ctx.s, ctx.prefix),
             Op::Dsv4Generation(op) => op.query_generation(db, ctx.batch_size, ctx.s),
             Op::Mhc(op) => op.query(db, ctx.num_tokens),
-            Op::Mamba2(op) => op.query(db, ctx.batch_size, ctx.s),
+            Op::Mamba2(op) => {
+                if ctx.beam_width != 1 && op.state_dtype != "unrecorded" && op.phase == "generation"
+                {
+                    return Err(AicError::InvalidEngineConfig(format!(
+                        "Mamba op {}: qualified generation requires beam_width 1, got {}",
+                        op.name, ctx.beam_width
+                    )));
+                }
+                op.query_with_prefix(db, ctx.batch_size, ctx.s, ctx.prefix)
+            }
             Op::Gdn(op) => op.query(db, ctx.batch_size, ctx.s),
             Op::WideEpContextMla(op) => op.query(db, ctx.batch_size, ctx.s, ctx.prefix),
             Op::WideEpGenerationMla(op) => op.query(db, ctx.batch_size, ctx.s),

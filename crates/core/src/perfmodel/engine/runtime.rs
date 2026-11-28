@@ -10,7 +10,7 @@
 //! `_run_context_phase` / `_run_generation_phase`) but executes a precompiled
 //! [`EngineSpec`] — Python no longer walks the op list per call. The per-phase
 //! op iteration is the shared logic in [`crate::session`]
-//! ([`run_context_ops`] / [`run_generation_ops_step`]); the `Engine` wraps the
+//! (`run_context_ops_planned` / [`run_generation_ops_step`]); the `Engine` wraps the
 //! stride quadrature and the `(nextn + 1)` decode-batch multiplier around it.
 //!
 //! The `Engine` is pure-Rust internals; its PyO3 bindings (`run_static`,
@@ -18,8 +18,12 @@
 //! embedded [`crate::AicEngineBuilder`] live in [`crate::py`]. The agg sweep is
 //! orchestrated in Python — there is no Rust `run_agg`.
 
+// Check this module's links with its Python embedding API available. Without
+// that feature, the embedding entry points linked above do not exist.
+#![cfg_attr(feature = "python", deny(rustdoc::broken_intra_doc_links))]
+
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::FpmQueryCoverage;
@@ -37,8 +41,8 @@ use crate::perfmodel::engine::spec::{EncoderImageShape, EngineSpec, VisionSpec};
 use crate::session::{
     ContextOpFilter, OpList, OpListPlan, OpMemo, QueryMemo, context_op_runtime,
     generation_op_runtime, get_mix_step_ops, query_context_op, query_generation_op,
-    run_context_ops, run_context_ops_planned, run_context_ops_with, run_generation_ops_step,
-    run_generation_ops_step_beamed_with, run_generation_ops_step_planned,
+    run_context_ops_planned, run_generation_ops_step, run_generation_ops_step_beamed_with,
+    run_generation_ops_step_planned,
 };
 use crate::{ForwardPassMetrics, ForwardPassWorkerType, validate_forward_pass_metrics};
 
@@ -133,10 +137,11 @@ pub(crate) type MoeCommFallbackValues = (MoeCommFallbackValue, Vec<MoeCommFallba
 /// the provenance tag (`silicon|empirical|sol|estimated|mixed`).
 pub type PerOpValue = (String, f64, f64, &'static str);
 
-/// One op name's folded `(latency_ms, energy_wms, source)`, addressed by its
-/// [`OpListPlan`] name slot instead of carrying the name. Folded exactly like
-/// [`PerOpValue`].
-pub(crate) type PerOpSlotValue = (f64, f64, &'static str);
+/// One op name's folded `(latency_ms, energy_wms, covered_latency_ms,
+/// source)`, addressed by its [`OpListPlan`] name slot instead of carrying the
+/// name. Folded like [`PerOpValue`]; the covered latency is decided per query
+/// ([`covered_latency`]) before the fold.
+pub(crate) type PerOpSlotValue = (f64, f64, f64, &'static str);
 
 /// Internal per-op value used by the provenance-aware engine walk. The fifth
 /// field is `None` or `(first_record, additional_records)` in deterministic
@@ -168,11 +173,17 @@ pub(crate) type StaticPerOpValuesWithCoverage = (
 );
 
 /// Per-op values for the shared, context-attention, and decode-attention
-/// buckets returned by the metadata-bearing mixed-step evaluation.
+/// buckets returned by the metadata-bearing mixed-step evaluation, plus the
+/// step's power-covered latency and its decode-only subtotal. Coverage follows
+/// [`StaticPerOpValuesWithCoverage`]: each query result counts when its own
+/// energy is positive, before the name fold, because a qualified Mamba op
+/// folds several prefill queries into one row.
 pub(crate) type MixedStepPerOpValuesWithMetadata = (
     Vec<PerOpValueWithMetadata>,
     Vec<PerOpValueWithMetadata>,
     Vec<PerOpValueWithMetadata>,
+    f64,
+    f64,
 );
 
 /// One SOL-decomposed per-op value: `(name, sol_time_ms, sol_math_ms,
@@ -194,6 +205,19 @@ struct PerOpFold {
     entries: Vec<PerOpValueWithMetadata>,
     /// Entry index per name slot, for [`Self::add_slot`].
     slots: Vec<Option<usize>>,
+    /// Each entry's power-covered latency, when the consumer needs it.
+    /// Summed per query before the fold.
+    covered: Option<Vec<f64>>,
+}
+
+/// A query result's power-covered latency: all of it when its own energy is
+/// positive, else none. Callers sum it before name folding.
+fn covered_latency(r: &PerformanceResult) -> f64 {
+    if r.energy_wms > 0.0 {
+        r.latency_ms
+    } else {
+        0.0
+    }
 }
 
 fn insert_per_op_fallback(
@@ -226,6 +250,14 @@ impl PerOpFold {
             inference_phase,
             entries: Vec::new(),
             slots: Vec::new(),
+            covered: None,
+        }
+    }
+
+    fn with_covered(inference_phase: &'static str) -> Self {
+        Self {
+            covered: Some(Vec::new()),
+            ..Self::new(inference_phase)
         }
     }
 
@@ -268,14 +300,21 @@ impl PerOpFold {
                 ),
             );
         }
-        if let Some(entry) = position.map(|position| &mut self.entries[position]) {
+        if let Some(position) = position {
+            let entry = &mut self.entries[position];
             entry.1 += r.latency_ms;
             entry.2 += r.energy_wms;
             if entry.3 != source {
                 entry.3 = "mixed";
             }
             extend_per_op_fallbacks(&mut entry.4, fallbacks);
+            if let Some(covered) = &mut self.covered {
+                covered[position] += covered_latency(&r);
+            }
             return;
+        }
+        if let Some(covered) = &mut self.covered {
+            covered.push(covered_latency(&r));
         }
         self.entries.push((
             name.to_string(),
@@ -288,6 +327,14 @@ impl PerOpFold {
 
     fn into_values(self) -> Vec<PerOpValueWithMetadata> {
         self.entries
+    }
+
+    /// [`Self::into_values`] with each entry's power-covered latency.
+    fn into_values_with_covered(self) -> (Vec<PerOpValueWithMetadata>, Vec<f64>) {
+        (
+            self.entries,
+            self.covered.expect("per-name coverage tracking enabled"),
+        )
     }
 }
 
@@ -310,20 +357,20 @@ impl PerOpSlotFold {
     }
 
     fn add(&mut self, slot: usize, r: PerformanceResult) {
-        self.add_value(slot, (r.latency_ms, r.energy_wms, r.source.as_str()));
+        self.add_value(slot, slot_value(&r));
     }
 
     /// Fold one value into `slot`.
-    fn add_value(&mut self, slot: usize, (latency_ms, energy_wms, source): PerOpSlotValue) {
+    fn add_value(&mut self, slot: usize, value: PerOpSlotValue) {
         if let Some(entry) = self.entries.get_mut(slot) {
-            entry.0 += latency_ms;
-            entry.1 += energy_wms;
-            // Equal labels are nearly always one static string: try its address.
-            if !std::ptr::eq(entry.2, source) && entry.2 != source {
-                entry.2 = "mixed";
+            entry.0 += value.0;
+            entry.1 += value.1;
+            entry.2 += value.2;
+            if !std::ptr::eq(entry.3, value.3) && entry.3 != value.3 {
+                entry.3 = "mixed";
             }
         } else if slot == self.entries.len() {
-            self.entries.push((latency_ms, energy_wms, source));
+            self.entries.push(value);
         } else {
             self.misordered = true;
         }
@@ -343,6 +390,16 @@ impl PerOpSlotFold {
         }
         Ok(self.entries)
     }
+}
+
+/// One query result as a slot value, its coverage decided before any fold.
+fn slot_value(r: &PerformanceResult) -> PerOpSlotValue {
+    (
+        r.latency_ms,
+        r.energy_wms,
+        covered_latency(r),
+        r.source.as_str(),
+    )
 }
 
 fn strip_per_op_metadata(entries: Vec<PerOpValueWithMetadata>) -> Vec<PerOpValue> {
@@ -418,7 +475,7 @@ struct RankOperationFold {
 impl RankOperationFold {
     fn new(db: &PerfDatabase) -> Self {
         Self {
-            fold: PerOpFold::new("context"),
+            fold: PerOpFold::with_covered("context"),
             sols: Vec::new(),
             sol_db: db.sol_full_view(),
             sol_queries: SolQueryMemo::default(),
@@ -485,18 +542,25 @@ impl RankOperationFold {
         });
     }
 
-    fn into_operations(self) -> Vec<super::diagnostics::StaticOperationDiagnostics> {
-        self.fold
-            .into_values()
+    /// The folded diagnostics and each one's power-covered latency.
+    fn into_operations(
+        self,
+    ) -> (
+        Vec<super::diagnostics::StaticOperationDiagnostics>,
+        Vec<f64>,
+    ) {
+        let (entries, covered) = self.fold.into_values_with_covered();
+        let operations = entries
             .into_iter()
             .zip(self.sols)
             .map(|(entry, sol)| operation_diagnostics(entry, sol))
-            .collect()
+            .collect();
+        (operations, covered)
     }
 }
 
 /// Name-folded operation values of one operation-graph rank: each name's
-/// `(latency_ms, energy_wms, source)`, value `k` named `names[k]`. Ranks that
+/// [`PerOpSlotValue`], value `k` named `names[k]`. Ranks that
 /// run the same walk share `names`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RankOperationValues {
@@ -544,6 +608,9 @@ pub(crate) struct RankPricing {
     pub(crate) fpm_terms: FpmRankTerms,
     /// [`RankDetail::Diagnostics`] of an operation graph.
     pub(crate) diagnostics: Option<Vec<super::diagnostics::StaticOperationDiagnostics>>,
+    /// Each diagnostic's power-covered latency, summed per query before the
+    /// name fold; present with `diagnostics`.
+    pub(crate) diagnostic_covered: Option<Vec<f64>>,
     /// What a caller derives from this pricing ([`Self::derived`]).
     derived: OnceLock<Box<dyn std::any::Any + Send + Sync>>,
 }
@@ -582,8 +649,9 @@ pub(crate) struct NativeIteration {
 enum RankObserver<'a> {
     Latency,
     /// Diagnostics: a whole-model rank's direct FPM lookups or an operation
-    /// graph's operations with their SOL comparison.
-    Diagnostics(&'a mut crate::FpmRankEstimate),
+    /// graph's operations with their SOL comparison, plus, when given, each
+    /// operation's power-covered latency.
+    Diagnostics(&'a mut crate::FpmRankEstimate, Option<&'a mut Vec<f64>>),
     /// An operation graph's operation values; whole-model FPM leaves `None`.
     Values(&'a mut Option<RankOperationValues>),
 }
@@ -591,8 +659,8 @@ enum RankObserver<'a> {
 /// Every scheduled-work field a rank dispatch reads
 /// ([`Engine::rank_latency_ms`]): the five counters and the prefill-length
 /// variance bits, with the detail the entry keeps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct RankKey([u32; 5], u64, RankDetail);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RankKey([u32; 5], u64, RankDetail, Option<Vec<[u32; 3]>>);
 
 impl RankKey {
     fn of(metrics: &ForwardPassMetrics, detail: RankDetail) -> Self {
@@ -607,6 +675,7 @@ impl RankKey {
             ],
             sched.var_prefill_length.to_bits(),
             detail,
+            sched.prefill_chunks.clone(),
         )
     }
 }
@@ -630,11 +699,15 @@ const SHARED_NAME_LISTS: usize = 16;
 #[derive(Debug)]
 struct MixStepPlan {
     names: Arc<[String]>,
+    qualified_mamba: bool,
+    /// Qualified Mamba in the generation list, which divides packed decode
+    /// tokens by its token width. A graph may qualify generation Mamba alone.
+    qualified_decode_mamba: bool,
     /// Slot of each context operation, which runs in the shared or the
     /// context-attention pass.
     context_slot: Vec<usize>,
-    /// Slot of each generation-attention operation; the decode-attention
-    /// pass runs no other generation operation.
+    /// Slot of each generation-attention or qualified Mamba operation; the
+    /// decode pass runs no other generation operation.
     generation_slot: Vec<Option<usize>>,
 }
 
@@ -650,20 +723,25 @@ impl MixStepPlan {
             })
         };
         let mut context_slot = vec![0; context.len()];
-        // Pass 1 skips context attention, which pass 2 runs alone.
+        // Pass 1 skips context attention, which pass 2 runs alone; a qualified
+        // Mamba scan stays in pass 1 whatever its name.
         for attention in [false, true] {
             for (index, op) in context.iter().enumerate() {
-                if op.is_context_attention() == attention {
+                if crate::perfmodel::session::in_packed_attention_pass(op) == attention {
                     context_slot[index] = slot_of(op);
                 }
             }
         }
         let generation_slot = generation
             .iter()
-            .map(|op| op.is_generation_attention().then(|| slot_of(op)))
+            .map(|op| {
+                (op.is_generation_attention() || op.is_qualified_mamba()).then(|| slot_of(op))
+            })
             .collect();
         Self {
             names: names.into(),
+            qualified_mamba: context.iter().any(Op::is_qualified_mamba),
+            qualified_decode_mamba: generation.iter().any(Op::is_qualified_mamba),
             context_slot,
             generation_slot,
         }
@@ -894,7 +972,7 @@ impl RankValueFold {
                 });
                 self.names = Some(Arc::clone(names));
             }
-            None => self.by_name = Some(PerOpFold::new("context")),
+            None => self.by_name = Some(PerOpFold::with_covered("context")),
         }
     }
 
@@ -959,10 +1037,7 @@ impl OperationObserver {
                     slots: Some(slots), ..
                 }),
                 Some(slot),
-            ) if divisor == 1.0 => slots.add_value(
-                slot,
-                (result.latency_ms, result.energy_wms, result.source.as_str()),
-            ),
+            ) if divisor == 1.0 => slots.add_value(slot, slot_value(&result)),
             (Self::Values(fold), _) => fold.add(slot, op, result.into_owned(), divisor),
         }
     }
@@ -1090,6 +1165,32 @@ impl PerOpSolFold {
     fn into_values(self) -> Vec<PerOpSolValue> {
         self.entries
     }
+}
+
+/// The mix-step pass of each operation name, or the first name used in two
+/// passes. Context attention and a qualified Mamba op price only their
+/// prefill, generation attention and a qualified Mamba op only their decode,
+/// and every other context operation runs in the shared pass.
+fn mixed_pass_map(context: &[Op], generation: &[Op]) -> Result<HashMap<String, MixedPass>, String> {
+    let context = context.iter().map(|op| {
+        let pass = if op.is_context_attention() || op.is_qualified_mamba() {
+            MixedPass::ContextAttention
+        } else {
+            MixedPass::SharedNonAttention
+        };
+        (op, pass)
+    });
+    let decode = generation
+        .iter()
+        .filter(|op| op.is_generation_attention() || op.is_qualified_mamba())
+        .map(|op| (op, MixedPass::DecodeAttention));
+    let mut passes = HashMap::new();
+    for (op, pass) in context.chain(decode) {
+        if *passes.entry(op.name().to_owned()).or_insert(pass) != pass {
+            return Err(op.name().to_owned());
+        }
+    }
+    Ok(passes)
 }
 
 /// Which of the three mixed-step passes produced a sinked per-op value.
@@ -1288,6 +1389,106 @@ impl Engine {
             .as_ref()
             .and_then(|s| s.nextn)
             .unwrap_or(0);
+        // [qualified, unrecorded] Mamba2 ops seen across both phases.
+        let mut seen = [false; 2];
+        Self::validate_mamba_ops(&spec.context_ops, None, true, &mut seen)?;
+        Self::validate_mamba_ops(
+            &spec.generation_ops,
+            Some(nextn.saturating_add(1)),
+            true,
+            &mut seen,
+        )?;
+        if let Some(vision) = &spec.vision {
+            // Vision queries use context coordinates. Validate independently
+            // of the text phases, whose mixed-step qualification must agree.
+            for ops in [
+                &vision.patch_ops,
+                &vision.transformer_ops,
+                &vision.output_ops,
+            ] {
+                Self::validate_mamba_ops(ops, None, true, &mut [false; 2])?;
+            }
+        }
+        if seen == [true, true] {
+            return Err(AicError::InvalidEngineConfig(
+                "Mamba ops must all record a state_dtype or all leave it unrecorded: mixed \
+                 steps would charge decode Mamba work twice or not at all"
+                    .into(),
+            ));
+        }
+        // A saturated `nextn + 1` would match a `u32::MAX` token width that no
+        // configured verify width can equal.
+        if seen[0] && nextn.checked_add(1).is_none() {
+            return Err(AicError::InvalidEngineConfig(
+                "qualified Mamba ops need nextn+1 to fit the u32 verify width".into(),
+            ));
+        }
+        // DSv4.1 staged mixed steps price every context op token-major, and
+        // the unstaged mixed walk skips a stage in either phase.
+        if seen[0]
+            && spec
+                .context_ops
+                .iter()
+                .chain(&spec.generation_ops)
+                .any(|op| matches!(op, Op::Dsv41Stage(_)))
+        {
+            return Err(AicError::InvalidEngineConfig(
+                "qualified Mamba ops are not supported beside DSv4.1 stages".into(),
+            ));
+        }
+        // Operation-graph Replay attributes a mixed rank's operations to a
+        // pass by name and splits every operation by token share when names
+        // collide, which would mix prefill and decode Mamba work. Whole-model
+        // FPM keeps draft tails in separate pass buckets (see fpm_split).
+        if seen[0]
+            && !matches!(
+                (spec.context_ops.first(), spec.generation_ops.first()),
+                (Some(Op::FpmForward(_)), Some(Op::FpmForward(_)))
+            )
+            && let Err(name) = mixed_pass_map(&spec.context_ops, &spec.generation_ops)
+        {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "operation name {name} belongs to two mixed-step passes beside qualified Mamba ops"
+            )));
+        }
+        // The SDK reports these names as amortized context attention, which
+        // XPU TTFT rescales; a qualified Mamba row is never amortized.
+        if let Some(op) = spec
+            .context_ops
+            .iter()
+            .chain(&spec.generation_ops)
+            .find(|op| {
+                op.is_qualified_mamba()
+                    && matches!(
+                        op.name(),
+                        "context_attention" | "context_attention (scaled)"
+                    )
+            })
+        {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "qualified Mamba op may not use the reserved attention name {}",
+                op.name()
+            )));
+        }
+        // Per-op rows fold by name and only attention is amortized over
+        // chunks, so a qualified Mamba name may repeat only on qualified Mamba.
+        if let Some(op) = spec
+            .context_ops
+            .iter()
+            .chain(&spec.generation_ops)
+            .filter(|op| op.is_qualified_mamba())
+            .find(|m| {
+                spec.context_ops
+                    .iter()
+                    .chain(&spec.generation_ops)
+                    .any(|o| !o.is_qualified_mamba() && o.name() == m.name())
+            })
+        {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "qualified Mamba op {} shares its name with another operation",
+                op.name()
+            )));
+        }
         super::readiness::validate_glm53_kv(
             &db,
             spec.context_ops.iter().chain(&spec.generation_ops),
@@ -1386,6 +1587,107 @@ impl Engine {
             vision: spec.vision,
             tp_size: spec.engine.parallel.tp_size,
         })
+    }
+
+    /// Mixed steps price only top-level qualified Mamba ops per phase, so a
+    /// qualified op inside a composite is rejected. Generation Mamba queries
+    /// carry `requests * (nextn + 1)` flattened tokens and the op divides by
+    /// its own width (`decode_width`); the two must agree. Ad-hoc queries pass
+    /// width 0, because the probe engine has no model `nextn`. Whole-model FPM
+    /// `sol_ops` use a separate path and are not walked. `seen` records
+    /// whether any qualified (`[0]`) or unrecorded (`[1]`) Mamba2 op appeared.
+    fn validate_mamba_ops(
+        ops: &[Op],
+        decode_width: Option<u32>,
+        top_level: bool,
+        seen: &mut [bool; 2],
+    ) -> Result<(), AicError> {
+        let invalid = |name: &str, why: String| {
+            Err(AicError::InvalidEngineConfig(format!(
+                "Mamba op {name}: {why}"
+            )))
+        };
+        for op in ops {
+            match op {
+                Op::Mamba2(m) => {
+                    let qualified = op.is_qualified_mamba();
+                    seen[usize::from(!qualified)] = true;
+                    if let Some(why) = m.field_error() {
+                        return invalid(&m.name, why);
+                    }
+                    // Only generation lists carry a decode width.
+                    let expected = if decode_width.is_some() {
+                        "generation"
+                    } else {
+                        "context"
+                    };
+                    if qualified && m.phase != expected {
+                        return invalid(
+                            &m.name,
+                            format!(
+                                "qualified op phase {:?} does not match its {expected} list",
+                                m.phase
+                            ),
+                        );
+                    }
+                    if qualified && !top_level {
+                        return invalid(
+                            &m.name,
+                            "a qualified op cannot be nested in a composite".into(),
+                        );
+                    }
+                    // Width 0: an ad-hoc generation query, whose op sets its own width.
+                    if let Some(width) = decode_width
+                        && width != 0
+                        && qualified
+                        && m.token_width != width
+                    {
+                        return invalid(
+                            &m.name,
+                            format!(
+                                "qualified op has token_width {} but speculative nextn+1 is {width}",
+                                m.token_width
+                            ),
+                        );
+                    }
+                }
+                Op::TokenScale(o) => Self::validate_mamba_ops(
+                    std::slice::from_ref(&o.op),
+                    decode_width,
+                    false,
+                    seen,
+                )?,
+                Op::Dsv41Stage(o) => {
+                    Self::validate_mamba_ops(&o.children, decode_width, false, seen)?
+                }
+                Op::Overlap(o) => {
+                    Self::validate_mamba_ops(&o.group_a, decode_width, false, seen)?;
+                    Self::validate_mamba_ops(&o.group_b, decode_width, false, seen)?;
+                }
+                Op::Fallback(o) => {
+                    Self::validate_mamba_ops(
+                        std::slice::from_ref(&o.primary),
+                        decode_width,
+                        false,
+                        seen,
+                    )?;
+                    Self::validate_mamba_ops(&o.fallback, decode_width, false, seen)?;
+                }
+                Op::Glm53Attention(o) => {
+                    Self::validate_mamba_ops(&o.measured, decode_width, false, seen)?
+                }
+                Op::Glm53Ffn(o) => {
+                    Self::validate_mamba_ops(&o.children, decode_width, false, seen)?;
+                    Self::validate_mamba_ops(&o.measured, decode_width, false, seen)?;
+                }
+                Op::Glm53Primitive(o) => {
+                    Self::validate_mamba_ops(&o.children, decode_width, false, seen)?;
+                    Self::validate_mamba_ops(&o.measured, decode_width, false, seen)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn reject_sd_round_ops(ops: &[Op]) -> Result<(), AicError> {
@@ -1747,26 +2049,7 @@ impl Engine {
         if self.fpm_split().is_some() || self.has_dsv41_stages() || !self.mixed_ops_supported {
             return None;
         }
-        let context = self.context_ops.iter().map(|op| {
-            let pass = if op.is_context_attention() {
-                MixedPass::ContextAttention
-            } else {
-                MixedPass::SharedNonAttention
-            };
-            (op, pass)
-        });
-        let decode = self
-            .generation_ops
-            .iter()
-            .filter(|op| op.is_generation_attention())
-            .map(|op| (op, MixedPass::DecodeAttention));
-        let mut passes = HashMap::new();
-        for (op, pass) in context.chain(decode) {
-            if *passes.entry(op.name().to_owned()).or_insert(pass) != pass {
-                return None;
-            }
-        }
-        Some(passes)
+        mixed_pass_map(&self.context_ops, &self.generation_ops).ok()
     }
 
     /// Whether this engine supplies an unscaled STP whole-forward reference.
@@ -1992,12 +2275,16 @@ impl Engine {
     /// Python `_run_context_phase` (`base_backend.py:144`): `effective_isl =
     /// isl - prefix`, validate `> 0`, then one full pass over `context_ops`.
     fn run_context_phase(&self, runtime: &RuntimeConfig) -> Result<f64, AicError> {
-        self.run_context_phase_with(runtime, None, |_, _| {})
+        self.run_context_phase_with(runtime, false, None, None, |_, _| {})
     }
 
+    /// `any_cached` marks a prefill whose exact cached-token total is nonzero
+    /// even when its integer mean `runtime.prefix` rounds to zero.
     fn run_context_phase_with(
         &self,
         runtime: &RuntimeConfig,
+        any_cached: bool,
+        total_new_tokens: Option<u32>,
         coverage: Option<&mut FpmQueryCoverage>,
         mut on_op: impl FnMut(&Op, PerformanceResult),
     ) -> Result<f64, AicError> {
@@ -2051,7 +2338,10 @@ impl Engine {
             runtime.prefix,
             runtime.seq_imbalance_correction_scale,
             ContextOpFilter::All,
-            |_, op, result| on_op(op, result.into_owned()),
+            any_cached,
+            total_new_tokens,
+            None,
+            |_, op, _, result| on_op(op, result.into_owned()),
         )
     }
 
@@ -2069,7 +2359,7 @@ impl Engine {
     ///
     /// `osl <= 1` yields an empty loop and 0.0 (matches Python).
     fn run_generation_phase(&self, runtime: &RuntimeConfig, stride: u32) -> Result<f64, AicError> {
-        self.run_generation_phase_with(runtime, stride, |_, _, _| {})
+        self.run_generation_phase_with(runtime, stride, |_, _, _, _| {})
     }
 
     /// [`Self::run_generation_phase`] with a per-op sink. Python builds a
@@ -2080,12 +2370,14 @@ impl Engine {
     /// `repeat_count`, in that exact order: `(r1 + r2) * k`, not
     /// `r1*k + r2*k` (bit-identical for repeated-name model families).
     ///
-    /// The sink also receives the op's name slot in [`Self::generation_plan`].
+    /// The sink also receives the op's name slot in [`Self::generation_plan`]
+    /// and the step's power-covered latency for that name, summed per query
+    /// before the fold and weighted by `repeat_count`.
     fn run_generation_phase_with(
         &self,
         runtime: &RuntimeConfig,
         stride: u32,
-        mut on_op: impl FnMut(usize, &Op, PerformanceResult),
+        mut on_op: impl FnMut(usize, &Op, PerformanceResult, f64),
     ) -> Result<f64, AicError> {
         self.check_profile_phase(false)?;
         if self.legacy_profile && runtime.osl > 2 {
@@ -2094,19 +2386,18 @@ impl Engine {
             ));
         }
         self.reject_full_round_surface("static generation trajectories")?;
-        let bs = runtime
-            .batch_size
-            .saturating_mul(self.nextn.saturating_add(1));
         let stride = stride.max(1);
         let mut total = 0.0_f64;
         if runtime.osl <= 1 {
             return Ok(0.0);
         }
+        // Pack only when a decode step runs, so an empty trajectory stays zero.
+        let bs = self.packed_decode_tokens(runtime.batch_size)?;
         let plan = &self.generation_plan;
         // DSv4.1 stages share their token-count children across steps and walks.
         let op_memo = self.has_dsv41_stages().then(|| self.op_memo());
         // Per-step name fold, indexed by name slot; `order` keeps first encounter.
-        let mut step_fold: Vec<Option<(&Op, PerformanceResult)>> = vec![None; plan.names()];
+        let mut step_fold: Vec<Option<(&Op, PerformanceResult, f64)>> = vec![None; plan.names()];
         let mut order = Vec::with_capacity(plan.names());
         let upper = runtime.osl - 1; // exclusive, matches Python `range(0, osl-1, stride)`
         let mut i = 0u32;
@@ -2131,7 +2422,9 @@ impl Engine {
                 |index, op, r| {
                     let r = r.into_owned();
                     let slot = plan.name_slot(index);
-                    if let Some((_, entry)) = &mut step_fold[slot] {
+                    let covered = covered_latency(&r);
+                    if let Some((_, entry, entry_covered)) = &mut step_fold[slot] {
+                        *entry_covered += covered;
                         entry.latency_ms += r.latency_ms;
                         entry.energy_wms += r.energy_wms;
                         if entry.source != r.source {
@@ -2139,14 +2432,15 @@ impl Engine {
                         }
                         entry.moe_comm_fallbacks.extend(r.moe_comm_fallbacks);
                     } else {
-                        step_fold[slot] = Some((op, r));
+                        step_fold[slot] = Some((op, r, covered));
                         order.push(slot);
                     }
                 },
             )?;
             for slot in order.drain(..) {
-                let (op, folded) = step_fold[slot].take().expect("visited name slot");
-                on_op(slot, op, folded.scaled(repeat_count as f64));
+                let (op, folded, covered) = step_fold[slot].take().expect("visited name slot");
+                let repeat = repeat_count as f64;
+                on_op(slot, op, folded.scaled(repeat), covered * repeat);
             }
             total += step * repeat_count as f64;
             i += stride;
@@ -2176,7 +2470,7 @@ impl Engine {
             prefix,
             ..Default::default()
         };
-        self.run_context_phase_with(&rt, coverage, |_, _| {})
+        self.run_context_phase_with(&rt, false, None, coverage, |_, _| {})
     }
 
     /// Preserve static prefill geometry, including explicitly equal per-request
@@ -2198,18 +2492,21 @@ impl Engine {
         };
         let mut queries = Vec::new();
         let mut energy_wms = 0.0;
-        let prefill_ms = self.run_context_phase_with(&runtime, coverage, |_, result| {
-            energy_wms += result.energy_wms;
-            queries.extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
-        })?;
+        let prefill_ms =
+            self.run_context_phase_with(&runtime, false, None, coverage, |_, result| {
+                energy_wms += result.energy_wms;
+                queries.extend(result.fpm_queries.into_iter().flat_map(|queries| *queries));
+            })?;
         Ok(static_prefill_estimate(prefill_ms, energy_wms, queries))
     }
 
     /// Prefill-step latency at exact per-rank iteration totals: the tokens the
     /// step computes and the cached or earlier-chunk KV its requests read.
-    /// A whole-model FPM context phase queries these native coordinates
-    /// directly. Other graphs price per-request shapes and keep the integer
-    /// means of [`Self::predict_prefill_latency`].
+    /// A whole-model FPM without operation-level draft tails queries these
+    /// native coordinates directly when `nextn == 0` or a measured-round
+    /// binding is present. Otherwise, it uses the integer means of
+    /// [`Self::predict_prefill_latency`], as other graphs do, except that
+    /// qualified Mamba ops split ragged totals into balanced request lengths.
     pub fn predict_prefill_latency_total(
         &self,
         batch_size: u32,
@@ -2317,7 +2614,13 @@ impl Engine {
                     osl: 1,
                     ..Default::default()
                 };
-                self.run_context_phase_with(&runtime, coverage, on_op)
+                self.run_context_phase_with(
+                    &runtime,
+                    total_kv_read_tokens > 0,
+                    Some(total_prefill_tokens),
+                    coverage,
+                    on_op,
+                )
             }
         }
     }
@@ -2340,8 +2643,25 @@ impl Engine {
 
     /// Predict one decode step from exact FPM iteration totals.
     ///
-    /// `total_past_kv_tokens` excludes the one current token processed by each
-    /// decode request, matching the collector's `total_kv_read_tokens` axis.
+    /// The two arguments are `ForwardPassMetrics::num_decode_requests` and
+    /// `sum_decode_kv_tokens`, whose units depend on the engine:
+    ///
+    /// - An operation graph takes packed rows. Under speculative decoding,
+    ///   `batch_size` is `requests * (nextn + 1)`, and `total_past_kv_tokens`
+    ///   sums each row's attention length including its current token, so
+    ///   `B` requests at width `v` and length `s` give `B*v` and `B*v*s`.
+    /// - A whole-model FPM takes logical requests, and a measured
+    ///   speculative-round FPM one measured round per request. There,
+    ///   `total_past_kv_tokens` excludes each request's current token,
+    ///   matching the collector's `total_kv_read_tokens` axis.
+    ///   A whole-model FPM with draft tails, or with speculative decoding and
+    ///   no measured-round profile, has no such mapping and returns
+    ///   `InvalidEngineConfig` before any lookup.
+    /// - A schema-v1 legacy profile takes a homogeneous batch of requests. Its
+    ///   `total_past_kv_tokens` excludes each request's current token and must
+    ///   divide by `batch_size`: two requests at sequence length 5 are `(2, 8)`.
+    ///
+    /// [`Self::decode_step_latency`] always takes logical requests.
     pub fn predict_decode_latency_total(
         &self,
         batch_size: u32,
@@ -2526,6 +2846,23 @@ impl Engine {
         )
     }
 
+    /// `requests * (nextn + 1)` packed decode tokens. Qualified Mamba divides
+    /// this count by its token width, so a count that `u32` cannot hold fails
+    /// rather than saturating to fewer requests. Other graphs saturate.
+    fn packed_decode_tokens(&self, requests: u32) -> Result<u32, AicError> {
+        let width = self.nextn.saturating_add(1);
+        match requests.checked_mul(width) {
+            Some(tokens) => Ok(tokens),
+            None if self.mix_plan.qualified_mamba || self.mix_plan.qualified_decode_mamba => {
+                Err(AicError::InvalidEngineConfig(format!(
+                    "{requests} decode requests of {width} tokens overflow the u32 count \
+                 that qualified Mamba ops divide by their token width"
+                )))
+            }
+            None => Ok(u32::MAX),
+        }
+    }
+
     /// [`Self::mixed_step_breakdown`] with a per-op sink. The sink observes
     /// `(pass, op, result)` for every queried op with RAW (undivided) pass-2
     /// values; the per-op wrapper applies the `ceil(isl/ctx)` division to the
@@ -2577,7 +2914,7 @@ impl Engine {
                 prefix,
                 seq_imbalance_correction_scale,
                 gen_seq_imbalance_correction_scale,
-                |_, _, _| {},
+                |_, _, _, _| {},
             )?;
             let prefill_ms = prefill_ms.latency_ms;
             let marginal_decode_ms = marginal_decode_ms.latency_ms;
@@ -2617,6 +2954,12 @@ impl Engine {
         // a guard — callers always pass isl >= 1. Clamp to avoid a Rust
         // div-by-zero panic on degenerate input Python would crash on.
         let isl = isl.max(1);
+        if ctx_tokens > 0 && prefix >= isl {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "isl must be greater than 0 after removing prefix, but got {}",
+                isl as i64 - prefix as i64
+            )));
+        }
 
         // ---- Pass 1: combined non-attention work ----
         // Speculative progress model: every decode request verifies one
@@ -2624,17 +2967,91 @@ impl Engine {
         // `gen * (nextn + 1)` decode tokens (mirrors Python `run_mixed`'s
         // `decode_query_tokens`). Acceptance does not reduce this
         // current-iteration work.
-        let decode_query_tokens = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
-        let combined = ctx_tokens + decode_query_tokens;
+        let decode_query_tokens = self.packed_decode_tokens(gen_tokens)?;
+        // Raw packed tokens before removing cached work; u64 so a wide decode
+        // batch beside cached prefill cannot overflow before the subtraction.
+        let combined = u64::from(ctx_tokens) + u64::from(decode_query_tokens);
         let prefix1 = prefix * (ctx_tokens / isl); // prefix * floor(ctx/isl)
-        if prefix1 >= combined {
+        if u64::from(prefix1) >= combined {
             return Err(AicError::InvalidEngineConfig(format!(
                 "isl must be greater than 0 after removing prefix, but got {}",
                 combined as i64 - prefix1 as i64
             )));
         }
+        // Qualified Mamba and the shared token-major ops compute the same new
+        // prefill tokens. Cache the graph classification in the plan and split
+        // the budget once per step, rather than once per Mamba operation.
+        let mamba_prefill = if self.mix_plan.qualified_mamba || self.mix_plan.qualified_decode_mamba
+        {
+            let per_request = isl.saturating_sub(prefix).max(1);
+            let (mut full, mut partial) = (ctx_tokens / isl, ctx_tokens % isl);
+            if partial > per_request {
+                return Err(AicError::InvalidEngineConfig(format!(
+                    "qualified Mamba partial prefill extend ({partial}) exceeds \
+                     one request's uncached length ({per_request})"
+                )));
+            }
+            if partial == per_request {
+                (full, partial) = (full + 1, 0);
+            }
+            Some((full, partial, per_request))
+        } else {
+            None
+        };
+        let shared_tokens = match mamba_prefill {
+            Some((full, partial, length)) => (full * length + partial)
+                .checked_add(decode_query_tokens)
+                .ok_or_else(|| {
+                    AicError::InvalidEngineConfig(format!(
+                        "{decode_query_tokens} decode tokens beside the new prefill tokens \
+                         overflow the u32 count of qualified Mamba shared ops"
+                    ))
+                })?,
+            None => match u32::try_from(combined - u64::from(prefix1)) {
+                Ok(tokens) => tokens,
+                Err(_) if self.mix_plan.qualified_decode_mamba => {
+                    return Err(AicError::InvalidEngineConfig(
+                        "qualified Mamba shared tokens overflow the u32 count".into(),
+                    ));
+                }
+                Err(_) => u32::MAX,
+            },
+        };
         let mut shared_non_attention = 0.0;
+        // Prefill-only, like context attention, but never amortized over chunks.
+        let mut context_mamba = 0.0;
         for op in &self.context_ops {
+            if op.is_qualified_mamba() {
+                // Each prefill chunk reads and writes its recurrent state once.
+                // Decode Mamba is priced in pass 3 at its own request shape.
+                // `ctx_tokens` packs `floor(ctx/isl)` complete requests (each
+                // `isl - prefix` new tokens) plus one request's partial extend,
+                // the `ceil(ctx/isl)` requests that context attention prices.
+                // Aggregate callers translate their capacity to this scheduled
+                // shape first, capping unused space at the uncached suffix.
+                // shortcut: sum uniform timing rows until variable-length batches are
+                // calibrated; this can overcount launch overhead for ragged batches.
+                // A partial extend as long as a full request joins its batch: one
+                // batch-of-n query, as packed telemetry prices it, not n batch-one rows.
+                let (full, partial, per_request) = mamba_prefill.expect("qualified Mamba plan");
+                for (batch, tokens) in [(full, per_request), (1, partial)] {
+                    if batch == 0 || tokens == 0 {
+                        continue;
+                    }
+                    let result = query_context_op(
+                        op,
+                        &self.db,
+                        batch,
+                        tokens,
+                        prefix,
+                        seq_imbalance_correction_scale,
+                        None,
+                    )?;
+                    context_mamba += result.latency_ms;
+                    on_op(MixedPass::ContextAttention, op, result);
+                }
+                continue;
+            }
             // Only target operations share a forward across prefill and
             // verification. The draft has its own phase-specific graph.
             if op.is_context_attention() || op.name().starts_with("draft_") {
@@ -2644,7 +3061,7 @@ impl Engine {
                 op,
                 &self.db,
                 1,
-                combined - prefix1,
+                shared_tokens,
                 prefix1,
                 seq_imbalance_correction_scale,
                 None,
@@ -2659,17 +3076,13 @@ impl Engine {
         // Python's `np.ceil(isl/0)` is +inf and the division yields 0 — skip.
         let mut context_attention = 0.0_f64;
         if ctx_tokens > 0 {
-            if prefix >= isl {
-                return Err(AicError::InvalidEngineConfig(format!(
-                    "isl must be greater than 0 after removing prefix, but got {}",
-                    isl as i64 - prefix as i64
-                )));
-            }
             let batch2 = ctx_tokens.div_ceil(isl);
             let scale2 = isl.div_ceil(ctx_tokens) as f64;
             let mut attn = 0.0;
             for op in &self.context_ops {
-                if !op.is_context_attention() && !op.name().starts_with("draft_") {
+                if op.is_qualified_mamba()
+                    || (!op.is_context_attention() && !op.name().starts_with("draft_"))
+                {
                     continue;
                 }
                 // Draft prefill uses the same whole-prefill amortization
@@ -2692,18 +3105,21 @@ impl Engine {
                 // fold-then-divide, `base_backend.py:1244-1246`).
                 on_op(MixedPass::ContextAttention, op, result);
             }
-            context_attention = attn / scale2;
+            context_attention = attn / scale2 + context_mamba;
         }
 
-        // ---- Pass 3: decode attention ----
+        // ---- Pass 3: decode attention and qualified Mamba ----
         let mut decode_attention = 0.0_f64;
         if gen_tokens > 0 {
-            let bs = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+            let bs = decode_query_tokens;
             // `_run_generation_phase` queries at s = isl_pass3 + i + 1 with
             // isl_pass3 = isl + osl//2 and a single step (osl=2, i=0).
             let s = isl + osl / 2 + 1;
             for op in &self.generation_ops {
-                if !op.is_generation_attention() && !op.name().starts_with("draft_") {
+                if !op.is_generation_attention()
+                    && !op.name().starts_with("draft_")
+                    && !op.is_qualified_mamba()
+                {
                     continue;
                 }
                 // The draft's TokenScale maps this verification-width
@@ -2924,7 +3340,7 @@ impl Engine {
             };
             return self.run_generation_phase(&rt, DEFAULT_STATIC_STRIDE);
         }
-        let effective_batch = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+        let effective_batch = self.packed_decode_tokens(gen_tokens)?;
         let s = isl.max(1).saturating_add(osl.max(1) / 2).saturating_add(1);
         run_generation_ops_step(
             &self.generation_ops,
@@ -2962,12 +3378,13 @@ impl Engine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-        mut on_op: impl FnMut(MixedPass, &Op, PerformanceResult),
+        mut on_op: impl FnMut(MixedPass, &Op, PerformanceResult, f64),
     ) -> Result<(PerformanceResult, PerformanceResult), AicError> {
         let mut prefill_component = PerformanceResult::zero();
         let price_target_energy =
             self.nextn == 0 && ctx_tail.is_empty() && self.fpm_execution_profile.is_none();
-        let decode_query_tokens = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+        // Reject unrepresentable qualified counts before querying either phase.
+        let decode_query_tokens = self.packed_decode_tokens(gen_tokens)?;
         let mut price_prefill = |batch: u32, tokens: u32, prefix: u32, scheduled: u32| {
             let mut result = prefill_op.query_totals(
                 &self.db,
@@ -2984,20 +3401,38 @@ impl Engine {
                 MixedPass::SharedNonAttention,
                 &self.context_ops[0],
                 result.clone(),
+                covered_latency(&result),
             );
             // Draft precompute is absent from the whole-model target curve.
             // Keep energy, provenance and executed fallback metadata together
             // with its latency for the native per-op reporting endpoint.
-            run_context_ops_with(
+            // Qualified scans restore/store state once per scheduled request.
+            // A final partial request must not inherit the full scan length;
+            // exact multiples retain one batched query. Other draft ops keep
+            // their existing uniform shape, as does the target query above.
+            let remainder = scheduled % tokens;
+            let chunks = [
+                [batch - u32::from(remainder > 0), tokens, prefix],
+                [1, remainder, prefix],
+            ];
+            let chunks = &chunks[..if remainder == 0 { 1 } else { 2 }];
+            run_context_ops_planned(
                 ctx_tail,
+                None,
+                None,
                 &self.db,
                 batch,
                 tokens,
                 prefix,
                 seq_imbalance_correction_scale,
                 ContextOpFilter::All,
-                |op, draft| {
-                    on_op(MixedPass::SharedNonAttention, op, draft.clone());
+                false,
+                None,
+                Some(chunks),
+                |_, op, _, draft| {
+                    let draft = draft.into_owned();
+                    let covered = covered_latency(&draft);
+                    on_op(MixedPass::SharedNonAttention, op, draft.clone(), covered);
                     result = std::mem::take(&mut result).plus(draft);
                 },
             )?;
@@ -3047,23 +3482,28 @@ impl Engine {
                 ..Default::default()
             };
             let mut target = PerformanceResult::zero();
+            let mut target_covered = 0.0;
             let mut draft = PerformanceResult::zero();
-            self.run_generation_phase_with(&rt, DEFAULT_STATIC_STRIDE, |_, op, result| {
-                let component = if matches!(op, Op::FpmForward(_)) {
-                    &mut target
-                } else {
-                    on_op(MixedPass::DecodeAttention, op, result.clone());
-                    &mut draft
-                };
-                *component = std::mem::take(component).plus(result);
-            })?;
+            self.run_generation_phase_with(
+                &rt,
+                DEFAULT_STATIC_STRIDE,
+                |_, op, result, covered| {
+                    let component = if matches!(op, Op::FpmForward(_)) {
+                        target_covered += covered;
+                        &mut target
+                    } else {
+                        on_op(MixedPass::DecodeAttention, op, result.clone(), covered);
+                        &mut draft
+                    };
+                    *component = std::mem::take(component).plus(result);
+                },
+            )?;
             if ctx_tokens > 0 {
                 // Use the equivalent-AR query's same batch and KV coordinates
                 // so the current per-curve coverage policy chooses the same rows.
-                let baseline_batch = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
                 let baseline_kv = gen_tokens as f64 * (rt.isl as f64 + 1.0);
                 let baseline =
-                    decode_op.query_pass_baseline(&self.db, baseline_batch, baseline_kv)?;
+                    decode_op.query_pass_baseline(&self.db, decode_query_tokens, baseline_kv)?;
                 target.latency_ms = (target.latency_ms - baseline.latency_ms).max(0.0);
                 target.energy_wms = if price_target_energy {
                     fpm_marginal_energy(target.latency_ms, target.energy_wms, baseline.energy_wms)
@@ -3073,10 +3513,17 @@ impl Engine {
             }
             // Draft work has no twin in the prefill pass and must survive
             // even when the target's marginal cost clamps to zero.
+            // A zeroed marginal energy covers nothing.
+            let target_covered = if target.energy_wms > 0.0 {
+                target_covered
+            } else {
+                0.0
+            };
             on_op(
                 MixedPass::DecodeAttention,
                 &self.generation_ops[0],
                 target.clone(),
+                target_covered,
             );
             marginal_decode = target.plus(draft);
         }
@@ -3257,21 +3704,21 @@ impl Engine {
         let mut context = PerOpFold::for_plan("context", &self.context_plan);
         let mut generation = PerOpFold::for_plan("generation", &self.generation_plan);
         let (mut context_covered_ms, mut generation_covered_ms) = (0.0_f64, 0.0_f64);
-        self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, op, r| {
-            // Decide coverage per result, before the name fold below.
-            let covered_ms = if r.energy_wms > 0.0 {
-                r.latency_ms
-            } else {
-                0.0
-            };
-            if is_context {
-                context_covered_ms += covered_ms;
-                context.add_slot(slot, op, r)
-            } else {
-                generation_covered_ms += covered_ms;
-                generation.add_slot(slot, op, r)
-            }
-        })?;
+        self.run_static_per_op_with(
+            runtime,
+            mode,
+            stride,
+            |is_context, slot, op, r, covered_ms| {
+                // Coverage is decided per query, before the name fold below.
+                if is_context {
+                    context_covered_ms += covered_ms;
+                    context.add_slot(slot, op, r)
+                } else {
+                    generation_covered_ms += covered_ms;
+                    generation.add_slot(slot, op, r)
+                }
+            },
+        )?;
         Ok((
             context.into_values(),
             generation.into_values(),
@@ -3299,23 +3746,27 @@ impl Engine {
             &self.generation_plan
         };
         let mut fold = PerOpSlotFold::for_plan(plan);
-        self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, _, r| {
+        self.run_static_per_op_with(runtime, mode, stride, |is_context, slot, _, r, covered| {
             if is_context == context {
-                fold.add(slot, r);
+                // A decode row is already folded per step: keep its per-query coverage.
+                fold.add_value(
+                    slot,
+                    (r.latency_ms, r.energy_wms, covered, r.source.as_str()),
+                );
             }
         })?;
         Ok((plan.slot_names(), fold.into_values(plan)?))
     }
 
     /// The static per-op walk: `on_op` observes whether each op is a context
-    /// op, its name slot and its result, in [`Self::run_static_per_op`] fold
-    /// order.
+    /// op, its name slot, its result and that result's power-covered latency,
+    /// in [`Self::run_static_per_op`] fold order.
     fn run_static_per_op_with(
         &self,
         runtime: &RuntimeConfig,
         mode: StaticMode,
         stride: u32,
-        mut on_op: impl FnMut(bool, usize, &Op, PerformanceResult),
+        mut on_op: impl FnMut(bool, usize, &Op, PerformanceResult, f64),
     ) -> Result<(), AicError> {
         self.reject_full_round_surface("per-operation static phases")?;
         if matches!(mode, StaticMode::Context | StaticMode::Both) {
@@ -3336,12 +3787,19 @@ impl Engine {
                 runtime.prefix,
                 runtime.seq_imbalance_correction_scale,
                 ContextOpFilter::All,
-                |index, op, r| on_op(true, self.context_plan.name_slot(index), op, r.into_owned()),
+                false,
+                None,
+                None,
+                |index, op, _, r| {
+                    let r = r.into_owned();
+                    let covered = covered_latency(&r);
+                    on_op(true, self.context_plan.name_slot(index), op, r, covered)
+                },
             )?;
         }
         if matches!(mode, StaticMode::Generation | StaticMode::Both) {
-            self.run_generation_phase_with(runtime, stride, |slot, op, r| {
-                on_op(false, slot, op, r)
+            self.run_generation_phase_with(runtime, stride, |slot, op, r, covered| {
+                on_op(false, slot, op, r, covered)
             })?;
         }
         Ok(())
@@ -3362,7 +3820,7 @@ impl Engine {
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
     ) -> Result<(Vec<PerOpValue>, Vec<PerOpValue>, Vec<PerOpValue>), AicError> {
-        let ((shared, context_attention, decode_attention), _) = self
+        let (shared, context_attention, decode_attention, _, _) = self
             .mixed_step_breakdown_per_op_impl(
                 ctx_tokens,
                 gen_tokens,
@@ -3391,7 +3849,7 @@ impl Engine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> Result<(MixedStepPerOpValuesWithMetadata, Option<f64>), AicError> {
+    ) -> Result<MixedStepPerOpValuesWithMetadata, AicError> {
         self.mixed_step_breakdown_per_op_impl(
             ctx_tokens,
             gen_tokens,
@@ -3413,7 +3871,7 @@ impl Engine {
         prefix: u32,
         seq_imbalance_correction_scale: f64,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> Result<(MixedStepPerOpValuesWithMetadata, Option<f64>), AicError> {
+    ) -> Result<MixedStepPerOpValuesWithMetadata, AicError> {
         self.reject_full_round_surface("per-operation mixed steps")?;
         // Preserve the FPM component contract while reporting the actual target
         // and draft operations independently. The same execution path supplies
@@ -3421,9 +3879,7 @@ impl Engine {
         if let Some((prefill_op, decode_op, ctx_tail, _gen_tail)) = self.fpm_split() {
             let mut shared = PerOpFold::new("context");
             let mut dec_attn = PerOpFold::new("generation");
-            let new_tokens = isl.max(1).saturating_sub(prefix);
-            let chunked = ctx_tokens > 0 && ctx_tokens < new_tokens;
-            let mut covered_prefill_ms = 0.0;
+            let (mut shared_covered, mut dec_covered) = (0.0, 0.0);
             self.fpm_mixed_step_components(
                 prefill_op,
                 decode_op,
@@ -3435,21 +3891,22 @@ impl Engine {
                 prefix,
                 seq_imbalance_correction_scale,
                 gen_seq_imbalance_correction_scale,
-                |pass, op, result| match pass {
-                    MixedPass::SharedNonAttention => {
-                        // A powered chunk does not cover other chunks folded into the same row.
-                        if chunked && result.energy_wms > 0.0 {
-                            covered_prefill_ms += result.latency_ms;
+                |pass, op, result, covered_ms| {
+                    let (fold, covered) = match pass {
+                        MixedPass::SharedNonAttention => (&mut shared, &mut shared_covered),
+                        MixedPass::DecodeAttention => (&mut dec_attn, &mut dec_covered),
+                        MixedPass::ContextAttention => {
+                            unreachable!("FPM uses the prefill component")
                         }
-                        shared.add(op, result);
-                    }
-                    MixedPass::DecodeAttention => dec_attn.add(op, result),
-                    MixedPass::ContextAttention => unreachable!("FPM uses the prefill component"),
+                    };
+                    // Decided per query, before any name fold.
+                    *covered += covered_ms;
+                    fold.add(op, result);
                 },
             )?;
             let mut shared = shared.into_values();
-            let decode = dec_attn.into_values();
-            let covered_latency_ms = if chunked {
+            let new_tokens = isl.max(1).saturating_sub(prefix);
+            if ctx_tokens > 0 && ctx_tokens < new_tokens {
                 // Fold each name before the same single division used by the
                 // scalar chunked-prefill path.
                 let chunks = new_tokens.div_ceil(ctx_tokens) as f64;
@@ -3457,20 +3914,28 @@ impl Engine {
                     row.1 /= chunks;
                     row.2 /= chunks;
                 }
-                let covered_decode_ms: f64 = decode
-                    .iter()
-                    .filter(|row| row.2 > 0.0)
-                    .map(|row| row.1)
-                    .sum();
-                Some(covered_prefill_ms / chunks + covered_decode_ms)
-            } else {
-                None
-            };
-            return Ok(((shared, Vec::new(), decode), covered_latency_ms));
+                shared_covered /= chunks;
+            }
+            return Ok((
+                shared,
+                Vec::new(),
+                dec_attn.into_values(),
+                shared_covered + dec_covered,
+                dec_covered,
+            ));
         }
         let mut shared = PerOpFold::new("context");
         let mut ctx_attn = PerOpFold::new("context");
         let mut dec_attn = PerOpFold::new("generation");
+        // Qualified Mamba prices this step's own chunks, so it is not amortized.
+        let mamba: HashSet<&str> = self
+            .context_ops
+            .iter()
+            .filter(|op| op.is_qualified_mamba())
+            .map(Op::name)
+            .collect();
+        // Covered latency: unamortized, then context rows the scale divides.
+        let (mut covered, mut amortized_covered, mut decode_covered) = (0.0, 0.0, 0.0);
         self.mixed_step_breakdown_with(
             ctx_tokens,
             gen_tokens,
@@ -3480,11 +3945,19 @@ impl Engine {
             seq_imbalance_correction_scale,
             gen_seq_imbalance_correction_scale,
             |pass, op, r| {
-                let out = match pass {
-                    MixedPass::SharedNonAttention => &mut shared,
-                    MixedPass::ContextAttention => &mut ctx_attn,
-                    MixedPass::DecodeAttention => &mut dec_attn,
+                let (out, sum) = match pass {
+                    MixedPass::SharedNonAttention => (&mut shared, &mut covered),
+                    MixedPass::ContextAttention if !mamba.contains(op.name()) => {
+                        (&mut ctx_attn, &mut amortized_covered)
+                    }
+                    MixedPass::ContextAttention => (&mut ctx_attn, &mut covered),
+                    MixedPass::DecodeAttention => (&mut dec_attn, &mut covered),
                 };
+                let query_covered = covered_latency(&r);
+                *sum += query_covered;
+                if matches!(pass, MixedPass::DecodeAttention) {
+                    decode_covered += query_covered;
+                }
                 out.add(op, r);
             },
         )?;
@@ -3494,14 +3967,21 @@ impl Engine {
             // division (`base_backend.py:1244-1246`): one `/ scale2` per
             // folded name, never a per-entry reciprocal multiply.
             let scale2 = isl.max(1).div_ceil(ctx_tokens) as f64;
-            for entry in &mut ctx_attn {
+            amortized_covered /= scale2;
+            for entry in ctx_attn
+                .iter_mut()
+                .filter(|e| !mamba.contains(e.0.as_str()))
+            {
                 entry.1 /= scale2;
                 entry.2 /= scale2;
             }
         }
         Ok((
-            (shared.into_values(), ctx_attn, dec_attn.into_values()),
-            None,
+            shared.into_values(),
+            ctx_attn,
+            dec_attn.into_values(),
+            covered + amortized_covered,
+            decode_covered,
         ))
     }
 
@@ -3514,7 +3994,7 @@ impl Engine {
         gen_seq_imbalance_correction_scale: f64,
     ) -> Result<Vec<PerOpValue>, AicError> {
         self.decode_step_per_op_impl(gen_tokens, isl, osl, gen_seq_imbalance_correction_scale)
-            .map(strip_per_op_metadata)
+            .map(|(entries, _)| strip_per_op_metadata(entries))
     }
 
     /// Metadata-bearing counterpart used only by the private PyO3 provenance
@@ -3525,7 +4005,7 @@ impl Engine {
         isl: u32,
         osl: u32,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> Result<Vec<PerOpValueWithMetadata>, AicError> {
+    ) -> Result<(Vec<PerOpValueWithMetadata>, f64), AicError> {
         self.decode_step_per_op_impl(gen_tokens, isl, osl, gen_seq_imbalance_correction_scale)
     }
 
@@ -3535,14 +4015,15 @@ impl Engine {
         isl: u32,
         osl: u32,
         gen_seq_imbalance_correction_scale: f64,
-    ) -> Result<Vec<PerOpValueWithMetadata>, AicError> {
+    ) -> Result<(Vec<PerOpValueWithMetadata>, f64), AicError> {
         self.check_profile_phase(false)?;
         self.reject_full_round_surface("per-operation decode steps")?;
         let mut out = PerOpFold::new("generation");
+        let mut covered = 0.0;
         if gen_tokens == 0 {
-            return Ok(out.into_values());
+            return Ok((out.into_values(), covered));
         }
-        let effective_batch = gen_tokens.saturating_mul(self.nextn.saturating_add(1));
+        let effective_batch = self.packed_decode_tokens(gen_tokens)?;
         let s = isl.max(1).saturating_add(osl.max(1) / 2).saturating_add(1);
         run_generation_ops_step_beamed_with(
             &self.generation_ops,
@@ -3552,9 +4033,12 @@ impl Engine {
             s,
             gen_seq_imbalance_correction_scale,
             false,
-            |op, r| out.add(op, r),
+            |op, r| {
+                covered += covered_latency(&r);
+                out.add(op, r);
+            },
         )?;
-        Ok(out.into_values())
+        Ok((out.into_values(), covered))
     }
 
     /// Evaluate an index-addressed sublist of the compiled CONTEXT op list at
@@ -3653,6 +4137,7 @@ impl Engine {
             AicError::InvalidEngineConfig(format!("evaluate_ops_json: invalid op list JSON: {e}"))
         })?;
         Self::reject_sd_round_ops(&ops)?;
+        Self::validate_mamba_ops(&ops, (!is_context).then_some(0), true, &mut [false; 2])?;
         let mut out = PerOpFold::new(if is_context { "context" } else { "generation" });
         for op in &ops {
             let r = if is_context {
@@ -3761,6 +4246,7 @@ impl Engine {
             ))
         })?;
         Self::reject_sd_round_ops(&ops)?;
+        Self::validate_mamba_ops(&ops, (!is_context).then_some(0), true, &mut [false; 2])?;
         let sol_db = self.db.sol_full_view();
         let mut out = PerOpSolFold::default();
         for op in &ops {
@@ -3791,6 +4277,11 @@ impl Engine {
         Ok(out.into_values())
     }
 
+    /// Whether observed prefill groups can affect this operation graph.
+    pub(crate) fn uses_prefill_chunks(&self) -> bool {
+        self.mix_plan.qualified_mamba
+    }
+
     /// Compute one forward-pass latency from a list of per-rank FPM entries.
     ///
     /// Re-platformed from the (deleted) `SessionEstimator::forward_pass_time_ms`
@@ -3803,7 +4294,7 @@ impl Engine {
     /// consumes ALREADY-PACKED telemetry: the FPM fields are the observed
     /// per-iteration counts, so the `(nextn + 1)` MTP multiplier is NOT applied
     /// here (it is already baked into the scheduled-decode counts the engine
-    /// emitted). The dispatch reuses the shared [`run_context_ops`] /
+    /// emitted). The dispatch reuses the shared `run_context_ops_planned` /
     /// [`run_generation_ops_step`] / [`get_mix_step_ops`] free fns so this path
     /// and the live engine-step path stay numerically identical.
     pub fn forward_pass_time_ms(
@@ -3847,7 +4338,7 @@ impl Engine {
                 } else {
                     self.rank_latency_ms(
                         metrics,
-                        RankObserver::Diagnostics(&mut evidence),
+                        RankObserver::Diagnostics(&mut evidence, None),
                         coverage.as_deref_mut(),
                     )?
                 };
@@ -3931,6 +4422,11 @@ impl Engine {
         coverage: Option<&mut FpmQueryCoverage>,
     ) -> Result<Arc<RankPricing>, AicError> {
         if coverage.is_some()
+            || metrics
+                .scheduled_requests
+                .prefill_chunks
+                .as_ref()
+                .is_some_and(|groups| groups.len() > 256)
             || (detail == Some(RankDetail::Diagnostics) && self.fpm_split().is_some())
         {
             return self.price_rank(metrics, detail, coverage).map(Arc::new);
@@ -3953,21 +4449,23 @@ impl Engine {
         let whole_model = self.fpm_split().is_some();
         let mut values = None;
         let mut evidence = crate::FpmRankEstimate::default();
+        let mut covered = Vec::new();
         let observer = match detail {
             None => RankObserver::Latency,
-            // A whole-model rank's values are the phase terms of its estimate.
+            // Whole-model values retain main's phase terms; operation graphs
+            // also retain pre-fold coverage for each diagnostic row.
             Some(RankDetail::Values) if !whole_model => RankObserver::Values(&mut values),
-            Some(_) => RankObserver::Diagnostics(&mut evidence),
+            Some(_) => RankObserver::Diagnostics(&mut evidence, Some(&mut covered)),
         };
         let latency_ms = self.rank_latency_ms(metrics, observer, coverage)?;
         let fpm_terms = evidence.terms();
-        let diagnostics = (detail == Some(RankDetail::Diagnostics) && !whole_model)
-            .then_some(evidence.operations);
+        let operation_graph = detail == Some(RankDetail::Diagnostics) && !whole_model;
         Ok(RankPricing {
             latency_ms,
             operations: values,
             fpm_terms,
-            diagnostics,
+            diagnostics: operation_graph.then_some(evidence.operations),
+            diagnostic_covered: operation_graph.then_some(covered),
             derived: OnceLock::new(),
         })
     }
@@ -4001,11 +4499,12 @@ impl Engine {
                 (names, values)
             }
             (_, _, Some(by_name)) => {
-                let (names, values): (Vec<_>, Vec<_>) = by_name
-                    .into_values()
+                let (entries, covered) = by_name.into_values_with_covered();
+                let (names, values): (Vec<_>, Vec<_>) = entries
                     .into_iter()
-                    .map(|(name, latency_ms, energy_wms, source, _)| {
-                        (name, (latency_ms, energy_wms, source))
+                    .zip(covered)
+                    .map(|((name, latency_ms, energy_wms, source, _), covered)| {
+                        (name, (latency_ms, energy_wms, covered, source))
                     })
                     .unzip();
                 (self.shared_names(names), values)
@@ -4025,7 +4524,7 @@ impl Engine {
     /// Dispatch one rank's FPM on its scheduled workload. Literal port of
     /// `SessionEstimator::rank_latency_ms` (520dcfff `session.rs:308`):
     /// prefill+decode -> mix step ([`get_mix_step_ops`]); prefill-only ->
-    /// [`run_context_ops`]; decode-only -> [`run_generation_ops_step`]. The FPM
+    /// `run_context_ops_planned`; decode-only -> [`run_generation_ops_step`]. The FPM
     /// counts pass through unscaled (no `nextn` multiplier — see
     /// [`Self::forward_pass_time_ms`]). With diagnostics, a whole-model FPM
     /// rank records its direct lookups and an operation graph its operations;
@@ -4036,10 +4535,10 @@ impl Engine {
         observer: RankObserver<'_>,
         mut coverage: Option<&mut FpmQueryCoverage>,
     ) -> Result<f64, AicError> {
-        let (mut evidence, values) = match observer {
-            RankObserver::Latency => (None, None),
-            RankObserver::Diagnostics(evidence) => (Some(evidence), None),
-            RankObserver::Values(values) => (None, Some(values)),
+        let (mut evidence, values, diagnostic_covered) = match observer {
+            RankObserver::Latency => (None, None, None),
+            RankObserver::Diagnostics(evidence, covered) => (Some(evidence), None, covered),
+            RankObserver::Values(values) => (None, Some(values), None),
         };
         let sched = &metrics.scheduled_requests;
         // Token-based dispatch, aligned with `IterationFeatures` (fpm/model.rs):
@@ -4162,7 +4661,11 @@ impl Engine {
             self.operation_rank_latency_ms(sched, has_prefill, has_decode, &mut operations)?;
         match (operations, evidence, values) {
             (OperationObserver::Diagnostics(operations), Some(evidence), _) => {
-                evidence.operations = operations.into_operations();
+                let (operations, covered) = operations.into_operations();
+                evidence.operations = operations;
+                if let Some(diagnostic_covered) = diagnostic_covered {
+                    *diagnostic_covered = covered;
+                }
             }
             (OperationObserver::Values(fold), _, Some(values)) => {
                 *values = Some(self.rank_operation_values(fold)?);
@@ -4272,6 +4775,7 @@ impl Engine {
                 sched.sum_prefill_kv_tokens,
                 kv_per_req,
                 n_decode,
+                sched.prefill_chunks.as_deref(),
                 |context, index, op, runtime, result, divisor| {
                     let (phase, slot, query_slot) = if context {
                         let query_slot = self.context_plan.query_slot(index);
@@ -4293,15 +4797,22 @@ impl Engine {
             let n_prefill = sched.num_prefill_requests.max(1);
             let new_tokens_per_req = sched.sum_prefill_tokens / n_prefill;
             let prefix_per_req = sched.sum_prefill_kv_tokens / n_prefill;
+            let any_cached = sched.sum_prefill_kv_tokens > 0;
             total += match &mut *operations {
-                OperationObserver::Latency => run_context_ops(
+                OperationObserver::Latency => run_context_ops_planned(
                     &self.context_ops,
+                    None,
+                    None,
                     &self.db,
                     n_prefill,
                     new_tokens_per_req,
                     prefix_per_req,
                     1.0,
                     ContextOpFilter::All,
+                    any_cached,
+                    Some(sched.sum_prefill_tokens),
+                    sched.prefill_chunks.as_deref(),
+                    |_, _, _, _| {},
                 )?,
                 operations => {
                     // The walk visits every op in order, so names fold by
@@ -4317,20 +4828,15 @@ impl Engine {
                         prefix_per_req,
                         1.0,
                         ContextOpFilter::All,
-                        |index, op, result| {
+                        any_cached,
+                        Some(sched.sum_prefill_tokens),
+                        sched.prefill_chunks.as_deref(),
+                        |index, op, runtime, result| {
                             let slot = Some(self.context_plan.name_slot(index));
                             let query_slot = self.context_plan.query_slot(index);
                             let query_slot = query_slot.map(|slot| (OpList::Context, slot));
-                            operations.add("context", slot, query_slot, op, result, 1.0, || {
-                                context_op_runtime(
-                                    op,
-                                    n_prefill,
-                                    new_tokens_per_req,
-                                    prefix_per_req,
-                                    1.0,
-                                    None,
-                                )
-                            });
+                            operations
+                                .add("context", slot, query_slot, op, result, 1.0, || *runtime);
                         },
                     )?
                 }
@@ -4465,6 +4971,7 @@ pub(crate) mod tests {
     };
     use crate::perfmodel::EngineConfig;
     use crate::perfmodel::engine::spec::EngineSpec;
+    use crate::session::run_context_ops_with;
     use crate::{BackendKind, ParallelMapping, QuantizationConfig};
 
     fn systems_root() -> PathBuf {
@@ -4665,6 +5172,45 @@ pub(crate) mod tests {
         assert!(vision_ms(&tp, 0, 16) == 0.0);
     }
 
+    #[test]
+    fn vision_mamba_lists_require_context_phase() {
+        let db = build_engine(None).db;
+        for list in ["patch", "transformer", "output"] {
+            for prefill in [false, true] {
+                let mut spec = EngineSpec::new(
+                    fixture_engine_config(Some(3)),
+                    context_ops(),
+                    generation_ops(),
+                );
+                let mut vision = VisionSpec {
+                    encoder_parallel: EncoderParallel::Tp,
+                    patch_ops: vec![],
+                    transformer_ops: vec![],
+                    output_ops: vec![],
+                };
+                let ops = match list {
+                    "patch" => &mut vision.patch_ops,
+                    "transformer" => &mut vision.transformer_ops,
+                    "output" => &mut vision.output_ops,
+                    _ => unreachable!(),
+                };
+                ops.push(qualified_mamba(prefill, if prefill { 1 } else { 4 }));
+                spec.vision = Some(vision);
+                let result = Engine::build(spec, Arc::clone(&db));
+                if prefill {
+                    // Accepted context scans must reach the vision consumer.
+                    assert!(vision_ms(&result.unwrap(), 1, 16) > 0.0, "{list}");
+                } else {
+                    assert!(
+                        matches!(&result, Err(AicError::InvalidEngineConfig(message))
+                            if message.contains("does not match its context list")),
+                        "{list}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Build an `Engine` from the hand-built op lists over the real fixture DB.
     fn build_engine(nextn: Option<u32>) -> Engine {
         // Match SILICON's shared-layer default and honor the declared reuse
@@ -4685,6 +5231,1442 @@ pub(crate) mod tests {
             generation_ops(),
         );
         Engine::build(spec, Arc::new(db)).unwrap()
+    }
+
+    /// FP16 Mamba2 op with a 1 MiB state; decode verifies four tokens (MTP3).
+    pub(crate) fn qualified_mamba(prefill: bool, token_width: u32) -> Op {
+        Op::Mamba2(crate::operators::Mamba2Op {
+            name: if prefill {
+                "context_ssm"
+            } else {
+                "generation_ssm"
+            }
+            .into(),
+            scale_factor: 1.0,
+            kernel_source: if prefill {
+                "mamba_chunk_scan_combined"
+            } else {
+                "selective_state_update_flashinfer"
+            }
+            .into(),
+            phase: if prefill { "context" } else { "generation" }.into(),
+            d_model: 4096,
+            d_state: 128,
+            d_conv: 4,
+            nheads: 64,
+            head_dim: 64,
+            n_groups: 4,
+            chunk_size: 128,
+            state_dtype: "bfloat16".into(),
+            token_width,
+        })
+    }
+
+    /// An engine whose only operations are a qualified context and
+    /// generation Mamba pair at MTP `nextn`.
+    /// A qualified Mamba engine over `db`, as [`qualified_mamba_engine`].
+    pub(crate) fn qualified_mamba_engine_over(db: PerfDatabase, nextn: u32) -> Engine {
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(Some(nextn)),
+            vec![qualified_mamba(true, 1)],
+            vec![qualified_mamba(false, nextn + 1)],
+        );
+        spec.engine.database_mode = db.database_mode;
+        Engine::build(spec, Arc::new(db)).unwrap()
+    }
+
+    /// Synthetic measured rows deliberately distinguish observed chunk groups
+    /// from their balanced mean. Latencies are fixture inputs, not predictions.
+    pub(crate) fn measured_mamba_engine() -> (Engine, tempfile::TempDir) {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().unwrap();
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).unwrap();
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["mamba_chunk_scan_combined"; 5]),
+                Col::Str("phase", vec!["context"; 5]),
+                Col::I64("batch_size", vec![1, 1, 1, 2, 1]),
+                Col::I64("seq_len", vec![500, 750, 1000, 750, 16]),
+                Col::I64("d_model", vec![4096; 5]),
+                Col::I64("d_state", vec![128; 5]),
+                Col::I64("d_conv", vec![4; 5]),
+                Col::I64("nheads", vec![64; 5]),
+                Col::I64("head_dim", vec![64; 5]),
+                Col::I64("n_groups", vec![4; 5]),
+                Col::I64("chunk_size", vec![128; 5]),
+                Col::F64("latency", vec![2.0, 7.0, 3.0, 11.0, 5.0]),
+            ],
+        );
+        let mut db = PerfDatabase::load(root.path(), "testsys", "test", "1.0").unwrap();
+        db.database_mode = DatabaseMode::Hybrid;
+        // State-space tables load lazily; keep their root alive for queries.
+        (qualified_mamba_engine_over(db, 3), root)
+    }
+
+    #[test]
+    fn qualified_mamba_uses_exact_prefill_groups_and_keys_the_rank_memo() {
+        let (engine, _root) = measured_mamba_engine();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let metrics = |groups, cached| ForwardPassMetrics {
+            scheduled_requests: crate::ScheduledRequestMetrics {
+                num_prefill_requests: 2,
+                sum_prefill_tokens: if cached { 32 } else { 1500 },
+                sum_prefill_kv_tokens: if cached { 64 } else { 0 },
+                prefill_chunks: Some(groups),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ragged = metrics(vec![[1, 500, 0], [1, 1000, 0]], false);
+        let balanced = metrics(vec![[2, 750, 0]], false);
+        // One measured batch-two row is 11 ms. Two identical groups describe
+        // that same batch, not two separate batch-one launches (7 + 7 ms).
+        let split = metrics(vec![[1, 750, 0], [1, 750, 0]], false);
+        for decode in [0, 8] {
+            for capture in [false, true] {
+                let estimate = |input: &ForwardPassMetrics| {
+                    let mut input = input.clone();
+                    input.scheduled_requests.num_decode_requests = decode;
+                    input.scheduled_requests.sum_decode_kv_tokens = decode * 16;
+                    engine
+                        .forward_pass_estimate(&[input], capture, None)
+                        .unwrap()
+                };
+                let grouped = estimate(&balanced);
+                let split = estimate(&split);
+                assert_eq!(grouped.latency_ms, split.latency_ms);
+                assert_eq!(
+                    serde_json::to_value(&grouped.ranks).unwrap(),
+                    serde_json::to_value(&split.ranks).unwrap()
+                );
+                if decode == 0 {
+                    assert!(close(split.latency_ms.unwrap(), 11.0));
+                }
+            }
+        }
+        // Same totals, different actual measured rows: 2 + 3 versus 11 ms.
+        for capture in [false, true] {
+            for (input, expected) in [(&ragged, 5.0), (&balanced, 11.0), (&ragged, 5.0)] {
+                let got = engine
+                    .forward_pass_estimate(&[input.clone()], capture, None)
+                    .unwrap();
+                assert!(close(got.latency_ms.unwrap(), expected));
+            }
+        }
+        let mut totals_only = balanced.clone();
+        totals_only.scheduled_requests.prefill_chunks = None;
+        assert!(close(
+            engine.forward_pass_time_ms(&[totals_only]).unwrap(),
+            11.0
+        ));
+        let warm_bytes = 16.0 * 18_560.0 + 2.0 * 1_048_576.0;
+        let warm_ms = warm_bytes / 7.7e12 * 1000.0;
+        let cold_warm = metrics(vec![[1, 16, 0], [1, 16, 64]], true);
+        for decode in [0, 8] {
+            let mut input = cold_warm.clone();
+            input.scheduled_requests.num_decode_requests = decode;
+            input.scheduled_requests.sum_decode_kv_tokens = decode * 16;
+            let detail = engine.forward_pass_estimate(&[input], true, None).unwrap();
+            let scan = detail.ranks[0]
+                .operations
+                .iter()
+                .find(|op| op.name == "context_ssm")
+                .unwrap();
+            assert!(close(scan.latency_ms, 5.0 + warm_ms));
+        }
+        let mut seen = Vec::new();
+        crate::session::get_mix_step_ops(
+            &engine.context_ops,
+            &engine.generation_ops,
+            None,
+            None,
+            None,
+            &engine.db,
+            32,
+            8,
+            16,
+            2,
+            32,
+            64,
+            16,
+            8,
+            cold_warm.scheduled_requests.prefill_chunks.as_deref(),
+            |context, _, _, runtime, result, _| {
+                if context {
+                    seen.push((runtime.prefix, result.source));
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (0, crate::operators::base::Source::Silicon),
+                (64, crate::operators::base::Source::Sol)
+            ]
+        );
+        let mut invalid = ragged;
+        invalid.scheduled_requests.prefill_chunks.as_mut().unwrap()[0][1] = 499;
+        assert!(
+            engine
+                .forward_pass_time_ms(&[invalid])
+                .unwrap_err()
+                .to_string()
+                .contains("prefill_chunks must match")
+        );
+    }
+
+    pub(crate) fn qualified_mamba_engine(nextn: u32) -> Engine {
+        let spec = EngineSpec::new(
+            fixture_engine_config(Some(nextn)),
+            vec![qualified_mamba(true, 1)],
+            vec![qualified_mamba(false, nextn + 1)],
+        );
+        Engine::build(spec, build_engine(None).db).unwrap()
+    }
+
+    #[test]
+    fn packed_mixed_step_rejects_token_sum_overflow() {
+        let engine = qualified_mamba_engine(0);
+        let metrics = |tokens| ForwardPassMetrics {
+            scheduled_requests: crate::ScheduledRequestMetrics {
+                num_prefill_requests: 1,
+                sum_prefill_tokens: tokens,
+                prefill_chunks: Some(vec![[1, tokens, 0]]),
+                num_decode_requests: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Each field and exact group is valid, but their combined token-major
+        // query is 2^32 + 1, which cannot be represented by RuntimeContext.
+        let invalid = metrics(0xffff_fffd);
+        crate::validate_forward_pass_metrics(&invalid).unwrap();
+        assert!(matches!(
+            engine.forward_pass_time_ms(&[invalid]),
+            Err(AicError::InvalidEngineConfig(message))
+                if message.contains("overflow the u32 mixed-step token count")
+        ));
+        assert!(
+            engine
+                .forward_pass_time_ms(&[metrics(u32::MAX - 4)])
+                .unwrap()
+                .is_finite()
+        );
+    }
+
+    #[test]
+    fn mixed_exact_prefill_rejects_zero_tokens_on_both_sides_of_the_mean_guard() {
+        let engine = qualified_mamba_engine(0);
+        for ctx_tokens in [1, 2] {
+            let error = crate::session::get_mix_step_ops(
+                &engine.context_ops,
+                &engine.generation_ops,
+                None,
+                None,
+                None,
+                &engine.db,
+                ctx_tokens,
+                1,
+                1,
+                2,
+                0,
+                0,
+                64,
+                1,
+                Some(&[[1, 0, 0], [1, ctx_tokens, 0]]),
+                |_, _, _, _, _, _| {},
+            )
+            .unwrap_err();
+            assert!(matches!(error, AicError::InvalidEngineConfig(_)));
+        }
+    }
+
+    #[test]
+    fn qualified_mamba_balanced_groups_handle_u32_boundary() {
+        let engine = qualified_mamba_engine(0);
+        for (tokens, requests, expected) in [
+            (u32::MAX, 1, vec![(1, u32::MAX)]),
+            (5, 2, vec![(1, 2), (1, 3)]),
+        ] {
+            let mut shapes = Vec::new();
+            let ms = crate::session::get_mix_step_ops(
+                &engine.context_ops,
+                &[],
+                None,
+                None,
+                None,
+                &engine.db,
+                tokens,
+                0,
+                tokens / requests,
+                requests,
+                0,
+                0,
+                0,
+                0,
+                None,
+                |_, _, _, runtime, _, _| shapes.push((runtime.batch_size, runtime.s)),
+            )
+            .unwrap();
+            assert!(ms.is_finite() && ms > 0.0);
+            assert_eq!(shapes, expected);
+        }
+    }
+
+    #[test]
+    fn qualified_mamba_static_generation_rejects_beams() {
+        let db = build_engine(None).db;
+        for (dtype, width) in [
+            ("float16", 1),
+            ("bfloat16", 1),
+            ("float32", 4),
+            ("unrecorded", 1),
+        ] {
+            let Op::Mamba2(mut scan) = qualified_mamba(false, width) else {
+                unreachable!()
+            };
+            scan.state_dtype = dtype.into();
+            let op = Op::Mamba2(scan);
+            let engine = Engine::build(
+                EngineSpec::new(
+                    fixture_engine_config(Some(width - 1)),
+                    vec![],
+                    vec![op.clone()],
+                ),
+                Arc::clone(&db),
+            )
+            .unwrap();
+            for beam_width in [1, 2] {
+                let rt = RuntimeConfig {
+                    batch_size: 2,
+                    isl: 64,
+                    osl: 2,
+                    beam_width,
+                    ..Default::default()
+                };
+                // Both the direct operation boundary and the static trajectory
+                // must reject unmodeled beam expansion. No FPM profile is set.
+                let direct = op.query(
+                    &db,
+                    &RuntimeContext {
+                        batch_size: 2 * width,
+                        beam_width,
+                        s: 65,
+                        ..Default::default()
+                    },
+                );
+                let trajectory = engine.run_static(&rt, StaticMode::Generation, 1);
+                if dtype == "unrecorded" || beam_width == 1 {
+                    assert!(direct.is_ok(), "{dtype}, width {width}: {direct:?}");
+                    assert!(trajectory.is_ok(), "{dtype}, width {width}: {trajectory:?}");
+                } else {
+                    for result in [direct.map(drop), trajectory.map(drop)] {
+                        assert!(
+                            matches!(&result, Err(AicError::InvalidEngineConfig(m))
+                                if m.contains("qualified generation requires beam_width 1, got 2")),
+                            "{dtype}, width {width}: {result:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_mamba_rejects_packed_decode_counts_beyond_u32() {
+        // Two requests of width u32::MAX would saturate to one request's width,
+        // which qualified Mamba would divide back into a single request. A graph
+        // may qualify generation Mamba alone, so check both layouts.
+        let generation_only = |nextn: u32| {
+            let spec = EngineSpec::new(
+                fixture_engine_config(Some(nextn)),
+                vec![],
+                vec![qualified_mamba(false, nextn + 1)],
+            );
+            Engine::build(spec, build_engine(None).db).unwrap()
+        };
+        let rt = RuntimeConfig {
+            batch_size: 2,
+            isl: 64,
+            osl: 4,
+            ..Default::default()
+        };
+        let decode_paths = |engine: &Engine| {
+            [
+                engine
+                    .mixed_step_breakdown(0, 2, 64, 2, 0, 1.0, 1.0)
+                    .map(drop),
+                engine.decode_step_latency(2, 64, 2, 1.0).map(drop),
+                engine.decode_step_per_op(2, 64, 2, 1.0).map(drop),
+                engine.run_generation_phase(&rt, 1).map(drop),
+            ]
+        };
+        let both = qualified_mamba_engine(u32::MAX - 1);
+        let with_prefill = both
+            .mixed_step_breakdown(64, 2, 64, 2, 0, 1.0, 1.0)
+            .map(drop);
+        for (engine, extra) in [
+            (&both, Some(with_prefill)),
+            (&generation_only(u32::MAX - 1), None),
+        ] {
+            for result in decode_paths(engine).into_iter().chain(extra) {
+                assert!(
+                    matches!(&result, Err(AicError::InvalidEngineConfig(m)) if m.contains("overflow")),
+                    "{result:?}"
+                );
+            }
+        }
+        // An empty decode trajectory packs nothing and stays zero.
+        let empty = RuntimeConfig {
+            batch_size: 2,
+            isl: 64,
+            osl: 1,
+            ..Default::default()
+        };
+        assert_eq!(both.run_generation_phase(&empty, 1).unwrap(), 0.0);
+        // Cached prefill leaves room for a wide decode: 4096 tokens with a
+        // 4000-token prefix add 96 new tokens, while the raw 4096 would overflow.
+        let near = qualified_mamba_engine(u32::MAX - 1001);
+        assert!(
+            near.mixed_step_breakdown(4096, 1, 4096, 2, 4000, 1.0, 1.0)
+                .is_ok()
+        );
+        let full = qualified_mamba_engine(u32::MAX - 11);
+        let result = full.mixed_step_breakdown(4096, 1, 4096, 2, 4000, 1.0, 1.0);
+        assert!(
+            matches!(&result, Err(AicError::InvalidEngineConfig(m)) if m.contains("overflow")),
+            "{result:?}"
+        );
+        // Two width-four requests stay representable.
+        for engine in [qualified_mamba_engine(3), generation_only(3)] {
+            for result in decode_paths(&engine) {
+                assert!(result.is_ok(), "{result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn generation_only_qualified_mamba_rejects_shared_token_overflow() {
+        let engine = qualified_mamba_engine(3);
+        let spec = EngineSpec::new(
+            fixture_engine_config(Some(3)),
+            vec![Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
+            vec![qualified_mamba(false, 4)],
+        );
+        let engine = Engine::build(spec, engine.db.clone()).unwrap();
+        let requests = u32::MAX / 4;
+        // Packed decode fits at 4_294_967_292, but eight more prefill
+        // positions do not. Three positions reach the exact boundary.
+        assert!(
+            engine
+                .mixed_step_breakdown(3, requests, 8, 2, 0, 1.0, 1.0)
+                .is_ok()
+        );
+        let result = engine.mixed_step_breakdown(8, requests, 8, 2, 0, 1.0, 1.0);
+        assert!(matches!(result, Err(AicError::InvalidEngineConfig(m)) if m.contains("overflow")));
+    }
+
+    #[test]
+    fn padded_prefill_keeps_nondivisible_token_major_positions() {
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
+        db.database_mode = DatabaseMode::Sol;
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(None),
+            vec![
+                qualified_mamba(true, 1),
+                Op::Elementwise(ElementwiseOp::new("norm", 2.0)),
+            ],
+            vec![qualified_mamba(false, 1)],
+        );
+        spec.engine.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        let ms = |bytes: f64| bytes / engine.db.system_spec.gpu.mem_bw * 1000.0;
+        for decodes in [0, 1] {
+            let input = ForwardPassMetrics {
+                scheduled_requests: crate::ScheduledRequestMetrics {
+                    num_prefill_requests: 2,
+                    sum_prefill_tokens: 23,
+                    sum_prefill_padding_tokens: 6,
+                    prefill_chunks: Some(vec![[1, 8, 0], [1, 9, 0]]),
+                    num_decode_requests: decodes,
+                    sum_decode_kv_tokens: decodes * 16,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // The scan processes 17 real prompt tokens and reads+writes two
+            // 1 MiB states. Norm touches every scheduled position (23, not
+            // floor(23/2)*2 = 22), plus a token for the optional decode rider.
+            let prefill_bytes = 17.0 * 18_560.0 + 2.0 * 2_097_152.0;
+            let decode_bytes = f64::from(decodes) * (18_560.0 + 2_097_152.0);
+            let norm_bytes = f64::from(23 + decodes) * 2.0;
+            let expected = ms(prefill_bytes + decode_bytes + norm_bytes);
+            let scalar = engine.forward_pass_time_ms(&[input.clone()]).unwrap();
+            assert!((scalar - expected).abs() < 1e-12, "decodes={decodes}");
+            let detail = engine.forward_pass_estimate(&[input], true, None).unwrap();
+            assert_eq!(detail.latency_ms.unwrap(), scalar);
+            let rows = &detail.ranks[0].operations;
+            let norm = rows.iter().find(|op| op.name == "norm").unwrap();
+            assert!((norm.latency_ms - ms(norm_bytes)).abs() < 1e-12);
+            let scan = rows.iter().find(|op| op.name == "context_ssm").unwrap();
+            assert!((scan.latency_ms - ms(prefill_bytes)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn qualified_mamba_exact_totals_preserve_new_tokens() {
+        let mut scan = qualified_mamba(true, 1);
+        if let Op::Mamba2(m) = &mut scan {
+            // FP16 has no measured BF16 scan row, so cold and cached queries
+            // both take SOL and the independent byte count below applies.
+            m.state_dtype = "float16".into();
+        }
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(None),
+            vec![scan, Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
+            vec![],
+        );
+        spec.engine.database_mode = DatabaseMode::Sol;
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
+        db.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        for (tokens, cached, scan_queries) in
+            [(17, 1, 2), (17, 0, 2), (16, 1, 1), (16, 0, 1), (17, 4, 2)]
+        {
+            // Two requests read and write two 1 MiB states; 17 new tokens
+            // move 17 * 18,560 activation bytes, split as lengths 8 and 9.
+            // Other ops keep the legacy integer-mean coordinates (18 norm
+            // tokens for 17 new plus 1 cached, otherwise 16 here).
+            let mean_tokens = 2 * ((tokens + cached) / 2 - cached / 2);
+            let bytes =
+                f64::from(tokens) * 18_560.0 + 2.0 * 2_097_152.0 + f64::from(mean_tokens) * 2.0;
+            let expected = bytes / engine.db.system_spec.gpu.mem_bw * 1000.0;
+            let mut seen = 0;
+            let total = engine
+                .run_context_phase_totals_with(2, tokens, cached, None, |op, _| {
+                    seen += usize::from(op.is_qualified_mamba());
+                })
+                .unwrap();
+            assert!(
+                (total - expected).abs() < 1e-12,
+                "tokens={tokens}, cached={cached}"
+            );
+            assert_eq!(seen, scan_queries);
+            assert_eq!(
+                engine
+                    .predict_prefill_latency_total(2, tokens, cached)
+                    .unwrap(),
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_step_shared_ops_follow_qualified_mamba_prefill_chunks() {
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
+        db.database_mode = DatabaseMode::Sol;
+        let db = Arc::new(db);
+        for qualified in [true, false] {
+            let mut scan = qualified_mamba(true, 1);
+            if !qualified && let Op::Mamba2(m) = &mut scan {
+                m.state_dtype = "unrecorded".into();
+            }
+            let mut spec = EngineSpec::new(
+                fixture_engine_config(Some(3)),
+                vec![scan, Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
+                vec![],
+            );
+            spec.engine.database_mode = DatabaseMode::Sol;
+            let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
+            for (ctx, new_tokens) in [
+                (5192, 2192),
+                (5000, 2000),
+                (1096, 1096),
+                (8192, 2192),
+                (0, 0),
+            ] {
+                // Two width-four decode requests add eight shared tokens.
+                // The 5192-token shape schedules two 1096-token cached
+                // suffixes: exactly 2200 norm tokens, never 3008.
+                let norm_tokens = if qualified {
+                    new_tokens + 8
+                } else {
+                    ctx - 3000 * (ctx / 4096) + 8
+                };
+                let expected = f64::from(norm_tokens) * 2.0 / db.system_spec.gpu.mem_bw * 1000.0;
+                let mut norm_ms = 0.0;
+                let parts = engine
+                    .mixed_step_breakdown_with(ctx, 2, 4096, 1, 3000, 1.0, 1.0, |_, op, result| {
+                        if op.name() == "norm" {
+                            norm_ms += result.latency_ms;
+                        }
+                    })
+                    .unwrap();
+                assert!(
+                    (norm_ms - expected).abs() < 1e-12,
+                    "qualified={qualified}, ctx={ctx}"
+                );
+                assert_eq!(parts[0], parts[1] + parts[2] + parts[3]);
+                let (shared, _, _) = engine
+                    .mixed_step_breakdown_per_op(ctx, 2, 4096, 1, 3000, 1.0, 1.0)
+                    .unwrap();
+                assert_eq!(shared.iter().find(|op| op.0 == "norm").unwrap().1, norm_ms);
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_mamba_rejects_overlong_partial_prefill_before_querying_ops() {
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(None),
+            vec![qualified_mamba(true, 1)],
+            vec![],
+        );
+        spec.engine.database_mode = DatabaseMode::Sol;
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
+        db.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        // A 100-token prompt with 60 cached tokens can extend at most 40
+        // tokens. Test both a lone partial request and one after a full prompt.
+        for ctx in [41, 99, 141, 150, 199] {
+            let mut queried = false;
+            let error = engine
+                .mixed_step_breakdown_with(ctx, 1, 100, 2, 60, 1.0, 1.0, |_, _, _| {
+                    queried = true;
+                })
+                .unwrap_err();
+            assert!(matches!(error, AicError::InvalidEngineConfig(_)));
+            assert!(error.to_string().contains("partial prefill extend"));
+            assert!(!queried, "invalid input must fail before executing an op");
+            assert!(
+                engine
+                    .mixed_step_latency(ctx, 1, 100, 2, 60, 1.0, 1.0)
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .mixed_step_breakdown_per_op(ctx, 1, 100, 2, 60, 1.0, 1.0)
+                    .is_err()
+            );
+        }
+        // At or below the suffix boundary the scheduled input remains valid.
+        for ctx in [39, 40, 100, 139, 140, 200] {
+            assert!(
+                engine
+                    .mixed_step_latency(ctx, 1, 100, 2, 60, 1.0, 1.0)
+                    .is_ok()
+            );
+        }
+        // Unqualified graphs retain their legacy partial-extend contract.
+        let legacy = build_engine(None);
+        assert!(
+            legacy
+                .mixed_step_latency(150, 1, 100, 2, 60, 1.0, 1.0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn generation_only_qualified_mamba_bounds_prefill_and_shared_tokens() {
+        let mut spec = EngineSpec::new(
+            fixture_engine_config(Some(3)),
+            vec![Op::Elementwise(ElementwiseOp::new("norm", 2.0))],
+            vec![qualified_mamba(false, 4)],
+        );
+        spec.engine.database_mode = DatabaseMode::Sol;
+        let mut db = Arc::try_unwrap(build_engine(None).db)
+            .unwrap_or_else(|_| panic!("test database is shared"));
+        db.database_mode = DatabaseMode::Sol;
+        let engine = Engine::build(spec.clone(), Arc::new(db)).unwrap();
+        let (shared, _, _) = engine
+            .mixed_step_breakdown_per_op(140, 2, 100, 8, 60, 1.0, 1.0)
+            .unwrap();
+        // One complete 40-token suffix, another 40-token partial extend,
+        // and two width-four decoders: exactly 88 shared positions.
+        let expected = 88.0 * 2.0 / engine.db.system_spec.gpu.mem_bw * 1000.0;
+        assert!((shared[0].1 - expected).abs() < 1e-12);
+        assert!(
+            engine
+                .mixed_step_latency(150, 2, 100, 8, 60, 1.0, 1.0)
+                .unwrap_err()
+                .to_string()
+                .contains("partial prefill extend")
+        );
+        let Op::Mamba2(scan) = &mut spec.generation_ops[0] else {
+            unreachable!()
+        };
+        scan.state_dtype = "unrecorded".into();
+        scan.token_width = 1;
+        let legacy = Engine::build(spec, Arc::clone(&engine.db)).unwrap();
+        assert!(
+            legacy
+                .mixed_step_latency(150, 2, 100, 8, 60, 1.0, 1.0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn physical_vllm_scan_label_is_context_only() {
+        let db = build_engine(None).db;
+        let scan = |prefill| {
+            let mut op = qualified_mamba(prefill, if prefill { 1 } else { 4 });
+            if let Op::Mamba2(m) = &mut op {
+                m.kernel_source = "vllm_mamba_chunk_scan_combined_varlen".into();
+            }
+            op
+        };
+        let context = Engine::build(
+            EngineSpec::new(fixture_engine_config(Some(3)), vec![scan(true)], vec![]),
+            Arc::clone(&db),
+        )
+        .unwrap();
+        assert!(context.predict_prefill_latency_total(2, 16, 1).unwrap() > 0.0);
+        let err = Engine::build(
+            EngineSpec::new(fixture_engine_config(Some(3)), vec![], vec![scan(false)]),
+            db,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("runs in the context phase"), "{err}");
+    }
+
+    #[test]
+    fn qualified_mamba_packed_attention_divisor_handles_large_prefill() {
+        let engine = qualified_mamba_engine(0);
+        for tokens in [16, 2_147_483_649] {
+            for chunks in [None, Some(vec![[1, tokens, 1]])] {
+                let metrics = ForwardPassMetrics {
+                    scheduled_requests: crate::ScheduledRequestMetrics {
+                        num_prefill_requests: 1,
+                        sum_prefill_tokens: tokens,
+                        sum_prefill_kv_tokens: 1,
+                        num_decode_requests: 1,
+                        sum_decode_kv_tokens: 8,
+                        prefill_chunks: chunks,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                // The combined count fits u32, but tokens + tokens - 1 does
+                // not. Even without context attention, its divisor is computed.
+                // Each token transfers 18,560 activation bytes. The prefill
+                // and width-one decode each read and write one 1 MiB state.
+                let bytes = (f64::from(tokens) + 1.0) * 18_560.0 + 4_194_304.0;
+                let expected = bytes / engine.db.system_spec.gpu.mem_bw * 1000.0;
+                let got = engine.forward_pass_time_ms(&[metrics]).unwrap();
+                assert!((got - expected).abs() < expected * 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_mamba_mixed_steps_preserve_prefill_and_decode_shapes() {
+        let mut engine = build_engine(Some(3));
+        engine.context_ops = vec![qualified_mamba(true, 1)];
+        engine.generation_ops = vec![qualified_mamba(false, 4)];
+        engine.context_plan = OpListPlan::new(&engine.context_ops);
+        engine.generation_plan = OpListPlan::new(&engine.generation_ops);
+        engine.mix_plan = MixStepPlan::new(&engine.context_ops, &engine.generation_ops);
+        // Per token 18,560 activation bytes. Each prefill chunk reads and writes
+        // its 1 MiB state; two width-four decodes add 10,634,240 bytes.
+        let ms = |bytes: f64| bytes / engine.db.system_spec.gpu.mem_bw * 1000.0;
+        let close = |got: f64, bytes: f64| (got - ms(bytes)).abs() < 1e-12;
+        let decode_bytes = 10_634_240.0;
+        let packed = |prefill_tokens: u32, prefills: u32, decodes: u32| {
+            engine
+                .forward_pass_time_ms(&[ForwardPassMetrics {
+                    scheduled_requests: crate::ScheduledRequestMetrics {
+                        num_prefill_requests: prefills,
+                        sum_prefill_tokens: prefill_tokens,
+                        num_decode_requests: decodes,
+                        sum_decode_kv_tokens: decodes * 8,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }])
+                .unwrap()
+        };
+        // (ctx, isl, prefix, prefill requests, new tokens): `ceil(ctx/isl)`
+        // requests, as context attention prices them. A partially cached chunk;
+        // a complete cached request plus a partial extend at its 1096 new
+        // tokens; a single complete uncached suffix; two complete requests;
+        // and no prefill.
+        for (ctx, isl, prefix, requests, new_tokens) in [
+            (512, 4096, 1024, 1, 512),
+            (5192, 4096, 3000, 2, 2192),
+            (7168, 4096, 1024, 2, 6144),
+            (1096, 4096, 3000, 1, 1096),
+            (8192, 4096, 3000, 2, 2192),
+            (0, 4096, 1024, 0, 0),
+        ] {
+            let bytes =
+                f64::from(new_tokens) * 18_560.0 + f64::from(requests) * 2_097_152.0 + decode_bytes;
+            let mixed = engine
+                .mixed_step_latency(ctx, 2, isl, 1, prefix, 1.0, 1.0)
+                .unwrap();
+            assert!(close(mixed, bytes), "chunk={ctx}, prefix={prefix}");
+            let (shared, context, decode) = engine
+                .mixed_step_breakdown_per_op(ctx, 2, isl, 1, prefix, 1.0, 1.0)
+                .unwrap();
+            let sum: f64 = shared
+                .iter()
+                .chain(&context)
+                .chain(&decode)
+                .map(|row| row.1)
+                .sum();
+            assert!((sum - mixed).abs() < 1e-12);
+            // The prefill-only scan is context-attention work, never amortized
+            // over chunks; the decode scan is decode-attention work.
+            let prefill_bytes =
+                f64::from(new_tokens) * 18_560.0 + f64::from(requests) * 2_097_152.0;
+            let [_, shared_ms, context_ms, decode_ms] = engine
+                .mixed_step_breakdown(ctx, 2, isl, 1, prefix, 1.0, 1.0)
+                .unwrap();
+            assert_eq!(shared_ms, 0.0);
+            assert!(close(context_ms, prefill_bytes), "chunk={ctx}");
+            assert!(close(decode_ms, decode_bytes));
+            let context_rows: f64 = context.iter().map(|row| row.1).sum();
+            assert!(close(context_rows, prefill_bytes), "chunk={ctx}");
+            assert!(shared.is_empty());
+            // Packed telemetry: two width-four decodes are 8 decode requests.
+            assert!(
+                close(packed(new_tokens, requests, 8), bytes),
+                "telemetry chunk={ctx}"
+            );
+        }
+        // A partial extend as long as a full request joins its batch: 5192 tokens
+        // at isl 4096 and prefix 3000 are one (2, 1096) query, as packed telemetry
+        // prices them. A shorter extend keeps its own query: (1, 1096) + (1, 904).
+        for (ctx, prefix, queries) in [(5192, 3000, 1), (7168, 1024, 1), (5000, 3000, 2)] {
+            let mut seen = 0;
+            engine
+                .mixed_step_breakdown_with(ctx, 2, 4096, 1, prefix, 1.0, 1.0, |pass, _, _| {
+                    seen += usize::from(matches!(pass, MixedPass::ContextAttention));
+                })
+                .unwrap();
+            assert_eq!(seen, queries, "chunk={ctx}, prefix={prefix}");
+        }
+        // Prefill telemetry carries request counts: two prefills of 17 tokens
+        // are two state pairs (9 + 8 tokens), never a third request from the
+        // average. One width-four decode packs as 4.
+        assert!(close(
+            packed(17, 2, 4),
+            17.0 * 18_560.0 + 2.0 * 2_097_152.0 + 5_317_120.0
+        ));
+        assert!(close(packed(16, 1, 0), 16.0 * 18_560.0 + 2_097_152.0));
+        // A pure-prefill step keeps the remainder too: scans of 8 and 9
+        // tokens, never two of 8, in the scalar and the detailed estimate.
+        let pure = ForwardPassMetrics {
+            scheduled_requests: crate::ScheduledRequestMetrics {
+                num_prefill_requests: 2,
+                sum_prefill_tokens: 17,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pure_bytes = 17.0 * 18_560.0 + 2.0 * 2_097_152.0;
+        assert!(close(packed(17, 2, 0), pure_bytes));
+        let estimate = engine.forward_pass_estimate(&[pure], true, None).unwrap();
+        assert!(close(
+            estimate.ranks[0].operations[0].latency_ms,
+            pure_bytes
+        ));
+        // Three prefill requests with two new tokens leave one request without
+        // work: the mixed and pure-prefill packed paths both reject the payload.
+        for decodes in [8, 0] {
+            let short = ForwardPassMetrics {
+                scheduled_requests: crate::ScheduledRequestMetrics {
+                    num_prefill_requests: 3,
+                    sum_prefill_tokens: 2,
+                    num_decode_requests: decodes,
+                    sum_decode_kv_tokens: decodes * 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let err = engine.forward_pass_time_ms(&[short]).unwrap_err();
+            assert!(err.to_string().contains("new token"), "{decodes}: {err}");
+        }
+        assert!(close(
+            engine.decode_step_latency(2, 16, 1, 1.0).unwrap(),
+            decode_bytes
+        ));
+        // Exact totals take packed rows: two width-four requests are 8 rows.
+        assert!(close(
+            engine.predict_decode_latency_total(8, 128).unwrap(),
+            decode_bytes
+        ));
+        assert!(engine.predict_decode_latency_total(2, 32).is_err());
+        // A draft-named Mamba op is priced once.
+        if let Op::Mamba2(op) = &mut engine.context_ops[0] {
+            op.name = "draft_context_ssm".into();
+        }
+        let draft_named = engine
+            .mixed_step_latency(16, 2, 16, 1, 0, 1.0, 1.0)
+            .unwrap();
+        assert!(close(
+            draft_named,
+            16.0 * 18_560.0 + 2_097_152.0 + decode_bytes
+        ));
+        assert!(
+            engine
+                .mixed_step_latency(4096, 2, 4096, 4097, 4097, 1.0, 1.0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn qualified_mamba_rejects_reserved_attention_names() {
+        // The SDK reports these names as amortized context attention; an
+        // ordinary scan name builds and prices the same mixed step.
+        let engine = |scan_name: &str, prefill: bool| {
+            let Op::Mamba2(mut scan) = qualified_mamba(prefill, 1) else {
+                unreachable!()
+            };
+            scan.name = scan_name.into();
+            let norm = Op::Elementwise(ElementwiseOp::new("norm", 2.0));
+            let (context, generation) = if prefill {
+                (
+                    vec![norm, Op::Mamba2(scan)],
+                    vec![qualified_mamba(false, 1)],
+                )
+            } else {
+                (vec![norm, qualified_mamba(true, 1)], vec![Op::Mamba2(scan)])
+            };
+            let spec = EngineSpec::new(fixture_engine_config(None), context, generation);
+            Engine::build(spec, build_engine(None).db)
+        };
+        for name in ["context_attention", "context_attention (scaled)"] {
+            for prefill in [true, false] {
+                let err = engine(name, prefill).unwrap_err();
+                assert!(
+                    matches!(&err, AicError::InvalidEngineConfig(m) if m.contains("reserved attention name")),
+                    "{err}"
+                );
+            }
+        }
+        let mixed = [ForwardPassMetrics {
+            scheduled_requests: crate::ScheduledRequestMetrics {
+                num_prefill_requests: 1,
+                sum_prefill_tokens: 16,
+                num_decode_requests: 2,
+                sum_decode_kv_tokens: 16,
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let plain = engine("context_ssm", true).unwrap();
+        assert!(plain.forward_pass_time_ms(&mixed).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn packed_cached_prefill_never_reaches_mamba_as_cold() {
+        // One cached token over two prefill requests rounds the mean prefix to
+        // zero; a qualified scan must still see a cached prefix.
+        let engine = build_engine(None);
+        let ops = [qualified_mamba(true, 1)];
+        let prefixes = |combined_prefix: u32| {
+            let mut seen = Vec::new();
+            crate::perfmodel::session::get_mix_step_ops(
+                &ops,
+                &[],
+                None,
+                None,
+                None,
+                &engine.db,
+                32,
+                0,
+                16,
+                2,
+                combined_prefix / 2,
+                combined_prefix,
+                0,
+                0,
+                None,
+                |_, _, _, ctx, _, _| seen.push(ctx.prefix),
+            )
+            .unwrap();
+            seen
+        };
+        assert_eq!(prefixes(1), vec![1]);
+        assert_eq!(prefixes(0), vec![0]);
+        assert_eq!(prefixes(64), vec![32]);
+    }
+
+    #[test]
+    fn ad_hoc_op_queries_validate_mamba_fields() {
+        let engine = build_engine(None);
+        let with = |state_dtype: &str, token_width: u32| match qualified_mamba(false, token_width) {
+            Op::Mamba2(mut m) => {
+                m.state_dtype = state_dtype.into();
+                serde_json::to_string(&vec![Op::Mamba2(m)]).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        // A valid qualified op prices. The SOL entry point has no Mamba
+        // decomposition, but it rejects invalid fields first.
+        engine
+            .evaluate_ops_json(&with("float16", 1), false, 2, 16, 0, 1.0, None)
+            .unwrap();
+        for (ops, message) in [
+            (with("fp16", 1), "unsupported state_dtype"),
+            (with("float16", 0), "must be positive"),
+            (with("unrecorded", 4), "unrecorded"),
+        ] {
+            let err = engine
+                .evaluate_ops_json(&ops, false, 2, 16, 0, 1.0, None)
+                .unwrap_err();
+            assert!(err.to_string().contains(message), "{err}");
+            let err = engine
+                .evaluate_ops_sol_json(&ops, false, 2, 16, 0, 1.0, None)
+                .unwrap_err();
+            assert!(err.to_string().contains(message), "{err}");
+        }
+        // Ad-hoc queries run on a model-less engine, so the op's own width
+        // applies: a width-four decode prices whole requests, 8 tokens, never 5.
+        let mtp = build_engine(None);
+        mtp.evaluate_ops_json(&with("float16", 4), false, 8, 16, 0, 1.0, None)
+            .unwrap();
+        let err = mtp
+            .evaluate_ops_json(&with("float16", 4), false, 5, 16, 0, 1.0, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a multiple of token_width 4"), "{err}");
+        // Context queries take only an exact "context" phase.
+        for (phase, message) in [
+            ("generation", "does not match its context list"),
+            ("prefill", "needs phase"),
+        ] {
+            let ops = match qualified_mamba(false, 1) {
+                Op::Mamba2(mut m) => {
+                    m.phase = phase.into();
+                    serde_json::to_string(&vec![Op::Mamba2(m)]).unwrap()
+                }
+                _ => unreachable!(),
+            };
+            for err in [
+                engine
+                    .evaluate_ops_json(&ops, true, 2, 16, 0, 1.0, None)
+                    .unwrap_err(),
+                engine
+                    .evaluate_ops_sol_json(&ops, true, 2, 16, 0, 1.0, None)
+                    .unwrap_err(),
+            ] {
+                let err = err.to_string();
+                assert!(err.contains(message), "{phase}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn packed_pure_prefill_with_any_cached_token_skips_cold_scan_rows() {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        // One cold measured scan row for two 16-token prefills.
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["mamba_chunk_scan_combined"]),
+                Col::Str("phase", vec!["context"]),
+                Col::I64("batch_size", vec![2]),
+                Col::I64("seq_len", vec![16]),
+                Col::I64("d_model", vec![4096]),
+                Col::I64("d_state", vec![128]),
+                Col::I64("d_conv", vec![4]),
+                Col::I64("nheads", vec![64]),
+                Col::I64("head_dim", vec![64]),
+                Col::I64("n_groups", vec![4]),
+                Col::I64("chunk_size", vec![128]),
+                Col::F64("latency", vec![0.5]),
+            ],
+        );
+        let db = Arc::new(PerfDatabase::load(root.path(), "testsys", "test", "1.0").expect("load"));
+        let spec = EngineSpec::new(
+            fixture_engine_config(None),
+            vec![qualified_mamba(true, 1)],
+            vec![],
+        );
+        let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
+        let prefill = |cached: u32| {
+            let metrics = ForwardPassMetrics {
+                scheduled_requests: crate::ScheduledRequestMetrics {
+                    num_prefill_requests: 2,
+                    sum_prefill_tokens: 32,
+                    sum_prefill_kv_tokens: cached,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let scalar = engine.forward_pass_time_ms(&[metrics.clone()]).unwrap();
+            let estimate = engine
+                .forward_pass_estimate(&[metrics], true, None)
+                .unwrap();
+            let op = &estimate.ranks[0].operations[0];
+            assert_eq!(scalar, estimate.latency_ms.unwrap());
+            (scalar, op.source.clone())
+        };
+        assert_eq!(prefill(0), (0.5, "silicon".to_string()));
+        // One cached token over two requests: the mean prefix rounds to zero,
+        // but the scan restores a state. 32 tokens * 18,560 bytes plus two
+        // 1 MiB BF16 states, each read and written once.
+        let (latency, source) = prefill(1);
+        assert_eq!(source, "sol");
+        assert!((latency - 4_788_224.0 / db.system_spec.gpu.mem_bw * 1000.0).abs() < 1e-12);
+        // The exact-total query keeps the same cache signal.
+        assert_eq!(engine.predict_prefill_latency_total(2, 32, 0).unwrap(), 0.5);
+        assert_eq!(
+            engine.predict_prefill_latency_total(2, 32, 1).unwrap(),
+            latency
+        );
+    }
+
+    #[test]
+    fn qualified_mamba_decode_reads_rows_only_at_width_one() {
+        use crate::perf_database::energy_test_fixtures::{
+            Col, write_energy_systems_root, write_parquet,
+        };
+        let root = tempfile::tempdir().expect("tmpdir");
+        write_energy_systems_root(root.path());
+        let data = root.path().join("data/test/1.0");
+        std::fs::create_dir_all(&data).expect("mkdir data");
+        // One measured decode row for two requests at qualified_mamba's shape.
+        write_parquet(
+            &data.join("mamba2_perf.parquet"),
+            &[
+                Col::Str("kernel_source", vec!["selective_state_update_flashinfer"]),
+                Col::Str("phase", vec!["generation"]),
+                Col::I64("batch_size", vec![2]),
+                Col::I64("seq_len", vec![1]),
+                Col::I64("d_model", vec![4096]),
+                Col::I64("d_state", vec![128]),
+                Col::I64("d_conv", vec![4]),
+                Col::I64("nheads", vec![64]),
+                Col::I64("head_dim", vec![64]),
+                Col::I64("n_groups", vec![4]),
+                Col::I64("chunk_size", vec![128]),
+                Col::F64("latency", vec![0.25]),
+            ],
+        );
+        let db = Arc::new(PerfDatabase::load(root.path(), "testsys", "test", "1.0").expect("load"));
+        let ms = |bytes: f64| bytes / db.system_spec.gpu.mem_bw * 1000.0;
+        let decode_only = |nextn: Option<u32>, width: u32, requests: u32, dtype: &str| {
+            let mut op = qualified_mamba(false, width);
+            if let Op::Mamba2(m) = &mut op {
+                m.state_dtype = dtype.into();
+            }
+            let spec = EngineSpec::new(fixture_engine_config(nextn), vec![], vec![op]);
+            let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
+            // Operation-level telemetry packs decode as `requests * width`.
+            let metrics = ForwardPassMetrics {
+                scheduled_requests: crate::ScheduledRequestMetrics {
+                    num_decode_requests: requests * width,
+                    sum_decode_kv_tokens: requests * width * 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let estimate = engine
+                .forward_pass_estimate(&[metrics], true, None)
+                .unwrap();
+            let op = &estimate.ranks[0].operations[0];
+            (
+                estimate.latency_ms.unwrap(),
+                op.latency_ms,
+                op.source.clone(),
+            )
+        };
+        // Width one keeps the measured row.
+        let (total, op_ms, source) = decode_only(None, 1, 2, "bfloat16");
+        assert_eq!((total, op_ms, source.as_str()), (0.25, 0.25, "silicon"));
+        // The BF16 row does not price an FP16 state either: same bytes, no row.
+        let (total, _, source) = decode_only(None, 1, 2, "float16");
+        let bytes = 2.0 * (18_560.0 + 2.0 * 1_048_576.0);
+        assert!((total - ms(bytes)).abs() < 1e-12, "fp16: {total}");
+        assert_eq!(source, "sol");
+        // The 16-bit row does not price an FP32 state: one 2 MiB read and
+        // one 2 MiB write per request.
+        let (total, _, source) = decode_only(None, 1, 2, "float32");
+        let bytes = 2.0 * (18_560.0 + 2.0 * 2_097_152.0);
+        assert!((total - ms(bytes)).abs() < 1e-12, "fp32: {total}");
+        assert_eq!(source, "sol");
+        // Width four verifies four tokens per request: activations for
+        // 4 tokens (18,560 B each) plus one state read and four 1 MiB writes.
+        for requests in [2_u32, 3] {
+            let bytes = f64::from(requests) * (4.0 * 18_560.0 + 5.0 * 1_048_576.0);
+            let (total, op_ms, source) = decode_only(Some(3), 4, requests, "float16");
+            assert!(
+                (total - ms(bytes)).abs() < 1e-12,
+                "{requests} requests: {total}"
+            );
+            assert_eq!((op_ms, source.as_str()), (total, "sol"));
+        }
+        // A mixed step selects the same decode source for the same op.
+        for (nextn, width, source) in [(None, 1, "silicon"), (Some(3), 4, "sol")] {
+            let spec = EngineSpec::new(
+                fixture_engine_config(nextn),
+                vec![qualified_mamba(true, 1)],
+                vec![qualified_mamba(false, width)],
+            );
+            let engine = Engine::build(spec, Arc::clone(&db)).unwrap();
+            let metrics = ForwardPassMetrics {
+                scheduled_requests: crate::ScheduledRequestMetrics {
+                    num_prefill_requests: 1,
+                    sum_prefill_tokens: 16,
+                    num_decode_requests: 2 * width,
+                    sum_decode_kv_tokens: 16 * width,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let estimate = engine
+                .forward_pass_estimate(&[metrics], true, None)
+                .unwrap();
+            let decode = estimate.ranks[0]
+                .operations
+                .iter()
+                .find(|op| op.name == "generation_ssm")
+                .unwrap();
+            assert_eq!(decode.source, source, "width {width}");
+        }
+    }
+
+    #[test]
+    fn mamba_ops_are_validated_at_build() {
+        let db = build_engine(None).db;
+        let build = |nextn: Option<u32>, op: Op| {
+            let mut ops = generation_ops();
+            ops.push(op);
+            Engine::build(
+                EngineSpec::new(fixture_engine_config(nextn), context_ops(), ops),
+                db.clone(),
+            )
+        };
+        let with = |state_dtype: &str, token_width: u32| match qualified_mamba(false, token_width) {
+            Op::Mamba2(mut m) => {
+                m.state_dtype = state_dtype.into();
+                Op::Mamba2(m)
+            }
+            _ => unreachable!(),
+        };
+        // Width one matches a non-speculative engine; MTP3 needs width four.
+        build(None, qualified_mamba(false, 1)).unwrap();
+        build(Some(3), qualified_mamba(false, 4)).unwrap();
+        build(None, with("unrecorded", 1)).unwrap();
+        let nested = Op::Overlap(crate::operators::op::OverlapOp::new(
+            "pair",
+            vec![qualified_mamba(false, 1)],
+            vec![],
+        ));
+        for (nextn, op, message) in [
+            (Some(3), qualified_mamba(false, 1), "token_width 1"),
+            // nextn + 1 overflows: a saturated width must not match u32::MAX.
+            (
+                Some(u32::MAX),
+                qualified_mamba(false, u32::MAX),
+                "fit the u32",
+            ),
+            (None, with("fp16", 1), "unsupported state_dtype"),
+            (None, with("float16", 0), "must be positive"),
+            (None, with("unrecorded", 4), "unrecorded"),
+            (None, nested, "nested"),
+            (
+                None,
+                qualified_mamba(true, 1),
+                "does not match its generation list",
+            ),
+        ] {
+            let err = build(nextn, op).unwrap_err().to_string();
+            assert!(err.contains(message), "{err}");
+        }
+        // GLM-5.3 composites nest analytical and measured children: a qualified
+        // scan in either list is rejected at build, and valid children pass.
+        let glm = |children: Vec<Op>, measured: Vec<Op>| {
+            Op::Glm53Primitive(crate::operators::glm53flash::Glm53PrimitiveOp {
+                name: "final_norm".into(),
+                role: "final_norm".into(),
+                backend: "vllm".into(),
+                checkpoint_format: "fp8".into(),
+                tp_size: 1,
+                is_context: true,
+                hidden_size: 4096,
+                vocab_size: 154880,
+                token_selection: "all_scheduled".into(),
+                output_dtype: "bfloat16".into(),
+                collective: "none".into(),
+                children,
+                measured,
+            })
+        };
+        let validate = |op: Op| Engine::validate_mamba_ops(&[op], None, true, &mut [false; 2]);
+        for op in [
+            glm(vec![qualified_mamba(true, 1)], vec![]),
+            glm(vec![], vec![qualified_mamba(true, 1)]),
+        ] {
+            let err = validate(op).unwrap_err().to_string();
+            assert!(err.contains("nested"), "{err}");
+        }
+        validate(glm(vec![], vec![])).unwrap();
+        // Mixed steps need both phases qualified or both unrecorded.
+        let phases = |context: &str, generation: &str| {
+            let op = |prefill, dtype: &str| match qualified_mamba(prefill, 1) {
+                Op::Mamba2(mut m) => {
+                    m.state_dtype = dtype.into();
+                    Op::Mamba2(m)
+                }
+                _ => unreachable!(),
+            };
+            Engine::build(
+                EngineSpec::new(
+                    fixture_engine_config(None),
+                    vec![op(true, context)],
+                    vec![op(false, generation)],
+                ),
+                db.clone(),
+            )
+        };
+        phases("float16", "float16").unwrap();
+        phases("unrecorded", "unrecorded").unwrap();
+        // Replay attributes by name, so qualified names stay phase-specific.
+        let named = |prefill| match qualified_mamba(prefill, 1) {
+            Op::Mamba2(mut m) => {
+                m.name = "ssm".into();
+                Op::Mamba2(m)
+            }
+            _ => unreachable!(),
+        };
+        let build = |context: Vec<Op>, generation: Vec<Op>| {
+            Engine::build(
+                EngineSpec::new(fixture_engine_config(None), context, generation),
+                db.clone(),
+            )
+        };
+        let block = |name: &str| Op::Elementwise(ElementwiseOp::new(name, 2.0));
+        let attention = || {
+            generation_ops()
+                .into_iter()
+                .find(|op| matches!(op, Op::GenerationAttention(_)))
+                .unwrap()
+        };
+        for (context, generation) in [
+            (vec![named(true)], vec![named(false)]),
+            // A context op of another pass under the same name.
+            (
+                vec![named(true), block("ssm")],
+                vec![qualified_mamba(false, 1)],
+            ),
+            // Unique Mamba names, but two other operations collide: Replay
+            // would split every operation, Mamba included, by token share.
+            (
+                vec![qualified_mamba(true, 1), block("generation_attention")],
+                vec![qualified_mamba(false, 1), attention()],
+            ),
+        ] {
+            let err = build(context, generation).unwrap_err().to_string();
+            assert!(err.contains("belongs to two mixed-step passes"), "{err}");
+        }
+        // Same pass: folding a scan with another operation by name would mix
+        // a Mamba row into that operation's per-op value. In the context pass
+        // the only partner is context attention, a reserved name that fails
+        // first, so the decode pass shows the rule.
+        let mut mamba_as_attention = qualified_mamba(false, 1);
+        mamba_as_attention.set_name("generation_attention".into());
+        let err = build(
+            vec![qualified_mamba(true, 1)],
+            vec![mamba_as_attention, attention()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("shares its name with another operation"),
+            "{err}"
+        );
+        // Repeated names within one pass stay valid.
+        build(
+            vec![named(true), named(true)],
+            vec![qualified_mamba(false, 1)],
+        )
+        .unwrap();
+        // A direct query fails loudly instead of pricing an invalid width.
+        let mut op = qualified_mamba(false, 1);
+        if let Op::Mamba2(m) = &mut op {
+            m.token_width = 0;
+        }
+        let err = op
+            .query(&db, &generation_op_runtime(2, 1, 16, 1.0, 0, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be positive"), "{err}");
+        // A context list takes only an exact "context" phase.
+        for (phase, message) in [
+            ("generation", "does not match its context list"),
+            ("prefill", "needs phase"),
+        ] {
+            // The generation op keeps its decode kernel, so only the list check fails.
+            let mut op = qualified_mamba(phase == "prefill", 1);
+            if let Op::Mamba2(m) = &mut op {
+                m.phase = phase.into();
+            }
+            let err = Engine::build(
+                EngineSpec::new(fixture_engine_config(None), vec![op], vec![]),
+                db.clone(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(message), "{phase}: {err}");
+        }
+        // A qualified pair beside DSv4.1 stages would take the staged mixed
+        // step, which has no per-phase Mamba pricing.
+        let stage = |is_context| {
+            Op::Dsv41Stage(crate::operators::Dsv41StageOp {
+                name: "encoder".into(),
+                is_context,
+                bounded: false,
+                decoder_replay: false,
+                window_size: 128,
+                children: vec![Op::Elementwise(ElementwiseOp {
+                    name: "norm".into(),
+                    scale_factor: 1.0,
+                    bytes_per_token: 8192.0,
+                    scale_num_tokens: 1,
+                    seq_split: 1,
+                })],
+            })
+        };
+        for (context, generation) in [
+            (vec![stage(true)], vec![stage(false)]),
+            (vec![], vec![stage(false)]),
+        ] {
+            let err = Engine::build(
+                EngineSpec::new(
+                    fixture_engine_config(None),
+                    [context, vec![qualified_mamba(true, 1)]].concat(),
+                    [generation, vec![qualified_mamba(false, 1)]].concat(),
+                ),
+                db.clone(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("DSv4.1 stages"), "{err}");
+        }
+        for (context, generation) in [("unrecorded", "float16"), ("float16", "unrecorded")] {
+            let err = phases(context, generation).unwrap_err().to_string();
+            assert!(err.contains("all record a state_dtype"), "{err}");
+        }
     }
 
     fn runtime(batch_size: u32, isl: u32, osl: u32) -> RuntimeConfig {
@@ -5070,6 +7052,10 @@ pub(crate) mod tests {
         assert_eq!(passes, expected);
         // GLM-5.3 runs `attention_{layer}` in both attention passes, which
         // name folding merges; DSv4.1 stages compose their own mixed work.
+        // A qualified Mamba op prices only its own phase.
+        let mamba = qualified_mamba_engine(3).mix_step_passes().unwrap();
+        assert_eq!(mamba["context_ssm"], MixedPass::ContextAttention);
+        assert_eq!(mamba["generation_ssm"], MixedPass::DecodeAttention);
         assert!(glm_layer_engine().mix_step_passes().is_none());
         assert!(dsv41_probe_engine(false).mix_step_passes().is_none());
     }
@@ -5119,7 +7105,7 @@ pub(crate) mod tests {
                 let actual = names
                     .iter()
                     .zip(&slots)
-                    .map(|(name, &(latency, energy, source))| {
+                    .map(|(name, &(latency, energy, _, source))| {
                         (name.clone(), latency.to_bits(), energy.to_bits(), source)
                     })
                     .collect::<Vec<_>>();
@@ -5154,12 +7140,14 @@ pub(crate) mod tests {
         fold.add(1, PerformanceResult::with_energy(0.5, 0.0, Source::Sol));
         fold.add(
             0,
-            PerformanceResult::with_energy(0.25, 4.0, Source::Empirical),
+            PerformanceResult::with_energy(0.25, 0.0, Source::Empirical),
         );
-        // "a": 1.0 + 0.25 ms and 2.0 + 4.0 W-ms; its sources differ.
+        // "a": 1.0 + 0.25 ms and 2.0 + 0.0 W-ms; its sources differ. Only
+        // its powered first query is covered, though its folded energy is
+        // positive.
         assert_eq!(
             fold.into_values(&plan).unwrap(),
-            [(1.25, 6.0, "mixed"), (0.5, 0.0, "sol")]
+            [(1.25, 2.0, 1.0, "mixed"), (0.5, 0.0, 0.0, "sol")]
         );
         let mut fold = PerOpSlotFold::for_plan(&plan);
         fold.add(1, PerformanceResult::new(1.0, Source::Sol));
@@ -5350,6 +7338,49 @@ pub(crate) mod tests {
         assert_eq!(result.latency_ms, 3.0);
         let unshared = memo.query(None, &runtime(8), price(4.0));
         assert!(matches!(unshared, Ok(Cow::Owned(_))));
+    }
+
+    #[test]
+    fn per_op_fold_tracks_coverage_only_when_requested() {
+        use crate::operators::base::Source;
+
+        let ops = [
+            Op::Gemm(GemmOp::new("a", 64, 64, GemmQuantMode::Bfloat16)),
+            Op::Gemm(GemmOp::new("b", 64, 64, GemmQuantMode::Bfloat16)),
+        ];
+        let plan = OpListPlan::new(&ops);
+        for phase in ["context", "generation"] {
+            for slotted in [false, true] {
+                let mut values = if slotted {
+                    PerOpFold::for_plan(phase, &plan)
+                } else {
+                    PerOpFold::new(phase)
+                };
+                let mut tracked = PerOpFold::with_covered(phase);
+                for (slot, latency, energy, source) in [
+                    (0, 1.0, 2.0, Source::Silicon),
+                    (1, 0.5, 0.0, Source::Sol),
+                    (0, 0.25, 0.0, Source::Empirical),
+                    (0, 0.125, 1.0, Source::Silicon),
+                ] {
+                    let result = PerformanceResult::with_energy(latency, energy, source);
+                    if slotted {
+                        values.add_slot(slot, &ops[slot], result.clone());
+                    } else {
+                        values.add(&ops[slot], result.clone());
+                    }
+                    tracked.add(&ops[slot], result);
+                    assert!(values.covered.is_none());
+                }
+                let (entries, covered) = tracked.into_values_with_covered();
+                assert_eq!(per_op_bits(&values.into_values()), per_op_bits(&entries));
+                // Positive folded energy must not cover the unpowered query
+                // of the repeated name, nor the entirely unpowered name.
+                assert_eq!(covered, [1.125, 0.0]);
+                assert_eq!(entries[0].1, 1.375);
+                assert_eq!(entries[0].3, "mixed");
+            }
+        }
     }
 
     #[test]
@@ -5854,7 +7885,7 @@ pub(crate) mod tests {
                 .names
                 .iter()
                 .zip(&operations.values)
-                .map(|(name, (latency_ms, energy_wms, source))| {
+                .map(|(name, (latency_ms, energy_wms, _, source))| {
                     (
                         name.clone(),
                         latency_ms.to_bits(),
@@ -6223,6 +8254,7 @@ pub(crate) mod tests {
             operations: None,
             fpm_terms: Default::default(),
             diagnostics: None,
+            diagnostic_covered: None,
             derived: OnceLock::new(),
         };
         let builds = std::cell::Cell::new(0);
@@ -7171,10 +9203,17 @@ pub(crate) mod tests {
         });
         let spec = EngineSpec::new(config, vec![composite], vec![generation; 3]);
         let engine = Engine::from_spec_bytes(&spec.to_bincode().unwrap(), &systems_root()).unwrap();
-        let ((shared, prefill, decode), covered_latency_ms) = engine
+        let (shared, prefill, decode, covered, _) = engine
             .mixed_step_breakdown_per_op_with_metadata(1, 1, 2, 2, 0, 1.0, 1.0)
             .unwrap();
-        assert_eq!(covered_latency_ms, None);
+        let expected_covered: f64 = shared
+            .iter()
+            .chain(&prefill)
+            .chain(&decode)
+            .filter(|row| row.2 > 0.0)
+            .map(|row| row.1)
+            .sum();
+        assert_eq!(covered, expected_covered);
         assert!(shared.is_empty());
         for (rows, phase) in [(&prefill, "context"), (&decode, "generation")] {
             assert_eq!(rows.len(), 1);
@@ -7796,6 +9835,59 @@ pub(crate) mod tests {
             vec![fpm_op(FpmPhase::Decode)],
         );
         Engine::build(spec, Arc::new(db))
+    }
+
+    #[test]
+    fn speculative_prefill_totals_without_a_round_binding_use_integer_means() {
+        use crate::perf_database::fpm_forward::tests::{RowSpec, write_pair};
+
+        for nextn in [0, 1] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut spec = build_fpm_spec(tmp.path(), Some(nextn));
+            let Op::FpmForward(decode) = &mut spec.generation_ops[0] else {
+                unreachable!()
+            };
+            // A valid speculative FPM shape without operation-level draft
+            // tails or a measured-round binding.
+            decode.verify_width = nextn + 1;
+            write_pair(
+                tmp.path(),
+                &[
+                    RowSpec {
+                        workload_kind: "prefill",
+                        batch_size: 2,
+                        total_prefill_tokens: 3,
+                        total_kv_read_tokens: 1,
+                        latency_ms: 3.0,
+                        ..RowSpec::default()
+                    },
+                    RowSpec {
+                        workload_kind: "prefill",
+                        batch_size: 2,
+                        total_prefill_tokens: 4,
+                        total_kv_read_tokens: 0,
+                        latency_ms: 4.0,
+                        ..RowSpec::default()
+                    },
+                    RowSpec {
+                        workload_kind: "decode",
+                        batch_size: 1,
+                        total_prefill_tokens: 0,
+                        total_kv_read_tokens: 8,
+                        latency_ms: 1.0,
+                        ..RowSpec::default()
+                    },
+                ],
+            );
+            let engine = Engine::from_spec_bytes(&spec.to_bincode().unwrap(), tmp.path()).unwrap();
+            // The non-speculative engine keeps (2, 3, 1). The speculative
+            // engine uses isl=(3+1)/2=2 and prefix=1/2=0, querying (2, 4, 0).
+            let expected = if nextn == 0 { 3.0 } else { 4.0 };
+            assert_eq!(
+                engine.predict_prefill_latency_total(2, 3, 1).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -8557,6 +10649,66 @@ pub(crate) mod tests {
         assert!((ms - expected).abs() < 1e-9, "got {ms}, want {expected}");
     }
 
+    #[test]
+    fn op_level_packed_decode_kv_includes_current_token() {
+        use crate::perf_database::energy_test_fixtures::write_energy_systems_root;
+
+        // No downloaded tables: compare the packed-input dispatch against an
+        // explicit attention query at the intended sequence length. This tests
+        // input coordinates, not the attention operator's numerical formula.
+        let root = tempfile::tempdir().unwrap();
+        write_energy_systems_root(root.path());
+        let mut db = PerfDatabase::load(root.path(), "testsys", "vllm", "1.0").unwrap();
+        db.database_mode = DatabaseMode::Sol;
+        let mut config = fixture_engine_config(Some(3));
+        config.database_mode = DatabaseMode::Sol;
+        let generation = generation_ops();
+        let attention = generation[1].clone();
+        let engine = Engine::build(
+            EngineSpec::new(config, context_ops(), generation),
+            Arc::new(db),
+        )
+        .unwrap();
+        // telem.py's 8 logical requests verify 4 tokens each. Its 32800 KV
+        // tokens already include each packed row's current token. The packed
+        // consumer must neither add 1 nor apply the verification width again.
+        let expected = |length| {
+            attention
+                .query(
+                    &engine.db,
+                    &generation_op_runtime(32, 1, length, 1.0, 0, None),
+                )
+                .unwrap()
+                .latency_ms
+        };
+        let intended = expected(1025);
+        assert_ne!(intended, expected(1024));
+        assert_ne!(intended, expected(1026));
+        for prefills in [0, 1] {
+            for length in [1024, 1025, 1026] {
+                let metrics = ForwardPassMetrics {
+                    scheduled_requests: crate::ScheduledRequestMetrics {
+                        num_prefill_requests: prefills,
+                        sum_prefill_tokens: prefills * 2048,
+                        num_decode_requests: 32,
+                        sum_decode_kv_tokens: 32 * length,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let estimate = engine
+                    .forward_pass_estimate(&[metrics], true, None)
+                    .unwrap();
+                let decode = estimate.ranks[0]
+                    .operations
+                    .iter()
+                    .find(|op| op.name == "generation_attention")
+                    .unwrap();
+                assert_eq!(decode.latency_ms, expected(length));
+            }
+        }
+    }
+
     /// The FPM rank dispatch queries RAW iteration totals — the tables'
     /// native coordinate system — not the op-level per-request averages,
     /// which floor-divide away up to (n - 1) tokens per axis.
@@ -8883,6 +11035,8 @@ pub(crate) mod tests {
             head_dim: 64,
             n_groups: 8,
             chunk_size: 256,
+            state_dtype: "unrecorded".into(),
+            token_width: 1,
         })];
         let ops_json = serde_json::to_string(&ops).unwrap();
         let err = engine
@@ -9105,6 +11259,82 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fpm_hybrid_keeps_same_named_draft_tails_in_separate_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut attention = crate::operators::glm53flash::tests::attention("kda");
+        attention.name = "block".into();
+        attention.is_context = false;
+        let (mut spec, mut db) = fpm_hybrid_spec(
+            tmp.path(),
+            Some(7),
+            8,
+            vec![Op::Glm53Attention(attention)],
+            vec![
+                qualified_mamba(true, 1),
+                Op::Elementwise(ElementwiseOp::new("block", 2.0)),
+            ],
+        );
+        // The GLM draft tail has no measured SILICON composition; HYBRID
+        // explicitly permits its analytical estimate beside the FPM target.
+        spec.engine.database_mode = DatabaseMode::Hybrid;
+        db.database_mode = DatabaseMode::Hybrid;
+        // These names collide in the operation-graph pass map. FPM instead
+        // reports each draft tail in its own pass, preserving both rows.
+        assert_eq!(
+            mixed_pass_map(&spec.context_ops, &spec.generation_ops),
+            Err("draft_block".into())
+        );
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        assert!(engine.mix_step_passes().is_none());
+        let (shared, context, decode) = engine
+            .mixed_step_breakdown_per_op(2048, 1, 2048, 2, 0, 1.0, 1.0)
+            .unwrap();
+        assert!(context.is_empty());
+        for pass in [&shared, &decode] {
+            let rows: Vec<_> = pass.iter().filter(|row| row.0 == "draft_block").collect();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].1 > 0.0);
+        }
+        // The context block moves 2 B for each of 2048 prefill tokens.
+        // HYBRID uses B200's 3 us launch and 80% bandwidth calibration.
+        let block_ms = shared.iter().find(|row| row.0 == "draft_block").unwrap().1;
+        let expected_ms = 0.003 + 4096.0 / (0.8 * engine.db.system_spec.gpu.mem_bw) * 1000.0;
+        assert!((block_ms - expected_ms).abs() < 1e-12);
+        let scalar = engine
+            .mixed_step_latency(2048, 1, 2048, 2, 0, 1.0, 1.0)
+            .unwrap();
+        let detailed: f64 = shared.iter().chain(&decode).map(|row| row.1).sum();
+        assert!((detailed - scalar).abs() < 1e-12);
+    }
+
+    #[test]
+    fn packed_qualified_graph_rejects_same_named_cross_pass_tails() {
+        let db =
+            Arc::new(PerfDatabase::load(&systems_root(), "b200_sxm", "vllm", "0.24.0").unwrap());
+        let mut attention = crate::operators::glm53flash::tests::attention("kda");
+        attention.name = "draft_block".into();
+        attention.is_context = false;
+        let error = Engine::build(
+            EngineSpec::new(
+                fixture_engine_config(Some(7)),
+                vec![
+                    qualified_mamba(true, 1),
+                    Op::Elementwise(ElementwiseOp::new("draft_block", 2.0)),
+                ],
+                vec![Op::Glm53Attention(attention)],
+            ),
+            db,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("operation name draft_block belongs to two mixed-step passes"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn fpm_hybrid_rejects_fpm_hidden_in_draft_token_scale() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut spec, db) = fpm_hybrid_spec(tmp.path(), None, 1, vec![], vec![]);
@@ -9165,7 +11395,7 @@ pub(crate) mod tests {
         let without = base
             .mixed_step_latency(2048, 1, 2048, 0, 0, 1.0, 1.0)
             .unwrap();
-        let tail_ms = run_context_ops(
+        let tail_ms = crate::session::run_context_ops(
             std::slice::from_ref(&ctx_op),
             &db,
             1,
@@ -9181,6 +11411,143 @@ pub(crate) mod tests {
             with_tail - without
         );
     }
+
+    #[test]
+    fn fpm_hybrid_qualified_draft_scan_uses_scheduled_chunks() {
+        use crate::perf_database::fpm_forward::tests::{RowSpec, default_rows, write_pair};
+        let tmp = tempfile::tempdir().unwrap();
+        let (spec, db) = fpm_hybrid_spec(
+            tmp.path(),
+            Some(7),
+            8,
+            vec![],
+            vec![qualified_mamba(true, 1)],
+        );
+        // Exact synthetic target rows: batch, scheduled + 8 decode tokens,
+        // and batch * prefix. These small shapes extend the default domain.
+        let mut rows = default_rows();
+        for (batch_size, total_prefill_tokens, total_kv_read_tokens, latency_ms) in [
+            (2, 392, 512, 12.0),
+            (2, 520, 512, 14.0),
+            (3, 648, 768, 16.0),
+            (2, 1508, 6000, 18.0),
+        ] {
+            rows.push(RowSpec {
+                workload_kind: "prefill",
+                batch_size,
+                total_prefill_tokens,
+                total_kv_read_tokens,
+                latency_ms,
+                ..RowSpec::default()
+            });
+        }
+        write_pair(tmp.path(), &rows);
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        let (prefill, decode, tail, _) = engine.fpm_split().unwrap();
+        // Hand-derived traffic for this scan: 18,560 activation bytes per new
+        // token and one read/write pair of a 1 MiB state per request. Cached
+        // scans use SOL, so each query's latency reveals its token/state count.
+        let ms = |batch: u32, length: u32| {
+            f64::from(batch) * (f64::from(length) * 18_560.0 + 2_097_152.0)
+                / engine.db.system_spec.gpu.mem_bw
+                * 1000.0
+        };
+        // The session canonicalizes groups by increasing chunk length.
+        for (scheduled, isl, prefix, groups, target_ms) in [
+            (384, 512, 256, &[(1, 128), (1, 256)][..], 12.0),
+            (512, 512, 256, &[(2, 256)][..], 14.0),
+            (640, 512, 256, &[(1, 128), (2, 256)][..], 16.0),
+            (1500, 4096, 3000, &[(1, 404), (1, 1096)][..], 18.0),
+        ] {
+            let mut scans = Vec::new();
+            let mut targets = Vec::new();
+            let (context, _) = engine
+                .fpm_mixed_step_components(
+                    prefill,
+                    decode,
+                    tail,
+                    scheduled,
+                    1,
+                    isl,
+                    1,
+                    prefix,
+                    1.0,
+                    1.0,
+                    |pass, op, result, covered| {
+                        if matches!(pass, MixedPass::SharedNonAttention) {
+                            assert_eq!(covered, 0.0);
+                            if op.is_qualified_mamba() {
+                                scans.push(result.latency_ms);
+                            } else {
+                                targets.push(result.latency_ms);
+                            }
+                        }
+                    },
+                )
+                .unwrap();
+            let expected: Vec<_> = groups
+                .iter()
+                .map(|&(batch, length)| ms(batch, length))
+                .collect();
+            assert_eq!(scans.len(), expected.len(), "scheduled={scheduled}");
+            for (got, want) in scans.iter().zip(&expected) {
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "scheduled={scheduled}: {got} vs {want}"
+                );
+            }
+            // One target query retains the exact scheduled-token coordinate.
+            assert_eq!(targets, vec![target_ms]);
+            assert!((context.latency_ms - target_ms - expected.iter().sum::<f64>()).abs() < 1e-12);
+            let scalar = engine
+                .mixed_step_latency(scheduled, 1, isl, 1, prefix, 1.0, 1.0)
+                .unwrap();
+            let (shared, context_rows, decode_rows) = engine
+                .mixed_step_breakdown_per_op(scheduled, 1, isl, 1, prefix, 1.0, 1.0)
+                .unwrap();
+            assert!(context_rows.is_empty());
+            let scan_row = shared
+                .iter()
+                .find(|row| row.0 == "draft_context_ssm")
+                .unwrap();
+            assert!((scan_row.1 - expected.iter().sum::<f64>()).abs() < 1e-12);
+            assert_eq!(scan_row.2, 0.0);
+            assert_eq!(scan_row.3, "sol");
+            let detailed: f64 = shared.iter().chain(&decode_rows).map(|row| row.1).sum();
+            assert!((detailed - scalar).abs() < 1e-12);
+        }
+
+        // 536,870,912 requests at width 8 need 2^32 packed tokens. Reject
+        // that count before querying the target prefill table or draft scans,
+        // rather than exposing a lookup error for a saturated coordinate.
+        let mut queried = false;
+        let error = engine
+            .fpm_mixed_step_components(
+                prefill,
+                decode,
+                tail,
+                384,
+                536_870_912,
+                512,
+                1,
+                256,
+                1.0,
+                1.0,
+                |_, _, _, _| queried = true,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AicError::InvalidEngineConfig(ref message)
+                    if message == "536870912 decode requests of 8 tokens overflow the u32 count \
+                                   that qualified Mamba ops divide by their token width"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(!queried, "overflow must fail before any prefill query");
+    }
+
     #[test]
     fn fpm_hybrid_rejects_invalid_widths_and_unclassified_tails() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9262,6 +11629,95 @@ pub(crate) mod tests {
         assert_eq!(target.1, 0.0);
     }
 
+    /// Two same-name draft decode ops, one powered and one not, fold into one
+    /// row with positive energy. Power coverage still counts only the powered
+    /// query's latency, in the mixed FPM step and in the static decode walk.
+    #[test]
+    fn fpm_decode_coverage_counts_each_same_name_draft_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let drafts: Vec<Op> = generation_ops()
+            .into_iter()
+            .map(|mut op| {
+                // `fpm_hybrid_spec` names each tail op `draft_<name>`.
+                op.set_name("dup".into());
+                op
+            })
+            .collect();
+        let (spec, _) = fpm_hybrid_spec(tmp.path(), Some(7), 8, drafts.clone(), vec![]);
+        // The b200 vLLM 0.22.0 attention table carries measured power.
+        let mut db = PerfDatabase::load(&systems_root(), "b200_sxm", "vllm", "0.22.0").unwrap();
+        db.set_fpm_forward_for_test(crate::perf_database::FpmForwardTable::new(
+            tmp.path().to_path_buf(),
+            "b200_sxm",
+            "vllm",
+            "0.25.1",
+        ));
+        let engine = Engine::build(spec, Arc::new(db)).unwrap();
+        // One decode request at width 8 and KV length 2048 + 1 + 1.
+        let queries: Vec<_> = drafts
+            .iter()
+            .map(|op| query_generation_op(op, &engine.db, 8, 1, 2050, 1.0, 0, None).unwrap())
+            .collect();
+        let powered: Vec<bool> = queries.iter().map(|r| r.energy_wms > 0.0).collect();
+        assert_eq!(
+            powered,
+            [false, true],
+            "the fixture needs one unpowered query"
+        );
+        let expected = queries[1].latency_ms;
+
+        let (_, _, decode, covered, decode_covered) = engine
+            .mixed_step_breakdown_per_op_with_metadata(2048, 1, 2048, 2, 0, 1.0, 1.0)
+            .unwrap();
+        assert!((decode_covered - expected).abs() < 1e-12);
+        let row = decode.iter().find(|row| row.0 == "draft_dup").unwrap();
+        assert!((row.1 - queries[0].latency_ms - queries[1].latency_ms).abs() < 1e-12);
+        assert!(row.2 > 0.0);
+        // The FPM components carry no energy, so only the powered draft counts.
+        assert!(
+            (covered - expected).abs() < 1e-12,
+            "{covered} vs {expected}"
+        );
+
+        // The single-step metadata endpoint must carry the same pre-fold
+        // coverage; Python cannot recover it from the positive folded energy.
+        let (decode, decode_covered) = engine
+            .decode_step_per_op_with_metadata(1, 2048, 2, 1.0)
+            .unwrap();
+        let row = decode.iter().find(|row| row.0 == "draft_dup").unwrap();
+        assert!(row.2 > 0.0 && decode_covered < row.1);
+        assert!((decode_covered - expected).abs() < 1e-12);
+        assert_eq!(
+            engine.decode_step_per_op(1, 2048, 2, 1.0).unwrap(),
+            strip_per_op_metadata(decode)
+        );
+        assert_eq!(
+            engine
+                .decode_step_per_op_with_metadata(0, 2048, 2, 1.0)
+                .unwrap(),
+            (vec![], 0.0)
+        );
+
+        let runtime = RuntimeConfig {
+            batch_size: 1,
+            isl: 2049,
+            osl: 2,
+            ..Default::default()
+        };
+        let (_, _, _, generation_covered) = engine
+            .run_static_per_op_with_coverage(&runtime, StaticMode::Generation, 1)
+            .unwrap();
+        assert!(
+            (generation_covered - expected).abs() < 1e-12,
+            "{generation_covered} vs {expected}"
+        );
+    }
+
+    /// AISIM-1973 D10 (aggregate FPM power is AISIM-2001): on a fully powered
+    /// v8 pair the operator prices energy, but the mixed step reports energy 0
+    /// for its FPM prefill and marginal-decode components. Every per-op value
+    /// matches the latency-only v6 pair bit for bit, so latencies are
+    /// unchanged and the draft tails keep their op-level energy.
     #[test]
     fn fpm_marginal_energy_requires_positive_time_and_both_inputs() {
         assert_eq!(fpm_marginal_energy(6.0, 5000.0, 2400.0), 2600.0);
@@ -9642,6 +12098,7 @@ pub(crate) mod tests {
                 requests * prefix,
                 kv,
                 generation,
+                None,
                 |_, _, _, _, _, _| {},
             )
             .unwrap();
