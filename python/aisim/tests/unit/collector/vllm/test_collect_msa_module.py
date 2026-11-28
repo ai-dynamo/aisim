@@ -240,30 +240,349 @@ def _call_lines(function, name):
     ]
 
 
-def test_dummy_fill_skips_the_rotary_table_and_seeds_the_index_projection_before_processing():
-    build = _function("_create_msa_attention_module")
+def test_dummy_fill_skips_the_rotary_table_and_seeds_before_processing():
+    # The move/fill/seed/process sequence is shared by the MSA and QSA builders
+    # (_finalize_module_weights), so the rotary-table contract is pinned there.
+    # The index seeder is an architecture hook: MSA passes MiniMax's fused
+    # qkv+index seeder, QSA passes none (its layout differs and its accepted
+    # rows were measured with the constant fill).
+    finalize = _function("_finalize_module_weights")
     fill = next(
-        node for node in ast.walk(build) if isinstance(node, ast.For) and "named_buffers" in ast.unparse(node.iter)
+        node for node in ast.walk(finalize) if isinstance(node, ast.For) and "named_buffers" in ast.unparse(node.iter)
     )
+    # Both parameter and buffer names are walked: the RoPE table is a buffer.
+    assert "named_parameters" in ast.unparse(fill.iter)
     # The table is passed over before any branch can overwrite it.
     skip = fill.body[1]
     assert ast.unparse(skip.test) == "name.endswith('cos_sin_cache')"
     assert isinstance(skip.body[-1], ast.Continue)
 
-    (moved,) = _call_lines(build, "_move_to_device")
-    (seeded,) = _call_lines(build, "_give_index_projection_values")
-    (processed,) = _call_lines(build, "process_weights_after_loading")
+    (moved,) = _call_lines(finalize, "_move_to_device")
+    (seeded,) = _call_lines(finalize, "seed_index")
+    (processed,) = _call_lines(finalize, "process_weights_after_loading")
     assert moved < fill.lineno < seeded < processed
+
+    def finalize_kwargs(builder):
+        (call,) = [
+            node
+            for node in ast.walk(_function(builder))
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "_finalize_module_weights"
+        ]
+        return {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+
+    assert finalize_kwargs("_create_msa_attention_module") == {"seed_index": "_give_index_projection_values"}
+    assert finalize_kwargs("_create_qsa_attention_module") == {}
+
+
+def test_qsa_builder_installs_servings_skinny_gemm_plans_before_processing_weights():
+    """Serving swaps in its measured GEMM plans at the end of model __init__.
+
+    ``Qwen4ExpForCausalLM.__init__`` (and ``Qwen4ExpMTP``) call
+    ``enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)``
+    (model.py:747, mtp.py @v0.32.0). That replaces the quant method of every
+    unquantized linear whose ``(N, K)`` has a plan, so those shapes run the
+    skinny kernel rather than ``F.linear``. The plans key on exact widths (the
+    TP4 fused QKV among them), so a module built without the call times a
+    different kernel than serving and labels the row as serving's.
+    """
+    build = _function("_create_qsa_attention_module")
+    (constructed,) = _call_lines(build, "Qwen4ExpQSAAttention")
+    (selected,) = _call_lines(build, "enable_qwen4_exp_low_latency_gemm")
+    (finalized,) = _call_lines(build, "_finalize_module_weights")
+    assert constructed < selected < finalized
+
+    (call,) = [
+        node
+        for node in ast.walk(build)
+        if isinstance(node, ast.Call) and ast.unparse(node.func).split(".")[-1] == "enable_qwen4_exp_low_latency_gemm"
+    ]
+    # Same module and the dtype serving passes.
+    assert ast.unparse(call.args[0]) == "attn_module"
+    assert ast.unparse(call.args[1]) == "vllm_config.model_config.dtype"
 
 
 def test_history_is_written_after_the_dtype_check_and_before_the_first_forward():
     run = _function("run_msa_module")
+    (checked,) = _call_lines(run, "_check_msa_kv_precision")
     (written,) = [
         node
         for node in ast.walk(run)
         if isinstance(node, ast.Call) and ast.unparse(node.func) == "_write_index_key_history"
     ]
     assert ast.unparse(written.args[0]) == "index_kv_cache"
-    raises = [node for node in ast.walk(run) if isinstance(node, ast.Raise)]
-    dtype_check = next(node.lineno for node in raises if "precision mismatch" in ast.unparse(node))
-    assert dtype_check < written.lineno < min(_call_lines(run, "forward"))
+    # The raises live in the shared helpers both builders call.
+    check_fn = _function("_check_msa_kv_precision")
+    raises = [node for node in ast.walk(check_fn) if isinstance(node, ast.Raise)]
+    assert any("precision mismatch" in ast.unparse(node) for node in raises)
+    assert checked < written.lineno < min(_call_lines(run, "forward"))
+
+    # The M3 index-key history is MSA-only: QSA has two side caches and no M3
+    # index layout, so it keeps the zero fill its accepted rows were measured
+    # with. The write must sit in the branch that is NOT the QSA route.
+    (branch,) = [
+        node
+        for node in run.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "attention_type == 'qsa'"
+        and any(
+            isinstance(call, ast.Call) and ast.unparse(call.func) == "_check_msa_kv_precision"
+            for call in ast.walk(ast.Module(body=node.orelse, type_ignores=[]))
+        )
+    ]
+    assert any(node is written for node in ast.walk(ast.Module(body=branch.orelse, type_ignores=[])))
+    assert not any(node is written for node in ast.walk(ast.Module(body=branch.body, type_ignores=[])))
+
+
+class _TensorPath:
+    """Chainable stand-in for the `arange(...).unsqueeze().expand()...` shape."""
+
+    def unsqueeze(self, _axis):
+        return self
+
+    def expand(self, *_shape):
+        return self
+
+    def reshape(self, *_shape):
+        return self
+
+    def contiguous(self):
+        return self
+
+
+def _run_msa_module(*, attention_type, calls):
+    """Exec the collector's real ``run_msa_module`` over stubbed framework/GPU boundaries.
+
+    The module imports vllm and torch at import time, so the point runner is
+    executed from its own AST with every boundary replaced: the framework
+    module/cache builders, the distributed and workspace setup, the timing
+    harness and the row writer. Everything between them — the dispatcher, the
+    branch split, the tensor preparation — is the shipped code.
+    """
+    import copy
+    from contextlib import nullcontext
+
+    forward_ctx = {
+        "attn": SimpleNamespace(bind_kv_cache=lambda cache: calls["bound"].append(cache)),
+        "index": SimpleNamespace(bind_kv_cache=lambda cache: calls["bound"].append(cache)),
+    }
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=forward_ctx),
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(hidden_size=2560), uses_mrope=False),
+    )
+    attn_module = SimpleNamespace(
+        forward=lambda *_a: calls["forwards"].append(1),
+        impl=SimpleNamespace(__class__=type("Impl", (), {})),
+        kv_cache=SimpleNamespace(dtype="bfloat16"),
+    )
+
+    def create_msa(**kwargs):
+        calls["create"] = kwargs
+        return attn_module, vllm_config, "MiniMaxM3ForCausalLM"
+
+    def create_qsa(**kwargs):
+        calls["create"] = kwargs
+        return attn_module, vllm_config, "Qwen4ExpForConditionalGeneration"
+
+    main_cache, index_cache = SimpleNamespace(dtype="bfloat16"), SimpleNamespace(dtype="bfloat16")
+
+    def create_msa_caches(**_kwargs):
+        calls["caches"] = "msa"
+        return (
+            main_cache,
+            index_cache,
+            object(),
+            object(),
+            SimpleNamespace(slot_mapping=object()),
+        )
+
+    def create_qsa_caches(**_kwargs):
+        calls["caches"] = "qsa"
+        return {"qsa": object()}, SimpleNamespace(slot_mapping=object())
+
+    @_nullcontext_manager
+    def bench(**_kwargs):
+        return {"latency_ms": 3.5, "power_stats": {"power": 1.0}}
+
+    fake_torch = SimpleNamespace(
+        inference_mode=nullcontext,
+        device=lambda value: value,
+        bfloat16="bfloat16",
+        long="long",
+        uint8="uint8",
+        arange=lambda *_a, **_k: _TensorPath(),
+        full=lambda *_a, **_k: object(),
+        cuda=SimpleNamespace(
+            set_device=lambda _d: None,
+            get_device_name=lambda _d: "GPU",
+            get_device_properties=lambda _d: SimpleNamespace(total_memory=1 << 40),
+            OutOfMemoryError=MemoryError,
+        ),
+    )
+    namespace = {
+        "torch": fake_torch,
+        "traceback": SimpleNamespace(print_exc=lambda: None),
+        "vllm_version": "0.32.0",
+        "_MSA_MODULE_ATTENTION_TYPES": ("msa", "qsa"),
+        "_ATTN_LAYER_NAME": "attn",
+        "_INDEX_CACHE_LAYER_NAME": "index",
+        "_attention_type_for_model": lambda _path: attention_type,
+        "_qsa_generation_kv_footprint_bytes": lambda _path: None,
+        "_kv_does_not_fit": lambda *_a, **_k: None,
+        "setup_distributed": lambda _d: None,
+        "enable_engine_fused_ops": lambda: None,
+        "init_workspace_manager": lambda _d: None,
+        "_create_msa_attention_module": create_msa,
+        "_create_qsa_attention_module": create_qsa,
+        "_create_kv_caches_and_metadata": create_msa_caches,
+        "_create_qsa_kv_caches_and_metadata": create_qsa_caches,
+        "_check_msa_kv_precision": lambda *_a: None,
+        "_check_qsa_kv_precision": lambda *_a: None,
+        "_write_index_key_history": lambda cache: calls["written"].append(cache),
+        "_qsa_kernel_source": lambda _module, context: "qsa_prefill" if context else "qsa_decode",
+        "_qsa_forward_positions": lambda *_a, **_k: object(),
+        "set_current_vllm_config": lambda _config: nullcontext(),
+        "set_forward_context": lambda *_a, **_k: nullcontext(),
+        "benchmark_with_power": bench,
+        "_persist_msa_row": lambda **kwargs: calls["rows"].append(kwargs),
+        "_cleanup": lambda: None,
+    }
+    tree = ast.parse(SRC.read_text())
+    node = copy.deepcopy(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_msa_module"))
+    node.decorator_list = []
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SRC), "exec"), namespace)
+    return namespace["run_msa_module"]
+
+
+def _nullcontext_manager(func):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def wrapped(*args, **kwargs):
+        yield func(*args, **kwargs)
+
+    return wrapped
+
+
+@pytest.mark.parametrize("attention_type", ["msa", "qsa"])
+def test_run_msa_module_prices_both_builders_from_the_new_token_budget(attention_type):
+    """Both builders size their per-step buffers from ``max_query_len``.
+
+    The serving scheduler budgets NEW tokens per step, so this is ``seq_len``
+    for a context point and ``1`` for generation — never the cached prefix.
+    """
+    calls = {"bound": [], "forwards": [], "written": [], "rows": [], "create": None, "caches": None}
+    run = _run_msa_module(attention_type=attention_type, calls=calls)
+
+    latency = run(
+        SimpleNamespace(enter_context=lambda ctx: ctx),
+        seq_len=1024,
+        batch_size=2,
+        num_heads=3,
+        kv_cache_dtype="bfloat16",
+        compute_dtype="bfloat16",
+        gemm_type="bfloat16",
+        perf_filename="/t/msa_context_module_perf.txt",
+        prefix_len=512,
+        model_path="Qwen/Qwen3.8-Flash-Next",
+        device="cuda:0",
+    )
+
+    assert latency == 3.5
+    assert calls["create"]["max_seq_len"] == 512 + 1024
+    assert calls["create"]["max_batch_size"] == 2
+    assert calls["create"]["max_query_len"] == 1024
+    assert calls["caches"] == attention_type
+    assert calls["rows"] and calls["rows"][0]["item"]["isl"] == 1024
+    assert calls["forwards"], "the dry run and the timed kernel must run"
+
+
+@pytest.mark.parametrize("builder", ["_create_msa_attention_module", "_create_qsa_attention_module"])
+def test_builder_sizes_the_step_budget_from_new_tokens_not_the_prefix(builder):
+    """Both builders take ``max_query_len`` and size the step budget from it.
+
+    The serving scheduler budgets NEW tokens per step, and each module
+    allocates its persistent selection/top-k buffer at
+    ``max_num_batched_tokens``. Sizing that from ``max_seq_len`` made a
+    1M-token QSA prefix reserve a ~4 GB packed selection buffer and the M3
+    SM100 indexer up to ~140 GB of score rows, none of which serving allocates.
+    """
+    tree = ast.parse(SRC.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == builder)
+    assert "max_query_len" in [a.arg for a in node.args.args]
+
+    config_calls = [
+        call for call in ast.walk(node) if isinstance(call, ast.Call) and ast.unparse(call.func) == "create_vllm_config"
+    ]
+    assert len(config_calls) == 1
+    options = {kw.arg: kw.value for kw in config_calls[0].keywords}
+    budget = ast.unparse(options["max_num_batched_tokens"])
+    assert "max_query_len" in budget
+    assert "max_seq_len" not in budget
+    assert "131072" in budget
+    # The KV bound still sizes the cache and the model limit.
+    assert "max_seq_len" in ast.unparse(options["num_gpu_blocks"])
+    local = {
+        target.id: ast.unparse(assign.value)
+        for assign in ast.walk(node)
+        if isinstance(assign, ast.Assign)
+        for target in assign.targets
+        if isinstance(target, ast.Name)
+    }
+    assert "max_seq_len" in local["max_model_len"]
+
+
+@pytest.mark.parametrize("attention_type", ["msa", "qsa"])
+def test_run_msa_module_writes_m3_history_only_on_the_msa_branch(attention_type):
+    """QSA's ``index_kv_cache`` is unbound; the shared history write is MSA-only."""
+    calls = {"bound": [], "forwards": [], "written": [], "rows": [], "create": None, "caches": None}
+    run = _run_msa_module(attention_type=attention_type, calls=calls)
+
+    run(
+        SimpleNamespace(enter_context=lambda ctx: ctx),
+        seq_len=1024,
+        batch_size=2,
+        num_heads=3,
+        kv_cache_dtype="bfloat16",
+        compute_dtype="bfloat16",
+        gemm_type="bfloat16",
+        perf_filename="/t/msa_context_module_perf.txt",
+        prefix_len=0,
+        model_path="Qwen/Qwen3.8-Flash-Next",
+        device="cuda:0",
+    )
+
+    if attention_type == "qsa":
+        assert calls["written"] == [], "QSA must keep the constructor's zero fill"
+    else:
+        assert len(calls["written"]) == 1
+
+
+def test_standalone_cli_offers_only_the_sparse_attention_families():
+    """``--model``'s choices (and a bare ``--quick``) must not list MLA/DSA rows.
+
+    ``get_mla_module_model_specs()`` without an ``attention_type`` returns every
+    ``mla_module`` row, so the unfiltered list offered ``deepseek-ai/DeepSeek-V3``
+    (``mla``) as a model for this collector. ``run_msa_module`` rejects that
+    type, and a bare ``--mode context --quick`` walks the same list, so the run
+    stopped on the first MLA row.
+    """
+    rows = [
+        SimpleNamespace(model_path="MiniMax/MiniMax-M3", attention_type="msa"),
+        SimpleNamespace(model_path="deepseek-ai/DeepSeek-V3", attention_type="mla"),
+        SimpleNamespace(model_path="deepseek-ai/DeepSeek-V3.2", attention_type="dsa"),
+        SimpleNamespace(model_path="Qwen/Qwen3.8-Flash-Next", attention_type="qsa"),
+    ]
+    namespace = {
+        "MLAModuleModelSpec": SimpleNamespace,
+        "_MSA_MODULE_ATTENTION_TYPES": ("msa", "qsa"),
+        "get_mla_module_model_specs": lambda **_kwargs: rows,
+    }
+    exec(
+        compile(ast.Module(body=[_function("_standalone_model_specs")], type_ignores=[]), str(SRC), "exec"),
+        namespace,
+    )
+
+    kept = namespace["_standalone_model_specs"]()
+
+    assert [spec.attention_type for spec in kept] == ["msa", "qsa"]
+    assert [spec.model_path for spec in kept] == ["MiniMax/MiniMax-M3", "Qwen/Qwen3.8-Flash-Next"]

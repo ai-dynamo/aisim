@@ -32,6 +32,7 @@ from typing import Any
 
 import yaml
 
+from aisim.fpm_cache_layout import cache_layout_markers
 from aisim.fpm_contract import (
     FPM_AUXILIARY_KINDS,
     FPM_BENCHMARK_RESULT_GLOB,
@@ -147,9 +148,40 @@ _FPM_VLLM_DECODE_FAKE_KV_ARGS = ("--no-enable-prefix-caching",)
 REMOTE_EXIT_MARKER = "__FPM_REMOTE_EXIT_CODE__="
 REMOTE_FILES_MARKER = "__FPM_REMOTE_FILES__="
 REMOTE_WORKDIR = "/tmp/fpm-bench"
+# Staging a cell is a few kilobytes over one exec channel. janus stalled that
+# channel on two of four cell stagings in this campaign (attempts 5 and 6, once
+# on each cell): kubectl reported "error: context deadline exceeded" while the
+# pod was Running and idle. The bytes were never the problem, so a transport
+# stall retries the copy it belongs to; a checksum mismatch does not.
+STAGING_ATTEMPTS = 3
+STAGING_COPY_TIMEOUT_SECONDS = 120
+STAGING_VERIFY_TIMEOUT_SECONDS = 90
+STAGING_RETRY_BACKOFF_SECONDS = 5.0
+_STAGING_STALL_MARKERS = (
+    "context deadline exceeded",
+    "deadline exceeded",
+    "i/o timeout",
+    "timeout awaiting response",
+    "connection reset",
+    "unable to upgrade connection",
+)
 _MEMORY_OBSERVER_FILES = ("fpm_memory_observer.py", "fpm_memory_worker.py", "fpm_memory_scheduler.py")
 # The source-pinned runtime adapters under runtime/, by model architecture.
 _ADAPTER_DIRS = {"DeepseekV41ForCausalLM": "dsv41", GLM_ARCHITECTURE: "glm53flash"}
+
+
+def _staging_stalled(
+    copied: subprocess.CompletedProcess[str] | None,
+    error: BaseException,
+) -> bool:
+    """True when a staging failure is a stalled exec channel, not the staged bytes."""
+
+    if isinstance(error, subprocess.TimeoutExpired):
+        return True
+    if copied is None:
+        return False
+    text = " ".join(part for part in (copied.stderr or "", copied.stdout or "", str(error)) if part).lower()
+    return any(marker in text for marker in _STAGING_STALL_MARKERS)
 
 
 def _observe_runtime_memory(plan: FPMCollectionPlan, cell: FPMCell) -> bool:
@@ -739,13 +771,6 @@ class KubernetesCellRunner:
         for pod in pods:
             self._exec_checked(pod, ["mkdir", "-p", REMOTE_WORKDIR, FPM_RESULTS_DIR], timeout=60)
             for path in files:
-                copied = self._kubectl(
-                    "cp",
-                    str(path),
-                    f"{self.namespace}/{pod}:{REMOTE_WORKDIR}/{path.name}",
-                    check=False,
-                    timeout=180,
-                )
                 remote_path = f"{REMOTE_WORKDIR}/{path.name}"
                 expected_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
                 verifier = (
@@ -754,18 +779,48 @@ class KubernetesCellRunner:
                     "actual = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None; "
                     "raise SystemExit(0 if actual == sys.argv[2] else 1)"
                 )
-                try:
-                    self._exec_checked(
-                        pod,
-                        ["python3", "-c", verifier, remote_path, expected_sha256],
-                        timeout=60,
-                    )
-                except RuntimeError as error:
-                    raise RuntimeError(
-                        f"failed to stage an exact copy of {path.name} to {pod}: "
-                        f"local_exit={copied.returncode}, "
-                        f"output={(copied.stderr or copied.stdout).strip()!r}"
-                    ) from error
+                # The transfer and its verification both ride the exec channel.
+                # A stall there says nothing about the staged bytes, so a
+                # transport stall is retried with the copy it belongs to and
+                # every attempt is reported. A checksum mismatch is a staging
+                # result, not a stall, and still fails on the first attempt.
+                for attempt in range(1, STAGING_ATTEMPTS + 1):
+                    copied: subprocess.CompletedProcess[str] | None = None
+                    try:
+                        copied = self._kubectl(
+                            "cp",
+                            str(path),
+                            f"{self.namespace}/{pod}:{REMOTE_WORKDIR}/{path.name}",
+                            check=False,
+                            timeout=STAGING_COPY_TIMEOUT_SECONDS,
+                        )
+                        self._exec_checked(
+                            pod,
+                            ["python3", "-c", verifier, remote_path, expected_sha256],
+                            timeout=STAGING_VERIFY_TIMEOUT_SECONDS,
+                        )
+                    except (RuntimeError, subprocess.TimeoutExpired) as error:
+                        if isinstance(error, _CommandCancelled):
+                            raise
+                        stalled = _staging_stalled(copied, error)
+                        if not stalled or attempt == STAGING_ATTEMPTS:
+                            output = (copied.stderr or copied.stdout).strip() if copied is not None else str(error)
+                            raise RuntimeError(
+                                f"failed to stage an exact copy of {path.name} to {pod}: "
+                                f"local_exit={None if copied is None else copied.returncode}, "
+                                f"attempts={attempt}, output={output!r}"
+                            ) from error
+                        logger.warning(
+                            "staging copy of %s to %s stalled on attempt %d/%d (%s); retrying",
+                            path.name,
+                            pod,
+                            attempt,
+                            STAGING_ATTEMPTS,
+                            error,
+                        )
+                        time.sleep(STAGING_RETRY_BACKOFF_SECONDS)
+                    else:
+                        break
 
     def prepare_attempt(
         self,
@@ -1660,6 +1715,35 @@ def _cell_generator_overrides(
             raise ValueError(
                 f"FPM decode strategy {cell.parallel_strategy!r} requires prefix caching disabled for fake-KV"
             )
+        if prefix_caching == "enabled" and _declares_recurrent_cache_layout(plan):
+            # Hybrid checkpoints keep recurrent (Mamba-spec) state groups. The
+            # real-KV warm-up refuses them unless the runtime's hybrid
+            # live-state mode is on: it skips the warm-up, then schedules a
+            # decode point with a null block table and the worker takes a CUDA
+            # illegal address. The mode is decode/agg only, so prefill cells
+            # never receive it, and it is mutually exclusive with the
+            # random-state mode that AISim does not render.
+            #
+            # The mode borrows recurrent state through a position-indexed block
+            # table: it reads the chain at the point's own block and forks the
+            # read/write span from the chain's live block. vLLM gives a Mamba
+            # group that row length only in align mode; with the default none
+            # the chain holds one state block and the first point fails with
+            # "chain ... too shallow for shadow". Align is also the mode vLLM
+            # documents as the prefix-caching default, so the collector selects
+            # it from the model config rather than leaving it to a model-config
+            # hook a checkpoint's architecture may not be wired to.
+            conflicting = policy_flags & {
+                "--benchmark-hybrid-live-state",
+                "--benchmark-randomize-kda-state",
+                "--mamba-cache-mode",
+            }
+            if conflicting:
+                raise ValueError(
+                    "recurrent cache layouts select the decode state mode from the model config; backend "
+                    f"policy cannot supply {sorted(conflicting)}"
+                )
+            scheduler_args.extend(["--benchmark-hybrid-live-state", "--mamba-cache-mode", "align"])
         workload_args = () if prefix_caching == "enabled" else _FPM_VLLM_DECODE_FAKE_KV_ARGS
     else:
         workload_args = _FPM_VLLM_PREFILL_ARGS
@@ -1682,6 +1766,25 @@ def _cell_generator_overrides(
         raise ValueError("backend policy cannot change --fpm-gpu-memory-utilization")
     merged_agg.update({"extra_cli_args": resolved_args})
     return merged
+
+
+def _declares_recurrent_cache_layout(plan: FPMCollectionPlan) -> bool:
+    """True when the plan's decode cells warm recurrent state groups through Dynamo's generic scheduler.
+
+    Hybrid checkpoints (for example a linear/recurrent layer next to full attention) keep recurrent state groups
+    that Dynamo's real-KV warm-up accepts only in hybrid live-state mode. The marker set is the same one config
+    intake uses, so the collector and intake agree on which checkpoints those are. GLM-5.3-Flash is excluded:
+    its producer seeds real KV through its own scheduler and its runtime probe is bound to that launch, so a
+    state-mode flag here would change an accepted probe/collection pair.
+    """
+
+    capability = getattr(plan, "capability", None)
+    if getattr(capability, "architecture", None) == GLM_ARCHITECTURE:
+        return False
+    model_config = getattr(capability, "model_config", None)
+    if model_config is None:
+        return False
+    return bool(cache_layout_markers(model_config.effective_payload, capability.architecture))
 
 
 def _decode_prefix_caching_mode(plan: FPMCollectionPlan, cell: FPMCell) -> str:

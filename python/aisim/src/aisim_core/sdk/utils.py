@@ -1547,6 +1547,145 @@ def _parse_hf_config_json(config: dict) -> dict:
             f"full_attn_layers={extra_params.layer_types.count('full_attention')}, "
             f"num_experts={extra_params.num_experts}"
         )
+    elif architecture == "Qwen4ExpForConditionalGeneration":
+        # Qwen3.8-Flash-Next: GDN + QSA hybrid decoder with gated residual
+        # ("hyper-connection") and n-gram PLE branches.
+        #
+        # ``layer_types`` sizes the 48 decoder layers only; the MTP draft layer is
+        # described separately under ``mtp.layer_types``. Trim defensively if a
+        # future revision concatenates them, matching the Step3p7 branch.
+        layer_types_raw = config.get("layer_types", [])
+        mtp_layers = int(config.get("mtp_num_hidden_layers", 0) or 0)
+        if mtp_layers and len(layer_types_raw) == layers + mtp_layers:
+            layer_types_raw = layer_types_raw[:layers]
+        if len(layer_types_raw) != layers:
+            raise ValueError(
+                f"Qwen3.8-Flash-Next layer_types length {len(layer_types_raw)} != "
+                f"num_hidden_layers {layers} (mtp_num_hidden_layers={mtp_layers})"
+            )
+        if any(lt not in ("linear_attention", "full_attention") for lt in layer_types_raw):
+            raise ValueError("Qwen3.8-Flash-Next layer_types must contain only 'linear_attention' or 'full_attention'")
+
+        # QSA compressed indexer. block_topk is what the sparse kernel selects; the
+        # runtime accepts only 512 or 2048, so an unsupported ratio is a hard error
+        # rather than a silently mis-sized attention cost.
+        indexer_budget = int(config["indexer_budget"])
+        indexer_compress_ratio = int(config["indexer_compress_ratio"])
+        if indexer_compress_ratio <= 0 or indexer_budget % indexer_compress_ratio:
+            raise ValueError(
+                "Qwen3.8-Flash-Next indexer_budget must be a positive multiple of "
+                f"indexer_compress_ratio; got budget={indexer_budget}, "
+                f"ratio={indexer_compress_ratio}"
+            )
+        block_topk = indexer_budget // indexer_compress_ratio
+        if block_topk not in (512, 2048):
+            raise ValueError(
+                "Qwen3.8-Flash-Next QSA block top-k (indexer_budget // "
+                f"indexer_compress_ratio) must be 512 or 2048; got {block_topk}"
+            )
+
+        hc_count = int(config.get("hc_count", 0) or 0)
+        hc_lowrank = int(config.get("hc_lowrank", 0) or 0)
+        if hc_count <= 0 or hc_lowrank <= 0:
+            raise ValueError(
+                "Qwen3.8-Flash-Next requires positive hc_count/hc_lowrank for the "
+                f"gated-residual branches; got hc_count={hc_count}, hc_lowrank={hc_lowrank}"
+            )
+
+        # ple_layer_ids are 1-BASED (runtime: ``(layer_id + 1) in ple_layer_ids``).
+        # A 0 or an out-of-range id means the config changed convention, which
+        # would move the PLE branch onto the wrong layer and misprice the model.
+        ple_layer_ids = tuple(int(idx) for idx in (config.get("ple_layer_ids") or ()))
+        invalid = [idx for idx in ple_layer_ids if idx < 1 or idx > layers]
+        if invalid:
+            raise ValueError(
+                "Qwen3.8-Flash-Next ple_layer_ids are 1-based decoder layer ids and "
+                f"must be within [1, {layers}]; got {sorted(ple_layer_ids)}"
+            )
+        # The runtime tests membership, so a repeated id is still one branch on
+        # the device. Building one PLE branch (and one 51.2e9-parameter table)
+        # per list entry would price a table the process never allocates.
+        if len(set(ple_layer_ids)) != len(ple_layer_ids):
+            raise ValueError(f"Qwen3.8-Flash-Next ple_layer_ids must not repeat a layer; got {sorted(ple_layer_ids)}")
+
+        # The six PLE geometry fields have no safe zero. A missing key would emit
+        # a zero-width table plus zero-width ``key_proj``/``value_proj`` GEMMs —
+        # no error, no FLOPs — and silently drop 51.2e9 parameters (the n-gram
+        # table) from the resident-weights inventory. Validate them only when the
+        # branch is active so a config without PLE stays parseable.
+        ple_embed_dim = int(config.get("ple_embed_dim", 0) or 0)
+        ple_conv_kernel_size = int(config.get("ple_conv_kernel_size", 0) or 0)
+        ngram_size = int(config.get("ngram_size", 0) or 0)
+        heads_per_ngram = int(config.get("heads_per_ngram", 0) or 0)
+        ngram_vocab_size_base = int(config.get("ngram_vocab_size_base", 0) or 0)
+        split_ngram_parts = int(config.get("split_ngram_parts", 0) or 0)
+        if ple_layer_ids:
+            ple_geometry = {
+                "ple_embed_dim": ple_embed_dim,
+                "ple_conv_kernel_size": ple_conv_kernel_size,
+                "ngram_size": ngram_size,
+                "heads_per_ngram": heads_per_ngram,
+                "ngram_vocab_size_base": ngram_vocab_size_base,
+                "split_ngram_parts": split_ngram_parts,
+            }
+            non_positive = sorted(name for name, value in ple_geometry.items() if value <= 0)
+            if non_positive:
+                raise ValueError(
+                    "Qwen3.8-Flash-Next carries a PLE branch on "
+                    f"ple_layer_ids={sorted(ple_layer_ids)} but these geometry fields are "
+                    f"missing or non-positive: {non_positive}"
+                )
+
+        output_gate_type = config.get("output_gate_type")
+        if output_gate_type not in (None, "sigmoid"):
+            raise ValueError(
+                f"Qwen3.8-Flash-Next modeling supports output_gate_type='sigmoid' only; got {output_gate_type!r}"
+            )
+
+        extra_params = common.Qwen4ExpConfig(
+            layer_types=tuple(layer_types_raw),
+            linear_num_key_heads=config["linear_num_key_heads"],
+            linear_key_head_dim=config["linear_key_head_dim"],
+            linear_num_value_heads=config["linear_num_value_heads"],
+            linear_value_head_dim=config["linear_value_head_dim"],
+            linear_conv_kernel_dim=config["linear_conv_kernel_dim"],
+            indexer_n_heads=int(config["indexer_n_heads"]),
+            indexer_kv_heads=int(config["indexer_kv_heads"]),
+            indexer_head_dim=int(config["indexer_head_dim"]),
+            indexer_budget=indexer_budget,
+            indexer_compress_ratio=indexer_compress_ratio,
+            hc_count=hc_count,
+            hc_lowrank=hc_lowrank,
+            ple_layer_ids=ple_layer_ids,
+            ple_embed_dim=ple_embed_dim,
+            ple_conv_kernel_size=ple_conv_kernel_size,
+            ngram_size=ngram_size,
+            heads_per_ngram=heads_per_ngram,
+            ngram_vocab_size_base=ngram_vocab_size_base,
+            split_ngram_parts=split_ngram_parts,
+            topk=topk,
+            num_experts=num_experts,
+            moe_inter_size=moe_inter_size,
+            shared_expert_inter_size=config.get("shared_expert_intermediate_size", 0),
+            mtp_num_hidden_layers=mtp_layers,
+            vision_config=_parse_qwen_vision_encoder_config(
+                vision_cfg,
+                expected_out_hidden_size=hidden_size,
+                supports_deepstack=False,
+                partial_rotary_factor=1.0,
+            ),
+            image_token_id=image_token_id,
+            video_token_id=video_token_id,
+        )
+        logger.info(
+            f"Qwen3.8-Flash-Next config: architecture={architecture}, "
+            f"gdn_layers={extra_params.layer_types.count('linear_attention')}, "
+            f"qsa_layers={extra_params.layer_types.count('full_attention')}, "
+            f"qsa_block_topk={extra_params.qsa_block_topk}, "
+            f"num_experts={extra_params.num_experts}, topk={extra_params.topk}, "
+            f"hc_count={extra_params.hc_count}, hc_lowrank={extra_params.hc_lowrank}, "
+            f"ple_layer_ids={extra_params.ple_layer_ids}, mtp_layers={mtp_layers}"
+        )
     elif architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration"):
         extra_params = _parse_qwen_vision_encoder_config(
             vision_cfg,

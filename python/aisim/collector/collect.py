@@ -15,7 +15,7 @@ import logging
 import os
 import warnings
 
-from helper import cuda_context_error, get_device_module, get_device_str
+from helper import FatalCollectError, cuda_context_error, get_device_module, get_device_str
 
 
 def setup_warning_filters():
@@ -1745,6 +1745,38 @@ def collect_module_safe(
         ]
 
 
+def _drain_undispatched(queue) -> int:
+    """Drop an op's never-started tasks, preserving one worker sentinel each.
+
+    Called when a task fails on a resource the whole op shares (a perf-log file
+    with an unusable header, a parked ``.retained`` twin, an unowned inode):
+    every remaining case of that op would re-hit the same error after paying a
+    full case setup. Tasks already handed to other workers keep running;
+    everything still queued is dropped so the executor records it as never
+    dispatched (not as failed, which would make ``--resume-retry-failed`` re-run
+    it behind the same broken file).
+
+    The ``None`` sentinels must go back: they are the only way a worker leaves
+    its ``queue.get()`` loop, so swallowing one would strand a live worker.
+    """
+    from queue import Empty
+
+    dropped = 0
+    sentinels = 0
+    while True:
+        try:
+            item = queue.get_nowait()
+        except Empty:
+            break
+        if item is None:
+            sentinels += 1
+        else:
+            dropped += 1
+    for _ in range(sentinels):
+        queue.put(None)
+    return dropped
+
+
 def worker(
     queue,
     device_id: int,
@@ -1883,6 +1915,23 @@ def worker(
             # Force flush logs before any potential exit
             for handler in worker_logger.handlers:
                 handler.flush()
+
+            if isinstance(e, FatalCollectError):
+                # The broken resource belongs to the op, not to this point: every
+                # remaining case would fail the same way after paying its setup.
+                # Drop the never-dispatched tasks (the executor records them as
+                # orphans, outside the failed ledger, so --resume requeues them)
+                # and stop this worker instead of walking the whole queue.
+                dropped = _drain_undispatched(queue)
+                # The traceback is already logged above; this line carries the
+                # consequence (how many points were dropped and why the run ends).
+                worker_logger.error(  # noqa: TRY400
+                    f"Fatal {type(e).__name__} on task {task_id}: dropping {dropped} undispatched "
+                    f"task(s) of {module_name}; the collection stops here, a plain --resume requeues them"
+                )
+                for handler in worker_logger.handlers:
+                    handler.flush()
+                exit(0)
 
             # Message matching alone misses launcher wrappers that hide the CUDA
             # error text (FlashInfer's "Got CUDA error. See above for details."):

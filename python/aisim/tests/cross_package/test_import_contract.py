@@ -111,6 +111,7 @@ CORE_SDK_LEAF_MODULES = [
     "models.nemotron_nas",
     "models.qwen35",
     "models.qwen3vl",
+    "models.qwen4_exp",
     "models.step3p7",
     "models.vit_ops",
     "operations.attention",

@@ -614,7 +614,10 @@ def _model_case_matches_path(value: dict, model_path: str) -> bool:
 
 def _model_case_values(op_name: str, *, apply_model_filter: bool = True) -> list[dict]:
     values = []
-    skipped = _SKIPPED_MODELS.get() if apply_model_filter else frozenset()
+    # A skipped model is skipped for the plan, not just for the targeted-run
+    # filter: without_models() must reach every model-row read, including the
+    # ones that pass apply_model_filter=False to bypass COLLECTOR_MODEL_PATH.
+    skipped = _SKIPPED_MODELS.get()
     for data in _load_model_cases_data():
         if data.get("architecture") in skipped:
             continue
@@ -647,7 +650,9 @@ def _model_case_values(op_name: str, *, apply_model_filter: bool = True) -> list
 
 def _framework_specific_model_case_values(op_name: str, backend: str, *, apply_model_filter: bool = True) -> list[dict]:
     values = []
-    skipped = _SKIPPED_MODELS.get() if apply_model_filter else frozenset()
+    # Skipped models stay out of every model-row read; only the targeted-run
+    # filter follows apply_model_filter (see _model_case_values).
+    skipped = _SKIPPED_MODELS.get()
     for data in _load_model_cases_data():
         if data.get("architecture") in skipped:
             continue
@@ -695,8 +700,12 @@ class MLAModuleModelSpec:
     wideep_mla: bool
     # Declared real tensor-parallel shards of this model (case_authoring's
     # model-correlated narrowing). When set, the module plans time only the
-    # per-rank heads these shards run (native_num_heads // tp) from the shared
-    # head grid.
+    # per-rank heads these shards run (native_num_heads // tp) instead of
+    # sweeping the shared inner_sweep_head_counts grid. MSA rows declare the
+    # shards they are actually served at (owner decision 2026-09-29: MSA is one
+    # fixed geometry, MiniMax-M3 64q/4kv/4idx; TP 16 is the ceiling), and a QSA
+    # row declares its serving shards because its per-rank head counts
+    # (Qwen4-Exp QSA: 24/12/6/3 at TP 1/2/4/8) are outside that grid.
     tensor_parallel_sizes: tuple[int, ...] | None = None
 
 
@@ -744,7 +753,12 @@ class MLAModulePrecisionSpec:
     attention_types: tuple[str, ...] = ("mla", "dsa")
 
 
-_MLA_MODULE_ATTENTION_TYPES = ("mla", "dsa", "msa")
+_MLA_MODULE_ATTENTION_TYPES = ("mla", "dsa", "msa", "qsa")
+# Combos that omit ``attention_types`` expand to exactly this set. It is
+# deliberately separate from the validation tuple above: adding a new
+# attention type must not retroactively attach it to every combo that was
+# written before it existed (that would silently grow existing plans).
+_MLA_MODULE_DEFAULT_ATTENTION_TYPES = ("mla", "dsa", "msa")
 
 
 def get_mla_module_model_specs(
@@ -826,7 +840,7 @@ def get_mla_module_model_specs(
             if backend == "vllm" and value.get("attention_type") == "dsa"
         }
         for spec in specs:
-            key = (spec.attention_type, spec.architecture if spec.attention_type in ("dsa", "msa") else None)
+            key = (spec.attention_type, spec.architecture if spec.attention_type in ("dsa", "msa", "qsa") else None)
             if key in canonical_specs:
                 if spec.attention_type == "dsa" and spec.model_path in preferred_dsa_paths:
                     collapsed.setdefault(key, []).append(canonical_specs[key].model_path)
@@ -845,6 +859,63 @@ def get_mla_module_model_specs(
             )
 
     return specs
+
+
+def get_msa_head_counts(backend: str | None = None) -> list[int]:
+    """Per-rank head axis for the MSA module collectors, descending.
+
+    Derived from the declared MSA model rows: ``native_num_heads // tp`` for
+    each ``tensor_parallel_sizes`` entry (falling back to the sweep's
+    ``module_tp_sizes`` when a row declares none). MSA serves one fixed
+    geometry, so unlike GQA attention there is no shared head grid to sweep;
+    head counts no real shard produces (48/96 -> 3/6 index heads) are never
+    generated.
+    """
+    sweep = get_mla_module_sweep_spec(backend)
+    heads: set[int] = set()
+    for spec in get_mla_module_model_specs(attention_type="msa", backend=backend):
+        tp_sizes = spec.tensor_parallel_sizes or tuple(sweep.module_tp_sizes)
+        for tp in tp_sizes:
+            if spec.native_num_heads % tp == 0:
+                heads.add(spec.native_num_heads // tp)
+    if not heads:
+        raise ValueError("mla_module: no MSA model row yields a per-rank head count (check tensor_parallel_sizes)")
+    return sorted(heads, reverse=True)
+
+
+def get_mla_module_model_aliases(model_path: str, *, backend: str | None = None) -> tuple[str, ...]:
+    """Declared artifact aliases of one mla_module model row.
+
+    Aliases (base/FP8/NVFP4 spellings of the same physical case) never produce
+    their own spec, so callers that receive a checkpoint path — a targeted
+    collector run, a CLI ``--model`` — need this to resolve back to the
+    representative row.
+    """
+    values = _model_case_values("mla_module", apply_model_filter=False)
+    if backend is not None:
+        values.extend(_framework_specific_model_case_values("mla_module", backend, apply_model_filter=False))
+    for value in values:
+        if str(value.get("model_path")) == model_path:
+            return tuple(str(alias) for alias in (value.get("model_aliases") or ()))
+    return ()
+
+
+def get_mla_module_model_head_counts(
+    model_spec: MLAModuleModelSpec,
+    *,
+    extra_tp_sizes: tuple[int, ...] | list[int] = (),
+) -> list[int]:
+    """Per-rank query-head counts this model declares as exact serving shapes.
+
+    A module row is collected at one TP rank's shard (the collector bakes the
+    sharded head count into the module), so the model's own ``native_num_heads
+    // tp`` is the only shape that reproduces serving. Those ranks come from
+    the model row's ``tensor_parallel_sizes`` plus any extra TP axis the caller
+    already sweeps; a rank that does not divide the head count is skipped.
+    """
+    native = int(model_spec.native_num_heads)
+    tp_sizes = sorted({int(tp) for tp in (*(model_spec.tensor_parallel_sizes or ()), *extra_tp_sizes)})
+    return sorted({native // tp for tp in tp_sizes if tp > 0 and native % tp == 0})
 
 
 def _required_mapping(value: object, *, field_name: str) -> dict[str, object]:
@@ -912,7 +983,7 @@ def get_mla_module_precision_specs(
         elif not isinstance(phases, tuple):
             raise TypeError("mla_module.module_precision_combos phases must be a string or list")
 
-        attention_types = combo.get("attention_types", _MLA_MODULE_ATTENTION_TYPES)
+        attention_types = combo.get("attention_types", _MLA_MODULE_DEFAULT_ATTENTION_TYPES)
         if isinstance(attention_types, str):
             attention_types = (attention_types,)
         elif isinstance(attention_types, list):

@@ -3,43 +3,81 @@
 # Portions adapted from vLLM dd10e03f95f94edbea1975c67ace3a35ec9a8a40.
 # Copyright contributors to the vLLM project. Modified for collector execution.
 
-# Versions are upgraded IN PLACE: this file always
-# targets the manifest pin; prior-version code is `git log -- <this file>`
-# away and prior-version DATA stays permanent under its version key. Every
-# vLLM citation below without a version is @v0.32.0 (paths under vllm/,
-# model paths under vllm/models/minimax_m3/).
+# Two routes share this module because they share one op (msa_module) and one
+# perf table:
+#   * MiniMax-M3 MSA (vllm/models/minimax_m3/ +
+#     MinimaxM3QKVParallelLinearWithIndexer +
+#     fused_minimax_m3_qknorm_rope_kv_insert). B200 0.25.0 validation: job
+#     1968755 passed 8 context and 6 generation cases after matching serving
+#     inference mode, positions, and THK top-k layout. The 0.24->0.29
+#     adaptations each carry a serving citation @0.29.0; the route follows the
+#     `msa` family pin, which moved to 0.32.0.
+#   * Qwen4-Exp QSA (Qwen3.8-Flash-Next) — the release that ships
+#     vllm/models/qwen4_exp/ (Qwen4ExpQSAAttention +
+#     Qwen4ExpQSAFlashAttentionBackend/Impl + the QSA side caches).
+# Versions are upgraded IN PLACE (owner policy 2026-09-20): a route targets the
+# manifest pin its run resolves, prior-version code is `git log -- <this file>`
+# away, and prior-version DATA stays permanent under its version key. One
+# release per file: the QSA route was built and collected on 0.31.0, then moved
+# with the `msa` family to 0.32.0 per the pin-consolidation rule (like the
+# GLM-5.3 model pin before it). The 0.31.0 Qwen tables stay under their
+# version key; a re-collection runs on 0.32.0 and lands under that key.
 __compat__ = "vllm==0.32.0"
 
 """
-MSA Module Collector for vLLM — MiniMax-M3 sparse-attention benchmarking.
+MSA Module Collector for vLLM — MiniMax-M3 sparse attention and Qwen4-Exp QSA.
 
-Profiles the complete MiniMax-M3 sparse-attention module forward pass
-(fused qkv+index projection, fused per-head Gemma QK norm + partial RoPE +
-paged KV/index-cache insert, lightning-indexer top-k block selection,
-block-sparse GQA attend, output projection), not a bare kernel. Uses vLLM's
-own modeling code (``MiniMaxM3SparseAttention``, the exact module
-``MiniMaxM3DecoderLayer`` builds for sparse layers — nvidia/model.py:712-720)
-with dummy weights, the same framework-builder approach as
-``collect_mla_module.py``.
+Profiles the complete sparse-attention module forward pass, not a bare
+kernel. Both attention types land in one op/table because the registry maps
+one op to one module: ``msa_module`` rows are keyed by ``architecture``
+(MiniMaxM3ForCausalLM vs Qwen4ExpForConditionalGeneration), which is what the
+consumer selects on.
 
-Kernel dispatch is the framework's own: the attend backend and impl are chosen
-by ``select_main_backend_and_impl_cls`` (Triton off the SM100 family; the
-fmha_sm100 "MSA" attend on it for top-k 4/8/16/32 and a non-e5m2 KV cache —
-common/sparse_attention.py:525-587) and the indexer impl by
-``select_indexer_impl_cls`` (fmha_sm100 score + top-k on the SM100 family at
-top-k 16, Triton elsewhere — common/indexer.py:495-550), both at module
-construction (nvidia/model.py:518-550). ``kernel_source`` records the
-actually-selected attend impl class. Per-SM validation state lives in the
-registry's ``unverified_sms``.
+MiniMax-M3 (``attention_type: msa``): fused qkv+index projection, fused
+per-head Gemma QK norm + partial RoPE + paged KV/index-cache insert, lightning
+-indexer top-k block selection, block-sparse GQA attend, output projection.
+Uses vLLM's own modeling code (``MiniMaxM3SparseAttention``, the exact module
+``MiniMaxM3DecoderLayer`` builds for sparse layers —
+vllm/models/minimax_m3/nvidia/model.py:671-679@v0.24.0) with dummy weights,
+the same framework-builder approach as ``collect_mla_module.py``.
+
+Qwen4-Exp QSA (``attention_type: qsa``): fused qkv+output-gate projection +
+fused Gemma QK norm/RoPE/gate, QSA index projection + layer norms + fused pre
+-indexer (RoPE + ring write + group compress), sparse paged attend, output
+projection. Uses ``Qwen4ExpQSAAttention`` (the module
+``Qwen4ExpAttentionDecoderLayer`` builds for every ``full_attention`` layer of
+Qwen3.8-Flash-Next) on the real checkpoint config, so the multimodal/MRoPE
+and fused-path decisions are serving's own
+(vllm/models/qwen4_exp/nvidia/qsa.py@v0.31.0).
+
+Measurement deviation on that route: M3's index-key history seed
+(``_write_index_key_history``) and the M3 index-projection weight seed
+(``_give_index_projection_values``, MiniMax's fused qkv+index layout) are both
+MSA-only. QSA keeps the allocator's zero fill in its main and two side caches
+and the constant dummy fill in its fused index projections: that is the
+condition the accepted C3.3 QSA rows were measured under, and re-seeding it
+would move a table already in the dataset. The block choice is
+score-dependent, but the timed top-k work is the selected block count, which
+the geometry fixes.
+
+Kernel dispatch is the framework's own in both cases: the MSA attend impl is
+chosen by ``select_main_impl_cls`` (Triton on non-SM100, fmha_sm100 "MSA"
+attend on the SM100 family — common/sparse_attention.py:391-422@v0.24.0), the
+MSA indexer impl by ``select_indexer_impl_cls``, and the QSA backend is fixed
+by the owning module (``Qwen4ExpQSAFlashAttentionBackend``). ``kernel_source``
+records the actually-selected impl/route. Hardware-validated on SM90; other
+SMs carry registry ``unverified_sms`` markers until validated.
 
 Supported models and micro-sweeps come from collector v2 YAML
-(``cases/models/MiniMaxM3ForCausalLM_cases.yaml`` `mla_module` rows with
-``attention_type: msa`` + ``cases/base_ops/mla_module.yaml`` vllm override).
+(``cases/models/*_cases.yaml`` `mla_module` rows with
+``attention_type: msa`` or ``qsa`` + ``cases/base_ops/mla_module.yaml`` vllm
+override).
 
 Usage:
     python collect_msa_module.py --mode context --model MiniMaxAI/MiniMax-M3
     python collect_msa_module.py --mode generation --quick --batch-size 4 --seq-len 2048 --num-heads 64
     python collect_msa_module.py --mode context --quick --kv-cache-dtype fp8
+    python collect_msa_module.py --mode generation --quick --model Qwen/Qwen3.8-Flash-Next --num-heads 3 --seq-len 4096
 """
 
 import argparse
@@ -77,12 +115,19 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from collector.case_generator import get_mla_module_model_specs
-from collector.helper import _resolve_local_model_path, benchmark_with_power, get_sm_version, log_perf
+from collector.case_generator import MLAModuleModelSpec, get_mla_module_model_specs
+from collector.helper import (
+    PerfLogError,
+    _resolve_local_model_path,
+    benchmark_with_power,
+    get_sm_version,
+    log_perf,
+)
 from collector.op_plans import plan, plan_cases
 from collector.registry_types import PerfFile
 from collector.vllm.utils import (
     BatchSpec,
+    common_attn_num_computed_tokens_cpu,
     create_common_attn_metadata,
     create_vllm_config,
     enable_engine_fused_ops,
@@ -97,6 +142,9 @@ if "minimax_m3" not in _CONFIG_REGISTRY:
 # ═══════════════════════════════════════════════════════════════════════
 # Test Cases — aligned with TRT-LLM's collect_msa_module.py
 # ═══════════════════════════════════════════════════════════════════════
+
+
+_MSA_MODULE_ATTENTION_TYPES = ("msa", "qsa")
 
 
 # Native MiniMax-M3 GQA ratio: 64 q heads / 4 kv heads (bundled config
@@ -141,13 +189,28 @@ def _generation_kv_footprint_bytes(total_tokens: int, num_heads: int, kv_cache_d
     return total_tokens * entry_bytes
 
 
-def _kv_does_not_fit(total_tokens: int, num_heads: int, kv_cache_dtype: str, total_memory: int) -> str | None:
+def _kv_does_not_fit(
+    total_tokens: int,
+    num_heads: int,
+    kv_cache_dtype: str,
+    total_memory: int,
+    *,
+    footprint=None,
+    num_requests: int = 1,
+) -> str | None:
     """Why a generation point's KV cache cannot fit the device, or None when it can.
 
     The module plans do not depend on the device, so the run refuses such a
-    point before allocating it.
+    point before allocating it. ``footprint`` supplies the checkpoint's own
+    bytes/token model (QSA's geometry is nothing like the M3 constants), and
+    defaults to the M3 one. ``num_requests`` is the batch: QSA's raw-key ring
+    is one fixed-size block per request, so its cost does not follow the token
+    count.
     """
-    needed = _generation_kv_footprint_bytes(total_tokens, num_heads, kv_cache_dtype)
+    if footprint is None:
+        needed = _generation_kv_footprint_bytes(total_tokens, num_heads, kv_cache_dtype)
+    else:
+        needed = footprint(total_tokens, num_heads, kv_cache_dtype, num_requests=num_requests)
     allowed = int(total_memory * _MEMORY_BUDGET_SAFETY_FACTOR)
     if needed <= allowed:
         return None
@@ -155,6 +218,118 @@ def _kv_does_not_fit(total_tokens: int, num_heads: int, kv_cache_dtype: str, tot
         f"FIXME(kernel-limit): does not fit: the KV cache needs {needed / 2**30:.1f} GiB, "
         f"the device allows {allowed / 2**30:.1f} GiB ({_MEMORY_BUDGET_SAFETY_FACTOR:g} of its memory)"
     )
+
+
+def _qsa_text_config(model_path: str) -> dict:
+    """Return the checkpoint's Qwen4-Exp text config (outer config if text-only).
+
+    The QSA module builder and the memory filter both key on the text
+    geometry, so this is the single place that resolves it. A checkpoint
+    without the QSA indexer schema raises instead of silently producing MSA
+    shapes under a QSA label.
+    """
+    local_model_path = _resolve_local_model_path(model_path)
+    with open(os.path.join(local_model_path, "config.json")) as f:
+        cfg = json.load(f)
+    text_cfg = cfg.get("text_config") or cfg
+    required = (
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "indexer_n_heads",
+        "indexer_kv_heads",
+        "indexer_head_dim",
+        "indexer_budget",
+        "indexer_compress_ratio",
+    )
+    missing = [name for name in required if text_cfg.get(name) is None]
+    if missing:
+        raise ValueError(
+            f"model {model_path} is missing the QSA indexer/config fields {missing}; "
+            "the msa_module collector only supports Qwen4-Exp checkpoints for "
+            "attention_type qsa"
+        )
+    return text_cfg
+
+
+def _uses_mrope_from_config(text_cfg: dict) -> bool:
+    """Whether the rotary embedding exposes MRoPE (``mrope_section`` present).
+
+    Mirrors vLLM's own detection (``uses_mrope`` reads the rope parameters of
+    the config or its text config, transformers_utils/config.py:716-726
+    @v0.31.0), which is what selects MRotaryEmbedding and therefore the
+    ``(3, num_tokens)`` position shape.
+    """
+    rope = text_cfg.get("rope_parameters") or text_cfg.get("rope_scaling") or {}
+    return bool(rope.get("mrope_section"))
+
+
+def _qsa_generation_kv_footprint_bytes(model_path: str):
+    """Build the QSA generation-memory filter for one checkpoint.
+
+    Geometry comes from the checkpoint's own text config because QSA is a GQA
+    full-attention layer (24 q / 2 kv heads, head_dim 256) plus two index side
+    caches — nothing like the M3 ratio/head_dim constants above. Per token:
+    the paged main K/V (2 x kv_heads x head_dim; 1 B/elem for the fp8 cache's
+    uint8 storage) and the compressed key cache (one state per
+    ``indexer_compress_ratio`` tokens). Per REQUEST: the raw-key ring, which
+    ``QSAKeyStateCache.get_kv_cache_spec`` declares as a ``CircularBufferSpec``
+    of ``compress_ratio * cdiv(compress_ratio + num_speculative_tokens,
+    compress_ratio)`` rows (one block per request, independent of the cached
+    length) carrying ``index_head_dim`` BF16 keys and three int64 MRoPE axes
+    (``common/qsa_cache.py@v0.32.0``; the module bench sets no speculative
+    tokens, so the capacity is one group). Module weights, metadata and the
+    selection buffer are excluded so the estimate stays a provable lower bound,
+    exactly like the M3 filter.
+    """
+    text_cfg = _qsa_text_config(model_path)
+    head_dim = int(text_cfg["head_dim"])
+    native_q = int(text_cfg["num_attention_heads"])
+    native_kv = int(text_cfg["num_key_value_heads"])
+    gqa_ratio = max(1, native_q // native_kv)
+    index_dim = int(text_cfg["indexer_head_dim"])
+    compress_ratio = int(text_cfg["indexer_compress_ratio"])
+    # QSAKeyStateCache pads the raw key to the int64 word and appends the three
+    # int64 MRoPE axes when the model caches positions; without MRoPE the
+    # stored head is exactly ``index_head_dim`` BF16 elements.
+    if _uses_mrope_from_config(text_cfg):
+        storage_key_words = -(-index_dim // 4) * 4 + 3 * 4
+    else:
+        storage_key_words = index_dim
+    # The module bench runs no speculative decoding, so the ring capacity is
+    # one committed group: compress_ratio * cdiv(compress_ratio, compress_ratio).
+    ring_capacity = compress_ratio
+
+    def footprint(total_tokens: int, num_heads: int, kv_cache_dtype: str, *, num_requests: int) -> int:
+        kv_heads = max(1, num_heads // gqa_ratio)
+        main_bytes_per_elem = 1 if kv_cache_dtype == "fp8" else 2
+        main = 2 * kv_heads * head_dim * main_bytes_per_elem
+        compressed = (index_dim * 2) / compress_ratio
+        ring = num_requests * ring_capacity * storage_key_words * 2
+        return int(total_tokens * (main + compressed)) + ring
+
+    return footprint
+
+
+def _attention_type_for_model(model_path: str) -> str:
+    """Resolve a case's attention type from its declared model row.
+
+    The case tuple keeps the trtllm/sglang positional prefix (no
+    attention_type field), so the worker looks it up here. An undeclared
+    model_path raises: guessing would run a MiniMax module under a Qwen4-Exp
+    row or vice versa.
+    """
+    matches = {
+        spec.attention_type
+        for spec in get_mla_module_model_specs(backend="vllm", apply_model_filter=False)
+        if spec.model_path == model_path
+    }
+    if len(matches) != 1:
+        raise ValueError(
+            f"model {model_path!r} resolves to {sorted(matches) or 'no'} mla_module "
+            "attention type(s); exactly one is required to pick the module builder"
+        )
+    return matches.pop()
 
 
 def get_msa_context_module_test_cases():
@@ -429,6 +604,28 @@ def _create_msa_attention_module(
             topk_indices_buffer=topk_indices_buffer,
         )
 
+    attn_module = _finalize_module_weights(attn_module, vllm_config, device, seed_index=_give_index_projection_values)
+
+    return attn_module, vllm_config, original_architecture
+
+
+def _finalize_module_weights(attn_module, vllm_config, device: str, *, seed_index=None):
+    """Move the module to ``device`` and load deterministic dummy weights.
+
+    Shared by the MSA and QSA builders: both construct the module inside the
+    framework with meta-device parameters under a serialized quant config, so
+    the move, the dummy fill, and the loader's
+    ``process_weights_after_loading`` step are identical.
+
+    ``seed_index`` is the architecture's own index-projection seeder, run after
+    the dummy fill and before ``process_weights_after_loading`` (serving's load
+    order). The MSA builder passes ``_give_index_projection_values``, which
+    reads MiniMax's fused qkv+index layout (``index_q_size``, ``idx_head_dim``,
+    ``qkv_proj``). The QSA builder passes none: its fused ``index_qk_proj`` has
+    a different layout (``index_qk_size``), and the accepted QSA rows were
+    measured with the constant fill, so seeding it here would change the
+    measurement conditions of a table already in the dataset.
+    """
     # Serialized quant configs create weight params on meta device; to()
     # cannot copy meta tensors, so use to_empty() when needed.
     attn_module = _move_to_device(attn_module, device)
@@ -458,7 +655,8 @@ def _create_msa_attention_module(
                 tensor.data.fill_(0.5)
             else:
                 tensor.data.fill_(0.01)
-    _give_index_projection_values(attn_module)
+    if seed_index is not None:
+        seed_index(attn_module)
 
     # Process weights, mimicking vLLM's model loader (quantized-layout
     # conversion; no-op for unquantized linears).
@@ -469,6 +667,187 @@ def _create_msa_attention_module(
             quant_method = getattr(module, "quant_method", None)
             if isinstance(quant_method, QuantizeMethodBase):
                 quant_method.process_weights_after_loading(module)
+    return attn_module
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# QSA module construction (Qwen4-Exp / Qwen3.8-Flash-Next)
+# ═══════════════════════════════════════════════════════════════════════
+
+# The QSA backend publishes ``MultipleOf(16)`` kernel block sizes
+# (Qwen4ExpQSAFlashAttentionBackend.get_supported_kernel_block_sizes,
+# qsa.py@v0.32.0) and the ring key-state cache asserts the attention block
+# size is divisible by its capacity (compress_ratio 4 + speculative lookahead
+# → 4), so 16 is the smallest block the kernel accepts.
+#
+# RECORDED DEVIATION — serving does not keep 16 for this checkpoint. Qwen4-Exp
+# is hybrid (36 GDN + 12 QSA layers), so
+# ``Platform.update_block_size_for_backend`` runs ``_align_hybrid_block_size``
+# (platforms/interface.py@v0.32.0), which raises ``block_size`` until one
+# attention page covers the mamba page and overrides even an explicit
+# ``--block-size``:
+#
+#     block_size >= mamba_page_size / (2 * kv_heads_per_tp * head_dim * dtype_bytes)
+#
+# The GDN recurrent state the SDK prices in ``_gdn_state_bytes_per_request`` is
+# 110.11 MiB per request at BF16 TP1 and 13.76 MiB at TP8, so serving resolves
+# ~56,376 tokens (TP1) and ~14,094 (TP8), not 16. This harness builds one
+# attention layer and no mamba spec, so it cannot run that alignment; it times
+# the QSA kernel at the backend's minimum block instead.
+#
+# Timing effect: the attended token count is ``indexer.token_topk`` from the
+# checkpoint config (checked at construction), not ``block_size``, so the
+# kernel's arithmetic per token is the same. What differs is the block table
+# the kernel walks and the compressed pool's page granularity
+# (``block_size / compress_ratio`` tokens per compressed page): at 16 that page
+# is 4 tokens, at 14,094 it is 3,523, i.e. ~880x fewer, much larger pages. These
+# rows therefore price the QSA kernel's per-token work at its smallest block,
+# not serving's block-table geometry; a consumer that needs the latter has to
+# re-apply the hybrid alignment above. The accepted rows were measured at 16 and
+# are deliberately not re-measured: changing the harness page would invalidate
+# every collected QSA row for this checkpoint without new H200 evidence.
+_QSA_BLOCK_SIZE = 16
+
+
+def _create_qsa_attention_module(
+    model_path: str,
+    num_heads: int,
+    gemm_type: str,
+    kv_cache_dtype: str,
+    max_seq_len: int,
+    max_batch_size: int,
+    max_query_len: int,
+    is_context: bool,
+    device: str = "cuda:0",
+):
+    """Create a ``Qwen4ExpQSAAttention`` module from vLLM's own modeling code.
+
+    Loads the real checkpoint config (multimodal config + MRoPE included) and
+    builds the exact module ``Qwen4ExpAttentionDecoderLayer`` creates for every
+    ``full_attention`` layer (vllm/models/qwen4_exp/nvidia/model.py@v0.31.0).
+    The TP-shard emulation shrinks the config's head axes in memory, exactly
+    as ``Qwen4ExpQSAAttention.__init__`` would divide them under TP (q heads
+    ``total // tp``, kv heads ``max(1, total_kv // tp)``); the indexer's 4
+    index heads are replicated, not sharded, so they stay checkpoint-exact.
+
+    ``max_query_len`` is the point's per-request new-token count (context
+    ``seq_len``; ``1`` for generation). The serving scheduler budgets NEW
+    tokens per step, so sizing ``max_num_batched_tokens`` from it is what keeps
+    QSA's per-step selection buffer
+    (``packed_output_width * max_num_batched_tokens`` int32 rows,
+    qsa.py:509-511@v0.32.0) independent of the cached prefix.
+    """
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        # The collector benchmarks the NVIDIA path; AMD routes through
+        # vllm/models/qwen4_exp/amd/, a different module with different
+        # kernels.
+        raise RuntimeError("collect_msa_module benchmarks the NVIDIA Qwen4-Exp path; ROCm is unsupported")
+
+    local_model_path = _resolve_local_model_path(model_path)
+    with open(os.path.join(local_model_path, "config.json")) as f:
+        cfg_dict = json.load(f)
+    original_architecture = cfg_dict.get("architectures", [cfg_dict.get("model_type", "unknown")])[0]
+    text_cfg = cfg_dict.get("text_config") or cfg_dict
+
+    native_q = int(text_cfg["num_attention_heads"])
+    native_kv = int(text_cfg["num_key_value_heads"])
+    gqa_ratio = max(1, native_q // native_kv)
+    if native_q % num_heads:
+        raise ValueError(f"num_heads={num_heads} is not a TP shard of the native {native_q} heads")
+    num_kv_heads = max(1, num_heads // gqa_ratio)
+
+    max_model_len = max(max_seq_len, 4096)
+
+    vllm_config = create_vllm_config(
+        model_name=local_model_path,
+        max_model_len=max_model_len,
+        block_size=_QSA_BLOCK_SIZE,
+        num_gpu_blocks=1 + _ceil_div(max_seq_len + 1, _QSA_BLOCK_SIZE) * max_batch_size,
+        max_num_seqs=max_batch_size,
+        # Same new-token budget as the MSA builder (see its comment): the
+        # selection buffer is allocated at this width, so counting cached
+        # tokens would scale it with the prefix. Keep the 131072 floor below.
+        max_num_batched_tokens=max(max_batch_size * max_query_len, 131072) if is_context else max_batch_size,
+        # QSA dequantizes fp8 inside its own Triton kernel
+        # (Qwen4ExpQSAFlashAttentionImpl.forward_qsa), so the cache dtype is
+        # serving's global --kv-cache-dtype and nothing else.
+        use_fp8_kv_cache=(kv_cache_dtype == "fp8"),
+        trust_remote_code=False,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+    )
+
+    # Override quant_config to control linear-layer GEMM precision (the BF16
+    # checkpoint ships no quant config, so None means bf16 GEMMs).
+    vllm_config.quant_config = _create_gemm_quant_config(gemm_type)
+
+    # TP-shard emulation on the TEXT config: the QSA module reads its geometry
+    # from the text backbone (hidden_size, heads, head_dim, indexer_*), and
+    # create_vllm_config's head overrides land on the outer multimodal config,
+    # which the Qwen4-Exp text backbone does not read.
+    hf_text_config = vllm_config.model_config.hf_text_config
+    if int(hf_text_config.num_attention_heads) != native_q:
+        raise RuntimeError(
+            f"resolved text config declares {hf_text_config.num_attention_heads} heads, "
+            f"expected the checkpoint's {native_q}"
+        )
+    hf_text_config.num_attention_heads = num_heads
+    hf_text_config.num_key_value_heads = num_kv_heads
+    arch_cfg = vllm_config.model_config.model_arch_config
+    arch_cfg.total_num_attention_heads = num_heads
+    arch_cfg.total_num_kv_heads = num_kv_heads
+
+    # Build inside set_current_vllm_config(): the module reads the current
+    # config in its constructor and registers itself plus its two side caches
+    # in compilation_config.static_forward_context.
+    from vllm.models.qwen4_exp.nvidia.low_latency_gemm import (
+        enable_qwen4_exp_low_latency_gemm,
+    )
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    with set_current_vllm_config(vllm_config), set_default_torch_dtype(vllm_config.model_config.dtype):
+        attn_module = Qwen4ExpQSAAttention(
+            vllm_config=vllm_config,
+            config=hf_text_config,
+            layer_id=0,
+            quant_config=vllm_config.quant_config,
+            reduce_results=True,
+            prefix="model.layers.0.self_attn",
+        )
+
+    # Serving ends its model __init__ with
+    # ``enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)``
+    # (model.py:747, mtp.py @v0.32.0). It swaps the quant method of every
+    # unquantized linear whose (N, K) has a measured SkinnyGemm plan, so those
+    # shapes run the skinny kernel instead of ``F.linear``. Called at the same
+    # point here — after construction, before the loader's
+    # ``process_weights_after_loading`` — so the methods this installs are the
+    # ones that process the dummy weights, as they are in serving. A no-op when
+    # no plan matches (the fused widths at TP8 have none; the plans are the TP4
+    # shapes), and on non-BF16 builds, exactly as in serving.
+    enable_qwen4_exp_low_latency_gemm(attn_module, vllm_config.model_config.dtype)
+
+    attn_module = _finalize_module_weights(attn_module, vllm_config, device)
+
+    # Serving-path proof: the QSA collectible unit only matches serving when
+    # the fused qk-norm/RoPE/gate kernel and the fused pre-indexer are the
+    # ones serving picks. Both are config-derived (MRoPE + gate + bf16
+    # rotary), so a checkpoint/config change that turns them off must fail
+    # loudly here instead of silently measuring the unfused reference path
+    # under the same kernel_source label.
+    if not getattr(attn_module, "use_fused_qk_norm_rope_gate", False):
+        raise RuntimeError(
+            "Qwen4Exp QSA did not select the fused qk-norm/RoPE/gate path; "
+            "the module bench would time a different kernel than serving"
+        )
+    if not getattr(attn_module.indexer, "use_fused_pre_indexer", False):
+        raise RuntimeError(
+            "Qwen4Exp QSA did not select the fused pre-indexer path; "
+            "the module bench would time a different kernel than serving"
+        )
 
     return attn_module, vllm_config, original_architecture
 
@@ -620,9 +999,7 @@ def _rebase_block_table_and_slots(common_attn_metadata, block_size: int):
     block_table += 1
 
     query_start_loc = common_attn_metadata.query_start_loc_cpu
-    # seq_lens - query_lens on device (CommonAttentionMetadata
-    # .compute_num_computed_tokens, v1/attention/backend.py:486-491)
-    context_lens = common_attn_metadata.compute_num_computed_tokens().cpu()
+    context_lens = common_attn_num_computed_tokens_cpu(common_attn_metadata)
     slot_mapping = common_attn_metadata.slot_mapping
     device = slot_mapping.device
     for i in range(common_attn_metadata.num_reqs):
@@ -770,6 +1147,203 @@ def _create_kv_caches_and_metadata(
     return kv_cache, index_kv_cache, attn_metadata, index_metadata, common_attn_metadata
 
 
+def _qsa_cache_storage(spec, num_blocks: int, torch_device):
+    """Allocate one KV-cache group's device storage as serving lays it out.
+
+    vLLM 0.31 views every group as one logical ``[B, H, N, C]`` tensor whose
+    ``C`` is measured in bytes (kv_cache_interface.py
+    ``compute_layer_kv_cache_shape_bytes``), then reinterprets that byte view
+    with the spec dtype (``create_kv_cache_views`` .view(spec.dtype)). The
+    collector allocates the same view directly — no layout permutation is
+    needed because each group is a single layer here.
+    """
+    from vllm.v1.kv_cache_interface import compute_layer_kv_cache_shape_bytes
+
+    raw = torch.zeros(
+        compute_layer_kv_cache_shape_bytes(spec, num_blocks),
+        dtype=torch.uint8,
+        device=torch_device,
+    )
+    return raw.view(spec.dtype)
+
+
+def _create_qsa_kv_caches_and_metadata(
+    vllm_config,
+    attn_module,
+    batch_size: int,
+    seq_len: int,
+    is_context: bool,
+    prefix_len: int = 0,
+    device: str = "cuda:0",
+):
+    """Allocate the QSA main + side caches and build all three metadata objects.
+
+    QSA has three KV-cache groups per layer: the paged main K/V
+    (FullAttentionSpec), the per-request raw-key ring (CircularBufferSpec, one
+    block per request holding the open compression group) and the compressed
+    key cache (MLAAttentionSpec, one state per ``compress_ratio`` tokens). All
+    three are indexed through the MAIN block table — the ring uses
+    ``block_table[req, 0]`` and the compressed cache uses
+    ``block_table[req, compressed_pos // states]`` — so they are allocated with
+    the main cache's block count (common/qsa_cache.py
+    circular_qsa_slot_mapping / compressed_qsa_slot_mapping@v0.31.0).
+
+    Metadata: one object per group, built by the group's own backend builder
+    over CommonAttentionMetadata, exactly as serving's KV-cache coordinator
+    does, and keyed by the layer names the model reads
+    (Qwen4ExpQSAAttention._run_qsa / QSAIndexer._metadata, qsa.py and
+    indexer_qsa.py@v0.31.0).
+    """
+    torch_device = torch.device(device)
+    block_size = vllm_config.cache_config.block_size
+    prefix_len = int(prefix_len) if is_context else 0
+
+    if is_context:
+        batch_spec = BatchSpec(
+            seq_lens=[prefix_len + seq_len] * batch_size,
+            query_lens=[seq_len] * batch_size,
+        )
+    else:
+        # Same generation KV coordinate contract as the MSA path: seq_len is
+        # the cached length, the current token decodes at position seq_len,
+        # and the persisted row is keyed at step = seq_len.
+        batch_spec = BatchSpec(
+            seq_lens=[seq_len + 1] * batch_size,
+            query_lens=[1] * batch_size,
+        )
+
+    common_attn_metadata = create_common_attn_metadata(batch_spec, block_size, torch_device, arange_block_indices=True)
+    common_attn_metadata.positions = torch.tensor(
+        _msa_query_positions(batch_size, seq_len, is_context, prefix_len),
+        dtype=torch.long,
+        device=torch_device,
+    )
+    num_blocks = _rebase_block_table_and_slots(common_attn_metadata, block_size)
+
+    main_spec = attn_module.get_kv_cache_spec(vllm_config)
+    attn_module.bind_kv_cache(_qsa_cache_storage(main_spec, num_blocks, torch_device))
+
+    metadata = {}
+    indexer = attn_module.indexer
+    for cache in (indexer.raw_key_cache, indexer.compressed_key_cache):
+        spec = cache.get_kv_cache_spec(vllm_config)
+        cache.bind_kv_cache(_qsa_cache_storage(spec, num_blocks, torch_device))
+        builder = cache.get_attn_backend().get_builder_cls()(spec, [cache.prefix], vllm_config, torch_device)
+        metadata[cache.prefix] = builder.build(
+            common_prefix_len=prefix_len,
+            common_attn_metadata=common_attn_metadata,
+        )
+
+    main_builder = attn_module.get_attn_backend().get_builder_cls()(
+        main_spec, [attn_module.layer_name], vllm_config, torch_device
+    )
+    metadata[attn_module.layer_name] = main_builder.build(
+        common_prefix_len=prefix_len,
+        common_attn_metadata=common_attn_metadata,
+    )
+
+    return metadata, common_attn_metadata
+
+
+def _qsa_forward_positions(
+    batch_size: int,
+    seq_len: int,
+    is_context: bool,
+    prefix_len: int,
+    uses_mrope: bool,
+    torch_device,
+):
+    """Positions the QSA owner consumes: ``(N,)`` text-only, ``(3, N)`` MRoPE.
+
+    Qwen4-Exp declares ``rope_parameters.mrope_section``, so serving builds
+    MRotaryEmbedding and passes the three-axis position tensor; for pure text
+    all three axes carry the same absolute position, which is exactly what the
+    fused qk-norm/RoPE/gate and the fused pre-indexer read.
+    """
+    positions = torch.tensor(
+        _msa_query_positions(batch_size, seq_len, is_context, prefix_len),
+        dtype=torch.long,
+        device=torch_device,
+    )
+    if uses_mrope:
+        positions = positions.unsqueeze(0).expand(3, -1).contiguous()
+    return positions
+
+
+def _qsa_kernel_source(attn_module, is_context: bool) -> str:
+    """Record the QSA route serving executes for this phase.
+
+    The QSA owner has exactly one backend/impl (Qwen4ExpQSAFlashAttentionImpl
+    over the Triton ``qsa_sparse_paged_attention`` + fused ``qsa_pre_indexer``
+    kernels), and the fused-path checks in the builder prove those were the
+    selected ones. The phase split exists because the prefill and decode
+    calls take different QSA config rows (``use_prefill_config``), so the two
+    directions are separate registry labels.
+    """
+    impl_name = type(attn_module.impl).__name__
+    if impl_name != "Qwen4ExpQSAFlashAttentionImpl":
+        raise RuntimeError(
+            f"Qwen4Exp QSA selected impl {impl_name!r}, expected the Qwen4ExpQSAFlashAttentionImpl "
+            "serving route; refusing to label the row with a guessed kernel_source"
+        )
+    return "vllm_qwen4exp_qsa_prefill_triton" if is_context else "vllm_qwen4exp_qsa_decode_triton"
+
+
+def _check_msa_kv_precision(attn_module, kv_cache, index_kv_cache, kv_cache_dtype: str) -> None:
+    """Prove the requested KV precision reached the MSA framework path.
+
+    A benchmark that silently ran bf16 under an "fp8" label would be wrong
+    data, worse than a crash. For "fp8": the layer must have been built with
+    cache_dtype "fp8" (nvidia/model.py:483-488@v0.24.0), the cache storage
+    must be the fp8 uint8 layout (utils/torch_utils.py:38), and the
+    framework-selected impl must be in fp8 mode (use_fp8_kv,
+    common/sparse_attention.py:298-306). The indexer side-cache stays bf16 in
+    both combos (default indexer_kv_dtype, config/attention.py:55).
+    """
+    want_fp8_kv = kv_cache_dtype == "fp8"
+    expected_cache_dtype = torch.uint8 if want_fp8_kv else torch.bfloat16
+    impl_use_fp8_kv = bool(getattr(attn_module.impl, "use_fp8_kv", False))
+    if (
+        kv_cache.dtype != expected_cache_dtype
+        or impl_use_fp8_kv != want_fp8_kv
+        or index_kv_cache.dtype != torch.bfloat16
+    ):
+        raise RuntimeError(
+            f"KV-cache precision mismatch: requested kv={kv_cache_dtype}, allocated "
+            f"main cache {kv_cache.dtype}, impl use_fp8_kv={impl_use_fp8_kv}, "
+            f"index cache {index_kv_cache.dtype} "
+            f"(layer cache_dtype={attn_module.kv_cache_dtype!r})"
+        )
+
+
+def _check_qsa_kv_precision(attn_module, kv_cache_dtype: str) -> None:
+    """Prove the requested KV precision reached the QSA framework path.
+
+    QSA's own Triton kernel dequantizes an e4m3 cache, so the layer must have
+    been constructed with that cache dtype and the bound main cache must be
+    the uint8 byte storage the kernel reinterprets
+    (Qwen4ExpQSAFlashAttentionImpl.forward_qsa, qsa.py@v0.31.0). The two side
+    caches are not part of the combo: the raw-key ring is always bf16 plus an
+    int64 position tail, and the compressed cache follows the model's
+    ``indexer_kv_dtype`` (bf16 by default).
+    """
+    want_fp8_kv = kv_cache_dtype == "fp8"
+    expected_cache_dtype = torch.uint8 if want_fp8_kv else torch.bfloat16
+    layer_cache_dtype = str(attn_module.kv_cache_dtype)
+    layer_is_fp8 = layer_cache_dtype in ("fp8", "fp8_e4m3")
+    if attn_module.kv_cache.dtype != expected_cache_dtype or layer_is_fp8 != want_fp8_kv:
+        raise RuntimeError(
+            f"KV-cache precision mismatch: requested kv={kv_cache_dtype}, allocated "
+            f"main cache {attn_module.kv_cache.dtype}, layer cache_dtype={layer_cache_dtype!r}"
+        )
+    raw_dtype = attn_module.indexer.raw_key_cache.dtype
+    if raw_dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"QSA raw-key side cache is {raw_dtype}, expected bf16 "
+            "(QSAKeyStateCache stores bf16 keys plus the MRoPE position tail)"
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Benchmark Runner
 # ═══════════════════════════════════════════════════════════════════════
@@ -791,22 +1365,42 @@ def run_msa_module(
     device: str = "cuda:0",
     warming_up: int = 10,
     test_ite: int = 6,
+    attention_type: str | None = None,
 ):
-    """Run a single MiniMax-M3 MSA module-level benchmark point."""
+    """Run a single sparse-attention module-level benchmark point.
+
+    ``attention_type`` selects the framework module builder: ``msa`` (the
+    MiniMax-M3 sparse layer) or ``qsa`` (the Qwen4-Exp full-attention layer).
+    When omitted it is resolved from the declared model row
+    (``_attention_type_for_model``), so the registry's positional case tuple
+    stays unchanged.
+    """
     if kv_cache_dtype not in ("bfloat16", "fp8") or compute_dtype != "bfloat16":
         raise ValueError(
             f"MSA combos are declared with bf16 compute and bf16/fp8 KV cache at "
             f"vllm {vllm_version}; "
             f"got compute={compute_dtype}, kv={kv_cache_dtype}"
         )
+    if attention_type is None:
+        attention_type = _attention_type_for_model(model_path)
+    if attention_type not in _MSA_MODULE_ATTENTION_TYPES:
+        raise ValueError(f"unknown attention_type {attention_type!r}")
 
     is_context = "context" in perf_filename
     prefix_len = int(prefix_len) if is_context else 0
     phase = "context" if is_context else "generation"
     if not is_context:
         # The plan does not depend on the device: refuse a point whose KV cache cannot fit it.
+        # QSA's footprint is the checkpoint's own geometry (24 q / 2 kv heads, head_dim 256,
+        # two index side caches); the M3 constants describe a different layer entirely.
+        footprint = _qsa_generation_kv_footprint_bytes(model_path) if attention_type == "qsa" else None
         reason = _kv_does_not_fit(
-            batch_size * seq_len, num_heads, kv_cache_dtype, torch.cuda.get_device_properties(device).total_memory
+            batch_size * seq_len,
+            num_heads,
+            kv_cache_dtype,
+            torch.cuda.get_device_properties(device).total_memory,
+            footprint=footprint,
+            num_requests=batch_size,
         )
         if reason is not None:
             raise RuntimeError(reason)
@@ -816,13 +1410,17 @@ def run_msa_module(
     enable_engine_fused_ops()
     init_workspace_manager(torch.device(device))
     print(
-        f"\n[MSA module] {phase} b={batch_size}, s={seq_len}, "
+        f"\n[MSA module] {phase} attn={attention_type} b={batch_size}, s={seq_len}, "
         f"prefix={prefix_len}, heads={num_heads}, gemm={gemm_type}, "
         f"compute={compute_dtype}, kv={kv_cache_dtype}, model={model_path}"
     )
 
     # 1. Create attention module (framework builds and dispatches the impls).
-    attn_module, vllm_config, original_architecture = _create_msa_attention_module(
+    # `max_query_len` is the point's new-token count. Both builders size their
+    # persistent per-step buffers from it — the M3 top-k/score buffers and the
+    # QSA selection buffer — so it is passed to both.
+    create_module = _create_qsa_attention_module if attention_type == "qsa" else _create_msa_attention_module
+    module_kwargs = dict(
         model_path=model_path,
         num_heads=num_heads,
         gemm_type=gemm_type,
@@ -833,64 +1431,99 @@ def run_msa_module(
         is_context=is_context,
         device=device,
     )
+    attn_module, vllm_config, original_architecture = create_module(**module_kwargs)
 
-    # 2. Create KV caches + metadata via the framework's builders.
-    with set_current_vllm_config(vllm_config):
-        kv_cache, index_kv_cache, attn_metadata, index_metadata, common_attn_metadata = _create_kv_caches_and_metadata(
-            vllm_config=vllm_config,
-            attn_module=attn_module,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            is_context=is_context,
-            prefix_len=prefix_len,
-            device=device,
-        )
-
-    # 2b. Bind the caches to the registered layers exactly as serving does:
+    # 2. Create KV caches + metadata via the framework's builders, then bind
+    # the caches to the registered layers exactly as serving does:
     # forward_context[layer_name].bind_kv_cache(kv_cache)
-    # (v1/worker/utils.py:880). The main layer's bind is the
-    # AttentionLayerBase default (stores the view as-is,
-    # model_executor/layers/attention_layer_base.py:27-33); the indexer's
-    # override squeezes the H=1 head dim, [B,1,N,C] -> [B,N,C]
-    # (common/indexer.py:141-143).
-    forward_ctx = vllm_config.compilation_config.static_forward_context
-    forward_ctx[_ATTN_LAYER_NAME].bind_kv_cache(kv_cache)
-    forward_ctx[_INDEX_CACHE_LAYER_NAME].bind_kv_cache(index_kv_cache)
+    # (v1/worker/utils.py:622@v0.29.0). The MSA layers bind explicitly below;
+    # the QSA builder binds each group through its own layer during creation.
+    if attention_type == "qsa":
+        with set_current_vllm_config(vllm_config):
+            qsa_metadata, common_attn_metadata = _create_qsa_kv_caches_and_metadata(
+                vllm_config=vllm_config,
+                attn_module=attn_module,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                is_context=is_context,
+                prefix_len=prefix_len,
+                device=device,
+            )
+        # The QSA builder binds all three groups through each layer's own
+        # bind_kv_cache (main K/V as-allocated; the two side caches
+        # transposed to QSA's [B, N, H, C] contract).
+        attn_metadata_dict = qsa_metadata
+        slot_mapping_dict = dict.fromkeys(qsa_metadata, common_attn_metadata.slot_mapping)
+        _check_qsa_kv_precision(attn_module, kv_cache_dtype)
+    else:
+        with set_current_vllm_config(vllm_config):
+            (
+                kv_cache,
+                index_kv_cache,
+                attn_metadata,
+                index_metadata,
+                common_attn_metadata,
+            ) = _create_kv_caches_and_metadata(
+                vllm_config=vllm_config,
+                attn_module=attn_module,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                is_context=is_context,
+                prefix_len=prefix_len,
+                device=device,
+            )
 
-    # 2c. Prove the requested KV precision actually reached the framework
-    # path — a benchmark that silently ran bf16 under an "fp8" label would be
-    # wrong data, worse than a crash. For "fp8": the layer must have been
-    # built with cache_dtype "fp8" (nvidia/model.py:493-498), the
-    # cache storage must be the fp8 uint8 layout (utils/torch_utils.py:39),
-    # and the framework-selected impl must be in fp8 mode (use_fp8_kv,
-    # common/sparse_attention.py:412). The indexer side-cache stays bf16
-    # in both combos (indexer_kv_dtype "auto" resolves to the layer's "bf16",
-    # config/attention.py:88,163-167; nvidia/model.py:507-509).
-    want_fp8_kv = kv_cache_dtype == "fp8"
-    expected_cache_dtype = torch.uint8 if want_fp8_kv else torch.bfloat16
-    impl_use_fp8_kv = bool(getattr(attn_module.impl, "use_fp8_kv", False))
-    if (
-        kv_cache.dtype != expected_cache_dtype
-        or impl_use_fp8_kv != want_fp8_kv
-        or index_kv_cache.dtype != torch.bfloat16
-    ):
-        raise RuntimeError(
-            f"KV-cache precision mismatch: requested kv={kv_cache_dtype}, allocated "
-            f"main cache {kv_cache.dtype}, impl use_fp8_kv={impl_use_fp8_kv}, "
-            f"index cache {index_kv_cache.dtype} "
-            f"(layer cache_dtype={attn_module.kv_cache_dtype!r})"
-        )
+        # 2b. Bind the caches to the registered layers exactly as serving does:
+        # forward_context[layer_name].bind_kv_cache(kv_cache)
+        # (v1/worker/utils.py:622@v0.29.0). The main layer's bind is the
+        # AttentionLayerBase default (stores the view as-is,
+        # model_executor/layers/attention_layer_base.py:26-32); the indexer's
+        # override squeezes the H=1 head dim, [B,1,N,C] -> [B,N,C]
+        # (common/indexer.py:140-142).
+        forward_ctx = vllm_config.compilation_config.static_forward_context
+        forward_ctx[_ATTN_LAYER_NAME].bind_kv_cache(kv_cache)
+        forward_ctx[_INDEX_CACHE_LAYER_NAME].bind_kv_cache(index_kv_cache)
 
-    # 2d. The cached history's index keys (bf16 rows, checked above).
-    _write_index_key_history(index_kv_cache)
+        # 2c. Prove the requested KV precision actually reached the framework
+        # path — a benchmark that silently ran bf16 under an "fp8" label would
+        # be wrong data, worse than a crash.
+        _check_msa_kv_precision(attn_module, kv_cache, index_kv_cache, kv_cache_dtype)
+
+        # 2d. The cached history's index keys (bf16 rows, checked just above).
+        # MSA-only: `index_kv_cache` is MiniMax's single index cache. QSA has
+        # two side caches and no M3 index layout, so it keeps the zero fill its
+        # accepted C3.3 rows were measured with.
+        _write_index_key_history(index_kv_cache)
+        attn_metadata_dict = {
+            _ATTN_LAYER_NAME: attn_metadata,
+            _INDEX_CACHE_LAYER_NAME: index_metadata,
+        }
+        slot_mapping_dict = {
+            _ATTN_LAYER_NAME: common_attn_metadata.slot_mapping,
+            _INDEX_CACHE_LAYER_NAME: common_attn_metadata.slot_mapping,
+        }
+
+    # 2e. QSA deviation: the main cache and both side caches stay at the
+    # constructor's zero fill, the condition the accepted QSA rows were
+    # measured under. QSA's block choice depends on the scores, but the timed
+    # top-k work is the selected block count, which is fixed by the geometry.
 
     # 3. Input tensors. Positions are absolute (cached prefix precedes the
-    # current chunk); generation decodes position seq_len with seq_len
-    # cached tokens (the KV coordinate contract in
-    # _create_kv_caches_and_metadata).
+    # current chunk); generation decodes the token at position seq_len with
+    # seq_len cached tokens. QSA adds the MRoPE axis on its own path.
     hidden_size = vllm_config.model_config.hf_text_config.hidden_size
     torch_device = torch.device(device)
-    if is_context:
+    if attention_type == "qsa":
+        num_tokens = seq_len * batch_size if is_context else batch_size
+        positions = _qsa_forward_positions(
+            batch_size,
+            seq_len,
+            is_context,
+            prefix_len,
+            uses_mrope=bool(vllm_config.model_config.uses_mrope),
+            torch_device=torch_device,
+        )
+    elif is_context:
         num_tokens = seq_len * batch_size
         positions = (
             torch.arange(prefix_len, prefix_len + seq_len, device=torch_device, dtype=torch.long)
@@ -917,16 +1550,7 @@ def run_msa_module(
     # The model consumes slot_mapping[self.layer_name] and
     # slot_mapping[indexer.index_cache.prefix] (nvidia/model.py:605-614) and
     # attn_metadata[layer_name] inside the impls
-    # (nvidia/sparse_attention_msa.py:253-256, common/sparse_attention.py:
-    # 458-461, common/indexer.py:415-418, nvidia/indexer_msa.py:268-271).
-    attn_metadata_dict = {
-        _ATTN_LAYER_NAME: attn_metadata,
-        _INDEX_CACHE_LAYER_NAME: index_metadata,
-    }
-    slot_mapping_dict = {
-        _ATTN_LAYER_NAME: common_attn_metadata.slot_mapping,
-        _INDEX_CACHE_LAYER_NAME: common_attn_metadata.slot_mapping,
-    }
+    # (common/sparse_attention.py:337-340, common/indexer.py:395-398).
     exit_stack.enter_context(set_current_vllm_config(vllm_config))
     exit_stack.enter_context(set_forward_context(attn_metadata_dict, vllm_config, slot_mapping=slot_mapping_dict))
 
@@ -1001,10 +1625,13 @@ def run_msa_module(
 
         op_name = f"msa_{phase}_module"
 
-        # Ground truth: the impl class the framework's own dispatch selected at
-        # construction (select_main_backend_and_impl_cls — Triton off the
-        # SM100 family, MSA on it; common/sparse_attention.py:525-587).
-        kernel_source = type(attn_module.impl).__name__
+        # Ground truth: for MSA, the impl class the framework's own dispatch
+        # selected at construction (select_main_impl_cls — Triton off-SM100,
+        # MSA on SM100); for QSA, the single audited QSA route plus its phase
+        # (prefill vs decode take different QSA config rows).
+        kernel_source = (
+            _qsa_kernel_source(attn_module, is_context) if attention_type == "qsa" else type(attn_module.impl).__name__
+        )
 
         _persist_msa_row(
             item={
@@ -1029,9 +1656,9 @@ def run_msa_module(
         )
 
         print(
-            f"  [{phase}] b={batch_size}, s={seq_len}, heads={num_heads}, "
+            f"  [{phase}] attn={attention_type} b={batch_size}, s={seq_len}, heads={num_heads}, "
             f"prefix={prefix_len}, gemm={gemm_type}, kv={kv_cache_dtype} "
-            f"(cache storage {kv_cache.dtype}), backend={kernel_source}: {latency:.4f} ms"
+            f"(cache storage {attn_module.kv_cache.dtype}), backend={kernel_source}: {latency:.4f} ms"
         )
 
         return latency
@@ -1083,6 +1710,10 @@ def _cleanup():
     torch.cuda.empty_cache()
 
 
+class PerfLogWriteError(RuntimeError):
+    """Fail the subprocess when a measured MSA row was not durably persisted."""
+
+
 def _persist_msa_row(
     *,
     item: dict,
@@ -1096,20 +1727,30 @@ def _persist_msa_row(
     """Persist one MSA perf row, failing the case when the write fails.
 
     ``log_perf`` returns False after lock exhaustion or a write/fsync
-    exception; discarding that would let the worker return normally and the
-    checkpoint advance with no row persisted (a silently shrunk dataset).
-    Mirrors the TRT-LLM and SGLang collectors."""
-    if not log_perf(
-        item_list=[item],
-        framework="VLLM",
-        version=vllm_version,
-        device_name=device_name,
-        op_name=op_name,
-        kernel_source=kernel_source,
-        perf_filename=perf_filename,
-        power_stats=power_stats,
-    ):
-        raise RuntimeError(f"failed to persist MSA row to {perf_filename}")
+    exception, and raises ``PerfLogError`` when the log file itself is
+    unusable (a parked ``.retained`` twin is also present, the inode is
+    unowned, or the retained file changed). Both mean the row is gone, so
+    neither may be swallowed: the sweep must abort on the first point with the
+    real cause instead of counting one identical failure per remaining shape
+    and then discarding the whole case. This mirrors the SGLang collector
+    (C3.3 heal 2026-11-01 lost 15 min of H200 time per case to exactly this
+    before it was diagnosed).
+    """
+    try:
+        persisted = log_perf(
+            item_list=[item],
+            framework="VLLM",
+            version=vllm_version,
+            device_name=device_name,
+            op_name=op_name,
+            kernel_source=kernel_source,
+            perf_filename=perf_filename,
+            power_stats=power_stats,
+        )
+    except PerfLogError as error:
+        raise PerfLogWriteError(f"failed to persist MSA row to {perf_filename}: {error}") from error
+    if not persisted:
+        raise PerfLogWriteError(f"failed to persist MSA row to {perf_filename}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1121,11 +1762,28 @@ def _perf_file_for(mode: str) -> str:
     return PerfFile.MSA_CONTEXT_MODULE if mode == "context" else PerfFile.MSA_GENERATION_MODULE
 
 
+def _standalone_model_specs() -> list[MLAModuleModelSpec]:
+    """The model rows this collector can actually run on its own.
+
+    ``get_mla_module_model_specs()`` with no ``attention_type`` returns every
+    ``mla_module`` row, including the full-attention MLA/DSA models this
+    collector does not implement. Offering them as ``--model`` choices, and
+    walking them in a bare ``--quick`` run, hand ``mla`` to ``run_msa_module``,
+    which rejects the type and stops the run: only the two sparse-attention
+    families are choices here.
+    """
+    return [
+        spec
+        for spec in get_mla_module_model_specs(apply_model_filter=False)
+        if spec.attention_type in _MSA_MODULE_ATTENTION_TYPES
+    ]
+
+
 def main():
-    all_model_specs = get_mla_module_model_specs(attention_type="msa", apply_model_filter=False)
+    all_model_specs = _standalone_model_specs()
     model_names = [spec.model_path for spec in all_model_specs]
 
-    parser = argparse.ArgumentParser(description="MiniMax-M3 MSA module-level collector for vLLM")
+    parser = argparse.ArgumentParser(description="MSA/QSA module-level collector for vLLM")
     parser.add_argument("--mode", choices=["context", "generation"], required=True)
     parser.add_argument("--model", type=str, default=None, choices=model_names)
     parser.add_argument("--num-heads", type=int, default=None)
@@ -1159,7 +1817,7 @@ def main():
             and (args.batch_size is None or case.batch_size == args.batch_size)
             and (args.prefix_len is None or case.prefix_len == args.prefix_len)
         ]
-        print(f"Running {len(test_cases)} {args.mode} MSA module test cases...")
+        print(f"Running {len(test_cases)} {args.mode} MSA/QSA module test cases...")
         num_failed = 0
         for i, case in enumerate(test_cases):
             print(f"[{i + 1}/{len(test_cases)}]", end="")
@@ -1176,6 +1834,10 @@ def main():
                     model_path=case.model_path,
                     device=args.device,
                 )
+            except PerfLogWriteError:
+                # Persistence failure is fatal for the case: re-raise so the
+                # caller records the real cause instead of a per-point error.
+                raise
             except Exception as e:
                 print(f"  FAILED: {case}: {e}")
                 traceback.print_exc()
@@ -1195,11 +1857,15 @@ def main():
     )
     for model_spec in model_specs_to_run:
         model_path = model_spec.model_path
-        print(f"\n{'=' * 60}\nModel: {model_path}  |  Attention: MSA\n{'=' * 60}")
+        print(f"\n{'=' * 60}\nModel: {model_path}  |  Attention: {model_spec.attention_type.upper()}\n{'=' * 60}")
+        # Quick default head count: the historical M3 TP1 shard (64) for msa;
+        # the model's own native head count for qsa, whose grid values are not
+        # shards of the checkpoint at all.
+        default_heads = model_spec.native_num_heads if model_spec.attention_type == "qsa" else 64
         run_msa_module(
             seq_len=args.seq_len or 2048,
             batch_size=args.batch_size or 4,
-            num_heads=args.num_heads or 64,
+            num_heads=args.num_heads or default_heads,
             kv_cache_dtype=args.kv_cache_dtype or "bfloat16",
             compute_dtype="bfloat16",
             gemm_type=args.gemm_type or "bfloat16",
@@ -1207,6 +1873,7 @@ def main():
             perf_filename=perf_filename,
             model_path=model_path,
             device=args.device,
+            attention_type=model_spec.attention_type,
         )
 
 

@@ -492,6 +492,9 @@ SKIPS: list[dict] = [
             "sgl-project/DeepSeek-V4-Pro-FP8",
         ],
     },
+    # TRT-LLM has no Qwen4-Exp model class, so it plans no op for Qwen3.8-Flash-Next
+    # (its MoE lane would otherwise price a model the framework cannot serve).
+    {"backend": "trtllm", "model": "Qwen4ExpForConditionalGeneration"},
 ]
 
 _RUN_KEYS = frozenset(("backend", "op", "sm"))

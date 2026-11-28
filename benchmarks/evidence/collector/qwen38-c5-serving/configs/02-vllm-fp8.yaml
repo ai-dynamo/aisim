@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# C5 cell 2: vLLM v0.31.0, FP8 checkpoint, aggregated TP8 / EP8, one fixed
+# closed-loop workload. 8 GPUs are the whole serving topology here, so one node
+# is the cell. Weights come from the read-only PVC; the node is pinned to the
+# host that already has the pinned image cached.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qwen38-serve-vllm-fp8
+  namespace: aisimulate-qwen38
+  labels:
+    app.kubernetes.io/part-of: aisimulate
+    app.kubernetes.io/component: serving-check
+    aisimulate.nvidia.com/runtime: vllm-0.31.0
+spec:
+  restartPolicy: Never
+  nodeName: psap-de-h200-cluster-6mgmp-gpu-h200-7zgjh
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: serve
+      image: docker.io/vllm/vllm-openai:v0.31.0@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3
+      command: [/bin/bash, /harness/run.sh]
+      args:
+        - vllm
+        - Qwen/Qwen3.8-Flash-Next-FP8
+        - 236dfdf285828023ca3bcd3f37366c58a3469b13
+        - "8"
+        - "8192"
+        - "128"
+        - "1"
+        - "8"
+      env:
+        - {name: HF_HUB_CACHE, value: /hf-cache/hub}
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: TRANSFORMERS_OFFLINE, value: "1"}
+        - {name: HF_HOME, value: /scratch/hf-home}
+        - {name: HOME, value: /scratch}
+        - {name: TMPDIR, value: /scratch}
+        - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+        - {name: HF_HUB_DISABLE_TELEMETRY, value: "1"}
+        - {name: VLLM_LOGGING_LEVEL, value: INFO}
+        - {name: NCCL_DEBUG, value: WARN}
+        - {name: VLLM_CACHE_ROOT, value: /scratch/vllm-cache}
+        # Every writable path lands in the size-capped emptyDir so a
+        # compile/cache spill cannot fill the node's root filesystem.
+        - {name: XDG_CACHE_HOME, value: /scratch/.cache}
+        - {name: TRITON_CACHE_DIR, value: /scratch/triton-cache}
+        - {name: TORCHINDUCTOR_CACHE_DIR, value: /scratch/torch-cache}
+        - {name: TORCH_EXTENSIONS_DIR, value: /scratch/torch-ext}
+      resources:
+        requests:
+          cpu: "16"
+          memory: 64Gi
+          ephemeral-storage: 8Gi
+        limits:
+          cpu: "32"
+          memory: 128Gi
+          ephemeral-storage: 24Gi
+          nvidia.com/gpu: 8
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: model-cache
+          mountPath: /hf-cache
+          readOnly: true
+        - name: harness
+          mountPath: /harness
+          readOnly: true
+        - name: scratch
+          mountPath: /scratch
+        # The container default is 64 MiB, which the TP8 NCCL handshake
+        # exhausts (same defect the C2 load runs pinned).
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: qwen38-model-cache
+        readOnly: true
+    - name: harness
+      configMap:
+        name: qwen38-serving-harness
+        defaultMode: 493
+    - name: scratch
+      emptyDir:
+        sizeLimit: 24Gi
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi

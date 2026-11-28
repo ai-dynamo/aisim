@@ -1,0 +1,52 @@
+vllm    attention_context                  - bfloat16 -                                  14195  attn_ctx_Llama-3.1-8B
+vllm    attention_context                  - fp8 -                                       14195  NO GATE
+vllm    attention_generation               - bfloat16 -                                  18048  attn_gen_Llama-3.1-8B
+vllm    attention_generation               - fp8 -                                       18048  NO GATE
+vllm    compute_scale                      - fp8 -                                        1628  ungated: deviation note in collector/vllm/collect_computescale.py; no serving instance to gate
+vllm    dsa_context_module                 - bfloat16/bfloat16/bfloat16 -                 5555  derivable: deepseek-ai/DeepSeek-V3.2 kv=auto
+vllm    dsa_context_module                 - fp8/bfloat16/bfloat16 -                      5555  derivable: deepseek-ai/DeepSeek-V3.2 kv=fp8
+vllm    dsa_context_module                 - bfloat16/bfloat16/fp8_block -                5555  dsa_ctx_bf16_DeepSeek-V3.2, dsa_ctx_bf16_s4096_DeepSeek-V3.2
+vllm    dsa_context_module                 - fp8/bfloat16/fp8_block -                     5555  dsa_ctx_fp8_s4096_DeepSeek-V3.2, dsa_ctx_fp8_s512_DeepSeek-V3.2
+vllm    dsa_generation_module              - bfloat16/bfloat16/bfloat16 -                 1885  derivable: deepseek-ai/DeepSeek-V3.2 kv=auto
+vllm    dsa_generation_module              - fp8/bfloat16/bfloat16 -                      1885  derivable: deepseek-ai/DeepSeek-V3.2 kv=fp8
+vllm    dsa_generation_module              - bfloat16/bfloat16/fp8_block -                1885  derivable: deepseek-ai/DeepSeek-V3.2 kv=auto
+vllm    dsa_generation_module              - fp8/bfloat16/fp8_block -                     1885  dsa_gen_fp8_DeepSeek-V3.2
+vllm    dsv4_csa_context_module            - fp8_block -                                  4504  dsv4_csa_ctx_DeepSeek-V4-Flash-FP8
+vllm    dsv4_csa_generation_module         - fp8_block -                                  1600  dsv4_csa_gen_DeepSeek-V4-Flash-FP8
+vllm    dsv4_hca_context_module            - fp8_block -                                  4504  dsv4_hca_ctx_DeepSeek-V4-Flash-FP8
+vllm    dsv4_hca_generation_module         - fp8_block -                                  1600  dsv4_hca_gen_DeepSeek-V4-Flash-FP8
+vllm    dsv4_paged_mqa_logits_module       - fp8 -                                        3918  dsv4_paged_mqa_logits_DeepSeek-V4-Flash-FP8
+vllm    encoder_attention                  - bfloat16 -                                   8779  encoder_attn_Qwen3-VL-2B
+vllm    gdn                                context bfloat16 -                               46  gdn_ctx_Qwen3.5-0.8B
+vllm    gdn                                generation bfloat16 -                            46  gdn_gen_Qwen3.5-0.8B
+vllm    gemm                               - bfloat16 -                                  40182  gemm_bf16_Llama-3.1-8B, gemm_bf16_m1_Llama-3.1-8B
+vllm    gemm                               - fp8 -                                       40182  NO GATE
+vllm    gemm                               - fp8_block -                                 40182  gemm_fp8block_DeepSeek-V3.2, gemm_fp8block_m1_DeepSeek-V3.2
+vllm    kda                                context bfloat16 -                                8  kda_ctx_Kimi-K3
+vllm    kda                                generation bfloat16 -                             8  kda_gen_Kimi-K3
+vllm    kda                                verify bfloat16 -                                 8  ungated: the serving probe runs no speculative decoding
+vllm    mhc_module                         - bfloat16 -                                      5  ungated: measures the no-norm mhc_pre by contract (the SDK bills attn_norm); serving fuses the norm
+vllm    mla_bmm_gen_post                   - bfloat16 -                                    336  mla_bmm_gen_DeepSeek-V3
+vllm    mla_bmm_gen_pre                    - bfloat16 -                                    300  mla_bmm_gen_DeepSeek-V3
+vllm    mla_context_module                 - bfloat16/bfloat16/bfloat16 -                 1464  mla_ctx_bf16_DeepSeek-V3
+vllm    mla_context_module                 - fp8/bfloat16/bfloat16 -                      1464  derivable: deepseek-ai/DeepSeek-V3 kv=fp8
+vllm    mla_context_module                 - bfloat16/bfloat16/fp8_block -                1464  derivable: deepseek-ai/DeepSeek-V3 kv=auto
+vllm    mla_context_module                 - fp8/bfloat16/fp8_block -                     1464  mla_ctx_fp8_DeepSeek-R1
+vllm    mla_generation_module              - bfloat16/bfloat16/bfloat16 -                 2208  derivable: deepseek-ai/DeepSeek-V3 kv=auto
+vllm    mla_generation_module              - fp8/bfloat16/bfloat16 -                      2208  derivable: deepseek-ai/DeepSeek-V3 kv=fp8
+vllm    mla_generation_module              - bfloat16/bfloat16/fp8_block -                2208  derivable: deepseek-ai/DeepSeek-V3 kv=auto
+vllm    mla_generation_module              - fp8/bfloat16/fp8_block -                     2208  mla_gen_fp8_DeepSeek-R1
+vllm    moe                                - fp8_block -                                   837  moe_fp8block_DeepSeek-V3.2
+vllm    moe                                - bfloat16 -                                    762  moe_bf16_gemma4-26B-A4B
+vllm    moe                                - fp8 -                                         600  derivable: google/gemma-4-26B-A4B kv=auto
+vllm    moe                                - w4a16_mxfp4 -                                 111  moe_mxfp4_gpt-oss-120b
+vllm    moe                                - int4_wo -                                      39  derivable: moonshotai/Kimi-K2.5 kv=auto
+vllm    msa_context_module                 - bfloat16/bfloat16/bfloat16 -                 5007  msa_ctx_MiniMax-M3
+vllm    msa_context_module                 - fp8/bfloat16/bfloat16 -                      2815  derivable: MiniMaxAI/MiniMax-M3 kv=fp8
+vllm    msa_context_module                 - bfloat16/bfloat16/fp8_block -                2815  derivable: MiniMaxAI/MiniMax-M3 kv=auto
+vllm    msa_context_module                 - fp8/bfloat16/fp8_block -                     2815  derivable: MiniMaxAI/MiniMax-M3 kv=fp8
+vllm    msa_generation_module              - bfloat16/bfloat16/bfloat16 -                 1701  msa_gen_MiniMax-M3
+vllm    msa_generation_module              - fp8/bfloat16/bfloat16 -                       965  derivable: MiniMaxAI/MiniMax-M3 kv=fp8
+vllm    msa_generation_module              - bfloat16/bfloat16/fp8_block -                 965  derivable: MiniMaxAI/MiniMax-M3 kv=auto
+vllm    msa_generation_module              - fp8/bfloat16/fp8_block -                      965  derivable: MiniMaxAI/MiniMax-M3 kv=fp8
+90: 51 paths, 27 gated, 18 derivable, 3 with no gate

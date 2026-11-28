@@ -493,7 +493,10 @@ impl PyGemm {
 
 /// Embedding lookup. `empirical_bw_scaling_factor` is accepted for calling-
 /// shape compatibility and dropped (its math retired with the Python query
-/// stack); the engine types the quant as bfloat16 (memory-only op).
+/// stack). `quant_mode` defaults to BF16, which is what every table stored at
+/// the model-wide dtype is; a checkpoint that quantizes the table itself (an
+/// FP8 n-gram table) passes its own mode so the lookup prices the dtype the
+/// runtime reads.
 #[pyclass(extends = PyOperation, subclass, name = "Embedding", module = "aisim_core._native")]
 pub struct PyEmbedding;
 
@@ -508,7 +511,7 @@ impl PyEmbedding {
     const _ENGINE_QUERY_SHAPE: &'static str = "tokens";
 
     #[new]
-    #[pyo3(signature = (name, scale_factor, row_size, column_size, empirical_bw_scaling_factor=0.3, *, seq_split=1))]
+    #[pyo3(signature = (name, scale_factor, row_size, column_size, empirical_bw_scaling_factor=0.3, *, seq_split=1, quant_mode=None))]
     fn new(
         name: String,
         scale_factor: f64,
@@ -516,6 +519,7 @@ impl PyEmbedding {
         column_size: u32,
         empirical_bw_scaling_factor: f64,
         seq_split: u32,
+        quant_mode: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyClassInitializer<Self>> {
         let _ = empirical_bw_scaling_factor;
         let inner = Op::Embedding(EmbeddingOp {
@@ -523,7 +527,10 @@ impl PyEmbedding {
             scale_factor,
             vocab_size: row_size,
             hidden_size: column_size,
-            quant_mode: GemmQuantMode::Bfloat16,
+            quant_mode: match quant_mode {
+                Some(mode) => gemm_quant(mode)?,
+                None => GemmQuantMode::Bfloat16,
+            },
             seq_split,
         });
         Ok(PyClassInitializer::from(PyOperation { inner }).add_subclass(PyEmbedding))
@@ -538,7 +545,17 @@ impl PyEmbedding {
             (o.name.clone(), o.scale_factor, o.vocab_size, o.hidden_size).into_pyobject(py)?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("seq_split", o.seq_split)?;
+        kwargs.set_item("quant_mode", enum_token(&o.quant_mode))?;
         Ok((args, kwargs))
+    }
+
+    #[getter(_quant_mode)]
+    fn quant_mode<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        py_enum_member(
+            py,
+            "GEMMQuantMode",
+            &enum_token(&slf.as_super().embedding()?.quant_mode),
+        )
     }
 
     #[getter(_row_size)]
@@ -3442,7 +3459,7 @@ macro_rules! msa_class {
                 if $is_context { "context" } else { "generation" };
 
             #[new]
-            #[pyo3(signature = (name, scale_factor, num_heads, num_kv_heads, hidden_size, head_dim, v_head_dim, index_n_heads, index_head_dim, index_topk, block_size, kvcache_quant_mode, fmha_quant_mode, gemm_quant_mode, dsa_architecture="GlmMoeDsaForCausalLM", dsa_scale_k=1.0))]
+            #[pyo3(signature = (name, scale_factor, num_heads, num_kv_heads, hidden_size, head_dim, v_head_dim, index_n_heads, index_head_dim, index_topk, block_size, kvcache_quant_mode, fmha_quant_mode, gemm_quant_mode, dsa_architecture="GlmMoeDsaForCausalLM", dsa_scale_k=1.0, architecture="MiniMaxM3ForCausalLM", output_gate_dim=0, indexer_k_dim=0))]
             #[allow(clippy::too_many_arguments)]
             fn new(
                 name: String,
@@ -3461,10 +3478,14 @@ macro_rules! msa_class {
                 gemm_quant_mode: &Bound<'_, PyAny>,
                 dsa_architecture: &str,
                 dsa_scale_k: f64,
+                architecture: &str,
+                output_gate_dim: u32,
+                indexer_k_dim: u32,
             ) -> PyResult<PyClassInitializer<Self>> {
                 let module = crate::operators::MsaModuleOp {
                     name,
                     scale_factor,
+                    architecture: architecture.to_string(),
                     num_heads,
                     num_kv_heads,
                     hidden_size,
@@ -3474,6 +3495,8 @@ macro_rules! msa_class {
                     index_head_dim,
                     index_topk,
                     block_size,
+                    output_gate_dim,
+                    indexer_k_dim,
                     kv_cache_dtype: kv_quant(kvcache_quant_mode)?,
                     fmha_quant_mode: fmha_quant(fmha_quant_mode)?,
                     gemm_quant_mode: gemm_quant(gemm_quant_mode)?,
@@ -3508,6 +3531,9 @@ macro_rules! msa_class {
                 kwargs.set_item("gemm_quant_mode", enum_token(&o.gemm_quant_mode))?;
                 kwargs.set_item("dsa_architecture", o.dsa_architecture.clone())?;
                 kwargs.set_item("dsa_scale_k", o.dsa_scale_k)?;
+                kwargs.set_item("architecture", o.architecture.clone())?;
+                kwargs.set_item("output_gate_dim", o.output_gate_dim)?;
+                kwargs.set_item("indexer_k_dim", o.indexer_k_dim)?;
                 Ok((args, kwargs))
             }
 
@@ -3573,6 +3599,16 @@ macro_rules! msa_class {
                 Ok(slf.as_super().msa()?.block_size)
             }
 
+            #[getter(_output_gate_dim)]
+            fn output_gate_dim(slf: PyRef<'_, Self>) -> PyResult<u32> {
+                Ok(slf.as_super().msa()?.output_gate_dim)
+            }
+
+            #[getter(_indexer_k_dim)]
+            fn indexer_k_dim(slf: PyRef<'_, Self>) -> PyResult<u32> {
+                Ok(slf.as_super().msa()?.indexer_k_dim)
+            }
+
             #[getter(_kvcache_quant_mode)]
             fn kvcache_quant_mode<'py>(
                 slf: PyRef<'py, Self>,
@@ -3587,6 +3623,11 @@ macro_rules! msa_class {
                 py: Python<'py>,
             ) -> PyResult<Bound<'py, PyAny>> {
                 py_enum_member(py, "FMHAQuantMode", &enum_token(&slf.as_super().msa()?.fmha_quant_mode))
+            }
+
+            #[getter(_architecture)]
+            fn architecture(slf: PyRef<'_, Self>) -> PyResult<String> {
+                Ok(slf.as_super().msa()?.architecture.clone())
             }
 
             #[getter(_dsa_architecture)]

@@ -71,6 +71,7 @@ __compat__ = "vllm==0.32.0"
 
 import contextlib
 import json
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,6 +136,65 @@ def _uses_modelopt_nvfp4_checkpoint(model_name: str) -> bool:
     return (
         str(checkpoint_qc.get("quant_method", "")).lower() == "modelopt"
         and str(checkpoint_qc.get("quant_algo", "")).upper() == "NVFP4"
+    )
+
+
+def _fp8_block_moe_local_inter_error(
+    moe_type: str,
+    inter_size: int,
+    hidden_size: int,
+    moe_tp_size: int,
+    moe_ep_size: int,
+) -> RuntimeError | None:
+    """The cited limit an fp8_block MoE case hits, or None when it can run.
+
+    Only expert-TP shards the intermediate dim: ``FusedMoEConfig`` derives
+    ``intermediate_size_per_partition = intermediate_size // tp_size``
+    (fused_moe/config.py:1323 @0.31.0), and ``FusedMoEParallelConfig.make``
+    collapses TP to 1 whenever expert parallelism is on -- "each device owns
+    a set of experts fully. There is no tensor parallel"
+    (fused_moe/config.py:1182-1226). So with ``moe_ep_size > 1`` every rank
+    keeps the full 640-wide expert and this limit cannot bind; the EP cases
+    are exactly the measurables the grid already collected (moe_tp 1, ep up
+    to 256).
+
+    Block-FP8 expert weights carry 128x128 checkpoint scales. vLLM first
+    tries to refine those blocks down to a finer size that divides the
+    per-rank shard: ``refine_fp8_moe_block_shape`` returns
+    ``gcd(block_n, block_k, intermediate_size_per_partition, hidden_dim)``
+    and only accepts it when it is >= 32, i.e. still consumable by a Triton
+    kernel (fused_moe/oracle/fp8.py:296-315 @0.31.0). Qwen3.8-Flash-Next has
+    inter_size 640, so moe_tp 2/4 resolve to 64/32-wide blocks and run, while
+    moe_tp 8/16/32 (80/40/20) refine to 16/8/4 and cannot. With
+    ``moe_backend="auto"`` (this collector's default) the
+    pad-TP-shard-to-whole-blocks branch is skipped, so the unrefined shard
+    reaches validate_fp8_block_shape_moe and raises a plain ValueError
+    (fused_moe/oracle/fp8.py:317-348, quantization/fp8.py:549-553,
+    quantization/utils/fp8_utils.py:1263-1289 @0.31.0).
+
+    That is a cited framework limit, not a collector defect: the caller
+    raises a ``FIXME(kernel-limit)`` error before FusedMoE allocates weights
+    so collect.py records ``kernel_limit`` instead of ``unexpected``
+    (collector/failure_handling.md).
+    """
+    if moe_type != "fp8_block":
+        return None
+    tp_shards = 1 if moe_ep_size > 1 else moe_tp_size
+    local_inter_size = inter_size // tp_shards
+    if local_inter_size % 128 == 0:
+        return None
+    refinement = math.gcd(math.gcd(128, local_inter_size), hidden_size)
+    if refinement >= 32:
+        # vLLM refines the block shape to this width and a Triton FP8 MoE
+        # kernel consumes it, so the case is measurable as-is.
+        return None
+    return RuntimeError(
+        f"FIXME(kernel-limit): vLLM block-FP8 MoE cannot refine the 128-wide "
+        f"checkpoint block for this expert-TP shard "
+        f"(refine_fp8_moe_block_shape, fused_moe/oracle/fp8.py:296-315 @0.31.0); "
+        f"inter_size={inter_size} / {tp_shards} = {local_inter_size}, "
+        f"gcd(128, {local_inter_size}, hidden {hidden_size}) = {refinement} < 32, "
+        f"and moe_backend=auto does not pad the shard"
     )
 
 
@@ -620,6 +680,12 @@ def run_moe_torch(
     moe_intermediate_size = _moe_intermediate_size(
         inter_size, moe_tp_size, moe_ep_size, runtime_config["min_moe_intermediate_per_partition"]
     )
+
+    # Refuse a case the pinned framework cannot run before FusedMoE allocates
+    # its weights, and record the reason as a cited kernel limit.
+    kernel_limit_error = _fp8_block_moe_local_inter_error(moe_type, inter_size, hidden_size, moe_tp_size, moe_ep_size)
+    if kernel_limit_error is not None:
+        raise kernel_limit_error
 
     # A non-gated activation has no up projection to load: RoutedExperts
     # rejects an up name next to it (routed_experts.py:118-124), and

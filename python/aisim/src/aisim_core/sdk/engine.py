@@ -161,9 +161,13 @@ from aisim_core.sdk.rust_engine_step import (
 # - 29 (native VL): optional `vision` section (encoder layout plus the patch,
 #   transformer and output op groups) appended after the op lists. Claimed 21
 #   concurrently with AIC-1781; renumbered after GLM-5.3-Flash at the merge.
+# - 30 (AFD): P2P fabric selectors and independent AFD F-node width.
+# - 31 (MSA architecture identity): `MsaModuleOp` gained the checkpoint's own
+#   `architecture` between `scale_factor` and `num_heads` (positional bincode),
+#   so Qwen QSA rows resolve on their own identity instead of the hardcoded M3
+#   architecture.
 # Single owner: the Rust crate constant. Python re-exports it for
 # diagnostics/tests instead of declaring a twin to keep in sync.
-# Schema 30 adds P2P fabric selectors and independent AFD F-node width.
 ENGINE_SPEC_SCHEMA_VERSION = aisim_core.engine_spec_schema_version()
 ENGINE_CONFIG_SCHEMA_VERSION = 1
 

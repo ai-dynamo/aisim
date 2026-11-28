@@ -7,6 +7,11 @@
         "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351"
       ]
     },
+    "LicenseRef-Qwen-Community-1.0": {
+      "license_text_sha256": [
+        "b3bdd8378e562efce6325fd3e28e36054874e67760d8285cea8b9d5ed9c0ec4f"
+      ]
+    },
     "MIT": {
       "license_text_sha256": [
         "789377a8cfe3a67c77bd2bd9f9cb9b0142a9a905906c91bcaba52092a8d03169"
@@ -255,6 +260,42 @@
         "file": "THIRD_PARTY_NOTICES.md",
         "section": "Qwen3.8-Max model configuration files",
         "license_text_sha256": "397da6f971d6949a826ac2b87bab4a9bd6cc895c2fc83737bcc84f6d48e4a351"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3.8-Flash-Next-FP8_config.json",
+      "sha256": "c22eb0a053eed62e18f0184d3ca62d3798f208c3e00b9feee939fc3dbacdc8ca",
+      "origin": "upstream",
+      "source": {
+        "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/blob/236dfdf285828023ca3bcd3f37366c58a3469b13/config.json",
+        "revision": "236dfdf285828023ca3bcd3f37366c58a3469b13",
+        "path": "config.json"
+      },
+      "license": "LicenseRef-Qwen-Community-1.0",
+      "copyright_owner": "Qwen",
+      "modified": false,
+      "notice": {
+        "file": "THIRD_PARTY_NOTICES.md",
+        "section": "Qwen3.8-Flash-Next model configuration files",
+        "license_text_sha256": "b3bdd8378e562efce6325fd3e28e36054874e67760d8285cea8b9d5ed9c0ec4f"
+      }
+    },
+    {
+      "path": "aisim_core/model_configs/Qwen--Qwen3.8-Flash-Next_config.json",
+      "sha256": "889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b",
+      "origin": "upstream",
+      "source": {
+        "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/de4b8e4d43b917e7706784d8bb445c9af86a3540/config.json",
+        "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+        "path": "config.json"
+      },
+      "license": "LicenseRef-Qwen-Community-1.0",
+      "copyright_owner": "Qwen",
+      "modified": false,
+      "notice": {
+        "file": "THIRD_PARTY_NOTICES.md",
+        "section": "Qwen3.8-Flash-Next model configuration files",
+        "license_text_sha256": "b3bdd8378e562efce6325fd3e28e36054874e67760d8285cea8b9d5ed9c0ec4f"
       }
     },
     {

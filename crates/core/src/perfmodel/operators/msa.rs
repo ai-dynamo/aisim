@@ -19,6 +19,13 @@
 //! the manual `dsa_scale_k` level-alignment hook:
 //! `latency = SOL_msa / (util_dsa * k)`. A policy with XOP disabled raises
 //! the terminal empirical miss when the silicon path also missed.
+//!
+//! The XOP transfer belongs to the architecture it was calibrated against
+//! ([`MSA_ARCHITECTURE`]). An op that selects another architecture reads that
+//! architecture's own rows, and when they are absent it raises a typed miss
+//! instead of borrowing the DSA transfer: the borrowed util prices a different
+//! kernel, and on SM90 it lands 15-28x below the measured module (see
+//! `docs/perf-model/models/qwen38-flash-next.md`). SOL remains available.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,9 +43,15 @@ use crate::perf_database::dsa::{
 };
 use crate::perf_database::gemm::quant_tc_flops;
 
-/// The architecture the MSA collector stamps on every row — the sole native
-/// head geometry in the msa tables (Python `DEFAULT_MSA_ARCHITECTURE`).
+/// Default MSA table architecture — the stamp on MiniMax-M3 rows (Python
+/// `DEFAULT_MSA_ARCHITECTURE`). The op's `architecture` field selects the
+/// silicon slice; Qwen3.8-Flash-Next QSA rows are keyed by
+/// `Qwen4ExpForConditionalGeneration`.
 const MSA_ARCHITECTURE: &str = "MiniMaxM3ForCausalLM";
+
+fn default_msa_architecture() -> String {
+    MSA_ARCHITECTURE.to_string()
+}
 
 /// One MSA module block (context or generation — the phase is chosen by the
 /// `Op` variant). Field-for-field mirror of Python `_BaseMSAModule`.
@@ -46,6 +59,12 @@ const MSA_ARCHITECTURE: &str = "MiniMaxM3ForCausalLM";
 pub struct MsaModuleOp {
     pub name: String,
     pub scale_factor: f64,
+    /// Architecture slice this op reads from the msa tables. Rows are keyed by
+    /// architecture, and different architectures carry different native head
+    /// geometry, so the lookup must not assume the M3 stamp. Defaults keep
+    /// previously serialized specs (and every M3 caller) on MiniMax.
+    #[serde(default = "default_msa_architecture")]
+    pub architecture: String,
     /// Local (per-rank) query heads.
     pub num_heads: u32,
     pub num_kv_heads: u32,
@@ -56,6 +75,21 @@ pub struct MsaModuleOp {
     pub index_head_dim: u32,
     pub index_topk: u32,
     pub block_size: u32,
+    /// Output width (per rank) of a sigmoid output gate fused into the
+    /// module's own q projection, in columns. Qwen3.8-Flash-Next QSA fuses
+    /// q_proj with its gate (`2 * heads * head_dim` wide); MiniMax-M3's q
+    /// projection has no gate, so its ops keep the default 0.
+    #[serde(default)]
+    pub output_gate_dim: u32,
+    /// Output width (per rank) of the indexer K half fused into the module's
+    /// own index_qk projection, in columns. Qwen3.8-Flash-Next QSA fuses the
+    /// index query and key halves (`index_n_heads + indexer_kv_heads` heads
+    /// at `index_head_dim`); MiniMax-M3 relies on a constant fill for its
+    /// index-K rows, so its ones are the default 0: its SOL is the anchor the
+    /// accepted M3 rows were calibrated against, and adding a term there
+    /// would move a table already in the dataset.
+    #[serde(default)]
+    pub indexer_k_dim: u32,
     pub kv_cache_dtype: KvCacheQuantMode,
     pub fmha_quant_mode: FmhaQuantMode,
     pub gemm_quant_mode: GemmQuantMode,
@@ -103,6 +137,27 @@ impl MsaModuleOp {
         }
     }
 
+    /// Whether this op may use the DSA cross-op (XOP) transfer.
+    ///
+    /// The transfer substitutes `SOL_msa / util_dsa` for a measured module and
+    /// is calibrated on M3's kernel. A different `architecture` reads a
+    /// different implementation (Qwen3.8-Flash-Next QSA has a block indexer and
+    /// a fused q+gate that M3 does not), so its util-space value is not a level
+    /// shift of M3's: borrowing measures the wrong op. Without rows for that
+    /// architecture the only correct answer is a typed coverage miss.
+    fn ensure_xop_calibrated(&self, phase: &str) -> Result<(), AicError> {
+        if self.architecture == MSA_ARCHITECTURE {
+            return Ok(());
+        }
+        Err(AicError::EmpiricalNotImplemented(format!(
+            "MSA {phase}: no silicon rows for architecture {} and the DSA cross-op \
+             transfer is calibrated for {MSA_ARCHITECTURE} only; collect \
+             msa_context_module_perf / msa_generation_module_perf rows for {} or run \
+             in SOL mode.",
+            self.architecture, self.architecture
+        )))
+    }
+
     /// The legacy cross-op fallback: `SOL_msa / (util_dsa * k)`, gated by XOP.
     fn xop_context(
         &self,
@@ -112,6 +167,7 @@ impl MsaModuleOp {
         prefix: u32,
         sol: f64,
     ) -> Result<PerformanceResult, AicError> {
+        self.ensure_xop_calibrated("context")?;
         if !db.transfer_policy.contains(TransferKind::XOp) {
             return Err(AicError::EmpiricalNotImplemented(
                 "MSA context: cross-op transfer (xop) is disabled by the transfer policy \
@@ -179,6 +235,7 @@ impl MsaModuleOp {
         s: u32,
         sol: f64,
     ) -> Result<PerformanceResult, AicError> {
+        self.ensure_xop_calibrated("generation")?;
         if !db.transfer_policy.contains(TransferKind::XOp) {
             return Err(AicError::EmpiricalNotImplemented(
                 "MSA generation: cross-op transfer (xop) is disabled by the transfer \
@@ -237,6 +294,8 @@ impl MsaModuleOp {
                 self.index_head_dim as i128,
                 self.index_topk as i128,
                 self.block_size as i128,
+                self.output_gate_dim as i128,
+                self.indexer_k_dim as i128,
                 self.kv_cache_dtype,
                 self.fmha_quant_mode,
                 self.gemm_quant_mode,
@@ -251,7 +310,7 @@ impl MsaModuleOp {
             self.kv_cache_dtype,
             self.fmha_quant_mode,
             self.gemm_quant_mode,
-            MSA_ARCHITECTURE,
+            &self.architecture,
             &sol,
         )
     }
@@ -278,6 +337,8 @@ impl MsaModuleOp {
                 self.index_head_dim as i128,
                 self.index_topk as i128,
                 self.block_size as i128,
+                self.output_gate_dim as i128,
+                self.indexer_k_dim as i128,
                 self.kv_cache_dtype,
                 self.fmha_quant_mode,
                 self.gemm_quant_mode,
@@ -290,7 +351,7 @@ impl MsaModuleOp {
             self.num_heads,
             self.kv_cache_dtype,
             self.gemm_quant_mode,
-            MSA_ARCHITECTURE,
+            &self.architecture,
             &sol,
         )
     }
@@ -318,6 +379,8 @@ impl MsaModuleOp {
             self.index_head_dim as i128,
             self.index_topk as i128,
             self.block_size as i128,
+            self.output_gate_dim as i128,
+            self.indexer_k_dim as i128,
             self.kv_cache_dtype,
             self.fmha_quant_mode,
             self.gemm_quant_mode,
@@ -448,6 +511,8 @@ fn msa_attention_sol_ms(
     index_head_dim: i128,
     index_topk: i128,
     block_size: i128,
+    output_gate_dim: i128,
+    indexer_k_dim: i128,
     kv_quant: KvCacheQuantMode,
     fmha_quant: FmhaQuantMode,
     gemm_quant: GemmQuantMode,
@@ -468,6 +533,8 @@ fn msa_attention_sol_ms(
         index_head_dim,
         index_topk,
         block_size,
+        output_gate_dim,
+        indexer_k_dim,
         kv_quant,
         fmha_quant,
         gemm_quant,
@@ -492,6 +559,8 @@ fn msa_attention_sol_ms_with(
     index_head_dim: i128,
     index_topk: i128,
     block_size: i128,
+    output_gate_dim: i128,
+    indexer_k_dim: i128,
     kv_quant: KvCacheQuantMode,
     fmha_quant: FmhaQuantMode,
     gemm_quant: GemmQuantMode,
@@ -505,10 +574,18 @@ fn msa_attention_sol_ms_with(
     let kv_len = if is_context { full_s } else { (s - 1).max(0) };
 
     // ── GEMM group (Q / GQA-KV / O / indexer-Q projections) ──────────────
+    // `output_gate_dim` and `indexer_k_dim` are the fused halves this
+    // architecture's own module adds to those projections (Qwen3.8-Flash-Next
+    // QSA fuses the sigmoid gate into q_proj and the key half into
+    // index_qk_proj). They are priced here, in the module that is measured,
+    // rather than as separate GEMMs outside it: SILICON/HYBRID return the
+    // whole module's measured latency, so an outside GEMM would be charged
+    // twice once the rows resolve.
     let gemm_ops = 2 * tokens * hidden_size * (num_heads * qk_head_dim)
         + 2 * tokens * hidden_size * (2 * num_kv_heads * head_dim)
         + 2 * tokens * (num_heads * v_head_dim) * hidden_size
-        + 2 * tokens * hidden_size * (index_n_heads * index_head_dim);
+        + 2 * tokens * hidden_size * (index_n_heads * index_head_dim)
+        + 2 * tokens * hidden_size * (output_gate_dim + indexer_k_dim);
 
     // ── sparse attention: top-k saturated causal (query, kv) pair count ──
     let (pairs, score_len) = if is_context {
@@ -544,7 +621,8 @@ fn msa_attention_sol_ms_with(
     let gemm_weight_elems = hidden_size * num_heads * qk_head_dim
         + hidden_size * 2 * num_kv_heads * head_dim
         + num_heads * v_head_dim * hidden_size
-        + hidden_size * index_n_heads * index_head_dim;
+        + hidden_size * index_n_heads * index_head_dim
+        + hidden_size * (output_gate_dim + indexer_k_dim);
     let gemm_weight_bytes = gemm_weight_elems as f64 * gemm_quant.mapping().memory;
     let kv_cache_bytes = (b * num_kv_heads * effective_kv * (qk_head_dim + v_head_dim)) as f64
         * kv_quant.mapping().memory;
@@ -589,6 +667,7 @@ mod tests {
         MsaModuleOp {
             name: "msa".to_string(),
             scale_factor: 1.0,
+            architecture: MSA_ARCHITECTURE.to_string(),
             num_heads: 8,
             num_kv_heads: 1,
             hidden_size: 6144,
@@ -598,6 +677,8 @@ mod tests {
             index_head_dim: 128,
             index_topk: 2048,
             block_size: 128,
+            output_gate_dim: 0,
+            indexer_k_dim: 0,
             kv_cache_dtype: KvCacheQuantMode::Bfloat16,
             fmha_quant_mode: FmhaQuantMode::Bfloat16,
             gemm_quant_mode: GemmQuantMode::Bfloat16,
@@ -661,19 +742,166 @@ mod tests {
         }
     }
 
+    /// An architecture other than M3 must NOT borrow the DSA transfer when its
+    /// own rows are absent: the guard raises the terminal empirical miss, in
+    /// both phases and in both modes that reach the transfer (HYBRID after the
+    /// silicon miss, EMPIRICAL directly). sglang/0.5.14 ships no msa tables, so
+    /// this is the same vehicle the M3 oracle test uses.
+    #[test]
+    fn msa_xop_refuses_an_uncalibrated_architecture() {
+        const QSA: &str = "Qwen4ExpForConditionalGeneration";
+        for mode in [DatabaseMode::Hybrid, DatabaseMode::Empirical] {
+            let mut db = db("sglang", "0.5.14");
+            db.database_mode = mode;
+            let op = MsaModuleOp {
+                architecture: QSA.to_string(),
+                ..msa_op()
+            };
+            for (phase, err) in [
+                ("context", op.query_context(&db, 1, 1024, 0).unwrap_err()),
+                ("generation", op.query_generation(&db, 1, 1025).unwrap_err()),
+            ] {
+                match err {
+                    AicError::EmpiricalNotImplemented(msg) => {
+                        assert!(
+                            msg.contains(QSA)
+                                && msg.contains(MSA_ARCHITECTURE)
+                                && msg.contains("calibrated"),
+                            "{phase} {mode:?}: guard message must name both \
+                             architectures, got {msg}"
+                        );
+                    }
+                    other => panic!("{phase} {mode:?}: expected the typed miss, got {other:?}"),
+                }
+            }
+            // Nothing was priced, so the borrowed tier must not be recorded.
+            assert_ne!(
+                db.worst_provenance(),
+                crate::operators::util_empirical::ProvenanceTier::XOp,
+                "{mode:?}: a refused transfer must not claim xop provenance"
+            );
+        }
+    }
+
+    /// The guard is scoped to other architectures: M3 keeps the transfer (the
+    /// oracle test above pins the values), and an op that DOES carry QSA rows
+    /// still resolves them under SILICON.
+    #[test]
+    fn msa_xop_guard_leaves_calibrated_and_collected_paths_intact() {
+        const QSA: &str = "Qwen4ExpForConditionalGeneration";
+        // M3, no tables -> transfer still fires.
+        let m3_db = db("sglang", "0.5.14");
+        assert_eq!(
+            msa_op().query_context(&m3_db, 1, 1024, 0).unwrap().source,
+            Source::Empirical
+        );
+        // QSA with rows -> own slice, under the default SILICON mode.
+        let mut qsa_db = db("vllm", "0.24.0");
+        qsa_db.database_mode = DatabaseMode::Silicon;
+        let (context, generation) = msa_grids(&[(MSA_ARCHITECTURE, 10.0), (QSA, 20.0)]);
+        qsa_db.msa.inject_for_test(context, generation);
+        let op = MsaModuleOp {
+            architecture: QSA.to_string(),
+            ..msa_op()
+        };
+        approx(
+            op.query_context(&qsa_db, 1, 1024, 0).unwrap().latency_ms,
+            20.0,
+        );
+        assert_eq!(
+            op.query_context(&qsa_db, 1, 1024, 0).unwrap().source,
+            Source::Silicon
+        );
+        approx(
+            op.query_generation(&qsa_db, 1, 4097).unwrap().latency_ms,
+            1.0,
+        );
+        assert_eq!(
+            op.query_generation(&qsa_db, 1, 4097).unwrap().source,
+            Source::Silicon
+        );
+    }
+
+    /// QSA's fused projection halves are priced INSIDE the module SOL, not as
+    /// GEMMs beside it. SILICON/HYBRID return the measured whole-module
+    /// latency, so a supplementary GEMM would be charged twice once the QSA
+    /// rows resolve; including the columns here keeps SOL and the measured
+    /// unit the same arithmetic module.
+    #[test]
+    fn msa_sol_prices_the_fused_projection_halves_inside_the_module() {
+        const GATE: u32 = 1024; // sigmoid output-gate width (columns)
+        const IDX_K: u32 = 128; // the fused index_qk key half
+        let mut db = db("vllm", "0.24.0");
+        db.database_mode = DatabaseMode::Sol;
+        let flops = msa_sol_flops(
+            &db.system_spec,
+            GemmQuantMode::Bfloat16,
+            FmhaQuantMode::Bfloat16,
+        )
+        .expect("bf16 flops");
+        let gemm_mem = GemmQuantMode::Bfloat16.mapping().memory;
+
+        let m3 = msa_op();
+        let mut qsa = msa_op();
+        qsa.output_gate_dim = GATE;
+        qsa.indexer_k_dim = IDX_K;
+
+        // One context point (math-bound: 1024 tokens make the added GEMM work
+        // dwarf the added weight read) and one generation point (memory-bound:
+        // one query token re-reads the whole weight block). Each delta is
+        // exactly its dominant resource's added work — the terms are charged
+        // once, inside the module.
+        let cases = [
+            (true, 1024u32, 0u32),  // context: 1024 tokens, math-bound
+            (false, 4097u32, 0u32), // generation: 1 token, memory-bound
+        ];
+        for (is_context, s, prefix) in cases {
+            let tokens = if is_context { s as f64 } else { 1.0 };
+            let delta_math =
+                2.0 * tokens * m3.hidden_size as f64 * (GATE + IDX_K) as f64 / flops.gemm * 1000.0;
+            let delta_mem = m3.hidden_size as f64 * (GATE + IDX_K) as f64 * gemm_mem
+                / db.system_spec.gpu.mem_bw
+                * 1000.0;
+            let base = if is_context {
+                m3.query_context(&db, 1, s, prefix).unwrap().latency_ms
+            } else {
+                m3.query_generation(&db, 1, s).unwrap().latency_ms
+            };
+            let fused = if is_context {
+                qsa.query_context(&db, 1, s, prefix).unwrap().latency_ms
+            } else {
+                qsa.query_generation(&db, 1, s).unwrap().latency_ms
+            };
+            assert!(fused > base, "fused halves must add work, not replace it");
+            if is_context {
+                assert!(delta_math > delta_mem, "context point must be math-bound");
+                approx(fused - base, delta_math);
+            } else {
+                assert!(
+                    delta_mem > delta_math,
+                    "generation point must be memory-bound"
+                );
+                approx(fused - base, delta_mem);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Own silicon tables (msa_context_module / msa_generation_module).
     // No parquet writer in the test deps, so the loaded-grid layer is
     // injected directly (the loader itself is the shared, DSA-tested
     // `load_dsa_parquet`).
     // ------------------------------------------------------------------
-
     use crate::perf_database::dsa::{DsaGrids, DsaHeadGrid, DsaKey};
     use std::collections::BTreeMap;
 
     fn msa_key() -> DsaKey {
+        msa_key_for(MSA_ARCHITECTURE)
+    }
+
+    fn msa_key_for(architecture: &str) -> DsaKey {
         DsaKey {
-            architecture: MSA_ARCHITECTURE.to_string(),
+            architecture: architecture.to_string(),
             fmha_quant: "bfloat16".to_string(),
             kv_quant: "bfloat16".to_string(),
             gemm_quant: "bfloat16".to_string(),
@@ -681,40 +909,49 @@ mod tests {
     }
 
     /// One-point grids at the coordinates the loader would produce for
-    /// kernel_source="default" rows (flashmla_kv bucket): context
-    /// `[heads=8][prefix=0][isl=1024][b=1] = 10.0`; generation collapsed to
-    /// `[heads=8][step=0][seq=4097][b=1] = 0.5`.
-    fn inject_msa_grids(db: &PerfDatabase) {
-        let mut ctx_head = DsaHeadGrid::new();
-        ctx_head
-            .entry(8)
-            .or_default()
-            .entry(0)
-            .or_default()
-            .entry(1024)
-            .or_default()
-            .insert(1, LeafValue::latency_only(10.0));
-        let mut gen_head = DsaHeadGrid::new();
-        gen_head
-            .entry(8)
-            .or_default()
-            .entry(0)
-            .or_default()
-            .entry(4097)
-            .or_default()
-            .insert(1, LeafValue::latency_only(0.5));
-        let context = DsaGrids {
-            by_keys: BTreeMap::from([(
-                msa_key(),
+    /// kernel_source="default" rows (flashmla_kv bucket), one per
+    /// `(architecture, context_ms)` entry: context
+    /// `[heads=8][prefix=0][isl=1024][b=1] = context_ms`; generation collapsed
+    /// to `[heads=8][step=0][seq=4097][b=1] = context_ms / 20`.
+    fn msa_grids(entries: &[(&str, f64)]) -> (DsaGrids, DsaGrids) {
+        let mut context = BTreeMap::new();
+        let mut generation = BTreeMap::new();
+        for (architecture, context_ms) in entries {
+            let mut ctx_head = DsaHeadGrid::new();
+            ctx_head
+                .entry(8)
+                .or_default()
+                .entry(0)
+                .or_default()
+                .entry(1024)
+                .or_default()
+                .insert(1, LeafValue::latency_only(*context_ms));
+            let mut gen_head = DsaHeadGrid::new();
+            gen_head
+                .entry(8)
+                .or_default()
+                .entry(0)
+                .or_default()
+                .entry(4097)
+                .or_default()
+                .insert(1, LeafValue::latency_only(context_ms / 20.0));
+            let key = msa_key_for(architecture);
+            context.insert(
+                key.clone(),
                 BTreeMap::from([("flashmla_kv".to_string(), ctx_head)]),
-            )]),
-        };
-        let generation = DsaGrids {
-            by_keys: BTreeMap::from([(
-                msa_key(),
-                BTreeMap::from([("flashmla_kv".to_string(), gen_head)]),
-            )]),
-        };
+            );
+            generation.insert(key, BTreeMap::from([("flashmla_kv".to_string(), gen_head)]));
+        }
+        (
+            DsaGrids { by_keys: context },
+            DsaGrids {
+                by_keys: generation,
+            },
+        )
+    }
+
+    fn inject_msa_grids(db: &PerfDatabase) {
+        let (context, generation) = msa_grids(&[(MSA_ARCHITECTURE, 10.0)]);
         db.msa.inject_for_test(context, generation);
     }
 
@@ -748,6 +985,94 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// SILICON/HYBRID return the measured whole-module latency, which already
+    /// contains the fused q+gate and indexer-K work. The fused widths feed the
+    /// SOL only; on a measured row they must not move the answer, or they
+    /// would be charged a second time.
+    #[test]
+    fn msa_silicon_row_is_not_recharged_for_the_fused_projection_halves() {
+        let mut db = db("vllm", "0.24.0");
+        db.database_mode = DatabaseMode::Silicon;
+        inject_msa_grids(&db);
+        let mut qsa = msa_op();
+        qsa.output_gate_dim = 1024;
+        qsa.indexer_k_dim = 128;
+
+        // The M3 row measured the whole module; the fused widths change only
+        // the analytical SOL, so the measured answer stays the row's value.
+        approx(
+            qsa.query_context(&db, 1, 1024, 0)
+                .expect("context silicon hit")
+                .latency_ms,
+            10.0,
+        );
+        approx(
+            qsa.query_generation(&db, 1, 4097)
+                .expect("generation silicon hit")
+                .latency_ms,
+            0.5,
+        );
+    }
+
+    /// Silicon lookup keys on the op's own architecture, not the M3 default:
+    /// Qwen3.8-Flash-Next QSA rows are keyed by
+    /// `Qwen4ExpForConditionalGeneration`, and reading the wrong slice would
+    /// interpolate M3 head geometry.
+    #[test]
+    fn msa_silicon_lookup_keys_on_the_op_architecture() {
+        const QSA: &str = "Qwen4ExpForConditionalGeneration";
+        let mut db = db("vllm", "0.24.0");
+        db.database_mode = DatabaseMode::Silicon;
+        let (context, generation) = msa_grids(&[(MSA_ARCHITECTURE, 10.0), (QSA, 20.0)]);
+        db.msa.inject_for_test(context, generation);
+
+        let mut qsa = msa_op();
+        qsa.architecture = QSA.to_string();
+        approx(
+            qsa.query_context(&db, 1, 1024, 0)
+                .expect("qsa context silicon hit")
+                .latency_ms,
+            20.0,
+        );
+        approx(
+            qsa.query_generation(&db, 1, 4097)
+                .expect("qsa generation silicon hit")
+                .latency_ms,
+            1.0,
+        );
+
+        let m3 = msa_op();
+        approx(
+            m3.query_context(&db, 1, 1024, 0)
+                .expect("m3 context silicon hit")
+                .latency_ms,
+            10.0,
+        );
+        approx(
+            m3.query_generation(&db, 1, 4097)
+                .expect("m3 generation silicon hit")
+                .latency_ms,
+            0.5,
+        );
+    }
+
+    /// Specs serialized before the field existed stay loadable and keep the
+    /// M3 slice every legacy caller expects.
+    #[test]
+    fn msa_op_json_without_architecture_defaults_to_m3() {
+        let mut value = serde_json::to_value(msa_op()).expect("serialize msa op");
+        let fields = value.as_object_mut().expect("object");
+        fields.remove("architecture");
+        // Specs serialized before the fused-half widths existed must stay
+        // readable, on M3's (no fused half) pricing.
+        fields.remove("output_gate_dim");
+        fields.remove("indexer_k_dim");
+        let restored: MsaModuleOp =
+            serde_json::from_value(value).expect("deserialize legacy msa op");
+        assert_eq!(restored.architecture, MSA_ARCHITECTURE);
+        assert_eq!((restored.output_gate_dim, restored.indexer_k_dim), (0, 0));
     }
 
     /// A quant slice absent from the injected table is a typed silicon miss:

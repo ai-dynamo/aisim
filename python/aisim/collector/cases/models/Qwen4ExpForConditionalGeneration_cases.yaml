@@ -1,0 +1,205 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Pinned framework sources for every citation in this file: SGLang v0.5.21
+# (python/sglang/srt/models/qwen4_exp.py, layers/attention/qsa/) and vLLM
+# v0.31.0 (vllm/model_executor/models/qwen4_exp/).
+schema_version: 1
+architecture: Qwen4ExpForConditionalGeneration
+model_path: Qwen/Qwen3.8-Flash-Next
+model_paths:
+  - Qwen/Qwen3.8-Flash-Next
+  - Qwen/Qwen3.8-Flash-Next-FP8
+include_base: true
+base_ops:
+  # No dense (GQA) attention rows: all 48 decoder layers are GDN or QSA, and
+  # those price through gdn / msa_*_module. attention_context and
+  # attention_generation are therefore NOT activated for this plan.
+  - gemm
+framework_specific_base_ops:
+  # Vision tower: 27 ViT blocks at head count 16 / head_dim 72 — a real
+  # collection surface (AISimulate expands the tower into 19 encoder ops).
+  sglang:
+    - encoder_attention
+  vllm:
+    - encoder_attention
+description: >
+  Qwen3.8-Flash-Next (Qwen4-Exp) GDN + QSA hybrid MoE model-centric plan.
+  48 decoder layers: 36 GDN linear-attention layers and 12 QSA compressed
+  sparse-attention layers (full_attention_interval 4, indices 3,7,...,47),
+  one n-gram PLE branch at layer 2, 512 routed experts top-10 with a 640-wide
+  shared expert, gated residual ("hyper-connection", hc_count 4 /
+  hc_lowrank 320), and a 1-layer QSA MTP draft. Both artifacts
+  (Qwen/Qwen3.8-Flash-Next bf16, Qwen/Qwen3.8-Flash-Next-FP8) are the same
+  multimodal architecture; the FP8 recipe quantizes routed experts only.
+
+model_case_values:
+  moe:
+    # One row covers both artifacts: the checkpoints are shape-identical and
+    # the only quantized module family is mlp.experts.* (the FP8
+    # quantization_config lists 943 modules_to_not_convert entries covering
+    # self_attn.*, indexer, linear_attn.*, mlp.shared_expert.*,
+    # mlp.gate/shared_expert_gate, attn/mlp hyper-connections, ple.*,
+    # visual.*, mtp.*, lm_head and embed_tokens — every family except the
+    # routed experts). So the routed-MoE dtype axis is exactly
+    # {bfloat16 (base), fp8_block (-FP8)} and no other mode describes a real
+    # artifact. The row applies to every CUDA backend; TRT-LLM leaves the whole
+    # model out of its plans (collector/skips.py: no Qwen4-Exp model class).
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      hidden_size: 2560
+      inter_size: 640
+      topk: 10
+      num_experts: 512
+      # RoutingMethodType.RenormalizeNaive is hardcoded at the
+      # get_moe_impl_class(...) call inside Qwen2MoeSparseMoeBlock.__init__
+      # (models/qwen2_moe.py@v0.5.21): softmax scores, top-k, renormalize —
+      # no scoring_func override, no e_score_correction_bias and no expert
+      # groups in the checkpoint config. Qwen4-Exp reaches that block through
+      # Qwen3_5ForCausalLM's MoE layer (qwen3_5.py:1272 builds
+      # Qwen2MoeSparseMoeBlock for the qwen4_exp text config).
+      # The shared expert (shared_expert_intermediate_size 640) is modeled by
+      # the SDK as its own GEMM rows (shared_gate_up / shared_down), never as
+      # part of the routed-MoE benchmark shape.
+      sglang_moe_routing_method_type: RenormalizeNaive
+      quantization_modes: [bfloat16, fp8_block]
+  mla_module:
+    # model_aliases (NOT model_paths): the QSA module benchmark builds dummy
+    # weights of the real serving layer and takes compute/KV/GEMM precision as
+    # explicit declared sweep axes (base_ops/mla_module.yaml), so the -FP8
+    # artifact provably cannot change the invoked kernel or the persisted
+    # row key — both checkpoints keep the QSA layer in bf16 (FP8 excludes
+    # self_attn.*/indexer), and the shape-only MSA tables carry no quant
+    # column. The alias keeps a targeted run on either path populating the
+    # plan while rows stay keyed to the single canonical model.
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      attention_type: qsa
+      # 24 query heads x head_dim 256, 2 KV heads. The module is collected at
+      # one TP rank's shard, which is the only shape that reproduces serving:
+      # 24/12/6/3 query heads at TP 1/2/4/8 (the shared MSA/DSA head grid
+      # carries 24 and 12 but not 6 or 3, hence the declared shard axis, the
+      # same ``tensor_parallel_sizes`` field the MSA rows declare).
+      native_num_heads: 24
+      tensor_parallel_sizes: [1, 2, 4, 8]
+  gdn:
+    # 36 GDN layers: 16 key heads x 128, 48 value heads x 128, conv width 4.
+    # mamba_ssm_dtype float32 pins SGLang to the Triton recurrent decode
+    # kernel on every SM (server_args.py _handle_linear_attn_backend picks the
+    # FlashInfer bf16-state kernel only when mamba_ssm_dtype is bfloat16).
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      d_model: 2560
+      d_conv: 4
+      num_k_heads: 16
+      head_k_dim: 128
+      num_v_heads: 48
+      head_v_dim: 128
+      tensor_parallel_sizes: [1, 2, 4, 8]
+      mamba_ssm_dtype: float32
+  gemm:
+    # Exact per-rank (n, k) shapes this model looks up that the base feature
+    # grid cannot express. They are listed here rather than left to
+    # interpolation because both artifacts are BF16 for every projection
+    # except the routed experts. Rows keep the model's own correlation: one
+    # row per projection family, with TP shards in the same row.
+    #
+    # LM head / logits: vocab 248320 x hidden 2560, sharded over TP.
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [248320, 124160, 62080, 31040]
+      input_feature_sizes: [2560]
+    # Hyper-connection inject: hc_count rows x (hc_count * hidden).
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [4]
+      input_feature_sizes: [10240]
+    # Shared-expert scalar gate: hidden -> 1.
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [1]
+      input_feature_sizes: [2560]
+    # GDN in_proj_ba: 2 * num_v_heads / tp (48 value heads sharded by TP).
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [96, 48, 24, 12]
+      input_feature_sizes: [2560]
+    # Shared-expert gate+up: 2 * shared_inter_size / tp.
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [1280, 640, 320, 160]
+      input_feature_sizes: [2560]
+    # Shared-expert down: hidden <- shared_inter_size / tp.
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [2560]
+      input_feature_sizes: [640, 320, 160, 80]
+    # Hyper-connection up (replicated): (hc_count * hidden) <- hc_lowrank.
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [10240]
+      input_feature_sizes: [320]
+    # Vision tower (TP-invariant; weights are replicated per rank):
+    # patch embed (hidden <- patch*patch*temporal*3), qkv ((q + 2kv) * 72),
+    # attention proj, FFN up/down (4304), and the two projector stages
+    # ((2*out_hidden) <- out_hidden, out_hidden <- 4608).
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [1152]
+      input_feature_sizes: [1152, 1536, 4304]
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [3456]
+      input_feature_sizes: [1152]
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [4304]
+      input_feature_sizes: [1152]
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [4608]
+      input_feature_sizes: [4608]
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      model_aliases:
+        - Qwen/Qwen3.8-Flash-Next-FP8
+      output_feature_sizes: [2560]
+      input_feature_sizes: [4608]
+
+all_frameworks_op_cases:
+  gemm:
+    cases: all
+  moe:
+    cases: all
+  gdn:
+    cases: all
+
+framework_specific_op_cases:
+  # QSA dispatches inside the existing MSA module op: the MSA tables are
+  # shape-only (no head_dim/block_size columns) and Qwen4-Exp geometry is
+  # baked into the collected kernel, so no separate op/perf file exists.
+  # TRT-LLM is deliberately absent: neither pinned TRT-LLM nor the model has
+  # a QSA attention path, so there is nothing silicon-true to collect there.
+  vllm:
+    msa_context_module:
+      cases: all
+    msa_generation_module:
+      cases: all
+  sglang:
+    msa_context_module:
+      cases: all
+    msa_generation_module:
+      cases: all

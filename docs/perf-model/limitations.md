@@ -50,6 +50,7 @@ patches, 9 embeddings, and 12 context tokens.
 - [Whole-forward](methods/whole-forward.md) documents exact identity and query-domain failures.
 - [Memory](memory.md) distinguishes physical payload/resource estimates from observed allocations.
 - [DeepSeek-V4.1](models/deepseek-v41.md) separates analytical and measured execution contracts.
+- [Qwen3.8-Flash-Next](models/qwen38-flash-next.md) scopes QSA, PLE residency and its FP8 split (routed experts plus the n-gram table).
 - [Replay features](../replay/features.md) records supported scheduler/cache/topology combinations.
 
 These are current modeling boundaries. Completed implementation plans and

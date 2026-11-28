@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""vLLM 0.24.0 Qwen3.5 Gated DeltaNet collector.
+"""vLLM Qwen3.5 Gated DeltaNet collector.
 
 The collector times the two production core operations separately. Prefill
 uses vLLM's ``ChunkGatedDeltaRule`` so its default resolver selects the real
@@ -17,6 +17,15 @@ Input/output projection GEMMs remain covered by the GEMM collector.
 # but FlashInfer 0.7.0.post1 rewrote its GDN prefill kernels and the FLA Triton
 # chunk kernels moved off tl.make_block_ptr, so prefill-core rows are re-collected.
 # Earlier audits are git history.
+#
+# The Qwen3.8-Flash-Next C3.4 GDN rows were collected and audited at v0.31.0 on
+# the real image
+# (docker.io/vllm/vllm-openai:v0.31.0@sha256:c1c9f6fd...67c3, H200/sm90) by
+# executing this collector's exact call path; that audit, its AUDIT_OK log and
+# the conv_state/packed_decode shape facts it pinned are git history. The run
+# then moved with the `linear_attention` family to 0.32.0 per the
+# pin-consolidation rule, and the 0.31.0 tables stay under their version key.
+# One release per file (owner policy 2026-09-20).
 __compat__ = "vllm==0.32.0"
 
 import gc

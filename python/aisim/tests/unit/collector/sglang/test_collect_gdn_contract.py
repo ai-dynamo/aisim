@@ -52,6 +52,105 @@ def test_gdn_context_raises_on_conv_int32_offset_overflow():
     assert "total_tokens * conv_channels >= 2**31" in source
     assert "int32 token-offset overflow" in source
     assert "causal_conv1d_triton.py:398-405" in source
+    assert "SGLang causal_conv1d Triton kernel int32 token-offset" in source
+    assert "causal_conv1d_triton.py:373-379" in source
+    # It must raise the dedicated type, so the sweep can tell a cited kernel
+    # limit apart from a genuine collector failure and keep measuring the rest.
+    assert "raise SGLangGdnKernelLimit(" in source
+    tree = ast.parse(source, filename=str(SOURCE_PATH))
+    guard = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SGLangGdnKernelLimit")
+    assert {"ValueError"} <= {base.id for base in guard.bases if isinstance(base, ast.Name)}
+
+
+def _load_kernel_limit_error():
+    # Exec both together: _gdn_context_incomplete_error resolves
+    # _gdn_context_summary from its globals at call time.
+    names = ("_gdn_context_summary", "_gdn_context_incomplete_error")
+    tree = ast.parse(SOURCE_PATH.read_text(encoding="utf-8"), filename=str(SOURCE_PATH))
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert len(nodes) == len(names)
+    namespace: dict = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE_PATH), "exec"), namespace)
+    return namespace["_gdn_context_incomplete_error"]
+
+
+def test_gdn_kernel_limit_error_is_classified_not_unexpected():
+    # The per-cell guard is expected on every rerun of the 0.5.21 grid (two
+    # context cases lose 10 and 6 cells to it, 2026-11-02 C3.4 gate), so the
+    # failure record must read kernel_limit, not unexpected — otherwise the
+    # run looks like a collector defect forever (failure_handling.md).
+    # collect._classify_exception keys on exactly this prefix
+    # (test_error_classification.py pins that contract); importing collect
+    # here would need PYTHONPATH=collector and a torch-bearing image.
+    collect_source = (SOURCE_PATH.parents[1] / "collect.py").read_text(encoding="utf-8")
+    assert 'KERNEL_LIMIT_PREFIX = "FIXME(kernel-limit)"' in collect_source
+
+    incomplete_error = _load_kernel_limit_error()
+    error = incomplete_error(
+        successful_points=102,
+        failed_points=0,
+        kernel_limit_points=10,
+        total_points=112,
+        kernel_limit_cells=["batch_size=64/seq_len=4096"],
+    )
+
+    assert error is not None
+    assert str(error).lstrip().startswith("FIXME(kernel-limit)")
+
+
+def test_gdn_context_kernel_limit_only_case_reports_fixme_and_names_cells():
+    incomplete_error = _load_kernel_limit_error()
+
+    error = incomplete_error(
+        successful_points=102,
+        failed_points=0,
+        kernel_limit_points=10,
+        total_points=112,
+        kernel_limit_cells=["batch_size=64/seq_len=4096", "batch_size=64/seq_len=8192"],
+    )
+
+    assert error is not None
+    message = str(error)
+    assert message.startswith("FIXME(kernel-limit):")
+    assert "measured 102/112 cells" in message
+    assert "kernel_limit=10" not in message  # the cells are named instead
+    assert "batch_size=64/seq_len=4096" in message
+    assert "batch_size=64/seq_len=8192" in message
+    assert "causal_conv1d_triton.py:373-379" in message
+
+
+def test_gdn_context_incomplete_error_prefers_real_failure_over_kernel_limit():
+    incomplete_error = _load_kernel_limit_error()
+
+    error = incomplete_error(
+        successful_points=100,
+        failed_points=2,
+        kernel_limit_points=10,
+        total_points=112,
+        kernel_limit_cells=["batch_size=64/seq_len=4096"],
+    )
+
+    assert error is not None
+    message = str(error)
+    assert not message.startswith("FIXME(kernel-limit):")
+    assert "strict completeness" in message
+    assert "error=2" in message
+    assert "kernel_limit=10" in message
+
+
+def test_gdn_context_complete_case_raises_nothing():
+    incomplete_error = _load_kernel_limit_error()
+
+    assert (
+        incomplete_error(
+            successful_points=112,
+            failed_points=0,
+            kernel_limit_points=0,
+            total_points=112,
+            kernel_limit_cells=[],
+        )
+        is None
+    )
 
 
 def _load_function(source_path: Path, name: str, namespace: dict | None = None):
@@ -214,7 +313,9 @@ class TestResolveFlashinferGdnDecode:
 
         generation_cases = [case for case in get_common_gdn_test_cases() if case.phase == "generation"]
 
-        assert len(generation_cases) == 42
+        # Qwen3.8-Flash-Next (Qwen4-Exp) adds one GDN row at d_model 2560 over
+        # TP 1/2/4/8 with mamba_ssm_dtype float32.
+        assert len(generation_cases) == 46
         assert {case.mamba_ssm_dtype for case in generation_cases} == {"float32"}
         assert [case for case in generation_cases if resolve(case.mamba_ssm_dtype)[0] is not None] == []
 

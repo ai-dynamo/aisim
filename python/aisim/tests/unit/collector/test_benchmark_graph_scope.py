@@ -8,7 +8,8 @@ import logging
 import os
 import sys
 import time
-from contextlib import contextmanager
+from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,16 @@ SOURCE = COLLECTOR / "helper.py"
 
 
 def trace_benchmark(
-    monkeypatch, *, source=SOURCE, failure=None, explicit=None, eager=False, fallback=False, tracing=False, **extra
+    monkeypatch,
+    *,
+    source=SOURCE,
+    failure=None,
+    explicit=None,
+    eager=False,
+    fallback=False,
+    tracing=False,
+    with_capture_context=False,
+    **extra,
 ):
     """Execute a helper source snapshot; retain graph references like a traceback."""
     from collector.helper import TRACE_CHILD_DIR_ENV, TRACE_MEASURED_RANGE, TRACE_TIMED_RANGE
@@ -81,6 +91,15 @@ def trace_benchmark(
         if state["stream"] == "capture":
             fault("capture_body")
 
+    @contextmanager
+    def capture_scope():
+        """Stand-in for a framework capture flag (SGLang ``model_capture_mode``)."""
+        events.append("scope:begin")
+        try:
+            yield
+        finally:
+            events.append("scope:end")
+
     class Event:
         def __init__(self, **kwargs):
             events.append("event:create")
@@ -118,8 +137,13 @@ def trace_benchmark(
         monkeypatch.delenv(TRACE_CHILD_DIR_ENV, raising=False)
     tree = ast.parse(source.read_text())
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "benchmark_with_power")
+    # The executed snapshot resolves the decorator, the annotations and the
+    # module-level names the body touches from this namespace, so it mirrors
+    # helper.py's own imports (contextmanager/nullcontext/Callable/time).
     namespace = {
         "contextmanager": contextmanager,
+        "nullcontext": nullcontext,
+        "Callable": Callable,
         "get_device_module": lambda device=None: cuda,
         "logging": logging,
         "os": os,
@@ -142,6 +166,8 @@ def trace_benchmark(
     }
     if explicit is not None:
         kwargs["explicit_graph_cleanup"] = explicit
+    if with_capture_context:
+        kwargs["capture_context"] = capture_scope
     kwargs.update(extra)
     result, caught = None, None
     try:
@@ -281,6 +307,39 @@ def test_eager_does_not_touch_graph_lifetime_in_either_mode(monkeypatch):
     assert default["resets"] == []
     # eager: num_warmups (2) + num_runs (3); the helper no longer repeats the eager warmup after the capture step
     assert default["events"].count("kernel") == 5
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_capture_context_wraps_the_capture_only(monkeypatch, explicit):
+    """A framework capture flag must cover capture and nothing else.
+
+    SGLang's model code branches on ``get_is_capture_mode()``; entering the
+    scope for the eager warmups or for the replays would measure a different
+    execution path than serving, so pin the exact span.
+    """
+    observed = trace_benchmark(monkeypatch, explicit=explicit, with_capture_context=True)
+    events = observed["events"]
+    assert events.count("scope:begin") == 1
+    assert events.count("scope:end") == 1
+    assert events.index("kernel") < events.index("scope:begin")
+    assert events.index("scope:begin") < events.index("capture:begin")
+    assert events.index("capture:end") < events.index("scope:end")
+    # Replays are outside the scope: no scope event after it closes.
+    assert events.index("scope:end") < events.index("graph:replay")
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_capture_context_is_exited_when_the_capture_fails(monkeypatch, explicit):
+    observed = trace_benchmark(monkeypatch, failure="capture_body", explicit=explicit, with_capture_context=True)
+    events = observed["events"]
+    assert observed["error"]["original_error"] is True
+    assert "scope:begin" in events
+    assert events.index("capture:begin") < events.index("scope:end")
+    assert "graph:replay" not in events
+
+
+def test_capture_context_defaults_to_none(monkeypatch):
+    assert trace_benchmark(monkeypatch) == trace_benchmark(monkeypatch, with_capture_context=False)
 
 
 def test_only_vllm_mla_module_binds_explicit_graph_cleanup():

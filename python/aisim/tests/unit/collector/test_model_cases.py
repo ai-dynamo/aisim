@@ -764,14 +764,19 @@ def test_gemm_common_cases_expand_from_base_op_yaml_shape_specs():
     # GLM-5.3-Flash adds ten new off-grid output widths at k=4096 (its
     # declared widths minus those another model already declares) across the
     # 74 standard / 21 XPU token counts.
-    assert len(cases) == 38258
+    # Qwen3.8-Flash-Next (Qwen4-Exp) adds 26 off-grid (n, k) pairs (the four
+    # per-TP LM-head widths, in_proj_ba / shared-expert / hyper-connection /
+    # scalar-gate widths, and the seven vision+projector shapes) across the
+    # same token grids: +1924 standard (26 x 74) and +546 XPU (26 x 21).
+    assert len(cases) == 40182
     assert cases[0] == GemmCommonTestCase(x=32768, n=65536, k=51200)
-    assert cases[-1] == GemmCommonTestCase(x=1, n=1, k=4096)
+    # Last model row is the projector fc1 (n=2560, k=4608) at one token.
+    assert cases[-1] == GemmCommonTestCase(x=1, n=2560, k=4608)
     assert not any(case.n == 65536 and case.k == 65536 for case in cases)
 
-    assert len(xpu_cases) == 10857
+    assert len(xpu_cases) == 11403
     assert xpu_cases[0] == GemmCommonTestCase(x=8192, n=65536, k=32768)
-    assert xpu_cases[-1] == GemmCommonTestCase(x=1, n=1, k=4096)
+    assert xpu_cases[-1] == GemmCommonTestCase(x=1, n=2560, k=4608)
     assert get_gemm_type_specs("vllm_xpu") == ["bfloat16", "fp8"]
 
     for backend_cases in (cases, xpu_cases):
@@ -834,7 +839,8 @@ def test_cross_model_common_cases_expand_from_base_op_yaml_sweeps(monkeypatch):
     # is unaffected either way. Qwen3.8-Max contributes one 117-case base
     # row and one 117-case RadixArk NVFP4 row. GLM-5.3-Flash adds two 99-case
     # rows (zai-org FP8 and nvidia NVFP4 checkpoints, 288 experts x 4096/2048).
-    assert len(moe_cases) == 7152
+    # +117 for Qwen3.8-Flash-Next's MoE row (2560/640, 512 experts top-10).
+    assert len(moe_cases) == 7269
 
     assert any(
         case.model_name == "nvidia/DeepSeek-V4-Flash-NVFP4"
@@ -874,6 +880,19 @@ def test_cross_model_common_cases_expand_from_base_op_yaml_sweeps(monkeypatch):
     assert any(
         case.model_name == "nvidia/MiniMax-M3-NVFP4" and case.hidden_size == 6144 and case.inter_size == 3072
         for case in moe_cases
+    )
+    # Qwen3.8-Flash-Next's 512-expert top-10 row, with softmax + renormalize
+    # (Qwen2MoeSparseMoeBlock's RenormalizeNaive) and no correction bias —
+    # the defaults would benchmark a different routing invocation.
+    qwen4_exp_moe = [case for case in moe_cases if case.model_name == "Qwen/Qwen3.8-Flash-Next"]
+    assert len(qwen4_exp_moe) == 117
+    assert all(
+        case.hidden_size == 2560
+        and case.inter_size == 640
+        and case.topk == 10
+        and case.num_experts == 512
+        and case.sglang_moe_routing_method_type == "RenormalizeNaive"
+        for case in qwen4_exp_moe
     )
     # Every Lightning case, not just one: the documented +114 contribution,
     # each carrying the exact checkpoint geometry (an `any(...)` pin would
@@ -919,7 +938,9 @@ def test_cross_model_common_cases_expand_from_base_op_yaml_sweeps(monkeypatch):
     assert len(mamba_cases) == 12
     assert {case.model_name for case in mamba_cases} >= {"MAMBA2_GENERIC_4K", "MAMBA2_GENERIC_1K"}
     # Qwen3.8-Max adds context/generation at TP 1/2/4/8/16.
-    assert len(get_common_gdn_test_cases()) == 84
+    # Qwen3.8-Flash-Next adds one row at d_model 2560 over TP 1/2/4/8
+    # (+8 = 4 TP sizes x 2 phases).
+    assert len(get_common_gdn_test_cases()) == 92
     mhc_cases = get_common_mhc_test_cases()
     # GLM-5.3-Flash adds one aliased (FP8/NVFP4) mHC row.
     assert len(mhc_cases) == 10
@@ -1105,6 +1126,8 @@ def test_mla_bmm_cases_expand_from_base_op_yaml():
 
 def test_mla_module_metadata_and_micro_sweeps_are_yaml_backed():
     from collector.case_generator import (
+        get_mla_module_model_aliases,
+        get_mla_module_model_head_counts,
         get_mla_module_model_specs,
         get_mla_module_precision_specs,
         get_mla_module_sweep_spec,
@@ -1140,9 +1163,9 @@ def test_mla_module_metadata_and_micro_sweeps_are_yaml_backed():
     assert get_mla_module_sweep_spec("sglang").context_sequence_lengths[-2:] == [8192, 16384]
 
     # FP8 prefill-query compute exists for the dense-MLA prefill path only: the
-    # sparse DSA and MSA builders have no prefill-query quantization concept, so
-    # the fp8 compute combos are scoped attention_types: [mla] and the DSA and
-    # MSA plans do not expand them.
+    # sparse DSA, MSA and QSA builders have no prefill-query quantization
+    # concept, so the fp8 compute combos are scoped attention_types: [mla] and
+    # the other plans do not expand them.
     for attention_type in ("dsa", "msa"):
         assert [
             (spec.compute_dtype, spec.kv_cache_dtype, spec.gemm_type)
@@ -1155,6 +1178,9 @@ def test_mla_module_metadata_and_micro_sweeps_are_yaml_backed():
             ("bfloat16", "bfloat16", "nvfp4"),
             ("bfloat16", "fp8", "nvfp4"),
         ]
+    # The mla scope adds the fp8 prefill-query compute combos on top of the
+    # dsa set; it no longer equals the unfiltered enumeration, which also
+    # carries the msa- and qsa-scoped combos.
     assert [
         (spec.compute_dtype, spec.kv_cache_dtype, spec.gemm_type)
         for spec in get_mla_module_precision_specs("plan", phase="context", attention_type="mla")
@@ -1169,6 +1195,20 @@ def test_mla_module_metadata_and_micro_sweeps_are_yaml_backed():
         ("bfloat16", "fp8", "nvfp4"),
         ("fp8", "fp8", "nvfp4"),
     ]
+    # QSA (Qwen3.8-Flash-Next) is bf16 end to end in both artifacts, so the
+    # scope narrows to exactly one triple on every phase and SM — no fp8-KV,
+    # no quantized-projection lane to collect.
+    for phase in ("context", "generation"):
+        for sm_version in (89, 90, 100):
+            assert [
+                (spec.compute_dtype, spec.kv_cache_dtype, spec.gemm_type)
+                for spec in get_mla_module_precision_specs(
+                    "plan",
+                    phase=phase,
+                    sm_version=sm_version,
+                    attention_type="qsa",
+                )
+            ] == [("bfloat16", "bfloat16", "bfloat16")]
 
     with pytest.raises(ValueError, match="attention_type"):
         get_mla_module_precision_specs("plan", phase="context", sm_version=100, attention_type="dense")
@@ -1208,13 +1248,35 @@ def test_mla_module_metadata_and_micro_sweeps_are_yaml_backed():
         ("dsa", "deepseek-ai/DeepSeek-V3.2", "DeepseekV32ForCausalLM"),
         ("dsa", "zai-org/GLM-5.2", "GlmMoeDsaForCausalLM"),
         ("msa", "MiniMaxAI/MiniMax-M3", "MiniMaxM3ForCausalLM"),
+        ("qsa", "Qwen/Qwen3.8-Flash-Next", "Qwen4ExpForConditionalGeneration"),
     }
     assert {(spec.attention_type, spec.model_path, spec.architecture) for spec in trtllm_specs} == {
         ("mla", "deepseek-ai/DeepSeek-V3", "DeepseekV3ForCausalLM"),
         ("dsa", "deepseek-ai/DeepSeek-V3.2", "DeepseekV32ForCausalLM"),
         ("dsa", "zai-org/GLM-5", "GlmMoeDsaForCausalLM"),
         ("msa", "MiniMaxAI/MiniMax-M3", "MiniMaxM3ForCausalLM"),
+        # The spec table is backend-agnostic metadata: an unfiltered read
+        # reports the QSA row for every backend, but the TRT-LLM collector
+        # asks for attention_type="msa", so this row is never dispatched
+        # there (the Qwen4-Exp plan declares no trtllm ops).
+        ("qsa", "Qwen/Qwen3.8-Flash-Next", "Qwen4ExpForConditionalGeneration"),
     }
+    qsa_specs = get_mla_module_model_specs(attention_type="qsa", apply_model_filter=False)
+    assert [
+        (spec.model_path, spec.architecture, spec.native_num_heads, spec.tensor_parallel_sizes) for spec in qsa_specs
+    ] == [
+        (
+            "Qwen/Qwen3.8-Flash-Next",
+            "Qwen4ExpForConditionalGeneration",
+            24,
+            (1, 2, 4, 8),
+        )
+    ]
+    # The QSA row declares its -FP8 sibling as an alias (never a second spec);
+    # a targeted run on either path resolves to the canonical row.
+    assert get_mla_module_model_aliases("Qwen/Qwen3.8-Flash-Next") == ("Qwen/Qwen3.8-Flash-Next-FP8",)
+    # Per-rank query heads at TP 1/2/4/8 (ascending, as the helper returns).
+    assert get_mla_module_model_head_counts(qsa_specs[0], extra_tp_sizes=(1, 2, 4, 8)) == [3, 6, 12, 24]
 
 
 def test_mla_module_targeted_artifacts_keep_requested_checkpoint(monkeypatch):
@@ -1877,22 +1939,37 @@ def test_qwen35_gemm_model_rows_add_exact_below_grid_widths():
 
 
 def test_vllm_msa_persist_row_raises_when_log_perf_fails():
-    """A false return from log_perf (lock exhaustion / write failure) must
-    fail the case: a worker that returns normally lets the checkpoint advance
-    with no row persisted, silently shrinking the dataset. Mirrors the
-    TRT-LLM/SGLang collectors' behavior."""
+    """A false return or a ``PerfLogError`` from log_perf must fail the case.
+
+    A worker that returns normally lets the checkpoint advance with no row
+    persisted, silently shrinking the dataset. Mirrors the SGLang collector,
+    which converts ``PerfLogError`` into the same fatal write error so the
+    sweep aborts on the first point with the real cause.
+    """
     source_path = REPO_ROOT / "collector/vllm/collect_msa_module.py"
     tree = ast.parse(source_path.read_text(), filename=str(source_path))
     helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_persist_msa_row")
 
-    def run(log_perf_result):
+    class PerfLogError(RuntimeError):
+        pass
+
+    class PerfLogWriteError(RuntimeError):
+        pass
+
+    def run(log_perf_result, *, raises=None):
         calls = {}
 
         def fake_log_perf(**kwargs):
             calls.update(kwargs)
+            if raises is not None:
+                raise raises
             return log_perf_result
 
-        namespace = {"log_perf": fake_log_perf}
+        namespace = {
+            "log_perf": fake_log_perf,
+            "PerfLogError": PerfLogError,
+            "PerfLogWriteError": PerfLogWriteError,
+        }
         exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source_path), "exec"), namespace)
         namespace["_persist_msa_row"](
             item={"latency": "1.0"},
@@ -1908,8 +1985,46 @@ def test_vllm_msa_persist_row_raises_when_log_perf_fails():
     calls = run(True)
     assert calls["perf_filename"] == "msa_generation_module_perf.txt"
 
-    with pytest.raises(RuntimeError, match="failed to persist MSA row"):
+    with pytest.raises(PerfLogWriteError, match="failed to persist MSA row"):
         run(False)
+
+    with pytest.raises(PerfLogWriteError, match="failed to persist MSA row"):
+        run(True, raises=PerfLogError("retained twin present"))
+
+
+def test_vllm_msa_main_reraises_persistence_failures_before_generic_handlers():
+    """``main()`` must let ``PerfLogWriteError`` escape, not log-and-continue.
+
+    The helper-level test above proves ``_persist_msa_row`` raises. This pins
+    the wiring in ``main()``: the fatal handler has to come before the
+    per-point ``except Exception`` fallback, otherwise a lost row is counted
+    as a failed point and the sweep keeps going. The SGLang collector uses the
+    same ordering.
+    """
+    source_path = REPO_ROOT / "collector/vllm/collect_msa_module.py"
+    tree = ast.parse(source_path.read_text(), filename=str(source_path))
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+
+    def handler_name(handler):
+        node = handler.type
+        if isinstance(node, ast.Name):
+            return node.id
+        return getattr(node, "attr", None)
+
+    guarded = [
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Try) and any(handler_name(handler) == "PerfLogWriteError" for handler in node.handlers)
+    ]
+    assert len(guarded) == 1, "exactly one try block should guard persistence failures"
+    handlers = guarded[0].handlers
+    fatal = next(i for i, handler in enumerate(handlers) if handler_name(handler) == "PerfLogWriteError")
+    fallback = [i for i, handler in enumerate(handlers) if handler_name(handler) == "Exception"]
+    assert fallback, "the per-point fallback handler must remain"
+    assert fatal < min(fallback), "PerfLogWriteError must be handled before except Exception"
+    assert [type(stmt) for stmt in handlers[fatal].body] == [ast.Raise], (
+        "the fatal handler must re-raise, not record a failed point"
+    )
 
 
 def test_nvfp4_checkpoint_targets_msa_module_specs(monkeypatch):

@@ -82,6 +82,13 @@ common_case_values:
       - {compute_dtype: bfloat16, kv_cache_dtype: bfloat16, gemm_type: nvfp4, attention_types: [mla, dsa, msa]}
       - {compute_dtype: bfloat16, kv_cache_dtype: fp8, gemm_type: nvfp4, attention_types: [mla, dsa, msa]}
       - {compute_dtype: fp8, kv_cache_dtype: fp8, gemm_type: nvfp4, phases: [context], attention_types: [mla]}
+      # QSA (Qwen3.8-Flash-Next): BF16 end to end in BOTH checkpoints. The FP8
+      # checkpoint quantizes routed experts only — its quantization_config
+      # excludes every self_attn.*/indexer module — and the compressed-index
+      # pool pins ``index_state_dtype = torch.bfloat16`` in both backends
+      # (SGLang mem_cache/qsa_kv_pool.py, vLLM's Qwen4ExpQSAAttention), so
+      # there is no fp8-KV or quantized-projection QSA lane to collect.
+      - {compute_dtype: bfloat16, kv_cache_dtype: bfloat16, gemm_type: bfloat16, attention_types: [qsa]}
     context:
       max_tokens: 131072
       # DSA and MSA context follow serving's chunked prefill. A forward takes at

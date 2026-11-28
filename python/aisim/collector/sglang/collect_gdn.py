@@ -122,6 +122,24 @@ except ModuleNotFoundError:
 
 from collector.op_plans import plan_cases
 
+
+class SGLangGdnKernelLimit(ValueError):
+    """A cell the pinned causal_conv1d Triton kernel cannot run without corrupting memory.
+
+    ``FIXME(kernel-limit)`` evidence (layer_permissions.md "Evidence-backed
+    guards"): the kernel's token-offset arithmetic overflows int32 once the
+    packed convolution offset total_tokens * conv_channels reaches 2**31
+    (causal_conv1d_triton.py:373-379). Silicon evidence: RTX 6000 Pro memcheck
+    2026-07-06 pinned the invalid global write at 262,144 tokens for the
+    Qwen3.5 conv widths (10,240 and 12,288) while the 131,072-token cells
+    pass, and the 0.5.21 H20 smoke (facts/upgrade_rc29, sgl_smoke_r6) still
+    faults with cudaErrorIllegalAddress in that envelope even though the
+    sequence offsets are cast to tl.int64. The per-cell guard raises this
+    before launching, so the offending cell is recorded as a kernel limit
+    instead of poisoning the CUDA context for the rest of the sweep.
+    """
+
+
 aic_debug = int(os.getenv("aic_gdn_debug", "0"))  # noqa: SIM112
 
 
@@ -173,6 +191,9 @@ def run_gdn_context_benchmark(
     flashinfer_prefill = _resolve_flashinfer_gdn_prefill(head_k_dim, head_v_dim, mamba_ssm_dtype)
     successful_points = 0
     failed_points = 0
+    kernel_limit_points = 0
+    kernel_limit_cells = []
+    total_points = len(batch_size_list) * len(seq_len_list)
 
     for batch_size in batch_size_list:
         for seq_len in seq_len_list:
@@ -202,10 +223,10 @@ def run_gdn_context_benchmark(
                 # sgl_smoke_r6) — silicon evidence keeps the guard; the int32 arithmetic is
                 # elsewhere in the kernel's per-block view strides.
                 if total_tokens * conv_channels >= 2**31:
-                    raise ValueError(
-                        "SGLang causal_conv1d Triton kernel int32 token-offset overflow: "
+                    raise SGLangGdnKernelLimit(
+                        "FIXME(kernel-limit): SGLang causal_conv1d Triton kernel int32 token-offset overflow: "
                         f"total_tokens={total_tokens} * conv_channels={conv_channels} >= 2**31 "
-                        "(causal_conv1d_triton.py:398-405)"
+                        "(causal_conv1d_triton.py:373-379)"
                     )
                 num_warmups = 3
                 num_runs = 10
@@ -361,6 +382,14 @@ def run_gdn_context_benchmark(
                         raise RuntimeError(f"failed to persist SGLang GDN context row to {perf_filename}")
                 successful_points += 1
 
+            except SGLangGdnKernelLimit as e:
+                # Verified kernel limit, not a collector failure: counted and
+                # reported separately so the case lands in the failure log as
+                # kernel_limit instead of an unexpected error.
+                kernel_limit_points += 1
+                kernel_limit_cells.append(f"batch_size={batch_size}/seq_len={seq_len}")
+                print(f"  Kernel limit at batch_size={batch_size}, seq_len={seq_len}: {e}")
+                continue
             except Exception as e:
                 failed_points += 1
                 print(f"  Error at batch_size={batch_size}, seq_len={seq_len}: {e}")
@@ -380,10 +409,54 @@ def run_gdn_context_benchmark(
                 if cleanup_errors:
                     raise RuntimeError(f"SGLang GDN context cleanup failed: {'; '.join(cleanup_errors)}")
 
-    summary = f"ok={successful_points} error={failed_points} skip=0"
+    summary = _gdn_context_summary(successful_points, failed_points, kernel_limit_points)
     print(f"GDN context summary: {summary}")
-    if failed_points or successful_points == 0:
-        raise RuntimeError(f"SGLang GDN context collection failed strict completeness: {summary}")
+    error = _gdn_context_incomplete_error(
+        successful_points=successful_points,
+        failed_points=failed_points,
+        kernel_limit_points=kernel_limit_points,
+        total_points=total_points,
+        kernel_limit_cells=kernel_limit_cells,
+    )
+    if error is not None:
+        raise error
+
+
+def _gdn_context_summary(successful_points: int, failed_points: int, kernel_limit_points: int) -> str:
+    """Per-case completeness line; kernel-limit cells are counted apart from failures."""
+    return f"ok={successful_points} error={failed_points} kernel_limit={kernel_limit_points} skip=0"
+
+
+def _gdn_context_incomplete_error(
+    *,
+    successful_points: int,
+    failed_points: int,
+    kernel_limit_points: int,
+    total_points: int,
+    kernel_limit_cells: list[str],
+) -> RuntimeError | None:
+    """The error a context case should raise, or None when it is complete.
+
+    A genuine failure always wins: it means the collector is wrong or the combo
+    is unverified. Kernel-limit-only incompleteness is still an error — the
+    case did not measure every cell — but its message starts with
+    ``FIXME(kernel-limit)`` so ``collect._classify_exception`` records it as a
+    cited kernel limit instead of an unexpected collector error
+    (failure_handling.md), and the cells the pinned kernel cannot run are named.
+    """
+    summary = _gdn_context_summary(successful_points, failed_points, kernel_limit_points)
+    if failed_points:
+        return RuntimeError(f"SGLang GDN context collection failed strict completeness: {summary}")
+    if kernel_limit_points:
+        return RuntimeError(
+            f"FIXME(kernel-limit): SGLang GDN context measured {successful_points}/{total_points} cells; "
+            f"{kernel_limit_points} cell(s) exceed the causal_conv1d int32 envelope "
+            "(total_tokens * conv_channels >= 2**31, causal_conv1d_triton.py:373-379): "
+            f"{'; '.join(kernel_limit_cells)}"
+        )
+    if successful_points == 0:
+        return RuntimeError(f"SGLang GDN context collection failed strict completeness: {summary}")
+    return None
 
 
 def _resolve_flashinfer_gdn_decode(mamba_ssm_dtype: str = "float32"):

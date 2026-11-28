@@ -1,0 +1,199 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# C5: aggregated serving check for Qwen3.8-Flash-Next, one cell per run.
+#
+# Purpose is measurement, not a new sweep: serve the checkpoint at the topology
+# AISimulate prices (TP8 / moe_ep_size 8, aggregated) with the flags the C2 load
+# runs already validated, then replay one fixed closed-loop workload through the
+# runtime's own bench client. The predictor arm is the same traffic through
+# `aisimulate predict --stack engine`, so both sides see identical request
+# shapes, concurrency and token counts.
+#
+# The resolved KV dtype is printed on purpose: it is the field the FP8 QSA key
+# derivation fix relies on (bf16 pool for both checkpoints).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen38-serving-harness
+  namespace: aisimulate-qwen38
+data:
+  aic-dist.py: |
+    import glob
+    import json
+
+    WANT = (
+        "completed", "failed", "duration", "total_input_tokens", "total_output_tokens",
+        "output_throughput", "mean_ttft_ms", "median_ttft_ms", "p99_ttft_ms",
+        "mean_tpot_ms", "median_tpot_ms", "mean_itl_ms", "median_itl_ms",
+    )
+    for path in sorted(glob.glob("/scratch/*.json")):
+        try:
+            data = json.load(open(path))
+        except Exception:
+            continue
+        if not isinstance(data, dict) or "mean_ttft_ms" not in data:
+            continue
+        print("  ", path)
+        for key in WANT:
+            if key in data:
+                value = data[key]
+                print("     %-22s %s" % (key, round(value, 2) if isinstance(value, float) else value))
+        for key in ("ttfts", "itls"):
+            seq = data.get(key)
+            if not isinstance(seq, list):
+                continue
+            # ttfts are per-request floats (seconds); itls are per-request lists
+            # of inter-token gaps, so flatten numeric leaves instead of assuming
+            # every element can be rounded.
+            leaves = []
+            for item in seq:
+                if isinstance(item, (int, float)) and not isinstance(item, bool):
+                    leaves.append(float(item))
+                elif isinstance(item, list):
+                    leaves.extend(float(x) for x in item if isinstance(x, (int, float)))
+            if leaves:
+                print("     %-22s n=%d first=%s" % (key, len(leaves), [round(v, 3) for v in leaves[:12]]))
+  run.sh: |
+    #!/bin/bash
+    set -uo pipefail
+    RUNTIME="${1:?vllm|sglang}"
+    MODEL="${2:?model id}"
+    REVISION="${3:?revision}"
+    TP="${4:?tp}"
+    ISL="${5:-8192}"
+    OSL="${6:-128}"
+    CONC="${7:-8}"
+    PROMPTS="${8:-32}"
+    MAXLEN=$(( ISL + OSL + 1024 ))
+    LOG=/scratch/server.log
+    BENCH=/scratch/bench.json
+    # The network is closed and the cache has snapshots/<rev> without a
+    # refs/main, so both the server and the bench client must be pointed at
+    # the snapshot directory itself rather than the public id.
+    TOKDIR="/hf-cache/hub/models--$(echo "$MODEL" | sed 's|/|--|g')/snapshots/$REVISION"
+
+    echo "=== $RUNTIME $MODEL@${REVISION:0:8} tp=$TP isl=$ISL osl=$OSL conc=$CONC prompts=$PROMPTS ==="
+    echo "start $(date -u +%H:%M:%SZ)"
+    nvidia-smi --query-gpu=index,memory.total,memory.used --format=csv,noheader | sed 's/^/  /'
+
+    READY_PAT="Application startup complete|Uvicorn running|The server is fired up"
+    FAIL_PAT="Traceback|Error|error:|OOM|out of memory"
+
+    if [ "$RUNTIME" = "vllm" ]; then
+      cmd=(vllm serve "$MODEL" --revision "$REVISION"
+           --tensor-parallel-size "$TP"
+           --enable-expert-parallel
+           --served-model-name "$MODEL"
+           --gpu-memory-utilization 0.90
+           --max-model-len "$MAXLEN"
+           --max-num-seqs "$CONC"
+           --no-enable-prefix-caching
+           --engram-config '{"cpu_offload": false}'
+           --port 8000)
+    else
+      cmd=(python3 -m sglang.launch_server
+           --model-path "$MODEL" --revision "$REVISION"
+           --tp-size "$TP" --ep-size "$TP"
+           --no-ple-offload-embedding
+           --disable-radix-cache
+           --context-length "$MAXLEN"
+           --mem-fraction-static 0.85
+           --host 127.0.0.1 --port 8000)
+    fi
+
+    echo "  ${cmd[*]}" | sed 's/{"cpu_offload": false}/{...}/'
+    "${cmd[@]}" > "$LOG" 2>&1 &
+    PID=$!
+
+    READY=0
+    for _ in $(seq 1 300); do
+      if grep -qE "$READY_PAT" "$LOG"; then READY=1; break; fi
+      if grep -qE "$FAIL_PAT" "$LOG"; then break; fi
+      if ! kill -0 "$PID" 2>/dev/null; then break; fi
+      sleep 4
+    done
+
+    echo
+    echo "--- load / capacity lines ---"
+    grep -iE "model loading took|loading weights took|Available KV cache|GPU KV cache size|KV Cache is allocated|kv_cache_dtype|cache_dtype|engram|ple_embedding" "$LOG" \
+      | grep -viE "warning|deprecat" | sed 's/^/  /' | head -25
+    echo
+    echo "--- resolved cache identity from the engine itself ---"
+    if [ "$RUNTIME" = "vllm" ]; then
+      curl -s localhost:8000/metrics | grep -E 'cache_config_info' | sed 's/^/  /'
+    else
+      curl -s localhost:8000/get_server_info 2>/dev/null | head -c 2000 | sed 's/^/  /'
+      echo
+    fi
+
+    if [ "$READY" -ne 1 ]; then
+      echo
+      echo "--- NOT READY; server errors ---"
+      grep -iE "$FAIL_PAT" "$LOG" | head -20 | sed 's/^/  /'
+      echo
+      echo "--- last 60 log lines (root cause) ---"
+      tail -60 "$LOG" | sed 's/^/  /'
+      echo "READY=0"
+      kill -KILL "$PID" 2>/dev/null
+      exit 1
+    fi
+
+    echo
+    echo "--- closed-loop workload: isl=$ISL osl=$OSL conc=$CONC prompts=$PROMPTS ---"
+    if [ "$RUNTIME" = "vllm" ]; then
+      vllm bench serve --backend openai --host 127.0.0.1 --port 8000 \
+        --num-warmups 2 \
+        --model "$MODEL" --tokenizer "$TOKDIR" \
+        --dataset-name random \
+        --random-input-len "$ISL" --random-output-len "$OSL" \
+        --num-prompts "$PROMPTS" --max-concurrency "$CONC" \
+        --ignore-eos --disable-tqdm \
+        --save-result --result-dir /scratch 2>&1 | tail -30 | sed 's/^/  /'
+    else
+      # `random` samples its token ids from ShareGPT, which the client fetches
+      # with hf_hub_download at dataset-build time; the network here is closed.
+      # `random-ids` draws ids from the tokenizer vocabulary instead (no fetch),
+      # and --tokenize-prompt sends them as input_ids, so the prompt length is
+      # exact rather than round-tripping through decode/encode. Same regime as
+      # the vLLM arm, whose random dataset also uses random vocabulary ids.
+      # --random-range-ratio 1.0 is NOT optional: SGLang's 0.0 default samples
+      # every length uniformly in [1, isl], so an 8192-token arm would average
+      # ~4.8k tokens and could not be compared with the predictor or with vLLM,
+      # whose default samples a fixed length.
+      python3 -m sglang.bench_serving --backend sglang \
+        --host 127.0.0.1 --port 8000 \
+        --model "$TOKDIR" --tokenizer "$TOKDIR" \
+        --dataset-name random-ids --tokenize-prompt \
+        --random-input-len "$ISL" --random-output-len "$OSL" \
+        --random-range-ratio 1.0 \
+        --num-prompts "$PROMPTS" --max-concurrency "$CONC" \
+        --warmup-requests 3 --output-details \
+        --output-file "$BENCH" 2>&1 | tail -30 | sed 's/^/  /'
+    fi
+
+    echo
+    echo "--- per-request distribution (warmup excluded by the client) ---"
+    python3 /harness/aic-dist.py
+
+    echo
+    echo "--- bench artifacts ---"
+    ls -l /scratch/*.json 2>/dev/null | sed 's/^/  /'
+    for f in /scratch/*.json; do
+      [ -f "$f" ] || continue
+      case "$f" in
+        */server_info.json) continue ;;
+      esac
+      echo "  == $f"
+      head -c 4000 "$f" | sed 's/^/  /'
+      echo
+    done
+
+    echo
+    echo "--- peak per-GPU memory while loaded ---"
+    nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | sed 's/^/  /'
+    kill -TERM "$PID" 2>/dev/null
+    sleep 10
+    kill -KILL "$PID" 2>/dev/null
+    echo "READY=1"
+    echo "end $(date -u +%H:%M:%SZ)"

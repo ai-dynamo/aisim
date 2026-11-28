@@ -199,3 +199,53 @@ def test_nvfp4_checkpoint_lane_resolution_per_backend():
     )
     latency = float(op()._engine_query(sg_hybrid, batch_size=2, s=512, prefix=0))
     assert latency > 0, "sglang HYBRID must fall back to the empirical transfer for the fp8_block lane"
+
+
+def test_xop_transfer_is_refused_for_an_architecture_it_was_not_calibrated_on():
+    """The DSA transfer substitutes M3's measured kernel, so another
+    architecture's missing slice must raise instead of borrowing.
+
+    Qwen3.8-Flash-Next QSA (``Qwen4ExpForConditionalGeneration``) is the first
+    consumer. sglang 0.5.14 carries no msa table, which is the same vehicle the
+    Rust oracle test uses for the transfer; HYBRID reaches the transfer after
+    its silicon miss and EMPIRICAL reaches it directly. Both must surface the
+    typed ``EmpiricalNotImplementedError`` naming the calibrated architecture.
+    """
+    from aisim.sdk.operations.msa import ContextMSAModule, GenerationMSAModule
+    from aisim.sdk.perf_database import get_database_view
+    from aisim_core.sdk.errors import EmpiricalNotImplementedError
+
+    def build(cls):
+        return cls(
+            "qsa",
+            1.0,
+            num_heads=24,
+            num_kv_heads=2,
+            hidden_size=4096,
+            head_dim=256,
+            v_head_dim=256,
+            index_n_heads=4,
+            index_head_dim=128,
+            index_topk=64,
+            block_size=64,
+            kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+            fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+            gemm_quant_mode=common.GEMMQuantMode.bfloat16,
+            architecture="Qwen4ExpForConditionalGeneration",
+        )
+
+    for mode in ("HYBRID", "EMPIRICAL"):
+        db = get_database_view(
+            "b200_sxm",
+            "sglang",
+            "0.5.14",
+            database_mode=mode,
+            allow_unlisted_version=True,
+        )
+        assert db is not None, f"b200 sglang 0.5.14 data missing ({mode})"
+        context = build(ContextMSAModule)
+        generation = build(GenerationMSAModule)
+        with pytest.raises(EmpiricalNotImplementedError, match=r"calibrated for MiniMaxM3ForCausalLM"):
+            context._engine_query(db, batch_size=1, s=1024, prefix=0)
+        with pytest.raises(EmpiricalNotImplementedError, match=r"calibrated for MiniMaxM3ForCausalLM"):
+            generation._engine_query(db, batch_size=1, s=1025)

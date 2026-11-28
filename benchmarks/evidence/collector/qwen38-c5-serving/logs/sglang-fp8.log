@@ -1,0 +1,90 @@
+=== sglang Qwen/Qwen3.8-Flash-Next-FP8@236dfdf2 tp=8 isl=8192 osl=128 conc=1 prompts=8 ===
+start 08:06:04Z
+  0, 143771 MiB, 0 MiB
+  1, 143771 MiB, 0 MiB
+  2, 143771 MiB, 0 MiB
+  3, 143771 MiB, 0 MiB
+  4, 143771 MiB, 0 MiB
+  5, 143771 MiB, 0 MiB
+  6, 143771 MiB, 0 MiB
+  7, 143771 MiB, 0 MiB
+  python3 -m sglang.launch_server --model-path Qwen/Qwen3.8-Flash-Next-FP8 --revision 236dfdf285828023ca3bcd3f37366c58a3469b13 --tp-size 8 --ep-size 8 --no-ple-offload-embedding --disable-radix-cache --context-length 9344 --mem-fraction-static 0.85 --host 127.0.0.1 --port 8000
+
+--- load / capacity lines ---
+  [2026-11-03 08:12:23 TP7 EP7] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 4080832, K size: 23.35 GB, V size: 23.35 GB
+  [2026-11-03 08:12:23 TP5 EP5] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 4080832, K size: 23.35 GB, V size: 23.35 GB
+  [2026-11-03 08:12:23 TP3 EP3] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 4080832, K size: 23.35 GB, V size: 23.35 GB
+  [2026-11-03 08:12:23 TP2 EP2] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 4080832, K size: 23.35 GB, V size: 23.35 GB
+  [2026-11-03 08:12:23 TP6 EP6] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 4080832, K size: 23.35 GB, V size: 23.35 GB
+  [2026-11-03 08:12:23 TP0 EP0] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 4080832, K size: 23.35 GB, V size: 23.35 GB
+  [2026-11-03 08:12:23 TP4 EP4] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 4080832, K size: 23.35 GB, V size: 23.35 GB
+  [2026-11-03 08:12:23 TP1 EP1] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 4080832, K size: 23.35 GB, V size: 23.35 GB
+
+--- resolved cache identity from the engine itself ---
+  {"model_path":"Qwen/Qwen3.8-Flash-Next-FP8","tokenizer_path":"Qwen/Qwen3.8-Flash-Next-FP8","tokenizer_mode":"auto","tokenizer_backend":"huggingface","tokenizer_worker_num":1,"detokenizer_worker_num":1,"skip_tokenizer_init":false,"load_format":"auto","model_loader_extra_config":"{}","trust_remote_code":false,"context_length":9344,"is_embedding":false,"enable_multimodal":null,"revision":"236dfdf285828023ca3bcd3f37366c58a3469b13","model_impl":"auto","model_config_parser":"auto","json_model_override_args":"{}","dtype":"auto","quantization":null,"quantization_param_path":null,"kv_cache_dtype":"auto","enable_fp32_lm_head":false,"modelopt_quant":null,"modelopt_checkpoint_restore_path":null,"modelopt_checkpoint_save_path":null,"modelopt_export_path":null,"quantize_and_serve":false,"rl_quant_profile":null,"enable_tf32_matmul":false,"mem_fraction_static":0.85,"max_running_requests":null,"max_queued_requests":null,"max_total_tokens":null,"chunked_prefill_size":8192,"prefill_decode_interval":0,"enable_dynamic_chunking":false,"max_prefill_tokens":16384,"prefill_max_requests":null,"schedule_policy":"fcfs","enable_priority_scheduling":false,"disable_priority_preemption":false,"default_priority_value":null,"abort_on_priority_when_disabled":false,"schedule_low_priority_values_first":false,"priority_scheduling_preemption_threshold":10,"retraction_policy":"length","schedule_conservativeness":1.0,"page_size":64,"c128_page_size":16,"swa_full_tokens_ratio":0.8,"disable_hybrid_swa_memory":false,"radix_eviction_policy":"lru","radix_eviction_policy_config":null,"prefill_only_disable_kv_cache":false,"disable_radix_cache":true,"enable_page_major_kv_layout":false,"enable_unified_memory":false,"disable_chunked_prefix_cache":false,"disable_overlap_schedule":false,"num_continuous_decode_steps":1,"scheduler_recv_interval":1,"enable_mixed_chunk":false,"nccl_port":null,"dist_timeout":null,"dist_init_addr":null,"gated_launch_port":null,"nnodes":1,"node_rank":0,"tp_size":8,"dcp_size":1,"pp_size":1,"pp
+
+--- closed-loop workload: isl=8192 osl=128 conc=1 prompts=8 ---
+  Peak output token throughput (tok/s):    128.00
+  Peak concurrent requests:                2
+  Total token throughput (tok/s):          8374.59
+  Concurrency:                             1.00
+  ----------------End-to-End Latency----------------
+  Mean E2E Latency (ms):                   990.84
+  Median E2E Latency (ms):                 990.15
+  P90 E2E Latency (ms):                    993.60
+  P95 E2E Latency (ms):                    994.76
+  P99 E2E Latency (ms):                    995.69
+  ---------------Time to First Token----------------
+  Mean TTFT (ms):                          189.08
+  Median TTFT (ms):                        188.29
+  P90 TTFT (ms):                           191.90
+  P95 TTFT (ms):                           193.12
+  P99 TTFT (ms):                           194.10
+  -----Time per Output Token (excl. 1st token)------
+  Mean TPOT (ms):                          6.31
+  Median TPOT (ms):                        6.31
+  P90 TPOT (ms):                           6.32
+  P95 TPOT (ms):                           6.32
+  P99 TPOT (ms):                           6.32
+  ---------------Inter-Token Latency----------------
+  Mean ITL (ms):                           6.31
+  Median ITL (ms):                         6.32
+  P90 ITL (ms):                            6.35
+  P95 ITL (ms):                            6.37
+  P99 ITL (ms):                            6.58
+  Max ITL (ms):                            10.88
+  ==================================================
+
+--- per-request distribution (warmup excluded by the client) ---
+   /scratch/bench.json
+     completed              8
+     duration               7.95
+     total_input_tokens     65536
+     total_output_tokens    1024
+     output_throughput      128.84
+     mean_ttft_ms           189.08
+     median_ttft_ms         188.29
+     p99_ttft_ms            194.1
+     mean_tpot_ms           6.31
+     median_tpot_ms         6.31
+     mean_itl_ms            6.31
+     median_itl_ms          6.32
+     ttfts                  n=8 first=[0.187, 0.19, 0.187, 0.188, 0.187, 0.194, 0.191, 0.189]
+     itls                   n=1016 first=[0.005, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006, 0.006]
+
+--- bench artifacts ---
+  -rw-r--r--. 1 1001410000 root 68446 Nov  3 08:14 /scratch/bench.json
+  == /scratch/bench.json
+  {"tag": null, "backend": "sglang", "dataset_name": "random-ids", "request_rate": Infinity, "max_concurrency": 1, "sharegpt_output_len": null, "random_input_len": 8192, "random_output_len": 128, "random_range_ratio": 1.0, "server_info": {"model_path": "Qwen/Qwen3.8-Flash-Next-FP8", "tokenizer_path": "Qwen/Qwen3.8-Flash-Next-FP8", "tokenizer_mode": "auto", "tokenizer_backend": "huggingface", "tokenizer_worker_num": 1, "detokenizer_worker_num": 1, "skip_tokenizer_init": false, "load_format": "auto", "model_loader_extra_config": "{}", "trust_remote_code": false, "context_length": 9344, "is_embedding": false, "enable_multimodal": null, "revision": "236dfdf285828023ca3bcd3f37366c58a3469b13", "model_impl": "auto", "model_config_parser": "auto", "json_model_override_args": "{}", "dtype": "auto", "quantization": null, "quantization_param_path": null, "kv_cache_dtype": "auto", "enable_fp32_lm_head": false, "modelopt_quant": null, "modelopt_checkpoint_restore_path": null, "modelopt_checkpoint_save_path": null, "modelopt_export_path": null, "quantize_and_serve": false, "rl_quant_profile": null, "enable_tf32_matmul": false, "mem_fraction_static": 0.85, "max_running_requests": null, "max_queued_requests": null, "max_total_tokens": null, "chunked_prefill_size": 8192, "prefill_decode_interval": 0, "enable_dynamic_chunking": false, "max_prefill_tokens": 16384, "prefill_max_requests": null, "schedule_policy": "fcfs", "enable_priority_scheduling": false, "disable_priority_preemption": false, "default_priority_value": null, "abort_on_priority_when_disabled": false, "schedule_low_priority_values_first": false, "priority_scheduling_preemption_threshold": 10, "retraction_policy": "length", "schedule_conservativeness": 1.0, "page_size": 64, "c128_page_size": 16, "swa_full_tokens_ratio": 0.8, "disable_hybrid_swa_memory": false, "radix_eviction_policy": "lru", "radix_eviction_policy_config": null, "prefill_only_disable_kv_cache": false, "disable_radix_cache": true, "enable_page_major_kv_layout": false, "enable_unified_memory": false, "disable_chunked_prefix_cache": false, "disable_overlap_schedule": false, "num_continuous_decode_steps": 1, "scheduler_recv_interval": 1, "enable_mixed_chunk": false, "nccl_port": null, "dist_timeout": null, "dist_init_addr": null, "gated_launch_port": null, "nnodes": 1, "node_rank": 0, "tp_size": 8, "dcp_size": 1, "pp_size": 1, "pp_max_micro_batch_size": null, "pp_async_batch_depth": 0, "dp_size": 1, "load_balance_method": "round_robin", "attn_cp_size": 1, "moe_dp_size": 1, "dwdp_size": 1, "dcp_comm_backend": "ag_rs", "dcp_replicate_q_proj": null, "enable_prefill_cp": false, "cp_strategy": null, "enable_dsa_cache_layer_split": false, "enable_cp_decode_attn_tp": false, "enable_dp_attention": false, "enable_dp_attention_local_control_broadcast": false, "enable_dp_lm_head": false, "enable_tp_lm_head_all_to_all": false, "enable_attn_tp_input_scattered": false, "enable_shared_experts_attn_tp": false, "shared_experts_tp_size": null, "enable_dense_mlp_attn_tp": false, "enable_layernorm_sp": false, "disable_attn_tp_gather": false, "enable_p2p_check": false, "device": "cuda", "base_gpu_id": 0, "gpu_id_step": 1, "random_seed": 128933999, "mlx_enable_sampling": false, "watchdog_timeout": 300, "soft_watchdog_timeout": null, "sleep_on_idle": false, "use_ray": false, "custom_sigquit_handler": null, "numa_node": null, "gc_threshold": null, "host": "127.0.0.1", "port": 8000, "fastapi_root_path": "", "smg_grpc_mode": false, "grpc_mode": false, "grpc_port": null, "grpc_worker_threads": 4, "sidecar": null, "sidecar_args": null, "skip_server_warmup": false, "warmups": null, "enable_http2": false, "http2_max_concurrent_streams": 200, "http2_initial_connection_window_size": 1048576, "ssl_keyfile": null, "ssl_certfile": null, "ssl_ca_certs": null, "ssl_keyfile_password": null, "enable_ssl_refresh": false, "api_key": null, "admin_api_key": null, "served_model_name": "Qwen/Qwen3.8-Flash-Next-FP8", "weight_version": "default", "chat_template": nul
+
+--- peak per-GPU memory while loaded ---
+  0, 129922 MiB
+  1, 129396 MiB
+  2, 129396 MiB
+  3, 129396 MiB
+  4, 129396 MiB
+  5, 129396 MiB
+  6, 129396 MiB
+  7, 128916 MiB
+READY=1
+end 08:14:56Z

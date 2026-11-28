@@ -167,6 +167,8 @@ class TestSupportedModels:
             "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
             "Qwen/Qwen3.8-2.4T-A95B",
             "Qwen/Qwen3.8-2.4T-A95B-FP8",
+            "Qwen/Qwen3.8-Flash-Next",
+            "Qwen/Qwen3.8-Flash-Next-FP8",
         ],
     )
     def test_specific_models_are_in_default_list(self, hf_id):
@@ -215,6 +217,9 @@ class TestSupportedModels:
             ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8", True),  # Has 'E' in derived pattern
             ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4", True),  # Has 'E' in derived pattern
             ("nvidia/Nemotron-H-56B-Base-8K", False),  # No 'E' in pattern (only M, *, -)
+            # Qwen3.8-Flash-Next: 512 experts, top-10 routed + 1 shared.
+            ("Qwen/Qwen3.8-Flash-Next", True),
+            ("Qwen/Qwen3.8-Flash-Next-FP8", True),
         ],
     )
     def test_model_moe_detection(self, hf_id, is_moe_expected):
@@ -2399,3 +2404,32 @@ def test_dsa_model_activation_width_is_the_residual_width(model):
     model_config = config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1)
     built = get_model(model, model_config, backend_name="sglang")
     assert built._num_heads * built._head_size == 6144
+
+
+# ── Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration) constants ────────────
+
+_QWEN38_FLASH_NEXT_ARCH = "Qwen4ExpForConditionalGeneration"
+
+
+class TestQwen38FlashNextRegistration:
+    """Qwen3.8-Flash-Next registers a dedicated QWEN4EXP family.
+
+    It shares the GDN contract with QWEN35 but adds QSA sparse attention,
+    gated-residual branches and an n-gram PLE table, so it must not reuse the
+    QWEN35 family (whose model class would silently drop those ops).
+    """
+
+    def test_architecture_in_model_family_map(self):
+        assert _QWEN38_FLASH_NEXT_ARCH in common.ARCHITECTURE_TO_MODEL_FAMILY
+
+    def test_architecture_maps_to_qwen4exp_family(self):
+        assert common.ARCHITECTURE_TO_MODEL_FAMILY[_QWEN38_FLASH_NEXT_ARCH] == "QWEN4EXP"
+        assert "QWEN4EXP" in common.ModelFamily
+
+    def test_architecture_is_multimodal(self):
+        """The decoder is nested under text_config, unlike Qwen3.8-Max."""
+        assert common.MULTIMODAL_TEXT_CONFIG_KEY[_QWEN38_FLASH_NEXT_ARCH] == "text_config"
+
+    def test_nvfp4_checkpoint_is_not_a_default_model(self):
+        """NVFP4 is Blackwell-only; registering it would advertise an unservable option."""
+        assert not any("Qwen3.8-Flash-Next-NVFP4" in hf_id for hf_id in common.DefaultHFModels)

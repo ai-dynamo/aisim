@@ -1,0 +1,5 @@
+sglang  msa_context_module                 - bfloat16/bfloat16/bfloat16 -                 5007  msa_ctx_MiniMax-M3
+sglang  msa_context_module                 - fp8/bfloat16/bfloat16 -                      2815  derivable: MiniMaxAI/MiniMax-M3 kv=fp8
+sglang  msa_generation_module              - bfloat16/bfloat16/bfloat16 -                 1701  msa_gen_MiniMax-M3
+sglang  msa_generation_module              - fp8/bfloat16/bfloat16 -                       965  derivable: MiniMaxAI/MiniMax-M3 kv=fp8
+90: 4 paths, 2 gated, 2 derivable, 0 with no gate
