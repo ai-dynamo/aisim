@@ -988,6 +988,367 @@ def _output_bytes(output):
 
 @pytest.mark.parametrize("command", ["predict", "recommend"])
 @pytest.mark.parametrize(
+    "input_kind", ["config", "config_alias", "trace", "trace_alias", "trace_directory", "trace_directory_alias"]
+)
+def test_overwrite_rejects_input_output_collisions_before_starting_worker(
+    tmp_path, monkeypatch, capsys, command, input_kind
+):
+    from aisimulate import supervision
+
+    config = _small_cli_config(tmp_path, command)
+    raw = yaml.safe_load(config.read_text())
+    output = tmp_path / "output"
+    (output / "recommendations").mkdir(parents=True)
+    (output / "prediction.json").write_text("previous prediction")
+    (output / "resource-runtime.json").write_text("previous resources")
+    (output / "recommendations/0002.yaml").write_text("previous candidate")
+    if input_kind.startswith("config"):
+        target = output / "recommendations/0001.yaml"
+        target.write_text(yaml.safe_dump(raw))
+        config = target
+    else:
+        target = output / "requests.jsonl"
+        target.write_text('{"timestamp":0,"input_length":8,"output_length":2,"hash_ids":[]}\n')
+        trace = target
+        if input_kind == "trace_alias":
+            trace = tmp_path / "trace-alias.jsonl"
+            trace.symlink_to(target)
+        if input_kind.startswith("trace_directory"):
+            trace = output
+            if input_kind == "trace_directory_alias":
+                trace = tmp_path / "trace-directory-alias"
+                trace.symlink_to(output, target_is_directory=True)
+        raw["traffic"] = {
+            "source": {
+                "type": "trace",
+                "format": "dynamo" if input_kind.startswith("trace_directory") else "mooncake",
+                "paths": [str(trace)],
+            },
+            "load": {"type": "trace_timestamps"},
+        }
+        config.write_text(yaml.safe_dump(raw))
+    if input_kind == "config_alias":
+        config = tmp_path / "config-alias.yaml"
+        config.symlink_to(target)
+    original = _output_bytes(output)
+
+    def unexpected_worker(*args, **kwargs):
+        pytest.fail("input/output collisions must be rejected before starting the worker")
+
+    monkeypatch.setattr(supervision, "run_process", unexpected_worker)
+    with pytest.raises(SystemExit) as error:
+        supervision.main([command, "--config", str(config), "--output-dir", str(output), "--overwrite"])
+    assert error.value.code == 2
+    assert "would remove input file" in capsys.readouterr().err
+    assert _output_bytes(output) == original
+
+
+def test_failed_run_retry_preserves_input_before_starting_worker(tmp_path, monkeypatch, capsys):
+    from aisim import supervision
+
+    output = tmp_path / "output"
+    output.mkdir()
+    yaml_config = _small_cli_config(tmp_path, "predict")
+    config = output / "resource-plan.json"
+    config.write_text(json.dumps(yaml.safe_load(yaml_config.read_text())))
+    (output / "execution-events.jsonl").write_text("{}\n")
+    (output / "resource-runtime.json").write_text(json.dumps({"schema_version": 1, "status": "failed"}))
+    before = _output_bytes(output)
+
+    def unexpected_worker(*args, **kwargs):
+        pytest.fail("reusing a failed run must preserve the active configuration")
+
+    monkeypatch.setattr(supervision, "run_process", unexpected_worker)
+    with pytest.raises(SystemExit) as error:
+        supervision.main(["predict", "--config", str(config), "--output-dir", str(output)])
+    assert error.value.code == 2
+    assert "would remove input file" in capsys.readouterr().err
+    assert _output_bytes(output) == before
+
+
+@pytest.mark.parametrize("input_kind", ["file_alias", "directory_alias"])
+@pytest.mark.parametrize("input_collection", [list, iter], ids=["list", "iterator"])
+def test_failed_run_retry_preserves_alias_published_during_cleanup(
+    tmp_path, monkeypatch, capsys, input_kind, input_collection
+):
+    from aisim import output as output_module
+
+    output = tmp_path / "output"
+    output.mkdir()
+    events = output / "execution-events.jsonl"
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    events.write_bytes(fixture.read_bytes())
+    runtime = output / "resource-runtime.json"
+    runtime.write_text(json.dumps({"schema_version": 1, "status": "failed"}))
+    before = _output_bytes(output)
+    events_stat = events.stat()
+    alias = tmp_path / "trace-alias"
+    trace = alias / events.name if input_kind == "directory_alias" else alias
+    fingerprint = output_module._fingerprint
+    inspected_events = False
+
+    def fingerprint_then_publish(path):
+        nonlocal inspected_events
+        result = fingerprint(path)
+        if path == events:
+            if inspected_events:
+                # Publish after preflight, without changing the cleanup target's fingerprint.
+                alias.symlink_to(
+                    output if input_kind == "directory_alias" else events,
+                    target_is_directory=input_kind == "directory_alias",
+                )
+            inspected_events = True
+        return result
+
+    monkeypatch.setattr(output_module, "_fingerprint", fingerprint_then_publish)
+    with pytest.raises(ValueError, match="output cleanup would remove input file"):
+        output_module.prepare_output_directory(output, overwrite=False, input_paths=input_collection([trace]))
+
+    assert alias.is_symlink()
+    assert trace.read_bytes() == before[events.name]
+    assert events.stat().st_ino == events_stat.st_ino
+    assert events.stat().st_mtime_ns == events_stat.st_mtime_ns
+    assert runtime.read_bytes() == before[runtime.name]
+    assert "removed diagnostics left by a failed run" not in capsys.readouterr().err
+
+
+def test_overwrite_preserves_inputs_that_are_not_known_output_files(tmp_path):
+    from aisimulate.output import prepare_output_directory
+
+    (tmp_path / "config.yaml").write_text("input config")
+    (tmp_path / "trace.jsonl").write_text("input trace")
+    (tmp_path / "prediction.json").write_text("previous prediction")
+    stale = tmp_path / "resource-runtime.json"
+    stale.symlink_to(stale)
+    (tmp_path / "recommendations").mkdir()
+    (tmp_path / "recommendations/0001.yaml").write_text("previous candidate")
+    prepare_output_directory(
+        tmp_path,
+        overwrite=True,
+        input_paths=[tmp_path / "config.yaml", tmp_path / "trace.jsonl"],
+    )
+    assert _output_bytes(tmp_path) == {"config.yaml": b"input config", "trace.jsonl": b"input trace"}
+    assert not stale.is_symlink()
+
+
+def test_overwrite_protects_relative_trace_directory_before_removing_other_outputs(tmp_path, monkeypatch):
+    from aisimulate.output import prepare_output_directory
+
+    output = tmp_path / "trace"
+    output.mkdir()
+    (output / "requests.jsonl").write_text("input trace")
+    (output / "prediction.json").write_text("previous prediction")
+    before = _output_bytes(output)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="would remove input file"):
+        prepare_output_directory("trace", overwrite=True, input_paths=["trace"])
+    assert _output_bytes(output) == before
+
+
+def test_public_cli_rejects_reusing_recommendation_directory_without_deleting_config(tmp_path):
+    import subprocess
+
+    output = tmp_path / "output"
+    (output / "recommendations").mkdir(parents=True)
+    config = output / "recommendations/0001.yaml"
+    config.write_bytes(_small_cli_config(tmp_path, "predict").read_bytes())
+    (output / "recommendation.json").write_text("previous recommendation")
+    before = _output_bytes(output)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "aisimulate",
+            "predict",
+            "--config",
+            str(config),
+            "--output-dir",
+            str(output),
+            "--overwrite",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "would remove input file" in result.stderr
+    assert _output_bytes(output) == before
+
+
+@pytest.mark.parametrize(
+    "command,access,cleanup_name",
+    [
+        ("predict", "direct", "prediction.json"),
+        ("predict", "direct", "report.html"),
+        ("predict", "direct", "telemetry-requests.jsonl"),
+        ("predict", "direct", "telemetry-samples.jsonl"),
+        ("predict", "direct", "telemetry-lifecycle.jsonl"),
+        ("recommend", "direct", "recommendations/0001.yaml"),
+        ("predict", "chain", "prediction.json"),
+        ("recommend", "chain", "recommendations/0001.yaml"),
+        ("predict", "relative", "prediction.json"),
+        ("recommend", "relative", "recommendations/0001.yaml"),
+        ("predict", "output_alias", "prediction.json"),
+        ("predict", "parent", "prediction.json"),
+    ],
+)
+def test_public_cli_preserves_config_reached_through_cleanup_symlink(tmp_path, command, access, cleanup_name):
+    import subprocess
+
+    source = _small_cli_config(tmp_path, command)
+    original_config = source.read_bytes()
+    output = tmp_path / "output"
+    (output / "recommendations").mkdir(parents=True)
+    (output / "fpm-coverage.json").write_text("previous coverage")
+    (output / "recommendation.json").write_text("previous recommendation")
+    (output / "recommendations/0002.yaml").write_text("previous candidate")
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    config = inputs / "config.yaml"
+    config.write_bytes(original_config)
+    cleanup = output / cleanup_name
+    if access == "parent":
+        (inputs / "nested").mkdir()
+        cleanup.symlink_to(inputs / "nested", target_is_directory=True)
+        config_path = cleanup / ".." / "config.yaml"
+    else:
+        cleanup.symlink_to(inputs, target_is_directory=True)
+        config_path = cleanup / "config.yaml"
+    if access == "chain":
+        alias = tmp_path / "input-alias"
+        alias.symlink_to(cleanup.relative_to(tmp_path), target_is_directory=True)
+        config_path = alias / "config.yaml"
+    elif access == "output_alias":
+        alias = tmp_path / "output-alias"
+        alias.symlink_to(output, target_is_directory=True)
+        config_path = alias / cleanup_name / "config.yaml"
+    elif access == "relative":
+        config_path = config_path.relative_to(tmp_path)
+    before = _output_bytes(output)
+    target = cleanup.readlink()
+    command_line = [sys.executable, "-m", "aisimulate", command, "--config", str(config_path)]
+    control = subprocess.run(
+        [*command_line, "--output-dir", str(tmp_path / "control")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert control.returncode == 0, control.stderr
+
+    result = subprocess.run(
+        [*command_line, "--output-dir", str(output), "--overwrite"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "would remove input file" in result.stderr
+    assert cleanup.is_symlink()
+    assert cleanup.readlink() == target
+    assert config.read_bytes() == original_config
+    assert (tmp_path / config_path).read_bytes() == original_config
+    assert _output_bytes(output) == before
+
+
+def test_overwrite_preserves_external_input_hardlink(tmp_path):
+    from aisimulate.output import prepare_output_directory
+
+    source = tmp_path / "config.yaml"
+    source.write_text("input config")
+    output = tmp_path / "output"
+    output.mkdir()
+    target = output / "prediction.json"
+    target.hardlink_to(source)
+    prepare_output_directory(output, overwrite=True, input_paths=iter([source]))
+    assert not target.exists()
+    assert source.read_text() == "input config"
+
+
+def test_overwrite_protects_input_iterator_symlink_target(tmp_path):
+    from aisimulate.output import prepare_output_directory
+
+    source = tmp_path / "config.yaml"
+    source.write_text("input config")
+    output = tmp_path / "output"
+    output.mkdir()
+    target = output / "prediction.json"
+    target.symlink_to(source)
+    with pytest.raises(ValueError, match="would remove input file"):
+        prepare_output_directory(output, overwrite=True, input_paths=iter([source]))
+    assert target.is_symlink()
+    assert source.read_text() == "input config"
+
+
+def test_overwrite_preserves_trace_directory_symlink_entry(tmp_path):
+    from aisimulate.output import prepare_output_directory
+
+    source = tmp_path / "source.jsonl"
+    source.write_text("external input trace")
+    traces = tmp_path / "traces"
+    traces.mkdir()
+    entry = traces / "requests.jsonl"
+    entry.symlink_to(source)
+    (traces / "notes.txt").write_text("unrelated notes")
+    before = _output_bytes(traces)
+    with pytest.raises(ValueError, match="would remove input file"):
+        prepare_output_directory(traces, overwrite=True, input_paths=[traces])
+    assert entry.is_symlink()
+    assert entry.readlink() == source
+    assert source.read_text() == "external input trace"
+    assert _output_bytes(traces) == before
+
+
+@pytest.mark.parametrize("trace_format,input_kind", [("weka", "directory"), ("mooncake", "file_alias")])
+def test_public_cli_preserves_trace_inputs_inside_output_directory(tmp_path, trace_format, input_kind):
+    import subprocess
+
+    fixtures = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces"
+    fixture = fixtures / ("weka/a.json" if trace_format == "weka" else "mooncake.jsonl")
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(fixture.read_bytes())
+    traces = tmp_path / "traces"
+    traces.mkdir()
+    entry = traces / "requests.jsonl"
+    if input_kind == "file_alias":
+        entry.symlink_to(source)
+    else:
+        entry.write_bytes(source.read_bytes())
+    config = _small_cli_config(tmp_path, "predict")
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {
+            "type": "trace",
+            "format": trace_format,
+            "paths": [str(traces if input_kind == "directory" else entry)],
+        },
+        "load": {"type": "trace_timestamps"},
+    }
+    if trace_format == "weka":
+        # Weka's directory consumer deliberately rejects symlinks.
+        raw["traffic"]["load"]["agentic_lanes"] = 1
+    config.write_text(yaml.safe_dump(raw))
+    command = [sys.executable, "-m", "aisimulate", "predict", "--config", str(config)]
+    # Consume the exact same input, including its symlink, with separate results.
+    control = subprocess.run(
+        [*command, "--output-dir", str(tmp_path / "control")], capture_output=True, text=True, timeout=30
+    )
+    assert control.returncode == 0, control.stderr
+
+    before = _output_bytes(traces)
+    result = subprocess.run(
+        [*command, "--output-dir", str(traces), "--overwrite"], capture_output=True, text=True, timeout=15
+    )
+    assert result.returncode == 2, result.stderr
+    assert "would remove input file" in result.stderr
+    assert entry.is_symlink() == (input_kind == "file_alias")
+    assert _output_bytes(traces) == before
+    assert source.read_bytes() == fixture.read_bytes()
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+@pytest.mark.parametrize(
     "extra,error",
     [
         (["--set", "foo.bar=1"], "unknown top-level section 'foo'"),
@@ -1088,3 +1449,425 @@ def test_supervisor_entry_point_groups_match_their_resolvers():
     assert supervision._OUTPUT_ADAPTER_GROUP == OUTPUT_ADAPTER_ENTRY_POINT_GROUP
     for stack in supervision._BUILTIN_STACKS:
         resolve_runner_factory(stack, entry_points=[])
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+def test_overwrite_preserves_trace_alias_published_during_cleanup(tmp_path, monkeypatch, capsys, command):
+    from aisim import output as output_module
+    from aisim import supervision
+
+    config = _small_cli_config(tmp_path, command)
+    output = tmp_path / "output"
+    output.mkdir()
+    requests = output / "requests.jsonl"
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    trace_bytes = fixture.read_bytes()
+    requests.write_bytes(trace_bytes)
+    trace = tmp_path / "trace.jsonl"
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+    check = output_module._check_input_collisions
+
+    def check_then_publish(targets, input_paths):
+        check(targets, input_paths)
+        # Publish the configured input immediately after the initial cleanup check.
+        if not trace.is_symlink():
+            trace.symlink_to(requests)
+
+    def unexpected_worker(*args, **kwargs):
+        assert trace.exists(), "overwrite removed the newly published trace before starting the worker"
+        pytest.fail("a cleanup collision must be rejected before starting the worker")
+
+    monkeypatch.setattr(output_module, "_check_input_collisions", check_then_publish)
+    monkeypatch.setattr(supervision, "run_process", unexpected_worker)
+    with pytest.raises(SystemExit) as error:
+        supervision.main([command, "--config", str(config), "--output-dir", str(output), "--overwrite"])
+
+    assert error.value.code == 2
+    assert "output cleanup would remove input file" in capsys.readouterr().err
+    assert trace.is_symlink()
+    assert trace.read_bytes() == trace_bytes
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+@pytest.mark.parametrize("input_kind", ["file", "directory_alias"])
+@pytest.mark.parametrize("cleanup_name", ["requests.jsonl", "resource-runtime.json"])
+def test_worker_cleanup_preserves_trace_created_after_parent_preflight(
+    tmp_path, monkeypatch, capfd, command, input_kind, cleanup_name
+):
+    import subprocess
+
+    from aisimulate import supervision
+
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    trace_bytes = fixture.read_bytes()
+    config = _small_cli_config(tmp_path, command)
+    output = tmp_path / "output"
+    output.mkdir()
+    cleanup = output / cleanup_name
+    if input_kind == "directory_alias":
+        inputs = tmp_path / "inputs"
+        inputs.mkdir()
+        (inputs / "trace.jsonl").write_bytes(trace_bytes)
+        trace = cleanup / "trace.jsonl"
+
+        def produce():
+            cleanup.symlink_to(inputs, target_is_directory=True)
+    else:
+        trace = cleanup
+
+        def produce():
+            trace.write_bytes(trace_bytes)
+
+    produce()
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+    control = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "aisimulate",
+            command,
+            "--config",
+            str(config),
+            "--output-dir",
+            str(tmp_path / "control"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert control.returncode == 0, control.stderr
+    cleanup.unlink()
+    original_run = supervision.run_process
+
+    def produce_then_run(*args, **kwargs):
+        assert not cleanup.exists()
+        assert not cleanup.is_symlink()
+        produce()
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(supervision, "run_process", produce_then_run)
+    result = supervision.main([command, "--config", str(config), "--output-dir", str(output), "--overwrite"])
+    assert result == 2
+    assert "output cleanup would remove input file" in capfd.readouterr().err
+    assert trace.exists()
+    assert trace.read_bytes() == trace_bytes
+    if input_kind == "directory_alias":
+        assert cleanup.is_symlink()
+        assert cleanup.readlink() == inputs
+
+
+def test_resource_plan_cleanup_preserves_trace_input(tmp_path, monkeypatch, capsys):
+    from aisimulate import main as cli
+    from aisimulate.resources import ResourceLimitError
+
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    trace_bytes = fixture.read_bytes()
+    config = _small_cli_config(tmp_path, "predict")
+    output = tmp_path / "output"
+    output.mkdir()
+    trace = output / "requests.jsonl"
+    trace.write_bytes(trace_bytes)
+    previous = output / "prediction.json"
+    previous.write_text("previous prediction")
+    plan = output / "resource-plan.json"
+    plan.write_text("previous plan")
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+
+    def reject_admission(*args):
+        raise ResourceLimitError("test admission rejection")
+
+    monkeypatch.setattr(cli, "_predict", reject_admission)
+    result = cli.main(["predict", "--config", str(config), "--output-dir", str(output), "--overwrite"])
+    assert result == 3
+    assert trace.exists()
+    assert trace.read_bytes() == trace_bytes
+    assert previous.read_text() == "previous prediction"
+    assert plan.read_text() == "previous plan"
+    assert "would remove input file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("input_kind", ["absent", "file", "file_alias"])
+def test_resource_plan_write_handles_trace_created_after_preparation(
+    tmp_path, monkeypatch, capsys, command, overwrite, input_kind
+):
+    from aisim import main as cli
+    from aisim.resources import ResourceLimitError
+
+    config = _small_cli_config(tmp_path, command)
+    output = tmp_path / "output"
+    trace = output / "resource-plan.json"
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    trace_bytes = fixture.read_bytes()
+    source_trace = tmp_path / "source-trace.jsonl"
+    source_trace.write_bytes(trace_bytes)
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+    prepare = cli.prepare_output_directory
+    plan = {"schema_version": 1, "admitted": False}
+
+    def reject_admission(*args):
+        raise ResourceLimitError("test admission rejection", plan=plan)
+
+    def prepare_then_publish(*args, **kwargs):
+        root = prepare(*args, **kwargs)
+        assert not trace.exists()
+        if input_kind == "file":
+            trace.write_bytes(trace_bytes)
+        elif input_kind == "file_alias":
+            trace.symlink_to(source_trace)
+        return root
+
+    monkeypatch.setattr(cli, f"_{command}", reject_admission)
+    monkeypatch.setattr(cli, "prepare_output_directory", prepare_then_publish)
+    result = cli.main(
+        [command, "--config", str(config), "--output-dir", str(output), *(["--overwrite"] if overwrite else [])]
+    )
+    captured = capsys.readouterr()
+    assert result == 3
+    assert "test admission rejection" in captured.err
+    if input_kind == "absent":
+        assert json.loads(trace.read_text()) == plan
+        assert json.loads(captured.out) == plan
+        assert "could not save resource plan" not in captured.err
+    else:
+        assert trace.is_symlink() == (input_kind == "file_alias")
+        assert trace.read_bytes() == trace_bytes
+        assert source_trace.read_bytes() == trace_bytes
+        assert "could not save resource plan" in captured.err
+        assert trace.name in captured.err
+        assert not captured.out
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+@pytest.mark.parametrize("input_kind", ["file", "directory_alias"])
+@pytest.mark.parametrize("report_name", ["resource-plan.json", "resource-runtime.json"])
+def test_supervisor_reports_preserve_trace_created_after_preflight(
+    tmp_path, monkeypatch, command, input_kind, report_name
+):
+    import subprocess
+
+    from aisim import supervision
+    from aisim.resources import ResourceLimitError
+
+    fixture = Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl"
+    trace_bytes = fixture.read_bytes()
+    config = _small_cli_config(tmp_path, command)
+    output = tmp_path / "output"
+    output.mkdir()
+    target = output / report_name
+    if input_kind == "directory_alias":
+        inputs = tmp_path / "inputs"
+        inputs.mkdir()
+        (inputs / "trace.jsonl").write_bytes(trace_bytes)
+        trace = target / "trace.jsonl"
+
+        def produce():
+            target.symlink_to(inputs, target_is_directory=True)
+    else:
+        trace = target
+
+        def produce():
+            trace.write_bytes(trace_bytes)
+
+    produce()
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+    control = subprocess.run(
+        [sys.executable, "-m", "aisim", command, "--config", str(config), "--output-dir", str(tmp_path / "control")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert control.returncode == 0, control.stderr
+    target.unlink()
+
+    def limit_after_preflight(*args, **kwargs):
+        assert not target.exists()
+        assert not target.is_symlink()
+        produce()
+        raise ResourceLimitError("test parent resource limit")
+
+    monkeypatch.setattr(supervision, "run_process", limit_after_preflight)
+    result = supervision.main([command, "--config", str(config), "--output-dir", str(output), "--overwrite"])
+    assert result == 3
+    assert trace.read_bytes() == trace_bytes
+    if input_kind == "directory_alias":
+        assert target.is_symlink()
+        assert target.readlink() == inputs
+    other_report = "resource-runtime.json" if report_name == "resource-plan.json" else "resource-plan.json"
+    assert json.loads((output / other_report).read_text())["schema_version"] == 1
+
+
+@pytest.mark.parametrize("protect_candidate", [False, True])
+def test_overwrite_handles_targets_unreachable_after_symlink_cleanup(tmp_path, protect_candidate):
+    from aisim.output import prepare_output_directory
+
+    output = tmp_path / "output"
+    output.mkdir()
+    candidates = tmp_path / "candidates"
+    candidates.mkdir()
+    candidate = candidates / "0001.yaml"
+    candidate.write_text("candidate config")
+    report = output / "report.html"
+    report.symlink_to(candidates, target_is_directory=True)
+    recommendations = output / "recommendations"
+    recommendations.symlink_to("report.html", target_is_directory=True)
+    previous = output / "prediction.json"
+    previous.write_text("previous prediction")
+    if protect_candidate:
+        with pytest.raises(ValueError, match="would remove input file"):
+            prepare_output_directory(output, overwrite=True, input_paths=[recommendations / "0001.yaml"])
+        assert report.is_symlink()
+        assert previous.read_text() == "previous prediction"
+    else:
+        prepare_output_directory(output, overwrite=True)
+        assert not report.is_symlink()
+        assert not previous.exists()
+    assert recommendations.is_symlink()
+    assert candidate.read_text() == "candidate config"
+
+
+@pytest.mark.parametrize("input_kind", ["file", "directory_alias"])
+def test_overwrite_rejects_looped_input_before_removing_outputs(tmp_path, input_kind):
+    from aisim.output import prepare_output_directory
+
+    output = tmp_path / "output"
+    output.mkdir()
+    previous = output / "prediction.json"
+    previous.write_text("previous prediction")
+    entry = tmp_path / "input-loop"
+    entry.symlink_to(entry, target_is_directory=input_kind == "directory_alias")
+    source = entry / "config.yaml" if input_kind == "directory_alias" else entry
+    with pytest.raises(ValueError, match="cannot resolve input path"):
+        prepare_output_directory(output, overwrite=True, input_paths=[source])
+    assert previous.read_text() == "previous prediction"
+    assert entry.is_symlink()
+    assert entry.readlink() == entry
+
+
+def test_overwrite_accepts_input_that_will_be_created_later(tmp_path):
+    from aisim.output import prepare_output_directory
+
+    output = tmp_path / "output"
+    output.mkdir()
+    previous = output / "prediction.json"
+    previous.write_text("previous prediction")
+    source = tmp_path / "future-inputs/trace.jsonl"
+    prepare_output_directory(output, overwrite=True, input_paths=[source])
+    assert not previous.exists()
+    assert not source.exists()
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+@pytest.mark.parametrize("input_kind", ["file", "directory_alias"])
+def test_preflight_rejects_looped_trace_input(tmp_path, monkeypatch, capsys, command, input_kind):
+    from aisim import supervision
+
+    config = _small_cli_config(tmp_path, command)
+    entry = tmp_path / "trace-loop"
+    entry.symlink_to(entry, target_is_directory=input_kind == "directory_alias")
+    trace = entry / "trace.jsonl" if input_kind == "directory_alias" else entry
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+    original_config = config.read_bytes()
+    output = tmp_path / "output"
+    output.mkdir()
+    previous = output / "prediction.json"
+    previous.write_text("previous prediction")
+
+    def unexpected_worker(*args, **kwargs):
+        pytest.fail("unresolvable input must be rejected before starting the worker")
+
+    monkeypatch.setattr(supervision, "run_process", unexpected_worker)
+    with pytest.raises(SystemExit) as error:
+        supervision.main([command, "--config", str(config), "--output-dir", str(output), "--overwrite"])
+    assert error.value.code == 2
+    assert "cannot resolve input path" in capsys.readouterr().err
+    assert previous.read_text() == "previous prediction"
+    assert config.read_bytes() == original_config
+    assert entry.is_symlink()
+
+
+@pytest.mark.parametrize("command", ["predict", "recommend"])
+@pytest.mark.parametrize("input_kind", ["file", "directory_alias"])
+@pytest.mark.parametrize(
+    "report_name,outcome,expected_code",
+    [
+        ("resource-runtime.json", "worker", 7),
+        ("resource-runtime.json", "resource", 3),
+        ("resource-plan.json", "resource", 3),
+    ],
+)
+def test_supervisor_reports_reject_looped_input_created_after_preflight(
+    tmp_path, monkeypatch, capsys, command, input_kind, report_name, outcome, expected_code
+):
+    from aisim import supervision
+    from aisim.resources import ResourceLimitError
+
+    config = _small_cli_config(tmp_path, command)
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    source = inputs / "trace.jsonl"
+    source.write_bytes((Path(__file__).parent / "e2e/configs/unified_cli/fixtures/traces/mooncake.jsonl").read_bytes())
+    trace_bytes = source.read_bytes()
+    entry = tmp_path / "trace-entry"
+    entry.symlink_to(
+        inputs if input_kind == "directory_alias" else source, target_is_directory=input_kind == "directory_alias"
+    )
+    trace = entry / "trace.jsonl" if input_kind == "directory_alias" else entry
+    raw = yaml.safe_load(config.read_text())
+    raw["traffic"] = {
+        "source": {"type": "trace", "format": "mooncake", "paths": [str(trace)]},
+        "load": {"type": "trace_timestamps"},
+    }
+    config.write_text(yaml.safe_dump(raw))
+    original_config = config.read_bytes()
+    output = tmp_path / "output"
+    target = output / report_name
+
+    def fail_after_preflight(*args, **kwargs):
+        entry.unlink()
+        entry.symlink_to(entry, target_is_directory=input_kind == "directory_alias")
+        target.write_text("previous diagnostic")
+        if outcome == "resource":
+            raise ResourceLimitError("test parent resource limit")
+        return {"schema_version": 1, "status": "failed", "reason": "test worker failure", "exit_code": 7}
+
+    monkeypatch.setattr(supervision, "run_process", fail_after_preflight)
+    result = supervision.main([command, "--config", str(config), "--output-dir", str(output), "--overwrite"])
+    assert result == expected_code
+    assert target.read_text() == "previous diagnostic"
+    assert source.read_bytes() == trace_bytes
+    assert config.read_bytes() == original_config
+    assert entry.is_symlink()
+    assert entry.readlink() == entry
+    assert "cannot resolve input path" in capsys.readouterr().err

@@ -366,11 +366,21 @@ def _run_process(
     }
 
 
-def _save_report(output: str, filename: str, report: dict[str, Any], *, overwrite: bool) -> None:
+def _save_report(
+    output: str,
+    filename: str,
+    report: dict[str, Any],
+    *,
+    overwrite: bool,
+    input_paths: Sequence[str | Path] = (),
+) -> None:
     root = Path(output)
     root.mkdir(parents=True, exist_ok=True)
     path = root / filename
     if overwrite and (path.is_file() or path.is_symlink()):
+        from .output import _check_input_collisions
+
+        _check_input_collisions([path], input_paths)
         path.unlink()
     # Exclusive creation prevents a diagnostic from overwriting unrelated evidence.
     with path.open("x", encoding="utf-8") as target:
@@ -583,7 +593,11 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
                     pickle.dump(raw, target)
                 worker_command = [sys.executable, "-m", "aisim.resource_worker", "cli-prepared", str(snapshot)]
             try:
-                output = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
+                from .config.traffic import TraceSource
+
+                source = config.traffic.source if config.traffic is not None else None
+                input_paths = [args.config, *(source.paths if isinstance(source, TraceSource) else [])]
+                output = prepare_output_directory(args.output_dir, overwrite=args.overwrite, input_paths=input_paths)
             except (OSError, ValueError) as exc:
                 parser.error(str(exc))
             event_output = str(output / "execution-events.jsonl")
@@ -625,7 +639,9 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
             for filename, payload in (("resource-plan.json", resource_plan), ("resource-runtime.json", report)):
                 if payload is not None:
                     try:
-                        _save_report(args.output_dir, filename, payload, overwrite=args.overwrite)
+                        _save_report(
+                            args.output_dir, filename, payload, overwrite=args.overwrite, input_paths=input_paths
+                        )
                     except (OSError, ValueError) as exc:
                         sys.stderr.write(f"could not save {filename}: {exc}\n")
         if report["status"] in _STOPPED_EXIT_CODES:

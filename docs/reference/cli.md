@@ -509,6 +509,17 @@ written twice when one of them writes `ais_perf_model`. In `predict`, an
 section is found later, when the run builds its workers. With `--overwrite`, the known outputs are
 already removed by then.
 
+For `predict` and `recommend`, both `--overwrite` and automatic cleanup of a failed run protect the
+active configuration and configured trace inputs, including symlinks and directory entries needed
+to reopen the original paths. Cleanup checks for collisions before removing any outputs and rechecks
+each entry before removal. A collision discovered during cleanup stops further removal.
+Resource-plan and runtime diagnostics also check for collisions with inputs created after preflight.
+The command skips a conflicting diagnostic and retains its original exit status.
+Use a separate output directory when predicting a configuration saved under the previous run's
+`recommendations/` directory.
+An input path containing a symbolic-link loop is rejected before cleanup or replacement of an
+existing resource report. Inputs that do not exist yet remain allowed.
+
 <a id="standard-output"></a>
 
 ### Standard Output

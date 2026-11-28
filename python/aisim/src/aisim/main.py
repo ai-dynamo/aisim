@@ -25,6 +25,7 @@ from .config.cli import (
     prediction_mapping,
 )
 from .config.common import split_config_sections
+from .config.traffic import TraceSource
 from .config_adapter import (
     ConfigAdapterResolutionError,
     SimulationConfigAdapter,
@@ -109,11 +110,23 @@ class _PredictionCliRunner:
             self._mark_execution_ready()
 
 
+def _cleanup_input_paths(config_path: str | Path, raw: dict[str, Any]) -> list[str | Path]:
+    traffic = raw.get("traffic")
+    source = traffic.get("source") if isinstance(traffic, dict) else None
+    paths = (
+        TraceSource.model_validate(source).paths if isinstance(source, dict) and source.get("type") == "trace" else []
+    )
+    return [config_path, *paths]
+
+
 class _PredictionCliRunnerFactory:
-    def __init__(self, factory, output_dir, overwrite, mark_execution_ready, mark_shutdown) -> None:
+    def __init__(
+        self, factory, output_dir, overwrite, mark_execution_ready, mark_shutdown, *, input_paths: Sequence[str | Path]
+    ) -> None:
         self._factory = factory
         self._output_dir = output_dir
         self._overwrite = overwrite
+        self._input_paths = tuple(input_paths)
         self._mark_execution_ready = mark_execution_ready
         self._mark_shutdown = mark_shutdown
         self.output_root: Path | None = None
@@ -122,7 +135,9 @@ class _PredictionCliRunnerFactory:
         return self._factory.capabilities()
 
     def create(self, worker_id):
-        self.output_root = prepare_output_directory(self._output_dir, overwrite=self._overwrite)
+        self.output_root = prepare_output_directory(
+            self._output_dir, overwrite=self._overwrite, input_paths=self._input_paths
+        )
         runner = self._factory.create(worker_id)
         self._mark_execution_ready()
         return _PredictionCliRunner(runner, self.output_root, self._mark_execution_ready, self._mark_shutdown)
@@ -171,6 +186,7 @@ def _predict(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
         args.overwrite,
         mark_execution_ready,
         mark_shutdown,
+        input_paths=_cleanup_input_paths(args.config, raw),
     )
     result = run_prediction(
         config,
@@ -340,7 +356,9 @@ def _recommend(args: argparse.Namespace, raw: dict[str, Any], factory) -> int:
     result = result.with_selected_prediction_configs(
         [(candidate_id, concrete) for candidate_id, _, concrete in selected]
     )
-    root = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
+    root = prepare_output_directory(
+        args.output_dir, overwrite=args.overwrite, input_paths=_cleanup_input_paths(args.config, raw)
+    )
     result_path = write_recommendation_result(root, result, exclusive=True)
     write_recommendation_csv(root, result, exclusive=True)
     if folded:
@@ -392,9 +410,12 @@ def _resource_plan(args, config, factory) -> dict[str, Any]:
     )
 
 
-def _write_resource_plan(args, plan: dict[str, Any]) -> None:
-    root = prepare_output_directory(args.output_dir, overwrite=args.overwrite)
-    (root / "resource-plan.json").write_text(json.dumps(plan, indent=2, allow_nan=False) + "\n")
+def _write_resource_plan(args, plan: dict[str, Any], raw: dict[str, Any]) -> None:
+    root = prepare_output_directory(
+        args.output_dir, overwrite=args.overwrite, input_paths=_cleanup_input_paths(args.config, raw)
+    )
+    with (root / "resource-plan.json").open("x", encoding="utf-8") as target:
+        target.write(json.dumps(plan, indent=2, allow_nan=False) + "\n")
     sys.stdout.write(json.dumps(plan, indent=2, allow_nan=False) + "\n")
 
 
@@ -465,7 +486,7 @@ def _main(argv: Sequence[str] | None = None, *, _prepared_config: dict[str, Any]
     except ResourceLimitError as exc:
         sys.stderr.write(f"aisim {args.command}: {exc}\n")
         try:
-            _write_resource_plan(args, exc.plan)
+            _write_resource_plan(args, exc.plan, raw)
         except (OSError, ValueError) as output_error:
             sys.stderr.write(f"could not save resource plan: {output_error}\n")
         return 3
