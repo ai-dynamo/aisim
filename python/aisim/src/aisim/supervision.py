@@ -52,6 +52,10 @@ _THREAD_VARIABLES = (
 )
 _POLL_SECONDS = 0.05
 _GRACE_SECONDS = 2.0
+# A candidate retains the complete calibrated estimator identity in several
+# public fields. Layer-wise routing profiles can exceed 1 MiB per candidate.
+_CHECKPOINT_RECORD_BYTES = 8 * 1024 * 1024
+_CHECKPOINT_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 def in_supervised_process() -> bool:
@@ -69,7 +73,9 @@ def checkpoint(event: str, value: dict[str, Any]) -> None:
         return
     record = json.dumps({"event": event, "value": value}, allow_nan=False) + "\n"
     path = Path(budget["events_path"])
-    if len(record) > 1024 * 1024 or (path.exists() and path.stat().st_size + len(record) > 64 * 1024 * 1024):
+    if len(record) > _CHECKPOINT_RECORD_BYTES or (
+        path.exists() and path.stat().st_size + len(record) > _CHECKPOINT_TOTAL_BYTES
+    ):
         raise ResourceLimitError("execution evidence exceeds the bounded checkpoint budget")
     with path.open("a", encoding="utf-8") as target:
         target.write(record)
@@ -338,21 +344,23 @@ def _run_process(
         reason, status = f"cannot monitor execution resources: {exc}", "resource_limited"
     finally:
         tree.close()
+    events_truncated = False
     if events_output is not None and events_path.exists():
         # Copy only complete records after workers have stopped. A final partial
         # write interrupted by termination must not masquerade as a finished event.
         target_path = Path(events_output)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         with target_path.open("x", encoding="utf-8") as target, events_path.open(encoding="utf-8") as source:
-            while line := source.readline(1024 * 1024 + 1):
-                if not line.endswith("\n") or len(line) > 1024 * 1024:
+            while line := source.readline(_CHECKPOINT_RECORD_BYTES + 1):
+                if not line.endswith("\n") or len(line) > _CHECKPOINT_RECORD_BYTES:
+                    events_truncated = True
                     break
                 target.write(line)
     code = process.returncode
     if status == "completed" and code:
         status = "resource_limited" if code == 3 else "failed"
         reason = f"execution process exited with status {code}"
-    return {
+    report = {
         "schema_version": 1,
         "status": status,
         "reason": reason,
@@ -364,6 +372,9 @@ def _run_process(
         "thread_limit_per_runtime": 1,
         "termination_complete": True,
     }
+    if events_truncated:
+        report["partial_evidence_truncated"] = True
+    return report
 
 
 def _save_report(output: str, filename: str, report: dict[str, Any], *, overwrite: bool) -> None:
@@ -634,6 +645,21 @@ def _main(argv: Sequence[str] | None, cleanup: ExitStack) -> int:
         return 1 if code < 0 else code
 
 
+def _parent_transfer_budget(budget: dict[str, Any]) -> int:
+    """Bound serialized bytes with the existing 64x JSON expansion allowance."""
+    host = discover_host()
+    return (
+        max(
+            0,
+            min(
+                host.available_memory_bytes - budget["reserved_host_memory_bytes"],
+                budget["memory_limit_bytes"] - host.process_memory_bytes,
+            ),
+        )
+        // 64
+    )
+
+
 def supervised_recommendation(config, kwargs):
     from .sweeper.result import SweepResult
 
@@ -670,11 +696,24 @@ def supervised_recommendation(config, kwargs):
                 events = root / "events.jsonl"
                 report["partial_events"] = []
                 if events.exists():
-                    with events.open() as source:
+                    try:
+                        transfer_bytes = min(_CHECKPOINT_TOTAL_BYTES, _parent_transfer_budget(report["budget"]))
+                    except ResourceLimitError:
+                        report["partial_evidence_truncated"] = True
+                        raise ResourceLimitError(message, plan=report) from None
+                    with events.open(encoding="utf-8") as source:
                         retained_bytes = 0
-                        for line in source:
+                        # Read at most the remaining allowance plus one character
+                        # to distinguish EOF from an unsafe next record.
+                        while line := source.readline(
+                            min(_CHECKPOINT_RECORD_BYTES, transfer_bytes - retained_bytes) + 1
+                        ):
                             retained_bytes += len(line)
-                            if retained_bytes > 1024 * 1024:
+                            if (
+                                not line.endswith("\n")
+                                or len(line) > _CHECKPOINT_RECORD_BYTES
+                                or retained_bytes > transfer_bytes
+                            ):
                                 report["partial_evidence_truncated"] = True
                                 break
                             report["partial_events"].append(json.loads(line))
@@ -683,15 +722,7 @@ def supervised_recommendation(config, kwargs):
                 raise KeyboardInterrupt
             raise RuntimeError(message)
         # Bound parent-side JSON expansion before loading any result bytes.
-        host = discover_host()
-        safe_bytes = max(
-            0,
-            min(
-                host.available_memory_bytes - report["budget"]["reserved_host_memory_bytes"],
-                report["budget"]["memory_limit_bytes"] - host.process_memory_bytes,
-            ),
-        )
-        if result.stat().st_size * 64 > safe_bytes:
+        if result.stat().st_size > _parent_transfer_budget(report["budget"]):
             raise ResourceLimitError(
                 "recommendation result exceeds the bounded parent transfer budget",
                 plan={

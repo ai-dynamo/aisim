@@ -106,8 +106,22 @@ the event log contains the candidates recorded so far; it is not a finalized
 recommendation. Replays are recorded in suggestion order, so the log can miss up
 to `optimizer.parallelism − 1` finished replays still waiting for an earlier one
 in their batch. The Python API returns partial sweep results for individual
-candidate refusals, or raises `ResourceLimitError` with bounded partial events
-when the supervisor stops the whole tree. Host evidence is available through
+candidate refusals, or raises `ResourceLimitError` with partial events in
+`ResourceLimitError.plan["partial_events"]` when the supervisor stops the whole
+tree. Both `execution-events.jsonl` checkpointing and partial-event retention
+allow complete JSONL records of up to 8 MiB, including the trailing newline,
+within a 64 MiB total budget. Before reading partial events, the parent also
+limits serialized bytes to
+`max(0, min(available memory - host reserve, execution memory limit - parent RSS)) // 64`,
+using live host memory after worker cleanup. This matches the completed-result
+transfer allowance; the factor of 64 provides conservative JSON expansion
+headroom, rather than measuring exact Python object sizes. Recovery retains
+only a complete prefix. An incomplete final line, a record exceeding 8 MiB,
+or a record crossing either the 64 MiB total or the parent transfer allowance
+ends recovery before that record is decoded and sets
+`ResourceLimitError.plan["partial_evidence_truncated"] = True`. With exhausted
+headroom, a nonempty log yields no partial events and sets the same flag.
+Host evidence is available through
 `result.execution_resources` and excluded from the portable result fingerprint.
 Use a new output directory or `--overwrite` to replace known outputs.
 
