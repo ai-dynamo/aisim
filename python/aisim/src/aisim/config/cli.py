@@ -107,6 +107,15 @@ class CoreRecommendationConfig(StrictModel):
     def _validate_cross_component(self) -> CoreRecommendationConfig:
         _validate_epd(self.traffic, self.engine)
         _validate_recommendation_context_lengths(self.traffic, self.engine)
+        if (
+            self.traffic is not None
+            and self.traffic.load.type == "kv_capacity_fraction"
+            and any(
+                getattr(getattr(worker, "kv_cache", None), "state_cache", None) is not None
+                for worker in (self.engine.workers.aggregated, self.engine.workers.prefill, self.engine.workers.decode)
+            )
+        ):
+            raise ValueError("hybrid state-cache recommendation requires an absolute traffic load")
         if self.engine.hardware == "auto" and self.optimization.hardware is None:
             raise ValueError("engine.hardware='auto' requires one optimization.hardware")
         source = self.traffic.source if self.traffic is not None else None

@@ -671,3 +671,57 @@ def test_conditional_min_gpus_arms_share_the_qualifying_bound():
         later.extend(sampler.suggest(2))
     assert any(suggestion.selection["adapter::router::mode"] == "kv_router" for suggestion in later)
     assert all(suggestion.parallel_config.total_gpus == 1 for suggestion in later)
+
+
+def _interval_min_gpus_branch(*, continuous: bool = False) -> BranchSpace:
+    # Deliberately put the interval-eligible topologies ahead of the DP1 preset.
+    shapes = tuple(
+        ReplicaParallelConfig(ParallelShape(tp=tp, dp=dp, moe_tp=1, moe_ep=tp * dp), replicas=1)
+        for tp, dp in ((4, 2), (2, 2), (1, 2), (1, 1))
+    )
+    return BranchSpace(
+        deployment_mode="agg",
+        parallel_configs=shapes,
+        supported_backends={shape: frozenset({"vllm"}) for shape in shapes},
+        knob_choices={"backend": ["vllm"], "agg_max_num_seqs": [128, 256]},
+        prefill_interval_choices={"prefill_schedule_interval": [1, 8]},
+        float_ranges={"kv_load_ratio": (0.1, 0.9)} if continuous else {},
+        prefer_smallest=True,
+    )
+
+
+@pytest.mark.parametrize("algorithm", [None, "bayesian", "random"])
+@pytest.mark.parametrize("batch_size", [1, 2, 7])
+@pytest.mark.parametrize("continuous", [False, True])
+def test_min_gpus_orders_topology_coverage_across_interval_arms(algorithm, batch_size, continuous):
+    sampler = make_branch_sampler(
+        _interval_min_gpus_branch(continuous=continuous), study_id="s", algorithm=algorithm, seed=11
+    )
+    for _ in range(2):
+        suggestions = []
+        while len(suggestions) < 7:
+            batch = sampler.suggest(min(batch_size, 7 - len(suggestions)))
+            assert batch
+            suggestions.extend(batch)
+        assert [item.parallel_config.total_gpus for item in suggestions] == [1, 2, 2, 4, 4, 8, 8]
+        assert {
+            (item.parallel_config.total_gpus, item.selection.get("prefill_schedule_interval")) for item in suggestions
+        } == {(1, None), (2, 1), (2, 8), (4, 1), (4, 8), (8, 1), (8, 8)}
+    if not continuous:
+        assert sampler.exhausted
+        assert sampler.suggest(1) == []
+
+
+def test_interval_min_gpus_orders_pending_retries_and_prunes_them_after_qualification():
+    sampler = make_branch_sampler(_interval_min_gpus_branch(continuous=True), study_id="s", seed=11)
+    first = sampler.suggest(7)
+    for item in first:
+        sampler.observe_infeasible(item, "sla")
+    one = next(item for item in first if item.parallel_config.total_gpus == 1)
+    eight = next(item for item in first if item.parallel_config.total_gpus == 8)
+    sampler.retry(eight)
+    # A pending large retry must not move ahead of another arm's smaller shape.
+    assert sampler.suggest(1)[0].parallel_config.total_gpus == 1
+    sampler.observe(one, {"objective": -1.0})
+    sampler.retry(eight)  # A late timeout cannot reintroduce an over-bound shape.
+    assert {item.parallel_config.total_gpus for item in sampler.suggest(8)} == {1}

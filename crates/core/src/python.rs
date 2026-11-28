@@ -7355,10 +7355,13 @@ mod tests {
     #[test]
     fn fitted_mtp_snapshot_load_errors_precede_executor_depth_validation() {
         pyo3::Python::initialize();
+        // Finish scheme registration before snapshot construction imports the
+        // base module, which parallel replay-depth tests also need.
+        Python::attach(|py| py.import("aisim_core.sdk.speculation").map(|_| ())).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut identity = unknown_regression_identity(ForwardPassWorkerType::Decode);
         identity.speculation = Some(
-            serde_json::from_value(serde_json::json!({"kind": "mtp", "params": {"depth": 6}}))
+            serde_json::from_value(serde_json::json!({"kind": "mtp", "params": {"depth": 8}}))
                 .unwrap(),
         );
         let mut model = ForwardPassPerfModel::best_available(identity).unwrap();
@@ -7367,7 +7370,7 @@ mod tests {
             .unwrap();
         let saved = model
             .save_state_snapshot(
-                dir.path().join("depth-six"),
+                dir.path().join("depth-eight"),
                 &crate::StateSnapshotOptions::default(),
             )
             .unwrap();
@@ -7379,7 +7382,7 @@ mod tests {
         };
         for missing_state in [false, true] {
             if missing_state {
-                std::fs::remove_file(dir.path().join("depth-six/state.bin")).unwrap();
+                std::fs::remove_file(dir.path().join("depth-eight/state.bin")).unwrap();
             }
             let error = resolve_role_timing(
                 &mut role.clone(),
@@ -7391,13 +7394,13 @@ mod tests {
                 &mut serde_json::Map::new(),
             )
             .err()
-            .expect("depth six is valid for cost prediction, but not replay");
+            .expect("depth eight is valid for cost prediction, but not replay");
             let error = format!("{error:#}");
             if missing_state {
                 assert!(error.contains("state.bin"), "{error}");
-                assert!(!error.contains("1..5 draft tokens"), "{error}");
+                assert!(!error.contains("1..7 draft tokens"), "{error}");
             } else {
-                assert!(error.contains("1..5 draft tokens"), "{error}");
+                assert!(error.contains("1..7 draft tokens"), "{error}");
             }
         }
     }
@@ -8006,9 +8009,25 @@ mod tests {
     }
 
     #[test]
+    fn replay_accepts_expanded_mtp_depths() {
+        pyo3::Python::initialize();
+        for depth in [6, 7] {
+            let mut config = aic_config();
+            config.speculation = Some(
+                serde_json::from_value(
+                    serde_json::json!({"kind": "mtp", "params": {"depth": depth}}),
+                )
+                .unwrap(),
+            );
+            config.validate_parallel_shape().unwrap();
+            assert_eq!(config.speculative_depth().unwrap(), depth);
+        }
+    }
+
+    #[test]
     fn replay_rejects_unsupported_depth_and_unmodeled_ngram_parameters() {
         for payload in [
-            serde_json::json!({"kind": "mtp", "params": {"depth": 6}}),
+            serde_json::json!({"kind": "mtp", "params": {"depth": 8}}),
             serde_json::json!({"kind": "ngram", "params": {"num_speculative_tokens": 2, "trigger_rate": 0.5}}),
         ] {
             let mut config = aic_config();

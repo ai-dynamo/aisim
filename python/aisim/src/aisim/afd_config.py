@@ -91,7 +91,7 @@ def validate_afd_worker(worker):
     if scheduler is not None and getattr(scheduler, "scheduler_select_time_ms", 0.0):
         raise ValueError("scheduler.scheduler_select_time_ms is unsupported for AFD")
     if scheduler is not None and (
-        getattr(scheduler, "prefill_schedule_interval", 1) != 1
+        getattr(scheduler, "prefill_schedule_interval", 1) not in (None, 1)
         or getattr(scheduler, "async_scheduling", None) is not None
         or getattr(scheduler, "launch", None) is not None
     ):

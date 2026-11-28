@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import itertools
+import math
+import operator
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
@@ -15,6 +18,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     StrictBool,
+    TypeAdapter,
     field_validator,
     model_serializer,
     model_validator,
@@ -582,6 +586,7 @@ class SchemeSpeculationConfig(StrictModel):
     draft_model_path: Annotated[str, Field(strict=True, min_length=1)] | None = None
     draft_config: dict[str, Any] | None = None
     expected_accepted_tokens: NonNegativeFloat
+    acceptance_rates: list[Annotated[float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)]] | None = None
     seed: Annotated[int, Field(strict=True, ge=0, le=0xFFFF_FFFF_FFFF_FFFF)] = 42
     # vLLM speculative_config.disable_eagle_block_drop: prefix-cache hits keep
     # their last matched block.
@@ -599,6 +604,13 @@ class SchemeSpeculationConfig(StrictModel):
         maximum = self.num_speculative_tokens
         if maximum == 0:
             raise ValueError("omit speculation to disable it")
+        if self.acceptance_rates is not None:
+            if self.kind != "mtp" or len(self.acceptance_rates) != maximum:
+                raise ValueError("MTP acceptance_rates requires one conditional probability per draft position")
+            if not math.isclose(
+                self.expected_accepted_tokens, sum(itertools.accumulate(self.acceptance_rates, operator.mul))
+            ):
+                raise ValueError("expected_accepted_tokens must match the MTP acceptance curve")
         if self.expected_accepted_tokens > maximum:
             raise ValueError(f"expected_accepted_tokens must be within [0, {maximum}] accepted draft tokens")
         return self
@@ -609,19 +621,54 @@ class SchemeSpeculationConfig(StrictModel):
 
     def cost_config(self) -> dict[str, Any]:
         return self.model_dump(
-            exclude={"expected_accepted_tokens", "seed", "disable_eagle_block_drop"}, exclude_none=True
+            exclude={"expected_accepted_tokens", "acceptance_rates", "seed", "disable_eagle_block_drop"},
+            exclude_none=True,
         )
 
     @model_serializer(mode="wrap")
     def _omit_default_block_drop(self, handler: Any) -> dict[str, Any]:
         # Keep the existing descriptor shape unless the switch is on.
         payload = handler(self)
+        if payload.get("acceptance_rates") is None:
+            payload.pop("acceptance_rates", None)
         if payload.get("disable_eagle_block_drop") is False:
             payload.pop("disable_eagle_block_drop")
         return payload
 
 
+class MtpDepthSearch(StrictModel):
+    """Candidate depths share a prefix of the same conditional acceptance curve."""
+
+    kind: Literal["mtp"]
+    depth: Choices[Annotated[int, Field(strict=True, ge=0, le=7)]]
+    acceptance_rates: list[Annotated[float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)]]
+    seed: Annotated[int, Field(strict=True, ge=0, le=0xFFFF_FFFF_FFFF_FFFF)] = 42
+    disable_eagle_block_drop: StrictBool = False
+
+    @model_validator(mode="after")
+    def _validate_curve(self) -> MtpDepthSearch:
+        if len(self.acceptance_rates) != max(self.depth.choices):
+            raise ValueError("acceptance_rates must cover exactly the largest MTP depth")
+        return self
+
+    def at_depth(self, depth: int) -> SchemeSpeculationConfig | None:
+        if depth not in self.depth.choices:
+            raise ValueError(f"unconfigured MTP depth {depth}")
+        if depth == 0:
+            return None
+        rates = self.acceptance_rates[:depth]
+        return SchemeSpeculationConfig(
+            kind="mtp",
+            params={"depth": depth},
+            acceptance_rates=rates,
+            expected_accepted_tokens=sum(itertools.accumulate(rates, operator.mul)),
+            seed=self.seed,
+            disable_eagle_block_drop=self.disable_eagle_block_drop,
+        )
+
+
 SpeculationConfig = NgramSpeculationConfig | SchemeSpeculationConfig
+SPECULATION_ADAPTER = TypeAdapter(SpeculationConfig)
 
 
 class TimingConfig(StrictModel):
@@ -1391,7 +1438,15 @@ class ParallelismRecommendationConfig(StrictModel):
         return self
 
 
-class SchedulerRecommendationConfig(StrictModel):
+PREFILL_INTERVAL_FIELDS = {"vllm": "prefill_schedule_interval", "sglang": "prefill_decode_interval"}
+
+
+class PrefillIntervalSearch(StrictModel):
+    prefill_schedule_interval: PositiveInt | Choices[PositiveInt] | None = None
+    prefill_decode_interval: NonNegativeInt | Choices[NonNegativeInt] | None = None
+
+
+class SchedulerRecommendationConfig(PrefillIntervalSearch):
     max_batched_tokens: PositiveInt | Choices[PositiveInt] | IntegerRange | None = None
     max_sequences: PositiveInt | Choices[PositiveInt] | IntegerRange | None = None
 
@@ -1418,6 +1473,8 @@ class KvCapacityRecommendationConfig(StrictModel):
 
 
 class KvCacheRecommendationConfig(StrictModel):
+    state_cache: StateCachePredictionConfig | None = None
+    prefix_match_unit: PositiveU64 | None = None
     block_size: PositiveInt | Choices[PositiveInt] | IntegerRange | None = None
     prefix_caching: bool = True
     decode_radix_cache: bool = False
@@ -1427,11 +1484,9 @@ class KvCacheRecommendationConfig(StrictModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _reject_state_cache_recommendation(cls, value: Any) -> Any:
+    def _reject_hicache_recommendation(cls, value: Any) -> Any:
         if isinstance(value, dict) and value.get("hicache") is not None:
             raise ValueError("hicache currently supports prediction only; recommendation is not supported")
-        if isinstance(value, dict) and value.get("state_cache") is not None:
-            raise ValueError("state_cache currently supports prediction only; recommendation is not supported")
         return value
 
 
@@ -1551,7 +1606,7 @@ class EngineRecommendationConfig(EstimatorPolicyConfig):
     backend: Backend | Choices[Backend] = Field(default_factory=lambda: Choices[Backend](choices=["vllm", "sglang"]))
     backend_version: str | dict[str, str] | None = None
     context_length: PositiveInt | Literal["max"] = "max"
-    speculation: NgramSpeculationConfig | None = None
+    speculation: NgramSpeculationConfig | MtpDepthSearch | None = None
     workers: WorkersRecommendationConfig = Field(default_factory=WorkersRecommendationConfig)
     kv_transfer: KvTransferConfig | None = None
 
@@ -1581,6 +1636,21 @@ class EngineRecommendationConfig(EstimatorPolicyConfig):
             unknown = sorted(set(self.backend_version) - backends)
             if unknown:
                 raise ValueError(f"backend_version contains unconfigured backend(s): {unknown}")
+        for role in ("aggregated", "prefill", "decode"):
+            worker = getattr(self.workers, role)
+            if worker is None or is_afd_worker(worker):
+                continue
+            for backend, field in PREFILL_INTERVAL_FIELDS.items():
+                if getattr(worker.scheduler, field) is not None and (role != "aggregated" or backend not in backends):
+                    raise ValueError(f"{field} search requires an aggregated {backend} worker")
+            cache = worker.kv_cache
+            if cache.state_cache is not None:
+                if not isinstance(self.speculation, MtpDepthSearch):
+                    raise ValueError("state_cache currently supports prediction only or an MTP depth search")
+                if cache.state_cache.num_speculative_states is not None:
+                    raise ValueError("the MTP depth search supplies state_cache.num_speculative_states")
+            elif cache.prefix_match_unit is not None:
+                raise ValueError("prefix_match_unit recommendation requires state_cache")
         _validate_recommendation_host_offload(self)
         _validate_recommendation_host(self, modes=modes, backends=backends)
         _validate_speculation(self, modes=modes, backends=backends)
@@ -1700,7 +1770,6 @@ def _validate_fpm_profile(engine, modes: set[str], backends: set[str]) -> None:
                         prefix_match_unit=cache.prefix_match_unit,
                         max_batched_tokens=worker.scheduler.max_batched_tokens,
                     )
-                    # Only a prediction states the interval. The search space and the onboarding plan run with 1.
                     if backend_version == "0.33.0" and worker.scheduler.prefill_schedule_interval != 1:
                         raise ValueError(
                             "grouped prefix caching on vLLM 0.33.0 requires prefill_schedule_interval=1; vLLM 0.33.0 "
@@ -1840,15 +1909,15 @@ def _validate_speculation(engine, *, modes: set[str], backends: set[str]) -> Non
                 # checks a recurrent one there.
                 if state.bytes_per_request is not None:
                     _require_block_drop_off(engine.speculation)
-            elif worker.scheduler.async_scheduling is True:
+            elif getattr(worker.scheduler, "async_scheduling", None) is True:
                 raise ValueError("mtp speculation with host_offload requires async_scheduling=false")
-            elif backends != {"vllm"} or not cache.prefix_caching or cache.g3_offload is not None:
+            elif backends != {"vllm"} or not cache.prefix_caching or getattr(cache, "g3_offload", None) is not None:
                 raise ValueError(
                     "mtp speculation with host_offload requires vllm, prefix_caching=true, and no g3_offload"
                 )
             if role == "aggregated" and cache.host_offload.scope != "dp_rank_local":
                 raise ValueError("mtp speculation with host_offload requires scope=dp_rank_local on workers.aggregated")
-            if role != "aggregated" and cache.kvcr is not None:
+            if role != "aggregated" and getattr(cache, "kvcr", None) is not None:
                 raise ValueError(f"mtp speculation does not support kv_cache.kvcr on workers.{role}")
         if kind == "ngram" and worker.timing.forward_model != "op_level":
             raise ValueError(f"{kind} speculation requires op_level timing")

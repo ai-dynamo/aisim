@@ -18,7 +18,7 @@ from aisim_core.sdk.rust_engine_step import UNKNOWN_IDENTITY
 from .capacity import resolve_model_context_length
 from .config.cli import CorePredictionConfig, CoreRecommendationConfig
 from .config.common import ENGINE_MODEL_CONTROL_FIELDS
-from .config.engine import is_afd_worker, resolve_block_size
+from .config.engine import PREFILL_INTERVAL_FIELDS, is_afd_worker, resolve_block_size
 from .config.traffic import TrafficPredictionConfig
 from .config_adapter import (
     CompiledSweepProvider,
@@ -116,7 +116,7 @@ def _run_recommendation(
     if config.engine.workers.encoder is not None and (stack != "engine" or adapter_configs):
         raise ValueError("encoder pools require --stack engine without adapters")
     if config.engine.speculation is not None and (stack != "engine" or adapter_configs):
-        raise ValueError("ngram speculation requires --stack engine without adapters")
+        raise ValueError(f"{config.engine.speculation.kind} speculation requires --stack engine without adapters")
     smart = recommendation_to_sweeper(config, adapter_configs=adapter_configs, stack=stack)
     if config.traffic is None:
         workload = smart.workload
@@ -434,6 +434,10 @@ def _role_search_space(
         scheduler = raw.get("scheduler") or {}
         if not isinstance(scheduler, dict):
             raise ValueError(f"engine.workers.{public_role}.scheduler must be a mapping")
+        if legacy_role == "agg":
+            intervals = {field: scheduler[field] for field in PREFILL_INTERVAL_FIELDS.values() if field in scheduler}
+            if intervals:
+                result["agg_prefill_intervals"] = intervals
         tokens_default = [8192] if legacy_role == "decode" else [8192, 16384, 32768]
         sequences_default = [1, 2, 4, 8, 16, 32, 64, 128, 256] if legacy_role == "prefill" else [256, 512, 1024]
         tokens_name = f"{legacy_role}_max_num_batched_tokens"
@@ -1091,6 +1095,21 @@ def _candidate_prediction(
             kv_cache["bytes_per_token"] = role_args["kv_cache_bytes_per_token"]
         if sample.get(f"{role}_native_host_offload") is not None:
             kv_cache["host_offload"] = deepcopy(sample[f"{role}_native_host_offload"])
+        source_cache = raw_worker.get("kv_cache", {})
+        if source_cache.get("state_cache") is not None:
+            state = deepcopy(source_cache["state_cache"])
+            if (
+                state.get("bytes_per_request") is not None
+                and state.get("sliding_window_lookahead_tokens") is None
+                and sample["mtp_depth"]
+            ):
+                state["num_speculative_states"] = sample["mtp_depth"]
+            kv_cache["state_cache"] = state
+            kv_cache["bytes_per_token"] = source_cache.get("bytes_per_token", "auto")
+            if source_cache.get("block_size") is None:
+                kv_cache.pop("block_size", None)
+            if source_cache.get("prefix_match_unit") is not None:
+                kv_cache["prefix_match_unit"] = source_cache["prefix_match_unit"]
         worker_config = {
             "parallelism": {
                 "replicas": sample[f"{prefix}replicas"],
@@ -1108,6 +1127,11 @@ def _candidate_prediction(
             "scheduler": {
                 "max_batched_tokens": sample[f"{role}_max_num_batched_tokens"],
                 "max_sequences": sample[f"{role}_max_num_seqs"],
+                **{
+                    field: sample[field]
+                    for field in PREFILL_INTERVAL_FIELDS.values()
+                    if role == "agg" and field in sample
+                },
             },
             "kv_cache": kv_cache,
             "timing": timing,

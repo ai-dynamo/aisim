@@ -409,6 +409,36 @@ def test_afd_worker_accepts_empty_common_parameter_blocks(key):
     CorePredictionConfig.model_validate(raw)
 
 
+@pytest.mark.parametrize(("mode", "afd_roles"), COMBINATIONS)
+@pytest.mark.parametrize("scheduler", [None, {}, {"max_sequences": 4}, {"prefill_schedule_interval": 1}])
+def test_afd_recommendation_preserves_omitted_prefill_interval(mode, afd_roles, scheduler):
+    raw = recommendation(mode, afd_roles)
+    if scheduler is not None:
+        for role in afd_roles:
+            raw["engine"]["workers"][role]["scheduler"] = scheduler
+    source = CoreRecommendationConfig.model_validate(raw)
+    restored = CoreRecommendationConfig.model_validate_json(source.model_dump_json())
+    for role in afd_roles:
+        saved_worker = restored.engine.workers.model_dump(mode="json")[role]
+        assert saved_worker.get("scheduler") == scheduler
+
+
+@pytest.mark.parametrize(
+    "config_type,raw_factory,interval",
+    [
+        (CorePredictionConfig, prediction, 2),
+        (CoreRecommendationConfig, recommendation, 2),
+        (CoreRecommendationConfig, recommendation, {"choices": [1]}),
+        (CoreRecommendationConfig, recommendation, {"choices": [1, 2]}),
+    ],
+)
+def test_afd_rejects_vllm_prefill_interval_controls(config_type, raw_factory, interval):
+    raw = raw_factory()
+    raw["engine"]["workers"]["decode"]["scheduler"] = {"prefill_schedule_interval": interval}
+    with pytest.raises(ValidationError, match="vLLM scheduling controls are unsupported"):
+        config_type.model_validate(raw)
+
+
 @pytest.mark.parametrize("missing", ["prefill", "decode"])
 def test_pd_requires_both_roles(missing):
     raw = prediction()
@@ -1498,6 +1528,7 @@ def test_common_afd_timing_and_search_domains_survive_saved_prediction():
     )
     restored = prediction_to_replay_spec(CorePredictionConfig.model_validate(saved))
     restored_meta = restored.backend_deployment.performance_model_metadata["aggregated"]
+    assert restored.backend_deployment.agg_engine_args["max_num_seqs"] == suggestion.selection["agg_max_num_seqs"]
     assert restored_meta["quant"] == meta["quant"]
     assert restored_meta["estimator"]["database_mode"] == "SOL"
 

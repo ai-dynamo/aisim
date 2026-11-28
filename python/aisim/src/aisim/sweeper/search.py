@@ -759,6 +759,21 @@ def _materialize_one(
             if prediction_config_factory is not None
             else None
         )
+        if (
+            "mtp_depth" in sample
+            and prediction_config is not None
+            and any(
+                worker.get("kv_cache", {}).get("state_cache") is not None
+                for worker in prediction_config["engine"]["workers"].values()
+            )
+        ):
+            from ..compiler import prediction_to_replay_spec
+            from ..config.cli import CorePredictionConfig
+
+            # Predict resolves hybrid state geometry for this topology and draft depth.
+            compiled = prediction_to_replay_spec(CorePredictionConfig.model_validate(prediction_config))
+            replay_spec = replace(replay_spec, backend_deployment=compiled.backend_deployment)
+            runner_factory.capabilities().require_compatible(replay_spec)
         if encoder is not None and prediction_config_factory is not None:
             from ..config.epd import validate_epd_prediction_mapping
 

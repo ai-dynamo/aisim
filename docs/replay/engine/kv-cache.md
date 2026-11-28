@@ -58,8 +58,8 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 | `hicache` | Unset (off) | Rejected | SGLang host KV cache for aggregated prediction; see [SGLang HiCache](#sglang-hicache). |
 | `g3_offload` | Unset (off) | Rejected | G3 block; see [G3 offload](#g3-offload). |
 | `kvcr` | Unset (off) | Rejected | KVCR block; see [KVCR peer fetch](#kvcr-peer-fetch). |
-| `state_cache` | Unset (off) | Rejected | Recurrent-state block; see [state cache](#state-cache). |
-| `prefix_match_unit` | Unset | Rejected | Prefix-matching granularity with `state_cache`. For a grouped FPM cache with prefix caching, it is the profile's `hash_block_size_tokens`: unset uses it, and a set value must equal it. See [grouped caches](#other-cache-modes). |
+| `state_cache` | Unset (off) | MTP depth search | Recurrent-state block; see [state cache](#state-cache). |
+| `prefix_match_unit` | Unset | Fixed with an MTP depth search and state cache | Prefix-matching granularity with `state_cache`. For a grouped FPM cache with prefix caching, it is the profile's `hash_block_size_tokens`: unset uses it, and a set value must equal it. See [grouped caches](#other-cache-modes). |
 
 The block-size defaults above are simulation defaults. When a Sweeper candidate's
 role block size is absent or `null`, the deployment generator omits `--block-size`
@@ -1057,7 +1057,9 @@ EAGLE block drop.
 This explicit mode models full-state scratch storage, not ReplaySSM or
 RecoverSSM rings or temporary records.
 
-Rejected: `recommend`, G3 offload, G2 for a recurrent state except as a
+For an [MTP depth search](../../sweeper/search-space.md#mtp-draft-depth), `recommend` uses fixed block counts and absolute traffic load. The selected depth supplies the scratch count for an explicit recurrent state.
+
+Rejected: other recommendation searches, G3 offload, G2 for a recurrent state except as a
 [hybrid G2](#hybrid-g2), G2 for a sliding-window state with `kvcr` or a
 `host_offload.connector` other than `offloading_v0_24`, and speculative
 sub-block matching without an explicit full-state scratch count.

@@ -238,7 +238,9 @@ without materializing the Cartesian product. Exhausting a finite space ends the 
 before `max_trials`; the summary says so.
 
 For `min_gpus`, both algorithms use this coverage order with the smallest legal GPU counts
-first; the Bayesian samplers do not otherwise favor small shapes. Once a candidate qualifies with
+first, including across prefill-interval and other conditional arms; a larger topology in one
+arm cannot hide a smaller legal preset in another. The Bayesian samplers do not otherwise
+favor small shapes. Once a candidate qualifies with
 `n` provisioned GPUs (including any encoder pool), backend/topology pairs whose topology alone
 needs more than `n` GPUs are not suggested or retried again, across every conditional arm of the
 branch, and the remaining budget revisits scheduler/workload knobs within that bound. Pairs
@@ -471,6 +473,26 @@ An encoder pool may be searched over
 on the worker is exclusive with an encoder pool, so comparing the two takes
 separate runs.
 
+## MTP draft depth
+
+On the offline engine stack, `engine.speculation.depth.choices` searches MTP depth alongside parallelism and scheduler limits.
+Depth zero disables speculation. Each positive depth uses the first `depth` entries in the supplied conditional acceptance curve.
+For example, rates of 0.8 and 0.5 give 0.8 + 0.8 × 0.5 = 1.2 expected accepted drafts, or 2.2 emitted tokens including the bonus.
+
+```yaml
+engine:
+  speculation:
+    kind: mtp
+    depth: {choices: [0, 1, 2, 3]}
+    acceptance_rates: [0.8, 0.5, 0.25]
+    seed: 42
+```
+
+Each worker uses default timing and an explicit fixed KV pool. The saved prediction includes the selected depth, its acceptance probabilities, and the expected accepted drafts.
+For a vLLM hybrid state cache, the prediction compiler sizes state at each selected depth and parallel shape. Explicit recurrent state sizes reserve the selected number of speculative copies.
+Host offload uses the usual vLLM connector rules. Set `disable_eagle_block_drop: true` for recurrent state with CPU offload.
+The GPU and host block counts are fixed inputs. Choose pool sizes that fit each deployment.
+
 <a id="removed-kvbm-fields"></a>
 
 ## Host Offload and Removed KVBM Fields
@@ -481,7 +503,7 @@ search fields. Those legacy fields have no adapter migration.
 The public `predict` and `recommend` commands support a separate native host-offload descriptor
 at `engine.workers.<role>.kv_cache.host_offload`. It sets the G2 `scope`, `num_host_blocks` and
 bandwidths as fixed values, not search dimensions. It requires vLLM and prefix caching; `predict`
-takes it with canonical MTP and no other speculation, `recommend` without speculation. For `recommend`, mode (`aggregated` or `disaggregated`)
+takes it with canonical MTP and no other speculation, `recommend` without speculation or with an MTP depth search. For `recommend`, mode (`aggregated` or `disaggregated`)
 and backend must be concrete; parallelism knobs, including `attention_data`, may be searched. When
 both prefill and decode use `scope: cluster_shared`, both roles must set `tensor` and `pipeline` to
 the same explicit integer (an omitted value is searched), their KV block geometry and pool fields

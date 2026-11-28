@@ -45,7 +45,7 @@ from .parallel_projection import (
     ParallelProjection,
 )
 from .replay import canonical_json
-from .search_space import BranchSpace, matches_parallel_domains
+from .search_space import BranchSpace, matches_parallel_domains, prefill_interval_arms
 
 _CONSTANT_PARAM = "_sweeper_constant"
 _METRIC = "objective"
@@ -552,6 +552,8 @@ class SmallestFirstBranchSampler(RandomBranchSampler):
     def __init__(self, branch: BranchSpace, *, seed: int, bound: _QualifyingBound | None = None) -> None:
         super().__init__(replace(branch, prefer_smallest=True), seed=seed)
         self._bound = bound if bound is not None else _QualifyingBound()
+        self._pruned_bound: int | None = None
+        self._visits: dict[tuple[str, Any], int] = {}
 
     @property
     def best_gpus(self) -> int | None:
@@ -562,10 +564,29 @@ class SmallestFirstBranchSampler(RandomBranchSampler):
         return self._bound.gpus is None or parallel_config.total_gpus <= self._bound.gpus
 
     def _prune(self) -> None:
-        if self._bound.gpus is None:
+        if self._bound.gpus == self._pruned_bound:
             return
         self._arms = deque(arm for arm in self._arms if self._within_bound(arm[1]))
         self._retries = deque(retry for retry in self._retries if self._within_bound(retry.parallel_config))
+        self._pruned_bound = self._bound.gpus
+
+    @property
+    def next_priority(self) -> tuple[int, int] | None:
+        """Next coverage pass and GPU count, without consuming a suggestion.
+
+        Passes take precedence so a continuous small arm cannot starve larger
+        topologies in other arms. Match RandomBranchSampler's single-slot retry
+        choice, including its alternation between retries and fresh candidates.
+        """
+        self._prune()
+        if self._retries and (self._retry_turn or not self._arms):
+            suggestion = self._retries[0]
+            backend, parallel = suggestion.selection["backend"], suggestion.parallel_config
+        elif self._arms:
+            backend, parallel, _, _ = self._arms[0]
+        else:
+            return None
+        return self._visits.get((backend, parallel), 0), parallel.total_gpus
 
     @property
     def exhausted(self) -> bool:
@@ -574,7 +595,11 @@ class SmallestFirstBranchSampler(RandomBranchSampler):
 
     def suggest(self, count: int) -> list[Suggestion]:
         self._prune()
-        return super().suggest(count)
+        suggestions = super().suggest(count)
+        for suggestion in suggestions:
+            pair = suggestion.selection["backend"], suggestion.parallel_config
+            self._visits[pair] = self._visits.get(pair, 0) + 1
+        return suggestions
 
     def retry(self, suggestion: Suggestion) -> None:
         if self._within_bound(suggestion.parallel_config):
@@ -790,6 +815,12 @@ def _conditional_arm_id(assignments: dict[str, Any]) -> str:
 def _expand_conditional_arms(branch: BranchSpace) -> list[tuple[str, BranchSpace]]:
     """Expand conditional selectors into flat sampler-compatible branch arms."""
 
+    if branch.prefill_interval_choices:
+        return [
+            (_conditional_arm_id({"prefill": group, "arm": arm_id}), arm)
+            for group, subspace in prefill_interval_arms(branch)
+            for arm_id, arm in _expand_conditional_arms(subspace)
+        ]
     selectors = tuple(dict.fromkeys(condition.selector for condition in branch.conditional_dimensions))
     arms: list[tuple[str, BranchSpace]] = []
     for raw_values in product(*(branch.knob_choices[selector] for selector in selectors)):
@@ -829,7 +860,8 @@ class ConditionalBranchSampler:
     The installed Vizier designers reject hierarchical search spaces.  Each
     selector assignment therefore owns a normal flat sampler study, while this
     facade preserves the external one-branch lifecycle and delegates observations
-    to the arm that produced the suggestion.
+    to the arm that produced the suggestion. Smallest-first samplers instead
+    share ascending-GPU coverage order across arms, with round-robin ties.
     """
 
     def __init__(
@@ -849,9 +881,46 @@ class ConditionalBranchSampler:
         if not self._samplers:
             raise ValueError("a conditional branch must produce at least one selector arm")
 
+    @staticmethod
+    def _wrap(arm_index: int, inner: Suggestion) -> Suggestion:
+        return Suggestion(
+            selection=inner.selection,
+            parallel_config=inner.parallel_config,
+            handle=_ConditionalSuggestionHandle(arm_index, inner),
+            projection=inner.projection,
+            infeasible_reason=inner.infeasible_reason,
+        )
+
+    def _suggest_smallest_first(self, count: int) -> list[Suggestion]:
+        suggestions = []
+        stalled = set()
+        while len(suggestions) < count:
+            priorities = []
+            for offset in range(len(self._samplers)):
+                index = (self._cursor + offset) % len(self._samplers)
+                sampler = self._samplers[index]
+                if index not in stalled and isinstance(sampler, SmallestFirstBranchSampler):
+                    priority = sampler.next_priority
+                    if priority is not None:
+                        priorities.append((priority, index))
+            if not priorities:
+                break
+            # min() preserves round-robin order for equal priorities. Advance
+            # one arm at a time so a batch also respects the global order.
+            _, arm_index = min(priorities, key=lambda item: item[0])
+            batch = self._samplers[arm_index].suggest(1)
+            self._cursor = (arm_index + 1) % len(self._samplers)
+            if batch:
+                suggestions.append(self._wrap(arm_index, batch[0]))
+            else:
+                stalled.add(arm_index)
+        return suggestions
+
     def suggest(self, count: int) -> list[Suggestion]:
         if count <= 0:
             return []
+        if self.branch.prefer_smallest:
+            return self._suggest_smallest_first(count)
         active = [index for index, sampler in enumerate(self._samplers) if not getattr(sampler, "exhausted", False)]
         if not active:
             return []
@@ -867,15 +936,7 @@ class ConditionalBranchSampler:
             inner = next(batches[arm_index], None)
             if inner is None:
                 continue
-            suggestions.append(
-                Suggestion(
-                    selection=inner.selection,
-                    parallel_config=inner.parallel_config,
-                    handle=_ConditionalSuggestionHandle(arm_index, inner),
-                    projection=inner.projection,
-                    infeasible_reason=inner.infeasible_reason,
-                )
-            )
+            suggestions.append(self._wrap(arm_index, inner))
         return suggestions
 
     @property
@@ -922,7 +983,14 @@ def make_branch_sampler(
         if flat_branch.prefer_smallest:
             # min_gpus: ascending GPU-count search, whatever optimizer was requested.
             return SmallestFirstBranchSampler(flat_branch, seed=flat_seed, bound=bound)
-        if algorithm == "random":
+        # A fully pinned interval arm has exactly one trial. Retire it after that trial
+        # so the optimizer can spend the remaining budget on arms with choices.
+        if algorithm == "random" or (
+            branch.prefill_interval_choices
+            and len(flat_branch.parallel_configs) == 1
+            and all(len(values) == 1 for values in flat_branch.knob_choices.values())
+            and all(lo == hi for lo, hi in (*flat_branch.float_ranges.values(), *flat_branch.integer_ranges.values()))
+        ):
             return RandomBranchSampler(flat_branch, seed=flat_seed)
         if algorithm == "bayesian":
             return SeededBayesianBranchSampler(
@@ -938,7 +1006,7 @@ def make_branch_sampler(
             seed=flat_seed,
         )
 
-    if branch.conditional_dimensions:
+    if branch.conditional_dimensions or branch.prefill_interval_choices:
         return ConditionalBranchSampler(
             branch,
             sampler_factory=construct,

@@ -368,6 +368,15 @@ def from_sweeper_candidate(
     backend_version = _required_text(config, "backend_version")
     hardware_sku = _required_text(config, "hardware_sku")
 
+    # No generator backend maps these scheduler controls yet. Dropping a
+    # searched value would deploy a different schedule from the scored one.
+    for field, default in (("prefill_schedule_interval", 1), ("prefill_decode_interval", 0)):
+        if config.get(field, default) != default:
+            raise SweeperCandidateError(
+                f"deployment generation cannot preserve candidate.config.{field}={config[field]!r}; "
+                "use the saved prediction YAML to replay the evaluated schedule"
+            )
+
     if mode == "disagg":
         role_hardware = {
             role: _role_hardware_sku(config, role, fallback=hardware_sku) for role in ("prefill", "decode")

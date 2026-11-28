@@ -1785,11 +1785,9 @@ def _materialize_engine_role(
     canonical_kind = canonical_speculation.get("kind") if isinstance(canonical_speculation, Mapping) else None
     speculation = None
     if speculation_raw is not None:
-        from pydantic import TypeAdapter
+        from .config.engine import SPECULATION_ADAPTER, NgramSpeculationConfig
 
-        from .config.engine import NgramSpeculationConfig, SpeculationConfig
-
-        speculation = TypeAdapter(SpeculationConfig).validate_python(speculation_raw)
+        speculation = SPECULATION_ADAPTER.validate_python(speculation_raw)
         if any(
             rank.get(key) is not None
             for key in (
@@ -1805,12 +1803,12 @@ def _materialize_engine_role(
         ):
             raise ValueError("speculation cannot be combined with legacy speculative decoding fields")
         rank["aic_nextn"] = speculation.num_speculative_tokens
-        if isinstance(speculation, NgramSpeculationConfig):
+        if speculation.acceptance_rates is not None:
             rank["aic_nextn_accept_rates"] = ",".join(str(rate) for rate in speculation.acceptance_rates)
         else:
             rank["aic_nextn_accepted"] = speculation.expected_accepted_tokens
-            if speculation.disable_eagle_block_drop:
-                rank["disable_eagle_block_drop"] = True
+        if not isinstance(speculation, NgramSpeculationConfig) and speculation.disable_eagle_block_drop:
+            rank["disable_eagle_block_drop"] = True
         rank["aic_mtp_seed"] = speculation.seed
 
     kind = speculation.kind if speculation is not None else canonical_kind
@@ -1877,8 +1875,9 @@ def _materialize_engine_role(
     nextn = _pop_alias(rank, "aic_nextn", ("aic_nextn", "nextn"))
     if nextn is not None:
         nextn = _positive_int(nextn, f"engine provider {role} aic_nextn")
-        if nextn > 5:
-            raise ValueError(f"engine provider {role} aic_nextn must be in 1..=5")
+        limit = 7 if kind == "mtp" else 5
+        if nextn > limit:
+            raise ValueError(f"engine provider {role} aic_nextn must be in 1..={limit}")
         rank["aic_nextn"] = nextn
 
     accept_rates = _pop_alias(

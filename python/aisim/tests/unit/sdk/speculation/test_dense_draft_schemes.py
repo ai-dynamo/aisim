@@ -609,7 +609,7 @@ def test_canonical_cost_preserves_all_schemes_without_replay_expansion(cost):
         REPLAY_SCHEMES[3],
         REPLAY_SCHEMES[4],
         REPLAY_SCHEMES[5],
-        {"kind": "mtp", "params": {"depth": 6}},
+        {"kind": "mtp", "params": {"depth": 8}},
         {"kind": "eagle3", "params": {"tree_shape": [1, 2], "verify_token_budget": 3}, "draft_config": EAGLE3_CONFIG},
         {"kind": "eagle3", "params": {"tree_shape": [1, 1], "verify_token_budget": 4}, "draft_config": EAGLE3_CONFIG},
     ],

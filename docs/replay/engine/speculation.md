@@ -24,22 +24,22 @@ verification round, including draft operations for schemes that model them.
 
 | Knob | Default | Recommend | Rules |
 |---|---|---|---|
-| `engine.speculation` | Unset (off) | Ngram only, fixed | Ngram block or registered-scheme block below. Rejected together with `nextn` or `nextn_accepted`; omit it to disable speculation. |
-| `engine.speculation.kind` | Required | Ngram only, fixed | `ngram` for prompt lookup; registered schemes include `mtp`, `eagle3`, `dflash`, `dspark`, and `draft_model`, subject to model/backend and replay limits below. Only `mtp` supports the scoped G2 composition below. |
-| `engine.speculation.params` | `{}` | Rejected | Scheme-specific cost parameters. The scheme must resolve to 1–5 draft tokens; EAGLE requires a chain. |
+| `engine.speculation` | Unset (off) | Fixed ngram or MTP depth choices | Ngram block or registered-scheme block below. Rejected together with `nextn` or `nextn_accepted`; omit it to disable speculation. |
+| `engine.speculation.kind` | Required | Fixed ngram or MTP depth choices | `ngram` for prompt lookup; registered schemes include `mtp`, `eagle3`, `dflash`, `dspark`, and `draft_model`, subject to model/backend and replay limits below. Only `mtp` supports the scoped G2 composition below. |
+| `engine.speculation.depth.choices` | Required for an MTP depth search | Searched | Unique integers from 0 to 7. Zero disables speculation. |
+| `engine.speculation.params` | `{}` | Rejected | Scheme-specific cost parameters. MTP accepts 1–7 draft tokens. Other replay schemes accept 1–5 and EAGLE requires a chain. |
 | `engine.speculation.draft_model_path` | Unset | Rejected | Draft checkpoint path or model ID, when required by the scheme. |
 | `engine.speculation.draft_config` | Unset | Rejected | Resolved draft geometry retained with the cost identity. See the [cost configuration](../../perf-model/configuration.md#speculative-decoding-configuration) for checkpoint requirements. |
 | `engine.speculation.expected_accepted_tokens` | Required for registered-scheme input | Rejected | Expected accepted draft tokens per round, excluding the base token, in `[0, resolved draft depth]`. |
 | `engine.speculation.num_speculative_tokens` | Required for flat ngram input | fixed | Integer from 1 to 5. |
-| `engine.speculation.acceptance_rates` | Required for flat ngram input | fixed | Exactly one conditional acceptance probability per draft token, each in `[0, 1]`. |
+| `engine.speculation.acceptance_rates` | Required for ngram or an MTP depth search | fixed | Exactly one conditional acceptance probability per draft position up to the largest depth, each in `[0, 1]`. |
 | `engine.speculation.seed` | `42` | fixed | Unsigned 64-bit sampling seed. |
-| `engine.speculation.disable_eagle_block_drop` | `false` | Rejected | Registered schemes only. Prefix-cache hits keep their last matched block; see [prefix caching](#prefix-caching). |
+| `engine.speculation.disable_eagle_block_drop` | `false` | Fixed for MTP | Registered schemes only. Prefix-cache hits keep their last matched block; see [prefix caching](#prefix-caching). |
 | `engine.nextn` | `0` (off) | fixed | MTP/EAGLE draft tokens, 0 to 5. For a measured SD-round FPM profile, must equal its recorded draft depth. AFD decode communication also uses the model’s MTP work scale. |
 | `engine.nextn_accepted` | Unset | fixed | Required when `nextn > 0`. Expected accepted **draft** tokens per round, excluding the base token, in `[0, nextn]`. |
 
 `recommend` retains the flat ngram and legacy `nextn` inputs, fixed for every
-candidate. Registered-scheme blocks are prediction-only. Recommendation does
-not search draft length or acceptance.
+candidate. [MTP depth choices](../../sweeper/search-space.md#mtp-draft-depth) compare positive depths and an optional depth-zero baseline in one search.
 
 ## Registered schemes
 
@@ -104,7 +104,7 @@ compile that OP graph; it follows the fitted-snapshot requirements below.
 MiniMax EAGLE3 remains unsupported.
 Selecting a scheme does not override these model-family gates.
 
-Replay uses the existing NextN executor for a linear chain of 1–5 draft tokens.
+Replay uses the NextN executor for a linear chain of up to seven MTP drafts, or five drafts for other schemes.
 EAGLE trees, a verification budget inconsistent with the chain, and wider
 blocks are rejected even when the cost API can estimate them. A scheme name
 does not enable a separate scheduler, tree traversal, dynamic verification

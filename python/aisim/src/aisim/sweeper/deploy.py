@@ -11,7 +11,7 @@ from typing import Any
 
 from ..capacity import estimate_kv_bytes_per_token, materialize_aic_num_gpu_blocks
 from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control, omit_inactive_moe_controls
-from ..config.engine import NgramSpeculationConfig, resolve_block_size
+from ..config.engine import PREFILL_INTERVAL_FIELDS, SPECULATION_ADAPTER, resolve_block_size
 from .replay import BackendDeploymentSpec, EncoderPoolSpec, ForwardPassEstimatorSpec
 
 # `--chunked-prefill-size` when SGLang is launched without one.
@@ -54,7 +54,7 @@ def _performance_model_metadata(sample: dict[str, Any], role: str, *, backend_ve
     if sample.get(f"{role}_fpm_parquet_path") is not None:
         config["fpm_parquet_path"] = sample[f"{role}_fpm_parquet_path"]
     if sample.get("speculation") is not None:
-        config["speculation"] = NgramSpeculationConfig.model_validate(sample["speculation"]).cost_config()
+        config["speculation"] = SPECULATION_ADAPTER.validate_python(sample["speculation"]).cost_config()
     if sample.get("systems_paths") is not None:
         config["systems_paths"] = sample["systems_paths"]
     return {"provider": "aic", "config": config}
@@ -102,6 +102,9 @@ def _engine_args_payload(
         memory_fraction_field: float(memory_fraction),
         "enable_prefix_caching": bool(sample[f"{role}_enable_prefix_caching"]),
     }
+    interval = PREFILL_INTERVAL_FIELDS.get(backend)
+    if role == "agg" and interval in sample:
+        payload[interval] = sample[interval]
     if backend == "sglang" and role == "decode" and sample.get("decode_radix_cache"):
         if sample["deployment_mode"] != "disagg" or sample.get("afd_roles"):
             raise ValueError("decode_radix_cache requires native SGLang disaggregated decode")

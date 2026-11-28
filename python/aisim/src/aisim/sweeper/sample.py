@@ -8,6 +8,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from ..config.engine import PREFILL_INTERVAL_FIELDS
 from .afd_parallel import AFDTopology
 from .config import ENGINE_MODEL_CONTROL_FIELDS, SearchSpace
 from .parallel_enum import DisaggParallelConfig, ParallelShape, ReplicaParallelConfig
@@ -179,6 +180,10 @@ def unroll_sample(
             for k in ("gemm_quant_mode", "moe_quant_mode", "fmha_quant_mode", "kvcache_quant_mode", "comm_quant_mode")
             if getattr(search_space, k) is not None
         }
+    if mode == "agg" and sample.get("attention_dp", 1) > 1:
+        interval = PREFILL_INTERVAL_FIELDS.get(sample["backend"])
+        if interval in selection:
+            sample[interval] = selection[interval]
     for key in searched:
         sample[key] = selection[key]
     for key in pinned:
@@ -190,6 +195,10 @@ def unroll_sample(
             "kv_transfer_timing_mode",
         ):
             sample[key] = getattr(search_space, key)
-    if search_space.speculation is not None:
-        sample["speculation"] = search_space.speculation.model_dump(mode="json")
+    speculation = search_space.speculation
+    if speculation is not None and speculation.kind == "mtp":
+        sample["mtp_depth"] = int(selection["mtp_depth"])
+        speculation = speculation.at_depth(sample["mtp_depth"])
+    if speculation is not None:
+        sample["speculation"] = speculation.model_dump(mode="json", exclude_none=True)
     return sample

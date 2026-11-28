@@ -18,8 +18,8 @@ pub fn normalize_conditional_accept_rates(
     rates: Option<&str>,
 ) -> anyhow::Result<Vec<f64>> {
     anyhow::ensure!(
-        (1..=5).contains(&nextn),
-        "aic_nextn must be in 1..=5, got {nextn}"
+        (1..=7).contains(&nextn),
+        "aic_nextn must be in 1..=7, got {nextn}"
     );
     let mut parsed = match rates.map(str::trim).filter(|rates| !rates.is_empty()) {
         Some(rates) => rates

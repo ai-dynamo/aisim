@@ -17,6 +17,7 @@ from aisim_core.sdk import (
 )
 from aisim_core.sdk.rust_engine_step import UNKNOWN_IDENTITY
 
+from ..config.engine import SPECULATION_ADAPTER
 from ..estimator_readiness import unready_estimator_message
 from .config import ENGINE_MODEL_CONTROL_FIELDS, SearchSpace
 from .deploy import _role_hardware_sku
@@ -184,8 +185,8 @@ class ForwardPassEstimatorResolver:
             cp_size=cp_size if cp_size != 1 else None,
             nextn=int(nextn or 0),
             **{name: getattr(self._search_space, name) for name in ENGINE_MODEL_CONTROL_FIELDS},
-            speculation=self._search_space.speculation.cost_config()
-            if self._search_space.speculation is not None
+            speculation=SPECULATION_ADAPTER.validate_python(sample["speculation"]).cost_config()
+            if sample.get("speculation") is not None
             else None,
             kv_block_size=int(block_size),
             estimation_mode=controls.get("estimation_mode", self._search_space.estimation_mode),

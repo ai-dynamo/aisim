@@ -277,7 +277,8 @@ def test_manual_pd_state_transfer_adds_one_state_to_ttft():
 
 
 def test_recommendation_rejects_manual_cache_instead_of_dropping_it():
-    raw = {"engine": _public()["engine"], "optimization": {"target": "throughput"}}
+    payload = _public(capacity={"type": "fixed", "blocks": 8})
+    raw = {"engine": payload["engine"], "optimization": {"target": "throughput"}}
     with pytest.raises(ValidationError, match="state_cache currently supports prediction only"):
         CoreRecommendationConfig.model_validate(raw)
 
