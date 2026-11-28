@@ -33,6 +33,7 @@ from aisim_core.sdk.common import (
     DefaultHFModels,
     HybridMoEConfig,
     KimiK3Config,
+    KimiK31DSAConfig,
     Qwen35Config,
     VisionEncoderConfig,
 )
@@ -894,6 +895,60 @@ def _parse_llama4_vision_config(
     )
 
 
+def _parse_kimi_k31_dsa_config(config: dict, layers: int) -> tuple[tuple[str, ...], KimiK31DSAConfig]:
+    """Validate the supported gated-DSA geometry before constructing native ops.
+
+    Native DSA dimensions and perf rows are keyed by architecture. Reject a
+    different indexer or MLA geometry instead of pricing it as K3.1 Pro.
+    """
+    linear = config.get("linear_attn_config")
+    dsa = config.get("dsa_config")
+    if not isinstance(linear, dict) or not isinstance(dsa, dict):
+        raise ValueError("Kimi K3.1 requires linear_attn_config and dsa_config objects")
+
+    def layer_ids(value, name):
+        if not isinstance(value, list) or not value or any(type(i) is not int or not 1 <= i <= layers for i in value):
+            raise ValueError(f"Kimi K3.1 {name} must contain valid 1-based layer ids")
+        if len(set(value)) != len(value):
+            raise ValueError(f"Kimi K3.1 {name} contains duplicate layer ids")
+        return set(value)
+
+    kda_ids = layer_ids(linear.get("kda_layers"), "linear_attn_config.kda_layers")
+    dsa_ids = layer_ids(dsa.get("dsa_layers"), "dsa_config.dsa_layers")
+    full_ids = layer_ids(linear.get("full_attn_layers"), "linear_attn_config.full_attn_layers")
+    if kda_ids & dsa_ids or kda_ids | dsa_ids != set(range(1, layers + 1)) or dsa_ids != full_ids:
+        raise ValueError("Kimi K3.1 KDA and DSA layers must partition all layers, with DSA matching full_attn_layers")
+
+    expected_indexer = {
+        "index_topk": 2048,
+        "index_head_dim": 128,
+        "index_num_heads": 32,
+        "index_rope_dim": 0,
+        "index_k_norm_type": "layernorm",
+        "index_topk_freq": 1,
+        "index_skip_topk_offset": 1,
+    }
+    expected_mla = {
+        "hidden_size": 7168,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "mla_use_nope": True,
+        "mla_use_output_gate": True,
+    }
+    for source, expected, prefix in ((dsa, expected_indexer, "dsa_config."), (config, expected_mla, "")):
+        for name, value in expected.items():
+            actual = source.get(name)
+            if type(actual) is not type(value) or actual != value:
+                raise ValueError(f"Kimi K3.1 requires {prefix}{name}={value!r}, got {actual!r}")
+    return (
+        tuple("linear_attention" if i in kda_ids else "sparse_attention" for i in range(1, layers + 1)),
+        KimiK31DSAConfig(**expected_indexer),
+    )
+
+
 def _parse_hf_config_json(config: dict) -> dict:
     """
     Convert a HuggingFace config.json dictionary into model configuration parameters.
@@ -1105,10 +1160,15 @@ def _parse_hf_config_json(config: dict) -> dict:
             root_quant_cfg=root_quant_cfg,
             processor_cfg=processor_cfg,
         )
-    elif architecture == "KimiK3ForConditionalGeneration":
+    elif architecture in {"KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration"}:
         # Kimi-K3: hybrid KDA linear attention + MLA full attention with LatentMoE.
         # linear_attn_config.kda_layers / full_attn_layers are 1-based layer ids.
         linear_attn_cfg = config.get("linear_attn_config") or {}
+        dsa_config = None
+        if architecture == "KimiK31ForConditionalGeneration":
+            layer_types, dsa_config = _parse_kimi_k31_dsa_config(config, layers)
+        elif config.get("dsa_config") is not None:
+            raise ValueError("Kimi K3 dsa_config requires architecture KimiK31ForConditionalGeneration")
         kda_layer_ids = set(linear_attn_cfg.get("kda_layers") or [])
         if not kda_layer_ids:
             raise ValueError("Kimi-K3 config must define linear_attn_config.kda_layers")
@@ -1119,7 +1179,10 @@ def _parse_hf_config_json(config: dict) -> dict:
                 f"layer ids {out_of_range} (num_hidden_layers={layers}); they would be "
                 "silently dropped and produce a wrong hybrid layer plan."
             )
-        layer_types = tuple("linear_attention" if (i + 1) in kda_layer_ids else "full_attention" for i in range(layers))
+        if dsa_config is None:
+            layer_types = tuple(
+                "linear_attention" if (i + 1) in kda_layer_ids else "full_attention" for i in range(layers)
+            )
         kimi_vision_config = None
         if vision_cfg is not None and not isinstance(vision_cfg, dict):
             raise ValueError("Kimi K3 vision_config must be an object")
@@ -1224,10 +1287,12 @@ def _parse_hf_config_json(config: dict) -> dict:
             dense_inter_size=config.get("intermediate_size", 0),
             attn_res_block_size=config.get("attn_res_block_size", 0) or 0,
             vision_config=kimi_vision_config,
+            dsa_config=dsa_config,
         )
         logger.info(
             f"Kimi-K3 hybrid config: kda_layers={layer_types.count('linear_attention')}, "
-            f"mla_layers={layer_types.count('full_attention')}, num_experts={num_experts}, "
+            f"mla_layers={layer_types.count('full_attention')}, dsa_layers={layer_types.count('sparse_attention')}, "
+            f"num_experts={num_experts}, "
             f"latent={extra_params.routed_expert_hidden_size}, shared={extra_params.num_shared_experts}, "
             f"vision={'enabled' if kimi_vision_config is not None else 'absent'}"
         )
@@ -1738,10 +1803,21 @@ def _categorize_ignore_pattern(pattern: str) -> set[str]:
     if any(kw in p for kw in ("self_attn", "q_proj", "k_proj", "v_proj", "o_proj")):
         categories.add("attention")
 
-    # shared_expert must be checked before the generic expert check
     if "shared_expert" in p:
         categories.add("shared_experts")
-    elif "expert" in p:
+    # Remove only the shared projection names. Any remaining expert reference
+    # (including another regex alternative) still excludes routed weights.
+    expert_pattern = p
+    for projection in (
+        "routed_expert_up_proj",
+        "routed_expert_down_proj",
+        "routed_expert_(up|down)_proj",
+        "routed_expert_(?:up|down)_proj",
+        "shared_experts",
+        "shared_expert",
+    ):
+        expert_pattern = expert_pattern.replace(projection, "")
+    if "expert" in expert_pattern:
         categories.add("routing_experts")
 
     if "lm_head" in p:
@@ -1973,7 +2049,7 @@ def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
 
 
 @cache
-def _load_model_config_from_model_path(model_path: str) -> dict:
+def _load_model_config_from_model_path(model_path: str, *, include_processor: bool = True) -> dict:
     """
     Get model configuration from model path.
 
@@ -1991,19 +2067,23 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
         ValueError: If the model config cannot be found
         HuggingFaceDownloadError: If fetching from HuggingFace fails
     """
+    if include_processor:
+        config = _load_model_config_from_model_path(model_path, include_processor=False)
+        return _attach_llama4_processor_config(dict(config), model_path)
+
     # Check if it's a local path
     if os.path.isdir(model_path):
-        config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
+        config = _load_local_config(model_path)
         return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
-        config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
+        config = _load_pre_downloaded_hf_config(model_path)
         return _attach_inferred_quant_fields(
             _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
         )
 
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+    config = _download_hf_config(model_path)
     try:
         hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
     except Exception as exc:  # best-effort for optional quant config
@@ -2026,7 +2106,11 @@ def get_model_config_from_model_path(model_path: str) -> dict:
     """
     raw_config = _load_model_config_from_model_path(model_path)
     architecture = (raw_config.get("architectures") or [None])[0]
-    kimi = architecture in ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
+    kimi = architecture in (
+        "KimiK25ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    )
     qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
     if (kimi or qwen_vl) and model_path not in DefaultHFModels:
         # Only Kimi and Qwen3-VL consume these processor files. Bundled

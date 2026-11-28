@@ -15,7 +15,82 @@ import logging
 import os
 import warnings
 
-from helper import cuda_context_error, get_device_module, get_device_str
+if __package__:
+    from .helper import (
+        EXIT_CODE_OPS_NOT_IN_PLAN,
+        EXIT_CODE_RESTART,
+        PERF_TRANSACTION_FILENAME,
+        SIDECAR_STAGING_FILENAME,
+        SIDECAR_TRANSACTION_FILENAME,
+        LockedOutputRoot,
+        PerfFileAttestation,
+        PerfFinalizationInfo,
+        PerfPublication,
+        WorkerRestartSignal,
+        _rename_noreplace,
+        _rename_noreplace_at,
+        atomic_write_reservation_path,
+        cleanup_atomic_write_reservations,
+        cleanup_perf_publication_artifacts,
+        cleanup_unjournaled_perf_preparations,
+        collector_retained_path,
+        create_test_case_id,
+        cuda_context_error,
+        finalize_perf_files,
+        find_perf_csv_outputs,
+        get_device_module,
+        get_device_str,
+        native_publication_lock,
+        perf_finalization_lifecycle,
+        perf_merge_locks,
+        perf_preparation_cleanup_path,
+        perf_preparation_path,
+        perf_transaction_artifact_paths,
+        restore_perf_publications,
+        save_error_report,
+        set_worker_heartbeat,
+        setup_logging,
+        setup_signal_handlers,
+        validate_restored_perf_publications,
+    )
+else:
+    from helper import (
+        EXIT_CODE_OPS_NOT_IN_PLAN,
+        EXIT_CODE_RESTART,
+        PERF_TRANSACTION_FILENAME,
+        SIDECAR_STAGING_FILENAME,
+        SIDECAR_TRANSACTION_FILENAME,
+        LockedOutputRoot,
+        PerfFileAttestation,
+        PerfFinalizationInfo,
+        PerfPublication,
+        WorkerRestartSignal,
+        _rename_noreplace,
+        _rename_noreplace_at,
+        atomic_write_reservation_path,
+        cleanup_atomic_write_reservations,
+        cleanup_perf_publication_artifacts,
+        cleanup_unjournaled_perf_preparations,
+        collector_retained_path,
+        create_test_case_id,
+        cuda_context_error,
+        finalize_perf_files,
+        find_perf_csv_outputs,
+        get_device_module,
+        get_device_str,
+        native_publication_lock,
+        perf_finalization_lifecycle,
+        perf_merge_locks,
+        perf_preparation_cleanup_path,
+        perf_preparation_path,
+        perf_transaction_artifact_paths,
+        restore_perf_publications,
+        save_error_report,
+        set_worker_heartbeat,
+        setup_logging,
+        setup_signal_handlers,
+        validate_restored_perf_publications,
+    )
 
 
 def setup_warning_filters():
@@ -88,40 +163,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from inspect import Parameter, signature
 from pathlib import Path
-
-from helper import (
-    EXIT_CODE_OPS_NOT_IN_PLAN,
-    EXIT_CODE_RESTART,
-    PERF_TRANSACTION_FILENAME,
-    SIDECAR_STAGING_FILENAME,
-    SIDECAR_TRANSACTION_FILENAME,
-    LockedOutputRoot,
-    PerfFileAttestation,
-    PerfFinalizationInfo,
-    PerfPublication,
-    WorkerRestartSignal,
-    _rename_noreplace,
-    _rename_noreplace_at,
-    atomic_write_reservation_path,
-    cleanup_atomic_write_reservations,
-    cleanup_perf_publication_artifacts,
-    cleanup_unjournaled_perf_preparations,
-    collector_retained_path,
-    create_test_case_id,
-    finalize_perf_files,
-    find_perf_csv_outputs,
-    perf_finalization_lifecycle,
-    perf_merge_locks,
-    perf_preparation_cleanup_path,
-    perf_preparation_path,
-    perf_transaction_artifact_paths,
-    restore_perf_publications,
-    save_error_report,
-    set_worker_heartbeat,
-    setup_logging,
-    setup_signal_handlers,
-    validate_restored_perf_publications,
-)
 
 # Module logger. ``setup_logging`` (main / workers) installs the configured
 # collector logger; until then this is the bare library logger so in-process
@@ -1503,6 +1544,30 @@ class ResumeCheckpoint:
             logger.info(f"{self.module_name}: {', '.join(parts)}")
         return runnable
 
+    @staticmethod
+    def has_recoverable_checkpoint(path: Path) -> bool:
+        """Inspect the same atomic-replacement states that load_existing recovers."""
+        if not path.parent.exists():
+            return False
+        with _locked_checkpoint_directory(path) as locked:
+            canonical = _checkpoint_path_in_locked_directory(path, locked)
+            if not any(
+                _entry_state_at(locked.file_descriptor, name) is not None
+                for name in (canonical.name, _atomic_write_previous_path(canonical).name)
+            ):
+                return False
+            _effective_checkpoint_state_at(locked.file_descriptor, canonical, context_path=canonical, kind="checkpoint")
+        return True
+
+    def unfinished_attempt_ids(self) -> set[str]:
+        return self._attempted - self._done - self._failed
+
+    def has_unfinished_attempts(self) -> bool:
+        return bool(self.unfinished_attempt_ids())
+
+    def has_passed(self, task_id: str) -> bool:
+        return task_id in self._done
+
     def mark_passed(self, task_id: str):
         """Mark a task as successfully completed. Skipped on resume."""
         self._done.add(task_id)
@@ -1527,6 +1592,9 @@ class ResumeCheckpoint:
         self._failed.add(task_id)
         self._dirty = True
         self.flush()
+
+    def unresolved_failed_ids(self) -> frozenset[str]:
+        return frozenset(self._failed)
 
     def unresolved_failed_count(self) -> int:
         """Number of tasks the checkpoint holds as failed and unresolved."""
@@ -2521,10 +2589,14 @@ def collect_ops(
                 logger.info(f"Skipping {collection['name']}.{collection['type']} — not in collector v2 case plan")
                 continue
             unverified_here = collection.get("unverified") or (
-                sm_version is not None and sm_version in (collection.get("unverified_sms") or ())
+                collection.get("unverified_sms") and (sm_version is None or sm_version in collection["unverified_sms"])
             )
             if unverified_here:
-                scope = "this backend" if collection.get("unverified") else f"SM{sm_version}"
+                scope = (
+                    "this backend"
+                    if collection.get("unverified")
+                    else ("unresolved SM" if sm_version is None else f"SM{sm_version}")
+                )
                 logger.warning(
                     f"Skipping {collection['name']}.{collection['type']} — registry marks it unverified "
                     f"on {scope}; remove the OpEntry marker once the collector is debugged there"
@@ -2668,13 +2740,14 @@ def collect_sglang(
     )
 
     from collector.fullnode import SGLANG_FULLNODE_OPS, collect_sglang_fullnode_op
-    from collector.sglang.registry import REGISTRY
+    from collector.sglang.registry import REGISTRY, require_kimi_k31_runtime
     from collector.version_resolver import build_collections
 
     all_errors = []
     registry = _registry_with_requested_wideep(REGISTRY, "sglang", ops, case_plan)
     ops_filter = ops if ops is not None else (case_plan.ops if case_plan is not None else None)
     collections = build_collections(registry, "sglang", version, ops_filter, logger=logger)
+    require_kimi_k31_runtime(version, {collection["type"] for collection in collections})
     requested_fullnode_ops = requested_ops & set(SGLANG_FULLNODE_OPS)
     fullnode_collections = [collection for collection in collections if collection["type"] in requested_fullnode_ops]
     pool_collections = [collection for collection in collections if collection["type"] not in SGLANG_FULLNODE_OPS]
@@ -3280,6 +3353,10 @@ def _load_selected_producer_checkpoint(
             f"{context}: staged table {staging_path} has no checkpoint for selected producer "
             f"{resume_tracker.module_name} at {checkpoint_path}"
         )
+    if collection["type"].startswith("kimi_k31_dsa_"):
+        from collector.fullnode import bind_native_checkpoint
+
+        bind_native_checkpoint(checkpoint_path, staging_path.parent)
     if staging_path.stem not in _registered_checkpoint_tables(resume_tracker._metadata, backend=backend):
         raise RuntimeError(
             f"{context}: checkpoint producer {resume_tracker.module_name} does not own staged table {staging_path}"
@@ -6001,7 +6078,11 @@ def _write_collector_provenance(
                 staging_path = output_root / staging_path
             staging_by_table.setdefault(table, staging_path)
 
-    module_failure_names = {e["module"] for e in run_errors if e.get("error_type") == "ModuleCollectionFailure"}
+    module_failure_names = {
+        e["module"]
+        for e in run_errors
+        if e.get("error_type") in {"ModuleCollectionFailure", "FullNodeCollectionFailure"}
+    }
     checkpoint_root = _checkpoint_backend_root(checkpoint_dir, backend)
     collector_hash = provenance.collector_hash(_REPO_ROOT)
     collector_ref = _git_collector_ref(_REPO_ROOT)
@@ -6200,7 +6281,25 @@ def _finalize_collector_outputs_transaction(
     sm_version: int | None,
 ) -> list[Path]:
     _require_separate_checkpoint_root(output_root, checkpoint_dir, backend)
-    with perf_finalization_lifecycle(output_root) as locked_output_root:
+    native_outputs = {
+        (output_root / collection["perf_filename"]).resolve()
+        for collection in (provenance_ctx.get("collections") or ())
+        if collection.get("type") in {"kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"}
+    }
+    # A shared table can also be finalized by another producer of that table.
+    native_outputs.update(
+        path.resolve()
+        for path in staging_paths
+        if path.name in {"dsa_context_module_perf.txt", "dsa_generation_module_perf.txt"}
+    )
+    with contextlib.ExitStack() as locks:
+        for output in sorted(native_outputs):
+            if output.parent != output_root.resolve():
+                raise RuntimeError(f"Native finalization output is outside its root: {output}")
+            locks.enter_context(native_publication_lock(output))
+            if output.with_name(f".{output.name}.pending").exists():
+                raise RuntimeError(f"Resume the pending native publication for {output} before finalization")
+        locked_output_root = locks.enter_context(perf_finalization_lifecycle(output_root))
         return _finalize_collector_outputs_transaction_locked(
             locked_output_root.path,
             staging_paths,
@@ -6539,6 +6638,11 @@ def main():
         planned_ops = case_plan.ops
         if args.ops is None:
             ops = planned_ops
+            if args.model_cases_full:
+                # The native preview runs only with its model-scoped pin, as
+                # declared in framework_manifest.yaml. A stock full run must
+                # not turn these into explicit native runtime requests.
+                ops = [op for op in ops if not op.startswith("kimi_k31_dsa_")]
         else:
             requested_ops = set(args.ops) - {FPM_FORWARD_OP}
             ops = [op for op in planned_ops if op in requested_ops]
@@ -6778,10 +6882,14 @@ def main():
     # nothing. Exit non-zero AFTER finalization so partial data from other ops
     # is still packaged, but the job is not reported as a clean success.
     module_failures = sorted(
-        {e["module"] for e in (run_errors or []) if e.get("error_type") == "ModuleCollectionFailure"}
+        {
+            e["module"]
+            for e in (run_errors or [])
+            if e.get("error_type") in {"ModuleCollectionFailure", "FullNodeCollectionFailure"}
+        }
     )
     if module_failures:
-        logger.error("Module-level collection failures (no cases ran): " + ", ".join(module_failures))
+        logger.error("Collection aborted for modules: " + ", ".join(module_failures))
         raise SystemExit(1)
 
 

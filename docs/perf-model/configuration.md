@@ -84,6 +84,7 @@ identities must be quoted to preserve their exact spelling:
 | --- | --- | --- |
 | `model` | Required | String model name or path; write a numeric identifier as `model: "123"`. |
 | `backend_version` | `null` | Optional string version; write `backend_version: "0.10"` to preserve the trailing zero. |
+| `attention_backend` | absent | Runtime attention selector. Kimi K3.1 accepts `flashmla` or `trtllm_mla`; FP8 KV requires one of these explicit physical cache layouts. The theoretical BF16 mode also permits the default; the pinned native runtime requires FP8 KV. |
 | `system`, `backend_version`, `tp`, `pp`, `attention_dp`, `moe_tp_size`, `moe_ep_size`, `gemm_quant_mode`, `moe_quant_mode`, `fmha_quant_mode`, `kvcache_quant_mode`, `comm_quant_mode`, `attention_backend` | As above | With `estimation_mode` `fpm_regression` or `fpm_learned`, each may be the literal `"unknown"` for a fact the saver did not know. Every other mode, a `fallback_policy` other than `deny` and an `fpm_profile` reject it. The integer fields accept only the string spelling. |
 | `deployment_limits` | absent | Optional mapping of the calibrated deployment's `num_gpus` (GPUs of one worker, `tp * pp * attention_dp`), `max_num_batched_tokens`, `max_num_seqs`, `max_kv_tokens` (KV capacity of one attention-DP rank, in tokens) and `context_length`. Each is a positive integer or `"unknown"`; an omitted entry is `"unknown"`. Absent, it is omitted from the serialized configuration. Accepted in every mode. |
 
@@ -113,6 +114,8 @@ and caps its `max_batched_tokens` and `max_sequences` domains at
 `max_num_batched_tokens` and `max_num_seqs` (see
 [snapshot roles](#recommending-with-a-calibrated-snapshot)). Nothing reads
 `context_length`.
+
+Replay preserves an omitted `engine.enable_eplb` through configuration serialization so a saved snapshot can supply its value. An authored `false` remains an explicit override.
 
 The canonical configuration carries the following AFD identity fields. Ordinary
 agg configurations omit them; AFD derives pool identities through the same
@@ -1659,7 +1662,7 @@ These additional public YAML fields are concrete controls:
 | `engine.attention_backend` | Attention kernel selector, including AFD per-pool construction; subject to canonical model/backend validation. |
 | `engine.moe_kernel_source` | Exact collected fused-MoE compute source, including AFD per-pool construction; unsupported with a large-EP MoE graph. |
 | `engine.moe_backend` | Runtime graph/backend selector, subject to canonical validation; nondefault overrides remain unsupported for AFD. |
-| `engine.enable_eplb`, `wideep_num_slots` | Expert load balancing and redundant expert slots; require compatible MoE execution. |
+| `engine.enable_eplb`, `wideep_num_slots` | Expert load balancing and redundant expert slots; require compatible MoE execution. Omitted EPLB inherits the snapshot value. |
 | `engine.nextn`, `nextn_accepted` | Compute-side MTP identity and separate expected acceptance assumption; both are required for explicit MTP. |
 | `engine.enable_chunked_prefill` | Override chunked prefill; omission preserves the backend default. |
 | `engine.enable_shared_layer` | Optional shared-data reuse override; explicit `false` disables reuse. Preserved by both AFD pools and their memory preflight. |
@@ -1704,6 +1707,7 @@ recorded `kv_cache_dtype`. Otherwise, the first matching rule below applies:
 | `kv_cache_quant_algo`, or a ModelOpt `kv_cache_scheme` string, is not missing/null, `fp8`, `nvfp4`, `bfloat16`, or `"none"` (for example, `int8`) | Rejected during checkpoint normalization |
 | `kv_cache_quant_algo: nvfp4`, or ModelOpt `kv_cache_scheme: NVFP4` or a 4-bit float scheme (`quant_method: modelopt`) | NVFP4 |
 | DeepSeek V4/V4.1 architecture | FP8 |
+| Kimi K3.1 architecture with no inferred KV declaration | FP8 (requires an explicit layout selector) |
 | `kv_cache_quant_algo: fp8`, or ModelOpt `kv_cache_scheme: FP8` | FP8 |
 | `kv_cache_quant_algo: "none"` | BF16 |
 | KV declaration missing/null or `bfloat16`; weight `quant_algo` is `fp8`, `fp8_block`, or `nvfp4` | FP8 |
@@ -1714,6 +1718,15 @@ does not prevent FP8 KV inference. For regular language roles using default timi
 pass `--set engine.kvcache_quant_mode=bfloat16` or set it in YAML to require BF16.
 The explicit engine field also accepts `int8`, subject to model/backend validation;
 this does not make an `int8` checkpoint KV declaration valid.
+Kimi K3.1 modeling accepts BF16 or FP8 KV only. BF16 is a theoretical
+analytic option: the pinned native SGLang runtime requires FP8 KV and defaults
+to FlashMLA for both phases. AISimulate infers FP8 when K3.1 KV metadata is
+absent; request BF16 explicitly for analytic SOL modeling. Its FP8 cache requires
+`attention_backend: flashmla` (656 bytes per sparse-layer latent entry) or
+`attention_backend: trtllm_mla` (576 bytes). Both retain a separate 132-byte
+indexer entry per token per sparse layer; the sparse top-k does not truncate
+the cached history. BF16 latent entries are 1152 bytes. An explicit K3.1
+backend never substitutes timing observations from the other backend.
 Fixed/polynomial timing and EPD currently reject this engine override. AFD passes
 explicit KV precision through canonical per-pool construction.
 
@@ -1725,8 +1738,10 @@ declaration), `fpm_profile`, or `aisimulate_policy`. `--detail memory` also incl
 estimate omit this disclosure. Fixed/polynomial timing roles currently size capacity
 at compile time and do not report the resolved precision through this path.
 
-FP8 uses one byte per KV element; BF16 uses two. At the same byte budget, linear
-FP8 KV holds twice as many tokens. This does not imply twice the throughput.
+For uniformly stored KV without layout overhead, FP8 uses one byte per element
+and BF16 uses two; FP8 then holds twice as many tokens at the same byte budget.
+Mixed RoPE precision and per-block scales change that ratio, as in K3.1 above.
+This does not imply twice the throughput.
 
 NVFP4 uses 9/16 byte per element: 4-bit values plus one FP8 scale per 16, as
 vLLM's `--kv-cache-dtype nvfp4` and TRT-LLM's `kv_cache_config.dtype: nvfp4`

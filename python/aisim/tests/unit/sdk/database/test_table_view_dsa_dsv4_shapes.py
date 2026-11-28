@@ -570,3 +570,97 @@ def test_calib_view_absent_file_and_empty_rows_return_none(systems_root: Path) -
     assert _fetch(_build_db(systems_root), "_dsv4_csa_topk_calib_data") is None
     _write_parquet(systems_root, CALIB_REL, [_calib_row(score_mode="")])
     assert _fetch(_build_db(systems_root), "_dsv4_csa_topk_calib_data") is None
+
+
+def test_context_fmha_capability_filters_native_dsa_architecture_axis(systems_root):
+    from aisim_core.sdk.perf_database import context_fmha_supported_modes
+
+    architecture = "KimiK31ForConditionalGeneration"
+    _write_parquet(
+        systems_root,
+        DSA_CTX_REL,
+        [
+            _dsa_row(
+                architecture=architecture,
+                kv_cache_dtype="fp8",
+                num_heads=12,
+                kernel_source="sglang_dsa_indexer_flashmla_kv_kv_flashmla_packed_eager",
+            ),
+            _dsa_row(architecture=DEFAULT_DSA_ARCHITECTURE, kv_cache_dtype="fp8", mla_dtype="fp8"),
+        ],
+    )
+    db = _build_db(systems_root)
+    assert context_fmha_supported_modes(
+        db, "dsa_context_module", common.KVCacheQuantMode.fp8, architecture=architecture, attention_backend="flashmla"
+    ) == ["bfloat16"]
+    assert context_fmha_supported_modes(
+        db, "dsa_context_module", common.KVCacheQuantMode.fp8, architecture=DEFAULT_DSA_ARCHITECTURE
+    ) == ["fp8"]
+
+
+@pytest.mark.parametrize("attention_backend", ["flashmla", "trtllm_mla"])
+def test_native_dsa_capabilities_match_physical_bucket_and_gemm(systems_root, attention_backend):
+    from aisim_core.sdk.perf_database import context_fmha_supported_modes, dsa_generation_supported_modes
+
+    architecture = "KimiK31ForConditionalGeneration"
+    # These synthetic rows exercise the actual Rust table view and its typed
+    # keys. The packed lane has BF16 projections; the raw lane has FP8 ones.
+    rows = [
+        _dsa_row(
+            architecture=architecture,
+            kv_cache_dtype="fp8",
+            mla_dtype="fp8",
+            gemm_type=gemm,
+            num_heads=12,
+            kernel_source=source,
+        )
+        for gemm, source in [
+            ("bfloat16", "sglang_dsa_indexer_flashmla_kv_kv_flashmla_packed_eager"),
+            ("fp8", "sglang_dsa_indexer_trtllm_kv_raw_fp8_eager"),
+        ]
+    ]
+    _write_parquet(systems_root, DSA_CTX_REL, rows)
+    _write_parquet(systems_root, DSA_GEN_REL, rows)
+    db = _build_db(systems_root)
+    for gemm in (common.GEMMQuantMode.bfloat16, common.GEMMQuantMode.fp8):
+        identity = dict(architecture=architecture, attention_backend=attention_backend, gemm_quant_mode=gemm)
+        expected = ["fp8"] if (attention_backend == "flashmla") == (gemm == common.GEMMQuantMode.bfloat16) else []
+        assert (
+            context_fmha_supported_modes(db, "dsa_context_module", common.KVCacheQuantMode.fp8, **identity) == expected
+        )
+        assert dsa_generation_supported_modes(db, **identity) == expected
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_b300_current_slot_retrieves_pinned_native_k31_sample(phase, monkeypatch):
+    from aisim_core.data.default_systems import default_systems_path
+    from aisim_core.sdk.engine import EngineHandle, _ops_json
+    from aisim_core.sdk.operations.dsa import ContextDSAModule, GenerationDSAModule
+    from aisim_core.sdk.perf_database import get_database
+
+    monkeypatch.delenv("AIC_ALLOW_UNLISTED_VERSIONS", raising=False)
+    root = Path(default_systems_path())
+    source = root / "data/b300_sxm/sparse_attention/sglang/0.0.0.dev1+g41208373c.d20261104"
+    sample = source / f"dsa_{phase}_module_perf.parquet"
+    rows = pq.read_table(sample).to_pylist()
+    row = next(r for r in rows if r["batch_size"] == 1 and r["tp_size"] == 4)
+    db = get_database(
+        "b300_sxm", "sglang", "current", systems_paths=str(root), database_mode="SILICON", strict_provenance=True
+    )
+    engine = EngineHandle.for_database(db, systems_path=str(root))
+    args = ("k31", 1.0, row["num_heads"], common.KVCacheQuantMode.fp8)
+    options = {"architecture": row["architecture"], "attention_backend": "flashmla"}
+    context = phase == "context"
+    op = (
+        ContextDSAModule(*args, common.FMHAQuantMode.bfloat16, common.GEMMQuantMode.bfloat16, **options)
+        if context
+        else GenerationDSAModule(*args, common.GEMMQuantMode.bfloat16, **options)
+    )
+    result = engine.evaluate_ops_json(
+        _ops_json([op]),
+        is_context=context,
+        batch_size=1,
+        s=row["isl"] if context else row["isl"] + row["step"],
+        prefix=row["step"] if context else 0,
+    )[0]
+    assert (result[1], result[3]) == (row["latency"], "silicon")

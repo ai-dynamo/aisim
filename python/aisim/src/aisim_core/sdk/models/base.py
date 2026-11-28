@@ -629,6 +629,10 @@ class BaseModel:
         """
         return self.get_kvcache_bytes_per_sequence(seq_len) / self._cp_kv_memory_divisor()
 
+    def get_kvcache_rank_bytes_per_token(self) -> float:
+        """Rank-local increment in cache bytes per token, excluding fixed request state."""
+        return self.get_kvcache_rank_bytes_per_sequence(1) - self.get_kvcache_rank_bytes_per_sequence(0)
+
     def get_kvcache_rank_batch_capacity(self, kv_budget_bytes: float, max_batch_size: int) -> int:
         """Token capacity of a RANK-LOCAL byte budget: the inverse of
         :meth:`get_kvcache_rank_bytes_per_sequence`. Under decode CP a budget of

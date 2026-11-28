@@ -506,9 +506,58 @@ _CONTEXT_FMHA_OP_TABLES: dict[str, tuple[str, ...]] = {
 }
 
 
-def context_fmha_supported_modes(database, ctx_op: str, kv_cache_mode) -> list[str]:
+def _dsa_slice_available(gemm_slices, *, gemm_quant_mode, architecture, attention_backend) -> bool:
+    # Match operators/dsa.rs::generation_table_backend, also used for K3.1
+    # context. Other architectures retain their backend donor fallback.
+    backend = None
+    if architecture == "KimiK31ForConditionalGeneration":
+        backend = "flashmla_kv" if attention_backend == "flashmla" else "trtllm"
+    slices = gemm_slices.values() if gemm_quant_mode is None else (gemm_slices.get(gemm_quant_mode, {}),)
+    return any(
+        architectures
+        and (
+            architecture is None
+            or (architecture in architectures and (backend is None or backend in architectures[architecture]))
+        )
+        for architectures in slices
+    )
+
+
+def dsa_generation_supported_modes(
+    database, *, architecture: str, attention_backend: str | None = None, gemm_quant_mode=None
+) -> list[str]:
+    """KV modes in the requested DSA GEMM, architecture and physical KV lane."""
+    flat = (getattr(database, "supported_quant_mode", {}) or {}).get("dsa_generation_module", []) or []
+    if not flat:
+        return []
+    data = getattr(database, "_generation_dsa_module_data", None)
+    if data is None:  # compatibility with database stubs without raw tables
+        return list(flat)
+    return sorted(
+        kv.name if hasattr(kv, "name") else str(kv)
+        for kv, gemm_slices in data.items()
+        if _dsa_slice_available(
+            gemm_slices,
+            gemm_quant_mode=gemm_quant_mode,
+            architecture=architecture,
+            attention_backend=attention_backend,
+        )
+    )
+
+
+def context_fmha_supported_modes(
+    database,
+    ctx_op: str,
+    kv_cache_mode,
+    *,
+    architecture: str | None = None,
+    attention_backend: str | None = None,
+    gemm_quant_mode=None,
+) -> list[str]:
     """FMHA mode names with perf data for ``ctx_op``, restricted to slices that
-    exist JOINTLY with ``kv_cache_mode``.
+    exist JOINTLY with ``kv_cache_mode`` and, for DSA, ``gemm_quant_mode``
+    and ``architecture``.
+    Kimi K3.1 also requires the requested attention backend's physical KV lane.
 
     The flat ``supported_quant_mode[ctx_op]`` list unions fmha keys across kv
     slices (and across granular+module tables for ``context_mla``), so an fmha
@@ -539,7 +588,16 @@ def context_fmha_supported_modes(database, ctx_op: str, kv_cache_mode) -> list[s
         lanes = list(data.values()) if isinstance(first_key, str) else [data]
         for lane_data in lanes:
             for fmha_key in lane_data:
-                if kv_cache_mode in lane_data[fmha_key]:
+                kv_slice = lane_data[fmha_key].get(kv_cache_mode)
+                if kv_slice is not None and (
+                    ctx_op != "dsa_context_module"
+                    or _dsa_slice_available(
+                        kv_slice,
+                        gemm_quant_mode=gemm_quant_mode,
+                        architecture=architecture,
+                        attention_backend=attention_backend,
+                    )
+                ):
                     modes.add(fmha_key.name if hasattr(fmha_key, "name") else str(fmha_key))
     if not saw_table:
         return list(flat)

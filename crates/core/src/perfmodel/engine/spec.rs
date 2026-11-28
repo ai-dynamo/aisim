@@ -515,6 +515,7 @@ pub(crate) mod tests {
             full_frac: 1.0,
             attn_projection_quant_modes: None,
             dcp_size: 2,
+            attention_backend: Some("flashmla".into()),
         }
     }
 
@@ -1831,13 +1832,13 @@ pub(crate) mod tests {
         let start = bytes.windows(op.len()).position(|x| x == op).unwrap();
         // The baseline v27 P2P op has neither span Option tag nor force-scale-out bool.
         bytes.drain(start + op.len() - 2..start + op.len());
-        for version in [27_u32, 28, 29, 31] {
+        for version in [27_u32, 28, 29, 30, ENGINE_SPEC_SCHEMA_VERSION + 1] {
             bytes[..4].copy_from_slice(&version.to_le_bytes());
             assert!(matches!(
                 EngineSpec::from_bincode(&bytes),
                 Err(AicError::UnsupportedSchemaVersion {
                     got,
-                    expected: 30,
+                    expected: ENGINE_SPEC_SCHEMA_VERSION,
                     ..
                 }) if got == version
             ));

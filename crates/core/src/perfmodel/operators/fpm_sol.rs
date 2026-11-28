@@ -74,7 +74,7 @@ use crate::operators::{
 };
 use crate::perf_database::PerfDatabase;
 use crate::perf_database::dsa::{
-    dsa_context_sol_flops, dsa_context_sol_ms, dsa_dims, dsa_generation_sol_flops,
+    dsa_context_sol_flops, dsa_context_sol_ms, dsa_dims_for_backend, dsa_generation_sol_flops,
     dsa_generation_sol_ms,
 };
 
@@ -394,6 +394,8 @@ fn dsa_context_module_sol(
     s: f64,
     p: f64,
 ) -> Result<f64, AicError> {
+    op.validate_kimi_geometry()?;
+    op.validate_kimi_backend()?;
     if op.cp_size > 1 {
         return Err(AicError::SolNotImplemented(format!(
             "forward_model='fpm' SOL roofline has no Rust implementation for DSA context \
@@ -402,7 +404,7 @@ fn dsa_context_module_sol(
         )));
     }
     let spec = &db.system_spec;
-    let dims = dsa_dims(&op.architecture);
+    let dims = dsa_dims_for_backend(&op.architecture, op.context_table_backend());
     let flops = dsa_context_sol_flops(spec, op.gemm_quant_mode, op.fmha_quant_mode)?;
     let (b, s, p) = (
         b.round().max(1.0) as i64,
@@ -476,8 +478,10 @@ fn dsa_generation_module_sol(
     b: f64,
     s: f64,
 ) -> Result<f64, AicError> {
+    op.validate_kimi_geometry()?;
+    op.validate_kimi_backend()?;
     let spec = &db.system_spec;
-    let dims = dsa_dims(&op.architecture);
+    let dims = dsa_dims_for_backend(&op.architecture, op.context_table_backend());
     let flops = dsa_generation_sol_flops(spec, op.gemm_quant_mode)?;
     // Decode CP geometry mirrors `DsaModuleOp::query_generation`: gathered
     // heads over this rank's KV stripe, sparse attention over the rank's
@@ -744,6 +748,7 @@ fn moe_dispatch_sol(op: &MoEDispatchOp, spec: &SystemSpec, x: f64) -> Result<f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perf_database::dsa::dsa_dims;
 
     use crate::common::enums::{
         CommQuantMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, MoeQuantMode,
@@ -1272,6 +1277,84 @@ mod tests {
             "GlmMoeDsaForCausalLM",
             2048,
         )
+    }
+
+    #[test]
+    fn kimi_fpm_sol_rejects_unsupported_geometry_and_ambiguous_backend() {
+        let d = db();
+        let mut valid = glm_dsa_op("attention");
+        valid.architecture = "KimiK31ForConditionalGeneration".into();
+        valid.attention_backend = Some("flashmla".into());
+        for generation in [false, true] {
+            let evaluate = |op: DsaModuleOp| {
+                let op = if generation {
+                    Op::DsaGeneration(op)
+                } else {
+                    Op::DsaContext(op)
+                };
+                op_sol_latency_ms(&op, &d, 1.0, 1.0, 4096.0, 0.0)
+            };
+            assert!(evaluate(valid.clone()).unwrap() > 0.0);
+            for (cp, dcp, frac) in [(2, 1, 1.0), (1, 2, 1.0), (1, 1, 0.5)] {
+                let mut invalid = valid.clone();
+                invalid.cp_size = cp;
+                invalid.dcp_size = dcp;
+                invalid.full_frac = frac;
+                assert!(matches!(
+                    evaluate(invalid),
+                    Err(AicError::InvalidEngineConfig(_))
+                ));
+            }
+            let mut ambiguous = valid.clone();
+            ambiguous.attention_backend = None;
+            assert!(matches!(
+                evaluate(ambiguous),
+                Err(AicError::InvalidEngineConfig(_))
+            ));
+        }
+    }
+
+    /// Hand ledger at TP8 (12 heads), BF16 weights, FP8 KV and one new token.
+    /// Both phases read 96,272,384 projection and 3,145,728 absorbed KV
+    /// weight bytes plus 9,216 gate IO bytes.
+    /// Decode reads 4096 * 132 index bytes and 2048 latent entries;
+    /// context at prefix=4095 reads the same index cache, 12 * 2048 latent
+    /// entries and 12 * 192 * 4 = 9,216 query IO bytes. Latent entries
+    /// occupy 656 bytes for FlashMLA, 576 for TRTLLM; BF16 uses 1152 for both.
+    #[test]
+    fn kimi_k31_fpm_sol_uses_backend_cache_layout_for_both_phases() {
+        let d = db();
+        for kv_quant in [KvCacheQuantMode::Fp8, KvCacheQuantMode::Bfloat16] {
+            for (backend, fp8_entry_bytes) in [("flashmla", 656.0), ("trtllm_mla", 576.0)] {
+                let mut op = DsaModuleOp::new(
+                    "attention",
+                    12,
+                    kv_quant,
+                    FmhaQuantMode::Bfloat16,
+                    GemmQuantMode::Bfloat16,
+                    "KimiK31ForConditionalGeneration",
+                    2048,
+                );
+                op.attention_backend = Some(backend.into());
+                let entry_bytes = if kv_quant == KvCacheQuantMode::Fp8 {
+                    fp8_entry_bytes
+                } else {
+                    1152.0
+                };
+                let common_bytes = 96_272_384.0 + 3_145_728.0 + 540_672.0 + 9_216.0;
+                approx(
+                    op_sol_latency_ms(&Op::DsaContext(op.clone()), &d, 1.0, 1.0, 1.0, 4095.0)
+                        .unwrap(),
+                    (common_bytes + 9_216.0 + 12.0 * 2048.0 * entry_bytes)
+                        / d.system_spec.gpu.mem_bw
+                        * 1000.0,
+                );
+                approx(
+                    op_sol_latency_ms(&Op::DsaGeneration(op), &d, 1.0, 1.0, 4096.0, 0.0).unwrap(),
+                    (common_bytes + 2048.0 * entry_bytes) / d.system_spec.gpu.mem_bw * 1000.0,
+                );
+            }
+        }
     }
 
     #[test]

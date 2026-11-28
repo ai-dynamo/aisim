@@ -830,6 +830,55 @@ def test_naive_fallback_mla_fixture():
     assert out["kv_size_per_token_bytes"] == 70_272  # config-driven MLA latent
 
 
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"architectures": ["KimiK3ForConditionalGeneration"]},
+        {"architectures": ["KimiK31ForConditionalGeneration"]},
+        {"architectures": ["KimiLinearForCausalLM"], "model_type": "kimi_linear"},
+        {"model_type": "kimi_k3"},
+        {"model_type": "kimi_k31"},
+    ],
+)
+def test_naive_capacity_rejects_kimi_token_state_geometry(identity):
+    # Even malformed/unparsed Kimi metadata must not become a plain 93-layer
+    # MLA estimate which discards the KDA state and K3.1 indexer layout.
+    raw = {
+        **identity,
+        "num_hidden_layers": 93,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "hidden_size": 7168,
+    }
+    with pytest.raises(ValueError, match="naive KV-cache estimation does not support Kimi K3/K3.1"):
+        memory.NaiveKVCacheEstimator.from_hf_config(raw, tp_size=8, pp_size=1)
+
+
+@pytest.mark.parametrize(
+    "decoder_dtype,root_dtype,expected",
+    [("float32", None, 1024), ("bfloat16", None, 512), ("float32", "bfloat16", 1024), (None, "float32", 1024)],
+)
+@pytest.mark.parametrize("dtype_key", ["torch_dtype", "dtype"])
+def test_naive_nested_decoder_precision_matches_geometry(decoder_dtype, root_dtype, expected, dtype_key):
+    raw = {
+        "architectures": ["Qwen3VLForConditionalGeneration"],
+        "text_config": {
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 128,
+            "hidden_size": 128,
+        },
+    }
+    if decoder_dtype:
+        raw["text_config"][dtype_key] = decoder_dtype
+    if root_dtype:
+        raw[dtype_key] = root_dtype
+    estimator = memory.NaiveKVCacheEstimator.from_hf_config(raw, tp_size=1, pp_size=1)
+    # One layer, K and V, one head, 128 elements, 4 (FP32) or 2 (BF16) bytes.
+    assert estimator.kv_bytes_per_token() == expected
+
+
 def test_naive_fallback_unsupported_arch_uses_raw_read(monkeypatch):
     # Unsupported architecture: `_parse_hf_config_json` raises, so the estimator
     # falls to the raw-key read. This drives the real parser (FooBar arch is not in

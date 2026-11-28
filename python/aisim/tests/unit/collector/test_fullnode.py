@@ -5,6 +5,7 @@
 
 import hashlib
 import json
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,6 @@ _COLLECTOR_DIR = str(Path(__file__).resolve().parents[3] / "collector")
 if _COLLECTOR_DIR not in sys.path:
     sys.path.insert(0, _COLLECTOR_DIR)
 
-import collect as collect_mod
 
 pytestmark = pytest.mark.unit
 
@@ -30,6 +30,7 @@ class _Checkpoint:
     instances: ClassVar[list] = []
 
     def __init__(self, **_kwargs):
+        self._path = Path(_kwargs["checkpoint_dir"]).resolve() / _kwargs["backend"] / f"{_kwargs['module_name']}.json"
         self.passed = []
         self.failed = []
         self.attempted = []
@@ -41,6 +42,12 @@ class _Checkpoint:
 
     def mark_attempted_many(self, task_ids):
         self.attempted.extend(task_ids)
+
+    def has_passed(self, task_id):
+        return task_id in self.passed
+
+    def unfinished_attempt_ids(self):
+        return set(self.attempted) - set(self.passed) - set(self.failed)
 
     def mark_passed(self, task_id):
         self.passed.append(task_id)
@@ -56,6 +63,26 @@ def _logger():
     return SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None, exception=lambda *_args: None)
 
 
+@pytest.mark.parametrize("pending", [True, False])
+def test_finalization_excludes_inflight_native_publication(tmp_path, pending):
+    from contextlib import nullcontext
+
+    import collect
+    from collector.helper import native_publication_lock
+
+    root = tmp_path / "out"
+    root.mkdir()
+    output = root / "dsa_generation_module_perf.txt"
+    if pending:
+        output.with_name(f".{output.name}.pending").touch()
+    owner = nullcontext() if pending else native_publication_lock(output)
+    with owner, pytest.raises(RuntimeError, match="pending native publication|publication owner"):
+        collect._finalize_collector_outputs_transaction(
+            root, [output], {}, [], backend="sglang", checkpoint_dir=str(tmp_path / "checkpoint"), sm_version=103
+        )
+    assert not (root / "collection_meta.yaml").exists()
+
+
 def test_shape_index_selects_exact_case_before_limit(monkeypatch):
     cases = [{"shape": 0}, {"shape": 1}, {"shape": 2}]
     monkeypatch.setenv("DEEPEP_LL_SHAPE_INDEX", "2")
@@ -68,6 +95,75 @@ def test_shape_index_rejects_out_of_range(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"DEEPEP_NORMAL_SHAPE_INDEX=3.*0\.\.1"):
         fullnode.select_cases("deepep_normal", [{"shape": 0}, {"shape": 1}], limit=None)
+
+
+def test_native_tp_route_uses_common_limit_without_collective_shape_selector(monkeypatch):
+    monkeypatch.setenv("DEEPEP_LL_SHAPE_INDEX", "999")
+    cases = [{"tp": 1}, {"tp": 2}, {"tp": 4}]
+    assert fullnode.select_cases("kimi_k31_dsa_context_module", cases, limit=2) == cases[:2]
+    assert fullnode.select_cases("kimi_k31_dsa_generation_module", cases, limit=None) == cases
+
+
+@pytest.fixture(autouse=True)
+def isolated_collector_workdir(monkeypatch, tmp_path):
+    monkeypatch.delenv("COLLECTOR_LOG_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+
+@pytest.mark.parametrize("sm", [103, None])
+@pytest.mark.parametrize("maturity", [{"unverified": True}, {"unverified_sms": (103,)}])
+def test_fullnode_preserves_registry_maturity_gate_before_import(maturity, sm):
+    _Checkpoint.instances.clear()
+    errors = fullnode.collect_sglang_fullnode_op(
+        {"name": "sglang", "type": "kimi_k31_dsa_context_module", "module": "must_not_import", **maturity},
+        runtime_version="0.0.0.dev1",
+        limit=None,
+        shuffle=False,
+        shuffle_seed=42,
+        backend="sglang",
+        resume_options=None,
+        model_path=None,
+        case_plan=None,
+        sm_version=sm,
+        case_filters=None,
+        get_test_cases_for_model=lambda *_args: pytest.fail("planned unverified collector"),
+        resume_checkpoint_cls=_Checkpoint,
+        logger=_logger(),
+    )
+    assert errors[0]["error_type"] == "UnverifiedCollector"
+    assert errors[0]["classification"] == "unverified_skipped"
+    assert not _Checkpoint.instances
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+def test_native_sm121_maturity_gate_prevents_import_and_queueing(phase):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import RUNTIME_VERSION
+    from collector.sglang.registry import REGISTRY
+    from collector.version_resolver import build_collections
+
+    _Checkpoint.instances.clear()
+    (collection,) = build_collections(
+        REGISTRY, "sglang", RUNTIME_VERSION, [f"kimi_k31_dsa_{phase}_module"]
+    )
+    assert 103 not in collection["unverified_sms"]
+    errors = fullnode.collect_sglang_fullnode_op(
+        {**collection, "module": "must_not_import"},
+        runtime_version=RUNTIME_VERSION,
+        limit=None,
+        shuffle=False,
+        shuffle_seed=42,
+        backend="sglang",
+        resume_options=None,
+        model_path=None,
+        case_plan=None,
+        sm_version=121,
+        case_filters=None,
+        get_test_cases_for_model=lambda *_args: pytest.fail("planned unverified SM121"),
+        resume_checkpoint_cls=_Checkpoint,
+        logger=_logger(),
+    )
+    assert errors[0]["classification"] == "unverified_skipped"
+    assert not _Checkpoint.instances
 
 
 def test_runner_maps_reported_failure_to_exact_checkpoint_task(monkeypatch):
@@ -172,7 +268,68 @@ def test_runner_fails_closed_when_failure_list_is_missing(monkeypatch):
     assert "must return" in errors[0]["error_message"]
 
 
+def test_native_failure_summary_aggregates_by_consumer_group(monkeypatch, tmp_path):
+    import collect as collect_mod
+    from collector.op_plans import ModuleCase
+
+    model = "moonshotai/Kimi-K3.1-Pro"
+    cases = [ModuleCase(length, 1, 48, "fp8", "bfloat16", "bfloat16", model, 0) for length in (4096, 8192)]
+    module_name = "fake_native_failure_groups"
+    monkeypatch.setitem(
+        sys.modules,
+        module_name,
+        SimpleNamespace(
+            __compat__="sglang==0.0.0.dev1+g41208373c.d20261104",
+            get_cases=lambda: cases,
+            run_cases=lambda **kwargs: {"succeeded": 0, "failed": kwargs["cases"]},
+        ),
+    )
+    monkeypatch.setattr(fullnode, "filter_cases", lambda values, **_kwargs: (values, []))
+    errors = fullnode.collect_sglang_fullnode_op(
+        {
+            "name": "sglang",
+            "type": "kimi_k31_dsa_generation_module",
+            "module": module_name,
+            "get_func": "get_cases",
+            "run_func": "run_cases",
+            "perf_filename": str(tmp_path / "dsa_generation_module_perf.txt"),
+        },
+        runtime_version="0.0.0.dev1+g41208373c.d20261104",
+        limit=None,
+        shuffle=False,
+        shuffle_seed=42,
+        backend="sglang",
+        resume_options=None,
+        model_path=None,
+        case_plan=None,
+        sm_version=103,
+        case_filters=None,
+        get_test_cases_for_model=lambda get_func, _model_path: get_func(),
+        resume_checkpoint_cls=_Checkpoint,
+        logger=_logger(),
+    )
+    expected_group = json.dumps(
+        dict(
+            model_path=model,
+            num_heads=48,
+            kv_cache_dtype="fp8",
+            compute_dtype="bfloat16",
+            gemm_type="bfloat16",
+            batch_size=1,
+        ),
+        sort_keys=True,
+    )
+    assert len(errors) == 2
+    assert {error["group"] for error in errors} == {expected_group}
+    monkeypatch.setenv("COLLECTOR_LOG_DIR", str(tmp_path))
+    collect_mod.generate_collection_summary(errors, "sglang", "test")
+    summary = json.loads((tmp_path / "collection_summary_sglang.json").read_text())["summary"]
+    assert summary["errors_by_group"] == {f"sglang.kimi_k31_dsa_generation_module:{expected_group}": 2}
+
+
 def test_replay_selects_full_node_cases_like_the_pool_ops(monkeypatch):
+    import collect as collect_mod
+
     cases = [{"shape": 0}, {"shape": 1}, {"shape": 2}]
     ran = []
 
@@ -225,6 +382,8 @@ def test_collect_sglang_passes_only_keywords_the_full_node_runner_accepts():
     import ast
     import inspect
 
+    import collect as collect_mod
+
     tree = ast.parse(Path(collect_mod.__file__).read_text(encoding="utf-8"))
     calls = [
         node
@@ -259,11 +418,16 @@ def _run_with_real_checkpoint(
     failed_cases=(),
     resume=False,
     retry_failed=False,
+    run_error=False,
 ):
+    import collect as collect_mod
+
     calls = []
 
     def run_cases(*, perf_filename, limit, cases):
         calls.append(list(cases))
+        if run_error:
+            raise RuntimeError("launcher failed before producing a row")
         return {"succeeded": len(cases) - len(failed_cases), "failed": list(failed_cases)}
 
     monkeypatch.setitem(
@@ -306,7 +470,52 @@ def _checkpoint_sets(path):
     return {key: set(data.get(key, [])) for key in ("done", "failed", "attempted")}
 
 
+def test_successful_retry_retains_run_diagnostic_without_unresolved_summary(monkeypatch, tmp_path):
+    cases = [{"shape": 1}]
+    errors, _, checkpoint = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, run_error=True)
+    assert errors[0]["error_type"] == "FullNodeCollectionFailure"
+    assert _checkpoint_sets(checkpoint)["failed"]
+
+    errors, calls, _ = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, resume=True, retry_failed=True)
+    assert calls == [cases]
+    assert errors == []
+    assert not _checkpoint_sets(checkpoint)["failed"]
+    diagnostic = checkpoint.with_name("errors_sglang.deepep_ll.json")
+    assert json.loads(diagnostic.read_text())[0]["error_message"] == "launcher failed before producing a row"
+    errors, calls, _ = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, resume=True)
+    assert errors == []
+    assert calls == []
+
+
+def test_optional_diagnostic_mirror_failure_keeps_measured_case_passed(monkeypatch, tmp_path):
+    log_dir = tmp_path / "unwritable-mirror"
+    monkeypatch.setenv("COLLECTOR_LOG_DIR", str(log_dir))
+    write_text = Path.write_text
+
+    def write(path, *args, **kwargs):
+        if path.parent == log_dir:
+            raise PermissionError("optional mirror unavailable")
+        return write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write)
+    cases = [{"shape": 1}, {"shape": 2}]
+    errors, calls, checkpoint = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, failed_cases=cases[:1])
+    assert calls == [cases]
+    assert len(errors) == 1
+    assert errors[0]["task_params"] == str(cases[0])
+    state = _checkpoint_sets(checkpoint)
+    assert len(state["done"]) == len(state["failed"]) == 1
+    assert state["done"].isdisjoint(state["failed"])
+    authoritative = json.loads(checkpoint.with_name("errors_sglang.deepep_ll.json").read_text())
+    assert authoritative == errors
+    errors, calls, _ = _run_with_real_checkpoint(monkeypatch, tmp_path, cases=cases, resume=True)
+    assert calls == []
+    assert len(errors) == 1  # The real failed case remains visible.
+
+
 def _finalize_pending_fullnode_event(tmp_path, checkpoint_path):
+    import collect as collect_mod
+
     pending = _checkpoint_sets(checkpoint_path)["attempted"]
     output_root = tmp_path / "out"
     output_root.mkdir()
@@ -405,7 +614,7 @@ def test_real_checkpoint_retry_after_closed_event_attests_only_retry(monkeypatch
 
 def test_real_checkpoint_zero_work_preserves_pending_and_failure_marks_all_selected(monkeypatch, tmp_path):
     cases = [{"shape": 1}, {"shape": 2}]
-    _, _, checkpoint_path = _run_with_real_checkpoint(
+    recorded_errors, _, checkpoint_path = _run_with_real_checkpoint(
         monkeypatch,
         tmp_path,
         cases=cases,
@@ -418,4 +627,355 @@ def test_real_checkpoint_zero_work_preserves_pending_and_failure_marks_all_selec
     assert calls == []
     assert _checkpoint_sets(checkpoint_path)["attempted"] == pending
     assert len(_checkpoint_sets(checkpoint_path)["failed"]) == 2
-    assert any(error["error_type"] == "UnresolvedFailures" for error in errors)
+    assert errors == recorded_errors
+    assert len(errors) == 2
+    assert {error["task_params"] for error in errors} == set(map(str, cases))
+
+
+@pytest.mark.parametrize("sm", [103, None])
+def test_pool_unknown_sm_cannot_bypass_registry_gate(sm):
+    import collect as collect_mod
+
+    errors = collect_mod.collect_ops(
+        1,
+        [{"name": "sglang", "type": "test", "module": "must_not_import", "unverified_sms": (103,)}],
+        sm_version=sm,
+    )
+    assert len(errors) == 1
+    assert errors[0]["classification"] == "unverified_skipped"
+
+
+def test_native_failure_records_survive_interruption_and_plain_resume(monkeypatch, tmp_path):
+    import logging
+
+    import collector.sglang.collect_kimi_k31_dsa_v1 as native
+    from collector.collect import ReplaySpec, ResumeCheckpoint, load_replay_cases
+    from collector.op_plans import ModuleCase
+
+    cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", native.MODEL, 0) for heads in (96, 48)]
+    calls = []
+    report_dir = tmp_path / "logs"
+    monkeypatch.setenv("COLLECTOR_LOG_DIR", str(report_dir))
+
+    def run(*, cases, **kwargs):
+        calls.extend(cases)
+        if len(calls) == 1:
+            return {
+                "failed": cases,
+                "failure_details": {
+                    str(cases[0]): {
+                        "error_type": "RuntimeError",
+                        "error_message": "FIXME(kernel-limit): observed native refusal",
+                    }
+                },
+            }
+        if len(calls) == 2:
+            # A real process/job interruption loses all in-memory errors.
+            assert (report_dir / "errors_sglang.kimi_k31_dsa_context_module.json").exists()
+            raise KeyboardInterrupt("job stopped during next case")
+        return {"failed": []}
+
+    class Checkpoint(ResumeCheckpoint):
+        def mark_failed(self, task_id):
+            saved = json.loads((report_dir / "errors_sglang.kimi_k31_dsa_context_module.json").read_text())
+            assert any(error["task_id"] == task_id for error in saved)
+            super().mark_failed(task_id)
+
+    monkeypatch.setattr(native, "run_kimi_k31_dsa_fullnode", run)
+
+    def collect():
+        return fullnode.collect_sglang_fullnode_op(
+            {
+                "name": "sglang",
+                "type": "kimi_k31_dsa_context_module",
+                "module": native.__name__,
+                "get_func": "get_kimi_k31_dsa_context_test_cases",
+                "run_func": "run_kimi_k31_dsa_fullnode",
+                "perf_filename": str(tmp_path / "context.txt"),
+            },
+            runtime_version=native.RUNTIME_VERSION,
+            limit=None,
+            shuffle=False,
+            shuffle_seed=42,
+            backend="sglang",
+            resume_options={"checkpoint_dir": str(tmp_path / "checkpoint"), "resume": True},
+            model_path=native.MODEL,
+            case_plan=None,
+            sm_version=103,
+            case_filters=None,
+            get_test_cases_for_model=lambda *_: cases,
+            resume_checkpoint_cls=Checkpoint,
+            logger=logging.getLogger(__name__),
+        )
+
+    with pytest.raises(KeyboardInterrupt):
+        collect()
+    report = report_dir / "errors_sglang.kimi_k31_dsa_context_module.json"
+    before = json.loads(report.read_text())
+    assert len(before) == 1
+    error = before[0]
+    assert error["task_params"] == str(cases[0])
+    assert error["classification"] == "kernel_limit"
+    assert error["error_type"] == "RuntimeError"
+    assert "observed native refusal" in error["error_message"]
+    assert json.loads(error["group"])["num_heads"] == 96
+    requested = load_replay_cases(str(report))
+    replay = ReplaySpec(str(report), requested)
+    assert replay.select("kimi_k31_dsa_context_module", cases, random.Random(42)) == [cases[0]]
+    assert collect() == before
+    assert calls == [cases[0], cases[1], cases[1]]
+    assert collect() == before  # zero-work resumes retain exact records too
+
+
+@pytest.mark.parametrize("phase", ["context", "generation"])
+@pytest.mark.parametrize("passed", [False, True])
+@pytest.mark.parametrize("other_passed", [False, True])
+@pytest.mark.parametrize("relocated", [False, True])
+def test_native_pending_publication_requires_owning_checkpoint(
+    monkeypatch, tmp_path, phase, passed, other_passed, relocated
+):
+    import collector.sglang.collect_kimi_k31_dsa_v1 as native
+    from collector.collect import ResumeCheckpoint
+    from collector.helper import create_test_case_id
+    from collector.op_plans import ModuleCase
+
+    tmp_path = tmp_path / "host-output"
+    tmp_path.mkdir()
+    cases = [ModuleCase(4096, 1, heads, "fp8", "bfloat16", "bfloat16", native.MODEL, 0) for heads in (96, 48)]
+    op = f"kimi_k31_dsa_{phase}_module"
+    full_name = f"sglang.{op}"
+    run_func = "run_kimi_k31_dsa_fullnode"
+    output = tmp_path / f"{phase}.txt"
+    owner_dir = tmp_path / "checkpoint"
+    other_dir = tmp_path / "other-checkpoint"
+    calls = []
+    interrupted = False
+
+    class Checkpoint(ResumeCheckpoint):
+        def flush(self, force=False):
+            nonlocal interrupted
+            super().flush(force=force)
+            if passed and not interrupted and len(self._done) == len(cases):
+                interrupted = True
+                raise KeyboardInterrupt("stopped after checkpoint, before publication")
+
+    def run(*, cases, perf_filename, **kwargs):
+        nonlocal interrupted
+        calls.extend(cases)
+        with Path(perf_filename).open("a") as stream:
+            stream.write(str(cases[0]) + "\n")
+        if not passed and not interrupted and len(calls) == 2:
+            interrupted = True
+            raise KeyboardInterrupt("stopped before checkpoint")
+        return {"failed": []}
+
+    monkeypatch.setattr(native, run_func, run)
+
+    def collect(checkpoint_dir, *, resume=True):
+        return fullnode.collect_sglang_fullnode_op(
+            {
+                "name": "sglang",
+                "type": op,
+                "module": native.__name__,
+                "get_func": f"get_kimi_k31_dsa_{phase}_test_cases",
+                "run_func": run_func,
+                "perf_filename": str(output),
+            },
+            runtime_version=native.RUNTIME_VERSION,
+            limit=None,
+            shuffle=False,
+            shuffle_seed=42,
+            backend="sglang",
+            resume_options={"checkpoint_dir": str(checkpoint_dir), "resume": resume},
+            model_path=native.MODEL,
+            case_plan=None,
+            sm_version=103,
+            case_filters=None,
+            get_test_cases_for_model=lambda *_: cases,
+            resume_checkpoint_cls=Checkpoint,
+            logger=_logger(),
+        )
+
+    with pytest.raises(KeyboardInterrupt, match="stopped"):
+        collect(owner_dir)
+    receipt = output.with_name(f".{output.name}.pending")
+    transaction_bytes = receipt.read_bytes()
+    transaction = json.loads(transaction_bytes)
+    stage = output.with_name(transaction["stage"])
+    stage_bytes = stage.read_bytes()
+    checkpoint_path = owner_dir / "sglang" / f"{full_name}.json"
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    assert output.read_text().splitlines() == [str(cases[0])]
+    assert stage.read_text().splitlines() == list(map(str, cases))
+    assert calls == cases
+
+    other = ResumeCheckpoint(
+        backend="sglang",
+        module_name=full_name,
+        run_func_name=run_func,
+        checkpoint_dir=str(other_dir),
+        framework_version=native.RUNTIME_VERSION,
+        sm_version=103,
+    )
+    if other_passed:
+        for case in cases:
+            task_id = create_test_case_id(case, run_func, full_name)
+            other.mark_attempted(task_id)
+            other.mark_passed(task_id)
+        other.flush(force=True)
+    other_bytes = other._path.read_bytes() if other._path.exists() else None
+
+    # Neither a missing pass nor a matching task ID in another checkpoint
+    # authorizes discarding or promoting this run's stage.
+    with pytest.raises(RuntimeError, match="owning checkpoint") as error:
+        collect(other_dir)
+    assert str(checkpoint_path) in str(error.value)
+    assert receipt.read_bytes() == transaction_bytes
+    assert stage.read_bytes() == stage_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+    assert (other._path.read_bytes() if other._path.exists() else None) == other_bytes
+    assert output.read_text().splitlines() == [str(cases[0])]
+    assert calls == cases
+
+    monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
+    with pytest.raises(RuntimeError, match="owning checkpoint") as error:
+        collect(other_dir)
+    assert str(checkpoint_path) in str(error.value)
+    monkeypatch.delenv("COLLECTOR_K31_FINALIZE_ONLY")
+
+    # Starting fresh at the same path must not erase a pending passed case.
+    with pytest.raises(RuntimeError, match="--resume"):
+        collect(owner_dir, resume=False)
+    assert receipt.read_bytes() == transaction_bytes
+    assert stage.read_bytes() == stage_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+
+    # Older receipts cannot safely be attributed from matching case IDs alone.
+    transaction.pop("checkpoint")
+    receipt.write_text(json.dumps(transaction))
+    legacy_bytes = receipt.read_bytes()
+    with pytest.raises(RuntimeError, match="no owning checkpoint recorded"):
+        collect(owner_dir)
+    assert receipt.read_bytes() == legacy_bytes
+    assert stage.read_bytes() == stage_bytes
+    assert checkpoint_path.read_bytes() == checkpoint_bytes
+    receipt.write_bytes(transaction_bytes)
+
+    # Canonical aliases still identify the owner. Its passed stage is promoted;
+    # an uncheckpointed stage is discarded and only that case is recollected.
+    if relocated:
+        # The same mounted tree has a new absolute prefix, as in host -> /out.
+        mounted = tmp_path.with_name("container-output")
+        tmp_path.rename(mounted)
+        tmp_path = mounted
+        output = mounted / output.name
+        receipt = mounted / receipt.name
+        stage = mounted / stage.name
+        owner_dir = mounted / "checkpoint"
+    alias = tmp_path / "checkpoint-alias"
+    alias.symlink_to(owner_dir, target_is_directory=True)
+    if passed:
+        monkeypatch.setenv("COLLECTOR_K31_FINALIZE_ONLY", "1")
+    assert collect(alias) == []
+    assert calls == (cases if passed else [*cases, cases[1]])
+    assert output.read_text().splitlines() == list(map(str, cases))
+    assert not receipt.exists()
+    assert not stage.exists()
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_native_checkpoint_cannot_authorize_another_output_root(tmp_path, resume):
+    from collector.collect import ResumeCheckpoint, _preflight_collector_finalization_inputs
+    from collector.op_plans import ModuleCase
+    from collector.sglang import collect_kimi_k31_dsa_v1 as native
+
+    op = "kimi_k31_dsa_generation_module"
+    full_name = f"sglang.{op}"
+    run_name = "run_kimi_k31_dsa_fullnode"
+    checkpoint_dir = tmp_path / "shared-checkpoint"
+    roots = [tmp_path / name for name in ("owner", "other")]
+    for root in roots:
+        root.mkdir()
+    calls = []
+
+    def run(*, perf_filename, **kwargs):
+        calls.append(perf_filename)
+        Path(perf_filename).write_text("latency\n1.0\n")
+        return {"failed": []}
+
+    def collect(root):
+        return fullnode._collect_selected_cases(
+            [ModuleCase(4096, 1, 96, "fp8", "bfloat16", "bfloat16", native.MODEL, 0)],
+            op,
+            full_name,
+            run,
+            run_name,
+            root / "dsa_generation_module_perf.txt",
+            True,
+            "sglang",
+            native.RUNTIME_VERSION,
+            103,
+            {"checkpoint_dir": str(checkpoint_dir), "resume": resume},
+            ResumeCheckpoint,
+            _logger(),
+        )
+
+    assert collect(roots[0]) == []
+    checkpoint = checkpoint_dir / "sglang" / f"{full_name}.json"
+    original = checkpoint.read_bytes()
+    with pytest.raises(RuntimeError, match="different output root"):
+        collect(roots[1])
+    assert len(calls) == 1
+    assert checkpoint.read_bytes() == original
+
+    assert not list(roots[1].iterdir())
+
+    # Even a staged table with matching case IDs cannot borrow the producer's
+    # checkpoint during common finalization, bypassing the full-node launcher.
+    for root in roots:
+        stage = root / "dsa_generation_module_perf.txt"
+        stage.write_text("latency\n1.0\n")
+        collection = {
+            "name": "sglang",
+            "type": op,
+            "run_func": run_name,
+            "perf_filename": str(stage),
+        }
+        context = {"installed_version": native.RUNTIME_VERSION, "collections": [collection]}
+        if root == roots[0]:
+            producers, _ = _preflight_collector_finalization_inputs(
+                root, [stage], context, backend="sglang", checkpoint_dir=str(checkpoint_dir), sm_version=103
+            )
+            assert checkpoint in producers
+        else:
+            with pytest.raises(RuntimeError, match="different output root"):
+                _preflight_collector_finalization_inputs(
+                    root, [stage], context, backend="sglang", checkpoint_dir=str(checkpoint_dir), sm_version=103
+                )
+    assert checkpoint.read_bytes() == original
+
+
+def test_native_receipt_rejects_different_checkpoint_with_same_relative_path(tmp_path):
+    roots = [tmp_path / name for name in ("producer", "unrelated")]
+    for root in roots:
+        root.mkdir()
+    checkpoints = [root / ".ckpt" / "sglang" / "native.json" for root in roots]
+    owner_ids = [
+        fullnode.bind_native_checkpoint(path, root, create=True) for path, root in zip(checkpoints, roots, strict=True)
+    ]
+    for checkpoint in checkpoints:
+        checkpoint.write_text(json.dumps({"done": ["same-task"], "attempted": ["same-task"]}))
+    receipt = roots[1] / ".native.txt.pending"
+    receipt.write_text(
+        json.dumps(
+            {
+                "checkpoint": str(checkpoints[0]),
+                "checkpoint_relative": ".ckpt/sglang/native.json",
+                "checkpoint_id": owner_ids[0],
+                "task_id": "same-task",
+            }
+        )
+    )
+    assert owner_ids[0] != owner_ids[1]
+    with pytest.raises(RuntimeError, match="owning checkpoint"):
+        fullnode._read_native_receipt(receipt, checkpoints[1])

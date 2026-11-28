@@ -8,27 +8,38 @@ per-GPU worker pool. This module keeps their case selection, checkpointing, and
 failure mapping out of the top-level backend entrypoint.
 """
 
+import json
 import os
 import random
+import shutil
+import tempfile
 import traceback
+import uuid
+from contextlib import nullcontext
 from datetime import datetime
+from pathlib import Path
 
 from collector.case_generator import without_models
-from collector.helper import create_test_case_id
+from collector.helper import _fsync_directory, collector_retained_path, create_test_case_id, native_publication_lock
+from collector.op_plans import OP_PLANS
 from collector.skips import filter_cases, models
 from collector.version_resolver import _check_compat
 
 SGLANG_FULLNODE_OPS = {
     "deepep_ll": "DEEPEP_LL_SHAPE_INDEX",
     "deepep_normal": "DEEPEP_NORMAL_SHAPE_INDEX",
+    "kimi_k31_dsa_context_module": None,
+    "kimi_k31_dsa_generation_module": None,
 }
 
 
-def _resume_errors(module_name, resume_tracker, resume_options, logger) -> list[dict]:
+def _resume_errors(module_name, resume_tracker, resume_options, logger, known_errors=()) -> list[dict]:
     if not (resume_options and resume_options.get("resume")):
         return []
-    unresolved = resume_tracker.unresolved_failed_count()
-    if not unresolved:
+    unresolved = len(
+        resume_tracker.unresolved_failed_ids() - {e["task_id"] for e in known_errors if e.get("task_params")}
+    )
+    if unresolved <= 0:
         return []
     logger.warning(
         f"{module_name}: checkpoint holds {unresolved} unresolved failed tasks "
@@ -49,7 +60,7 @@ def _resume_errors(module_name, resume_tracker, resume_options, logger) -> list[
 def select_cases(op: str, cases: list, limit: int | None) -> list:
     """Apply the explicit job-array shape selector or the common case limit."""
     shape_index_env = SGLANG_FULLNODE_OPS[op]
-    shape_index = os.environ.get(shape_index_env)
+    shape_index = os.environ.get(shape_index_env) if shape_index_env else None
     if shape_index is not None and shape_index != "":
         idx = int(shape_index)
         if idx < 0 or idx >= len(cases):
@@ -58,6 +69,83 @@ def select_cases(op: str, cases: list, limit: int | None) -> list:
     if limit is not None:
         return cases[:limit]
     return cases
+
+
+def bind_native_checkpoint(checkpoint_path: Path, output_root: Path, *, create: bool = False) -> str:
+    """Bind a producer namespace before using it, including across container mounts.
+
+    Both paths are relative to the checkpoint directory so relocating their
+    common mount does not change ownership. Anonymous existing checkpoints
+    cannot be attributed safely and require manual recovery.
+    """
+    from collector.collect import (
+        _atomic_write_previous_path,
+        _entry_state_at,
+        _locked_checkpoint_directory,
+        _validated_regular_file_at,
+    )
+
+    owner_path = checkpoint_path.with_suffix(".json.output-owner")
+    expected_root = os.path.relpath(output_root.resolve(), checkpoint_path.parent)
+    if create:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with _locked_checkpoint_directory(checkpoint_path) as locked:
+        directory_fd = locked.file_descriptor
+        if _entry_state_at(directory_fd, owner_path.name) is None:
+            existing = any(
+                _entry_state_at(directory_fd, path.name) is not None
+                for path in (checkpoint_path, _atomic_write_previous_path(checkpoint_path))
+            )
+            if not create or existing:
+                raise RuntimeError(
+                    f"Native checkpoint {checkpoint_path} has no output root owner; preserve it for recovery"
+                )
+            descriptor = os.open(
+                owner_path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd
+            )
+            with os.fdopen(descriptor, "w") as stream:
+                json.dump({"output_root": expected_root, "checkpoint_id": uuid.uuid4().hex}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.fsync(directory_fd)
+        snapshot = _validated_regular_file_at(
+            directory_fd,
+            owner_path.name,
+            owner_path,
+            None,
+            context_path=checkpoint_path,
+            capture_contents=True,
+            kind="native checkpoint owner",
+        )
+        owner = json.loads(snapshot.contents)
+        if owner.get("output_root") != expected_root or not owner.get("checkpoint_id"):
+            raise RuntimeError(f"Native checkpoint {checkpoint_path} belongs to a different output root")
+        return owner["checkpoint_id"]
+
+
+def _read_native_receipt(receipt: Path, checkpoint_path: Path) -> dict:
+    transaction = json.loads(receipt.read_text())
+    owner = transaction.get("checkpoint")
+    relative_owner = transaction.get("checkpoint_relative")
+    matches = (
+        relative_owner == os.path.relpath(checkpoint_path, receipt.parent)
+        if relative_owner is not None
+        else owner == str(checkpoint_path)
+    )
+    if matches and relative_owner is not None:
+        checkpoint_id = bind_native_checkpoint(checkpoint_path, receipt.parent)
+        matches = transaction.get("checkpoint_id") == checkpoint_id
+    if not owner or not matches:
+        if not owner:
+            raise RuntimeError(
+                f"Pending native publication {receipt} has no owning checkpoint recorded; "
+                "preserve its receipt and stage and identify the original checkpoint before recovery"
+            )
+        raise RuntimeError(
+            f"Pending native publication {receipt} belongs to owning checkpoint {owner}, "
+            f"not {checkpoint_path}; resume the owning checkpoint with --resume"
+        )
+    return transaction
 
 
 def collect_sglang_fullnode_op(
@@ -84,6 +172,36 @@ def collect_sglang_fullnode_op(
     if case_plan is not None and not case_plan.has_op(op):
         logger.info(f"Skipping {full_name} — not in collector v2 case plan")
         return []
+
+    # Full-node routes obey the same registry maturity contract as pool ops.
+    # In particular, moving a native TP module here must not enable an
+    # unqualified backend/SM merely because it owns its GPU group exclusively.
+    unverified_here = collection.get("unverified") or (
+        collection.get("unverified_sms") and (sm_version is None or sm_version in collection["unverified_sms"])
+    )
+    if unverified_here:
+        scope = (
+            "this backend"
+            if collection.get("unverified")
+            else ("unresolved SM" if sm_version is None else f"SM{sm_version}")
+        )
+        logger.warning(f"Skipping {full_name} — registry marks it unverified on {scope}")
+        return [
+            {
+                "module": full_name,
+                "error_type": "UnverifiedCollector",
+                "error_message": f"registry marks this op unverified on {scope}; collection skipped",
+                "classification": "unverified_skipped",
+            }
+        ]
+
+    if op.startswith("kimi_k31_dsa_") and os.environ.get("COLLECTOR_MEASURE_POWER", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        raise ValueError("native Kimi K3.1 does not support --measure_power; use latency-only collection")
 
     module_name = collection["module"]
     get_module = __import__(module_name, fromlist=[collection["get_func"]])
@@ -133,6 +251,43 @@ def collect_sglang_fullnode_op(
             }
         ]
 
+    native = op.startswith("kimi_k31_dsa_")
+    output = Path(collection["perf_filename"])
+    if native:
+        output = output.resolve()
+    with native_publication_lock(output) if native else nullcontext():
+        return _collect_selected_cases(
+            cases,
+            op,
+            full_name,
+            run_func,
+            run_func_name,
+            output,
+            native,
+            backend,
+            runtime_version,
+            sm_version,
+            resume_options,
+            resume_checkpoint_cls,
+            logger,
+        )
+
+
+def _collect_selected_cases(
+    cases,
+    op,
+    full_name,
+    run_func,
+    run_func_name,
+    output,
+    native,
+    backend,
+    runtime_version,
+    sm_version,
+    resume_options,
+    resume_checkpoint_cls,
+    logger,
+):
     raw_task_infos = [
         {
             "id": create_test_case_id(case, run_func_name, full_name),
@@ -153,60 +308,209 @@ def collect_sglang_fullnode_op(
         framework_version=runtime_version,
         sm_version=sm_version,
     )
+    receipt = output.with_name(f".{output.name}.pending")
+    if native and receipt.exists():
+        # Check ownership before loading or filtering the active checkpoint:
+        # another run's pass set cannot authorize promotion or deletion.
+        _read_native_receipt(receipt, resume_tracker._path)
+        if not (resume_options and resume_options.get("resume")):
+            raise RuntimeError(
+                f"Pending native publication {receipt} requires --resume with owning checkpoint {resume_tracker._path}"
+            )
+    checkpoint_id = bind_native_checkpoint(resume_tracker._path, output.parent, create=True) if native else None
     if resume_options and resume_options.get("resume"):
         resume_tracker.load_existing()
         task_infos = resume_tracker.filter_done(raw_task_infos, retry_failed=resume_options.get("retry_failed", False))
     else:
         task_infos = raw_task_infos
 
+    if native and resume_tracker.unfinished_attempt_ids() - {task["id"] for task in raw_task_infos}:
+        raise RuntimeError("Native resume must select every unfinished attempt before publication")
+
+    if (
+        native
+        and os.environ.get("COLLECTOR_K31_FINALIZE_ONLY") == "1"
+        and not all(resume_tracker.has_passed(task["id"]) for task in raw_task_infos)
+    ):
+        raise RuntimeError("Native finalize-only requires a passed checkpoint for every selected case")
+    error_path = Path(checkpoint_dir) / backend / f"errors_{full_name}.json"
+    errors: list[dict] = []
+    if resume_options and resume_options.get("resume") and error_path.exists():
+        errors = json.loads(error_path.read_text())
+
+    historical = [e for e in errors if e.get("error_type") == "FullNodeCollectionFailure"]
+    errors = [e for e in errors if e.get("error_type") != "FullNodeCollectionFailure"]
+
+    def persist_errors():
+        if not errors and not error_path.exists():
+            return
+        error_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = error_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(historical + errors, indent=2))
+        os.replace(temporary, error_path)
+        log_dir = os.environ.get("COLLECTOR_LOG_DIR")
+        if log_dir:
+            report = Path(log_dir) / error_path.name
+            try:
+                report.parent.mkdir(parents=True, exist_ok=True)
+                temporary = report.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps(historical + errors, indent=2))
+                os.replace(temporary, report)
+            except OSError as exc:
+                logger.warning(f"Failed to mirror collector diagnostics to {report}: {exc}")
+
+    # A native worker can outlive a killed launcher. Give each attempt a
+    # private staging file. Only the parent publishes its bytes, after the
+    # checkpoint is durable. A receipt bridges the two atomic replacements.
+    def finish_publication():
+        if not receipt.exists():
+            return
+        transaction = _read_native_receipt(receipt, resume_tracker._path)
+        name = transaction["stage"]
+        if Path(name).name != name or not name.startswith(f".{output.name}.stage-"):
+            raise ValueError(f"invalid native staging filename in {receipt}")
+        stage = output.with_name(name)
+        # A surviving child inherits this flock even after its launcher dies.
+        # Acquire it before changing any bytes or removing the recovery receipt.
+        with native_publication_lock(stage):
+            if resume_tracker.has_passed(transaction["task_id"]) and stage.exists():
+                if collector_retained_path(output).exists():
+                    # Reuse the retained inode through the same publication protocol
+                    # as the other collector writers after a closed event.
+                    from collector.collect import _atomic_write_bytes
+
+                    _atomic_write_bytes(output, stage.read_bytes())
+                    stage.unlink()
+                else:
+                    os.replace(stage, output)
+            else:
+                stage.unlink(missing_ok=True)
+            stage.with_name(f".{stage.name}.publication-lock").unlink(missing_ok=True)
+            _fsync_directory(output.parent)
+            receipt.unlink()
+            _fsync_directory(output.parent)
+
+    if native:
+        if Path(f"{output}.lock").exists():
+            raise RuntimeError(f"Native output already has a writer lock: {output}.lock")
+        if (
+            resume_options
+            and resume_options.get("resume")
+            and not receipt.exists()
+            and output.exists()
+            and resume_tracker.has_unfinished_attempts()
+        ):
+            raise RuntimeError(
+                f"Unreconciled native staging rows in {output}; preserve and restart in a fresh directory"
+            )
+        finish_publication()
+
     if not task_infos:
         logger.info(f"{full_name}: no full-node tasks to run")
-        return _resume_errors(full_name, resume_tracker, resume_options, logger)
+        return errors + _resume_errors(full_name, resume_tracker, resume_options, logger, errors)
 
     logger.info(f"Running {full_name} full-node collection (bypassing per-GPU worker pool)")
-    errors: list[dict] = []
     task_by_id = {task_info["id"]: task_info["params"] for task_info in task_infos}
-    id_by_case = {str(task_info["params"]): task_info["id"] for task_info in task_infos}
+    completed = set()
+    submitted = set()
     try:
-        # The runner consumes the selected cases as one batch, so persist its
-        # entire pending provenance set atomically before handing it control.
-        # An interrupted resume then extends this set; only the successful
-        # common parquet/sidecar finalizer closes it.
-        resume_tracker.mark_attempted_many(task_by_id)
-        result = run_func(
-            perf_filename=collection["perf_filename"],
-            limit=None,
-            cases=[task_info["params"] for task_info in task_infos],
-        )
-        if not isinstance(result, dict) or "failed" not in result:
-            raise RuntimeError(f"{full_name} runner must return a result containing its failed case list")
-        failed_cases = result["failed"]
-        unknown_failed = [case for case in failed_cases if str(case) not in id_by_case]
-        if unknown_failed:
-            raise RuntimeError(
-                f"{full_name} runner reported failures outside the requested case plan: {unknown_failed}"
-            )
-        failed_ids = {id_by_case[str(case)] for case in failed_cases if str(case) in id_by_case}
-        for task_id in task_by_id:
-            if task_id in failed_ids:
-                resume_tracker.mark_failed(task_id)
-            else:
-                resume_tracker.mark_passed(task_id)
-        for task_id in sorted(failed_ids):
-            errors.append(
-                {
-                    "module": full_name,
-                    "task_id": task_id,
-                    "task_params": str(task_by_id[task_id]),
-                    "error_type": "FullNodeCaseFailure",
-                    "error_message": "full-node runner reported failed case",
-                    "classification": "unexpected",
-                    "timestamp": datetime.now().isoformat(),
+        # DeepEP amortizes group setup across its batch. K3.1 already launches
+        # a fresh native process per case: checkpoint each returned case before
+        # launching the next so a job time limit cannot erase earlier progress.
+        batches = ([task_info] for task_info in task_infos) if op.startswith("kimi_k31_dsa_") else (task_infos,)
+        for batch in batches:
+            batch_ids = {str(task_info["params"]): task_info["id"] for task_info in batch}
+            filename = str(output)
+            if native:
+                with tempfile.NamedTemporaryFile(
+                    dir=output.parent, prefix=f".{output.name}.stage-", delete=False
+                ) as tmp:
+                    filename = Path(tmp.name)
+                if output.exists():
+                    shutil.copyfile(output, filename)
+                transaction = {
+                    "task_id": batch[0]["id"],
+                    "stage": filename.name,
+                    "checkpoint": str(resume_tracker._path),
+                    "checkpoint_relative": os.path.relpath(resume_tracker._path, output.parent),
+                    "checkpoint_id": checkpoint_id,
                 }
+                pending = receipt.with_suffix(".pending.tmp")
+                with pending.open("w") as stream:
+                    json.dump(transaction, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(pending, receipt)
+                _fsync_directory(output.parent)
+            resume_tracker.mark_attempted_many(batch_ids.values())
+            submitted.update(batch_ids.values())
+            result = run_func(
+                perf_filename=str(filename) if native else filename,
+                limit=None,
+                cases=[task_info["params"] for task_info in batch],
+                **(
+                    {
+                        "expected_sm": sm_version,
+                        "phase": "context" if op == "kimi_k31_dsa_context_module" else "generation",
+                    }
+                    if native
+                    else {}
+                ),
             )
+            if not isinstance(result, dict) or "failed" not in result:
+                raise RuntimeError(f"{full_name} runner must return a result containing its failed case list")
+            # Native runners can retain per-case causes without changing the case
+            # list/checkpoint protocol used by older full-node collectors.
+            failed_cases = result["failed"]
+            failure_details = result.get("failure_details", {})
+            unknown_failed = [case for case in failed_cases if str(case) not in batch_ids]
+            if unknown_failed:
+                raise RuntimeError(
+                    f"{full_name} runner reported failures outside the requested case plan: {unknown_failed}"
+                )
+            failed_ids = {batch_ids[str(case)] for case in failed_cases}
+            errors[:] = [error for error in errors if error.get("task_id") not in batch_ids.values()]
+            for task_id in sorted(failed_ids):
+                case = task_by_id[task_id]
+                detail = failure_details.get(str(case), {})
+                # Use the plan's consumer dimensions, excluding swept history
+                # coordinates, so repeated failures expose unavailable keys.
+                spec = OP_PLANS.get(op)
+                group = (
+                    json.dumps({field: getattr(case, field) for field in spec.group_fields}, sort_keys=True)
+                    if spec is not None and all(hasattr(case, field) for field in spec.group_fields)
+                    else None
+                )
+                message = detail.get("error_message", "full-node runner reported failed case")
+                errors.append(
+                    {
+                        "module": full_name,
+                        "task_id": task_id,
+                        "task_params": str(task_by_id[task_id]),
+                        "group": group,
+                        "error_type": detail.get("error_type", "FullNodeCaseFailure"),
+                        "error_message": message,
+                        "classification": "kernel_limit"
+                        if message.lstrip().startswith("FIXME(kernel-limit)")
+                        else "unexpected",
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
+            persist_errors()
+            # mark_failed/mark_passed may themselves flush: publish the exact
+            # error records first, before any cumulative checkpoint can skip them.
+            for task_id in batch_ids.values():
+                completed.add(task_id)
+                if task_id in failed_ids:
+                    resume_tracker.mark_failed(task_id)
+                else:
+                    resume_tracker.mark_passed(task_id)
+            resume_tracker.flush(force=True)
+            if native:
+                finish_publication()
     except Exception as e:
         logger.exception(f"{full_name} full-node collection failed")
-        for task_id in task_by_id:
+        for task_id in submitted - completed:
             resume_tracker.mark_failed(task_id)
         errors.append(
             {
@@ -220,7 +524,10 @@ def collect_sglang_fullnode_op(
             }
         )
     finally:
+        persist_errors()
         resume_tracker.flush(force=True)
 
-    errors.extend(_resume_errors(full_name, resume_tracker, resume_options, logger))
+    if native:
+        finish_publication()
+    errors.extend(_resume_errors(full_name, resume_tracker, resume_options, logger, errors))
     return errors

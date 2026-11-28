@@ -28,9 +28,10 @@ logger = logging.getLogger(__name__)
 
 # Canonical user-facing attention-backend vocabulary. ``"default"`` selects
 # the framework default and is not a named measurement lane.
-ATTENTION_BACKEND_CHOICES: tuple[str, ...] = ("fa3", "fa4", "triton", "trtllm_mha", "flashinfer", "fla", "default")
-_KNOWN_LANES: frozenset[str] = frozenset(choice for choice in ATTENTION_BACKEND_CHOICES if choice != "default")
-_KNOWN_LANE_VALUES: frozenset[str] = frozenset(ATTENTION_BACKEND_CHOICES)
+_DENSE_BACKEND_CHOICES: tuple[str, ...] = ("fa3", "fa4", "triton", "trtllm_mha", "flashinfer", "fla", "default")
+ATTENTION_BACKEND_CHOICES: tuple[str, ...] = (*_DENSE_BACKEND_CHOICES, "flashmla", "trtllm_mla")
+_KNOWN_LANES: frozenset[str] = frozenset(choice for choice in _DENSE_BACKEND_CHOICES if choice != "default")
+_KNOWN_LANE_VALUES: frozenset[str] = frozenset(_DENSE_BACKEND_CHOICES)
 
 # User-facing override vocabulary (the CLI's ``--attention-backend`` choices,
 # minus the universal ``"default"``) -> the stored ``kernel_source`` labels

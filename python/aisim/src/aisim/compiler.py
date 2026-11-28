@@ -670,13 +670,10 @@ def _roles_with_afd_deployment(engine, *, workload):
                     engine.model,
                     tp_size=worker.afd.tp_a,
                     pp_size=1,
-                    moe_tp_size=1,
+                    moe_tp_size=worker.afd.tp_a,
                     moe_ep_size=1,  # KV belongs to one A replica, independently of F-pool EP.
-                    kvcache_quant_mode=(
-                        worker.timing.kvcache_quant_mode
-                        if worker.timing is not None and worker.timing.kvcache_quant_mode is not None
-                        else engine.kvcache_quant_mode
-                    ),
+                    backend=engine.backend,
+                    **_kv_geometry_controls(engine, worker),
                 )
             )
         else:
@@ -1154,10 +1151,7 @@ def _worker_engine_args(
             **_prefill_cp_knob(parallel, "cp_size"),
             kv_block_size=block_size,
             nextn=engine.nextn,
-            **{
-                name: getattr(timing, name, None) if getattr(timing, name, None) is not None else getattr(engine, name)
-                for name in ENGINE_MODEL_CONTROL_FIELDS
-            },
+            **{name: _worker_model_control(engine, worker, name, saved) for name in ENGINE_MODEL_CONTROL_FIELDS},
             speculation=engine.speculation.cost_config() if engine.speculation is not None else None,
             estimation_mode=timing.estimation_mode or engine.estimation_mode,
             fallback_policy=timing.fallback_policy or engine.fallback_policy,
@@ -1262,6 +1256,16 @@ def _worker_engine_args(
     return payload
 
 
+def _worker_model_control(engine, worker, name: str, saved: dict):
+    """Resolve explicit role/engine controls before the named snapshot's identity."""
+    value = getattr(worker.timing, name, None)
+    if value is None:
+        value = getattr(engine, name)
+        if name == "enable_eplb" and name not in engine.model_fields_set and name in saved:
+            return saved[name]
+    return saved.get(name) if value is None else value
+
+
 _SWA_PREFIX_ARCHITECTURES = frozenset({"DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"})
 
 
@@ -1305,6 +1309,22 @@ def _swa_prefix_tails(engine: EnginePredictionConfig, worker: WorkerPredictionCo
     return 4 * worker.scheduler.max_sequences
 
 
+def _kv_geometry_controls(engine, worker) -> dict[str, str | None]:
+    """Use the same authored/restored dtype and layout for every KV consumer."""
+    from .sweeper.state_snapshot import saved_snapshot_config
+
+    controls = worker.timing.estimator_config if worker.timing is not None else None
+    saved = saved_snapshot_config(controls if controls is not None else engine.estimator_config)
+
+    def control(name: str) -> str | None:
+        value = _worker_model_control(engine, worker, name, saved)
+        # Unknown is an exact restoration identity, not a physical KV dtype
+        # or layout. Geometry may still derive those from checkpoint metadata.
+        return None if value == "unknown" else value
+
+    return {name: control(name) for name in ("attention_backend", "kvcache_quant_mode")}
+
+
 def _resolve_kv_bytes_per_token(
     engine: EnginePredictionConfig,
     worker: WorkerPredictionConfig,
@@ -1321,19 +1341,21 @@ def _resolve_kv_bytes_per_token(
         pp_size=parallel.pipeline,
         moe_tp_size=parallel.moe_tensor,
         moe_ep_size=parallel.moe_expert,
+        backend=engine.backend,
+        backend_version=engine.backend_version,
+        attention_dp_size=parallel.attention_data,
+        cp_size=_prefill_cp(parallel),
+        dcp_size=_decode_cp(parallel),
         **(
             {
                 "fpm_profile": engine.fpm_profile.model_dump(mode="json"),
                 "worker_type": role,
                 "system": worker.hardware or engine.hardware,
-                "backend": engine.backend,
-                "backend_version": engine.backend_version,
-                "attention_dp_size": parallel.attention_data,
             }
             if engine.fpm_profile is not None
             else {}
         ),
-        kvcache_quant_mode=worker.timing.kvcache_quant_mode or engine.kvcache_quant_mode,
+        **_kv_geometry_controls(engine, worker),
     )
 
 

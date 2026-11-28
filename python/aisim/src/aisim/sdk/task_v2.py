@@ -1106,9 +1106,9 @@ class Task:
         # means the FP8 it runs. A whole-model FPM identity is caller-owned, as in
         # the resolvers (helpers.resolve_trtllm_mla_compute): its fmha_quant_mode
         # names the collected cell, not the kernel precision.
+        if self.forward_model == "fpm":
+            return
         for role in roles:
-            if self.forward_model == "fpm":
-                break
             if role == "decode" or self._role_attr(role, "fmha_quant_mode") != common.FMHAQuantMode.bfloat16:
                 continue
             sm_version = load_system_spec(self._role_attr(role, "system_name")).get("gpu", {}).get("sm_version")
@@ -1155,6 +1155,13 @@ class Task:
                 continue
             if self._role_attr(role, "fmha_quant_mode") != common.FMHAQuantMode.fp8:
                 continue
+            if self._architecture == "KimiK31ForConditionalGeneration":
+                database = self._try_load_role_database(role)
+                resolved_mode = getattr(
+                    database, "_default_database_mode", common.DatabaseMode[(self.database_mode or "SILICON").upper()]
+                )
+                if resolved_mode == common.DatabaseMode.SOL:
+                    continue
             ctx_ops = [ctx for ctx, _gen in self._reachable_attention_op_keys(role)]
             supported = {op: self._context_fmha_supported_modes(role, op) for op in ctx_ops}
             informative = [modes for modes in supported.values() if modes]
@@ -1197,7 +1204,10 @@ class Task:
             if len(regimes) == 2:
                 break
         backend_name = self._role_attr(role, "backend_name")
-        return [attention_op_keys(self._model_family, backend_name, large) for large in sorted(regimes or {False})]
+        return [
+            attention_op_keys(self._model_family, backend_name, large, architecture=self._architecture)
+            for large in sorted(regimes or {False})
+        ]
 
     def _attention_op_keys(self, role: str) -> tuple[str, str]:
         """The role's primary (context_op, generation_op) keys: the large-EP
@@ -1524,6 +1534,9 @@ class Task:
             database,
             ctx_op,
             self._role_attr(role, "kvcache_quant_mode"),
+            architecture=self._architecture,
+            attention_backend=self.attention_backend,
+            gemm_quant_mode=self._role_attr(role, "gemm_quant_mode"),
         )
 
     def _attention_quant_identity_mixed(self, role: str) -> bool:
@@ -2220,6 +2233,11 @@ class Task:
                 )
             return
 
+        resolved_mode = (
+            database.get_default_database_mode()
+            if hasattr(database, "get_default_database_mode")
+            else common.DatabaseMode[(self.database_mode or "SILICON").upper()]
+        )
         supported: dict = getattr(database, "supported_quant_mode", {}) or {}
         is_moe = self._is_moe
 
@@ -2289,7 +2307,9 @@ class Task:
             qp = _mode_profile(mode)
             return any(p != qp for p in _supported_profiles(mode, supported_names))
 
-        def _check(op: str, mode: Any, *, profile_transfer: bool = False) -> None:
+        def _check(
+            op: str, mode: Any, *, profile_transfer: bool = False, supported_modes: list[str] | None = None
+        ) -> None:
             if mode is None:
                 return
             # Strict per-dtype FLOPS resolution happens at every query entry
@@ -2305,8 +2325,8 @@ class Task:
             _spec = getattr(database, "system_spec", None)
             if _spec is not None and getattr(getattr(mode, "value", None), "compute_dtype", None) is not None:
                 common.get_quant_tc_flops(_spec, mode)
-            modes = supported.get(op, []) or []
-            if not modes:
+            modes = (supported.get(op, []) or []) if supported_modes is None else supported_modes
+            if not modes and supported_modes is None:
                 return  # DB doesn't record support for this op; skip
             name = mode.name if hasattr(mode, "name") else str(mode)
             if name in modes:
@@ -2363,14 +2383,66 @@ class Task:
               losing them is not silent.
             - No informative op at all -> abstain (legacy behavior for ops the
               DB records nothing about)."""
+            # SOL computes K3.1 KV layouts analytically. FP8 still requires
+            # an explicit physical backend, independently of measured coverage.
+            if (
+                self._architecture == "KimiK31ForConditionalGeneration"
+                and mode == common.KVCacheQuantMode.fp8
+                and self.attention_backend not in ("flashmla", "trtllm_mla")
+            ):
+                raise ValueError("Kimi K3.1 FP8 KV requires attention_backend=flashmla or trtllm_mla")
+            if (
+                self._architecture == "KimiK31ForConditionalGeneration"
+                and resolved_mode == common.DatabaseMode.SOL
+                and (
+                    mode
+                    in (
+                        common.KVCacheQuantMode.bfloat16,
+                        common.FMHAQuantMode.bfloat16,
+                        common.FMHAQuantMode.fp8,
+                    )
+                    or (mode == common.KVCacheQuantMode.fp8 and self.attention_backend in ("flashmla", "trtllm_mla"))
+                )
+            ):
+                # Analytic FMHA still needs hardware compute support even when
+                # it has no measured table to validate against.
+                if isinstance(mode, common.FMHAQuantMode) and getattr(database, "system_spec", None) is not None:
+                    common.get_quant_tc_flops(database.system_spec, mode)
+                ops = [op for op in ops if op not in ("dsa_context_module", "dsa_generation_module")]
+            if self.forward_model == "fpm" and self._architecture == "KimiK31ForConditionalGeneration":
+                # The whole-forward profile supplies the timing cell. Keep the
+                # physical KV backend check above, independent of timing coverage.
+                ops = [op for op in ops if op != "dsa_generation_module"]
             informative = [op for op in ops if supported.get(op)]
             if not informative:
                 return
-            _check(informative[0], mode)
+
+            def _attention_modes(op):
+                if (
+                    self._architecture != "KimiK31ForConditionalGeneration"
+                    or resolved_mode != common.DatabaseMode.SILICON
+                ):
+                    return None
+                from aisim.sdk.perf_database import context_fmha_supported_modes, dsa_generation_supported_modes
+
+                identity = dict(
+                    architecture=self._architecture,
+                    attention_backend=self.attention_backend,
+                    gemm_quant_mode=self._role_attr(role, "gemm_quant_mode"),
+                )
+                if op == "dsa_context_module":
+                    return context_fmha_supported_modes(
+                        database, op, self._role_attr(role, "kvcache_quant_mode"), **identity
+                    )
+                if op == "dsa_generation_module":
+                    return dsa_generation_supported_modes(database, **identity)
+                return None
+
+            _check(informative[0], mode, supported_modes=_attention_modes(informative[0]))
             unusable = []
             for op in informative[1:]:
                 try:
-                    _check(op, mode)
+                    _check(op, mode, supported_modes=_attention_modes(op))
                 except (ValueError, UnsupportedWideepConfigError):
                     unusable.append(op)
             if unusable:
@@ -2400,7 +2472,7 @@ class Task:
             _check("moe", self._role_attr(role, "moe_quant_mode"), profile_transfer=True)
 
         # FMHA: only meaningful for context-using workers (agg, prefill).
-        if validate_context:
+        if validate_context and self.forward_model != "fpm":
             _check_attention([ctx for ctx, _gen in attention_op_pairs], self._role_attr(role, "fmha_quant_mode"))
 
         # KV cache: only meaningful for generation-using workers (agg, decode).

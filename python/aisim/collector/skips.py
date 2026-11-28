@@ -6,6 +6,7 @@
 An entry in ``SKIPS`` skips a case when every key matches:
 
 - ``backend``, ``op`` and ``sm``: the run;
+- ``sm_except``: any explicitly selected SM outside the listed set;
 - ``model``: the ``architecture`` of the case file a model row comes from;
 - ``dtype``: the case's dtype or quant mode;
 - ``dispatch``: a kernel the op plan picks for the backend; the entry leaves
@@ -13,9 +14,9 @@ An entry in ``SKIPS`` skips a case when every key matches:
 - any other key: the case field (or property) of that name.
 
 A list matches any of its values; a callable is a predicate on the value. An
-entry without ``sm`` applies on every SM. A ``model`` entry drops that file's
+entry without either SM selector applies on every SM. A ``model`` entry drops that file's
 rows before cases are merged, so a shape another model also needs is still
-collected; besides ``model`` it may name only ``backend``, ``op`` and ``sm``.
+collected; besides ``model`` it may name only run selectors.
 
 Add an entry only when the cases would be mismeasured, would hang, would fail
 as a whole block, or come from a model the backend cannot serve. Write the
@@ -56,6 +57,16 @@ _MSA_MODULE_OPS = ["msa_context_module", "msa_generation_module"]
 _ATTENTION_OPS = ["attention_context", "attention_generation"]
 
 SKIPS: list[dict] = [
+    # The native launcher rejects all other physical SMs before spawning TP ranks
+    # (sglang/collect_kimi_k31_dsa_v1.py). Every case in that block would fail.
+    {
+        "backend": "sglang",
+        "op": ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"],
+        "sm_except": [90, 100, 103],
+    },
+    # Native K31 Gated DSA has one source-pinned SGLang implementation.
+    # Other framework implementations require their own serving audit.
+    {"backend": ["vllm", "trtllm"], "op": ["kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module"]},
     # SGLang shards DeepSeek-V4 attention by its published parallel context only
     # (MQALayer reads get_parallel().attn_tp_size; srt/models/deepseek_v4.py), which a
     # single-process collector cannot publish, so collect_dsv4_attn refuses every TP>1
@@ -494,7 +505,7 @@ SKIPS: list[dict] = [
     },
 ]
 
-_RUN_KEYS = frozenset(("backend", "op", "sm"))
+_RUN_KEYS = frozenset(("backend", "op", "sm", "sm_except"))
 _MISSING = object()
 
 # Case attribute names that carry a dtype or quant mode.
@@ -514,11 +525,12 @@ def _check(skips: list[dict]) -> None:
         if "model" in entry:
             extra = sorted(set(entry) - _RUN_KEYS - {"model"})
             if extra:
-                raise ValueError(f"{where}: a model entry may name only backend, op and sm besides model, not {extra}")
+                raise ValueError(f"{where}: a model entry may name only run selectors besides model, not {extra}")
             if not all(isinstance(model, str) for model in _values(entry["model"])):
                 raise ValueError(f"{where}.model must name case-file architectures")
-        if "sm" in entry and not all(type(sm) is int for sm in _values(entry["sm"])):
-            raise ValueError(f"{where}.sm must be SM versions")
+        for key in ("sm", "sm_except"):
+            if key in entry and not all(type(sm) is int for sm in _values(entry[key])):
+                raise ValueError(f"{where}.{key} must be SM versions")
 
 
 def _values(want) -> list:
@@ -533,6 +545,8 @@ def _matches(want, value) -> bool:
 
 def _applies(entry: dict, backend: str | None, op: str | None, sm: int | None) -> bool:
     """Whether an entry's run keys match this backend, op and SM."""
+    if "sm_except" in entry and (sm is None or _matches(entry["sm_except"], sm)):
+        return False
     for key, value in (("backend", backend), ("op", op), ("sm", sm)):
         if key in entry and (value is None or not _matches(entry[key], value)):
             return False

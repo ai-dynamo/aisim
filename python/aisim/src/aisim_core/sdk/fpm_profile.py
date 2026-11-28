@@ -83,6 +83,26 @@ def _quantization_from_engine_config(config_json: str) -> dict[str, str]:
                 f"FPM profile identity conflict: {field}={supplied!r}, "
                 f"profile {mode}={modes[mode]!r} requires wire dtype {expected!r}"
             )
+    # Native EngineConfig may repeat the recorded backend identity. Validate
+    # it here before the memory bridge omits it as a user override.
+    supplied_backend = config["extra"].get("moe_backend")
+    if supplied_backend is not None and supplied_backend != deployment.moe_backend:
+        raise ValueError(
+            f"FPM profile identity conflict: moe_backend={supplied_backend!r}, "
+            f"profile moe_backend={deployment.moe_backend!r}"
+        )
+    supplied_comm = config["extra"].get("comm_quant_mode")
+    if supplied_comm is not None and supplied_comm != modes["comm_quant_mode"]:
+        raise ValueError(
+            f"FPM profile identity conflict: comm_quant_mode={supplied_comm!r}, "
+            f"profile comm_quant_mode={modes['comm_quant_mode']!r}"
+        )
+    supplied_attention = config["extra"].get("attention_backend")
+    if supplied_attention is not None and supplied_attention != modes["attention_backend"]:
+        raise ValueError(
+            f"FPM profile identity conflict: attention_backend={supplied_attention!r}, "
+            f"profile attention_backend={modes['attention_backend']!r}"
+        )
     modes.pop("attention_backend")
     return modes
 

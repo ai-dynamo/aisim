@@ -1098,6 +1098,15 @@ class EstimatorPolicyConfig(StrictModel):
     fmha_quant_mode: str | None = None
     comm_quant_mode: str | None = None
 
+    @model_serializer(mode="wrap")
+    def _preserve_omitted_eplb(self, handler: Any):
+        payload = handler(self)
+        # A snapshot may supply True. Keep omission distinct from authored
+        # False across saved configuration round trips.
+        if "enable_eplb" not in self.model_fields_set:
+            payload.pop("enable_eplb", None)
+        return payload
+
     @model_validator(mode="after")
     def _validate_engine_controls(self):
         if self.nextn and self.nextn_accepted is None:

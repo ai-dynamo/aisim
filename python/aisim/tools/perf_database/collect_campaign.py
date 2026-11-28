@@ -46,13 +46,15 @@ into one table is the delivery step (playbook §8) and is out of scope here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import yaml
@@ -108,31 +110,64 @@ def load_plan(path: Path) -> Plan:
     return Plan(backend=str(doc["backend"]), sm=int(doc["sm"]), shards=tuple(shards))
 
 
-def pinned_image(backend: str, op: str) -> str:
-    """The manifest-pinned image for (backend, op) — family pins included."""
-    from collector.framework_manifest import resolve_op_runtime
+def _native_k31(backend: str, op: str) -> bool:
+    return backend == "sglang" and op in ("kimi_k31_dsa_context_module", "kimi_k31_dsa_generation_module")
 
-    return resolve_op_runtime(backend, op).image()
+
+def _require_native_model(op, model_path):
+    from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL
+
+    if model_path != MODEL:
+        raise SystemExit(f"{op}: native K3.1 shards require model_path: {MODEL} to select the pinned K3.1 runtime")
+
+
+def pinned_image(backend: str, op: str, model_path: str | None = None) -> str:
+    """The manifest-pinned image for (backend, op) — family pins included."""
+    from collector.framework_manifest import _model_pinned_runtime, load_manifest, resolve_op_runtime
+
+    runtime = resolve_op_runtime(backend, op)
+    if model_path is not None:
+        model_runtime = _model_pinned_runtime(load_manifest(), backend.lower(), model_path)
+        if model_runtime is not None:
+            return model_runtime.image()
+    return runtime.image()
 
 
 def collect_image_tag(base_image: str) -> str:
     """Deterministic local tag for <base image> + finalize deps."""
     name = base_image.split("@", 1)[0].replace("/", "-").replace(":", "-")
+    if "@" in base_image:
+        # Bind the immutable base, including its digest. Bound the readable
+        # prefix so the Docker tag remains within its 128-character limit.
+        name = f"{name[:50]}-{hashlib.sha256(base_image.encode()).hexdigest()}"
     return f"aisim-collect:{name}"
 
 
-def dockerfile(base_image: str) -> str:
-    return (
+def dockerfile(base_image: str, model_path: str | None = None) -> str:
+    recipe = (
         f"FROM {base_image}\n"
         "# collector finalize deps the framework image does not ship (collector/helper.py finalize_perf_files)\n"
         f"RUN pip install --no-cache-dir {' '.join(FINALIZE_DEPS)}\n"
     )
 
+    if model_path == "moonshotai/Kimi-K3.1-Pro":
+        from collector.sglang.collect_kimi_k31_dsa_v1 import MODEL, MODEL_REVISION, TOKENIZER_FILES
 
-def build_image(base_image: str, *, network: str = "host", extra_build_args: list[str] | None = None) -> str:
+        files = ("config.json", *TOKENIZER_FILES)
+        fetch = (
+            "from huggingface_hub import hf_hub_download; "
+            f"[hf_hub_download({MODEL!r}, name, revision={MODEL_REVISION!r}) for name in {files!r}]"
+        )
+        recipe += f"RUN python3 -c {shlex.quote(fetch)}\n"
+    return recipe
+
+
+def build_image(
+    base_image: str, *, model_path: str | None = None, network: str = "host", extra_build_args: list[str] | None = None
+) -> str:
     tag = collect_image_tag(base_image)
     cmd = ["docker", "build", "--network", network, "-t", tag, "-f", "-", "."] + (extra_build_args or [])
-    subprocess.run(cmd, input=dockerfile(base_image), text=True, check=True)
+    subprocess.run(cmd, input=dockerfile(base_image, model_path), text=True, check=True)
     return tag
 
 
@@ -212,6 +247,7 @@ def docker_argv(
     shard_dir: Path,
     container_name: str,
     collector_ref: str,
+    mode: str = "run",
 ) -> list[str]:
     return [
         "docker",
@@ -225,6 +261,11 @@ def docker_argv(
         "16g",
         "-e",
         "CUDA_MPS_PIPE_DIRECTORY=/nonexistent-no-mps",
+        *(
+            ["-e", "COLLECTOR_K31_FINALIZE_ONLY=1"]
+            if mode == "finalize" and _native_k31(plan.backend, shard.op)
+            else []
+        ),
         "-e",
         "HF_HUB_OFFLINE=1",
         "-e",
@@ -254,12 +295,68 @@ def shard_dir(root: Path, shard: Shard) -> Path:
     return root / shard.op / shard.name
 
 
-def shard_state(root: Path, shard: Shard) -> str:
+def _native_phase_table(op: str) -> str:
+    phase = "context" if op == "kimi_k31_dsa_context_module" else "generation"
+    return f"dsa_{phase}_module_perf.parquet"
+
+
+def _native_committed_table(directory: Path, shard: Shard, backend: str) -> bool:
+    """Require the phase's pinned runtime, committed record and Parquet row count."""
+    from collector.framework_manifest import _model_pinned_runtime, load_manifest
+    from collector.provenance import validate_collection_meta_for_update
+
+    table = Path(_native_phase_table(shard.op)).stem
+    sidecar = directory / "collection_meta.yaml"
+    if not sidecar.is_file():
+        return False
+    document = yaml.safe_load(sidecar.read_text())
+    validate_collection_meta_for_update(document, tables_to_update={table})
+    entry = document["tables"].get(table)
+    expected_runtime = _model_pinned_runtime(load_manifest(), backend, shard.model_path)
+    if entry is None or expected_runtime is None:
+        return False
+    runtimes = [document["runtime"]]
+    runtimes.extend(event["runtime"] for event in entry.get("collections", []) if "runtime" in event)
+    # Public-version equality would admit a different native source build.
+    if any(runtime["framework"] != backend or runtime["version"] != expected_runtime.version for runtime in runtimes):
+        return False
+    # Reduced legacy summaries cannot attest this native table.
+    if not (entry.get("collections") or entry.get("case_plan_hash")):
+        return False
+    import pyarrow.parquet as pq
+
+    return entry["rows"] > 0 and pq.read_metadata(directory / f"{table}.parquet").num_rows == entry["rows"]
+
+
+def shard_state(root: Path, shard: Shard, backend: str | None = None) -> str:
     d = shard_dir(root, shard)
     if not d.exists():
         return "pending"
-    if list(d.glob("*.parquet")):
+    native = backend is not None and _native_k31(backend, shard.op)
+    published = (d / _native_phase_table(shard.op)).is_file() if native else any(d.glob("*.parquet"))
+    if native:
+        from collector.helper import PERF_TRANSACTION_FILENAME, SIDECAR_TRANSACTION_FILENAME
+
+        perf_filename = Path(_native_phase_table(shard.op)).with_suffix(".txt").name
+        pending_files = (PERF_TRANSACTION_FILENAME, SIDECAR_TRANSACTION_FILENAME, f".{perf_filename}.pending")
+        if any((d / name).exists() for name in pending_files):
+            return "pending-publication"
+        if (d / perf_filename).is_file():
+            from collector.collect import ResumeCheckpoint, _checkpoint_case_ids, _checkpoint_snapshot
+
+            checkpoint = d / ".ckpt" / backend / f"{backend}.{shard.op}.json"
+            if ResumeCheckpoint.has_recoverable_checkpoint(checkpoint):
+                # The per-case receipt is removed before common finalization.
+                # Only passes in the still-open provenance event own staged
+                # rows; cumulative passes in a closed checkpoint do not.
+                snapshot = _checkpoint_snapshot(checkpoint, None, context_path=checkpoint, capture_contents=True)
+                state = json.loads(snapshot.contents)
+                if _checkpoint_case_ids(state, "done") & _checkpoint_case_ids(state, "attempted"):
+                    return "pending-publication"
+    if published and (not native or _native_committed_table(d, shard, backend)):
         return "finalized"
+    if native and published:
+        return "incomplete-provenance"
     if (d / "DONE").exists():
         return "done-no-parquet"
     if (d / ".ckpt").exists():
@@ -295,6 +392,7 @@ def run_shard(
         shard_dir=d,
         container_name=name,
         collector_ref=collector_ref,
+        mode=mode,
     )
     _log(
         root,
@@ -315,6 +413,11 @@ def run_shard(
         rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
         log.write(f"### {time.strftime('%FT%T')} exit={rc}\n")
     parquets = sorted(p.name for p in d.glob("*.parquet"))
+    if rc == 0 and _native_k31(plan.backend, shard.op) and shard_state(root, shard, plan.backend) != "finalized":
+        rc = 1
+        (d / "DONE").unlink(missing_ok=True)
+        with (d / "run.log").open("a") as log:
+            log.write("Native phase publication is incomplete. Inspect the checkpoint and publication diagnostics.\n")
     if rc == 0:
         (d / "DONE").touch()
     _log(root, {"event": "end", "mode": mode, "shard": shard.key, "gpu": gpu, "exit": rc, "parquet": parquets})
@@ -329,22 +432,89 @@ def _free_gpu(busy: dict[int, subprocess.Popen | None], gpus: list[int]) -> int 
     return None
 
 
+def _validate_shard_allocation(plan: Plan, shard: Shard, *, finalize_checkpoint: Path | None = None) -> bool:
+    """Refuse a native TP group, or require checkpoint-only recovery (True)."""
+    if not _native_k31(plan.backend, shard.op):
+        return False
+    from collector.collect import ResumeCheckpoint
+    from collector.op_plans import plan as plan_cases
+    from collector.sglang.collect_kimi_k31_dsa_v1 import validate_case
+    from collector.sglang.registry import REGISTRY
+
+    _require_native_model(shard.key, shard.model_path)
+    entry = next(entry for entry in REGISTRY if entry.op == shard.op)
+    if entry.unverified or plan.sm in entry.unverified_sms:
+        raise SystemExit(f"{shard.key}: registry marks the native op unverified on SM{plan.sm}")
+    # Match collect.py's --model-path selection, independent of the host shell.
+    previous_model = os.environ.get("COLLECTOR_MODEL_PATH")
+    try:
+        os.environ["COLLECTOR_MODEL_PATH"] = shard.model_path
+        cases = plan_cases(shard.op, plan.backend, plan.sm, include_long_context=shard.include_long_context).cases
+    finally:
+        if previous_model is None:
+            os.environ.pop("COLLECTOR_MODEL_PATH", None)
+        else:
+            os.environ["COLLECTOR_MODEL_PATH"] = previous_model
+    cases = [
+        case
+        for case in cases
+        if (not shard.model_path or case.model_path == shard.model_path)
+        and (not shard.case_filter or shard.case_filter in str(case))
+    ]
+    if not cases:
+        raise SystemExit(f"{shard.key}: no qualified native cases on SM{plan.sm}")
+    required_gpus = max(validate_case(case) for case in cases)
+    if finalize_checkpoint is not None and ResumeCheckpoint.has_recoverable_checkpoint(finalize_checkpoint):
+        # The mounted collector checks every selected ID under the output lock
+        # before publication; this flag forbids it from launching missing work.
+        return required_gpus > 1
+    if required_gpus > 1:
+        raise SystemExit(
+            f"{shard.key}: TP{required_gpus} needs {required_gpus} GPUs, but campaign shards expose one GPU; "
+            "use collector/collect.py's full-node path (collector/fullnode.py) on a dedicated "
+            "allocation exposing the full TP group, or select only TP1 cases with case_filter"
+        )
+    return False
+
+
 def run_campaign(
-    plan: Plan, *, plan_path: Path, root: Path, gpus: list[int], checkout: Path, image_override: str | None, mode: str
+    plan: Plan, *, root: Path, gpus: list[int], checkout: Path, image_override: str | None, mode: str
 ) -> int:
     """GPU pool over the plan. mode=run: skip DONE shards; mode=finalize: only done-no-parquet shards."""
     root.mkdir(parents=True, exist_ok=True)
     todo = []
+    shard_modes = {}
     for s in plan.shards:
-        st = shard_state(root, s)
-        if mode == "run" and st in ("finalized", "done-no-parquet") and (shard_dir(root, s) / "DONE").exists():
+        st = shard_state(root, s, plan.backend)
+        completed = st == "finalized" or (st == "done-no-parquet" and not _native_k31(plan.backend, s.op))
+        if mode == "run" and completed and (shard_dir(root, s) / "DONE").exists():
             continue
+        checkpoint = shard_dir(root, s) / ".ckpt" / plan.backend / f"{plan.backend}.{s.op}.json"
+        checkpoint_available = False
+        if _native_k31(plan.backend, s.op):
+            from collector.collect import ResumeCheckpoint
+
+            checkpoint_available = ResumeCheckpoint.has_recoverable_checkpoint(checkpoint)
         if mode == "finalize" and st != "done-no-parquet":
-            continue
+            if st == "incomplete-provenance":
+                raise SystemExit(
+                    f"{s.key}: incomplete-provenance; no recoverable publication can restore the native record"
+                )
+            if st == "pending-publication" and not checkpoint_available:
+                raise SystemExit(f"{s.key}: publication recovery requires its native checkpoint")
+            recoverable = st in ("started", "pending-publication") and checkpoint_available
+            if not recoverable:
+                continue
+        checkpoint_only = _validate_shard_allocation(
+            plan, s, finalize_checkpoint=checkpoint if mode == "finalize" or checkpoint_available else None
+        )
+        shard_modes[s.key] = "finalize" if checkpoint_only else mode
         todo.append(s)
     print(f"{mode}: {len(todo)}/{len(plan.shards)} shards on gpus {gpus}")
     ref = collector_ref(checkout)  # once, before any shard starts: every shard records the same commit
-    images = {s.op: (image_override or collect_image_tag(pinned_image(plan.backend, s.op))) for s in todo}
+    images = {
+        s.key: (image_override or collect_image_tag(pinned_image(plan.backend, s.op, s.model_path))) for s in todo
+    }
     for img in sorted(set(images.values())):
         if image_digest(img) is None:
             raise SystemExit(f"image {img} not present — run `build-image` for its base first")
@@ -365,22 +535,24 @@ def run_campaign(
                 sys.executable,
                 __file__,
                 "_shard",
-                "--plan",
-                str(plan_path),
+                "--backend",
+                plan.backend,
+                "--sm",
+                str(plan.sm),
                 "--root",
                 str(root),
                 "--gpu",
                 str(g),
                 "--shard",
-                s.key,
+                json.dumps(asdict(s)),
                 "--checkout",
                 str(checkout),
                 "--image",
-                images[s.op],
+                images[s.key],
                 "--collector-ref",
                 ref,
                 "--mode",
-                mode,
+                shard_modes[s.key],
             ]
         )
     for p in busy.values():
@@ -400,7 +572,7 @@ def status(plan: Plan, root: Path) -> None:
             last = next(
                 (ln for ln in reversed(tail) if "it/s" in ln or "s/it" in ln or "Completed" in ln or "exit=" in ln), ""
             )
-        print(f"{s.op:28s} {s.name:20s} {shard_state(root, s):16s} {last[:100]}")
+        print(f"{s.op:28s} {s.name:20s} {shard_state(root, s, plan.backend):16s} {last[:100]}")
 
 
 def main() -> int:
@@ -409,6 +581,7 @@ def main() -> int:
     b = sub.add_parser("build-image", help="build <manifest image for (backend, op)> + finalize deps")
     b.add_argument("--backend", required=True)
     b.add_argument("--op", required=True, help="any op of the backend; family pins may select a different image")
+    b.add_argument("--model-path", default=None, help="model identity for model-scoped runtime pins")
     b.add_argument("--build-arg", action="append", default=[], help="extra docker build args, e.g. http_proxy=...")
     for name in ("run", "finalize", "status"):
         p = sub.add_parser(name)
@@ -419,7 +592,9 @@ def main() -> int:
             p.add_argument("--checkout", type=Path, default=PKG_ROOT, help="python/aisim checkout to mount")
             p.add_argument("--image", default=None, help="override the manifest-derived collect image (A/B only)")
     h = sub.add_parser("_shard")  # internal: one shard in one container (spawned by run/finalize)
-    for flag in ("--plan", "--root", "--checkout"):
+    h.add_argument("--backend", required=True)
+    h.add_argument("--sm", required=True, type=int)
+    for flag in ("--root", "--checkout"):
         h.add_argument(flag, required=True, type=Path)
     h.add_argument("--gpu", required=True, type=int)
     h.add_argument("--shard", required=True)
@@ -428,8 +603,8 @@ def main() -> int:
     h.add_argument("--mode", required=True)
     args = ap.parse_args()
     if args.cmd == "_shard":
-        plan = load_plan(args.plan)
-        shard = next(s for s in plan.shards if s.key == args.shard)
+        shard = Shard(**json.loads(args.shard))
+        plan = Plan(backend=args.backend, sm=args.sm, shards=(shard,))
         return run_shard(
             plan,
             shard,
@@ -441,8 +616,12 @@ def main() -> int:
             mode=args.mode,
         )
     if args.cmd == "build-image":
-        base = pinned_image(args.backend, args.op)
-        tag = build_image(base, extra_build_args=[f"--build-arg={a}" for a in args.build_arg])
+        if _native_k31(args.backend, args.op):
+            _require_native_model(args.op, args.model_path)
+        base = pinned_image(args.backend, args.op, args.model_path)
+        tag = build_image(
+            base, model_path=args.model_path, extra_build_args=[f"--build-arg={a}" for a in args.build_arg]
+        )
         print(f"built {tag} from {base}")
         return 0
     plan = load_plan(args.plan.resolve())
@@ -452,7 +631,6 @@ def main() -> int:
     gpus = [int(x) for x in args.gpus.split(",") if x.strip()]
     return run_campaign(
         plan,
-        plan_path=args.plan.resolve(),
         root=args.root.resolve(),
         gpus=gpus,
         checkout=args.checkout.resolve(),

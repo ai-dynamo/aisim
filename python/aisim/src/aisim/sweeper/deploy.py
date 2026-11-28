@@ -66,6 +66,7 @@ def _engine_args_payload(
     *,
     backend_version: str,
     forward_pass_estimator: ForwardPassEstimatorSpec | None = None,
+    prefill_estimator: ForwardPassEstimatorSpec | None = None,
 ) -> dict[str, Any]:
     """Build the runner-neutral engine argument payload for one role."""
     if any(is_active_engine_model_control(name, sample.get(name)) for name in ENGINE_MODEL_CONTROL_FIELDS) and (
@@ -189,13 +190,8 @@ def _engine_args_payload(
         configured_bytes = sample[f"{role}_kv_bytes_per_token"]
         payload["kv_cache_bytes_per_token"] = (
             estimate_kv_bytes_per_token(
-                str(sample["model_name"]),
-                tp_size=tp,
-                pp_size=int(sample[f"{prefix}pp"]),
-                moe_tp_size=moe_tp,
-                moe_ep_size=moe_ep,
-                **_profile_kv_args(sample, role, backend_version),
-                **({"kvcache_quant_mode": sample["kvcache_quant_mode"]} if sample.get("kvcache_quant_mode") else {}),
+                forward_pass_estimator.model_path if forward_pass_estimator is not None else str(sample["model_name"]),
+                **_kv_geometry_args(sample, role, backend_version, forward_pass_estimator),
             )
             if configured_bytes == "auto"
             else int(configured_bytes)
@@ -204,13 +200,8 @@ def _engine_args_payload(
     if role in {"prefill", "decode"} and transfer_geometry is not None:
         payload["kv_transfer_bytes_per_token"] = (
             estimate_kv_bytes_per_token(
-                str(sample["model_name"]),
-                tp_size=int(sample["prefill_tp"]),
-                pp_size=int(sample["prefill_pp"]),
-                moe_tp_size=int(sample["prefill_moe_tp"]),
-                moe_ep_size=int(sample["prefill_moe_ep"]),
-                **_profile_kv_args(sample, "prefill", backend_version),
-                **({"kvcache_quant_mode": sample["kvcache_quant_mode"]} if sample.get("kvcache_quant_mode") else {}),
+                prefill_estimator.model_path if prefill_estimator is not None else str(sample["model_name"]),
+                **_kv_geometry_args(sample, "prefill", backend_version, prefill_estimator),
             )
             if transfer_geometry == "auto"
             else int(transfer_geometry)
@@ -223,6 +214,40 @@ def _engine_args_payload(
         if sample.get("kv_transfer_timing_mode") is not None:
             payload["kv_transfer_timing_mode"] = sample["kv_transfer_timing_mode"]
     return payload
+
+
+def _kv_geometry_args(
+    sample: dict[str, Any],
+    role: str,
+    backend_version: str,
+    estimator: ForwardPassEstimatorSpec | None,
+) -> dict[str, Any]:
+    """Use the source role's resolved layout and topology for byte geometry."""
+    prefix = _role_prefix(role)
+    resolved = estimator.config if estimator is not None else {}
+    result = {
+        "tp_size": int(sample[f"{prefix}tp"]),
+        "pp_size": int(sample[f"{prefix}pp"]),
+        "moe_tp_size": int(sample[f"{prefix}moe_tp"]),
+        "moe_ep_size": int(sample[f"{prefix}moe_ep"]),
+        "attention_dp_size": int(sample[f"{prefix}attention_dp"]),
+        "cp_size": resolved.get("cp_size", sample.get(f"{prefix}cp")) or 1,
+        "dcp_size": resolved.get("dcp", sample.get(f"{prefix}dcp")) or 1,
+        "worker_type": "aggregated" if role == "agg" else role,
+        "system": resolved.get("system", _role_hardware_sku(sample, role)),
+        "backend": resolved.get("backend", sample["backend"]),
+        "backend_version": resolved.get("backend_version", backend_version),
+        "attention_backend": resolved.get("attention_backend", sample.get("attention_backend")),
+        "kvcache_quant_mode": resolved.get("kvcache_quant_mode", sample.get("kvcache_quant_mode")),
+    }
+    # Snapshot sentinels pin restoration identity, not physical cache geometry.
+    for name in ("attention_backend", "kvcache_quant_mode"):
+        if result[name] == "unknown":
+            result[name] = None
+    profile = resolved.get("fpm_profile", sample.get("fpm_profile"))
+    if profile is not None:
+        result["fpm_profile"] = profile
+    return result
 
 
 def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any], *, backend_version: str) -> None:
@@ -260,20 +285,6 @@ def _add_grouped_prefix_caching(payload: dict[str, Any], sample: dict[str, Any],
     payload["vllm_version"] = deployment.backend_version
     # vLLM always sizes its pool with a model length, and the Rust gate refuses a rank without one.
     payload.setdefault("max_model_len", profile.context_length)
-
-
-def _profile_kv_args(sample: dict[str, Any], role: str, backend_version: str) -> dict[str, Any]:
-    if sample.get("fpm_profile") is None:
-        return {}
-    prefix = _role_prefix(role)
-    return {
-        "fpm_profile": sample["fpm_profile"],
-        "worker_type": "aggregated" if role == "agg" else role,
-        "system": _role_hardware_sku(sample, role),
-        "backend": sample["backend"],
-        "backend_version": backend_version,
-        "attention_dp_size": int(sample[f"{prefix}attention_dp"]),
-    }
 
 
 def _frontend_row(sample: dict[str, Any], role: str) -> dict[str, Any] | None:
@@ -404,9 +415,14 @@ def build_backend_deployment(
         "prefill",
         backend_version=backend_version,
         forward_pass_estimator=forward_pass_estimators.get("prefill"),
+        prefill_estimator=forward_pass_estimators.get("prefill"),
     )
     decode_args = _engine_args_payload(
-        sample, "decode", backend_version=backend_version, forward_pass_estimator=forward_pass_estimators.get("decode")
+        sample,
+        "decode",
+        backend_version=backend_version,
+        forward_pass_estimator=forward_pass_estimators.get("decode"),
+        prefill_estimator=forward_pass_estimators.get("prefill"),
     )
     return BackendDeploymentSpec(
         prefill_engine_args=prefill_args,
@@ -486,6 +502,7 @@ def _build_afd_roles_deployment(sample, backend_version, estimators, encoder):
                         "prefill",
                         backend_version=backend_version,
                         forward_pass_estimator=estimators.get("prefill"),
+                        prefill_estimator=estimators.get("prefill"),
                     )["kv_transfer_bytes_per_token"]
                 raw["kv_transfer_bytes_per_token"] = transfer
                 raw["kv_transfer_timing_mode"] = sample.get("kv_transfer_timing_mode", "destination_missing")
@@ -506,7 +523,11 @@ def _build_afd_roles_deployment(sample, backend_version, estimators, encoder):
                 else _performance_model_metadata(sample, legacy, backend_version=backend_version)
             )
             raw = _engine_args_payload(
-                sample, legacy, backend_version=backend_version, forward_pass_estimator=estimator
+                sample,
+                legacy,
+                backend_version=backend_version,
+                forward_pass_estimator=estimator,
+                prefill_estimator=estimators.get("prefill"),
             )
             count = int(sample[f"{prefix}replicas"])
         kwargs["agg_engine_args" if role == "aggregated" else f"{role}_engine_args"] = raw

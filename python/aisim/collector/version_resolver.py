@@ -148,6 +148,10 @@ def build_collections(
     Returns:
         List of collection dicts ready for collect_ops().
     """
+    if backend_name == "sglang" and ops:
+        from collector.sglang.registry import require_kimi_k31_runtime
+
+        require_kimi_k31_runtime(runtime_version, set(ops))
     collections = []
     for entry in registry:
         if ops and entry.op not in ops:

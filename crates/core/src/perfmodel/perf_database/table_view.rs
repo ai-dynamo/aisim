@@ -1653,7 +1653,8 @@ fn view_dsa_module(
                 }
                 // int(step): negative values stayed negative prefix keys.
                 let prefix = step.map(|v| v as i64).unwrap_or(0);
-                for backend in crate::perf_database::dsa::dsa_kernel_source_buckets(&ks, &kv_dtype)
+                for backend in
+                    crate::perf_database::dsa::dsa_kernel_source_buckets(&ks, &kv_dtype, &arch)?
                 {
                     source_values.put(
                         vec![
@@ -1672,7 +1673,8 @@ fn view_dsa_module(
                 }
             } else {
                 let s = row.u32(r.col("isl")?)? + row.u32(r.col("step")?)?;
-                for backend in crate::perf_database::dsa::dsa_kernel_source_buckets(&ks, &kv_dtype)
+                for backend in
+                    crate::perf_database::dsa::dsa_kernel_source_buckets(&ks, &kv_dtype, &arch)?
                 {
                     source_values.put(
                         vec![

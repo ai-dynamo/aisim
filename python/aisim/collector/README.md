@@ -41,6 +41,17 @@ separate checkpoint/output roots for before/after cost experiments; changing a
 group's point list changes its existing task ID and can repeat its older points
 on resume, while preventing newly added points from being skipped.
 
+Native Kimi K3.1 checkpoints keep a `.json.output-owner` record beside each
+producer checkpoint. Keep it with the checkpoint when moving a shard: it binds
+the output root by relative path and gives pending publication receipts a stable
+checkpoint identity across container mounts. Reusing that checkpoint directory
+for a different output root is rejected before collection and finalization.
+An existing checkpoint without an owner record cannot be attributed safely;
+preserve its files for manual recovery, or start a new collection with fresh
+checkpoint and output roots. A campaign marks a native shard complete only when
+its phase Parquet has committed `collection_meta.yaml` provenance with a matching
+row count; a missing record remains incomplete even after a zero-work resume.
+
 See [the declaration fields](cases/README.md#optional-long-context-points) and
 [coverage rationale](cases/README.md#choosing-coverage). Collection-cost
 estimates count setup changes, point preparation, warmup/capture and timed
@@ -346,13 +357,33 @@ per op, always. `families:` overrides require the op catalog
 (`op_backend_catalog.yaml`); without it, family-scoped pins fail closed rather
 than silently falling back to `default`.
 
+Runtime specifications (under `default`, `families`, or model-scoped `models`
+overrides) support these fields:
+
+| Field | Behavior |
+| --- | --- |
+| `version` | Required exact package version; must also occur among `platform_versions` values when that map is present. |
+| `images` | Required image variants, including `default`; public references require an index digest. |
+| `platform_versions` | Optional nonempty map from CPU machine name to exact package build, for platform children of the same pinned image index. |
+| `source_commit` | Immutable full 40-character lowercase Git SHA; required with `platform_versions`. |
+
+For example, Kimi K3.1's model override selects distinct exact SGLang builds
+for `x86_64` and `aarch64`, both bound to the same audited source commit and
+image index. `platform_runtime_version` selects by `platform.machine()`;
+`AMD64` and `arm64` normalize to `x86_64` and `aarch64`. An unlisted machine
+fails closed instead of using `version`. These aliases permit CPU-only planning;
+native Kimi K3.1 execution still requires Linux.
+
 WideEP runtimes (`wideep_sglang`, `wideep_trtllm`) are flattened into peer
 framework entries rather than nested under a `wideep:` key, so the same
 per-op resolution logic applies uniformly. Each WideEP entry adds
 `base_framework` (the stock framework it forks from), `data_backend` (which
 table namespace its output is written under), and `collector_dir`.
-`collect.py` requires the exact public version for a run and rejects
-mixed-pin selections across ops.
+`collect.py` uses `require_collector_runtime` to check the resolved pin. When
+the pin includes a PEP 440 local build suffix (`+...`), the complete installed
+version must equal it, including that suffix, using PEP 440 equality. A pin
+without local metadata requires the same public version but permits local
+CUDA/XPU wheel suffixes. It rejects mixed-pin selections across ops.
 
 Image digests are policy, not decoration: the rule is syntactic — any image
 reference containing `/` must be pinned with `@sha256:<64 hex>`; only bare

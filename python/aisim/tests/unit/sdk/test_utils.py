@@ -1513,7 +1513,7 @@ class TestKVCacheQuantInference:
         assert modes.get("gemm_quant_mode") == (common.GEMMQuantMode[gemm] if gemm else None)
         assert modes.get("moe_quant_mode") == (common.MoEQuantMode[moe] if moe else None)
 
-    @pytest.mark.parametrize("weight_algo", [None, "NVFP4"])
+    @pytest.mark.parametrize("weight_algo", [None, "FP8", "FP8_BLOCK", "NVFP4"])
     @pytest.mark.parametrize(
         "kv_fields,normalized_kv",
         [
@@ -1534,7 +1534,7 @@ class TestKVCacheQuantInference:
 
         assert raw.get("kv_cache_quant_algo") == normalized_kv
         if weight_algo:
-            assert modes["kvcache_quant_mode"] == common.KVCacheQuantMode.fp8
+            assert modes["kvcache_quant_mode"] == common.KVCacheQuantMode[normalized_kv or "fp8"]
             assert modes["fmha_quant_mode"] == common.FMHAQuantMode.fp8
         else:
             assert modes.get("kvcache_quant_mode") == (
@@ -1688,12 +1688,11 @@ class TestParseCompressedTensorsQuant:
         _, ignored = parse_compressed_tensors_quant(self._make_quant_config(4, "int", ignore=["re:.*self_attn.*"]))
         assert "attention" in ignored
 
-    def test_routing_experts_pattern_detected(self):
+    @pytest.mark.parametrize("pattern", [r"re:.*mlp\.experts\..*", r"re:.*routed_expert_.*"])
+    def test_routing_experts_pattern_detected(self, pattern):
         from aisim.sdk.utils import parse_compressed_tensors_quant
 
-        _, ignored = parse_compressed_tensors_quant(
-            self._make_quant_config(4, "int", ignore=["re:.*mlp\\.experts\\..*"])
-        )
+        _, ignored = parse_compressed_tensors_quant(self._make_quant_config(4, "int", ignore=[pattern]))
         assert "routing_experts" in ignored
 
     def test_shared_experts_pattern_detected_not_routing(self):
@@ -1703,6 +1702,32 @@ class TestParseCompressedTensorsQuant:
         _, ignored = parse_compressed_tensors_quant(self._make_quant_config(4, "int", ignore=["re:.*shared_experts.*"]))
         assert "shared_experts" in ignored
         assert "routing_experts" not in ignored
+
+    @pytest.mark.parametrize(
+        "projection",
+        [
+            "block_sparse_moe.routed_expert_up_proj",
+            "block_sparse_moe.routed_expert_down_proj",
+            r"re:.*block_sparse_moe\.routed_expert_(up|down)_proj.*",
+            r"re:.*block_sparse_moe\.routed_expert_(?:up|down)_proj.*",
+        ],
+    )
+    @pytest.mark.parametrize("architecture", ["KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration"])
+    def test_latent_moe_projection_exclusion_preserves_quantized_experts(self, projection, architecture):
+        from aisim.sdk import common
+        from aisim.sdk.models import _infer_quant_modes_from_raw_config
+        from aisim.sdk.utils import _attach_inferred_quant_fields, parse_compressed_tensors_quant
+
+        # Synthetic mixed-precision declaration: non-expert projections are
+        # BF16, while the expert bank retains four-bit floating-point weights.
+        quant = self._make_quant_config(4, "float", ignore=["self_attn", projection])
+        assert parse_compressed_tensors_quant(quant) == ("w4a16_mxfp4", frozenset({"attention"}))
+        raw = _attach_inferred_quant_fields(
+            {"architectures": [architecture], "text_config": {"quantization_config": quant}}
+        )
+        modes = _infer_quant_modes_from_raw_config(raw)
+        assert modes.get("gemm_quant_mode", common.GEMMQuantMode.bfloat16) == common.GEMMQuantMode.bfloat16
+        assert modes["moe_quant_mode"] == common.MoEQuantMode.w4a16_mxfp4
 
     def test_dense_mlp_pattern_detected(self):
         from aisim.sdk.utils import parse_compressed_tensors_quant
@@ -2331,3 +2356,19 @@ def test_qwen3_vl_pixel_budget_follows_the_checkpoint_processor(tmp_path, caplog
         enc_cfg = get_model_config_from_model_path(str(bare))["extra_params"]
     assert (enc_cfg.min_pixels, enc_cfg.max_pixels) == utils.QWEN3_VL_PIXEL_BOUNDS
     assert "no pixel budget" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"re:.*block_sparse_moe\.(routed_expert_up_proj|experts\..*)",
+        r"re:.*(experts|routed_expert_up_proj).*",
+        r"re:.*(?:routed_expert_(?:up|down)_proj|experts\..*)",
+        r"re:.*(shared_experts|experts|routed_expert_down_proj).*",
+    ],
+)
+def test_combined_ignore_patterns_preserve_expert_bank_exclusion(pattern):
+    from aisim_core.sdk.utils import _categorize_ignore_pattern
+
+    assert "routing_experts" in _categorize_ignore_pattern(pattern)
