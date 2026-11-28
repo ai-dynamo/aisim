@@ -11,6 +11,7 @@
 //! mode replays them cold. Block mode keeps the blocks of every group in one
 //! block pool, so that cached blocks stay until eviction.
 
+use super::state_cache_manager::GroupStateLease;
 use crate::engine::cache::vllm_block_pool::{
     BlockCopyId, BlockReservation, CacheKey, KeyInBlock, PrefixHit, VllmBlockPool,
 };
@@ -105,45 +106,16 @@ impl GroupLease {
                 debug_assert_eq!(copies.iter().flatten().count(), copies.len() - first_live);
                 copies.len() - first_live
             }
-            Self::State(state) => [
-                state.running,
-                state.hit.map(|(id, _)| id),
-                state.previous.map(|(id, _)| id),
-                state.copy,
-                state.checkpoint.map(|(id, _)| id),
-            ]
-            .into_iter()
-            .flatten()
-            .count(),
+            Self::State(state) => state.live_copies(),
             Self::Ring { copy } => usize::from(copy.is_some()),
         }
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct GroupStateLease {
-    /// The block that the request writes.
-    pub(crate) running: Option<BlockCopyId>,
-    /// A cached hit block, and the index of the block whose end it covers.
-    /// The block of a hit on a block boundary is held until the request's
-    /// next allocation.
-    pub(crate) hit: Option<(BlockCopyId, usize)>,
-    /// The running block before a boundary crossing or producer copy-on-write,
-    /// and the step after which it can go.
-    pub(crate) previous: Option<(BlockCopyId, u64)>,
-    /// The copy block of a partial hit.
-    pub(crate) copy: Option<BlockCopyId>,
-    /// A vLLM 0.32.0 prefill checkpoint block, and its token position.
-    pub(crate) checkpoint: Option<(BlockCopyId, usize)>,
-    /// The key of a state that the request published inside its running
-    /// block. The next allocation keeps that block and takes a fresh one.
-    pub(crate) published: Option<CacheKey>,
-}
-
 /// The block pool of block mode. Every group takes blocks of one page size
 /// from it, and every cached block has a `CacheKey::Grouped` key.
 pub(crate) struct GroupedBlockPool {
-    pool: VllmBlockPool,
+    pub(super) pool: VllmBlockPool,
     page_size_bytes: u64,
     /// Unique among the pools of the process, so that a residency stamp of
     /// one pool never matches another pool.
@@ -242,6 +214,31 @@ impl GroupedBlockPool {
         self.pool.grouped_keys_in_block(group, first)
     }
 
+    /// Probe only the positions listed under the first hash inside this
+    /// physical block. Attention and state each supply their own hit test.
+    pub(super) fn hit_in_block(
+        &self,
+        group: usize,
+        first: Option<SequenceHash>,
+        floor: usize,
+        top: usize,
+        alignment: usize,
+        hits: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        let mut ends = self
+            .keys_in_block(group as u16, first?)
+            .rev()
+            .map(|offset| floor + offset as usize);
+        let found = ends.find(|&end| end <= top && hits(end));
+        debug_assert!(
+            (found.unwrap_or(floor) + alignment..=top)
+                .step_by(alignment)
+                .all(|end| !hits(end)),
+            "a cached position inside a block is not listed under its block"
+        );
+        found
+    }
+
     pub(crate) fn release(&mut self, id: BlockCopyId) {
         self.pool.release(id);
     }
@@ -256,11 +253,13 @@ impl GroupedBlockPool {
     /// them.
     pub(crate) fn release_all(&mut self, ids: impl IntoIterator<Item = BlockCopyId>) {
         for id in ids {
-            self.pool.release(id);
+            self.release(id);
         }
     }
 
     pub(crate) fn cancel(&mut self, reservation: BlockReservation) {
+        // State groups consume this same reservation through the underlying pool.
+        self.note_peak();
         self.pool.cancel(reservation);
     }
 
@@ -755,12 +754,16 @@ mod tests {
                     },
                     GroupLease::Ring { copy: Some(ids[2]) },
                     GroupLease::State(GroupStateLease {
-                        running: Some(ids[3]),
+                        blocks: super::super::state_cache_manager::StateLease {
+                            working: Some(ids[3]),
+                            previous: Some(ids[5]),
+                            checkpoint: Some(ids[7]),
+                            ..Default::default()
+                        },
                         hit: Some((ids[4], 1)),
-                        previous: Some((ids[5], 2)),
                         copy: Some(ids[6]),
-                        checkpoint: Some((ids[7], 8)),
-                        published: None,
+                        checkpoint_position: 8,
+                        ..Default::default()
                     }),
                 ],
                 allocated: true,

@@ -3198,72 +3198,89 @@ fn single_group_cores(version: &str) -> (VllmCore, VllmCore) {
     (linear, grouped)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ObservedPass {
+    admissions: Vec<(Uuid, usize)>,
+    computed: Vec<(Uuid, usize)>,
+    completed: Vec<Uuid>,
+    active_blocks: usize,
+}
+
+/// Observe the scheduler entry point, including intervening idle passes and
+/// the pass that drops the last block. Future arrivals can reuse cached state.
+fn replay_passes(
+    core: &mut VllmCore,
+    requests: &[PlannedRequest],
+) -> (Vec<ObservedPass>, Vec<usize>) {
+    let mut trace = TraceCollector::default();
+    let mut passes = Vec::new();
+    let mut peaks = Vec::new();
+    let mut pending = requests.iter().peekable();
+    for pass in 0..400 {
+        while let Some(&&(id, at, ranges, output)) = pending.peek()
+            && at == pass
+        {
+            let tokens = ranges.iter().flat_map(|&(a, b)| a..b).collect();
+            submit_tokens(core, id, tokens, output);
+            pending.next();
+        }
+        if let Some(pool) = core
+            .kv_manager
+            .grouped()
+            .and_then(|grouped| grouped.block_pool())
+        {
+            pool.reset_peak_active_blocks();
+        }
+        let result = core.execute_pass(&mut trace, pass as f64);
+        if let Some(pool) = core
+            .kv_manager
+            .grouped()
+            .and_then(|grouped| grouped.block_pool())
+        {
+            peaks.push(pool.peak_active_blocks());
+        }
+        let mut computed = core
+            .state
+            .requests
+            .iter()
+            .map(|(id, r)| (*id, r.num_computed_tokens))
+            .collect::<Vec<_>>();
+        computed.sort();
+        assert!(result.output_signals.iter().all(|signal| !signal.rejected));
+        passes.push(ObservedPass {
+            admissions: result
+                .admissions
+                .iter()
+                .map(|a| (a.uuid, a.reused_input_tokens))
+                .collect(),
+            computed,
+            completed: result
+                .output_signals
+                .iter()
+                .filter(|s| s.completed)
+                .map(|s| s.uuid)
+                .collect(),
+            active_blocks: core.kv_manager.num_active_blocks(),
+        });
+        if pending.peek().is_none() && core.is_drained() {
+            assert_eq!(passes.last().unwrap().active_blocks, 0);
+            return (passes, peaks);
+        }
+    }
+    panic!("replay did not drain");
+}
+
 #[test]
 fn single_full_attention_group_matches_the_linear_pool() {
-    // Every rule row. One full-attention group at the hash block leaves every
-    // row difference inert (the last cacheable stop, the partial tail and the
-    // checkpoint block), so every row matches the linear pool.
     for version in ["0.31.0", "0.32.0", "0.33.0"] {
         let (mut linear, mut grouped) = single_group_cores(version);
-        let mut linear_trace = TraceCollector::default();
-        let mut grouped_trace = TraceCollector::default();
-        let computed = |core: &VllmCore| {
-            let mut computed: Vec<(Uuid, usize)> = core
-                .state
-                .requests
-                .iter()
-                .map(|(id, request)| (*id, request.num_computed_tokens))
-                .collect();
-            computed.sort();
-            computed
-        };
-        let mut next = 0;
-        let mut hits = Vec::new();
-        for pass in 0..400 {
-            while let Some(&(id, at, ranges, output)) = SINGLE_GROUP_PLAN.get(next)
-                && at == pass
-            {
-                let tokens: Vec<u32> = ranges.iter().flat_map(|&(a, b)| a..b).collect();
-                submit_tokens(&mut linear, id, tokens.clone(), output);
-                submit_tokens(&mut grouped, id, tokens, output);
-                next += 1;
-            }
-            let expected = linear.execute_pass(&mut linear_trace, pass as f64);
-            let actual = grouped.execute_pass(&mut grouped_trace, pass as f64);
-            let reused = |admissions: &[crate::engine::scheduler::AdmissionEvent]| {
-                admissions
-                    .iter()
-                    .map(|admission| (admission.uuid, admission.reused_input_tokens))
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(
-                reused(&actual.admissions),
-                reused(&expected.admissions),
-                "{version} pass {pass}"
-            );
-            assert_eq!(
-                computed(&grouped),
-                computed(&linear),
-                "{version} pass {pass}"
-            );
-            assert_eq!(
-                grouped.kv_manager.num_active_blocks(),
-                linear.kv_manager.num_active_blocks(),
-                "{version} pass {pass}"
-            );
-            assert!(
-                expected
-                    .output_signals
-                    .iter()
-                    .chain(&actual.output_signals)
-                    .all(|output| !output.rejected)
-            );
-            hits.extend(reused(&actual.admissions));
-            if next == SINGLE_GROUP_PLAN.len() && linear.is_drained() && grouped.is_drained() {
-                break;
-            }
-        }
-        assert!(linear.is_drained() && grouped.is_drained(), "{version}");
+        let (expected, _) = replay_passes(&mut linear, &SINGLE_GROUP_PLAN);
+        let (actual, _) = replay_passes(&mut grouped, &SINGLE_GROUP_PLAN);
+        assert_eq!(actual, expected, "{version}");
+        let hits: Vec<_> = actual
+            .iter()
+            .flat_map(|p| p.admissions.iter().copied())
+            .collect();
         // The linear cap is `known - 1` floored to the block
         // (`apply_prefix_recompute`), the grouped one `num_tokens - 1` floored to
         // the alignment (`mgr:289-295`). With one group both are the block.
@@ -3290,5 +3307,135 @@ fn single_full_attention_group_matches_the_linear_pool() {
             ],
             "{version}"
         );
+    }
+}
+
+/// An aligned hit uses one cached block per physical state slot. A linear
+/// state can span several slots, while grouped replay gives each its own group.
+#[test]
+fn grouped_state_matches_state_cache_for_aligned_hits_and_checkpoints() {
+    let requests: &[PlannedRequest] = &[
+        (1, 0, &[(0, 13)], 2),
+        (2, 5, &[(0, 12), (40, 47)], 2),
+        (3, 5, &[(0, 12), (60, 65)], 1),
+    ];
+    for (version, checkpoint) in GLM_CORES {
+        for width in [1, 2] {
+            let base = || {
+                MockEngineArgs::builder()
+                    .block_size(4)
+                    .max_num_batched_tokens(Some(16))
+                    .max_num_seqs(Some(3))
+                    .max_model_len(Some(64))
+                    .enable_prefix_caching(true)
+                    .prefix_match_unit(Some(4))
+                    .speedup_ratio(0.0)
+            };
+            let mut linear = VllmCore::new(
+                base()
+                    .num_gpu_blocks(32)
+                    .kv_cache_bytes_per_token(Some(4))
+                    .state_cache(Some(crate::engine::StateCacheConfig {
+                        bytes_per_request: 16 * width,
+                        sliding_window: None,
+                        num_speculative_states: None,
+                        prefill_checkpoint: checkpoint,
+                        junction_checkpoints: false,
+                    }))
+                    .build()
+                    .unwrap(),
+            );
+            let mut attention = group("attention", 4, 16, None);
+            attention.prefix_cacheable = Some(true);
+            let mut groups = vec![attention];
+            for i in 0..width {
+                let mut state = state(&format!("state_{i}"), 16, 1);
+                state.prefix_cacheable = Some(true);
+                if version != "0.31.0" {
+                    state.prefill_checkpoint_blocks = Some(u32::from(checkpoint));
+                    state.prefill_checkpoint_alignment = checkpoint.then_some(1);
+                }
+                groups.push(state);
+            }
+            let mut grouped = VllmCore::new(
+                base()
+                    .num_gpu_blocks(1)
+                    .vllm_version(Some(version.into()))
+                    .kv_cache_groups(groups)
+                    .kv_cache_capacity_bytes(Some(32 * 16))
+                    .build()
+                    .unwrap(),
+            );
+            let (expected, _) = replay_passes(&mut linear, requests);
+            let (actual, _) = replay_passes(&mut grouped, requests);
+            assert_eq!(
+                actual, expected,
+                "{version}, checkpoint {checkpoint}, {width} slots"
+            );
+            assert_eq!(
+                actual
+                    .iter()
+                    .flat_map(|p| &p.admissions)
+                    .map(|(_, hit)| *hit)
+                    .collect::<Vec<_>>(),
+                [0, 12, 12]
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_state_partial_hit_with_different_attention_and_state_blocks() {
+    // A partial hit at 14 is a full sequence of attention blocks plus a
+    // two-token attention tail. It is six tokens into an eight-token state.
+    let requests: &[PlannedRequest] = &[(1, 0, &[(0, 15)], 2), (2, 6, &[(0, 14), (100, 107)], 2)];
+    for version in ["0.31.0", "0.32.0", "0.33.0"] {
+        let mut attention = group("attention", 4, 8, None);
+        attention.prefix_cacheable = Some(true);
+        let mut recurrent = state("state", 8, 1);
+        recurrent.block_size_tokens = 8;
+        recurrent.prefix_cacheable = Some(true);
+        if version != "0.31.0" {
+            recurrent.prefill_checkpoint_blocks = Some(0);
+        }
+        let mut core = prefix_core(vec![attention, recurrent], 16 * 8, 8, 2, version);
+        let (actual, peaks) = replay_passes(&mut core, requests);
+        let hits: Vec<_> = actual
+            .iter()
+            .flat_map(|p| &p.admissions)
+            .map(|(_, hit)| *hit)
+            .collect();
+        assert_eq!(hits, [0, 14]);
+        assert_eq!(
+            actual.iter().map(|p| p.active_blocks).collect::<Vec<_>>(),
+            [3, 5, 5, 6, 0, 0, 5, 7, 8, 0]
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(|p| p.computed.first().map(|(_, n)| *n))
+                .collect::<Vec<_>>(),
+            [
+                Some(8),
+                Some(12),
+                Some(14),
+                Some(15),
+                None,
+                None,
+                Some(16),
+                Some(20),
+                Some(21),
+                None
+            ]
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .enumerate()
+                .flat_map(|(pass, p)| p.completed.iter().map(move |id| (pass, id.as_u128())))
+                .collect::<Vec<_>>(),
+            [(4, 1), (9, 2)]
+        );
+        assert_eq!(peaks, [3, 5, 5, 6, 6, 0, 7, 7, 8, 8]);
     }
 }

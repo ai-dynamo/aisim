@@ -564,6 +564,7 @@ identify the modified source material.
 
 The repository-root files `crates/core/src/engine/scheduler/vllm/core.rs`,
 `crates/core/src/engine/kv_manager/{state_cache_manager,vllm_backend}.rs`,
+`crates/core/src/engine/kv_manager/state_cache_manager/align.rs`,
 `crates/core/src/engine/cache/vllm_block_pool.rs`,
 `crates/core/src/engine/kv_manager/g1_manager.rs`,
 and `crates/core/src/engine/kv_manager/state_cache_tests.rs` adapt the align-mode
@@ -624,6 +625,8 @@ boundary is one whole-state copy, and no upstream source file is vendored.
 
 
 The repository-root files `crates/core/src/engine/kv_manager/grouped_prefix.rs`,
+`crates/core/src/engine/kv_manager/state_cache_manager.rs`,
+`crates/core/src/engine/kv_manager/state_cache_manager/{align,grouped}.rs`,
 `crates/core/src/engine/kv_manager/grouped_prefix_tests.rs` (its test module,
 with cases ported from the upstream tests) and
 `crates/core/src/engine/kv_manager/grouped.rs` adapt rules of vLLM v0.31.0,
@@ -633,10 +636,12 @@ vLLM v0.33.0, immutable commit `4ba787ec9959e566d3b587a796dff07673324da5`.
 From `kv_cache_coordinator.py`, `block_pool.py` and
 `single_type_kv_cache_manager.py`, the block mode of `grouped.rs` adapts the one
 block pool of all groups, the capacity cost of a cached hit block that leaves
-the free queue, the tail-first free order of a request's cached blocks and the
-blocks that a request holds in a state group: the running block, a hit block,
-the previous running block, the copy block of a partial hit and the prefill
-checkpoint block of v0.32.0.
+the free queue and the tail-first free order of a request's cached blocks.
+The state cache manager and its grouped module adapt the state block lifecycle
+in `single_type_kv_cache_manager.py`: the running block, a hit block, the previous
+running block, partial-hit copy sources and destinations, and the prefill
+checkpoint block of v0.32.0. The grouped module models when each state key
+becomes visible and which positions to search for a reusable state.
 In `grouped_prefix.rs`, one rule table keyed by the vLLM version holds the three
 rows. The v0.33.0 row follows the rules of v0.32.0, which the listed v0.33.0
 files keep for a cache without speculative decoding.
@@ -644,15 +649,15 @@ From `kv_cache_coordinator.py`, `grouped_prefix.rs` adapts the hybrid cache-hit
 lookup over the spec groups, the hit alignment, the scheduler block, the pinning
 of the hit blocks before an allocation and the release of the groups in group
 order. From `single_type_kv_cache_manager.py`, it adapts the hit rules of each
-group type, the copy of a hit that ends inside a block, the cached partial-tail
-entry, the state retention and the block lifetimes of an allocation, with the
-checkpoint block of v0.32.0. From `kv_cache_manager.py`, it adapts the hit cap,
+attention group type, the copy of an attention hit that ends inside a block
+and the cached partial-tail entry. From `kv_cache_manager.py`, it adapts the hit cap,
 the junction of a hit, the whole-prompt block count of an admission and the
 release of the skipped blocks before an allocation. From `sched/scheduler.py`,
-it adapts the align-mode prefill split, with the checkpoint branch of v0.32.0,
-and the release of a copied hit block at the end of its step. From
-`kv_cache_interface.py`, it adapts the admission cap of a sliding-window group
-and the checkpoint block of v0.32.0, with its position and its validity test.
+the state cache manager adapts the release of a copied hit block at the end of
+its step. Its align module adapts the prefill split and retention boundaries,
+including the checkpoint branch of v0.32.0 and the checkpoint position and
+validity tests in `kv_cache_interface.py`. The grouped coordinator adapts the
+admission cap of a sliding-window group from that same interface.
 From `block_pool.py`, it adapts the lookup of one spec group and the free order
 of cached blocks. From `kv_cache_utils.py`, it adapts the rule that the hash
 block divides the block of every prefix-cacheable group. From `engine/core.py`,
@@ -2648,8 +2653,9 @@ Copyright contributors to the vLLM project. Licensed under Apache-2.0.
 The full license text is reproduced in `LICENSE`.
 
 The same revision supplies the fine-grained MTP lookup and prefill-boundary
-behavior in repository-root `crates/core/src/engine/kv_manager/vllm_backend.rs`
-and `crates/core/src/engine/scheduler/vllm/core.rs`.
+behavior in repository-root `crates/core/src/engine/kv_manager/vllm_backend.rs`,
+`crates/core/src/engine/kv_manager/state_cache_manager/align.rs` and
+`crates/core/src/engine/scheduler/vllm/core.rs`.
 The source paths are `vllm/v1/core/single_type_kv_cache_manager.py`,
 `vllm/v1/core/kv_cache_coordinator.py`, `vllm/v1/core/kv_cache_manager.py`,
 `vllm/v1/core/sched/scheduler.py`, and `vllm/v1/kv_cache_interface.py`.
@@ -2662,7 +2668,8 @@ adapts `vllm/v1/core/kv_cache_utils.py` at that revision.
 ## vLLM Mamba2 prefill checkpoints and the EAGLE drop switch
 
 The internal prefill checkpoints in repository-root
-`crates/core/src/engine/kv_manager/{state_cache_manager,vllm_backend}.rs` and
+`crates/core/src/engine/kv_manager/{state_cache_manager,vllm_backend}.rs`,
+`crates/core/src/engine/kv_manager/state_cache_manager/align.rs` and
 `crates/core/src/engine/scheduler/vllm/core.rs`, the
 `disable_eagle_block_drop` switch, and the tests in
 `crates/core/src/engine/scheduler/vllm/hybrid_prefix_tests.rs` (which also cover

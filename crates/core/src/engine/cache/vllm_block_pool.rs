@@ -40,7 +40,7 @@ pub(crate) enum CacheKey {
 }
 
 impl CacheKey {
-    fn prefix_hash(self) -> SequenceHash {
+    pub(in crate::engine) fn prefix_hash(self) -> SequenceHash {
         match self {
             Self::Token(hash) | Self::State { prefix: hash, .. } | Self::Grouped { hash, .. } => {
                 hash
