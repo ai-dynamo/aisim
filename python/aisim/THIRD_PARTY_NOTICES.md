@@ -2717,3 +2717,22 @@ https://github.com/ai-dynamo/aiconfigurator/blob/d1fe4661bca3af24daab50300f196f6
 
 Modified for AISim's current layout and contracts; source links are
 preserved beside the adapted content.
+
+## AIConfigurator PR #1611 migration
+
+The following repository-root paths contain modified adaptations of the
+AIConfigurator contribution at immutable commit `7ce66d6c01f77365e2592956f99be4ff0ae6eecc`:
+
+- `python/aisim/collector/sglang/collect_dsv4_attn.py` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/7ce66d6c01f77365e2592956f99be4ff0ae6eecc/collector/sglang/collect_dsv4_attn.py
+- `python/aisim/tests/unit/collector/sglang/test_collect_dsv4_attn_contract.py` from
+  https://github.com/ai-dynamo/aiconfigurator/blob/7ce66d6c01f77365e2592956f99be4ff0ae6eecc/tests/unit/collector/sglang/test_collect_dsv4_attn_contract.py
+
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+The contribution was submitted by xinjun.jiang. Licensed under Apache-2.0;
+the license text is included in the repository and Python distribution.
+Upstream license:
+https://github.com/ai-dynamo/aiconfigurator/blob/7ce66d6c01f77365e2592956f99be4ff0ae6eecc/LICENSE
+
+Modified for AISim's current layout and contracts; source links are
+preserved beside the adapted content.
