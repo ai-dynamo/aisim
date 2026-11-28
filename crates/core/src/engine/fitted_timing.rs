@@ -382,7 +382,8 @@ pub(crate) fn detailed_rank_metrics(
 /// Require execution a regression or learned `mode` estimator can price
 /// through its iteration query: no speculation scheme but MTP, speculative
 /// rounds (`nextn > 0` or MTP) only for a vLLM regression (which pins the
-/// depth it was fitted at), and no bounded decoder replay.
+/// depth it was fitted at) or a learned artifact (whose recorded training
+/// depth construction checks), and no bounded decoder replay.
 pub(crate) fn require_fitted_execution(
     mode: EstimationMode,
     backend: &str,
@@ -390,14 +391,15 @@ pub(crate) fn require_fitted_execution(
     speculation_kind: Option<&str>,
     decoder_replay: bool,
 ) -> Result<()> {
-    let nextn_priced =
-        !nextn_positive || (mode == EstimationMode::FpmRegression && backend == "vllm");
+    let nextn_priced = !nextn_positive
+        || mode == EstimationMode::FpmLearned
+        || (mode == EstimationMode::FpmRegression && backend == "vllm");
     let mode = wire_name(mode);
     ensure!(
         nextn_priced && speculation_kind.is_none_or(|kind| matches!(kind, "none" | "mtp")),
         "{mode} replay does not support speculative decoding here: speculation schemes other \
          than MTP are rejected, and nextn > 0 or MTP is priced only by a vLLM fpm_regression \
-         snapshot, at the depth it was fitted at"
+         snapshot or an fpm_learned artifact, at the depth it was trained at"
     );
     ensure!(
         !decoder_replay,
@@ -563,26 +565,36 @@ mod tests {
     }
 
     #[test]
-    fn mtp_replay_requires_a_vllm_regression() {
-        require_fitted_execution(
+    fn mtp_replay_requires_a_vllm_regression_or_a_learned_artifact() {
+        for (mode, backend) in [
+            (EstimationMode::FpmRegression, "vllm"),
+            (EstimationMode::FpmLearned, "sglang"),
+            (EstimationMode::FpmLearned, "vllm"),
+        ] {
+            for kind in [None, Some("mtp")] {
+                require_fitted_execution(mode, backend, true, kind, false).unwrap();
+            }
+        }
+        let error = require_fitted_execution(
             EstimationMode::FpmRegression,
-            "vllm",
+            "sglang",
             true,
             Some("mtp"),
             false,
         )
-        .unwrap();
-        for (mode, backend) in [
-            (EstimationMode::FpmLearned, "vllm"),
-            (EstimationMode::FpmRegression, "sglang"),
-        ] {
-            let error = require_fitted_execution(mode, backend, true, Some("mtp"), false)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("nextn > 0 or MTP is priced only by a vLLM fpm_regression snapshot, at the depth it was fitted at"),
-                "{error}"
-            );
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "nextn > 0 or MTP is priced only by a vLLM fpm_regression snapshot or an \
+                 fpm_learned artifact, at the depth it was trained at"
+            ),
+            "{error}"
+        );
+        // Other schemes stay rejected for both estimators.
+        for mode in [EstimationMode::FpmRegression, EstimationMode::FpmLearned] {
+            assert!(require_fitted_execution(mode, "vllm", true, Some("eagle3"), false).is_err());
+            assert!(require_fitted_execution(mode, "vllm", false, Some("ngram"), false).is_err());
         }
     }
 

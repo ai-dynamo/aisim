@@ -33,8 +33,10 @@ worker's attention-DP ranks; when the artifact reads `req_*`, `slot*` or
 length-variance features, replay supplies each rank's per-request
 `extend_lengths` / `past_kv_lengths` and variances from its scheduled requests
 (see [engine replay timing](../configuration.md#engine-replay-timing)). Replay
-rejects a learned role without a forest store for the work it schedules, a rank
-hosting the vision encoder, and speculative decoding.
+rejects a learned role without a forest store for the work it schedules and a
+rank hosting the vision encoder. Of the speculative decoding schemes, replay
+prices only MTP, with an artifact trained on MTP rounds at the configured depth
+(see [MTP speculative decoding](configuration.md#mtp-speculative-decoding)).
 
 The original PR 280 design rationale, model details, evaluation method and result
 tables are in [`design.md`](design.md). Online update equations, causal selection
@@ -192,6 +194,22 @@ python -m aisim_core.sdk.fpm_learned train \
   Aggregated engines get up to four stores (`pure_decode`,
   `contains_locally_mixed`, `cross_rank_aggregated`, `pure_prefill`), selected
   by the same rule the regression fallback uses.
+- `metadata.nextn` records the MTP draft depth of the training steps; replay
+  accepts the artifact only at that depth (see
+  [MTP speculative decoding](configuration.md#mtp-speculative-decoding)). The
+  trainer reads it from the step fields `spec_num_steps` and
+  `spec_num_draft_tokens`, which must agree on one chain depth
+  (`spec_num_draft_tokens = spec_num_steps + 1`) across active steps. The
+  SGLang FPM hook extension proposed in
+  [ai-dynamo/aisim#872](https://github.com/ai-dynamo/aisim/pull/872) records
+  them; no hook in this release does. They describe the draft chain's shape,
+  which other chain-draft schemes such as EAGLE share, so they do not prove
+  the steps ran MTP: train only on captures from an MTP deployment. For
+  telemetry without these fields, declare the depth with `--nextn N`; the
+  default is 0 (no speculative decoding). The depth must be 0 to 5, the range
+  a configuration accepts. Train one artifact per depth. Per-request extend
+  lengths must match the verify width replay queries at that depth (see the
+  linked section).
 - `--join-ranks` defaults to `none`: every record is one iteration.
   `counter` keys records by `(worker_id, counter_id)` and rejects repeated
   keys, but refuses records from more than one `dp_rank` per key. Dynamo's
@@ -912,8 +930,10 @@ pooled ten-run training time are in `design.md` §8. Artifacts are 100–450 KB 
 - Learned mode uses explicit `estimation_mode: fpm_learned` through
   `best_available(config)`. Its callers provide complete iteration telemetry;
   engine replay, engine CLI and Sweeper build it per pass from the scheduled
-  requests and never tune the model. Speculative decoding is unsupported by
-  learned mode.
+  requests and never tune the model. Of the speculative decoding schemes,
+  learned mode prices only MTP, and only with an artifact trained on MTP
+  rounds at the configured depth (`metadata.nextn`). See
+  [MTP speculative decoding](configuration.md#mtp-speculative-decoding) for the rules.
 
 - Stock Dynamo FPM v1 carries aggregates only (counts, sums, variances). The
   per-request `extend_lengths` / `past_kv_lengths` lists are an additive

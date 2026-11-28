@@ -10,6 +10,7 @@ searched, and Core's restoration rejects any other candidate.
 
 from __future__ import annotations
 
+import json
 import shutil
 from copy import deepcopy
 from pathlib import Path
@@ -789,7 +790,7 @@ def test_an_aggregated_planner_regression_prices_prefill_decode_and_mixed_passes
         (
             "sglang-nextn",
             lambda raw, w: raw["engine"].update(backend="sglang"),
-            r"records nextn=1; only a vLLM fpm_regression model prices MTP rounds",
+            r"records nextn=1; only a vLLM fpm_regression model or an fpm_learned model prices MTP rounds",
         ),
         ("no-kv", lambda raw, w: None, r"does not record deployment_limits.max_kv_tokens"),
         ("no-limits", lambda raw, w: None, r"does not record deployment_limits.max_kv_tokens"),
@@ -811,17 +812,26 @@ def test_planner_snapshot_rules_fail_validation(planner_snapshots, name, edit, m
         _space(raw)
 
 
-def test_a_learned_snapshot_fitted_with_mtp_is_rejected_on_vllm():
-    # Replay prices nextn > 0 only with a vLLM fpm_regression model.
+@pytest.mark.parametrize("backend", ["vllm", "sglang"])
+def test_a_learned_snapshot_fitted_with_mtp_is_accepted(backend):
+    # A learned artifact trained on MTP rounds prices them; restoration checks its trained depth.
     summary = {
         "kind": "learned_frozen",
         "selected_estimation_mode": "fpm_learned",
         "readiness": {"stores": [{"workload_kind": "pure_decode", "ready": True}]},
-        "identity": {"backend": "vllm", "nextn": 1},
+        "identity": {
+            "backend": backend,
+            "nextn": 1,
+            "backend_version": "unknown",
+            "deployment_limits": {"max_kv_tokens": 8192, "max_num_batched_tokens": 8192, "max_num_seqs": 256},
+        },
     }
     snapshot = SnapshotRole(role="decode", path="snapshot", summary=summary, config={})
-    with pytest.raises(ValueError, match=r"records nextn=1; only a vLLM fpm_regression model prices MTP rounds"):
-        _validate_fitted(snapshot)
+    _validate_fitted(snapshot)
+    summary["selected_estimation_mode"] = "fpm_regression"
+    if backend != "vllm":
+        with pytest.raises(ValueError, match=r"records nextn=1; only a vLLM fpm_regression model or an fpm_learned"):
+            _validate_fitted(snapshot)
 
 
 def test_planner_snapshots_without_the_role_stores_are_rejected(planner_snapshots):
@@ -944,6 +954,65 @@ def test_a_vllm_planner_snapshot_fitted_with_mtp_is_recommended_and_replayed_at_
         "expected_accepted_tokens": engine.pop("nextn_accepted"),
     }
     assert _replay(prediction).metrics["mean_tpot_ms"] == candidate.metrics["mean_tpot_ms"]
+
+
+@pytest.mark.parametrize("saved", [{"nextn": 1}, {"speculation": {"kind": "mtp", "params": {"depth": 1}}}])
+def test_a_learned_snapshot_trained_on_mtp_is_recommended_and_replayed_at_its_depth(tmp_path, saved):
+    # A constant 5 ms forest trained on depth-1 MTP rounds, saved with either spelling of that depth.
+    stump = {"left": [-1], "right": [-1], "feature": [-1], "threshold": [0.0], "value": [0.0]}
+    artifact = tmp_path / "forest.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "schema": "aic_fpm_learned_forward_perf",
+                "schema_version": 1,
+                "worker_type": "aggregated",
+                "target": "ms",
+                "features": ["num_decode_requests"],
+                "stores": {
+                    kind: {"baseline": 5.0, "trees": [stump]}
+                    for kind in ("pure_decode", "pure_prefill", "contains_locally_mixed")
+                },
+                "metadata": {"nextn": 1},
+            }
+        )
+    )
+    model = RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=_MODEL,
+            system="unknown",
+            backend="vllm",
+            backend_version="unknown",
+            worker_type="aggregated",
+            tp="unknown",
+            pp="unknown",
+            attention_dp="unknown",
+            kv_block_size=_BLOCK,
+            estimation_mode="fpm_learned",
+            estimator_config={"fpm_learned": {"artifact_path": str(artifact), "adaptation": "frozen"}},
+            deployment_limits=_LIMITS,
+            **saved,
+        )
+    )
+    raw = _planner_request(_moved(model, tmp_path, "learned-mtp", include_perf_db=False), mode="aggregated")
+    raw["engine"].update(nextn=1, nextn_accepted=0.5)
+    result = _planner_run(raw)
+    assert result.counts.feasible == 1, [record.reason for record in result.candidates]
+    [candidate] = result.selected_candidates
+    assert candidate.prediction_config["engine"]["nextn"] == 1
+    assert _replay(candidate.prediction_config).metrics["mean_tpot_ms"] == candidate.metrics["mean_tpot_ms"]
+    # An MTP scheme of the same depth is the same nextn; another depth is rejected.
+    prediction = deepcopy(candidate.prediction_config)
+    engine = prediction["engine"]
+    engine["speculation"] = {
+        "kind": "mtp",
+        "params": {"depth": engine.pop("nextn")},
+        "expected_accepted_tokens": engine.pop("nextn_accepted"),
+    }
+    assert _replay(prediction).metrics["mean_tpot_ms"] == candidate.metrics["mean_tpot_ms"]
+    raw["engine"].update(nextn=2, nextn_accepted=1.0)
+    with pytest.raises((ValidationError, ValueError), match="nextn"):
+        _space(raw)
 
 
 @pytest.mark.parametrize("depth", [3, 3.0])

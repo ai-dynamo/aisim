@@ -1286,10 +1286,11 @@ pub struct DecodeWork {
     pub kv_bound_tokens: usize,
     /// Per-request context lengths, in no particular order.
     pub lengths: Vec<usize>,
-    /// Tokens each request of `lengths` verifies in this forward, in the same
-    /// order: one plus the drafts the scheduler gave it, which the token
+    /// Query tokens each request of `lengths` computes in this forward, in the
+    /// same order: one plus the drafts the scheduler gave it, which the token
     /// budget, the context limit or drafts not yet ready can make fewer than
-    /// `verify_width`.
+    /// `verify_width`. vLLM's native MTP counts padded positions, which it
+    /// computes but cannot accept.
     pub widths: Vec<usize>,
     /// Tokens each request verifies in this forward: one plus the configured
     /// speculative (MTP) depth, or one without speculation.

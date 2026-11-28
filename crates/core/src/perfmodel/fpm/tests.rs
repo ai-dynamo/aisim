@@ -2601,6 +2601,28 @@ fn learned_model_predicts_from_artifact_json() {
 }
 
 #[test]
+fn directly_loaded_mtp_learned_artifact_rejects_draft_length_scaling() {
+    // `from_learned` carries no configuration, so the guard must read the
+    // artifact's recorded depth: an MTP forest already measures the round.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&learned_decode_artifact_json()).unwrap();
+    value["metadata"]["nextn"] = 3.into();
+    let model = ForwardPassPerfModel::from_learned(&value.to_string(), Default::default()).unwrap();
+    let query = [decode_fpm(2, 1000, 0.0)];
+    assert!(
+        model
+            .estimate_forward_pass_time_ms(&query)
+            .unwrap()
+            .is_some()
+    );
+    let error = model
+        .estimate_speculative_forward_pass_time_ms(&query, 3)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("requires an ordinary STP FPM"), "{error}");
+}
+
+#[test]
 fn speculative_scaling_uses_stp_learned_predictions_without_mutating_tuning() {
     let model =
         ForwardPassPerfModel::from_learned(&learned_decode_artifact_json(), Default::default())
@@ -3298,6 +3320,62 @@ fn canonical_learned_fixture(path: &std::path::Path) -> crate::ForwardPassPerfMo
     config.estimator_config.fpm_learned.artifact_path = Some(path.to_owned());
     config.estimator_config.fpm_learned.adaptation = crate::LearnedAdaptation::Frozen;
     config
+}
+
+#[test]
+fn canonical_learned_requires_the_artifact_trained_mtp_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact = |nextn: Option<serde_json::Value>| {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&learned_decode_artifact_json()).unwrap();
+        if let Some(nextn) = nextn {
+            value["metadata"]["nextn"] = nextn;
+        }
+        let path = dir
+            .path()
+            .join(format!("forest-{}.json", value["metadata"]["nextn"]));
+        std::fs::write(&path, value.to_string()).unwrap();
+        path
+    };
+    let plain = artifact(None);
+    let mtp = artifact(Some(3.into()));
+    let build = |path: &std::path::Path, nextn: u32| {
+        let mut config = canonical_learned_fixture(path);
+        config.nextn = nextn;
+        ForwardPassPerfModel::best_available(config)
+    };
+    // Matching depths construct; an MTP artifact prices a verify-width decode.
+    build(&plain, 0).unwrap();
+    let model = build(&mtp, 3).unwrap();
+    assert_eq!(model.provenance().unwrap().config.nextn, 3);
+    let mut verify = decode_fpm(2, 1000, 0.0);
+    verify.scheduled_requests.extend_lengths = Some(vec![4, 4]);
+    verify.scheduled_requests.past_kv_lengths = Some(vec![496, 496]);
+    assert!(
+        model
+            .estimate_forward_pass_time_ms(&[verify])
+            .unwrap()
+            .is_some()
+    );
+    // An artifact trained without MTP never prices MTP replay, and an MTP
+    // artifact never prices another depth or plain decode.
+    for (path, nextn, trained) in [(&plain, 3, 0), (&mtp, 0, 3), (&mtp, 2, 3)] {
+        let error = build(path, nextn).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!(
+                "trained on steps with MTP depth {trained} (metadata.nextn), but the \
+                 configuration's speculative depth is {nextn}"
+            )),
+            "{error}"
+        );
+    }
+    // A malformed recorded depth is rejected when the artifact loads.
+    let bad = artifact(Some((-1).into()));
+    let error = build(&bad, 0).unwrap_err().to_string();
+    assert!(
+        error.contains("metadata.nextn -1 is not a non-negative integer"),
+        "{error}"
+    );
 }
 
 #[test]

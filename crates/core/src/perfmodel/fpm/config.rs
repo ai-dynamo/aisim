@@ -821,14 +821,26 @@ impl ForwardPassPerfModelConfig {
                     ));
                 }
             }
-            if self.nextn != 0
+            // MTP (`nextn > 0` or an `mtp` scheme) is priced from measured
+            // rounds; construction checks the artifact's recorded depth. The
+            // mixed composition's interpolation fallback cannot price MTP.
+            let speculative = self.nextn != 0
                 || self
                     .speculation
                     .as_ref()
-                    .is_some_and(|speculation| speculation.kind != "none")
+                    .is_some_and(|speculation| speculation.kind != "none");
+            if speculative && self.estimator_config.temporary_mixed_composition.is_some() {
+                return Err(invalid_config(
+                    "temporary_mixed_composition does not support speculative decoding",
+                ));
+            }
+            if self
+                .speculation
+                .as_ref()
+                .is_some_and(|speculation| !matches!(speculation.kind.as_str(), "none" | "mtp"))
             {
                 return Err(invalid_config(
-                    "fpm_learned does not support speculative decoding",
+                    "fpm_learned supports MTP speculative decoding only",
                 ));
             }
         } else if learned.artifact_path.is_some() || learned.checkpoint_path.is_some() {
@@ -1265,7 +1277,13 @@ mod tests {
         }
         let mut speculative = companion;
         speculative.nextn = 1;
-        assert!(speculative.validate().is_err());
+        assert!(
+            speculative
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("temporary_mixed_composition does not support speculative decoding")
+        );
     }
 
     #[test]
@@ -1527,10 +1545,27 @@ mod tests {
     }
 
     #[test]
-    fn learned_normalization_rejects_mtp_before_reading_the_artifact() {
+    fn learned_configuration_accepts_mtp_and_rejects_other_schemes() {
+        // MTP passes configuration validation; construction then checks the
+        // artifact's recorded training depth.
+        for fields in [
+            serde_json::json!({"nextn": 3}),
+            serde_json::json!({"speculation": {"kind": "mtp", "params": {"depth": 3}}}),
+        ] {
+            let mut value = serde_json::json!({
+                "estimation_mode": "fpm_learned",
+                "estimator_config": {"fpm_learned": {"artifact_path": "seed.json", "adaptation": "frozen"}}
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            config(value).validate().unwrap();
+        }
         let error = config(serde_json::json!({
             "estimation_mode": "fpm_learned",
-            "speculation": {"kind": "mtp", "params": {"depth": 3}},
+            "backend": "vllm",
+            "speculation": {"kind": "ngram", "params": {"num_speculative_tokens": 2}},
             "estimator_config": {"fpm_learned": {"artifact_path": "missing-seed.json", "adaptation": "frozen"}}
         }))
         .normalize()
@@ -1538,7 +1573,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("fpm_learned does not support speculative decoding"),
+                .contains("fpm_learned supports MTP speculative decoding only"),
             "{error}"
         );
     }
@@ -1571,7 +1606,7 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("fpm_learned does not support speculative decoding")
+                .contains("fpm_learned supports MTP speculative decoding only")
         );
     }
 

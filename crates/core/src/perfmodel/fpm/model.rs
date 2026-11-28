@@ -18,7 +18,7 @@ use mixed_fallback::MixedComposition;
 #[path = "model_snapshot.rs"]
 mod persist;
 pub use persist::{ForwardPassStateSnapshotSummary, StateSnapshotOptions};
-pub(crate) use persist::{relocate_snapshot_inputs, verify_snapshot_identity};
+pub(crate) use persist::{mtp_scheme_depth, relocate_snapshot_inputs, verify_snapshot_identity};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -534,9 +534,14 @@ impl ForwardPassPerfModel {
             ));
         }
         // Path 1: only an ordinary STP FPM supplies the reference to scale.
-        let already_speculative = self.provenance.as_ref().is_some_and(|provenance| {
-            provenance.config.nextn != 0 || provenance.config.speculation.is_some()
-        });
+        // A learned artifact trained on MTP rounds is speculative whether or
+        // not it was built from a configuration (`from_learned` has none).
+        let trained_on_mtp = matches!(&self.mode,
+            ForwardPassPerfMode::Learned { learned, .. } if learned.trained_nextn() != 0);
+        let already_speculative = trained_on_mtp
+            || self.provenance.as_ref().is_some_and(|provenance| {
+                provenance.config.nextn != 0 || provenance.config.speculation.is_some()
+            });
         let native_is_stp_fpm = match &self.mode {
             ForwardPassPerfMode::Native { engine, .. } => engine.is_autoregressive_fpm(),
             _ => true,
@@ -687,6 +692,16 @@ impl ForwardPassPerfModel {
             return Err(AicError::InvalidEngineConfig(
                 "learned artifact worker_type does not match canonical model identity".into(),
             ));
+        }
+        // An artifact prices the steps it was trained on: MTP rounds at its
+        // recorded draft depth, or plain decode steps when it records none.
+        let depth = config.regression_depth()?;
+        if learned.trained_nextn() != depth {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "learned artifact was trained on steps with MTP depth {} (metadata.nextn), but the \
+                 configuration's speculative depth is {depth}; train on step captures at the same depth",
+                learned.trained_nextn()
+            )));
         }
         let artifact_identity = learned.metadata().get("identity");
         if let Some(identity) = artifact_identity {
@@ -899,12 +914,14 @@ impl ForwardPassPerfModel {
                 last_error = Some(error);
                 continue;
             }
-            // An explicit vLLM regression prices MTP as the depth it was fitted at.
+            // An explicit vLLM regression prices MTP as the depth it was fitted
+            // at, and an explicit learned artifact as the depth it was trained at.
             if let Some(speculation) = &config.speculation
-                && !(mode == EstimationMode::FpmRegression
-                    && config.estimation_mode == mode
-                    && config.backend == crate::BackendKind::Vllm
-                    && speculation.kind == "mtp")
+                && !(config.estimation_mode == mode
+                    && speculation.kind == "mtp"
+                    && (mode == EstimationMode::FpmLearned
+                        || (mode == EstimationMode::FpmRegression
+                            && config.backend == crate::BackendKind::Vllm)))
             {
                 if mode != EstimationMode::OpLevel {
                     let error = AicError::UnsupportedModel(format!(

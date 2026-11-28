@@ -411,14 +411,50 @@ _NGRAM = {"kind": "ngram", "params": {"num_speculative_tokens": 3}}
 
 
 @pytest.mark.parametrize("entrypoint", ["normalize_config", "best_available"])
-def test_learned_rejects_mtp_before_reading_the_artifact(entrypoint, tmp_path):
+def test_learned_rejects_non_mtp_speculation_before_reading_the_artifact(entrypoint, tmp_path):
     config = _config(
         estimation_mode="fpm_learned",
-        speculation=_MTP,
+        speculation=_NGRAM,
         estimator_config={"fpm_learned": {"artifact_path": str(tmp_path / "missing.json"), "adaptation": "frozen"}},
     )
-    with pytest.raises(ValueError, match="fpm_learned does not support speculative decoding"):
+    with pytest.raises(ValueError, match="fpm_learned supports MTP speculative decoding only"):
         getattr(RustForwardPassPerfModel, entrypoint)(config)
+
+
+@pytest.mark.parametrize("speculation", [{"nextn": 3}, {"speculation": _MTP}])
+def test_learned_mtp_requires_an_artifact_trained_at_that_depth(speculation, tmp_path):
+    def artifact(name, metadata):
+        stump = {"left": [-1], "right": [-1], "feature": [-1], "threshold": [0.0], "value": [0.0]}
+        path = tmp_path / name
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "aic_fpm_learned_forward_perf",
+                    "schema_version": 1,
+                    "worker_type": "aggregated",
+                    "target": "ms",
+                    "features": ["num_decode_requests"],
+                    "stores": {kind: {"baseline": 5.0, "trees": [stump]} for kind in ("pure_decode", "pure_prefill")},
+                    "metadata": metadata,
+                }
+            )
+        )
+        return str(path)
+
+    def build(path):
+        return RustForwardPassPerfModel.best_available(
+            _config(
+                estimation_mode="fpm_learned",
+                estimator_config={"fpm_learned": {"artifact_path": path, "adaptation": "frozen"}},
+                **speculation,
+            )
+        )
+
+    model = build(artifact("mtp.json", {"nextn": 3}))
+    assert model.diagnostics()["provenance"]["selected_estimation_mode"] == "fpm_learned"
+    # An artifact trained without MTP (no recorded depth) is never used for MTP.
+    with pytest.raises(ValueError, match=r"trained on steps with MTP depth 0 \(metadata.nextn\)"):
+        build(artifact("plain.json", {}))
 
 
 @pytest.mark.parametrize(("mode", "backend"), [("fpm_interpolation", "vllm"), ("fpm_regression", "sglang")])

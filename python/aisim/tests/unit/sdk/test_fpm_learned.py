@@ -691,3 +691,211 @@ def test_train_hisim_slot_features_roundtrip() -> None:
     )
     # 30 shallow trees on 96 slot columns: a loose fit is enough to prove the slot path is wired end to end
     assert report["pure_decode"]["mape_pct"] < 12.0
+
+
+def _mtp_fpm(nd: int, kv: int, wall: float, *, steps: int | None, draft_tokens: int | None = None) -> dict:
+    fpm = _decode_fpm(nd, kv, wall)
+    if steps is not None:
+        fpm["scheduled_requests"]["spec_num_steps"] = steps
+        fpm["scheduled_requests"]["spec_num_draft_tokens"] = steps + 1 if draft_tokens is None else draft_tokens
+    return fpm
+
+
+def test_training_nextn_reads_the_capture_hook_depth():
+    """``metadata.nextn`` comes from the steps' ``spec_num_steps``; idle ranks do not count."""
+    idle = _decode_fpm(0, 0, 0.0)
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=3), idle]]) == 3
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=3)]], nextn=3) == 3
+    # Depth 0 may record a verify width of 0 or 1.
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=0, draft_tokens=0)]]) == 0
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=0, draft_tokens=1)]]) == 0
+    # JSON may carry integral counts as floats.
+    assert fpm_learned.training_nextn([[_mtp_fpm(2, 100, 0.01, steps=3.0, draft_tokens=4.0)]]) == 3
+    assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]]) == 0
+    # Telemetry without the hook fields declares its depth.
+    assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]], nextn=2) == 2
+    # A step that records only the verify width carries depth width - 1.
+    width_only = _decode_fpm(2, 100, 0.01)
+    width_only["scheduled_requests"]["spec_num_draft_tokens"] = 4
+    assert fpm_learned.training_nextn([[width_only]]) == 3
+    with pytest.raises(ValueError, match="does not match the steps' recorded spec_num_steps=7"):
+        width_only["scheduled_requests"]["spec_num_draft_tokens"] = 8
+        fpm_learned.training_nextn([[width_only]], nextn=3)
+
+
+@pytest.mark.parametrize(
+    ("iterations", "nextn", "match"),
+    [
+        ([[_mtp_fpm(1, 50, 0.01, steps=3)], [_mtp_fpm(1, 50, 0.01, steps=2)]], None, "mix speculative depths"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=3)], [_decode_fpm(1, 50, 0.01)]], None, "mix speculative depths"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=3)]], 2, "does not match the steps' recorded spec_num_steps=3"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=3, draft_tokens=8)]], None, "only chain MTP drafts"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=0, draft_tokens=8)]], None, "only chain MTP drafts"),
+        ([[_decode_fpm(1, 50, 0.01)]], -1, "nextn must be an integer"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=3.9, draft_tokens=4.9)]], None, "spec_num_steps must be a non-negative integer"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=True, draft_tokens=2)]], None, "spec_num_steps must be a non-negative integer"),
+        ([[_mtp_fpm(1, 50, 0.01, steps=3, draft_tokens=-1)]], None, "spec_num_draft_tokens must be a non-negative"),
+    ],
+)
+def test_training_nextn_rejects_ambiguous_depths(iterations, nextn, match):
+    with pytest.raises(ValueError, match=match):
+        fpm_learned.training_nextn(iterations, nextn)
+
+
+def _listed_decode(widths: list[int], *, steps: int | None = None) -> dict:
+    fpm = _mtp_fpm(len(widths), 100 * len(widths), 0.01, steps=steps)
+    fpm["scheduled_requests"]["extend_lengths"] = widths
+    fpm["scheduled_requests"]["past_kv_lengths"] = [100] * len(widths)
+    return fpm
+
+
+def test_training_nextn_requires_verify_widths_in_request_lists():
+    """Replay queries decode at width nextn + 1 (1 without MTP); listed decode widths must agree."""
+    # The stock SGLang decode hook lists extend 1 and omits the depth fields.
+    with pytest.raises(ValueError, match="every decode request in the per-request lists has extend length 1"):
+        fpm_learned.training_nextn([[_listed_decode([1, 1])]], nextn=3)
+    # The capture hook's depth fields mark SGLang steps, which verify the full width.
+    assert fpm_learned.training_nextn([[_listed_decode([4, 4], steps=3)]]) == 3
+    with pytest.raises(ValueError, match=r"extend lengths \[1, 2\] contradict MTP depth 3.*verify width 4;"):
+        fpm_learned.training_nextn([[_listed_decode([4, 4], steps=3)], [_listed_decode([1, 2], steps=3)]])
+    # vLLM may verify fewer tokens near limits, but never more than nextn + 1.
+    assert fpm_learned.training_nextn([[_listed_decode([4, 2])], [_listed_decode([1, 1])]], nextn=3) == 3
+    with pytest.raises(ValueError, match=r"extend lengths \[5\] contradict MTP depth 3.*verify width 1 to 4;"):
+        fpm_learned.training_nextn([[_listed_decode([4, 5])]], nextn=3)
+    # Without MTP, decode requests verify one token: wider lists are unlabeled speculative rounds.
+    assert fpm_learned.training_nextn([[_listed_decode([1, 1])]]) == 0
+    for nextn in (None, 0):
+        with pytest.raises(ValueError, match=r"extend lengths \[4, 4\] contradict MTP depth 0"):
+            fpm_learned.training_nextn([[_listed_decode([4, 4])]], nextn)
+    # Aggregate-only captures carry no widths.
+    assert fpm_learned.training_nextn([[_decode_fpm(2, 100, 0.01)]], nextn=3) == 3
+
+
+def test_trained_depth_must_be_one_a_configuration_accepts():
+    """Configuration validation accepts nextn and MTP depth 0..=5; validate_artifact keeps the loader's u32 bound."""
+    with pytest.raises(ValueError, match=r"nextn must be an integer in \[0, 5\]"):
+        fpm_learned.training_nextn([[_decode_fpm(1, 50, 0.01)]], 6)
+    assert fpm_learned.training_nextn([[_decode_fpm(1, 50, 0.01)]], 5) == 5
+    for steps in (6, 2**32):
+        for width_only in (False, True):
+            fpm = _mtp_fpm(1, 50, 0.01, steps=steps)
+            if width_only:
+                del fpm["scheduled_requests"]["spec_num_steps"]
+            with pytest.raises(ValueError, match=rf"recorded MTP depth {steps} is outside \[0, 5\]"):
+                fpm_learned.training_nextn([[fpm]])
+    assert fpm_learned.training_nextn([[_mtp_fpm(1, 50, 0.01, steps=5)]]) == 5
+
+
+def test_train_rejects_an_identity_at_another_depth(monkeypatch):
+    """An identity naming another depth would bind the artifact to a configuration it cannot load at."""
+    pytest.importorskip("sklearn")
+    iterations = [[_mtp_fpm(n, 100 * n, 0.01 + 0.001 * n, steps=1)] for n in range(1, 31)]
+    identity = {"worker_type": "decode", "nextn": 0, "speculation": None}
+    monkeypatch.setattr(fpm_learned, "_checkpoint_identity", lambda supplied, worker_type: dict(supplied))
+    with pytest.raises(ValueError, match="training identity has MTP depth 0, but the steps ran at depth 1"):
+        fpm_learned.train(iterations, "decode", max_iter=5, identity=identity)
+    other = {**identity, "nextn": 1, "speculation": {"kind": "eagle", "params": {}}}
+    with pytest.raises(ValueError, match="learned artifacts support only MTP"):
+        fpm_learned.train(iterations, "decode", max_iter=5, identity=other)
+    artifact = fpm_learned.train(iterations, "decode", max_iter=5, identity={**identity, "nextn": 1})
+    assert artifact["metadata"]["identity"]["nextn"] == 1
+    # An identity supplied through metadata binds the artifact the same way.
+    with pytest.raises(ValueError, match="training identity has MTP depth 0, but the steps ran at depth 1"):
+        fpm_learned.train(iterations, "decode", max_iter=5, metadata={"identity": identity})
+    bound = fpm_learned.train(iterations, "decode", max_iter=5, metadata={"identity": {**identity, "nextn": 1}})
+    assert bound["metadata"]["identity"]["nextn"] == 1
+
+
+def _listed_mixed(widths: list[int], decodes: int, *, steps: int | None = None, prefill_tokens: int = 100) -> dict:
+    fpm = _listed_decode(widths, steps=steps)
+    fpm["scheduled_requests"].update(
+        num_prefill_requests=len(widths) - decodes, num_decode_requests=decodes, sum_prefill_tokens=prefill_tokens
+    )
+    return fpm
+
+
+def test_depth_reads_only_the_iterations_the_role_trains_on():
+    """A prefill trainer skips decode rows, so their depth and widths do not label its artifact."""
+    prefill = [[_prefill_fpm(1, 64 + n, 0, 0.01 + 0.001 * n)] for n in range(30)]
+    decode = [[_listed_decode([4, 4], steps=3)]]
+    assert fpm_learned.training_nextn(prefill + decode, worker_type="prefill") == 0
+    with pytest.raises(ValueError, match="mix speculative depths"):
+        fpm_learned.training_nextn(prefill + decode)
+    pytest.importorskip("sklearn")
+    artifact = fpm_learned.train(prefill + decode, "prefill", max_iter=5)
+    assert artifact["metadata"]["nextn"] == 0
+
+
+def test_depth_is_checked_on_the_rows_the_stores_fit():
+    """A row the fitter discards cannot vouch for a depth the exported forest never saw."""
+    pytest.importorskip("sklearn")
+    narrow = [[_listed_decode([1])] for _ in range(4)]
+    inconsistent = _listed_decode([4])
+    inconsistent["scheduled_requests"]["past_kv_lengths"] = [5000]  # aggregate decode KV is 100
+    with pytest.raises(ValueError, match="every decode request in the per-request lists has extend length 1"):
+        fpm_learned.train(
+            narrow + [[inconsistent]], "decode", features=["slot0_extend"], nextn=3, max_iter=5, min_store_rows=2
+        )
+    # A store below min_store_rows is not exported either, so its depth does not count.
+    deep_prefill = _prefill_fpm(1, 64, 0, 0.01)
+    deep_prefill["scheduled_requests"].update(spec_num_steps=3, spec_num_draft_tokens=4)
+    rows = [[_decode_fpm(n, 100 * n, 0.01)] for n in range(1, 4)] + [[deep_prefill]]
+    with pytest.raises(ValueError, match="mix speculative depths"):
+        fpm_learned.training_nextn(rows)
+    artifact = fpm_learned.train(rows, "aggregated", max_iter=5, min_store_rows=2)
+    assert artifact["metadata"]["nextn"] == 0 and "pure_prefill" not in artifact["stores"]
+
+
+def test_mixed_steps_must_list_a_verify_width_for_every_decode_request():
+    """A mixed step's lists do not mark decode requests, but must hold enough widths replay could query."""
+    decode = _listed_decode([4, 4])
+    # vLLM lists requests sorted by KV, so the prefill may sit anywhere.
+    for widths in ([4, 4, 100], [100, 2, 4], [4, 100, 1]):
+        assert fpm_learned.training_nextn([[decode], [_listed_mixed(widths, 2)]], nextn=3) == 3
+    # The prefill total bounds the decode tokens: a short prefill cannot hide a too-wide decode.
+    with pytest.raises(ValueError, match=r"leave 5 tokens beyond sum_prefill_tokens for 1 decode requests"):
+        fpm_learned.training_nextn([[decode], [_listed_mixed([2, 5], 1, prefill_tokens=2)]], nextn=3)
+    assert fpm_learned.training_nextn([[decode], [_listed_mixed([2, 4], 1, prefill_tokens=2)]], nextn=3) == 3
+    # SGLang may page-round sum_prefill_tokens above the listed logical lengths: still trainable.
+    sglang = _listed_mixed([1, 31, 1, 19], 2, prefill_tokens=512)
+    assert fpm_learned.training_nextn([[sglang]]) == 0
+    with pytest.raises(ValueError, match=r"only 1 of the extend lengths \[6, 6, 100\] fit|only 0 of"):
+        fpm_learned.training_nextn([[decode], [_listed_mixed([6, 6, 100], 2)]], nextn=3)
+    with pytest.raises(ValueError, match=r"only 1 of the extend lengths \[100, 4, 6\] fit MTP depth 3"):
+        fpm_learned.training_nextn([[decode], [_listed_mixed([100, 4, 6], 2)]], nextn=3)
+    # SGLang hook steps verify the full width; without MTP a decode request verifies one token.
+    with pytest.raises(
+        ValueError, match=r"only 1 of the extend lengths \[4, 2, 100\] fit MTP depth 3's verify width 4,"
+    ):
+        fpm_learned.training_nextn([[_listed_decode([4, 4], steps=3)], [_listed_mixed([4, 2, 100], 2, steps=3)]])
+    with pytest.raises(ValueError, match="fit MTP depth 0"):
+        fpm_learned.training_nextn([[_listed_mixed([4, 4, 100], 2)]])
+
+
+def test_learned_identity_spells_an_mtp_scheme_as_nextn():
+    from aisim_core.sdk.rust_engine_step import RustForwardPassPerfModel
+
+    base = {"model": "m", "system": "s", "backend": "vllm", "worker_type": "decode"}
+    scheme = RustForwardPassPerfModel.learned_identity({**base, "speculation": {"kind": "mtp", "params": {"depth": 2}}})
+    assert scheme == RustForwardPassPerfModel.learned_identity({**base, "nextn": 2})
+    assert scheme["nextn"] == 2
+
+
+def test_train_records_nextn_and_validate_checks_it():
+    pytest.importorskip("sklearn")
+    iterations = [[_mtp_fpm(n, 100 * n, 0.01 + 0.001 * n, steps=3)] for n in range(1, 31)]
+    artifact = fpm_learned.train(iterations, "decode", max_iter=5)
+    assert artifact["metadata"]["nextn"] == 3
+    fpm_learned.validate_artifact(artifact)
+    assert (
+        fpm_learned.train([[_decode_fpm(n, 100 * n, 0.01)] for n in range(1, 31)], "decode", max_iter=5)["metadata"][
+            "nextn"
+        ]
+        == 0
+    )
+    with pytest.raises(ValueError, match="metadata cannot set nextn"):
+        fpm_learned.train(iterations, "decode", max_iter=5, metadata={"nextn": 0})
+    for bad in (-1, 2**32):
+        artifact["metadata"]["nextn"] = bad
+        with pytest.raises(ValueError, match=rf"metadata.nextn {bad} is not an integer in \[0, 4294967295\]"):
+            fpm_learned.validate_artifact(artifact)

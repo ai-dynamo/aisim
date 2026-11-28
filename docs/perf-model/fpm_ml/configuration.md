@@ -37,10 +37,58 @@ a training or runtime checkpoint. Omitted `correction.enabled` resolves to
 hybrid correction. Learned mode
 requires `fallback_policy: deny`; `allow` and the legacy `regression` policy
 are invalid configurations. Learned source open, checksum, parsing and identity
-errors fail construction. Learned mode also rejects active speculative decoding
-(`nextn != 0` or `speculation.kind` other than `none`). An explicit
+errors fail construction. Learned mode supports MTP speculative decoding
+(`nextn: N` or `speculation: {kind: mtp, params: {depth: N}}`) and rejects
+every other `speculation.kind` except `none`. An explicit
 `speculation: {kind: none}` is accepted and normalized to no speculation;
 it must not contain parameters or a draft checkpoint.
+
+### MTP speculative decoding
+
+A learned artifact prices the steps it was trained on. Trained on MTP-on step
+captures, each decode step is a complete measured round (Option 2 in
+[whole-forward methods](../methods/whole-forward.md#consuming-a-measured-round)):
+target verification, sampling and draft work are already in the label, so no
+draft tail or STP scaling is added, and a query with `draft_length` is
+rejected, including for an artifact loaded directly with `from_learned`. Replay
+queries the artifact with each decode request's verify width as its extend
+length: `nextn + 1` on SGLang, as the SGLang step-capture hook records it, and
+each request's scheduled query width on vLLM, which can be smaller at token or
+context limits. On vLLM, a waiting request with one token left that joins an
+MTP batch is padded to `nextn + 1` query tokens, which it computes but cannot
+accept; replay queries the padded width, as the capture hook's
+`num_scheduled_tokens` records it. A temporary mixed composition does not
+support MTP.
+
+The artifact records the MTP draft depth of its training steps in
+`metadata.nextn`; an absent field means steps without speculative decoding
+(depth 0). Construction requires this depth to equal the configuration's
+speculative depth (`nextn`, or the MTP scheme's `depth`), so an artifact
+trained without MTP is never used for MTP, and an MTP artifact is never used
+for plain decode or another depth. The trainer writes `metadata.nextn` from the
+steps' `spec_num_steps` (or `spec_num_draft_tokens - 1`), or from `--nextn`
+for telemetry without those fields, reading only the steps the trained
+worker role uses (see
+[Train](learned-forward-pass-model.md#2-train)). It checks each step's
+per-request extend lengths against that depth, since replay queries a decode
+request at its verify width: 1 without MTP; exactly `nextn + 1` for steps that
+record the hook's depth fields (SGLang); and 1 to `nextn + 1` for other MTP
+steps (vLLM), of which at least one decode-only request must be wider than 1.
+Every width of a decode-only step must be allowed. A mixed step's lists do not
+mark which requests decode (vLLM sorts them by KV length), so at least
+`num_decode_requests` of its widths must be allowed, and the tokens beyond
+`sum_prefill_tokens` must fit that many decode requests at the allowed
+widths. The stock SGLang decode
+hook lists 1 for every request, so its MTP captures are rejected.
+Aggregate-only captures carry no widths. The trained depth must be 0 to 5, the
+range a configuration accepts; `metadata.nextn` itself must fit in the
+loader's `u32`.
+
+`nextn: N` and an MTP scheme of depth N are one deployment identity: an
+artifact's `metadata.identity` and a checkpoint's identity record the scheme as
+`nextn`, so either spelling loads a source trained with the other. A training
+identity (`--identity`, or `metadata.identity` passed to `train`) must name the
+steps' depth.
 
 ## Estimator namespaces
 

@@ -573,6 +573,7 @@ def _build_dataset(
     features: Sequence[str],
     *,
     provenance: dict[str, list[tuple[int, str]]] | None = None,
+    sources: dict[str, list[int]] | None = None,
 ) -> dict[str, tuple[list[list[float]], list[float]]]:
     unknown = [name for name in features if name not in FEATURE_NAMES]
     if unknown:
@@ -601,6 +602,8 @@ def _build_dataset(
         rows, y = dataset[kind]
         rows.append([named[name] for name in features])
         y.append(wall_ms)
+        if sources is not None:
+            sources.setdefault(kind, []).append(index)
         if provenance is not None:
             source_fields = ("worker_id", "dp_rank", "counter_id", "observed_at_unix_ms", "recv_ms")
             source = [{key: fpm[key] for key in source_fields if key in fpm} for fpm in metrics_by_rank]
@@ -666,6 +669,23 @@ def _checkpoint_identity(identity: dict[str, Any] | None, worker_type: str) -> d
     if resolved.get("worker_type") != worker_type:
         raise ValueError("checkpoint identity worker_type must match the training worker_type")
     return resolved
+
+
+def _require_identity_depth(identity: dict[str, Any], depth: int) -> None:
+    """The deployment identity must name the depth the steps ran at, or the artifact loads nowhere.
+
+    Rust's identity projection already spells an MTP scheme as ``nextn``.
+    """
+    if identity.get("speculation") is not None:
+        raise ValueError(
+            "the training identity names a speculation scheme; learned artifacts support only MTP, which the "
+            "canonical identity (RustForwardPassPerfModel.learned_identity) spells as nextn"
+        )
+    if identity.get("nextn", 0) != depth:
+        raise ValueError(
+            f"training identity has MTP depth {identity.get('nextn', 0)}, but the steps ran at depth {depth}; "
+            "set the identity's nextn (or MTP depth) to the capture depth"
+        )
 
 
 def write_original_a_manifest(
@@ -920,6 +940,149 @@ def _write_training_checkpoint(
             raise
 
 
+# The Rust artifact loader reads metadata.nextn as a u32.
+_MAX_NEXTN = 2**32 - 1
+
+
+# Configuration validation accepts nextn (and MTP depth) 0..=5, so a deeper artifact could never be constructed.
+_MAX_TRAINED_NEXTN = 5
+
+
+def _is_nextn(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and 0 <= value <= _MAX_NEXTN
+
+
+def _telemetry_count(sched: dict[str, Any], key: str, index: int) -> int | None:
+    """A capture-hook count field: absent, or a non-negative integer (integral floats from JSON allowed)."""
+    value = sched.get(key)
+    if value is None:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"iteration {index}: {key} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _role_eligible(metrics_by_rank: Sequence[dict[str, Any]], worker_type: str) -> bool:
+    try:
+        classify_workload(metrics_by_rank, worker_type)
+    except ValueError:
+        return False
+    return True
+
+
+def training_nextn(
+    iterations: Sequence[Sequence[dict[str, Any]]], nextn: int | None = None, worker_type: str | None = None
+) -> int:
+    """MTP draft depth of the training steps, recorded as artifact ``metadata.nextn``.
+
+    The SGLang step-capture hook records ``spec_num_steps`` (draft depth) and
+    ``spec_num_draft_tokens`` (verify width, ``spec_num_steps + 1`` for the
+    chain drafts replay prices) on every step; a step with only the width
+    records depth ``width - 1``. Steps must agree on one depth.
+    ``nextn`` declares the depth for telemetry without these fields and must
+    match a recorded depth. Without either, the steps ran without speculative
+    decoding (depth 0). With ``worker_type``, only iterations that role trains
+    on count, as :func:`train` skips the others.
+    """
+    if worker_type is not None:
+        iterations = [it for it in iterations if _role_eligible(it, worker_type)]
+    if nextn is not None and not (_is_nextn(nextn) and nextn <= _MAX_TRAINED_NEXTN):
+        raise ValueError(f"nextn must be an integer in [0, {_MAX_TRAINED_NEXTN}], got {nextn!r}")
+    recorded: set[int] = set()
+    unrecorded = False
+    for index, metrics_by_rank in enumerate(iterations):
+        for fpm in metrics_by_rank:
+            sched = _sched(fpm)
+            if not _rank_active(sched):
+                continue
+            steps = _telemetry_count(sched, "spec_num_steps", index)
+            draft_tokens = _telemetry_count(sched, "spec_num_draft_tokens", index)
+            if steps is None:
+                if draft_tokens is None:
+                    unrecorded = True
+                    continue
+                # Width without depth: a chain draft of depth d verifies d + 1 tokens.
+                steps = max(draft_tokens - 1, 0)
+            # Depth 0 (no speculation) may record a width of 0 or 1; any wider width contradicts it.
+            if draft_tokens is not None and draft_tokens != steps + 1 and not (steps == 0 and draft_tokens == 0):
+                raise ValueError(
+                    f"iteration {index}: spec_num_draft_tokens={draft_tokens} != spec_num_steps + 1; "
+                    "only chain MTP drafts (verify width nextn + 1) are supported"
+                )
+            recorded.add(steps)
+    if len(recorded) > 1 or (recorded and unrecorded):
+        found = sorted(recorded) + (["unrecorded"] if unrecorded else [])
+        raise ValueError(f"training steps mix speculative depths {found}; train one artifact per depth")
+    if recorded:
+        (depth,) = recorded
+        if nextn is not None and nextn != depth:
+            raise ValueError(f"nextn={nextn} does not match the steps' recorded spec_num_steps={depth}")
+    else:
+        depth = nextn or 0
+    if depth > _MAX_TRAINED_NEXTN:
+        raise ValueError(
+            f"recorded MTP depth {depth} is outside [0, {_MAX_TRAINED_NEXTN}], the depths a configuration accepts"
+        )
+    _require_verify_widths(iterations, depth, full=bool(recorded))
+    return depth
+
+
+def _require_verify_widths(iterations: Sequence[Sequence[dict[str, Any]]], depth: int, *, full: bool) -> None:
+    """Per-request decode widths must match the query replay sends at ``depth``.
+
+    Replay queries each decode request at its verify width: ``depth + 1``, or 1 without speculation. Steps
+    that record the capture hook's depth fields (SGLang, ``full``) must list the full width. vLLM may schedule
+    a shorter width near token or context limits, so other MTP captures may list 1 to ``depth + 1`` but need at
+    least one decode-only request wider than 1; the stock SGLang decode hook lists 1 for every request. A
+    decode-only step's every listed width must be allowed. A mixed step's lists do not mark which requests
+    decode (vLLM sorts them by KV), so at least ``num_decode_requests`` of its widths must be allowed, and the
+    tokens beyond ``sum_prefill_tokens`` cannot exceed that many decode requests at the full width. Only this
+    upper bound is checked: SGLang's reporter can page-round ``sum_prefill_tokens`` above the logical lengths
+    the lists carry, which only lowers the remainder.
+    Aggregate-only captures carry no widths.
+    """
+    low = depth + 1 if full else 1
+    expected = f"{depth + 1}" if low == depth + 1 else f"1 to {depth + 1}"
+    widest = None
+    for index, metrics_by_rank in enumerate(iterations):
+        for fpm in metrics_by_rank:
+            sched = _sched(fpm)
+            decodes = int(sched.get("num_decode_requests", 0))
+            pairs = _request_pairs(sched)
+            if not decodes or pairs is None:
+                continue
+            widths = [extend for extend, _ in pairs]
+            allowed = [width for width in widths if low <= width <= depth + 1]
+            if int(sched.get("num_prefill_requests", 0)):
+                if len(allowed) < decodes:
+                    raise ValueError(
+                        f"iteration {index}: only {len(allowed)} of the extend lengths {widths} fit MTP depth "
+                        f"{depth}'s verify width {expected}, but the step schedules {decodes} decode requests; "
+                        "record or pass the depth the steps ran at"
+                    )
+                decode_tokens = sum(widths) - int(sched.get("sum_prefill_tokens", 0))
+                if decode_tokens > decodes * (depth + 1):
+                    raise ValueError(
+                        f"iteration {index}: the extend lengths {widths} leave {decode_tokens} tokens beyond "
+                        f"sum_prefill_tokens for {decodes} decode requests, but MTP depth {depth} verifies at most "
+                        f"{depth + 1} tokens per request; record or pass the depth the steps ran at"
+                    )
+                continue
+            if bad := [width for width in widths if width not in allowed]:
+                raise ValueError(
+                    f"iteration {index}: decode request extend lengths {bad} contradict MTP depth {depth}, which "
+                    f"replay queries at verify width {expected}; record or pass the depth the steps ran at"
+                )
+            widest = max(widths) if widest is None else max(widest, *widths)
+    if depth > 0 and widest == 1:
+        raise ValueError(
+            f"MTP depth {depth}: every decode request in the per-request lists has extend length 1, but replay "
+            f"queries decode requests at verify width {depth + 1}; capture with a hook that records verify widths"
+        )
+
+
 def train(
     iterations: Sequence[Sequence[dict[str, Any]]],
     worker_type: str,
@@ -936,8 +1099,13 @@ def train(
     metadata: dict[str, Any] | None = None,
     online_checkpoint_dir: str | os.PathLike[str] | None = None,
     identity: dict[str, Any] | None = None,
+    nextn: int | None = None,
 ) -> dict[str, Any]:
     """Fit each workload store and return the prediction artifact unchanged.
+
+    ``metadata.nextn`` records the MTP draft depth the training steps ran at
+    (see :func:`training_nextn`); replay accepts the artifact only at that
+    depth.
 
     ``online_checkpoint_dir`` additionally exports the exact fitted rows and
     bin mapper for Rust online fitting. It requires a canonical ``identity``
@@ -951,6 +1119,10 @@ def train(
         raise ValueError(f"invalid worker_type {worker_type!r}")
     if target not in TARGETS:
         raise ValueError(f"target must be one of {TARGETS}, got {target!r}")
+    if metadata and "nextn" in metadata:
+        raise ValueError("metadata cannot set nextn; pass nextn= or let the trainer read it from the steps")
+    if nextn is not None and not (_is_nextn(nextn) and nextn <= _MAX_TRAINED_NEXTN):
+        raise ValueError(f"nextn must be an integer in [0, {_MAX_TRAINED_NEXTN}], got {nextn!r}")
     checkpoint_identity = _checkpoint_identity(identity, worker_type) if identity is not None else None
     if (
         checkpoint_identity is not None
@@ -982,11 +1154,27 @@ def train(
             "per-request features requested but no FPM record carries extend_lengths/past_kv_lengths; "
             "collect with the per-request FPM extension or use the default aggregate --features fpm5 (or v1)"
         )
+    sources: dict[str, list[int]] = {}
     dataset = _build_dataset(
-        iterations, worker_type, features, provenance=provenance if online_checkpoint_dir is not None else None
+        iterations,
+        worker_type,
+        features,
+        provenance=provenance if online_checkpoint_dir is not None else None,
+        sources=sources,
     )
     if not dataset:
         raise ValueError("no trainable iterations (all idle, zero wall_time, or role-incompatible)")
+    # The depth and its widths describe exactly the rows the exported stores fit.
+    fitted = {index for indices in sources.values() if len(indices) >= min_store_rows for index in indices}
+    # A sequential pass: callers may stream a re-iterable source that does not support indexing.
+    trained_nextn = training_nextn(
+        [metrics for index, metrics in enumerate(iterations) if index in fitted], nextn, worker_type
+    )
+    if checkpoint_identity is not None:
+        _require_identity_depth(checkpoint_identity, trained_nextn)
+    elif metadata and isinstance(metadata.get("identity"), dict):
+        # Rust compares a supplied metadata.identity with the configuration it loads at.
+        _require_identity_depth(metadata["identity"], trained_nextn)
     stores: dict[str, Any] = {}
     counts: dict[str, int] = {}
     trees: dict[str, int] = {}
@@ -1035,6 +1223,7 @@ def train(
             "train_rows": counts,
             "trees_fitted": trees,
             **(metadata or {}),
+            "nextn": trained_nextn,
             **({"identity": checkpoint_identity} if checkpoint_identity is not None else {}),
         },
     }
@@ -1089,6 +1278,10 @@ def validate_artifact(artifact: dict[str, Any]) -> None:
     if unknown:
         raise ValueError(f"unknown features {unknown}")
     _reject_duplicate_features(features)
+    metadata = artifact.get("metadata") or {}
+    recorded_nextn = metadata.get("nextn", 0) if isinstance(metadata, dict) else 0
+    if not _is_nextn(recorded_nextn):
+        raise ValueError(f"metadata.nextn {recorded_nextn!r} is not an integer in [0, {_MAX_NEXTN}]")
     stores = artifact.get("stores")
     if not isinstance(stores, dict) or not stores:
         raise ValueError("artifact stores must be a non-empty mapping")
@@ -1243,6 +1436,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
         early_stopping=args.early_stopping,
         online_checkpoint_dir=args.online_checkpoint_dir,
         identity=identity,
+        nextn=args.nextn,
         metadata={
             "sources": [os.fspath(p) for p in args.fpm],
             "join_ranks": args.join_ranks,
@@ -1307,6 +1501,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="also export fitted rows and bins to a new directory for Rust online fitting (early stopping must be off)",
     )
     tr.add_argument("--identity", help="canonical FPM configuration JSON; required with --online-checkpoint-dir")
+    tr.add_argument(
+        "--nextn",
+        type=int,
+        default=None,
+        help="MTP draft depth of the steps (0 to 5), for telemetry that does not record spec_num_steps "
+        "(default: read from the steps, else 0); recorded as metadata.nextn",
+    )
     tr.add_argument(
         "--early-stopping",
         action="store_true",

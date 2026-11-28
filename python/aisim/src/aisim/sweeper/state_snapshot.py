@@ -114,17 +114,17 @@ class SnapshotRole:
 
     @property
     def mtp_scheme(self) -> bool:
-        """Whether a vLLM regression was fitted with an MTP scheme, which it prices as the ``nextn`` of its depth."""
+        """Whether a vLLM regression or a learned model was fitted with an MTP scheme, priced as the ``nextn``
+        of its depth."""
 
-        return (
-            (self.identity.get("speculation") or {}).get("kind") == "mtp"
-            and self.identity["backend"] == "vllm"
-            and self.summary["selected_estimation_mode"] == "fpm_regression"
+        mode = self.summary["selected_estimation_mode"]
+        return (self.identity.get("speculation") or {}).get("kind") == "mtp" and (
+            mode == "fpm_learned" or (self.identity["backend"] == "vllm" and mode == "fpm_regression")
         )
 
     @property
     def nextn(self) -> int:
-        """The draft depth replay pins: ``nextn``, or the depth of the MTP scheme a vLLM regression was fitted with."""
+        """The draft depth replay pins: ``nextn``, or the depth of the MTP scheme the model was fitted with."""
 
         if self.mtp_scheme:
             return int(self.identity["speculation"]["params"]["depth"])
@@ -347,9 +347,11 @@ def _validate_fitted(snapshot: SnapshotRole) -> None:
             f"replay prices every {_WORKER_TYPES[role]} iteration with it, so tune it with observed forward passes "
             "of that work before saving it"
         )
-    if snapshot.nextn > 0 and (identity["backend"] != "vllm" or mode != "fpm_regression"):
+    # A learned model prices MTP rounds at the depth its artifact was trained at; restoration checks that depth.
+    if snapshot.nextn > 0 and mode != "fpm_learned" and (identity["backend"] != "vllm" or mode != "fpm_regression"):
         raise ValueError(
-            f"{snapshot.describe()} records nextn={snapshot.nextn}; only a vLLM fpm_regression model prices MTP rounds"
+            f"{snapshot.describe()} records nextn={snapshot.nextn}; only a vLLM fpm_regression model or an "
+            "fpm_learned model prices MTP rounds"
         )
     if identity.get("backend_version") is None:
         raise ValueError(

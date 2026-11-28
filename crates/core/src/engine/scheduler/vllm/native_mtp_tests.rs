@@ -533,3 +533,74 @@ fn warm_host_prefix_cannot_reject_a_request_that_fits_cold(
     );
     assert!(core.is_drained());
 }
+
+#[test]
+fn padded_waiting_query_reaches_fitted_timing_at_its_physical_width() {
+    // Fitted (learned) timing prices the per-request query widths the
+    // capture hook records as num_scheduled_tokens: the padding a one-token
+    // waiting request computes counts, though it cannot be accepted.
+    let mut core = VllmCore::new(args(2, 8, false, false));
+    submit(&mut core, 105, 4, 16);
+    let mut collector = crate::engine::trace::TraceCollector::default();
+    let first = core.execute_pass(&mut collector, 0.0);
+    submit(&mut core, 106, 1, 8);
+    let work = core.schedule_pass(None, first.end_ms).unwrap();
+    let prefill = work.prefill.as_ref().unwrap();
+    assert_eq!(prefill.requests, vec![(3, 0, 1)]);
+    assert_eq!(prefill.totals.new_tokens, 3);
+    assert_eq!(work.decode.as_ref().unwrap().widths, vec![3]);
+    let padded = core.resolve_pass(None).unwrap();
+    assert_eq!(padded.output_signals.len(), 4, "padding is never accepted");
+}
+
+#[test]
+fn readmitted_query_reaches_fitted_timing_as_one_prefill() {
+    // A preempted depth-2 request with a four-token prompt and one generated
+    // token recomputes all five known tokens in one query. Like the
+    // scheduler's own telemetry, fitted timing sees one five-token prefill.
+    let mut config = args(2, 16, true, false);
+    config.num_gpu_blocks = 5;
+    let mut core = VllmCore::new(config);
+    let first_id = submit(&mut core, 130, 4, 16);
+    let second_id = submit(&mut core, 131, 4, 16);
+    let mut collector = crate::engine::trace::TraceCollector::default();
+    let first = core.execute_pass(&mut collector, 0.0);
+    core.complete_engine_boundary(first.end_ms);
+    let second = core.execute_pass(&mut collector, first.end_ms);
+    assert_eq!(
+        second.pressure_events.len(),
+        1,
+        "the second decoder is preempted"
+    );
+    assert_eq!(core.state.requests[&second_id].sequence.len(), 5);
+    core.apply_command(SchedulerCommand::CancelRequest {
+        request_id: first_id,
+    })
+    .unwrap();
+    core.complete_engine_boundary(second.end_ms);
+
+    let work = core.schedule_pass(None, second.end_ms).unwrap();
+    let prefill = work.prefill.as_ref().unwrap();
+    assert_eq!(prefill.requests, vec![(5, 0, 4)]);
+    assert_eq!(prefill.totals.batch_size, 1);
+    assert_eq!(prefill.totals.new_tokens, 5);
+    assert!(
+        work.decode.is_none(),
+        "no decode entry for the readmitted query"
+    );
+    let query = crate::engine::fitted_timing::fitted_rank_query(&work).unwrap();
+    let metrics = crate::engine::fitted_timing::detailed_rank_metrics(&query, &work).unwrap();
+    let scheduled = &metrics.scheduled_requests;
+    assert_eq!(scheduled.num_prefill_requests, 1);
+    assert_eq!(scheduled.num_decode_requests, 0);
+    assert_eq!(scheduled.extend_lengths.as_deref(), Some(&[5][..]));
+    assert_eq!(scheduled.past_kv_lengths.as_deref(), Some(&[0][..]));
+    let resolved = core.resolve_pass(None).unwrap();
+    assert!(
+        resolved
+            .output_signals
+            .iter()
+            .any(|signal| signal.uuid == second_id && signal.token_id.is_some()),
+        "the readmitted request still emits"
+    );
+}
