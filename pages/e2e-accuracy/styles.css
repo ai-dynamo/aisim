@@ -875,6 +875,6 @@ dialog::backdrop { background: #0009; }
 .agentx-table tr.agentx-op[data-agentx-parent]:not(:hover):not(:focus-visible){background:var(--agentx-op-sub)}
 .agentx-table tr.agentx-learned[data-agentx-parent]:not(:hover):not(:focus-visible){background:var(--agentx-learned-sub)}
 .agentx-metrics-title{margin-top:16px}
-#agentx-quantile-tooltip,#agentx-step-tooltip{position:fixed;inset:auto;margin:0;box-sizing:border-box;width:360px;max-width:calc(100vw - 16px);padding:14px 16px;border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--text);box-shadow:0 8px 24px #0003;font-size:12px;line-height:1.6}
+#agentx-quantile-tooltip,#agentx-step-tooltip{position:fixed;inset:auto;margin:0;box-sizing:border-box;width:360px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;padding:14px 16px;border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--text);box-shadow:0 8px 24px #0003;font-size:12px;line-height:1.6}
 #agentx-quantile-tooltip p,#agentx-step-tooltip p{margin:0 0 10px}
 #agentx-quantile-tooltip p:last-child,#agentx-step-tooltip p:last-child{margin-bottom:0}

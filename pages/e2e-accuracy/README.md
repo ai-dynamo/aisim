@@ -713,7 +713,8 @@ as unscored incomplete-campaign evidence. They do not replace active coverage
 or satisfy the complete twelve-replay publication gate.
 
 The **AgentX NEW** tab uses a separate `aisimulate.agentx.accuracy.v1` publication.
-It does not change InfX snapshots or calculate shape errors. The beta notice links
+It does not change InfX snapshots or calculate their curve shape errors. Its
+per-request quantile error compares request latency distributions instead. The beta notice links
 to the [AgentX support matrix](https://ai-dynamo.org/aisim/feature-support-matrix/#agentx).
 
 Initial coverage is explicitly selected in the reviewed private HF catalog
@@ -806,10 +807,11 @@ metrics, because GLM's shifted-step reference is the learned model.
   determine eligibility. Missing, failed, ambiguous, invalid-output, and
   output-length-mismatched observations retain explicit counts. Different input
   lengths are reported and do not imply identical prompts or cache histories.
-- GLM retains the successful profiling cohort span. Qwen retains the complete
-  finite measured cohort, including between-turn delays. Preparation and warmup
-  remain outside scoring. Qwen additionally requires native cache receipts to
-  match the measured trajectory before publishing accuracy.
+- GLM and the current Qwen Weka profiles retain the successful profiling span.
+  In the archived `finite-v1` campaign only, Qwen retains the complete finite
+  measured cohort, including between-turn delays, and additionally requires
+  native cache receipts to match the measured trajectory before publishing
+  accuracy. Preparation and warmup remain outside scoring.
 
 ### Publication and detail data
 
@@ -826,7 +828,8 @@ form one complete campaign. Each result records `performance_model`
 `dropped_shifted` and `decode`/`prefill` sums, or null) and `cpu_overhead`
 (`tokenization` and `extra_cpu_overhead`, or null). Validation recomputes the
 point estimates from the published request pairs. Historical publications without
-these fields remain readable as op-based results under `details/<run-id>.json`.
+these fields remain readable as op-based results under `details/<run-id>.json`;
+qualification of a new campaign rejects any result without them.
 Qualification requires every catalog identity under each applicable performance
 model, consistent wheel,
 dataset, evaluated commit, and driver digests, and reconciled request accounting.

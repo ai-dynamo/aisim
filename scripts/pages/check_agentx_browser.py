@@ -406,6 +406,31 @@ async def check():
                     await expect(tooltip).to_be_visible()
                     await page.mouse.click(5, 5)
                     await expect(tooltip).to_be_hidden()
+                # At a laptop width the table scrolls horizontally: bringing a trigger into view must not close
+                # its popover while the pointer stays on it, and a short viewport scrolls the popover inside.
+                wide = page.viewport_size
+                for label in ("About per-request quantile error", "About step error"):
+                    info = page.get_by_role("button", name=label)
+                    tooltip = page.locator("#" + await info.get_attribute("aria-describedby"))
+                    await page.set_viewport_size({"width": 1366, "height": 768})
+                    await info.evaluate("b => b.closest('.table-scroll').scrollLeft = 0")
+                    await info.hover()
+                    await expect(tooltip).to_be_visible()
+                    await page.wait_for_timeout(300)
+                    await expect(tooltip).to_be_visible()
+                    box, trigger = await tooltip.bounding_box(), await info.bounding_box()
+                    assert abs(box["y"] - (trigger["y"] + trigger["height"] + 8)) < 2, (box, trigger)
+                    await page.mouse.move(5, 5)
+                    await expect(tooltip).to_be_hidden()
+                    await page.set_viewport_size({"width": 1366, "height": 357})
+                    await info.focus()
+                    await expect(tooltip).to_be_visible()
+                    box = await tooltip.bounding_box()
+                    assert box["y"] >= 0 and box["y"] + box["height"] <= 357, box
+                    assert await tooltip.evaluate("t => getComputedStyle(t).overflowY") == "auto"
+                    await page.keyboard.press("Escape")
+                    await expect(tooltip).to_be_hidden()
+                await page.set_viewport_size(wide)
                 await expect(table.locator(".source-tag")).to_have_text(
                     ["AgentX official", "AgentX official", "Self-collected"]
                 )

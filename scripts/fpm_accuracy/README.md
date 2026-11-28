@@ -49,6 +49,11 @@ The baseline reads no FPM artifact. It runs with silicon data,
 summary then lists `op_level` after the default methods. Without the option,
 the published methods and output are unchanged.
 
+The two methods score different populations. `op_level` prices every eligible
+measured step, because it trains on nothing. `learned` scores only its held-out
+subset. Their MAPEs are therefore not directly comparable. Compare them on the
+same steps before ranking them.
+
 Gym regression selects the measured signed 4×1 lazy configuration through
 `estimator_config`: attention/MoE features and retention axes, 64 observations
 per store, minimum five observations, ridge 1e-9, no scheduled rebuilds, signed

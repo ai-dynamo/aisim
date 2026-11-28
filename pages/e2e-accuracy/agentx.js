@@ -164,13 +164,18 @@ window.AgentX = (() => {
     const button=target.querySelector(b), tooltip=target.querySelector(t);
     let timer;
     const hide=()=>{clearTimeout(timer);if(tooltip.matches(":popover-open"))tooltip.hidePopover();};
-    const show=()=>{
-      clearTimeout(timer);
-      if(!tooltip.matches(":popover-open"))tooltip.showPopover();
+    const place=()=>{
       const rect=button.getBoundingClientRect();
       tooltip.style.left=`clamp(8px, ${rect.left}px, calc(100vw - ${tooltip.offsetWidth + 8}px))`;
       tooltip.style.top=`clamp(8px, ${rect.bottom + 8}px, calc(100vh - ${tooltip.offsetHeight + 8}px))`;
     };
+    const show=()=>{
+      clearTimeout(timer);
+      if(!tooltip.matches(":popover-open"))tooltip.showPopover();
+      place();
+    };
+    // Scrolling the trigger into view must not close a popover its trigger still holds; follow the trigger instead.
+    const held=()=>button.matches(":hover")||document.activeElement===button||tooltip.matches(":hover");
     const leave=()=>{
       clearTimeout(timer);
       timer=setTimeout(()=>{if(document.activeElement!==button && !button.matches(":hover") && !tooltip.matches(":hover"))hide();},140);
@@ -182,7 +187,7 @@ window.AgentX = (() => {
     button.addEventListener("blur",leave);
     tooltip.addEventListener("pointerenter",()=>clearTimeout(timer));
     tooltip.addEventListener("pointerleave",leave);
-    target.querySelector(".table-scroll").addEventListener("scroll",hide);
+    target.querySelector(".table-scroll").addEventListener("scroll",()=>{if(!tooltip.matches(":popover-open"))return;if(held())place();else hide();});
   }
   function source(run) {
     return run.category === "agentx" ? `<a href="${esc(run.benchmark_url)}" target="_blank" rel="noopener">AgentX benchmark ↗</a> · <a href="${esc(run.source_run_url)}" target="_blank" rel="noopener">Source run ↗</a>` :

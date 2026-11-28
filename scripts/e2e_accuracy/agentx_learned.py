@@ -78,8 +78,10 @@ def _unwrap(line):
     return fpm if isinstance(fpm, dict) and "scheduled_requests" in fpm else None
 
 
-def windows(spec, seed, cache, *, scoring=False):
-    """Yield ``(lanes, records)`` per capture window in record order.
+def windows(spec, seed, cache, *, scoring=False, lanes=None):
+    """Yield ``(lanes, records)`` per capture window in record order, only at ``lanes`` when given.
+
+    The lane filter applies before any trace is downloaded or parsed.
 
     ``dynamo_native``: the published training selection names each trace and its 1-based inclusive
     line range. ``sglang_hook``: the published manifest lists one warm-up and one profiling capture per
@@ -88,8 +90,11 @@ def windows(spec, seed, cache, *, scoring=False):
     if spec["layout"] == "dynamo_native":
         selection = json.loads(_download(spec, f"training/seed{seed}.selection.json", cache).read_text())
         for item in selection:
-            lanes = int(re.search(r"/l(\d+)/", item["path"]).group(1))
-            path = _download(spec, f"native-step/seed{seed}/l{lanes}/traces/{Path(item['path']).name}", cache)
+            window_lanes = int(re.search(r"/l(\d+)/", item["path"]).group(1))
+            if lanes is not None and window_lanes != lanes:
+                continue
+            name = Path(item["path"]).name
+            path = _download(spec, f"native-step/seed{seed}/l{window_lanes}/traces/{name}", cache)
             if _sha256(path) != item["sha256"]:
                 raise ValueError(f"Step capture checksum mismatch: {item['path']}")
             with gzip.open(path, "rt") as stream:
@@ -98,7 +103,7 @@ def windows(spec, seed, cache, *, scoring=False):
                     for number, line in enumerate(stream, start=1)
                     if item["first_line"] <= number <= item["last_line"]
                 ]
-            yield lanes, [r for r in records if r is not None]
+            yield window_lanes, [r for r in records if r is not None]
     elif spec["layout"] == "sglang_hook":
         manifest = json.loads(_download(spec, "aisim-manifest.json", cache).read_text())
         for artifact in sorted(manifest["artifacts"], key=lambda a: a["artifact_id"]):
@@ -106,6 +111,8 @@ def windows(spec, seed, cache, *, scoring=False):
                 r"step-capture/seed(\d+)/c(\d+)/(warmup|profiling)\.jsonl\.gz", artifact["artifact_id"]
             )
             if not match or int(match.group(1)) != seed or (scoring and match.group(3) != "profiling"):
+                continue
+            if lanes is not None and int(match.group(2)) != lanes:
                 continue
             path = _download(spec, artifact["artifact_id"], cache)
             if _sha256(path) != artifact["sha256"]:
@@ -320,7 +327,7 @@ def score_steps(model, lanes, timing_config, workdir, reference_config=None):
         return None  # The evaluated wheel cannot price learned MTP steps; step metrics are unavailable.
     errors = {"decode": [], "prefill": []}
     dropped = 0
-    for window_lanes, records in windows(spec, TEST_SEED, workdir / "hf", scoring=True):
+    for window_lanes, records in windows(spec, TEST_SEED, workdir / "hf", scoring=True, lanes=lanes):
         if window_lanes != lanes:
             continue
         flags = [False] * len(records)

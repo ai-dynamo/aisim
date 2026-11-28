@@ -680,6 +680,9 @@ def qualify(args):
     summaries = []
     for run in runs:
         validate_result(run)
+        # Historical publications may omit these fields; a result from the current driver must carry them.
+        if not {"performance_model", "accuracy_metrics", "cpu_overhead"} <= set(run):
+            raise ValueError("AgentX result lacks performance-model, metric, or CPU-overhead fields")
         features = run.get("simulation_features")
         if (
             features is None

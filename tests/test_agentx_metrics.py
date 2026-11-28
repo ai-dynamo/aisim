@@ -303,6 +303,10 @@ def test_dynamo_native_windows_follow_the_published_selection(tmp_path, monkeypa
     assert [(lanes, [r["scheduled_requests"]["num_decode_requests"] for r in rows]) for lanes, rows in windows] == [
         (8, [2, 3, 4])
     ]
+    # Another lane's trace is neither downloaded nor parsed.
+    requested.clear()
+    assert list(agentx_learned.windows(spec, 7, tmp_path, lanes=14)) == []
+    assert requested == ["training/seed7.selection.json"]
     selection.write_text(selection.read_text().replace(digest, "0" * 64))
     with pytest.raises(ValueError, match="checksum"):
         list(agentx_learned.windows(spec, 7, tmp_path))
@@ -351,6 +355,13 @@ def test_qualification_requires_every_performance_model(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="learned-FPM support"):
         runner.qualify(Namespace(**{**vars(args), "output": tmp_path / "inconsistent"}))
+    # Only historical publications may omit the new result fields; a current shard result must carry them.
+    legacy = {k: v for k, v in op.items() if k not in {"performance_model", "accuracy_metrics", "cpu_overhead"}}
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": False, "learned_speculative": False, "runs": [legacy]})
+    )
+    with pytest.raises(ValueError, match="lacks performance-model"):
+        runner.qualify(Namespace(**{**vars(args), "output": tmp_path / "legacy"}))
     (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [op]}))
     with pytest.raises(KeyError):
         runner.qualify(Namespace(**{**vars(args), "output": tmp_path / "unrecorded"}))
@@ -381,6 +392,8 @@ def test_sglang_hook_windows_follow_the_published_manifest(tmp_path, monkeypatch
     assert [lanes for lanes, _ in agentx_learned.windows(spec, 7, tmp_path)] == [14, 8, 8]
     assert [lanes for lanes, _ in agentx_learned.windows(spec, 7, tmp_path, scoring=True)] == [14, 8]
     assert [lanes for lanes, _ in agentx_learned.windows(spec, 42, tmp_path)] == [8]
+    # Scoring one lane count reads only that lane's capture.
+    assert [lanes for lanes, _ in agentx_learned.windows(spec, 7, tmp_path, scoring=True, lanes=8)] == [8]
 
 
 def test_shifted_pairs_flag_both_records_of_a_split_step():

@@ -53,6 +53,20 @@ def observation(key="a", **values):
     }
 
 
+def current(run):
+    """A result as the current driver writes it: op-based, with metrics and CPU-overhead fields."""
+    from scripts.e2e_accuracy.agentx_metrics import request_metrics
+
+    summary = [item for item in run.get("config_summary", []) if item["name"] != "Estimation"]
+    run.update(
+        performance_model="op_level",
+        config_summary=[*summary, {"name": "Estimation", "value": "op_level"}],
+        accuracy_metrics={**request_metrics(run["pairs"]), "step": None},
+        cpu_overhead=None,
+    )
+    return run
+
+
 def result(**changes):
     value = {
         "id": "agentx-446063",
@@ -744,7 +758,7 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
     )
     from scripts.e2e_accuracy.run_agentx_accuracy import qualify
 
-    run = result()
+    run = current(result())
     run["simulation_features"] = simulation_record()
     catalog = silicon_inputs(tmp_path, run)
     snapshot = json.loads(bundle()["summary.json"])["snapshot"]
@@ -835,11 +849,13 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
         indexed["cache.g1_prefix"]["evidence"][0].update(
             {"sha256": "f" * 64} if problem == "unretained" else {"pointer": "/missing"}
         )
-    run = result(
-        id=identity,
-        category="self_collected",
-        feature_metadata=features,
-        simulation_features=simulation_record(identity),
+    run = current(
+        result(
+            id=identity,
+            category="self_collected",
+            feature_metadata=features,
+            simulation_features=simulation_record(identity),
+        )
     )
     if problem == "missing_metadata":
         del run["feature_metadata"]
