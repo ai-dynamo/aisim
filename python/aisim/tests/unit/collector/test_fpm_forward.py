@@ -1990,12 +1990,13 @@ def test_empty_base_config_with_sibling_quant_config_is_rejected(tmp_path):
 
 
 def test_empty_huggingface_config_with_quant_config_is_rejected(monkeypatch):
-    def download(_model_path, filename, *, raise_on_404):
+    def download(_model_path, filename, *, raise_on_404, revision="main"):
         if filename == "config.json":
-            return {}
-        return {"quantization": {"quant_algo": "FP8"}}
+            return {}, "a" * 40
+        assert revision == "a" * 40
+        return {"quantization": {"quant_algo": "FP8"}}, revision
 
-    monkeypatch.setattr("collector.fpm_forward.model_capability._download_hf_json", download)
+    monkeypatch.setattr("aisim_core.sdk.utils._download_hf_json_at", download)
 
     with pytest.raises(ValueError, match="must not be empty"):
         load_model_config("new-org/empty-config-model")

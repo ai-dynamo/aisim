@@ -123,6 +123,10 @@ class TestBuildNaiveOptimizationType:
     _SYS: ClassVar[dict] = {"gpus_per_node": 8, "vram_per_gpu": 141 * 1024**3}
     _WEIGHT = 30 * 1024**3  # 30 GiB -> fits in 1 GPU
 
+    @pytest.fixture(autouse=True)
+    def _use_bundled_model_configs(self, monkeypatch):
+        monkeypatch.delenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", raising=False)
+
     @patch(
         "aisim.generator.naive._estimate_model_weight_bytes",
         return_value=30 * 1024**3,
@@ -134,7 +138,7 @@ class TestBuildNaiveOptimizationType:
     def test_default_mode_is_agg(self, _sys, _est):
         """Calling without mode/optimization_type preserves backward compat."""
         result = build_naive_generator_params(
-            model_name="test/model",
+            model_name="Qwen/Qwen3-32B",
             total_gpus=8,
             system_name="h200_sxm",
             backend_name="vllm",
@@ -152,7 +156,7 @@ class TestBuildNaiveOptimizationType:
     )
     def test_disagg_mode_creates_prefill_decode(self, _sys, _est):
         result = build_naive_generator_params(
-            model_name="test/model",
+            model_name="Qwen/Qwen3-32B",
             total_gpus=8,
             system_name="h200_sxm",
             backend_name="vllm",
@@ -173,7 +177,7 @@ class TestBuildNaiveOptimizationType:
     )
     def test_disagg_prefill_decode_have_same_parallelization(self, _sys, _est):
         result = build_naive_generator_params(
-            model_name="test/model",
+            model_name="Qwen/Qwen3-32B",
             total_gpus=8,
             system_name="h200_sxm",
             backend_name="vllm",
@@ -195,7 +199,7 @@ class TestBuildNaiveOptimizationType:
     )
     def test_agg_worker_params_contain_parallelization_keys(self, _sys, _est):
         result = build_naive_generator_params(
-            model_name="test/model",
+            model_name="Qwen/Qwen3-32B",
             total_gpus=8,
             system_name="h200_sxm",
             backend_name="vllm",
@@ -222,7 +226,7 @@ class TestBuildNaiveOptimizationType:
     )
     def test_disagg_worker_config_has_prefill_decode_counts(self, _sys, _est):
         result = build_naive_generator_params(
-            model_name="test/model",
+            model_name="Qwen/Qwen3-32B",
             total_gpus=8,
             system_name="h200_sxm",
             backend_name="vllm",
@@ -246,7 +250,7 @@ class TestBuildNaiveOptimizationType:
         """With optimization_type set, parallelization should still be valid."""
         for opt in ("throughput", "latency"):
             result = build_naive_generator_params(
-                model_name="test/model",
+                model_name="Qwen/Qwen3-32B",
                 total_gpus=8,
                 system_name="h200_sxm",
                 backend_name="vllm",
@@ -266,7 +270,7 @@ class TestBuildNaiveOptimizationType:
     )
     def test_model_too_large_for_one_gpu_selects_higher_tp(self, _sys, _est):
         result = build_naive_generator_params(
-            model_name="test/model",
+            model_name="Qwen/Qwen3-32B",
             total_gpus=8,
             system_name="h200_sxm",
             backend_name="vllm",

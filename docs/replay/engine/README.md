@@ -103,7 +103,7 @@ Field tables on these pages use the following columns:
 | Knob | Default | Recommend | Rules |
 |---|---|---|---|
 | `engine.mode` | `aggregated` | `{choices: [aggregated, disaggregated]}` | `aggregated` or `disaggregated`. AFD is a per-role worker type described in [Analytical AFD and EPD](analytical.md). |
-| `engine.model` | Required | fixed | Hugging Face ID or local model directory. |
+| `engine.model` | Required | fixed | Hugging Face ID or local model directory. Bundled models load offline. Other IDs download `config.json`, falling back to the local Hugging Face cache on network failure, HTTP 429, or HTTP 5xx. FPM profiles with `profile.model_revision` pinned to a commit read the cache first. With `HF_HUB_OFFLINE=1` or `TRANSFORMERS_OFFLINE=1`, only the cache is read; missing required config raises an error. Missing optional metadata is allowed, with a warning when its absence is unconfirmed. The SDK and FPM Collector pin cached config companions to that snapshot; quantization or processor metadata with an unverified snapshot raises an error and never replaces a successfully downloaded config. Corrupt cached files or refs raise errors. |
 | `engine.hardware` | Required | `auto` allowed | System identifier, such as `h200_sxm`. `auto` is recommendation-only and resolves from `optimization.hardware`. |
 | `engine.backend` | `vllm` | `{choices: [vllm, sglang]}` | `vllm`, `sglang`, or `trtllm`. Selects both the scheduler semantics and the performance data. |
 | `engine.backend_version` | `current` | fixed | Selects performance data. It does not change scheduler behavior, except for a grouped FPM cache with prefix caching. That cache follows the rules of this vLLM version, which must then be `0.31.0`, `0.32.0` or `0.33.0`. Replay passes it to the rank as `vllm_version`. See [grouped caches](kv-cache.md#other-cache-modes). Must be a queryable version for the hardware and backend: `current`, `previous` when configured, `next` when newer data is available, or a version one of those available aliases resolves to. See [backend versions](#backend-versions). |
@@ -113,6 +113,50 @@ Field tables on these pages use the following columns:
 | `engine.tokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Tokenizes each request on its worker before the engine; see [Request tokenization](#tokenization). A caller that opts in to [measured CPU overhead](#measured-cpu-overhead) fills it when unset. Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and SGLang frontend stages (which already price the tokenizer) are rejected. |
 | `engine.extra_cpu_overhead` | Unset (off) | predict only | Optional `base_ms` and `per_input_token_us` (finite and non-negative, default `0`). Delays every request before the engine by `base_ms + per_input_token_us × input tokens` without queueing; see [Extra CPU overhead](#extra-cpu-overhead). Filled like `engine.tokenization` by [measured CPU overhead](#measured-cpu-overhead). Same replay support and rejections as `engine.tokenization`. |
 | `engine.detokenization` | Unset (off) | predict only | Optional `workers` (positive integer, default `1`), `base_ms` and `per_output_us` (finite and non-negative, default `0`). Detokenizes each pass's outputs on the worker that emits tokens before the client receives them; see [Response detokenization](#detokenization). Aggregated and disaggregated token replay on `--stack engine` only; online replay, worker scaling, AFD, encoder pools and `traffic.load.agentic_profile` are rejected. |
+
+For a cached config, the SDK and FPM Collector read `hf_quant_config.json` at
+that config's snapshot commit. A successful network config is never replaced
+with an older cached config when its quantization request fails: an unverified
+cached sidecar raises an error. Corrupt cached config or sidecar metadata and
+unverified sidecar provenance also fail DSPARK `nextn` resolution in the CLI
+recommendation/sizing path, instead of returning `None` as an access failure.
+Downloaded companions require a verified config snapshot too: if the config
+response omits `X-Repo-Commit`, present companion metadata raises a typed
+provenance error. Use one cached snapshot or a local model directory in that
+case. Absent optional companions remain supported. Passing a snapshot directory
+as a local model also rejects processor entries that are directories or dangling
+links, rather than treating them as absent.
+Generator DSA KV-dtype resolution also propagates metadata access errors, so a
+failed sidecar request cannot silently remove a checkpoint's FP8 prescription.
+To retry offline, first cache `config.json` and any needed quantization or
+processor files in one invocation under `main` (for a checkpoint publishing all
+these files, `env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE hf download org/model config.json hf_quant_config.json preprocessor_config.json video_preprocessor_config.json --revision main`),
+then set `HF_HUB_OFFLINE=1`. This primes missing files but can reuse corrupt
+cached bytes. To repair an unpinned `engine.model: org/model`, force-download
+`config.json` and the full required companion file set together under `main`
+before retrying offline. For example, a Llama 4 checkpoint without inline
+processor data needs
+`env -u HF_HUB_OFFLINE -u TRANSFORMERS_OFFLINE hf download org/model config.json preprocessor_config.json --revision main --force-download`;
+include `hf_quant_config.json` too if the checkpoint publishes it. Fetching only
+`config.json` can advance `refs/main` to a new snapshot without its required
+processor. An unpinned model ID needs the cache's `refs/main`; downloading only
+with `--revision <commit>` does not create that ref. For an exact commit,
+force-download any corrupt files with `--revision <commit> --force-download`,
+cache all required files at that commit and set
+`engine.model` to its local snapshot directory, or supply another local model
+directory. Replay's `engine.model` takes an ID or directory; the separate FPM
+profile field `profile.model_revision` supports an explicit revision pin.
+
+List only companion files published by the checkpoint in that download command.
+Fetching the files together resolves one snapshot; separate downloads from a
+moving `main` can leave `refs/main` pointing to a snapshot missing earlier files.
+Offline optional files recorded absent in the Hub cache's `.no_exist` directory
+use the normal defaults quietly. An uncached optional file with unknown status
+also uses those defaults, but emits a warning naming the file and a command to
+cache it at the selected revision. Llama 4 requires `preprocessor_config.json`
+when `image_processor_config` is not inline; an offline miss fails with recovery
+guidance. For Qwen3-VL and Kimi, inline `preprocessor_config` values are retained
+when a sidecar is absent; fields supplied by a sidecar override the inline values.
 
 <a id="tokenization"></a>
 

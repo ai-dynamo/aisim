@@ -307,7 +307,15 @@ def test_typed_request_preserves_cluster_overrides(tmp_path):
 
 @pytest.mark.parametrize("source", ["sdk", "sweeper"])
 @pytest.mark.parametrize("mode", ["agg", "disagg"])
-def test_sdk_and_sweeper_inputs_reach_persisted_slurm_bundle(source, mode, tmp_path):
+def test_sdk_and_sweeper_inputs_reach_persisted_slurm_bundle(source, mode, tmp_path, monkeypatch):
+    from aisim_core.sdk.utils import _load_pre_downloaded_hf_config
+
+    # The SDK resolves serving prescriptions while building generator inputs.
+    # Use a real local checkpoint instead of a path absent from the test host.
+    monkeypatch.delenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", raising=False)
+    model_path = tmp_path / "Qwen3"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(json.dumps(_load_pre_downloaded_hf_config("Qwen/Qwen3-32B")))
     overrides = {
         "generator_dynamo_version": "1.2.0",
         "rule": "benchmark",
@@ -333,7 +341,7 @@ def test_sdk_and_sweeper_inputs_reach_persisted_slurm_bundle(source, mode, tmp_p
             primary_backend_name="vllm",
             primary_system_name="h200_sxm",
             primary_backend_version="0.20.1",
-            primary_model_path="/models/Qwen3",
+            primary_model_path=str(model_path),
             prefix=0,
             is_moe=False,
             nextn=0,
@@ -360,7 +368,7 @@ def test_sdk_and_sweeper_inputs_reach_persisted_slurm_bundle(source, mode, tmp_p
     else:
         config = {
             "deployment_mode": mode,
-            "model_name": "/models/Qwen3",
+            "model_name": str(model_path),
             "backend": "vllm",
             "backend_version": "0.20.1",
             "hardware_sku": "h200_sxm",
@@ -412,7 +420,7 @@ def test_sdk_and_sweeper_inputs_reach_persisted_slurm_bundle(source, mode, tmp_p
         argv = worker["argv"]
         assert argv[:3] == ["python3", "-m", "dynamo.vllm"]
         for flag, value in (
-            ("--model", "/models/Qwen3"),
+            ("--model", str(model_path)),
             ("--served-model-name", "selected-model"),
             ("--tensor-parallel-size", "2"),
             ("--max-num-seqs", str(batch_size)),
@@ -461,6 +469,7 @@ def test_benchmark_request_matches_dynamo_protocol(backend, target, version, leg
 
 
 def test_naive_cli_input_preserves_benchmark_sizing_rule(monkeypatch):
+    monkeypatch.delenv("AICONFIGURATOR_MODEL_CONFIGS_PATH", raising=False)
     monkeypatch.setattr(
         "aisim.generator.naive._get_system_config",
         lambda _: {"gpus_per_node": 8, "vram_per_gpu": 192 * 1024**3},
@@ -471,7 +480,7 @@ def test_naive_cli_input_preserves_benchmark_sizing_rule(monkeypatch):
         lambda _: {"architecture": "Qwen3ForCausalLM", "num_experts": 0},
     )
     params = build_naive_generator_params(
-        model_name="test/model",
+        model_name="Qwen/Qwen3-32B",
         total_gpus=1,
         system_name="b200_sxm",
         backend_name="vllm",

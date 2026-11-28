@@ -24,6 +24,7 @@ from typing import Any
 import yaml
 
 from aisim.sdk import perf_database
+from aisim.sdk.errors import is_expected_cli_error
 from aisim.sdk.utils import (
     _load_model_config_from_model_path,
     _parse_hf_config_json,
@@ -211,12 +212,23 @@ def _estimate_model_weight_bytes(model_path: str, *, model_metadata: dict[str, A
     """
     try:
         raw_config = _load_model_config_from_model_path(model_path)
+        llama4_config = None
+        if (raw_config.get("architectures") or [None])[0] == "Llama4ForConditionalGeneration":
+            # The raw loader deliberately omits separate processor files. Llama 4
+            # needs that metadata even when normalizing config for weight sizing.
+            # Invalid processor metadata must not select the raw architecture fallback.
+            llama4_config = get_model_config_from_model_path(model_path)
     except Exception as e:
-        logger.exception("Could not estimate model size for %s.", model_path)
+        if is_expected_cli_error(e):
+            # Expected CLI errors keep their traceback at DEBUG only.
+            logger.error("Could not estimate model size for %s: %s", model_path, e)  # noqa: TRY400
+            logger.debug("Traceback for model size estimation of %s", model_path, exc_info=True)
+        else:
+            logger.exception("Could not estimate model size for %s.", model_path)
         raise RuntimeError(f"Model {model_path!r} not found or config unavailable") from e
 
     try:
-        config = _parse_hf_config_json(raw_config)
+        config = llama4_config if llama4_config is not None else _parse_hf_config_json(raw_config)
         weight_bytes = _estimate_weight_bytes_from_config(config, model_path)
 
         if model_metadata is not None:

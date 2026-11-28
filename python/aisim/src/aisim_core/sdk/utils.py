@@ -11,15 +11,22 @@
 # from vLLM (Apache-2.0), copyright contributors to the vLLM project:
 # https://github.com/vllm-project/vllm/blob/ee0da84ab9e04ac7610e28580af62c365e898389/vllm/model_executor/models/mistral3.py
 
+import contextvars
+import http.client
 import importlib.resources as pkg_resources
 import json
 import logging
 import os
 import re
+import stat
 import tempfile
 import urllib.request
-from functools import cache
+from collections import namedtuple
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
+from threading import Lock
 from urllib.parse import quote
 
 import yaml
@@ -78,16 +85,10 @@ def _load_json_with_infinity(file_path) -> dict:
     Load JSON file with support for JavaScript-style Infinity and NaN values.
 
     Standard JSON doesn't support Infinity/NaN, but HuggingFace configs may contain them (e.g., Nemotron-H-56B)
-    This function pre-processes the file content to replace these values before parsing.
+    Decode non-finite constants as null without changing quoted strings.
     """
-    with open(file_path) as f:
-        content = f.read()
-    # Replace JavaScript-style Infinity/NaN with Python-compatible values
-    # Use regex to match standalone Infinity/-Infinity/NaN (not part of a string)
-    content = re.sub(r"\bInfinity\b", "null", content)
-    content = re.sub(r"-Infinity\b", "null", content)
-    content = re.sub(r"\bNaN\b", "null", content)
-    return json.loads(content)
+    with open(file_path, "rb") as f:
+        return json.load(f, parse_constant=lambda _: None)
 
 
 def _derive_nemotronh_hybrid_pattern(config: dict) -> str:
@@ -416,6 +417,18 @@ class HuggingFaceDownloadError(Exception):
     pass
 
 
+class _HuggingFaceMetadataError(HuggingFaceDownloadError):
+    """Metadata is invalid or confirmed incomplete; callers must not treat it as an access failure."""
+
+
+class _HuggingFaceCacheError(_HuggingFaceMetadataError):
+    """A present cache file is unreadable or invalid, rather than absent."""
+
+
+class _HuggingFaceProvenanceError(_HuggingFaceMetadataError):
+    """Companion metadata cannot be bound to the selected config snapshot."""
+
+
 def _get_hf_auth_headers() -> dict[str, str]:
     """Respect Hugging Face token/cache settings for model metadata downloads."""
     if os.environ.get("HF_HUB_DISABLE_IMPLICIT_TOKEN", "").upper() in ("1", "ON", "YES", "TRUE"):
@@ -435,16 +448,270 @@ def _get_hf_auth_headers() -> dict[str, str]:
     return headers
 
 
+_TRUTHY = ("1", "ON", "YES", "TRUE")
+_OFFLINE_VARIABLES = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+_COMMIT_HASH = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _hf_offline_variable() -> str | None:
+    """Return the environment variable that turns Hugging Face offline mode on, if any."""
+    for name in _OFFLINE_VARIABLES:
+        if os.environ.get(name, "").strip().upper() in _TRUTHY:
+            return name
+    return None
+
+
+def _hf_hub_cache() -> Path:
+    """Locate the Hugging Face hub cache with the same precedence as huggingface_hub."""
+    for name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if (configured := os.environ.get(name)) is not None:
+            return Path(os.path.expandvars(configured)).expanduser()
+    default_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "huggingface"
+    return Path(os.path.expandvars(str(os.environ.get("HF_HOME", default_home)))).expanduser() / "hub"
+
+
+def _check_hf_model_id(hf_id: str) -> None:
+    """Reject ambiguous Hub IDs before encoding their cache directory name."""
+    parts = hf_id.split("/")
+    if (
+        len(parts) not in (1, 2)
+        or len(parts[-1]) > 96
+        or "--" in hf_id
+        or ".." in hf_id
+        or hf_id.endswith(".git")
+        or any(
+            not re.fullmatch(r"[\w.-]+", part) or part.startswith((".", "-")) or part.endswith((".", "-"))
+            for part in parts
+        )
+    ):
+        raise HuggingFaceDownloadError(
+            f"unsupported Hugging Face model ID {hf_id!r}: expected model or namespace/model"
+        )
+
+
+def _check_hf_revision(revision: str) -> None:
+    """Reject revisions that are not a commit, branch or tag name before any lookup."""
+    path = Path(revision)
+    if (
+        not revision
+        or path.is_absolute()
+        or any(part in ("", ".", "..") for part in revision.split("/"))
+        or "\\" in revision
+        or "\x00" in revision
+    ):
+        raise HuggingFaceDownloadError(
+            f"unsupported Hugging Face revision {revision!r}: expected a commit hash, branch or tag name "
+            "(for example main, v1.0 or release/v1)"
+        )
+
+
+def _hf_cache_snapshot(hf_id: str, revision: str) -> tuple[Path, str] | None:
+    """Resolve a cache ref to its immutable snapshot, validating present refs."""
+    _check_hf_model_id(hf_id)
+    _check_hf_revision(revision)
+    repo = _hf_hub_cache() / f"models--{hf_id.replace('/', '--')}"
+    commit = revision
+    if not _COMMIT_HASH.fullmatch(revision):
+        # Branch and tag refs may contain slashes; the hub cache stores them as nested files.
+        ref_path = repo / "refs" / revision
+        try:
+            commit = ref_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as error:
+            try:
+                ref_path.lstat()
+            except FileNotFoundError:
+                return None
+            except OSError as probe_error:
+                raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: {probe_error}") from probe_error
+            raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: dangling ref link") from error
+        except (OSError, UnicodeError) as error:
+            raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: {error}") from error
+    if not _COMMIT_HASH.fullmatch(commit):
+        raise _HuggingFaceCacheError(f"Invalid cached ref at {ref_path}: expected a 40-hex commit, got {commit!r}")
+    return repo, commit
+
+
+def _hf_optional_absence_known(hf_id: str, filename: str, revision: str) -> bool:
+    snapshot = _hf_cache_snapshot(hf_id, revision)
+    if snapshot is None:
+        return False
+    marker = snapshot[0] / ".no_exist" / snapshot[1] / filename
+    try:
+        mode = marker.stat().st_mode
+    except FileNotFoundError as error:
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as probe_error:
+            raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: {probe_error}") from probe_error
+        raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: dangling marker link") from error
+    except OSError as error:
+        raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: {error}") from error
+    if not stat.S_ISREG(mode):
+        raise _HuggingFaceCacheError(f"Invalid cached absence marker at {marker}: expected a regular file")
+    return True
+
+
+def _cached_hf_file(hf_id: str, filename: str, revision: str) -> tuple[Path, str] | None:
+    """Find a regular cached file and the snapshot commit it belongs to."""
+    snapshot = _hf_cache_snapshot(hf_id, revision)
+    if snapshot is None or Path(filename).name != filename:
+        return None
+    repo, commit = snapshot
+    path = repo / "snapshots" / commit / filename
+    try:
+        try:
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            # A missing name is optional absence; a dangling blob link is corrupt.
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                return None
+            raise _HuggingFaceCacheError(f"Invalid cached {filename} at {path}: dangling snapshot link") from None
+        if not stat.S_ISREG(mode):
+            raise _HuggingFaceCacheError(f"Invalid cached {filename} at {path}: expected a regular file")
+    except OSError as error:
+        raise _HuggingFaceCacheError(f"Invalid cached {filename} at {path}: {error}") from error
+    return path, commit
+
+
+def _load_cached_hf_json_at(hf_id: str, filename: str, revision: str) -> tuple[dict, str] | None:
+    found = _cached_hf_file(hf_id, filename, revision)
+    if found is None:
+        return None
+    path, commit = found
+    logger.debug("Loaded %s's %s from the Hugging Face cache at %s", hf_id, filename, path)
+    try:
+        # Match the network JSON decoder, including quoted NaN/Infinity text.
+        with path.open("rb") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, RecursionError) as error:
+        raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise _HuggingFaceCacheError(f"Invalid cached {filename} for {hf_id} at {path}: expected a JSON object")
+    return data, commit
+
+
+def _load_cached_hf_json(hf_id: str, filename: str, revision: str) -> dict | None:
+    found = _load_cached_hf_json_at(hf_id, filename, revision)
+    return None if found is None else found[0]
+
+
+def _local_config_hint(hf_id: str, filename: str, revision: str = "main") -> str:
+    pinned = "" if revision == "main" else f" --revision {revision}"
+    at = "" if revision == "main" else f" at revision {revision}"
+    return (
+        f"AISim bundles configs only for its supported models. For {hf_id}{at}, pass a local directory "
+        f"that contains {filename} as the model, or fetch the file into the Hugging Face cache while "
+        f"online with `hf download {hf_id} {filename}{pinned}`."
+    )
+
+
+def _is_transient_http_error(error: urllib.error.HTTPError) -> bool:
+    """Rate limits and server errors say nothing about the file; treat them like an outage."""
+    return error.code == 429 or error.code >= 500
+
+
+def _cached_after_network_failure(
+    hf_id: str, filename: str, revision: str, url: str, reason: object
+) -> tuple[dict, str]:
+    cached = _load_cached_hf_json_at(hf_id, filename, revision)
+    if cached is not None:
+        logger.warning("Could not reach Hugging Face for %s's %s (%s); using the cached copy", hf_id, filename, reason)
+        return cached
+    raise HuggingFaceDownloadError(
+        f"Cannot load {hf_id}'s {filename}: the download from Hugging Face failed ({reason}; URL: {url}) and "
+        f"the file is not in the local Hugging Face cache. {_local_config_hint(hf_id, filename, revision)} "
+        "Set HF_HUB_OFFLINE=1 to use only local files without trying the network."
+    )
+
+
 def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, revision: str = "main") -> dict | None:
-    """Download and parse a JSON file from a HuggingFace model repo."""
+    """Load a JSON file from a Hugging Face model repo; see :func:`_download_hf_json_at`."""
+    data, commit = _download_hf_json_at(hf_id, filename, raise_on_404=raise_on_404, revision=revision)
+    capture = _SNAPSHOT_CAPTURE.get()
+    if capture is not None and commit is not None:
+        capture[(hf_id, filename)] = commit
+    return data
+
+
+def _download_hf_json_at(
+    hf_id: str, filename: str, *, raise_on_404: bool = True, revision: str = "main"
+) -> tuple[dict | None, str | None]:
+    """Load a JSON file from a Hugging Face model repo, from the local cache or the network.
+
+    Returns the data and its snapshot commit, from the local cache, a pinned
+    request, or the network response's X-Repo-Commit header when available, so
+    related files can be read from the same commit.
+
+    Offline mode (``HF_HUB_OFFLINE`` or ``TRANSFORMERS_OFFLINE``) reads only the
+    local Hugging Face cache and never opens a connection. Online, a pinned commit
+    is read from the cache when present; other revisions are fetched so a moved
+    branch is honored. The cache is the fallback when the network fails or Hugging
+    Face answers with a rate limit or server error (HTTP 429 or 5xx).
+    An optional online file is absent only when HTTP 404 identifies EntryNotFound;
+    missing revisions, repositories, and unidentified 404s remain access errors.
+    """
+    _check_hf_model_id(hf_id)
+    _check_hf_revision(revision)
+    offline = _hf_offline_variable()
+    if offline is not None or _COMMIT_HASH.fullmatch(revision):
+        cached = _load_cached_hf_json_at(hf_id, filename, revision)
+        if cached is not None:
+            return cached
+        if not raise_on_404 and _hf_optional_absence_known(hf_id, filename, revision):
+            logger.debug("Confirmed absent optional %s for %s at %s", filename, hf_id, revision)
+            return None, None
+    if offline is not None:
+        if not raise_on_404:
+            logger.warning(
+                "%s is set; optional %s for %s is not cached and its absence is unconfirmed. "
+                "Continuing without this metadata. %s",
+                offline,
+                filename,
+                hf_id,
+                _local_config_hint(hf_id, filename, revision),
+            )
+            return None, None
+        raise HuggingFaceDownloadError(
+            f"Cannot load {hf_id}'s {filename}: Hugging Face offline mode is on ({offline} is set) and the "
+            f"file is not in the local Hugging Face cache ({_hf_hub_cache()}). "
+            f"{_local_config_hint(hf_id, filename, revision)}"
+        )
     url = f"https://huggingface.co/{hf_id}/raw/{quote(revision, safe='')}/{filename}"
     try:
-        req = urllib.request.Request(url, headers=_get_hf_auth_headers())
+        headers = _get_hf_auth_headers()
+    except (OSError, UnicodeError) as error:
+        raise HuggingFaceDownloadError(
+            f"Cannot read the Hugging Face token for {hf_id}'s {filename}: {error}"
+        ) from error
+    try:
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
-            return json.load(response)
+            commit = getattr(response, "headers", {}).get("X-Repo-Commit")
+            if commit is not None and not _COMMIT_HASH.fullmatch(commit):
+                raise _HuggingFaceProvenanceError(f"Invalid response commit for {hf_id}'s {filename}: {commit!r}")
+            if _COMMIT_HASH.fullmatch(revision):
+                if commit is not None and commit != revision:
+                    raise _HuggingFaceProvenanceError(
+                        f"Response commit {commit} for {hf_id}'s {filename} does not match requested commit {revision}"
+                    )
+                commit = revision
+            data = json.load(response)
+        if not isinstance(data, dict):
+            raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: expected a JSON object")
+        return data, commit
     except urllib.error.HTTPError as e:
-        if e.code == 404 and not raise_on_404:
-            return None
+        if e.code == 404 and (e.headers or {}).get("X-Error-Code") == "EntryNotFound":
+            if raise_on_404:
+                raise _HuggingFaceMetadataError(
+                    f"Missing required {filename} for {hf_id} at revision {revision} (HTTP error 404; URL: {url})"
+                ) from e
+            return None, None
+        if _is_transient_http_error(e):
+            return _cached_after_network_failure(hf_id, filename, revision, url, f"HTTP error {e.code}: {e.reason}")
         token_path = Path.home() / ".cache" / "huggingface" / "token"
         raise HuggingFaceDownloadError(
             f"Failed to download {hf_id}'s {filename} from HuggingFace: "
@@ -454,8 +721,46 @@ def _download_hf_json(hf_id: str, filename: str, *, raise_on_404: bool = True, r
             f"(2) set the HUGGING_FACE_HUB_TOKEN environment variable, or "
             f"(3) run `huggingface-cli login` (token stored at {token_path})."
         ) from e
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        # HTTPException covers a body cut short (IncompleteRead) or a malformed response.
+        try:
+            return _cached_after_network_failure(hf_id, filename, revision, url, getattr(e, "reason", None) or e)
+        except _HuggingFaceCacheError:
+            raise
+        except HuggingFaceDownloadError as missing:
+            raise missing from e
+    except _HuggingFaceMetadataError:
+        raise
+    except (ValueError, RecursionError) as e:
+        raise _HuggingFaceMetadataError(f"Invalid {filename} for {hf_id} from {url}: {e}") from e
     except Exception as e:
         raise HuggingFaceDownloadError(f"Failed to download {hf_id}'s {filename} from HuggingFace: {e}") from e
+
+
+# Snapshot provenance for downloaded and cache-served files. A capture is scoped to one loader
+# call through a context variable, so concurrent loads cannot see each other's
+# commits. Loaded configs own their provenance so active readers retain it
+# after cache eviction, without a registry keeping failed attempts alive.
+_SNAPSHOT_CAPTURE: contextvars.ContextVar[dict[tuple[str, str], str] | None] = contextvars.ContextVar(
+    "aisim_hf_snapshot_capture", default=None
+)
+
+
+class _SnapshotConfig(dict):
+    """A JSON mapping owning its non-serialized source and optional Hub commit."""
+
+    __slots__ = ("__weakref__", "_bundled_root", "_snapshot_commit", "_source")
+
+    def __init__(self, payload: dict, commit: str | None = None, *, source: str | Path = "hub", bundled_root=None):
+        super().__init__(payload)
+        self._snapshot_commit = commit
+        self._source = source
+        self._bundled_root = bundled_root
+
+
+def _config_snapshot_commit(raw_config: dict) -> str | None:
+    """The verified snapshot commit a loaded raw config came from, or None."""
+    return raw_config._snapshot_commit if isinstance(raw_config, _SnapshotConfig) else None
 
 
 def _download_hf_config(hf_id: str) -> dict:
@@ -563,6 +868,8 @@ def _qwen_pixel_bounds(processor_cfg: dict | None) -> tuple[int, int]:
         return QWEN3_VL_PIXEL_BOUNDS
     if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in bounds):
         raise ValueError(f"Qwen preprocessor pixel budget must be positive integers, got {bounds!r}")
+    if bounds[0] > bounds[1]:
+        raise ValueError(f"Qwen preprocessor pixel budget minimum must not exceed maximum, got {bounds!r}")
     return bounds
 
 
@@ -1652,17 +1959,19 @@ def _get_model_config_path():
     return pkg_resources.files("aisim_core") / "model_configs"
 
 
-def _load_pre_downloaded_hf_config(hf_id: str) -> dict:
+def _load_pre_downloaded_hf_config(hf_id: str, *, root=None) -> dict:
     """Load a cached HuggingFace config.json from the model_configs package directory."""
-    config_path = _get_model_config_path() / f"{hf_id.replace('/', '--')}_config.json"
+    config_path = (root if root is not None else _get_model_config_path()) / f"{hf_id.replace('/', '--')}_config.json"
     if not config_path.exists():
         raise ValueError(f"HuggingFace model {hf_id} is not cached in model_configs directory.")
     return _load_json_with_infinity(config_path)
 
 
-def _load_pre_downloaded_hf_quant_config(hf_id: str) -> dict | None:
+def _load_pre_downloaded_hf_quant_config(hf_id: str, *, root=None) -> dict | None:
     """Load a cached hf_quant_config.json, returning None if not present."""
-    config_path = _get_model_config_path() / f"{hf_id.replace('/', '--')}_hf_quant_config.json"
+    config_path = (
+        root if root is not None else _get_model_config_path()
+    ) / f"{hf_id.replace('/', '--')}_hf_quant_config.json"
     if not config_path.exists():
         return None
     return _load_json_with_infinity(config_path)
@@ -1943,6 +2252,12 @@ def _attach_inferred_quant_fields(raw_config: dict) -> dict:
 
 def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> dict:
     """Merge normalized hf_quant_config fields into raw_config if present."""
+    if (
+        hf_quant_config is not None
+        and "quantization" in hf_quant_config
+        and not isinstance(hf_quant_config["quantization"], dict)
+    ):
+        raise _HuggingFaceMetadataError("hf_quant_config.json quantization must be an object")
     if not hf_quant_config:
         return raw_config
     raw_config["hf_quant_config"] = hf_quant_config
@@ -1953,29 +2268,359 @@ def _attach_hf_quant_config(raw_config: dict, hf_quant_config: dict | None) -> d
     return raw_config
 
 
-def _attach_llama4_processor_config(raw_config: dict, model_path: str) -> dict:
+def _check_hf_companion_snapshot(hf_id: str, filename: str, revision: str, cached_commit: str | None) -> None:
+    """Present companion metadata requires the config's immutable snapshot."""
+    if not _COMMIT_HASH.fullmatch(revision):
+        raise _HuggingFaceProvenanceError(
+            f"Cannot verify {filename} for {hf_id}: config.json has no verified snapshot commit. "
+            "Cache config.json and the companion files from the same revision before setting HF_HUB_OFFLINE=1, "
+            "or supply a local model directory."
+        )
+    if cached_commit is not None and cached_commit != revision:
+        raise _HuggingFaceProvenanceError(
+            f"Cannot mix cached {filename} from snapshot {cached_commit} with {hf_id} config at {revision}. "
+            "Cache config.json and the companion files from the same revision before setting HF_HUB_OFFLINE=1, "
+            "or supply a local model directory."
+        )
+
+
+def _download_hf_companion_json(
+    hf_id: str, filename: str, *, revision: str = "main", raise_on_404: bool = False
+) -> dict | None:
+    """Reject cached companion metadata unless the model config pins its snapshot."""
+    capture: dict[tuple[str, str], str] = {}
+    token = _SNAPSHOT_CAPTURE.set(capture)
+    try:
+        pinned = {} if revision == "main" else {"revision": revision}
+        data = _download_hf_json(hf_id, filename, raise_on_404=raise_on_404, **pinned)
+    finally:
+        _SNAPSHOT_CAPTURE.reset(token)
+    if data is not None:
+        _check_hf_companion_snapshot(hf_id, filename, revision, capture.get((hf_id, filename)))
+    return data
+
+
+def _attach_llama4_processor_config(raw_config: dict, model_path: str, *, revision: str = "main") -> dict:
     """Load Llama 4's separate processor metadata, retaining bundled inline configs."""
     if (raw_config.get("architectures") or [None])[0] != "Llama4ForConditionalGeneration":
         return raw_config
     if "image_processor_config" in raw_config:
         return raw_config
-    if os.path.isdir(model_path):
-        processor_path = Path(model_path) / "preprocessor_config.json"
+    source = raw_config._source
+    if isinstance(source, Path):
+        processor_path = source / "preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
-    elif model_path in DefaultHFModels:
-        processor_path = _get_model_config_path() / f"{model_path.replace('/', '--')}_preprocessor_config.json"
+    elif source == "bundled":
+        processor_path = raw_config._bundled_root / f"{model_path.replace('/', '--')}_preprocessor_config.json"
         processor_config = _load_json_with_infinity(processor_path) if processor_path.exists() else None
     else:
-        processor_config = _download_hf_json(model_path, "preprocessor_config.json", raise_on_404=False)
+        processor_config = _download_hf_companion_json(
+            model_path, "preprocessor_config.json", revision=revision, raise_on_404=True
+        )
     if processor_config is not None:
-        raw_config["image_processor_config"] = processor_config
+        raw_config = {**raw_config, "image_processor_config": processor_config}
     return raw_config
 
 
-@cache
+def _attach_multimodal_processor_config(raw_config: dict, model_path: str, *, revision: str = "main") -> dict:
+    """Load processor metadata for parsing without modifying the cached base config."""
+    architecture = (raw_config.get("architectures") or [None])[0]
+    kimi = architecture in ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
+    qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
+    if not (kimi or qwen_vl):
+        return raw_config
+    source = raw_config._source
+    if source != "bundled":
+        # Bundled checkpoints use the pinned processor defaults. Other checkpoints
+        # may override them with media_proc_cfg or native HF processor files.
+        inline = raw_config.get("preprocessor_config", {})
+        if not isinstance(inline, dict):
+            raise ValueError("preprocessor_config must be an object")
+        # Inline values survive absent sidecars; explicit sidecar fields override
+        # them. Copy the mapping so validation/retry never mutates the raw cache.
+        processor = dict(inline)
+        files = [("preprocessor_config.json", None)]
+        if kimi:
+            files.append(("video_preprocessor_config.json", "video_processor"))
+        for filename, key in files:
+            if isinstance(source, Path):
+                path = source / filename
+                try:
+                    mode = path.stat().st_mode
+                except FileNotFoundError as error:
+                    try:
+                        path.lstat()
+                    except FileNotFoundError:
+                        continue
+                    except OSError as probe_error:
+                        raise _HuggingFaceMetadataError(
+                            f"Invalid local {filename} at {path}: {probe_error}"
+                        ) from probe_error
+                    raise _HuggingFaceMetadataError(
+                        f"Invalid local {filename} at {path}: dangling processor link"
+                    ) from error
+                except OSError as error:
+                    raise _HuggingFaceMetadataError(f"Invalid local {filename} at {path}: {error}") from error
+                if not stat.S_ISREG(mode):
+                    raise _HuggingFaceMetadataError(f"Invalid local {filename} at {path}: expected a regular file")
+                data = _load_json_with_infinity(path)
+                if data is None:
+                    family = "Kimi" if kimi else "Qwen3-VL"
+                    raise ValueError(f"{family} {filename} must be an object")
+            else:
+                data = _download_hf_companion_json(model_path, filename, revision=revision)
+            if data is not None:
+                if not isinstance(data, dict):
+                    family = "Kimi" if kimi else "Qwen3-VL"
+                    raise ValueError(f"{family} {filename} must be an object")
+                if key is None:
+                    if qwen_vl:
+                        # Normalize each source before merging so a one-bound
+                        # sidecar replaces only that bound, across both spellings.
+                        data = dict(data)
+                        for source in (processor, data):
+                            if isinstance(source.get("size"), dict):
+                                for bound, alias in (("min_pixels", "shortest_edge"), ("max_pixels", "longest_edge")):
+                                    if bound not in source and alias in source["size"]:
+                                        source[bound] = source["size"][alias]
+                    if kimi:
+                        nested_media = "media_proc_cfg" in processor or "media_proc_cfg" in data
+                        inline_media = processor.get("media_proc_cfg", processor)
+                        sidecar_media = data.get("media_proc_cfg", data)
+                        if not isinstance(inline_media, dict) or not isinstance(sidecar_media, dict):
+                            raise ValueError("Kimi media_proc_cfg must be an object")
+                        has_video = "video_processor" in processor or "video_processor" in data
+                        inline_video = processor.get("video_processor", {})
+                        sidecar_video = data.get("video_processor", {})
+                        if not isinstance(inline_video, dict) or not isinstance(sidecar_video, dict):
+                            raise ValueError("Kimi video processor config must be an object")
+                        video = {**inline_video, **sidecar_video}
+                        media = {
+                            name: value
+                            for name, value in {**inline_media, **sidecar_media}.items()
+                            if name not in ("media_proc_cfg", "video_processor")
+                        }
+                        for native, legacy in (
+                            ("max_patches", "in_patch_limit"),
+                            ("merge_size", "merge_kernel_size"),
+                            ("size", "patch_limit_on_one_side"),
+                        ):
+                            if native in sidecar_media and legacy not in sidecar_media:
+                                if legacy == "patch_limit_on_one_side" and legacy in media:
+                                    # Legacy image geometry also supplies the video
+                                    # default. Preserve it when replacing the image alias.
+                                    side = media[legacy]
+                                    video.setdefault("size", {"max_height": side, "max_width": side})
+                                    has_video = True
+                                media.pop(legacy, None)
+                        processor.update(data)
+                        if nested_media:
+                            processor["media_proc_cfg"] = media
+                        else:
+                            processor = media
+                        if has_video:
+                            processor["video_processor"] = video
+                    else:
+                        processor.update(data)
+                else:
+                    inline_video = processor.get(key, {})
+                    if not isinstance(inline_video, dict):
+                        raise ValueError(f"{key} must be an object")
+                    processor[key] = {**inline_video, **data}
+                if kimi:
+                    # Native video fields override legacy media aliases through
+                    # either sidecar, after preserving unspecified inline fields.
+                    sidecar_video = data.get("video_processor", {}) if key is None else data
+                    if "merge_size" in sidecar_video and "merge_kernel_size" not in sidecar_video:
+                        processor["video_processor"].pop("merge_kernel_size", None)
+                    media = processor.get("media_proc_cfg", processor)
+                    if not isinstance(media, dict):
+                        raise ValueError("Kimi media_proc_cfg must be an object")
+                    media = dict(media)
+                    for native, legacy in (
+                        ("max_patches", "in_patch_limit_each_frame"),
+                        ("temporal_patch_size", "temporal_merge_kernel_size"),
+                    ):
+                        if native in sidecar_video:
+                            media.pop(legacy, None)
+                    if "media_proc_cfg" in processor:
+                        processor["media_proc_cfg"] = media
+                    else:
+                        processor = media
+        raw_config = {**raw_config, "preprocessor_config": processor}
+    return raw_config
+
+
+@dataclass(slots=True)
+class _ModelConfigCacheEntry:
+    raw: dict
+    # Sidecars exposed through raw belong only to this parsed generation.
+    deferred_processor: dict | None = None
+    # Count only leases of the current parsed generation.
+    readers: int = 0
+    parsed: bool = False
+    result: dict | None = None
+    generation: object = field(default_factory=object)
+    processor_lock: Lock = field(default_factory=Lock)
+
+
+@dataclass(slots=True)
+class _ModelConfigLoad:
+    readers: int = 0
+
+
+def _cache_raw_model_config(load):
+    """Publish raw and parsed results in one generation; evict if all readers fail."""
+    entries = {}
+    # A token tracks concurrent cold loads until the last one finishes.
+    # Eviction/clear invalidates it without retaining per-model history.
+    loading = {}
+    hits = misses = 0
+    parsed_hits = parsed_misses = 0
+    lock = Lock()
+    info = namedtuple("CacheInfo", "hits misses maxsize currsize")
+
+    @wraps(load)
+    def cached(model_path):
+        nonlocal hits, misses
+        while True:
+            with lock:
+                if model_path in entries:
+                    hits += 1
+                    return entries[model_path].raw
+                misses += 1
+                token = loading.setdefault(model_path, _ModelConfigLoad())
+                token.readers += 1
+            try:
+                config = load(model_path)
+                with lock:
+                    # Concurrent cold loads use the first still-published base.
+                    if model_path in entries:
+                        return entries[model_path].raw
+                    if loading.get(model_path) is token:
+                        entries[model_path] = _ModelConfigCacheEntry(config)
+                        return config
+                    # An eviction/clear invalidated this read. Resolve again rather
+                    # than republishing a base read before the source was repaired.
+            finally:
+                with lock:
+                    token.readers -= 1
+                    if not token.readers and loading.get(model_path) is token:
+                        del loading[model_path]
+
+    def clear():
+        nonlocal hits, misses, parsed_hits, parsed_misses
+        with lock:
+            entries.clear()
+            loading.clear()
+            hits = misses = 0
+            parsed_hits = parsed_misses = 0
+
+    @contextmanager
+    def reader(model_path, *, with_generation=False):
+        while True:
+            _load_model_config_from_model_path(model_path)
+            with lock:
+                # Lookup and lease acquisition are atomic. If another reader
+                # evicted the base, resolve again outside the lock, never restore it.
+                entry = entries.get(model_path)
+                if entry is not None:
+                    entry.readers += 1
+                    generation = entry.generation
+                    break
+        succeeded = False
+        try:
+            yield (entry, generation) if with_generation else entry
+            succeeded = True
+        finally:
+            with lock:
+                if entry.generation is generation:
+                    entry.readers -= 1
+                    entry.parsed |= succeeded
+                    if not entry.readers and not entry.parsed and entries.get(model_path) is entry:
+                        del entries[model_path]
+                        loading.pop(model_path, None)
+
+    def clear_parsed():
+        nonlocal parsed_hits, parsed_misses
+        with lock:
+            for entry in entries.values():
+                if entry.deferred_processor is not None:
+                    # Retain genuine inline metadata, and leave snapshots owned
+                    # by in-flight readers intact when dropping a deferred file.
+                    raw = entry.raw
+                    entry.raw = _SnapshotConfig(
+                        {key: value for key, value in raw.items() if key != "image_processor_config"},
+                        raw._snapshot_commit,
+                        source=raw._source,
+                        bundled_root=raw._bundled_root,
+                    )
+                    entry.deferred_processor = None
+                entry.readers = 0
+                entry.parsed = False
+                entry.result = None
+                entry.generation = object()
+            parsed_hits = parsed_misses = 0
+
+    def parse_cached(model_path, parse, *, use_cache=True):
+        nonlocal parsed_hits, parsed_misses
+        if use_cache:
+            with lock:
+                entry = entries.get(model_path)
+                if entry is not None and entry.result is not None:
+                    parsed_hits += 1
+                    return entry.result
+                parsed_misses += 1
+        with reader(model_path, with_generation=True) as (entry, generation):
+            llama4 = (entry.raw.get("architectures") or [None])[0] == "Llama4ForConditionalGeneration"
+            # Keep Llama 4 validation and publication serialized. Other model
+            # readers remain independent while accessing processor metadata.
+            with entry.processor_lock if llama4 else nullcontext():
+                with lock:
+                    if use_cache and entry.generation is generation and entry.result is not None:
+                        return entry.result
+                result = parse(entry, model_path)
+                with lock:
+                    if entries.get(model_path) is entry and entry.generation is generation:
+                        # Processor and parsed-result publication share the same
+                        # generation check, including uncached inspection calls.
+                        if (
+                            llama4
+                            and "image_processor_config" not in entry.raw
+                            and "image_processor_config" in result["raw_config"]
+                        ):
+                            entry.deferred_processor = result["raw_config"]["image_processor_config"]
+                            entry.raw["image_processor_config"] = entry.deferred_processor
+                        if use_cache:
+                            if entry.result is None:
+                                entry.result = result
+                            entry.parsed = True
+                            return entry.result
+                return result
+
+    def parsed_cache_info():
+        with lock:
+            return info(parsed_hits, parsed_misses, None, sum(entry.result is not None for entry in entries.values()))
+
+    def cache_info():
+        with lock:
+            return info(hits, misses, None, len(entries))
+
+    cached.cache_clear = clear
+    cached.cache_reader = reader
+    cached.cache_clear_parsed = clear_parsed
+    cached.cache_parse = parse_cached
+    cached.cache_info_parsed = parsed_cache_info
+    cached.cache_info = cache_info
+    return cached
+
+
+@_cache_raw_model_config
 def _load_model_config_from_model_path(model_path: str) -> dict:
     """
-    Get model configuration from model path.
+    Get base and quantization configuration without reading separate processor files.
+
+    Processor metadata is loaded and validated by ``get_model_config_from_model_path``.
 
     The model_path can be:
     1. A HuggingFace model path (e.g., "Qwen/Qwen3-32B")
@@ -1993,26 +2638,47 @@ def _load_model_config_from_model_path(model_path: str) -> dict:
     """
     # Check if it's a local path
     if os.path.isdir(model_path):
-        config = _attach_llama4_processor_config(_load_local_config(model_path), model_path)
-        return _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(model_path)))
+        source = Path(model_path).resolve()
+        config = _load_local_config(str(source))
+        loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(config, _load_local_quant_config(str(source))))
+        return _SnapshotConfig(loaded, None, source=source)
 
     # Otherwise treat as HuggingFace path
     if model_path in DefaultHFModels:
-        config = _attach_llama4_processor_config(_load_pre_downloaded_hf_config(model_path), model_path)
-        return _attach_inferred_quant_fields(
-            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path))
+        root = _get_model_config_path()
+        if isinstance(root, Path):
+            root = root.resolve()
+        config = _load_pre_downloaded_hf_config(model_path, root=root)
+        loaded = _attach_inferred_quant_fields(
+            _attach_hf_quant_config(config, _load_pre_downloaded_hf_quant_config(model_path, root=root))
         )
+        return _SnapshotConfig(loaded, None, source="bundled", bundled_root=root)
 
-    config = _attach_llama4_processor_config(_download_hf_config(model_path), model_path)
+    capture: dict[tuple[str, str], str] = {}
+    token = _SNAPSHOT_CAPTURE.set(capture)
     try:
-        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False)
-    except Exception as exc:  # best-effort for optional quant config
-        logger.debug("Failed to download hf_quant_config.json for %s: %s", model_path, exc)
-        hf_quant_config = None
-    return _attach_inferred_quant_fields(_attach_hf_quant_config(config, hf_quant_config))
+        raw_config = _download_hf_config(model_path)
+        # Pin companions to the verified config snapshot, including successful
+        # downloads, so later reads cannot mix metadata after a branch moves.
+        commit = capture.get((model_path, "config.json"))
+        pinned = {"revision": commit} if commit else {}
+        hf_quant_config = _download_hf_json(model_path, "hf_quant_config.json", raise_on_404=False, **pinned)
+        if hf_quant_config is None:
+            logger.debug("No optional hf_quant_config.json for %s", model_path)
+    finally:
+        _SNAPSHOT_CAPTURE.reset(token)
+    if hf_quant_config is not None:
+        _check_hf_companion_snapshot(
+            model_path, "hf_quant_config.json", commit or "main", capture.get((model_path, "hf_quant_config.json"))
+        )
+    loaded = _attach_inferred_quant_fields(_attach_hf_quant_config(raw_config, hf_quant_config))
+    return _SnapshotConfig(loaded, commit)
 
 
-@cache
+_model_config_reader = _load_model_config_from_model_path.cache_reader
+_model_config_parser = _load_model_config_from_model_path.cache_parse
+
+
 def get_model_config_from_model_path(model_path: str) -> dict:
     """
     Get model configuration from model path and parse it into model configuration parameters.
@@ -2024,35 +2690,37 @@ def get_model_config_from_model_path(model_path: str) -> dict:
         dict: Model configuration parameters and raw config under "raw_config".
         Quantization metadata retains its original root or text_config scope.
     """
-    raw_config = _load_model_config_from_model_path(model_path)
-    architecture = (raw_config.get("architectures") or [None])[0]
-    kimi = architecture in ("KimiK25ForConditionalGeneration", "KimiK3ForConditionalGeneration")
-    qwen_vl = architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
-    if (kimi or qwen_vl) and model_path not in DefaultHFModels:
-        # Only Kimi and Qwen3-VL consume these processor files. Bundled
-        # checkpoints use the pinned processor defaults; local/downloaded
-        # checkpoints may override them with the original media_proc_cfg or
-        # native HF layout. Qwen's per-clip video budget is not modeled.
-        processor = {}
-        files = [("preprocessor_config.json", None)]
-        if kimi:
-            files.append(("video_preprocessor_config.json", "video_processor"))
-        for filename, key in files:
-            if os.path.isdir(model_path):
-                path = Path(model_path) / filename
-                data = _load_json_with_infinity(path) if path.is_file() else None
-            else:
-                data = _download_hf_json(model_path, filename, raise_on_404=False)
-            if data is not None:
-                if not isinstance(data, dict):
-                    family = "Kimi" if kimi else "Qwen3-VL"
-                    raise ValueError(f"{family} {filename} must be an object")
-                if key is None:
-                    processor.update(data)
-                else:
-                    processor[key] = data
-        raw_config = {**raw_config, "preprocessor_config": processor}
+    return _model_config_parser(model_path, _parse_model_config_entry)
+
+
+def _get_uncached_model_config_from_model_path(model_path: str) -> dict:
+    return _model_config_parser(model_path, _parse_model_config_entry, use_cache=False)
+
+
+# Preserve the functools-style inspection/invalidation API while keeping the
+# parsed result and its publication state on the raw entry, under one lock.
+get_model_config_from_model_path.__wrapped__ = _get_uncached_model_config_from_model_path
+get_model_config_from_model_path.cache_clear = _load_model_config_from_model_path.cache_clear_parsed
+get_model_config_from_model_path.cache_info = _load_model_config_from_model_path.cache_info_parsed
+get_model_config_from_model_path.cache_parameters = lambda: {"maxsize": None, "typed": False}
+
+
+def _parse_model_config_entry(entry: _ModelConfigCacheEntry, model_path: str) -> dict:
+    return _parse_model_config_from_raw(entry.raw, model_path)
+
+
+def _parse_model_config_from_raw(raw_config: dict, model_path: str) -> dict:
+    """Parse one leased base; publication succeeds only after full validation."""
+    base_config = raw_config
+    commit = _config_snapshot_commit(raw_config)
+    pinned = {"revision": commit} if commit else {}
+    raw_config = _attach_llama4_processor_config(raw_config, model_path, **pinned)
+    raw_config = _attach_multimodal_processor_config(raw_config, model_path, **pinned)
     parsed = _parse_hf_config_json(raw_config)
+    if raw_config is not base_config:
+        raw_config = _SnapshotConfig(
+            raw_config, commit, source=base_config._source, bundled_root=base_config._bundled_root
+        )
     if parsed["architecture"] == "DeepseekV4ForCausalLM" and model_path not in common.DEEPSEEK_V4_HF_MODELS:
         supported = ", ".join(sorted(common.DEEPSEEK_V4_HF_MODELS))
         logger.warning(
