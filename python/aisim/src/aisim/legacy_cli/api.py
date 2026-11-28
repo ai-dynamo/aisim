@@ -109,16 +109,40 @@ class CLIResult:
     """Result from running CLI default or exp mode."""
 
     chosen_exp: str
-    """Name of the experiment with the best throughput."""
+    """Chosen experiment, preferring SLA-compliant results within the GPU budget.
+
+    Load matching first prefers SLA-compliant full-target results, then
+    SLA-compliant partial-load results, then closest-SLA diagnostics.
+    ``cli_recommend`` raises ``NoFeasibleConfigError`` if no load-match
+    candidate is eligible instead of returning a result. Throughput mode
+    selects the highest throughput.
+    """
 
     best_configs: dict[str, pd.DataFrame]
-    """Best configurations per experiment, filtered by latency constraints."""
+    """Best configurations per experiment.
+
+    Load-match rows expose ``sla_satisfied``, ``load_satisfied`` and
+    ``gpu_budget_satisfied``; closest-SLA diagnostics are explicitly marked.
+    No load-match row exceeds an explicit GPU budget. If no replica fits,
+    ``cli_recommend`` raises ``NoFeasibleConfigError`` instead of returning
+    an empty result. Throughput mode can retain experiment keys with empty
+    dataframes, including when strict SLA filtering removes every row.
+    """
 
     pareto_fronts: dict[str, pd.DataFrame]
     """Pareto frontier data per experiment."""
 
     best_throughputs: dict[str, float]
-    """Best throughput (tokens/s/gpu_cluster) per experiment."""
+    """Objective-specific comparison score per experiment.
+
+    Throughput mode uses ``tokens/s/gpu_cluster``. Load-match mode uses
+    ``1 / total_gpus_needed`` for full-load matches. GPU-capped results and
+    SLA diagnostics under a GPU budget use ``tokens/s/gpu_cluster``.
+    Unbudgeted sizing retains inverse-GPU scores, including diagnostic results.
+    Full-target and capped scores have different units; chosen_exp compares
+    them only within the preferred group described above.
+    Read throughput values from ``best_configs`` when sizing for a load target.
+    """
 
     tasks: dict[str, Task]
     """Task objects used for each experiment."""
@@ -545,7 +569,14 @@ def cli_recommend(
 
     Returns:
         CLIResult with best configs containing ``total_gpus_needed`` and
-        ``replicas_needed`` columns, ranked by fewest GPUs first.
+        ``replicas_needed`` columns, ranked by fewest GPUs first. The
+        ``best_throughputs`` values are inverse-GPU comparison scores, not
+        token throughput. This API performs unbudgeted sizing, including
+        closest-SLA diagnostics; see :class:`CLIResult` for the general
+        score units and selection rules.
+
+    Raises:
+        NoFeasibleConfigError: If no feasible configuration is found for the load target.
 
     Example:
         >>> result = cli_recommend(
@@ -556,6 +587,8 @@ def cli_recommend(
         ...     tpot=30,
         ... )
         >>> print(result.best_configs)
+        >>> print(result.chosen_exp)  # Mode selected for the target load
+        >>> print(result.best_throughputs)  # 1 / total_gpus_needed for load matching
     """
     import math
 
