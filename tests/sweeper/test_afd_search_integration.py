@@ -86,6 +86,23 @@ def recommendation(mode="disaggregated", afd_roles=("prefill", "decode")):
     return raw
 
 
+@pytest.mark.parametrize(
+    ("make_config", "config_type"),
+    [(prediction, CorePredictionConfig), (recommendation, CoreRecommendationConfig)],
+)
+def test_afd_requires_chunk_size_under_afd(make_config, config_type):
+    raw = make_config("aggregated", ("aggregated",))
+    worker = raw["engine"]["workers"]["aggregated"]
+    worker["scheduler"] = {"chunked_prefill_size": 128}
+    with pytest.raises(ValidationError, match=r"scheduler\.chunked_prefill_size.*use afd\.chunked_prefill_size"):
+        config_type.model_validate(raw)
+
+    del worker["scheduler"]
+    worker["afd"]["chunked_prefill_size"] = 128
+    parsed = config_type.model_validate(raw)
+    assert parsed.engine.workers.aggregated.afd.chunked_prefill_size == 128
+
+
 @pytest.mark.parametrize(("mode", "afd_roles"), COMBINATIONS)
 def test_saved_afd_search_does_not_invent_ordinary_estimator_overrides(mode, afd_roles):
     smart = recommendation_to_sweeper(CoreRecommendationConfig.model_validate(recommendation(mode, afd_roles)))

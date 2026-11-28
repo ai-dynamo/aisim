@@ -984,6 +984,12 @@ def _worker_engine_args(
     if capacity.type == "default" and memory_fraction is None:
         memory_fraction = 0.88 if backend == "sglang" else 0.9
     block_size = resolve_block_size(backend, cache.block_size)
+    chunk = worker.scheduler.chunked_prefill_size
+    if chunk is not None and chunk // parallel.attention_data < block_size:
+        raise ValueError(
+            f"workers.{role}.scheduler.chunked_prefill_size={chunk} must provide at least one "
+            f"block ({block_size} tokens) per attention_data rank ({parallel.attention_data})"
+        )
     payload: dict[str, JSONValue] = {
         "worker_type": role,
         "engine_type": backend,
@@ -1232,6 +1238,11 @@ def _worker_engine_args(
                 frontend=worker.frontend,
             )
         )
+    if chunk is not None:
+        payload.setdefault("sglang", {}).update(
+            chunked_prefill_size=chunk,
+            max_prefill_tokens=worker.scheduler.max_batched_tokens,
+        )
     # After the host arguments, which replace the `sglang` entry.
     swa_prefix_tails = _swa_prefix_tails(engine, worker, role)
     if swa_prefix_tails is not None:
@@ -1257,8 +1268,12 @@ def _worker_engine_args(
             sglang = payload.setdefault("sglang", {})
             assert isinstance(sglang, dict)
             sglang.setdefault("chunked_prefill_size", worker.scheduler.max_batched_tokens)
-        if isinstance(sglang, dict) and isinstance(chunk := sglang.get("chunked_prefill_size"), int):
-            sglang["chunked_prefill_size"] = max(block_size, chunk // block_size * block_size)
+        if (
+            isinstance(sglang, dict)
+            and chunk is None
+            and isinstance(fallback := sglang.get("chunked_prefill_size"), int)
+        ):
+            sglang["chunked_prefill_size"] = max(block_size, fallback // block_size * block_size)
     return payload
 
 

@@ -311,9 +311,12 @@ encoded on that worker also require default (AIC) timing; `host_loop` and
 `frontend` work with any timing model. Image workloads take either this path
 or an encoder pool (`engine.workers.encoder`, analytical or native), never
 both; `min_pixels`/`max_pixels` are honored on this path and by native encoder
-pools, not by the analytical overlay. On this path
-`scheduler.max_batched_tokens` becomes SGLang's `chunked_prefill_size`; other
-SGLang predictions keep their existing behavior. `recommend` accepts the same
+pools, not by the analytical overlay. On this path, an explicit
+`scheduler.chunked_prefill_size` sets SGLang's chunk budget and
+`scheduler.max_batched_tokens` sets the per-rank prefill admission ceiling.
+When the chunk size is unset, the budget comes from
+`scheduler.max_batched_tokens`, rounded down to a whole KV block with a
+minimum of one block. `recommend` accepts the same
 fields as fixed data; candidates search load, scheduling, tensor parallelism
 and replicas (not `mode`, which must be concrete), and their saved prediction
 YAML reproduces the scored metrics through `aisim predict`.

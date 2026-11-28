@@ -1034,6 +1034,23 @@ def test_runner_canary_checks_both_production_architectures_with_step_home() -> 
     assert "container" not in shared  # Shared admission does not permit container pods.
 
 
+def test_prediction_collection_uses_hosted_workspace_and_ref_gate() -> None:
+    jobs = _workflow("prediction-regression-gate.yml")["jobs"]
+    collect = jobs["collect"]
+    # The internal runner canary is irrelevant after the hosted-runner migration.
+    assert "canary" not in jobs
+    assert collect["needs"] == "refs"
+    assert collect["runs-on"] == "ubuntu-24.04"
+    assert "container" not in collect
+    assert "HOME" not in collect.get("env", {})
+    # Default success() stops snapshots if comparison-ref resolution fails.
+    assert "if" not in collect
+    assert not collect.get("continue-on-error")
+    assert jobs["report"]["needs"] == "collect"
+    failure = next(step for step in jobs["report"]["steps"] if step.get("if") == "needs.collect.result != 'success'")
+    assert "exit 1" in failure["run"]
+
+
 def test_workflow_runner_selectors_match_registered_pools_and_runbook() -> None:
     labels = yaml.safe_load((REPOSITORY_ROOT / ".github/actionlint.yaml").read_text())["self-hosted-runner"]["labels"]
     for name in ("prod-aisim-default-amd64-v1", "prod-aisim-default-arm64-v1", "dynamo-cpu-4gi-amd64"):
