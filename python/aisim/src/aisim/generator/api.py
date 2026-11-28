@@ -22,6 +22,7 @@ from .artifacts import ArtifactWriter
 from .rendering import _cast_literal, render_backend_parameters, render_backend_templates
 from .utils import (
     DEFAULT_BACKEND,
+    _deep_merge_dicts,
     _load_yaml_payload,
     get_default_dynamo_version_mapping,
     normalize_backend,
@@ -611,16 +612,6 @@ def _assign_path(target: dict[str, Any], dotted_key: str, value: Any) -> None:
             node[segment] = next_node
         node = next_node
     node[parts[-1]] = value
-
-
-def _deep_merge_dicts(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in incoming.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
 
 
 from .aggregators import (
