@@ -552,3 +552,37 @@ fn padded_waiting_query_reaches_fitted_timing_at_its_physical_width() {
     let padded = core.resolve_pass(None).unwrap();
     assert_eq!(padded.output_signals.len(), 4, "padding is never accepted");
 }
+
+#[test]
+fn readmitted_query_reaches_fitted_timing_once() {
+    // A preempted depth-2 request with a four-token prompt and one generated
+    // token recomputes all five known tokens in one query. Its prefill and
+    // decode entries split that query, so fitted timing counts it once.
+    let mut config = args(2, 16, true, false);
+    config.num_gpu_blocks = 5;
+    let mut core = VllmCore::new(config);
+    let first_id = submit(&mut core, 130, 4, 16);
+    let second_id = submit(&mut core, 131, 4, 16);
+    let mut collector = crate::engine::trace::TraceCollector::default();
+    let first = core.execute_pass(&mut collector, 0.0);
+    core.complete_engine_boundary(first.end_ms);
+    let second = core.execute_pass(&mut collector, first.end_ms);
+    assert_eq!(
+        second.pressure_events.len(),
+        1,
+        "the second decoder is preempted"
+    );
+    assert_eq!(core.state.requests[&second_id].sequence.len(), 5);
+    core.apply_command(SchedulerCommand::CancelRequest {
+        request_id: first_id,
+    })
+    .unwrap();
+    core.complete_engine_boundary(second.end_ms);
+
+    let work = core.schedule_pass(None, second.end_ms).unwrap();
+    let prefill = work.prefill.as_ref().unwrap();
+    let widths = &work.decode.as_ref().unwrap().widths;
+    assert_eq!(prefill.requests, vec![(4, 0, 4)]);
+    assert_eq!(widths, &vec![1]);
+    core.resolve_pass(None).unwrap();
+}

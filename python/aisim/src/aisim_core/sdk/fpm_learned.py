@@ -573,6 +573,7 @@ def _build_dataset(
     features: Sequence[str],
     *,
     provenance: dict[str, list[tuple[int, str]]] | None = None,
+    sources: dict[str, list[int]] | None = None,
 ) -> dict[str, tuple[list[list[float]], list[float]]]:
     unknown = [name for name in features if name not in FEATURE_NAMES]
     if unknown:
@@ -601,6 +602,8 @@ def _build_dataset(
         rows, y = dataset[kind]
         rows.append([named[name] for name in features])
         y.append(wall_ms)
+        if sources is not None:
+            sources.setdefault(kind, []).append(index)
         if provenance is not None:
             source_fields = ("worker_id", "dp_rank", "counter_id", "observed_at_unix_ms", "recv_ms")
             source = [{key: fpm[key] for key in source_fields if key in fpm} for fpm in metrics_by_rank]
@@ -1116,7 +1119,8 @@ def train(
         raise ValueError(f"target must be one of {TARGETS}, got {target!r}")
     if metadata and "nextn" in metadata:
         raise ValueError("metadata cannot set nextn; pass nextn= or let the trainer read it from the steps")
-    trained_nextn = training_nextn(iterations, nextn, worker_type)
+    if nextn is not None and not (_is_nextn(nextn) and nextn <= _MAX_TRAINED_NEXTN):
+        raise ValueError(f"nextn must be an integer in [0, {_MAX_TRAINED_NEXTN}], got {nextn!r}")
     checkpoint_identity = _checkpoint_identity(identity, worker_type) if identity is not None else None
     if (
         checkpoint_identity is not None
@@ -1125,11 +1129,6 @@ def train(
         and metadata["identity"] != checkpoint_identity
     ):
         raise ValueError("metadata.identity conflicts with the canonical training identity")
-    if checkpoint_identity is not None:
-        _require_identity_depth(checkpoint_identity, trained_nextn)
-    elif metadata and isinstance(metadata.get("identity"), dict):
-        # Rust compares a supplied metadata.identity with the configuration it loads at.
-        _require_identity_depth(metadata["identity"], trained_nextn)
     provenance: dict[str, list[tuple[int, str]]] = {}
     checkpoint_stores: dict[str, dict[str, Any]] = {}
     if online_checkpoint_dir is not None:
@@ -1153,11 +1152,24 @@ def train(
             "per-request features requested but no FPM record carries extend_lengths/past_kv_lengths; "
             "collect with the per-request FPM extension or use the default aggregate --features fpm5 (or v1)"
         )
+    sources: dict[str, list[int]] = {}
     dataset = _build_dataset(
-        iterations, worker_type, features, provenance=provenance if online_checkpoint_dir is not None else None
+        iterations,
+        worker_type,
+        features,
+        provenance=provenance if online_checkpoint_dir is not None else None,
+        sources=sources,
     )
     if not dataset:
         raise ValueError("no trainable iterations (all idle, zero wall_time, or role-incompatible)")
+    # The depth and its widths describe exactly the rows the exported stores fit.
+    fitted = sorted(index for kind, indices in sources.items() if len(indices) >= min_store_rows for index in indices)
+    trained_nextn = training_nextn([iterations[index] for index in fitted], nextn, worker_type)
+    if checkpoint_identity is not None:
+        _require_identity_depth(checkpoint_identity, trained_nextn)
+    elif metadata and isinstance(metadata.get("identity"), dict):
+        # Rust compares a supplied metadata.identity with the configuration it loads at.
+        _require_identity_depth(metadata["identity"], trained_nextn)
     stores: dict[str, Any] = {}
     counts: dict[str, int] = {}
     trees: dict[str, int] = {}

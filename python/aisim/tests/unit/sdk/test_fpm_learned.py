@@ -826,6 +826,26 @@ def test_depth_reads_only_the_iterations_the_role_trains_on():
     assert artifact["metadata"]["nextn"] == 0
 
 
+def test_depth_is_checked_on_the_rows_the_stores_fit():
+    """A row the fitter discards cannot vouch for a depth the exported forest never saw."""
+    pytest.importorskip("sklearn")
+    narrow = [[_listed_decode([1])] for _ in range(4)]
+    inconsistent = _listed_decode([4])
+    inconsistent["scheduled_requests"]["past_kv_lengths"] = [5000]  # aggregate decode KV is 100
+    with pytest.raises(ValueError, match="every decode request in the per-request lists has extend length 1"):
+        fpm_learned.train(
+            narrow + [[inconsistent]], "decode", features=["slot0_extend"], nextn=3, max_iter=5, min_store_rows=2
+        )
+    # A store below min_store_rows is not exported either, so its depth does not count.
+    deep_prefill = _prefill_fpm(1, 64, 0, 0.01)
+    deep_prefill["scheduled_requests"].update(spec_num_steps=3, spec_num_draft_tokens=4)
+    rows = [[_decode_fpm(n, 100 * n, 0.01)] for n in range(1, 4)] + [[deep_prefill]]
+    with pytest.raises(ValueError, match="mix speculative depths"):
+        fpm_learned.training_nextn(rows)
+    artifact = fpm_learned.train(rows, "aggregated", max_iter=5, min_store_rows=2)
+    assert artifact["metadata"]["nextn"] == 0 and "pure_prefill" not in artifact["stores"]
+
+
 def test_mixed_steps_must_list_a_verify_width_for_every_decode_request():
     """A mixed step's lists do not mark decode requests, but must hold enough widths replay could query."""
     decode = _listed_decode([4, 4])
