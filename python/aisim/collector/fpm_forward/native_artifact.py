@@ -557,11 +557,50 @@ def _without_sidecar_names(evidence: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+TRTLLM_RUNTIME_VERSION = "1.3.0rc29"
+TRTLLM_TIMING_BOUNDARY = "trtllm_pyexecutor_completion_interval"
+_TRTLLM_SETTINGS = {
+    "enable_iter_perf_stats": True,
+    "disable_overlap_scheduler": True,
+    "cuda_graph_config": None,
+    "enable_block_reuse": False,
+    "enable_chunked_prefill": False,
+    "max_num_tokens": 8192,
+    "beam_width": 1,
+    "speculation_enabled": False,
+}
+
+
+def _validate_trtllm_producer(cell: FPMCell, payload: dict[str, Any], path: Path, bundle_sha256: str | None) -> None:
+    """Bind the observer's schema-3 artifact to the frozen collector attempt."""
+    topology = cell.topology
+    if (topology.tp, topology.dp, topology.pp, topology.cp, topology.total_gpus) != (2, 1, 1, 1, 2):
+        raise ValueError(f"TRT-LLM FPM requires TP2/DP1 on two GPUs: {path}")
+    if payload.get("schema_version") != FPM_NATIVE_BENCHMARK_POWER_RESULT_SCHEMA_VERSION:
+        raise ValueError(f"TRT-LLM FPM requires a schema-3 rank artifact: {path}")
+    if payload.get("timing_boundary") != TRTLLM_TIMING_BOUNDARY:
+        raise ValueError(f"TRT-LLM FPM timing boundary mismatch: {path}")
+    if not _is_hex(bundle_sha256, 64) or payload.get("producer") != {
+        "trtllm_package_version": TRTLLM_RUNTIME_VERSION,
+        "bundle_sha256": bundle_sha256,
+    }:
+        raise ValueError(f"TRT-LLM FPM producer does not match the frozen runtime bundle: {path}")
+    settings = payload.get("serving_config")
+    if not isinstance(settings, dict) or any(
+        key not in settings or not _same(settings[key], value) for key, value in _TRTLLM_SETTINGS.items()
+    ):
+        raise ValueError(f"TRT-LLM FPM pinned serving settings mismatch: {path}")
+    batch_size = settings.get("max_batch_size")
+    if type(batch_size) is not int or batch_size < 4:
+        raise ValueError(f"TRT-LLM FPM requires max_batch_size >= 4: {path}")
+
+
 def _validate_collector_provenance(
     cell: FPMCell,
     raw_root: Path,
     rank_payloads: list[tuple[Path, dict[str, Any]]],
     *,
+    expected_backend: str,
     expected_plan_sha256: str | None,
     expected_attempt_id: str | None,
 ) -> tuple[str, str]:
@@ -603,7 +642,7 @@ def _validate_collector_provenance(
         runtime = payload.get("runtime")
         if (
             not isinstance(runtime, dict)
-            or runtime.get("backend") != "vllm"
+            or runtime.get("backend") != expected_backend
             or not isinstance(runtime.get("backend_version"), str)
             or not runtime["backend_version"]
         ):
@@ -620,7 +659,10 @@ def _validate_collector_provenance(
             raise ValueError(f"Collector provenance differs across pods: {path}")
 
     assert canonical is not None
-    return str(canonical["runtime"]["backend_version"]), str(canonical["attempt_id"])
+    version = str(canonical["runtime"]["backend_version"])
+    if expected_backend == "trtllm" and version != TRTLLM_RUNTIME_VERSION:
+        raise ValueError(f"TRT-LLM FPM requires runtime version {TRTLLM_RUNTIME_VERSION}: found {version!r}")
+    return version, str(canonical["attempt_id"])
 
 
 def _require_int(point: dict[str, Any], key: str) -> int:
@@ -862,6 +904,8 @@ def validate_native_collection(
     cell: FPMCell,
     raw_root: Path,
     *,
+    expected_backend: str = "vllm",
+    expected_bundle_sha256: str | None = None,
     expected_plan_sha256: str | None = None,
     expected_attempt_id: str | None = None,
 ) -> NativeCollection:
@@ -874,6 +918,7 @@ def validate_native_collection(
         cell,
         raw_root,
         rank_payloads,
+        expected_backend=expected_backend,
         expected_plan_sha256=expected_plan_sha256,
         expected_attempt_id=expected_attempt_id,
     )
@@ -926,6 +971,8 @@ def validate_native_collection(
             raise ValueError(f"native result is missing coverage/results/iteration_groups: {path}")
         if any(not isinstance(row, dict) or not isinstance(row.get("point"), dict) for row in rows):
             raise ValueError(f"native result has malformed result points: {path}")
+        if expected_backend == "trtllm":
+            _validate_trtllm_producer(cell, payload, path, expected_bundle_sha256)
         evidence = _validate_execution_provenance(cell, payload, path)
         # The validation above has proven that the artifact's mode is the mode of the cell's contract.
         execution_mode = payload.get("execution_mode") if evidence is not None else None

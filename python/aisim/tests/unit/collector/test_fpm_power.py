@@ -13,10 +13,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from aisim.fpm_contract import FPM_POWER_WINDOW_REL_TOL
+from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
 from collector.fpm_forward.config import FPMCollectionOptions, add_fpm_arguments, reject_fpm_arguments_without_fpm
 from collector.fpm_forward.database import (
     POWER_WINDOW_MEASUREMENT_POLICY,
     SINGLE_SAMPLE_MEASUREMENT_POLICY,
+    TRTLLM_POWER_MEASUREMENT_POLICY,
     aggregate_cell,
     validate_formal_database_commit,
     write_formal_database,
@@ -25,9 +29,6 @@ from collector.fpm_forward.native_artifact import select_native_measurements, va
 from collector.fpm_forward.planner import BackendPolicy, FPMCell
 from collector.fpm_forward.runtime_memory import saved_plan_identity
 from collector.fpm_forward.types import ParallelTopology
-
-from aisim.fpm_contract import FPM_POWER_WINDOW_REL_TOL
-from aisim_core.sdk.fpm_identity import EXECUTION_COLUMNS
 
 from .test_fpm_profile_collection import _argv, _plan, _profile, no_models_or_timing_data  # noqa: F401
 
@@ -577,6 +578,85 @@ def test_latency_gated_power_round_trips_through_the_power_window_publication(tm
     assert published["latency_ms"] == pytest.approx(4.0)
     assert published["measurement_policy"] == POWER_WINDOW_MEASUREMENT_POLICY
     assert validate_formal_database_commit(parquet, metadata, plan)["schema_version"] == 8
+
+
+def _trtllm_fixture(tmp_path):
+    bundle_hash = "a" * 64
+    version = "1.3.0rc29"
+    points = [
+        _point("decode", 1, total_kv=32768),
+        _point("decode", 2, total_kv=32896),
+    ]
+    plan, cell, cell_dir = _write_cell(
+        tmp_path,
+        tp=2,
+        points=points,
+        powers={
+            1: {0: _power([("GPU-a", 600_000.0), ("GPU-b", 640_000.0)], window_s=2.0, iterations=100, drift=400)},
+            2: {0: _unavailable("rank_boundary_mismatch")},
+        },
+    )
+    plan.backend = "trtllm"
+    plan.runtime_backend_version = version
+    plan.runtime_instrumentation = SimpleNamespace(sha256=bundle_hash)
+    provenance = cell_dir / "raw" / "pod-0" / "collector-provenance.json"
+    record = json.loads(provenance.read_text())
+    record["runtime"] = {"backend": "trtllm", "backend_version": version}
+    provenance.write_text(json.dumps(record))
+
+    def edit(payload):
+        payload.update(
+            timing_boundary="trtllm_pyexecutor_completion_interval",
+            producer={"trtllm_package_version": version, "bundle_sha256": bundle_hash},
+            serving_config={
+                "enable_iter_perf_stats": True,
+                "disable_overlap_scheduler": True,
+                "cuda_graph_config": None,
+                "enable_block_reuse": False,
+                "enable_chunked_prefill": False,
+                "max_num_tokens": 8192,
+                "max_batch_size": 4,
+                "beam_width": 1,
+                "speculation_enabled": False,
+            },
+        )
+
+    _edit_ranks(cell_dir, edit)
+    return plan, cell, cell_dir
+
+
+def test_trtllm_power_fixture_publishes_schema_eight(tmp_path):
+    plan, cell, cell_dir = _trtllm_fixture(tmp_path)
+    rows = aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
+    parquet, metadata, _ = write_formal_database(plan, rows, systems_root=tmp_path / "systems")
+    commit = json.loads(metadata.read_text())
+    assert (commit["schema_version"], commit["backend"], commit["measurement_policy"]) == (
+        8,
+        "trtllm",
+        TRTLLM_POWER_MEASUREMENT_POLICY,
+    )
+    assert validate_formal_database_commit(parquet, metadata, plan)["schema_version"] == 8
+    published = pq.read_table(parquet).to_pylist()
+    assert [row["power_w"] for row in published] == [310.0, None]
+    assert [row["latency_ms"] for row in published] == [4.0, 4.0]
+    assert {row["measurement_policy"] for row in published} == {TRTLLM_POWER_MEASUREMENT_POLICY}
+    assert write_formal_database(plan, rows, systems_root=tmp_path / "systems")[:2] == (parquet, metadata)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("schema_version", 2, "schema-3"),
+        ("timing_boundary", "different_boundary", "timing boundary"),
+        ("producer", {"trtllm_package_version": "1.3.0rc29", "bundle_sha256": "b" * 64}, "frozen runtime bundle"),
+        ("serving_config", {"enable_iter_perf_stats": True}, "pinned serving settings"),
+    ],
+)
+def test_trtllm_power_fixture_rejects_wrong_producer_evidence(tmp_path, field, replacement, message):
+    plan, cell, cell_dir = _trtllm_fixture(tmp_path)
+    _edit_ranks(cell_dir, lambda payload: payload.update({field: replacement}))
+    with pytest.raises(ValueError, match=message):
+        aggregate_cell(plan, cell, cell_dir, expected_attempt_id="attempt")
 
 
 def test_local_power_must_match_the_synchronized_group_copy(tmp_path):

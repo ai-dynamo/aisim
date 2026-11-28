@@ -70,6 +70,7 @@ pub const FPM_NATIVE_AR_CUDA_MEASUREMENT_POLICY: &str = "vllm_native_ar_model_st
 /// Single-sample latency plus a separate >= 2 s power window (schema 8, vLLM).
 pub const FPM_FORWARD_POWER_MEASUREMENT_POLICY: &str =
     "dynamo_native_single_sample_power_window_v1";
+const TRTLLM_POWER_MEASUREMENT_POLICY: &str = "trtllm_observer_single_sample_power_window_v1";
 const FPM_ROW_MEASUREMENT_POLICY: &str = "per_row_single_sample_or_median_of_3";
 const FPM_FULL_GRID_MEASUREMENT_POLICY: &str = "per_row_single_sample_or_full_grid_median_v1";
 
@@ -91,7 +92,7 @@ enum MeasurementPolicy {
     /// step CUDA time, including sampling, with the same sample selection.
     NativeArCudaActualSample,
     /// Schema 8: single-sample latency with a per-row `power_w` column.
-    SingleSamplePowerWindow,
+    SingleSamplePowerWindow(&'static str),
 }
 
 impl MeasurementPolicy {
@@ -104,7 +105,7 @@ impl MeasurementPolicy {
             Self::SglangNativeFpmMedian => "sglang_native_fpm_radix_seed_median_v1",
             Self::NativeCudaActualSample => FPM_NATIVE_CUDA_MEASUREMENT_POLICY,
             Self::NativeArCudaActualSample => FPM_NATIVE_AR_CUDA_MEASUREMENT_POLICY,
-            Self::SingleSamplePowerWindow => FPM_FORWARD_POWER_MEASUREMENT_POLICY,
+            Self::SingleSamplePowerWindow(name) => name,
         }
     }
 
@@ -117,7 +118,7 @@ impl MeasurementPolicy {
             | Self::SglangNativeFpmMedian
             | Self::NativeCudaActualSample
             | Self::NativeArCudaActualSample
-            | Self::SingleSamplePowerWindow => None,
+            | Self::SingleSamplePowerWindow(_) => None,
         }
     }
 
@@ -128,7 +129,7 @@ impl MeasurementPolicy {
             | Self::PerRowFullGrid
             | Self::NativeCudaActualSample
             | Self::NativeArCudaActualSample
-            | Self::SingleSamplePowerWindow => None,
+            | Self::SingleSamplePowerWindow(_) => None,
             Self::VllmNativeFpmMedian => Some("glm53flash_prefix_cache_real_seed_v1"),
             Self::SglangNativeFpmMedian => Some("glm53flash_sglang_radix_real_seed_v1"),
         }
@@ -141,7 +142,7 @@ impl MeasurementPolicy {
             | Self::PerRowFullGrid
             | Self::NativeCudaActualSample
             | Self::NativeArCudaActualSample
-            | Self::SingleSamplePowerWindow => None,
+            | Self::SingleSamplePowerWindow(_) => None,
             Self::VllmNativeFpmMedian => Some("dynamo_vllm_instrumented_scheduler_fpm_wall_time"),
             Self::SglangNativeFpmMedian => Some("sglang_native_fpm_rank0_device_timer_wall_time"),
         }
@@ -636,12 +637,16 @@ fn validate_sidecar(
         (Some(FPM_FULL_GRID_MEASUREMENT_POLICY), Some(6 | 7), _) => {
             MeasurementPolicy::PerRowFullGrid
         }
-        // V1 power is produced by the Dynamo vLLM self-benchmark only.
         (
             Some(FPM_FORWARD_POWER_MEASUREMENT_POLICY),
             Some(FPM_FORWARD_POWER_SCHEMA_VERSION),
             "vllm",
-        ) => MeasurementPolicy::SingleSamplePowerWindow,
+        ) => MeasurementPolicy::SingleSamplePowerWindow(FPM_FORWARD_POWER_MEASUREMENT_POLICY),
+        (
+            Some(TRTLLM_POWER_MEASUREMENT_POLICY),
+            Some(FPM_FORWARD_POWER_SCHEMA_VERSION),
+            "trtllm",
+        ) => MeasurementPolicy::SingleSamplePowerWindow(TRTLLM_POWER_MEASUREMENT_POLICY),
         (Some("vllm_native_fpm_prefix_seed_median_v1"), Some(7), "vllm") => {
             MeasurementPolicy::VllmNativeFpmMedian
         }
@@ -3857,6 +3862,60 @@ pub(crate) mod tests {
                 ..row
             })
             .collect()
+    }
+
+    #[test]
+    fn schema_eight_trtllm_preserves_the_row_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rows = powered_rows();
+        for row in &mut rows {
+            row.backend = "trtllm";
+            row.backend_version = "1.3.0rc29";
+            row.measurement = Some((TRTLLM_POWER_MEASUREMENT_POLICY, 1));
+        }
+        let write = |rows: &[RowSpec]| {
+            write_pair_with(tmp.path(), rows, |sidecar| {
+                sidecar.insert("backend".into(), "trtllm".into());
+                sidecar.insert("backend_version".into(), "1.3.0rc29".into());
+                sidecar.insert(
+                    "measurement_policy".into(),
+                    TRTLLM_POWER_MEASUREMENT_POLICY.into(),
+                );
+            })
+        };
+        let path = write(&rows);
+        let pair = load_pair(&path, "b200_sxm", "trtllm", "1.3.0rc29", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leaves(&pair.cells[0].decode)[&vec![8, 4096]].power, 360.0);
+
+        rows[7].measurement = Some((FPM_FORWARD_POWER_MEASUREMENT_POLICY, 1));
+        write(&rows);
+        assert!(
+            load_pair(&path, "b200_sxm", "trtllm", "1.3.0rc29", true)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("row 7 measurement_policy must match sidecar")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the schema-8 pair emitted by test_trtllm_power_fixture_publishes_schema_eight"]
+    fn schema_eight_loads_trtllm_collector_fixture() {
+        let path = std::env::var_os("AISIM_TRTLLM_FIXTURE_PARQUET")
+            .expect("set AISIM_TRTLLM_FIXTURE_PARQUET to the collector-published fixture");
+        let pair = load_pair(Path::new(&path), "h200_sxm", "trtllm", "1.3.0rc29", true)
+            .unwrap()
+            .unwrap();
+        let [cell] = pair.cells.as_slice() else {
+            panic!("expected one fixture cell")
+        };
+        let decode = leaves(&cell.decode);
+        assert_eq!(decode[&vec![4, 32768]], LeafValue::with_power(4.0, 310.0));
+        let unavailable = decode[&vec![4, 32896]];
+        assert_eq!(unavailable.latency, 4.0);
+        assert!(unavailable.power.is_nan());
     }
 
     #[test]
