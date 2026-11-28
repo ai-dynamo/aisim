@@ -217,6 +217,31 @@ def test_model_preflight_rejects_interleaved_dense_before_database_preparation()
         validate_afd_model("meta-llama/Llama-4-Maverick-17B-128E-Instruct")
 
 
+def test_model_preflight_rejects_dense_gemma4_afd():
+    # AFD is routed-MoE only and this PR does not change that: the dense Gemma 4
+    # checkpoint was already rejected here before `check_is_moe` stopped calling
+    # the whole GEMMA4MIX family MoE, because AFD reads the checkpoint's own
+    # expert metadata (num_experts=None, num_moe_layers=0) rather than the
+    # classification. Pin the outcome so the two stay aligned.
+    from aisim.sweeper.afd_parallel import validate_afd_model
+
+    with pytest.raises(NotImplementedError, match="Dense AFD is not implemented"):
+        validate_afd_model("nvidia/Gemma-4-31B-IT-NVFP4")
+
+
+@pytest.mark.parametrize("is_moe", [False, True], ids=["after-the-fix", "before-the-fix"])
+def test_search_space_afd_enumeration_rejects_a_dense_gemma4_shape(is_moe):
+    # `sweeper/search_space.py` builds `AFDSearchConfig` from
+    # `resolve_model_hardware` facts. A dense checkpoint resolves `num_experts=0`,
+    # so `AFDTopology` sees zero experts and raises the same NotImplementedError
+    # whether `is_moe` is False (this branch) or True (before the classification
+    # fix). That is why the search path needs no behavior change either.
+    from aisim.sweeper.afd_parallel import AFDSearchConfig, enumerate_afd_topologies
+
+    with pytest.raises(NotImplementedError, match="Dense AFD is not implemented"):
+        enumerate_afd_topologies(AFDSearchConfig(total_gpus=8, gpus_per_node=4, is_moe=is_moe, num_experts=0))
+
+
 @pytest.mark.usefixtures("raw_data_coordinates")
 @pytest.mark.parametrize("fallback_policy", ["deny", "allow", "regression"])
 def test_canonical_pool_constructor_cannot_fallback_from_nonprefix_dense(fallback_policy):

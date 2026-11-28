@@ -18,7 +18,15 @@ parallelism, SGLang `--attn-cp-size` / vLLM `-pcp`; extra attention ranks, so
 `tp * attention_dp * cp_size == moe_tp_size * moe_ep_size`) and `dcp`
 (decode context parallelism, vLLM `-dcp` / SGLang `--dcp-size`; stripes the
 decode KV cache across the existing TP ranks and adds no GPUs). Both default to
-one and stay out of the serialized identity when unset.
+one and stay out of the serialized identity when unset. A routed-MoE topology
+must set at least one of `moe_tp_size`/`moe_ep_size` when the attention width is
+greater than one: one omitted width is inferred from that width, while omitting
+both is an error (see
+[GPU memory and cache capacity](memory.md#kv-cache-capacity-reservation)). At
+attention width one the pair is necessarily `1x1`, and an unsharded canonical
+identity records it as unset, so the config and the SDK estimator resolve it. Dense topologies
+never read these widths, so an explicit value is kept and an omitted one stays
+`1`.
 
 ```python
 from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel

@@ -1064,7 +1064,11 @@ def _add_estimate_mode_arguments(parser):
         dest="moe_tp_size",
         type=int,
         default=None,
-        help="MoE tensor parallelism size. Alias: --etp.",
+        help=(
+            "MoE tensor parallelism size. One width may be omitted (inferred from "
+            "tp*attention_dp*cp_size); a routed model at attention width >1 must set one. "
+            "Alias: --etp."
+        ),
     )
     parser.add_argument(
         "--moe-ep-size",
@@ -1072,7 +1076,11 @@ def _add_estimate_mode_arguments(parser):
         dest="moe_ep_size",
         type=int,
         default=None,
-        help="MoE expert parallelism size. Alias: --ep.",
+        help=(
+            "MoE expert parallelism size. One width may be omitted (inferred from "
+            "tp*attention_dp*cp_size); a routed model at attention width >1 must set one. "
+            "Alias: --ep."
+        ),
     )
 
     # Disagg: prefill-specific overrides (fall back to shared args when None)
@@ -1106,7 +1114,10 @@ def _add_estimate_mode_arguments(parser):
         dest="prefill_moe_tp_size",
         type=int,
         default=None,
-        help="Prefill MoE TP size (disagg). Defaults to --moe-tp-size. Alias: --p-etp.",
+        help=(
+            "Prefill MoE TP size (disagg). Defaults to --moe-tp-size; the same "
+            "inference and omitted-width rule apply. Alias: --p-etp."
+        ),
     )
     parser.add_argument(
         "--prefill-moe-ep-size",
@@ -1114,7 +1125,10 @@ def _add_estimate_mode_arguments(parser):
         dest="prefill_moe_ep_size",
         type=int,
         default=None,
-        help="Prefill MoE EP size (disagg). Defaults to --moe-ep-size. Alias: --p-ep.",
+        help=(
+            "Prefill MoE EP size (disagg). Defaults to --moe-ep-size; the same "
+            "inference and omitted-width rule apply. Alias: --p-ep."
+        ),
     )
     parser.add_argument(
         "--prefill-batch-size",
@@ -1164,7 +1178,10 @@ def _add_estimate_mode_arguments(parser):
         dest="decode_moe_tp_size",
         type=int,
         default=None,
-        help="Decode MoE TP size (disagg). Defaults to --moe-tp-size. Alias: --d-etp.",
+        help=(
+            "Decode MoE TP size (disagg). Defaults to --moe-tp-size; the same "
+            "inference and omitted-width rule apply. Alias: --d-etp."
+        ),
     )
     parser.add_argument(
         "--decode-moe-ep-size",
@@ -1172,7 +1189,10 @@ def _add_estimate_mode_arguments(parser):
         dest="decode_moe_ep_size",
         type=int,
         default=None,
-        help="Decode MoE EP size (disagg). Defaults to --moe-ep-size. Alias: --d-ep.",
+        help=(
+            "Decode MoE EP size (disagg). Defaults to --moe-ep-size; the same "
+            "inference and omitted-width rule apply. Alias: --d-ep."
+        ),
     )
     parser.add_argument(
         "--decode-batch-size",

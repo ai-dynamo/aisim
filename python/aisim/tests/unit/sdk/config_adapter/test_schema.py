@@ -141,6 +141,44 @@ def test_worker_width_invariants_are_enforced(values):
         WorkerSettingsV1(replicas=1, batch_size=1, **values)
 
 
+def test_worker_moe_widths_are_required_together_without_inference():
+    """The adapter is the strict layer: a one-sided pair is rejected, not resolved."""
+    with pytest.raises(ValidationError, match="moe_tp_size and moe_ep_size must be set together"):
+        WorkerSettingsV1(replicas=1, batch_size=1, gpus_per_replica=2, tp_size=2, moe_tp_size=2)
+
+
+def _worker_payload(**moe_fields: object) -> dict:
+    payload = _request().model_dump(mode="json")
+    worker = payload["topology"]["worker"]
+    for key in ("moe_tp_size", "moe_ep_size"):
+        worker.pop(key)
+    worker.update(moe_fields)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "moe_fields",
+    [
+        {"moe_tp_size": 2},
+        {"moe_ep_size": 1},
+        {"moe_tp_size": 2, "moe_ep_size": None},
+        {"moe_tp_size": None, "moe_ep_size": 1},
+    ],
+)
+def test_packaged_json_schema_rejects_a_one_sided_moe_pair(moe_fields):
+    """The published schema enforces the pair, not only the Python validator."""
+    schema = json.loads(EstimateRequestV1.schema_path().read_text())
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_worker_payload(**moe_fields), schema)
+
+
+@pytest.mark.parametrize("moe_fields", [{}, {"moe_tp_size": None, "moe_ep_size": None}])
+def test_packaged_json_schema_accepts_an_absent_or_null_moe_pair(moe_fields):
+    """An unsharded or non-MoE worker may omit the pair or send both as null."""
+    schema = json.loads(EstimateRequestV1.schema_path().read_text())
+    jsonschema.validate(_worker_payload(**moe_fields), schema)
+
+
 def test_adaptation_outcome_status_invariants_are_enforced():
     error = AdaptationDiagnostic(severity="error", code="invalid", message="invalid")
     warning = AdaptationDiagnostic(severity="warning", code="warning", message="warning")

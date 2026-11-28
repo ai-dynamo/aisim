@@ -44,6 +44,32 @@ through the backend's `current` data alias for the requested system and data
 roots. Explicit version selectors are preserved. FPM profile estimates still
 require the profile's literal backend version.
 
+A routed-MoE SDK estimate must name at least one expert width when the
+attention width (`tp * attention_dp * cp_size`) is greater than one.
+`estimate_kv_cache` and `KVCacheEstimator.from_request` infer a single omitted
+`moe_tp_size` or `moe_ep_size` from that width, and reject an omitted pair with
+`InvalidEngineConfigurationError`, matching
+`ModelConfig.resolve_moe_parallelism`: at that width several layouts exist, the
+caller would otherwise get an expert layout it never requested, and the naive
+fallback would shard expert weights by `1 * 1` while the native build priced
+another layout. At attention width one the only possible pair is `1x1`, and the
+Replay and sweeper metadata producers record an unsharded route as
+`moe_tp_size: null, moe_ep_size: null`
+([FPM identity guidance](fpm-self-service/e2e-gbdt.md#before-you-start)),
+so the estimator resolves those to `1x1` instead of failing single-GPU routed
+capacity estimation. Dense checkpoints never read these widths, so they keep the
+caller's explicit value and `1` for an omitted one, as direct construction does.
+
+With `allow_naive_fallback=True`, `estimate_kv_cache` still re-raises every
+`InvalidEngineConfigurationError` instead of pricing the request with the naive
+estimator. The rule applies to all models, not only Gemma 4, and covers the
+omitted-pair and width-mismatch rejections above: a configuration the native
+build refuses must not become a plausible-looking capacity number. Other
+failures from the native model build (unsupported model/backend, unavailable
+performance data, an HF config fetch failure) remain fallback-eligible when the
+caller allows it. Budget math runs after the model builds, outside the fallback
+path, so its failures (no KV budget, zero per-token KV size) always propagate.
+
 For Mistral3's gated Pixtral encoder, the analytical activation estimate includes
 the replicated residual alongside the gate and up intermediates. Encoder tensor
 parallelism shards those intermediates; encoder data parallelism keeps a full
