@@ -9,8 +9,8 @@ No trained model is stored. Every evaluation downloads the pinned public step ca
 
 Both performance models score the same held-out seed-7 steps at the evaluated lane count, through
 ``RustForwardPassPerfModel.best_available`` with the replay's compiled timing configuration. SGLang 0.5.20
-captures drop steps whose device time landed on an adjacent record (``unattributed`` and
-``shifted_pairs``); training drops only the model-free ``unattributed`` steps.
+captures drop steps whose device time landed on an adjacent record, selected from capture evidence alone
+(``unattributed``) so the held-out cohort never depends on a scored model; training drops the same steps.
 """
 
 import gzip
@@ -293,25 +293,12 @@ def _available(timing_config):
         raise
 
 
-def shifted_pairs(records, predict):
-    """Flags adjacent records whose measured times split one step: one under 0.5x the reference
-    prediction next to one over 1.5x. Category checks miss chunk-to-chunk shifts between prefills."""
-    ratio = [records[i]["wall_time"] * 1e3 / predict(r) if _busy(r) else None for i, r in enumerate(records)]
-    flags = [False] * len(records)
-    for index, value in enumerate(ratio):
-        if value is None or value >= 0.5:
-            continue
-        for neighbour in (index - 1, index + 1):
-            if 0 <= neighbour < len(records) and ratio[neighbour] is not None and ratio[neighbour] > 1.5:
-                flags[index] = flags[neighbour] = True
-    return flags
-
-
-def score_steps(model, lanes, timing_config, workdir, reference_config=None):
+def score_steps(model, lanes, timing_config, workdir):
     """Held-out seed-7 step error at one lane count with the replay's compiled timing config.
 
-    Where the captures carry SGLang 0.5.20's device-time shift, ``reference_config`` (the held-out learned
-    model) also flags shifted pairs. Both performance models drop the same steps.
+    Where the captures carry SGLang 0.5.20's device-time shift, the cohort drops only the steps whose
+    recorded device-time categories lack their target forward. No prediction selects the cohort, so both
+    performance models score the same steps.
     """
     spec = STEP_CAPTURES.get(model)
     if spec is None:
@@ -322,18 +309,14 @@ def score_steps(model, lanes, timing_config, workdir, reference_config=None):
     op_level = timing_config.get("estimation_mode") != LEARNED
     width = int(timing_config.get("nextn") or 0) + 1
     estimator = _available(timing_config)
-    reference = _available(reference_config) if spec["drop_unattributed"] else None
-    if estimator is None or (spec["drop_unattributed"] and reference is None):
+    if estimator is None:
         return None  # The evaluated wheel cannot price learned MTP steps; step metrics are unavailable.
     errors = {"decode": [], "prefill": []}
     dropped = 0
     for window_lanes, records in windows(spec, TEST_SEED, workdir / "hf", scoring=True, lanes=lanes):
         if window_lanes != lanes:
             continue
-        flags = [False] * len(records)
-        if reference is not None:
-            pairs = shifted_pairs(records, lambda fpm: reference.estimate_forward_pass_time_ms([fpm]))
-            flags = [a or b for a, b in zip(unattributed(records), pairs, strict=True)]
+        flags = unattributed(records) if spec["drop_unattributed"] else [False] * len(records)
         dropped += sum(flags)
         for fpm, flag in zip(records, flags, strict=True):
             kind, measured = step_kind(fpm), fpm["wall_time"] * 1e3

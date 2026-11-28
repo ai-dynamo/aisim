@@ -134,6 +134,8 @@ def test_published_metrics_reconcile_with_pairs_and_estimation():
         lambda r: r.update(performance_model="fpm_learned"),
         lambda r: r.update(performance_model="magic"),
         lambda r: r["accuracy_metrics"]["step"].update(decode={"n": 1}),
+        # An empty category must contribute nothing to a pooled MAPE.
+        lambda r: r["accuracy_metrics"]["step"].update(prefill={"n": 0, "sum_ape": 5.0, "sum_sq_ape": 25.0}),
         lambda r: r["cpu_overhead"].update(tokenization={"workers": "many"}),
         lambda r: r.pop("cpu_overhead"),
     ):
@@ -396,11 +398,27 @@ def test_sglang_hook_windows_follow_the_published_manifest(tmp_path, monkeypatch
     assert [lanes for lanes, _ in agentx_learned.windows(spec, 7, tmp_path, scoring=True, lanes=8)] == [8]
 
 
-def test_shifted_pairs_flag_both_records_of_a_split_step():
-    records = [fpm(prefill=1, wall=0.010), fpm(prefill=1, wall=0.002), fpm(prefill=1, wall=0.030), fpm(), fpm(decode=1)]
-    # Predicted 10 ms each: 0.2x next to 3x is one step split across two records; idle records never pair.
-    assert agentx_learned.shifted_pairs(records, lambda r: 10.0) == [False, True, True, False, False]
-    assert agentx_learned.shifted_pairs(records[:2], lambda r: 10.0) == [False, False]
+def test_held_out_cohort_does_not_depend_on_the_scored_model(tmp_path, monkeypatch):
+    # Every step carries its target forward, so capture evidence keeps all four however far a prediction
+    # misses; residuals never select the cohort. 10 ms predictions against 4, 16, 10, 10 ms give 46.875%.
+    records = [fpm(decode=4, wall=w, categories={"target_verify": w}) for w in (0.004, 0.016, 0.010, 0.010)]
+    for record in records:
+        record["scheduled_requests"]["sum_decode_kv_tokens"] = 4096
+
+    class Estimator:
+        def __init__(self, config):
+            pass
+
+        def estimate_forward_pass_time_ms(self, metrics):
+            return 10.0
+
+    monkeypatch.setattr(agentx_learned, "STEP_CAPTURES", {"m": {"drop_unattributed": True}})
+    monkeypatch.setattr(agentx_learned, "windows", lambda *args, **kwargs: iter([(8, records)]))
+    monkeypatch.setattr(agentx_learned, "_estimator", Estimator)
+    for mode in ("op_level", "fpm_learned"):
+        step = agentx_learned.score_steps("m", 8, {"estimation_mode": mode, "nextn": 3}, tmp_path)
+        assert step["dropped_shifted"] == 0 and step["decode"]["n"] == 4
+        assert step["decode"]["sum_ape"] / step["decode"]["n"] == pytest.approx(46.875)
 
 
 def test_operation_level_decode_is_packed_by_verification_width(tmp_path, monkeypatch):
@@ -444,24 +462,32 @@ def test_operation_level_decode_is_packed_by_verification_width(tmp_path, monkey
     assert [x[1] for x in seen] == [step["scheduled_requests"], prefill["scheduled_requests"]]
 
 
-def test_wheels_without_learned_mtp_publish_op_based_results_without_step_metrics(tmp_path, monkeypatch):
+def test_wheels_without_learned_mtp_still_score_op_based_steps(tmp_path, monkeypatch):
+    class Estimator:
+        def estimate_forward_pass_time_ms(self, metrics):
+            return 10.0
+
     def construct(config):
         if config["estimation_mode"] == "fpm_learned":
             raise ValueError("invalid engine config: fpm_learned does not support speculative decoding")
-        return object()
+        return Estimator()
 
     monkeypatch.setattr(agentx_learned, "STEP_CAPTURES", {"m": {"drop_unattributed": True}})
     monkeypatch.setattr(agentx_learned, "_estimator", construct)
+    decode = fpm(decode=1)
+    decode["scheduled_requests"]["sum_decode_kv_tokens"] = 1024
+    monkeypatch.setattr(agentx_learned, "windows", lambda *args, **kwargs: iter([(8, [decode])]))
     op, learned = {"estimation_mode": "op_level", "nextn": 3}, {"estimation_mode": "fpm_learned", "nextn": 3}
-    assert agentx_learned.score_steps("m", 8, op, tmp_path, learned) is None
-    assert agentx_learned.score_steps("m", 8, learned, tmp_path, learned) is None
+    # The op-based cohort needs no learned reference, so it scores on a wheel that rejects learned MTP.
+    assert agentx_learned.score_steps("m", 8, op, tmp_path)["decode"]["n"] == 1
+    assert agentx_learned.score_steps("m", 8, learned, tmp_path) is None
 
     def broken(config):
         raise ValueError("invalid engine config: something else")
 
     monkeypatch.setattr(agentx_learned, "_estimator", broken)
     with pytest.raises(ValueError, match="something else"):
-        agentx_learned.score_steps("m", 8, op, tmp_path, learned)
+        agentx_learned.score_steps("m", 8, op, tmp_path)
 
 
 def test_learned_models_retrain_every_evaluation(tmp_path, monkeypatch):

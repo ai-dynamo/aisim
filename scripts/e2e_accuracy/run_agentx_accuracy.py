@@ -511,12 +511,9 @@ def run_one(root, run, directory, timeout, context, performance_model=OP_LEVEL, 
         raise ValueError("Learned step captures differ from the replayed speculative decoding")
     step = None
     if timing is not None and workdir is not None and learned is not None:
-        # Step error is held out: the seed-42 learned model prices the seed-7 steps, and it is also the
-        # reference that flags device-time shifts for both performance models.
-        held_out = held_out_timing(timing, learned["held_out"])
-        step = score_steps(
-            run["model"], run["lanes"], held_out if performance_model == LEARNED else timing, workdir, held_out
-        )
+        # Step error is held out: the seed-42 learned model prices the seed-7 steps.
+        held_out = held_out_timing(timing, learned["held_out"]) if performance_model == LEARNED else timing
+        step = score_steps(run["model"], run["lanes"], held_out, workdir)
     settings = {
         "Estimation": performance_model,
         "Timing correction": False,

@@ -766,8 +766,8 @@ without the learned FPM publishes op-based entries only; each shard records
 those entries. A wheel that rejects a learned FPM with speculative decoding
 (probed by configuration validation before any replay) omits the learned
 entries of models whose step captures use speculative decoding (GLM MTP); it
-does not publish them as failed. Their op-based entries then have no step
-metrics, because GLM's shifted-step reference is the learned model.
+does not publish them as failed. Their op-based entries keep step metrics,
+because the held-out cohort is selected without any model.
 
 - All errors are unsigned percentages over uniquely matched requests.
   e2e error is `100 * abs(mean AISim / mean silicon - 1)` of request TTFT or TPOT.
@@ -793,9 +793,9 @@ metrics, because GLM's shifted-step reference is the learned model.
   shown. SGLang 0.5.20 can record a step's device time on the adjacent record.
   GLM therefore drops each step whose `device_time_s_by_category` lacks its target
   forward (`extend` for prefill, `target_verify` for MTP decode) and the record
-  before it, and both records of a pair where one measures under 0.5x and its
-  neighbour over 1.5x the held-out learned model. Both performance models drop
-  the same steps (`dropped_shifted`). Training drops only the first, model-free kind.
+  before it. The cohort comes from capture evidence alone, never from a scored
+  model's residuals, so both performance models score the same steps
+  (`dropped_shifted` counts the drops). Training drops the same steps.
 - The learned FPM is never stored. `scripts/e2e_accuracy/agentx_learned.py` pins
   each model's public step captures to an immutable dataset revision. Every
   evaluation retrains the replay model on seeds 42 and 7 and the step-error model

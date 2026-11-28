@@ -869,6 +869,7 @@ def validate_performance_model(run):
                 or item["n"] < 0
                 or not finite(item["sum_ape"])
                 or not finite(item["sum_sq_ape"])
+                or (item["n"] == 0 and (item["sum_ape"] != 0 or item["sum_sq_ape"] != 0))
             ):
                 raise ValueError("Invalid step accumulator")
     overhead = run["cpu_overhead"]
