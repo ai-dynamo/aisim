@@ -108,6 +108,17 @@ pub struct AgenticProfileReport {
     pub idle_shifts: Vec<AgenticIdleShift>,
 }
 
+/// What the idle guards need from a pass over the active plays.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct AgenticIdleScan {
+    /// Earliest tree-idle stamp of any active play.
+    pub earliest_idle_ms: Option<f64>,
+    /// Earliest tree-idle stamp of an active play with a scheduled timer.
+    pub earliest_pending_idle_ms: Option<f64>,
+    /// Whether any active play has a scheduled timer.
+    pub any_pending: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct AgenticProfileState {
     pub options: AgenticProfileOptions,
@@ -120,6 +131,7 @@ pub(super) struct AgenticProfileState {
     pub replacements_at_ms: (Option<f64>, usize),
     pub tree_idle_since_ms: Vec<Option<f64>>,
     pub global_idle_since_ms: Option<f64>,
+    pub idle_scan: Option<AgenticIdleScan>,
     pub issued_requests: usize,
     pub successful_responses: usize,
     pub canceled_requests: usize,
