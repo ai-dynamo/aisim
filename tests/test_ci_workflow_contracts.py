@@ -645,6 +645,84 @@ def test_fast_prerequisite_waits_with_a_bounded_timeout(status):
     assert now[0] == 20
 
 
+@pytest.mark.parametrize("status", ["queued", "in_progress", "completed"])
+def test_fast_prerequisite_waits_for_job_metadata_after_run_completion(status):
+    now = [0]
+    job_reads = []
+
+    def api(endpoint):
+        if "/jobs?" in endpoint:
+            assert "/attempts/1/" in endpoint
+            jobs = _fast_jobs()
+            if not job_reads:
+                jobs[0].update(status=status, conclusion=None)
+            job_reads.append(endpoint)
+            return [{"jobs": jobs}]
+        return [{"workflow_runs": [_fast_run()]}]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    assert _require_fast(api, timeout=20, interval=15, clock=lambda: now[0], sleep=sleep) == _fast_run()
+    assert len(job_reads) == 2
+    assert now[0] == 15
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", "completed"])
+def test_fast_prerequisite_never_accepts_persistently_incomplete_job_metadata(status):
+    now = [0]
+    jobs = _fast_jobs()
+    jobs[0].update(status=status, conclusion=None)
+
+    def api(endpoint):
+        return [{"jobs": jobs}] if "/jobs?" in endpoint else [{"workflow_runs": [_fast_run()]}]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    with pytest.raises(GateError, match="No complete Fast CI evidence.*within 20s"):
+        _require_fast(api, timeout=20, interval=15, clock=lambda: now[0], sleep=sleep)
+    assert now[0] == 20
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"head_sha": "b" * 40},
+        *({"conclusion": result} for result in ["failure", "cancelled", "skipped", "neutral", "timed_out"]),
+    ],
+)
+def test_fast_prerequisite_does_not_retry_invalid_job_evidence(override):
+    jobs = _fast_jobs()
+    jobs[0].update(override)
+
+    def api(endpoint):
+        return [{"jobs": jobs}] if "/jobs?" in endpoint else [{"workflow_runs": [_fast_run()]}]
+
+    def sleep(_):
+        pytest.fail("Invalid job evidence must fail immediately")
+
+    with pytest.raises(GateError, match="wrong-commit job"):
+        _require_fast(api, sleep=sleep)
+
+
+def test_fast_prerequisite_checks_for_a_new_failed_attempt_while_job_metadata_is_pending():
+    reads = []
+
+    def api(endpoint):
+        if "/jobs?" in endpoint:
+            jobs = _fast_jobs()
+            jobs[0].update(status="in_progress", conclusion=None)
+            return [{"jobs": jobs}]
+        run = _fast_run() if not reads else _fast_run(run_attempt=2, conclusion="failure")
+        reads.append(endpoint)
+        return [{"workflow_runs": [run]}]
+
+    with pytest.raises(GateError, match="Latest Fast CI run 10 finished with failure"):
+        _require_fast(api, sleep=lambda _: None)
+    assert len(reads) == 2
+
+
 def test_fast_prerequisite_rechecks_a_rerun_started_during_job_inspection():
     reads = [0]
 

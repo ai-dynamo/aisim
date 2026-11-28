@@ -3,6 +3,10 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
+<!-- Documentation corrections adapted and modified from AIConfigurator PR #1612:
+https://github.com/ai-dynamo/aiconfigurator/blob/bff1492d4f668232b9dd411f9b28d849a2776000/docs/cli_user_guide.md
+-->
+
 # AIC compatibility CLI
 
 This guide documents the legacy `aiconfigurator cli` compatibility commands that still ship
@@ -568,7 +572,9 @@ Let's run `aiconfigurator cli default --model-path Qwen/Qwen3-32B-FP8 --total-gp
     - TTFT: 202.65ms
     - TPOT: 8.07ms
 ```
-This shows that for model `Qwen/Qwen3-32B-FP8` to deploy on 32 H200, if you require your TTFT to be less than 1000ms and TPOT to be less than 10ms, and your problem is isl=3000 osl=512, then disagg will be 1.43x of agg. The target result is shown as Overall Best Configuration.
+With TTFT and TPOT targets of 1000 ms and 10 ms, this example reports 1.43x the throughput for disaggregated serving compared to aggregated serving. The run uses `Qwen/Qwen3-32B-FP8` on 32 H200 GPUs with `isl=3000` and `osl=512`. The result appears under Overall Best Configuration.
+
+Before rate matching, the disaggregated sweep requires corrected prefill TTFT and decode TPOT to be strictly below their respective targets. A prefill candidate at exactly 1000 ms or a decode candidate at exactly 10 ms is excluded. The aggregated sweep accepts TTFT and TPOT equal to their targets.
 
 **Python API equivalent:**
 ```python
@@ -621,7 +627,17 @@ print(result.best_configs["disagg"])
      0                60                 120               180              240
 tokens/s/gpu                        tokens/s/user
 ```
-Pareto frontier shows the trade-off betwen generation speed `tokens/s/user` and throughput `tokens/s/gpu`. The best points is tagged as `x`. As you want the TPOT to be less than 10ms, which means the generation speed is faster than 1000/10ms = 100 tokens/s/user, then by reading the pareto froniter, you will get the point tagged as x. You can see that, if you want different TPOT, you will have different result. Sometimes, agg will be better than disagg (higher throughput at same tokens/s/user)
+In this compatibility CLI example, the saved `pareto_frontier.png` plots per-GPU throughput (`tokens/s/gpu`) against generation speed (`tokens/s/user`). Generation speed is `1000 / TPOT_ms`, so a TPOT limit of 10 ms admits points at or to the right of 100 tokens/s/user, including the boundary.
+
+For a fixed GPU budget, the picker ranks configurations that meet the limit by `tokens/s/gpu_cluster`, which the worker setup table below displays as `tokens/s/gpu`. This metric averages throughput across the whole budget. If whole replicas leave some GPUs unused, a configuration with higher throughput in the saved plot can rank lower in the picker.
+
+The saved plot can also omit the picker's best configuration. When the plotted rows lack a top-level `backend` column, as disaggregated results do, the plot computes another Pareto front using `tokens/s/gpu`. Rows with a top-level `backend` column, including aggregated results, are plotted without recomputation. For example, with an eight-GPU budget, an eight-GPU replica at 100 tokens/s/gpu ranks above a five-GPU replica at 120 tokens/s/gpu: their budget-adjusted rates are 100 and 75 tokens/s/gpu_cluster. If the five-GPU replica also has higher generation speed, it dominates the eight-GPU replica when the plot recomputes the front. Use the worker setup table or the saved `best_config_topn.csv` for the picker's ranking.
+
+Without `--strict-sla`, the plotted frontier can include points that violate the TPOT limit. Within each experiment, the top-N picker prefers configurations within the limit. When none meet it, the picker first keeps the configuration with the highest `tokens/s/gpu_cluster` value in each parallel group (`parallel` for aggregated serving, `(d)parallel` for disaggregated serving), then orders those representatives by increasing TPOT for its top-N results.
+
+Without `--strict-sla`, if no configuration meets the TPOT constraint and fallback rows are available, the terminal worker setup table omits those rows and reports that none met the constraint. Use `--save-dir DIR` and open `best_config_topn.csv` in the experiment's output directory to see the fallback configurations. With `--strict-sla`, if no configurations qualify, the picker returns no fallback rows and the worker setup table omits that message. See [strict SLA filtering](#strict-sla-filtering).
+
+The unified Sweeper uses a different aggregate per-user metric; see [Pareto objectives](../sweeper/optimization-goals.md#pareto) before interpreting its x-axis as a TPOT threshold.
 
 3. Worker setup
 ```
@@ -931,6 +947,8 @@ disagg Top Configurations: (Sorted by tokens/s/gpu)
 AIC's TPOT metric is the inter-token latency during the decode phase — it does not include TTFT. Pass `--inclusive-tpot` to report TPOT as `(ttft + tpot × (osl − 1)) / osl`, which spreads the TTFT cost across all output tokens. This matches the end-to-end per-token latency reported by GuideLLM and other benchmarking tools, making predicted values directly comparable to benchmark measurements.
 
 The flag only affects terminal output and saved CSV — SLA filtering always uses inter-token latency.
+
+<a id="strict-sla-filtering"></a>
 
 #### Strict SLA filtering (`--strict-sla`)
 
