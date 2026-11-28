@@ -51,6 +51,23 @@ fn step(core: &mut VllmCore) -> EnginePassResult {
     core.try_execute_hidden_pass(0.0).unwrap()
 }
 
+fn validate_state_config(config: &MockEngineArgs) {
+    crate::engine::EngineConfig {
+        block_size: config.block_size,
+        num_gpu_blocks: config.num_gpu_blocks,
+        max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(usize::MAX),
+        enable_prefix_caching: config.enable_prefix_caching,
+        kv_cache_bytes_per_token: config.kv_cache_bytes_per_token,
+        state_cache: config.state_cache,
+        prefix_match_unit: config.prefix_match_unit,
+        aic_nextn: config.aic_nextn,
+        aic_nextn_accept_rates: config.aic_nextn_accept_rates.clone(),
+        ..Default::default()
+    }
+    .validate()
+    .unwrap();
+}
+
 fn run_to_completion(core: &mut VllmCore) {
     for _ in 0..256 {
         if core.state.requests.is_empty() {
@@ -71,6 +88,566 @@ fn reused(pass: &EnginePassResult, id: Uuid) -> usize {
 
 fn tokens(prefix: std::ops::Range<u32>, suffix: std::ops::Range<u32>) -> Vec<u32> {
     prefix.chain(suffix).collect()
+}
+
+#[test]
+fn cold_aligned_admission_requires_the_state_rotation_peak() {
+    #[derive(Clone, Default)]
+    struct Warnings(
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    );
+    struct Fields(std::collections::BTreeMap<String, String>);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+    }
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(Default::default());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    for capacity in [4, 6] {
+        let mut config = args(false, false);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.num_gpu_blocks = capacity;
+        config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 900, (0..65).collect(), 1);
+        let warnings = Warnings::default();
+        let first = tracing::subscriber::with_default(warnings.clone(), || step(&mut core));
+        if capacity == 4 {
+            assert!(
+                first.admissions.is_empty(),
+                "reject before computing 64 tokens"
+            );
+            assert!(
+                first
+                    .output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+            );
+            assert!(
+                warnings.0.lock().unwrap().iter().any(|fields| {
+                    fields.get("required_blocks").map(String::as_str) == Some("6")
+                        && fields.get("available_blocks").map(String::as_str) == Some("4")
+                }),
+                "admission must report required and available capacity"
+            );
+        } else {
+            assert_eq!(first.admissions.len(), 1);
+            assert_eq!(core.state.requests[&id].num_computed_tokens, 64);
+            let last = step(&mut core);
+            assert!(
+                last.output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && !signal.rejected })
+            );
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        assert_eq!(core.state.preemptions_total, 0);
+    }
+}
+
+#[test]
+fn cold_one_pass_prefill_under_the_eagle_drop_needs_one_working_state() {
+    // The drop keeps no state at token 64, so the 65-token prompt runs in one
+    // pass: two token blocks, one working state and one scratch state.
+    let mut config = args(false, false);
+    config.block_size = 64;
+    config.prefix_match_unit = Some(64);
+    config.num_gpu_blocks = 6;
+    config.aic_nextn = Some(1);
+    config.aic_nextn_accept_rates = Some("1".to_string());
+    let state = config.state_cache.as_mut().unwrap();
+    state.bytes_per_request = 1500;
+    state.num_speculative_states = Some(1);
+    let mut core = VllmCore::new(config);
+    let id = submit(&mut core, 901, (0..65).collect(), 1);
+    let mut passes = vec![step(&mut core)];
+    assert_eq!(passes[0].admissions.len(), 1);
+    while !core.state.requests.is_empty() && passes.len() < 8 {
+        passes.push(step(&mut core));
+    }
+    assert!(
+        passes
+            .iter()
+            .flat_map(|pass| &pass.output_signals)
+            .any(|signal| signal.uuid == id && signal.completed && !signal.rejected)
+    );
+    assert_eq!(core.state.preemptions_total, 0);
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+}
+
+#[test]
+fn cold_budget_split_prefill_requires_the_state_rotation_peak() {
+    // No retained boundary splits this EAGLE prompt, but the step budget
+    // does: two token blocks + two working states + one scratch state = 8.
+    for capacity in [6, 8] {
+        let mut config = args(false, false);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.max_num_batched_tokens = Some(64);
+        config.num_gpu_blocks = capacity;
+        config.aic_nextn = Some(1);
+        config.aic_nextn_accept_rates = Some("1".to_string());
+        let state = config.state_cache.as_mut().unwrap();
+        state.bytes_per_request = 1500;
+        state.num_speculative_states = Some(1);
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 902, (0..65).collect(), 1);
+        let first = step(&mut core);
+        if capacity == 6 {
+            assert!(first.admissions.is_empty(), "reject before partial prefill");
+            assert!(
+                first
+                    .output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+            );
+        } else {
+            assert_eq!(first.admissions.len(), 1);
+            assert_eq!(core.state.requests[&id].num_computed_tokens, 64);
+            let last = step(&mut core);
+            assert!(
+                last.output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && !signal.rejected })
+            );
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        assert_eq!(core.state.preemptions_total, 0);
+    }
+}
+
+#[test]
+fn shared_first_pass_budget_waits_instead_of_rejecting_a_feasible_prefill() {
+    let mut config = args(true, true);
+    config.block_size = 64;
+    config.prefix_match_unit = Some(64);
+    config.max_num_batched_tokens = Some(192);
+    config.num_gpu_blocks = 9;
+    config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+    validate_state_config(&config);
+    let mut core = VllmCore::new(config);
+    let first = submit(&mut core, 920, (1000..1064).collect(), 2);
+    let second = submit(&mut core, 921, (0..193).collect(), 1);
+
+    // The remaining 128-token budget would split the second prompt into
+    // 128 + 65, exporting a checkpoint in addition to two working states.
+    // Waiting permits 192 + 1 instead, whose eight-block peak fits alone.
+    let pass = step(&mut core);
+    assert_eq!(pass.admissions.len(), 1);
+    assert_eq!(reused(&pass, first), 0);
+    assert_eq!(core.state.requests[&second].num_computed_tokens, 0);
+    let mut completed = Vec::new();
+    for _ in 0..8 {
+        if core.state.requests.is_empty() {
+            break;
+        }
+        let pass = step(&mut core);
+        for signal in pass.output_signals {
+            assert!(!signal.rejected);
+            if signal.completed {
+                completed.push(signal.uuid);
+            }
+        }
+    }
+    assert_eq!(completed, [first, second]);
+    assert!(core.state.requests.is_empty());
+    assert_eq!(core.state.preemptions_total, 0);
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+}
+
+#[test]
+fn non_block_multiple_budget_accounts_for_the_aligned_rotation() {
+    // EAGLE drops all retained boundaries for this prompt, but align mode
+    // floors the 100-token budget to 64. Its second pass rotates the state:
+    // two token blocks + two two-block working states + two scratch blocks.
+    for capacity in [6, 8] {
+        let mut config = args(false, false);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.max_num_batched_tokens = Some(100);
+        config.num_gpu_blocks = capacity;
+        config.aic_nextn = Some(1);
+        config.aic_nextn_accept_rates = Some("1".into());
+        let state = config.state_cache.as_mut().unwrap();
+        state.bytes_per_request = 1500;
+        state.num_speculative_states = Some(1);
+        validate_state_config(&config);
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 922, (0..101).collect(), 1);
+        let pass = step(&mut core);
+        if capacity == 6 {
+            assert!(pass.admissions.is_empty(), "reject before partial prefill");
+            assert_eq!(pass.fpm.unwrap().sum_prefill_tokens, 0);
+            assert!(
+                pass.output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+            );
+        } else {
+            assert_eq!(core.state.requests[&id].num_computed_tokens, 64);
+            let last = step(&mut core);
+            assert!(
+                last.output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && !signal.rejected })
+            );
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.state.preemptions_total, 0);
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    }
+}
+
+#[test]
+fn cold_budget_split_within_one_state_slot_does_not_rotate() {
+    let mut config = args(false, false);
+    config.block_size = 64;
+    config.prefix_match_unit = Some(64);
+    config.max_num_batched_tokens = Some(16);
+    // One token block, one two-block working state, one two-block scratch.
+    config.num_gpu_blocks = 5;
+    config.aic_nextn = Some(1);
+    config.aic_nextn_accept_rates = Some("1".to_string());
+    let state = config.state_cache.as_mut().unwrap();
+    state.bytes_per_request = 1500;
+    state.num_speculative_states = Some(1);
+    let mut core = VllmCore::new(config);
+    let id = submit(&mut core, 904, (0..32).collect(), 1);
+    let first = step(&mut core);
+    assert_eq!(first.admissions.len(), 1);
+    assert_eq!(core.state.requests[&id].num_computed_tokens, 16);
+    let last = step(&mut core);
+    assert!(
+        last.output_signals
+            .iter()
+            .any(|signal| { signal.uuid == id && signal.completed && !signal.rejected })
+    );
+    assert!(core.state.requests.is_empty());
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    assert_eq!(core.state.preemptions_total, 0);
+}
+
+#[test]
+fn cold_prefill_checkpoint_only_replaces_rotation_in_one_pass() {
+    // 193 tokens occupy four blocks. A one-pass prefill uses a two-block
+    // working state and checkpoint (8 total). A 128-token budget also holds
+    // the previous working state while exporting the checkpoint (10 total).
+    // A 64-token budget exports no internal checkpoint, so two working states
+    // suffice (8 total), with chunks ending at 64, 128, 192 and 193.
+    for (budget, capacity, admitted) in [
+        (64, 8, true),
+        (128, 8, false),
+        (1024, 8, true),
+        (128, 10, true),
+        (192, 8, true),
+    ] {
+        let mut config = args(true, false);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.max_num_batched_tokens = Some(budget);
+        config.num_gpu_blocks = capacity;
+        config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 903, (0..193).collect(), 1);
+        let first = step(&mut core);
+        if admitted {
+            assert_eq!(first.admissions.len(), 1);
+            if budget < 193 {
+                assert_eq!(core.state.requests[&id].num_computed_tokens, budget);
+                if budget == 64 {
+                    for (expected_end, active_blocks) in [(128, 6), (192, 7)] {
+                        let pass = step(&mut core);
+                        assert!(pass.output_signals.is_empty());
+                        assert_eq!(core.state.requests[&id].num_computed_tokens, expected_end);
+                        assert_eq!(core.kv_manager.num_active_blocks(), active_blocks);
+                    }
+                }
+                let last = step(&mut core);
+                assert!(
+                    last.output_signals.iter().any(|signal| {
+                        signal.uuid == id && signal.completed && !signal.rejected
+                    })
+                );
+            } else {
+                assert!(
+                    first.output_signals.iter().any(|signal| {
+                        signal.uuid == id && signal.completed && !signal.rejected
+                    })
+                );
+            }
+        } else {
+            assert!(first.admissions.is_empty(), "reject before partial prefill");
+            assert!(
+                first
+                    .output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+            );
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        assert_eq!(core.state.preemptions_total, 0);
+    }
+}
+
+#[test]
+fn resumed_cold_checkpoint_does_not_coexist_with_later_rotation() {
+    let mut config = args(true, true);
+    config.block_size = 64;
+    config.prefix_match_unit = Some(64);
+    config.max_num_batched_tokens = Some(256);
+    config.num_gpu_blocks = 11;
+    config.state_cache.as_mut().unwrap().bytes_per_request = 3 * 64 * 16;
+    config.preemption_mode = crate::engine::common::protocols::PreemptionMode::Fifo;
+    validate_state_config(&config);
+    let mut core = VllmCore::new(config);
+    let older = core.receive(DirectRequest {
+        uuid: Some(Uuid::from_u128(930)),
+        tokens: (0..65).collect(),
+        max_output_tokens: 129,
+        output_token_ids: Some((65..194).collect()),
+        ..Default::default()
+    });
+
+    // Real decode history leaves an attention prefix at 192 when FIFO
+    // preempts this request to grow the disjoint request's token allocation.
+    for _ in 0..128 {
+        if core.state.requests[&older].sequence.len() == 192 {
+            break;
+        }
+        step(&mut core);
+    }
+    assert_eq!(core.state.requests[&older].sequence.len(), 192);
+    let newer = submit(&mut core, 931, (1000..1064).collect(), 2);
+    let mut completed = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let pass = step(&mut core);
+        for signal in pass.output_signals {
+            assert!(!signal.rejected);
+            if signal.completed {
+                assert!(completed.insert(signal.uuid));
+            }
+        }
+        if core.state.preemptions_total > 0 {
+            break;
+        }
+    }
+    assert_eq!(core.state.preemptions_total, 1);
+    let request = &core.state.requests[&older];
+    assert_eq!(request.sequence.len(), 193);
+    assert_eq!(request.num_computed_tokens, 0);
+    assert_eq!(request.sequence.lease.allocated_tokens(), 0);
+
+    // Resume with no recurrent state hit. The first pass needs 3 token +
+    // 3 working + 3 checkpoint blocks. The next needs 4 token + 6 working
+    // blocks, after the checkpoint can be reclaimed: max(9, 10), not 12.
+    let resumed = step(&mut core);
+    assert_eq!(reused(&resumed, older), 0);
+    assert!(resumed.output_signals.iter().all(|signal| !signal.rejected));
+    let request = &core.state.requests[&older];
+    assert_eq!(request.sequence.lease.junction(), Some(192));
+    assert_eq!(request.num_computed_tokens, 192);
+    let fpm = resumed.fpm.as_ref().unwrap();
+    assert_eq!(fpm.sum_prefill_tokens, 192);
+    assert_eq!(fpm.sum_prefill_kv_tokens, 0);
+    let last = step(&mut core);
+    for signal in last.output_signals {
+        assert!(!signal.rejected);
+        if signal.completed {
+            assert!(completed.insert(signal.uuid));
+        }
+    }
+    assert_eq!(completed, [older, newer].into_iter().collect());
+    assert!(core.state.requests.is_empty());
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    assert_eq!(core.state.preemptions_total, 1);
+}
+
+#[test]
+fn cold_non_block_multiple_budget_accounts_for_the_final_checkpoint() {
+    // A 100-token budget floors non-final chunks to 64 tokens. The chunks
+    // start at 0, 64 and 128; the final 65-token chunk exports checkpoint 192.
+    // Four token blocks, two two-block working states and the two-block
+    // checkpoint need ten blocks at the peak.
+    for capacity in [8, 10] {
+        let mut config = args(true, false);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.max_num_batched_tokens = Some(100);
+        config.num_gpu_blocks = capacity;
+        config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+        let mut core = VllmCore::new(config);
+        let id = submit(&mut core, 914, (0..193).collect(), 1);
+
+        for (start, computed) in [(0, 64), (64, 64), (128, 65)] {
+            assert_eq!(core.state.requests[&id].num_computed_tokens, start);
+            let pass = step(&mut core);
+            let fpm = pass.fpm.as_ref().unwrap();
+            if capacity == 8 {
+                assert!(pass.admissions.is_empty(), "reject before partial prefill");
+                assert_eq!(fpm.sum_prefill_tokens, 0);
+                assert!(
+                    pass.output_signals
+                        .iter()
+                        .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+                );
+                break;
+            }
+
+            if start == 0 {
+                assert_eq!(pass.admissions.len(), 1);
+                assert_eq!(reused(&pass, id), 0);
+            } else {
+                assert!(pass.admissions.is_empty());
+            }
+            assert_eq!(fpm.sum_prefill_kv_tokens, start as u64);
+            assert_eq!(fpm.sum_prefill_tokens, computed);
+            if start == 128 {
+                assert!(
+                    pass.output_signals.iter().any(|signal| {
+                        signal.uuid == id && signal.completed && !signal.rejected
+                    })
+                );
+            } else {
+                assert!(pass.output_signals.is_empty());
+                assert_eq!(
+                    core.state.requests[&id].num_computed_tokens,
+                    start + computed as usize
+                );
+            }
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        assert_eq!(core.state.preemptions_total, 0);
+    }
+}
+
+#[test]
+fn warm_junction_checkpoint_admission_accounts_for_the_final_chunk() {
+    // Four token blocks and two two-block working states fit in eight blocks.
+    // A warm attention-only prefix forces a stop at 64, so the final chunk
+    // [64, 193) also exports checkpoint 192 and needs ten blocks. The cold
+    // budget split at 192 exports no checkpoint and still fits in eight.
+    // The junction also rotates the state when the whole prompt fits in the
+    // token budget; it is still a two-pass prefill.
+    for (warm, budget, capacity) in [
+        (false, 192, 8),
+        (true, 192, 8),
+        (true, 192, 10),
+        (true, 1024, 8),
+        (true, 1024, 10),
+    ] {
+        let mut config = args(true, true);
+        config.block_size = 64;
+        config.prefix_match_unit = Some(64);
+        config.max_num_batched_tokens = Some(budget);
+        config.num_gpu_blocks = capacity;
+        config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+        let mut core = VllmCore::new(config);
+        if warm {
+            let parent = submit(&mut core, 910, (0..64).collect(), 1);
+            let pass = step(&mut core);
+            assert!(
+                pass.output_signals.iter().any(|signal| {
+                    signal.uuid == parent && signal.completed && !signal.rejected
+                })
+            );
+            assert!(core.state.requests.is_empty());
+            assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        }
+
+        let id = submit(&mut core, 911, (0..193).collect(), 1);
+        let first = step(&mut core);
+        if warm && capacity == 8 {
+            assert!(first.admissions.is_empty(), "reject before partial prefill");
+            assert!(
+                first
+                    .output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && signal.rejected })
+            );
+        } else {
+            assert_eq!(reused(&first, id), 0);
+            let request = &core.state.requests[&id];
+            assert_eq!(request.sequence.lease.junction(), warm.then_some(64));
+            assert_eq!(request.num_computed_tokens, if warm { 64 } else { 192 });
+            let last = step(&mut core);
+            assert!(
+                last.output_signals
+                    .iter()
+                    .any(|signal| { signal.uuid == id && signal.completed && !signal.rejected })
+            );
+        }
+        assert!(core.state.requests.is_empty());
+        assert_eq!(core.kv_manager.num_active_blocks(), 0);
+        assert_eq!(core.state.preemptions_total, 0);
+    }
+}
+
+#[test]
+fn warm_junction_budget_split_does_not_charge_an_unexported_checkpoint() {
+    // The attention-only junction changes the chunks from 128 + 65 to
+    // 64 + 128 + 1. None exports an internal checkpoint, so four token
+    // blocks plus two two-block working states fit in eight blocks.
+    let mut config = args(true, true);
+    config.block_size = 64;
+    config.prefix_match_unit = Some(64);
+    config.max_num_batched_tokens = Some(128);
+    config.num_gpu_blocks = 8;
+    config.state_cache.as_mut().unwrap().bytes_per_request = 1500;
+    let mut core = VllmCore::new(config);
+
+    let parent = submit(&mut core, 912, (0..64).collect(), 1);
+    let warmup = step(&mut core);
+    assert!(
+        warmup
+            .output_signals
+            .iter()
+            .any(|signal| signal.uuid == parent && signal.completed && !signal.rejected)
+    );
+    assert!(core.state.requests.is_empty());
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+
+    let id = submit(&mut core, 913, (0..193).collect(), 1);
+    for expected_end in [64, 192] {
+        let pass = step(&mut core);
+        assert!(pass.output_signals.is_empty());
+        if expected_end == 64 {
+            assert_eq!(reused(&pass, id), 0);
+        }
+        let request = &core.state.requests[&id];
+        assert_eq!(request.sequence.lease.junction(), Some(64));
+        assert_eq!(request.num_computed_tokens, expected_end);
+    }
+    let last = step(&mut core);
+    assert!(
+        last.output_signals
+            .iter()
+            .any(|signal| signal.uuid == id && signal.completed && !signal.rejected)
+    );
+    assert!(core.state.requests.is_empty());
+    assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    assert_eq!(core.state.preemptions_total, 0);
 }
 
 #[test]

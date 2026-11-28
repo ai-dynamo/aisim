@@ -21,13 +21,13 @@
 use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
-use super::AllocationRequirement;
 use super::grouped::{GroupedBlockPool, GroupedKvPool, GroupedLease};
 use super::grouped_prefix::{
     AdmissionLimits, GroupedHit, GroupedPrefixCoordinator, GroupedPrefixRules, StoredGroupedHit,
 };
 use super::grouped_transfer::GroupedTransferRules;
 use super::state_cache_manager::{StateCacheManager, StateRequest};
+use super::{AllocationRequirement, PrefillBudget};
 use crate::engine::belady::BeladyOracle;
 use crate::engine::cache::vllm_block_pool::{
     BlockCopyId, BlockReservation, CacheKey, ReserveOutcome, VllmBlockPool,
@@ -163,6 +163,104 @@ pub(crate) fn mamba_prefill_checkpoint(
         && query_start + hash_block_size <= position
         && position < query_end)
         .then_some(position)
+}
+
+/// Shared align-mode chunk and internal-checkpoint plan for scheduling and admission.
+/// Modified simulation of vLLM v0.29.0, Copyright contributors to the vLLM project.
+/// Source: https://github.com/vllm-project/vllm/blob/98dff2a81d747d1dba01a47f939f48c3526d4206/vllm/v1/core/sched/scheduler.py
+/// Internal checkpoints follow vLLM 43b4aaea3e40e20ef53ce2bfecfa1b72060bf2b5.
+/// See THIRD_PARTY_NOTICES.md; Apache-2.0.
+pub(crate) struct StatePrefillConfig {
+    pub(crate) block_size: usize,
+    pub(crate) unit: usize,
+    pub(crate) token_budget: usize,
+    pub(crate) prefill_checkpoint: bool,
+    pub(crate) speculative_drop: bool,
+}
+
+impl StatePrefillConfig {
+    pub(crate) fn plan(
+        &self,
+        start: usize,
+        prompt: usize,
+        known: usize,
+        desired: usize,
+        junction: Option<usize>,
+    ) -> (usize, Option<usize>) {
+        let unit = self.unit;
+        let alignment = self.block_size;
+        let prefill_end = prompt.max(known.saturating_sub(1));
+        if start >= prefill_end {
+            return (desired, None);
+        }
+        let native_mtp = self.speculative_drop;
+        let prefill_checkpoint = self.prefill_checkpoint;
+        let mut end = start + desired;
+        // vLLM decides on the unclipped chunk end.
+        let exports_checkpoint = prefill_checkpoint
+            && mamba_prefill_checkpoint(
+                start,
+                end,
+                prefill_end,
+                prefill_end,
+                unit,
+                alignment,
+                native_mtp,
+            )
+            .is_some();
+        if end < prefill_end {
+            let aligned = end / alignment * alignment;
+            // A block larger than the whole step budget must make progress
+            // using private state, then stop at the next reachable boundary.
+            if aligned > start || alignment <= self.token_budget {
+                end = aligned;
+            }
+        }
+        let (stops, junction) =
+            self.stops(start, prompt, junction.filter(|&junction| junction < end));
+        for stop in stops
+            .into_iter()
+            .filter(|_| !exports_checkpoint)
+            .chain([junction])
+            .flatten()
+        {
+            if start < stop && stop < end {
+                end = stop;
+            }
+        }
+        // The pass reserves the checkpoint of the chunk it schedules, keyed on
+        // its end; a junction stop short of the prompt leaves none.
+        let checkpoint = prefill_checkpoint
+            .then(|| {
+                mamba_prefill_checkpoint(start, end, prefill_end, end, unit, alignment, native_mtp)
+            })
+            .flatten();
+        (end.saturating_sub(start), checkpoint)
+    }
+
+    fn stops(
+        &self,
+        start: usize,
+        prompt: usize,
+        junction: Option<usize>,
+    ) -> ([Option<usize>; 4], Option<usize>) {
+        let alignment = self.block_size;
+        // Match retention boundaries, including prompts ending on a full block.
+        let (last_full, resend_full, tail) =
+            state_boundaries(prompt, alignment, self.unit, self.speculative_drop);
+        let next = start.checked_add(alignment - start % alignment);
+        let stops = [
+            next.filter(|_| !start.is_multiple_of(alignment)),
+            Some(resend_full),
+            Some(last_full),
+            (last_full < tail && tail < prompt).then_some(tail),
+        ];
+        // A sub-block junction's state is not separately cacheable.
+        let junction = junction
+            .filter(|&junction| start < junction)
+            .map(|junction| start + (junction - start) / alignment * alignment);
+        (stops, junction)
+    }
 }
 
 struct PendingStore {
@@ -909,10 +1007,13 @@ impl VllmKvManager {
     pub(crate) fn admission_requirement(
         &self,
         lease: &BlockRequestLease,
-        known_tokens: usize,
+        sequence: &RequestSequence,
         cost: &PrefillCost,
         reserved_blocks: usize,
+        budget: PrefillBudget,
     ) -> AllocationRequirement {
+        let known_tokens = sequence.len();
+        let prompt_tokens = sequence.num_input_tokens();
         let token_blocks = known_tokens.div_ceil(self.block_size);
         if let Some(manager) = &self.state_cache
             && cost.cached_tokens > 0
@@ -920,58 +1021,217 @@ impl VllmKvManager {
                 .state_hash(cost.cached_tokens, self.block_size)
                 .is_some_and(|hash| manager.defers_same_step_hit(hash))
         {
-            // vLLM cannot allocate a hit on a state cached in this step: it
-            // asks for num_gpu_blocks + 1, so the request waits.
+            // vLLM cannot allocate a hit on a state cached in this step.
             return AllocationRequirement::Blocks(self.pool.capacity() + 1);
         }
-        let checkpoint_blocks = self.admission_checkpoint_blocks(cost.cached_tokens, known_tokens);
+        let junction = lease
+            .junction()
+            .filter(|&junction| cost.cached_tokens < junction && junction < known_tokens);
+        let checkpoint_end = self.admission_checkpoint_end(
+            cost.cached_tokens,
+            prompt_tokens,
+            known_tokens,
+            junction,
+            budget,
+        );
         if let Some(state) = &self.state_cache {
-            let copies = if cost.cached_tokens > 0 { 2 } else { 1 };
-            if known_tokens == 0
-                || token_blocks
-                    .saturating_add(state.blocks_per_state.saturating_mul(copies))
+            let full_budget: PrefillBudget = budget.total.into();
+            let full_checkpoint_end = if budget.remaining == budget.total {
+                checkpoint_end
+            } else {
+                self.admission_checkpoint_end(
+                    cost.cached_tokens,
+                    prompt_tokens,
+                    known_tokens,
+                    junction,
+                    full_budget,
+                )
+            };
+            let peak = |first_budget: usize, checkpoint: Option<usize>| {
+                // Only scheduled stops can force a second working state. In
+                // particular, a non-final chunk uses its block-floored end.
+                let (split_rotates, first_checkpoint) =
+                    state.align_block_size.map_or((false, false), |block| {
+                        let plan = StatePrefillConfig {
+                            block_size: block,
+                            unit: self.prefix_match_unit.unwrap_or(block),
+                            token_budget: budget.total,
+                            prefill_checkpoint: state.prefill_checkpoint,
+                            speculative_drop: state.speculative_drop(),
+                        };
+                        let (tokens, checkpoint) = plan.plan(
+                            cost.cached_tokens,
+                            prompt_tokens,
+                            known_tokens,
+                            known_tokens
+                                .saturating_sub(cost.cached_tokens)
+                                .min(first_budget),
+                            junction,
+                        );
+                        let first_end = cost.cached_tokens + tokens;
+                        let rotates = first_end < known_tokens
+                            && first_end.saturating_sub(1) / block
+                                < known_tokens.saturating_sub(1) / block;
+                        (rotates, checkpoint.is_some())
+                    });
+                // A retained sub-block state also needs copy-on-write even
+                // when both chunks target the same physical state slot.
+                let retains_state = state.align_block_size.is_some_and(|block| {
+                    let (last_full, resend_full, tail) = state_boundaries(
+                        prompt_tokens,
+                        block,
+                        self.prefix_match_unit.unwrap_or(block),
+                        state.speculative_drop(),
+                    );
+                    [last_full, resend_full, tail]
+                        .into_iter()
+                        .any(|stop| 0 < stop && stop < known_tokens)
+                });
+                let copies = if cost.cached_tokens > 0
+                    || split_rotates
+                    || (retains_state && checkpoint.is_none())
+                {
+                    2
+                } else {
+                    1
+                };
+                let working_peak =
+                    token_blocks.saturating_add(state.blocks_per_state.saturating_mul(copies));
+                // A cold first pass has no previous working state. Its
+                // checkpoint is released before a later pass rotates the
+                // working state, so price those complete footprints apart.
+                // Warm restores and later checkpoint passes still hold their
+                // source state through the checkpoint's forward pass.
+                let checkpoint_peak = checkpoint.map_or(0, |end| {
+                    let working_copies = if first_checkpoint && cost.cached_tokens == 0 {
+                        1
+                    } else {
+                        copies
+                    };
+                    end.div_ceil(self.block_size)
+                        .saturating_add(state.blocks_per_state.saturating_mul(working_copies + 1))
+                });
+                working_peak
+                    .max(checkpoint_peak)
                     .saturating_add(state.speculative_blocks)
-                    .saturating_add(checkpoint_blocks)
                     .saturating_add(usize::from(
                         !cost.cached_tokens.is_multiple_of(self.block_size),
                     ))
-                    > self.pool.capacity()
-            {
+            };
+            // Feasibility uses an otherwise empty step: sharing a budget must
+            // cause waiting, never permanent rejection of a feasible request.
+            let required_blocks = peak(budget.total, full_checkpoint_end);
+            if known_tokens == 0 || required_blocks > self.pool.capacity() {
+                tracing::warn!(
+                    required_blocks,
+                    available_blocks = self.pool.capacity(),
+                    "state_cache admission peak exceeds KV pool capacity"
+                );
                 return AllocationRequirement::Impossible;
             }
+            if budget.remaining != budget.total
+                && peak(budget.remaining, checkpoint_end) > self.pool.capacity()
+            {
+                return AllocationRequirement::Blocks(self.pool.capacity() + 1);
+            }
         }
+        let token_peak = checkpoint_end.map_or(token_blocks, |end| {
+            token_blocks.max(
+                end.div_ceil(self.block_size).saturating_add(
+                    self.state_cache
+                        .as_ref()
+                        .expect("checkpoint requires state cache")
+                        .blocks_per_state,
+                ),
+            )
+        });
         AllocationRequirement::Blocks(
-            token_blocks
-                .saturating_sub((cost.active_cached_tokens / self.block_size).max(reserved_blocks))
-                .saturating_add(self.state_restore_overhead(lease, cost.cached_tokens))
-                .saturating_add(checkpoint_blocks),
+            token_peak
+                .saturating_sub(
+                    (cost.active_cached_tokens / self.block_size)
+                        .max(reserved_blocks)
+                        .min(token_blocks),
+                )
+                .saturating_add(self.state_restore_overhead(lease, cost.cached_tokens)),
         )
     }
 
-    /// vLLM's full-ISL admission counts the checkpoint block of the prefill
-    /// that resumes at the hit (vLLM 43b4aaea MambaManager's
-    /// `get_num_blocks_to_allocate` with `apply_admission_cap`).
-    fn admission_checkpoint_blocks(&self, cached_tokens: usize, known_tokens: usize) -> usize {
+    /// Check the actual first chunk, then jump to the final full-budget chunk.
+    /// This is constant-time even for a long prompt with a tiny token budget.
+    fn admission_checkpoint_end(
+        &self,
+        prefill_start: usize,
+        prompt_tokens: usize,
+        known_tokens: usize,
+        junction: Option<usize>,
+        budget: PrefillBudget,
+    ) -> Option<usize> {
         let Some(manager) = &self.state_cache else {
-            return 0;
+            return None;
         };
         let Some(block_size) = manager
             .align_block_size
             .filter(|_| manager.prefill_checkpoint)
         else {
-            return 0;
+            return None;
         };
-        // The gate's query runs to the full sequence, which reaches prefill_end.
-        mamba_prefill_checkpoint(
-            cached_tokens,
-            known_tokens,
-            known_tokens,
-            known_tokens,
+        // Checkpoint mode is validated to use unit == block_size.
+        let plan = StatePrefillConfig {
             block_size,
-            block_size,
-            manager.speculative_drop(),
-        )
-        .map_or(0, |_| manager.blocks_per_state)
+            unit: block_size,
+            token_budget: budget.total,
+            prefill_checkpoint: true,
+            speculative_drop: manager.speculative_drop(),
+        };
+        let (first_tokens, first_checkpoint) = plan.plan(
+            prefill_start,
+            prompt_tokens,
+            known_tokens,
+            known_tokens
+                .saturating_sub(prefill_start)
+                .min(budget.remaining),
+            junction,
+        );
+        if first_checkpoint.is_some() {
+            return Some(prefill_start + first_tokens);
+        }
+        let mut start = prefill_start + first_tokens;
+        let prefill_end = prompt_tokens.max(known_tokens.saturating_sub(1));
+        let chunk_tokens = budget.total / block_size * block_size;
+        if start >= prefill_end || chunk_tokens == 0 {
+            return None;
+        }
+        // A resumed request can still stop at its original prompt's retention
+        // boundaries before reaching known-1. Jump only within each segment,
+        // never over a scheduled boundary. There are at most five fixed stops;
+        // sorting this stack array adds no work proportional to prompt length.
+        let (stops, junction_stop) = plan.stops(start, prompt_tokens, junction);
+        let [next, resend, last, tail] = stops;
+        let mut targets = [next, resend, last, tail, junction_stop, Some(prefill_end)]
+            .map(|stop| stop.unwrap_or(prefill_end).min(prefill_end));
+        targets.sort_unstable();
+        for target in targets {
+            if target <= start {
+                continue;
+            }
+            let chunks_before_target = target
+                .saturating_sub(start)
+                .saturating_sub(budget.total)
+                .div_ceil(chunk_tokens);
+            let query_start = start + chunks_before_target * chunk_tokens;
+            let (tokens, checkpoint) = plan.plan(
+                query_start,
+                prompt_tokens,
+                known_tokens,
+                known_tokens.saturating_sub(query_start).min(budget.total),
+                junction,
+            );
+            if checkpoint.is_some() {
+                return Some(query_start + tokens);
+            }
+            start = query_start + tokens;
+        }
+        None
     }
 
     /// Check the operation's peak, including any required preservation copy.

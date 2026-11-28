@@ -59,7 +59,7 @@ All paths below are under `engine.workers.<role>.kv_cache`.
 | `g3_offload` | Unset (off) | Rejected | G3 block; see [G3 offload](#g3-offload). |
 | `kvcr` | Unset (off) | Rejected | KVCR block; see [KVCR peer fetch](#kvcr-peer-fetch). |
 | `state_cache` | Unset (off) | Rejected | Recurrent-state block; see [state cache](#state-cache). |
-| `prefix_match_unit` | Unset | Rejected | Prefix-matching granularity with `state_cache`. For a grouped FPM cache with prefix caching, it is the profile's `hash_block_size_tokens`: unset uses it, and a set value must equal it. See [grouped caches](#other-cache-modes). |
+| `prefix_match_unit` | Unset; `block_size` with a recurrent `state_cache` and prefix caching | Rejected | Prefix-matching granularity with `state_cache`; incompatible with detailed native KV-event artifacts. For a grouped FPM cache with prefix caching, it is the profile's `hash_block_size_tokens`: unset uses it, and a set value must equal it. See [grouped caches](#other-cache-modes). |
 
 The block-size defaults above are simulation defaults. When a Sweeper candidate's
 role block size is absent or `null`, the deployment generator omits `--block-size`
@@ -470,7 +470,7 @@ also differs from vLLM v0.32.0 here:
 
 With [`state_cache`](#state-cache), the two v0.32.0 profiles also keep recurrent
 states, so a follow-up whose state left G1 can resume from host memory. This
-needs `prefix_match_unit` equal to `block_size`.
+needs an explicit `prefix_match_unit` equal to `block_size`.
 
 - A state goes to G2 when G1 publishes it, before the pass's blocks, as one key
   per state block, for example one per Mamba group. `offloading_v0_32` stores
@@ -881,13 +881,13 @@ This gives eight 1024-byte blocks. Each request's state takes two blocks
 |---|---|---|
 | `state_cache.bytes_per_request` | Inferred | State bytes per request per rank. When set, `block_size` and numeric `bytes_per_token` must also be set. |
 | `state_cache.num_speculative_states` | Unset | Explicit full-state scratch copies per request. Must match the draft depth, from positive `nextn` or `engine.speculation`. Requires numeric state bytes and token geometry. Under MTP it also applies vLLM's [EAGLE block drop](speculation.md#prefix-caching) to state lookups. |
-| `state_cache.prefill_checkpoint` | `false` | vLLM's internal prefill checkpoint; see [below](#opt-in-align-rules). Needs `prefix_match_unit` equal to `block_size`. |
+| `state_cache.prefill_checkpoint` | `false` | vLLM's internal prefill checkpoint; see [below](#opt-in-align-rules). Needs an explicit `prefix_match_unit` equal to `block_size`. |
 | `state_cache.junction_checkpoints` | `false` | vLLM v0.29.0's shared-prefix junction states; see [below](#opt-in-align-rules). Needs an explicit `prefix_match_unit`. |
 | `state_cache.mamba_cache_dtype` | `auto` | Kimi K3 only. `auto` (model dtype), `float16` or `float32`. Used when bytes are inferred. |
 | `state_cache.indexer_cache_dtype` | `auto` | DeepSeek V4 only. `auto` (vLLM's FP8), `fp8` or `mxfp4`; vLLM supports `mxfp4` only on Blackwell datacenter GPUs. Used when bytes are inferred. |
 | `state_cache.retention_interval` | Unset (every block boundary) | DeepSeek V4 with inferred bytes only. vLLM's `VLLM_PREFIX_CACHE_RETENTION_INTERVAL`: `0` or a multiple of the resolved `block_size`. DeepSeek V4 rejects `prefix_match_unit`. |
 | `state_cache.sliding_window_lookahead_tokens` | Inferred (DeepSeek V4: 64) | Tokens past the full-attention hit that the MTP layer's sliding-window group reads; sizing fills it. Set it only with explicit `bytes_per_request`, to replay a state resolved earlier. |
-| `prefix_match_unit` | Unset (`block_size`) | Positive divisor of `block_size`. Lets prefixes match at a finer granularity than the physical block. |
+| `prefix_match_unit` | `block_size` for a recurrent state with prefix caching, otherwise unset | Positive divisor of `block_size`. Requires chunked prefill with recurrent prefix caching. Rejects detailed native KV-event artifact capture. |
 
 `state_cache: {}` infers Kimi K3 geometry from the model. `block_size` is then
 a requested page size (default 64) that is enlarged to fit one state per layer.
@@ -942,6 +942,61 @@ with one difference: when a prompt ends on a block boundary, replay also keeps
 the state one block earlier (two under the EAGLE block drop), so an identical
 resend resumes there. vLLM keeps a state there only if a prefill chunk ended
 there.
+
+vLLM uses align mode for a recurrent state whenever prefix caching is on, so an
+unset `prefix_match_unit` resolves to `block_size`: prefill chunks stop at the
+block boundaries where the state is kept. This requires
+`engine.enable_chunked_prefill` to remain enabled; explicitly disabling it is
+rejected for both default and explicit units with recurrent prefix caching.
+
+Fixed pools need room for the aligned prefill peak: token blocks plus both the
+previous and new working state when prefill stops at a retained boundary or
+the scheduler's token budget splits it across physical blocks, as well as
+any speculative scratch states and internal prefill checkpoint. A checkpoint
+replaces the second working state only when the cold prefill fits in one pass.
+The internal checkpoint is charged only if the final budgeted prefill chunk
+exports one. For a cold 193-token prompt with 64-token blocks and two-block states,
+a 64-token budget exports no internal checkpoint and fits in eight blocks;
+a 128-token budget needs ten blocks, while a one-pass prefill needs eight.
+With both checkpoint options enabled, a recorded shared-prefix junction also
+splits prefill. A junction at token 64 with a 192-token budget instead schedules
+chunks of 64 and 129 tokens: the final chunk exports checkpoint 192, so the
+peak is four token blocks plus three two-block states, or ten blocks.
+For
+example, a 65-token prompt with 64-token blocks, 16 KV bytes per token and a
+1,500-byte state needs two token blocks and two two-block states: six blocks.
+A four-block pool is rejected at admission, before prefill, with required and
+available block counts in the native admission warning.
+
+Detailed native artifact capture (`run_replay_with_artifacts_json`) requires an
+aggregated topology and KV event export. Disaggregated P/D deployments fail on
+topology first, including when prefix caching is disabled. For aggregated
+deployments, capture rejects any set `prefix_match_unit` before engine construction.
+This includes the default `block_size` unit for recurrent states with prefix
+caching: inferred Kimi K3 states, explicit `bytes_per_request` states, and
+DeepSeek V4 with explicit bytes and no `sliding_window_lookahead_tokens`.
+Sliding-window states and recurrent states with prefix caching disabled do not
+receive that default. Ordinary CLI `--capture-telemetry` and `--export-html`
+use telemetry capture without native KV-event export and support the aligned
+recurrent-state default.
+
+Dynamo's [Router event observation](https://github.com/ai-dynamo/dynamo/blob/099f12765b23b3d7d617eb9e340b1913a2ed406b/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs#L188-L198)
+also requests engine KV events when its
+`use_kv_events` option is true; `reads_engine_kv_events` defaults to true when
+there is no Router config. The same native `prefix_match_unit` rejection
+applies to aligned recurrent states, including the resolved default. For
+offline `predict --stack dynamo`, a Dynamo build that accepts the option turns
+the observation off:
+
+```yaml
+router:
+  policy: kv_router
+  use_kv_events: false
+```
+
+This source contract describes offline replay. The option does not affect
+ordinary Engine-stack telemetry. See
+[Dynamo integration](../dynamo.md#router-configuration).
 
 ### State pool from recorded runtime memory
 

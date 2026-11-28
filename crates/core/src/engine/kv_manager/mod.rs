@@ -17,6 +17,22 @@ pub(crate) enum AllocationRequirement {
     Impossible,
 }
 
+/// Whole-step feasibility and the budget left for this admission's first pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrefillBudget {
+    pub(crate) total: usize,
+    pub(crate) remaining: usize,
+}
+
+impl From<usize> for PrefillBudget {
+    fn from(total: usize) -> Self {
+        Self {
+            total,
+            remaining: total,
+        }
+    }
+}
+
 /// Generic destination prompt-reservation behavior selected by scheduler
 /// policy before entering the backend-neutral G1 manager.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,9 +70,7 @@ pub(crate) use grouped::GroupedKvPool;
 pub(crate) use grouped_prefix::{AdmissionLimits, GroupedPrefixRules, VllmRuleVersion};
 pub(crate) use grouped_transfer::GroupedTransferRules;
 pub(crate) use sglang_backend::SglangKvManager;
-pub(crate) use vllm_backend::{
-    BlockRequestLease, PrefixHashMemo, mamba_prefill_checkpoint, state_boundaries,
-};
+pub(crate) use vllm_backend::{BlockRequestLease, PrefixHashMemo, StatePrefillConfig};
 
 #[cfg(test)]
 pub(crate) use vllm_backend::{apply_mtp_prefix_recompute, apply_prefix_recompute};

@@ -493,7 +493,7 @@ Do not interpret its allocation byte rate as logical KV bytes per token.
 The profile does not expose an aggregate token capacity.
 
 Use aggregated vLLM replay with the measured block length and scheduler limits.
-Keep prefix caching enabled. Fixed capacity overrides, offload, and disaggregated
+Keep prefix caching and chunked prefill enabled. Fixed capacity overrides, offload, and disaggregated
 FPM replay are unsupported for this layout. Original timing imports remain valid
 as timing-only evidence.
 

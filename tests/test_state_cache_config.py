@@ -233,7 +233,8 @@ def test_public_pd_state_cache_requires_both_roles(role):
 
 def test_native_pd_state_cache_requires_both_roles():
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_public_pd()))
-    decode = {key: value for key, value in spec.backend_deployment.decode_engine_args.items() if key != "state_cache"}
+    decode = dict(spec.backend_deployment.decode_engine_args)
+    del decode["state_cache"], decode["prefix_match_unit"]
     spec = replace(spec, backend_deployment=replace(spec.backend_deployment, decode_engine_args=decode))
     with pytest.raises(RuntimeError, match="both prefill and decode"):
         EngineReplayRunnerFactory().create(0).run(spec)
@@ -273,7 +274,8 @@ def test_manual_pd_state_transfer_adds_one_state_to_ttft():
         return metrics["mean_ttft_ms"]
 
     # The 1500-byte state crosses a 1000 B/s link once, on top of the prompt KV.
-    assert ttft(True) - ttft(False) == pytest.approx(1500.0)
+    # The aligned prefill also stops at the last full block, which adds one 1 ms pass.
+    assert ttft(True) - ttft(False) == pytest.approx(1501.0)
 
 
 def test_recommendation_rejects_manual_cache_instead_of_dropping_it():
@@ -415,6 +417,170 @@ def test_aligned_state_config_survives_public_export_and_engine_handoff(forbid_e
     assert runtime.execution_spec["spec"]["engine"]["rank"]["prefix_match_unit"] == 16
 
 
+@pytest.mark.parametrize(
+    "overrides,unit", [({}, KV["block_size"]), ({"state_cache": WINDOW}, None), ({"prefix_caching": False}, None)]
+)
+def test_unset_prefix_match_unit_aligns_only_a_cached_recurrent_state(forbid_estimators, overrides, unit):
+    config = CorePredictionConfig.model_validate(_public(**overrides))
+    assert prediction_to_replay_spec(config).backend_deployment.agg_engine_args.get("prefix_match_unit") == unit
+
+
+@pytest.mark.parametrize("unit", [None, 16, 64])
+def test_recurrent_state_rejects_detailed_native_artifacts(forbid_estimators, unit):
+    from aisim import _runtime
+
+    config = CorePredictionConfig.model_validate(_public(prefix_match_unit=unit))
+    spec = prediction_to_replay_spec(config)
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    assert runtime.execution_spec["spec"]["engine"]["rank"]["prefix_match_unit"] == (unit or 64)
+    error = "detailed replay artifacts require KV event export, which prefix_match_unit"
+    with pytest.raises(RuntimeError, match=error):
+        _runtime.run_replay_with_artifacts_json(json.dumps(runtime.execution_spec))
+
+
+@pytest.mark.parametrize("overrides", [{"prefix_caching": False}, {"state_cache": WINDOW}])
+def test_unaligned_state_supports_detailed_native_artifacts(forbid_estimators, overrides):
+    from aisim import _runtime
+
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(_public(**overrides)))
+    assert "prefix_match_unit" not in spec.backend_deployment.agg_engine_args
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    captured = json.loads(_runtime.run_replay_with_artifacts_json(json.dumps(runtime.execution_spec)))
+    assert captured["report"]["completed_requests"] == 1
+    assert len(captured["artifacts"]["requests"]) == 1
+
+
+@pytest.mark.parametrize("capture_flag", ["--capture-telemetry", "--export-html"])
+def test_default_recurrent_state_cli_telemetry_preserves_alignment(tmp_path, forbid_estimators, capture_flag):
+    import yaml
+
+    import aisim.main as cli
+
+    path = tmp_path / "state.yaml"
+    path.write_text(yaml.safe_dump(_public()), encoding="utf-8")
+    output = tmp_path / "output"
+    assert cli.main(["predict", "-c", str(path), "--output-dir", str(output), capture_flag]) == 0
+    prediction = json.loads((output / "prediction.json").read_text())
+    assert prediction["completed_requests"] == 1
+    # A 128-token prompt stops at 64 to retain a resumable recurrent state.
+    assert prediction["mean_ttft_ms"] == pytest.approx(2.0)
+    requests = [json.loads(line) for line in (output / "telemetry-requests.jsonl").read_text().splitlines()]
+    assert len(requests) == 1
+    assert requests[0]["input_length"] == 128
+    assert requests[0]["output_length"] == 1
+    if capture_flag == "--export-html":
+        assert (output / "report.html").is_file()
+
+
+@pytest.mark.parametrize("unit", [None, 16, 64])
+def test_aligned_recurrent_state_requires_chunked_prefill(forbid_estimators, unit):
+    raw = _public(prefix_match_unit=unit)
+    raw["engine"]["enable_chunked_prefill"] = False
+    with pytest.raises(ValueError, match="prefix_match_unit.*engine.enable_chunked_prefill"):
+        prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    raw["engine"]["enable_chunked_prefill"] = True
+    args = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw)).backend_deployment.agg_engine_args
+    assert args["prefix_match_unit"] == (unit or 64)
+
+
+@pytest.mark.parametrize("overrides", [{"prefix_caching": False}, {"state_cache": WINDOW}])
+def test_unaligned_state_allows_unchunked_prefill(forbid_estimators, overrides):
+    raw = _public(**overrides)
+    raw["engine"]["enable_chunked_prefill"] = False
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    assert "prefix_match_unit" not in spec.backend_deployment.agg_engine_args
+    assert EngineReplayRunnerFactory().create(0).run(spec).metrics["completed_requests"] == 1
+
+
+@pytest.mark.parametrize(
+    "input_tokens,blocks,budget,completed,checkpoint",
+    [
+        (64, 3, 1024, 1, False),
+        (65, 4, 1024, 0, False),
+        (65, 6, 1024, 1, False),
+        (65, 6, 1024, 1, True),
+        (193, 8, 128, 0, True),
+        (193, 8, 1024, 1, True),
+        (193, 10, 128, 1, True),
+    ],
+)
+def test_aligned_state_admission_accounts_for_rotating_state(
+    forbid_estimators, input_tokens, blocks, budget, completed, checkpoint
+):
+    raw = _public(
+        capacity={"type": "fixed", "blocks": blocks},
+        state_cache={**STATE, "prefill_checkpoint": checkpoint},
+        prefix_match_unit=64 if checkpoint else None,
+    )
+    raw["engine"]["workers"]["aggregated"]["scheduler"] = {"max_batched_tokens": budget}
+    raw["traffic"]["source"]["input_tokens"] = input_tokens
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    report = EngineReplayRunnerFactory().create(0).run(spec)
+    assert report.metrics["completed_requests"] == completed
+    # Two token pages + two ceil(1500 / (64 * 16)) state copies = six blocks.
+    # A pool that cannot fit the peak must reject before computing any prefill.
+    assert report.metrics["committed_prefill_tokens"] == (input_tokens if completed else 0)
+
+
+@pytest.mark.parametrize("budget,blocks,completed", [(1024, 6, 1), (64, 6, 0), (64, 8, 1)])
+def test_eagle_state_admission_accounts_for_budget_split(forbid_estimators, budget, blocks, completed):
+    from aisim import _runtime
+
+    raw = _public(
+        timing="default",
+        capacity={"type": "fixed", "blocks": blocks},
+        state_cache={**STATE, "num_speculative_states": 1},
+    )
+    raw["engine"]["workers"]["aggregated"]["scheduler"] = {"max_batched_tokens": budget}
+    raw["engine"]["speculation"] = {"kind": "mtp", "params": {"depth": 1}, "expected_accepted_tokens": 1.0}
+    raw["traffic"]["source"]["input_tokens"] = 65
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    native = runtime.execution_spec
+    # Public MTP requires default timing. As in the reuse tests below, use
+    # fixed native timing to isolate scheduling from FPM data availability.
+    native["spec"]["engine"]["rank"]["timing_model"] = {
+        "type": "fixed",
+        "prefill_ms": 1.0,
+        "decode_ms": 1.0,
+    }
+    report = json.loads(_runtime.run_replay_json(json.dumps(native)))
+    assert report["completed_requests"] == completed
+    assert report["committed_prefill_tokens"] == (65 if completed else 0)
+
+
+def test_manual_dsv4_without_lookahead_uses_recurrent_aligned_chunks(forbid_estimators):
+    from aisim import ReplayOutputRequirements
+
+    payload = _public()
+    payload["engine"]["model"] = FLASH
+    payload["engine"]["workers"]["aggregated"]["scheduler"] = {"max_batched_tokens": 100}
+    payload["traffic"]["source"]["input_tokens"] = 192
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(payload))
+    args = spec.backend_deployment.agg_engine_args
+    assert args["prefix_match_unit"] == args["block_size"] == 64
+    assert args["state_cache"] == STATE
+    report = (
+        EngineReplayRunnerFactory()
+        .create(0)
+        .run(
+            spec,
+            output_requirements=ReplayOutputRequirements(capture_telemetry=True, telemetry_sample_interval_ms=0.5),
+        )
+    )
+    # Floor the 100-token step budget to 64-token boundaries: 64 + 64 + 64.
+    # An unaligned replay would instead schedule 100 + 92.
+    samples = report.metadata["native_report"]["telemetry"]["samples"]
+    chunks = [sample["traffic"]["committed_prefill_tokens"] for sample in samples]
+    assert [tokens for tokens in chunks if tokens] == [64, 64, 64]
+    assert report.metrics["completed_requests"] == 1
+    assert report.metrics["total_output_tokens"] == 1
+    assert report.metrics["committed_prefill_tokens"] == 192
+
+
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "1536", 1 << 64, 63, 65])
 def test_aligned_state_config_rejects_invalid_geometry(value):
     with pytest.raises(ValidationError, match="prefix_match_unit"):
@@ -477,6 +643,59 @@ def test_full_block_aligned_state_allows_mtp_through_engine_handoff(forbid_estim
     rank = runtime.execution_spec["spec"]["engine"]["rank"]
     assert rank["aic_nextn"] == 3
     assert rank["prefix_match_unit"] == rank["block_size"] == 64
+
+
+@pytest.mark.parametrize("speculative_states,disable_drop,reused", [(None, False, 48), (1, False, 32), (1, True, 48)])
+@pytest.mark.parametrize("unit", [None, 16])
+def test_full_block_state_mtp_reuse_requires_scratch_states_to_drop_a_block(
+    forbid_estimators, speculative_states, disable_drop, reused, unit
+):
+    from aisim import _runtime
+
+    raw = _public(block_size=16, prefix_match_unit=unit)
+    raw["traffic"]["source"].update(input_tokens=64, cached_prefix_tokens=48)
+    raw["traffic"]["stop"]["requests"] = 2
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    native = runtime.execution_spec
+    rank = native["spec"]["engine"]["rank"]
+    assert rank["prefix_match_unit"] == 16
+    # Fixed native timing isolates state reuse from FPM estimator availability.
+    rank.update(aic_nextn=1, disable_eagle_block_drop=disable_drop)
+    if speculative_states is not None:
+        rank["state_cache"]["num_speculative_states"] = speculative_states
+    native["spec"]["record_per_request"] = True
+    report = json.loads(_runtime.run_replay_json(json.dumps(native)))
+    assert report["completed_requests"] == 2
+    assert report["total_output_tokens"] == 2
+    assert [row["first_admission_reused_input_tokens"] for row in report["per_request"]] == [0, reused]
+    # With no scratch states, retain and reuse 48 = 64 - block_size tokens.
+    # Speculative dropping moves the resumable state one block earlier to 32.
+    assert report["committed_prefill_tokens"] == 128 - reused
+
+
+@pytest.mark.parametrize("disable_drop,reused", [(False, 32), (True, 48)])
+def test_sliding_window_mtp_drops_a_block_without_scratch_states(forbid_estimators, disable_drop, reused):
+    from aisim import _runtime
+
+    raw = _public(block_size=16, state_cache=WINDOW, capacity={"type": "fixed", "blocks": 64})
+    raw["traffic"]["source"].update(input_tokens=64, cached_prefix_tokens=48)
+    raw["traffic"]["stop"]["requests"] = 2
+    spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+    runtime = RecordingRuntime()
+    EngineReplayRunnerFactory(runtime=runtime).create(0).run(spec)
+    native = runtime.execution_spec
+    rank = native["spec"]["engine"]["rank"]
+    assert "prefix_match_unit" not in rank
+    assert "num_speculative_states" not in rank["state_cache"]
+    rank.update(aic_nextn=1, disable_eagle_block_drop=disable_drop)
+    native["spec"]["record_per_request"] = True
+    report = json.loads(_runtime.run_replay_json(json.dumps(native)))
+    assert report["completed_requests"] == 2
+    assert report["total_output_tokens"] == 2
+    assert [row["first_admission_reused_input_tokens"] for row in report["per_request"]] == [0, reused]
+    assert report["committed_prefill_tokens"] == 128 - reused
 
 
 @pytest.mark.parametrize(
@@ -614,6 +833,7 @@ def test_auto_state_geometry_reaches_native_wire_and_fixed_budget(auto_k3_payloa
     spec = prediction_to_replay_spec(config)
     args = spec.backend_deployment.agg_engine_args
     assert args["block_size"] == 768
+    assert args["prefix_match_unit"] == 768
     assert args["kv_cache_bytes_per_token"] == 27648
     assert args["num_gpu_blocks"] == 8
     assert args["state_cache"] == {"bytes_per_request": 61046784}
