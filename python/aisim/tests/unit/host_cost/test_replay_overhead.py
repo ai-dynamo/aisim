@@ -502,3 +502,17 @@ def test_two_host_cpus_of_one_sku_cannot_write_over_each_other(tmp_path):
     assert ((root / xeon).read_bytes(), (root / xeon).with_name("runs.parquet").read_bytes()) == before
     check_entry(root, unqueued(epyc, prefix="epyc"))
     check_entry(root, xeon)
+
+
+def test_two_measurements_of_one_deployment_are_refused_not_ordered(dataset, tmp_path, monkeypatch):
+    root = _copy(dataset, tmp_path)
+    run = _tokenizer_run(tmp_path, "two", framework="vllm", version="0.31.0", tokenizer="qwen2", per_token_us=0.9)
+    environment = json.loads((run / "environment.json").read_text())
+    environment["tokenizer_workers"] = 2
+    (run / "environment.json").write_text(json.dumps(environment))
+    register_entries(root, [write_entry(root, run, system="b300_sxm", model=QWEN, gpu_time=None, prefix="two")])
+    monkeypatch.setenv(replay.LOCAL_ENV, str(root))
+    with pytest.raises(DataConflictError, match="several host-cost-profile entries match vllm 0.31.0"):
+        _measured()
+    # Another version has one measurement and is unaffected.
+    assert _measured(backend="sglang", backend_version="0.5.20", model=GLM) is not None

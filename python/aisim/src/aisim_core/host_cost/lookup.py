@@ -200,13 +200,23 @@ def choose(
             and _setting(entry, "cpu_model") == cpu_model
         )
 
-    tokenizers = [e for e in catalog if matches(e, PURPOSE)]
-    found = _closest(tokenizers, version, lambda e: e.identity.framework_version, True)
-    if found is None:
+    def pick(purpose: str) -> Choice | None:
+        candidates = [e for e in catalog if matches(e, purpose)]
+        found = _closest(candidates, version, lambda e: e.identity.framework_version, True)
+        if found is None:
+            return None
+        selected = found[0].identity.framework_version
+        tied = sorted(e.configuration_id for e in candidates if e.identity.framework_version == selected)
+        if len(tied) > 1:
+            # Two measurements of one deployment (for example with different tokenizer worker counts) would make the
+            # catalog order decide the replay; refuse instead of picking one.
+            raise ValueError(f"several {purpose} entries match {framework} {selected} on {system}: {tied}")
+        return Choice(*found)
+
+    tokenizer_choice = pick(PURPOSE)
+    if tokenizer_choice is None:
         return None, None
-    unqueued = [e for e in catalog if matches(e, UNQUEUED_PURPOSE)]
-    extra = _closest(unqueued, version, lambda e: e.identity.framework_version, True)
-    return Choice(*found), None if extra is None else Choice(*extra)
+    return tokenizer_choice, pick(UNQUEUED_PURPOSE)
 
 
 @dataclass(frozen=True)

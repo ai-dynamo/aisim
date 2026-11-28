@@ -801,6 +801,53 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
     assert validate_bundle(files)["runs"][0]["id"] == run["id"]
 
 
+def test_a_campaign_with_a_stated_serving_cpu_qualifies(tmp_path, monkeypatch):
+    from argparse import Namespace
+
+    from scripts.e2e_accuracy import run_agentx_accuracy
+
+    run = result()
+    run["simulation_features"] = simulation_record()
+    silicon_inputs(tmp_path, run)
+    cpu = "Intel(R) Xeon(R) Platinum 8559C"
+    stated = []
+
+    def run_one(root, source, directory, timeout, context, serving_host_cpu=None):
+        stated.append(serving_host_cpu)
+        return run
+
+    monkeypatch.setattr(run_agentx_accuracy, "run_one", run_one)
+    shards = tmp_path / "shards"
+    common = {
+        "inputs": tmp_path,
+        "output": shards,
+        "shard_count": 1,
+        "point_timeout": 1,
+        "branch": "main",
+        "commit": "a" * 40,
+        "revision": "b" * 40,
+        "wheel": None,
+        "wheel_sha256": "c" * 64,
+        "run_id": "123",
+        "run_attempt": 1,
+        "preview": True,
+    }
+    run_agentx_accuracy.campaign(Namespace(**common, shard_index=0, serving_host_cpu=cpu))
+    assert stated == [cpu]
+    shard = json.loads((shards / "shard-0.json").read_text())
+    assert shard["snapshot"]["serving_host_cpu"] == cpu
+    args = Namespace(inputs=tmp_path, shards=shards, shard_count=1, output=tmp_path / "public")
+    run_agentx_accuracy.qualify(args)
+    files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
+    assert validate_bundle(files, preview=True)["runs"][0]["id"] == run["id"]
+    assert "serving_host_cpu" not in json.loads(files["summary.json"])["snapshot"]
+    # A shard without the stated CPU cannot merge with one that has it.
+    without = {**shard, "snapshot": {k: v for k, v in shard["snapshot"].items() if k != "serving_host_cpu"}}
+    (shards / "shard-1.json").write_bytes(canonical(without))
+    with pytest.raises(ValueError, match="different revisions"):
+        run_agentx_accuracy.qualify(Namespace(**{**vars(args), "shard_count": 2, "output": tmp_path / "mixed"}))
+
+
 @pytest.mark.parametrize(
     "problem",
     [

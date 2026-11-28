@@ -561,6 +561,9 @@ def qualify(args):
             raise ValueError("Partial measurement campaigns cannot publish")
     elif status.exists():
         raise ValueError("Measurement campaign status differs from replay")
+    # The stated serving CPU only keeps shards with and without measured CPU overhead apart; the public snapshot
+    # contract has no field for it.
+    snapshot.pop("serving_host_cpu", None)
     snapshot["completed_at"] = datetime.now(UTC).isoformat()
     args.output.mkdir(parents=True, exist_ok=True)
     summaries = []
