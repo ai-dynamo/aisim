@@ -1432,8 +1432,8 @@ test("AgentX TPOT denominator counts scored requests when metrics are recorded",
   vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
   const point={request_errors:{tpot_ms:{count:10},ttft_ms:{count:10}},accuracy_metrics:{tpot_ms:{n:8,excluded:2},ttft_ms:{n:10,excluded:0}}};
   context.point=point;
-  assert.equal(vm.runInContext("window.AgentX.denominator(point,'tpot_ms')",context),"8 (2 excluded &lt;1 ms)");
-  assert.equal(vm.runInContext("window.AgentX.denominator(point,'ttft_ms')",context),"10");
+  assert.equal(vm.runInContext("window.AgentX.denominator(point,'tpot_ms')",context),"8 for e2e and quantile error (2 excluded &lt;1 ms), 10 for request MAPE");
+  assert.equal(vm.runInContext("window.AgentX.denominator(point,'ttft_ms')",context),"10 for e2e and quantile error");
   context.point={request_errors:point.request_errors};
   assert.equal(vm.runInContext("window.AgentX.denominator(point,'tpot_ms')",context),"10");
 });

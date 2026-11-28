@@ -510,7 +510,7 @@ def run_one(root, run, directory, timeout, context, performance_model=OP_LEVEL, 
     ):
         raise ValueError("Learned step captures differ from the replayed speculative decoding")
     step = None
-    if timing is not None and workdir is not None and learned is not None:
+    if timing is not None and workdir is not None and (performance_model != LEARNED or learned is not None):
         # Step error is held out: the seed-42 learned model prices the seed-7 steps.
         held_out = held_out_timing(timing, learned["held_out"]) if performance_model == LEARNED else timing
         step = score_steps(run["model"], run["lanes"], held_out, workdir)
@@ -599,7 +599,8 @@ def campaign(args):
         workdir = args.learned_workdir or scratch
         for run in selected:
             for performance_model in performance_models(run, learned, speculative):
-                if learned and run["model"] not in trained:
+                # Train only for a scheduled learned row; op-based step scoring reads its own held-out capture.
+                if performance_model == LEARNED and run["model"] not in trained:
                     trained[run["model"]] = learned_artifacts(run["model"], workdir, scratch / "models")
                 results.append(
                     run_one(
