@@ -296,21 +296,27 @@ def _apply_measured_cpu_overhead(
     system = worker.hardware or engine.hardware
     version = deployment.backend_version
     if not version or version in {"current", "previous", "next"}:
+        if worker.timing.type != "default":
+            # A self-contained timing model reads no performance data, so it has no version to key a measurement by
+            # (and resolving one would compose the default operation tables). Set ``engine.backend_version``.
+            return deployment
         # An omitted version is the documented ``current`` default; resolve it (and any alias the estimator did not
-        # pin) the way replay queries the performance data, so the measurement is keyed by the version replayed.
-        from aisim_core.sdk.perf_database import resolve_query_version
+        # pin) as the runtime does: the ``current`` slot, else the latest version under slotless roots.
+        from aisim_core.sdk.perf_database import get_latest_database_version, resolve_query_version
 
         from .sweeper.forward_pass_estimator import resolve_systems_paths
 
+        roots = list(resolve_systems_paths(worker.timing.systems_paths or engine.systems_paths))
         try:
-            version = resolve_query_version(
-                system,
-                engine.backend,
-                version or "current",
-                systems_paths=list(resolve_systems_paths(worker.timing.systems_paths or engine.systems_paths)),
+            version = (
+                get_latest_database_version(system, engine.backend, systems_paths=roots)
+                if version in {None, "", "current"}
+                else resolve_query_version(system, engine.backend, version, systems_paths=roots)
             )
         except ValueError:
-            return deployment  # no version slot to resolve (a self-contained replay): nothing to key a measurement by
+            version = None
+        if not version:
+            return deployment  # no version to resolve: nothing to key a measurement by
     from aisim_core.host_cost.replay import measured_overhead
 
     measured = measured_overhead(

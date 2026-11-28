@@ -148,6 +148,23 @@ def entry_directory(framework: str, version: str, system: str, tokenizer: str, *
     return "/".join(part for part in (prefix.strip("/"), CATEGORY, framework, version, system, tokenizer) if part)
 
 
+def _refuse_other_identity(root: Path, directory: str, configuration: str) -> None:
+    """Refuse to write over an existing entry of another configuration (for example the same SKU on another host CPU).
+
+    Entry paths do not carry every identity setting, so two configurations can map to one directory; overwriting
+    would silently invalidate the digest an earlier registration pinned. Rewriting the same configuration is allowed.
+    """
+    existing = root / directory / MANIFEST_NAME
+    if not existing.is_file():
+        return
+    found = Manifest.model_validate_json(existing.read_bytes()).configuration_id
+    if found != configuration:
+        raise ValueError(
+            f"{directory} already holds host-cost configuration {found}; write configuration {configuration} "
+            "under another prefix"
+        )
+
+
 def _identity(environment: Mapping[str, Any], system: str, model: str) -> Identity:
     host = environment["host"]
     settings = {
@@ -199,6 +216,8 @@ def write_entry(
     directory = entry_directory(
         environment["framework"], environment["framework_version"], system, environment["tokenizer_key"], prefix=prefix
     )
+    configuration = configuration_id(CATEGORY, PURPOSE, identity)
+    _refuse_other_identity(root, directory, configuration)
     relative = f"{directory}/requests.parquet"
     table = pa.Table.from_pylist([row.model_dump() for row in rows], schema=_ARROW)
     write_parquet(table, root / relative, HOST_COST_SCHEMA)
@@ -229,7 +248,7 @@ def write_entry(
         schema_version="aisim-artifact-manifest/v1",
         category=CATEGORY,
         purpose=PURPOSE,
-        configuration_id=configuration_id(CATEGORY, PURPOSE, identity),
+        configuration_id=configuration,
         identity=identity,
         requested_settings=None,
         artifacts=[artifact],
@@ -299,6 +318,8 @@ def write_unqueued_entry(
     directory = unqueued_directory(
         framework, version, system, str(tokenizer_settings["tokenizer_key"]), endpoint, prefix=prefix
     )
+    configuration = configuration_id(CATEGORY, UNQUEUED_PURPOSE, identity)
+    _refuse_other_identity(root, directory, configuration)
     relative = f"{directory}/runs.parquet"
     table = pa.Table.from_pylist([row.model_dump() for row in rows], schema=_UNQUEUED_ARROW)
     write_parquet(table, root / relative, UNQUEUED_SCHEMA)
@@ -318,7 +339,7 @@ def write_unqueued_entry(
         schema_version="aisim-artifact-manifest/v1",
         category=CATEGORY,
         purpose=UNQUEUED_PURPOSE,
-        configuration_id=configuration_id(CATEGORY, UNQUEUED_PURPOSE, identity),
+        configuration_id=configuration,
         identity=identity,
         requested_settings=None,
         artifacts=[artifact],
@@ -394,8 +415,8 @@ def check_entry(root: str | Path, path: str) -> Manifest:
     stored = read_fit(manifest)
     for name in ("base_ms", "per_input_token_us"):
         want, have = getattr(recomputed, name), getattr(stored, name)
-        if abs(want - have) > 1e-9 * max(1.0, abs(have)):
-            raise ValueError(f"stored fit {name} differs from the fit of the rows")
+        if not math.isfinite(have) or abs(want - have) > 1e-9 * max(1.0, abs(have)):
+            raise ValueError(f"stored fit differs from the fit of the rows ({name})")
     return manifest
 
 

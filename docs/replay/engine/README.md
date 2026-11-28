@@ -234,7 +234,11 @@ version, endpoint, host CPU and tokenizer:
 - An uncollected backend version reuses the closest collected one (at or
   below it, else the nearest above). An omitted `engine.backend_version` is
   the `current` default and resolves the way replay resolves it for the
-  performance data. Host CPU, tokenizer and endpoint must match exactly.
+  performance data: the `current` slot, else the latest version under
+  performance roots without slots. A `fixed` or `polynomial` timing model
+  reads no performance data, so with the version omitted nothing is applied;
+  set `engine.backend_version` to apply the measurement. Host CPU, tokenizer
+  and endpoint must match exactly.
 - The vLLM tokenizer measurement includes prefix-cache block hashing, which
   vLLM runs only with prefix caching on (its default). The fit is applied
   whatever `prefix_caching` says; with prefix caching off it overstates the

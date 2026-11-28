@@ -381,8 +381,9 @@ def test_caller_set_fields_win_over_the_measured_overhead(local):
 def test_compiler_resolves_an_omitted_backend_version_before_the_lookup(local, monkeypatch):
     import aisim_core.sdk.perf_database as perf_database
 
-    # The documented default ``current`` resolves through the performance data's version slots.
-    monkeypatch.setattr(perf_database, "resolve_query_version", lambda system, backend, version, **_: "0.31.0")
+    # The documented default ``current`` resolves as the runtime does: the ``current`` slot, else (slotless roots) the
+    # latest version.
+    monkeypatch.setattr(perf_database, "get_latest_database_version", lambda system, backend, **_: "0.31.0")
     config = _prediction()
     config = config.model_copy(update={"engine": config.engine.model_copy(update={"backend_version": None})})
     spec = prediction_to_replay_spec(config, cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU)
@@ -402,7 +403,7 @@ def test_an_edited_tokenizer_intercept_fails_verification(dataset, tmp_path):
     data = json.loads(path.read_text())
     data["provenance"]["host_cost"]["fit"]["base_ms"] += 5.0
     path.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match="base_ms differs"):
+    with pytest.raises(ValueError, match=r"differs from the fit of the rows \(base_ms\)"):
         check_entry(root, "data/host-cost/sglang/0.5.21/b300_sxm/glm/aisim-manifest.json")
 
 
@@ -419,16 +420,85 @@ def test_results_are_independent_and_a_local_dataset_is_read_again(dataset, tmp_
     assert later.tokenization["base_ms"] + later.extra_cpu_overhead["base_ms"] == pytest.approx(40.0)
 
 
+def _without_version(config):
+    return config.model_copy(update={"engine": config.engine.model_copy(update={"backend_version": None})})
+
+
 def test_an_unresolvable_default_version_leaves_the_replay_unchanged(local, monkeypatch):
     import aisim_core.sdk.perf_database as perf_database
 
-    def no_slots(*_args, **_kwargs):
-        raise ValueError("no queryable versions")
-
-    monkeypatch.setattr(perf_database, "resolve_query_version", no_slots)
-    config = _prediction()
-    config = config.model_copy(update={"engine": config.engine.model_copy(update={"backend_version": None})})
+    monkeypatch.setattr(perf_database, "get_latest_database_version", lambda *_args, **_kwargs: None)
     deployment = prediction_to_replay_spec(
-        config, cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
+        _without_version(_prediction()), cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
     ).backend_deployment
     assert deployment.tokenization is None and deployment.extra_cpu_overhead is None
+
+
+def test_a_fixed_timing_replay_never_resolves_a_version_from_performance_data(local, monkeypatch):
+    import aisim.sweeper.forward_pass_estimator as forward_pass_estimator
+    import aisim_core.sdk.perf_database as perf_database
+
+    def unavailable(*_args, **_kwargs):
+        raise MissingDataError("offline with an empty operation-table cache")
+
+    for module, name in (
+        (forward_pass_estimator, "resolve_systems_paths"),
+        (perf_database, "get_latest_database_version"),
+        (perf_database, "resolve_query_version"),
+    ):
+        monkeypatch.setattr(module, name, unavailable)
+    # A self-contained replay: fixed timing and a fixed KV capacity, so nothing reads the operation tables.
+    fixed = {
+        "aggregated": {
+            "timing": {"type": "fixed", "prefill_ms": 1, "decode_ms": 2},
+            "kv_cache": {"capacity": {"type": "fixed", "blocks": 128}},
+        }
+    }
+    omitted = prediction_to_replay_spec(
+        _without_version(_prediction(workers=fixed)), cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
+    ).backend_deployment
+    assert omitted.tokenization is None and omitted.extra_cpu_overhead is None
+    # A stated version keys the measurement without any performance data.
+    stated = prediction_to_replay_spec(
+        _prediction(workers=fixed), cpu_overhead_endpoint="chat", cpu_overhead_host_cpu=CPU
+    ).backend_deployment
+    assert stated.extra_cpu_overhead["base_ms"] == pytest.approx(_measured().extra_cpu_overhead["base_ms"])
+
+
+def test_two_host_cpus_of_one_sku_cannot_write_over_each_other(tmp_path):
+    root = tmp_path / "dataset"
+    first = _tokenizer_run(tmp_path, "first", framework="vllm", version="0.31.0", tokenizer="qwen2", per_token_us=1.5)
+    other = _tokenizer_run(tmp_path, "other", framework="vllm", version="0.31.0", tokenizer="qwen2", per_token_us=1.1)
+    environment = json.loads((other / "environment.json").read_text())
+    environment["host"]["cpu_model"] = "AMD EPYC 9575F"
+    (other / "environment.json").write_text(json.dumps(environment))
+    path = write_entry(root, first, system="b300_sxm", model=QWEN, gpu_time=None)
+    before = (root / path).read_bytes()
+    with pytest.raises(ValueError, match="already holds host-cost configuration"):
+        write_entry(root, other, system="b300_sxm", model=QWEN, gpu_time=None)
+    epyc = write_entry(root, other, system="b300_sxm", model=QWEN, gpu_time=None, prefix="epyc")
+    assert (root / path).read_bytes() == before
+    # Rewriting the same configuration is allowed.
+    assert write_entry(root, first, system="b300_sxm", model=QWEN, gpu_time=None) == path
+
+    def unqueued(tokenizer_path, *, prefix="data"):
+        return write_unqueued_entry(
+            root,
+            framework="vllm",
+            version="0.31.0",
+            system="b300_sxm",
+            endpoint="chat",
+            model=QWEN,
+            runs=[{"run": "r", "base_ms": 20.0, "total_per_input_token_us": 1.7}],
+            tokenizer_manifest=Manifest.model_validate_json((root / tokenizer_path).read_bytes()),
+            method={"measure": "test"},
+            prefix=prefix,
+        )
+
+    xeon = unqueued(path)
+    before = (root / xeon).read_bytes(), (root / xeon).with_name("runs.parquet").read_bytes()
+    with pytest.raises(ValueError, match="already holds host-cost configuration"):
+        unqueued(epyc)
+    assert ((root / xeon).read_bytes(), (root / xeon).with_name("runs.parquet").read_bytes()) == before
+    check_entry(root, unqueued(epyc, prefix="epyc"))
+    check_entry(root, xeon)

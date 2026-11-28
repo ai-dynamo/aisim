@@ -24,6 +24,9 @@ host CPU must be the serving node's. Collect with the
 | `requests.parquet` | One row per timed request, schema `aisim-host-cost/v1` |
 | `aisim-manifest.json` | Envelope manifest (`category: host-cost`, `purpose: host-cost-profile`) |
 
+The path does not carry the host CPU. Writing a configuration over an existing entry of another configuration (for
+example the same system measured on another host CPU) is refused; write it under another prefix.
+
 ## Row columns (`aisim-host-cost/v1`)
 
 | Column | Meaning |

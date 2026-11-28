@@ -525,6 +525,9 @@ def campaign(args):
         "cohort_sha256": catalog["snapshot_id"],
         "preview": args.preview,
     }
+    if args.serving_host_cpu is not None:
+        # Bind the opt-in to the snapshot so shards with and without measured CPU overhead cannot merge.
+        snapshot["serving_host_cpu"] = args.serving_host_cpu
     status = args.inputs / "measurement-status.json"
     if status.exists():
         if not args.preview or read(status) != {"measurement_campaign_status": "partial"}:
