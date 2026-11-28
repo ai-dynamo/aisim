@@ -30,6 +30,14 @@ from scripts.e2e_accuracy.run_agentx_accuracy import artifact, normalize_native
 from scripts.pages.agentx_pages import unpack, validate_bundle
 
 
+@pytest.fixture(autouse=True)
+def op_level_only(monkeypatch):
+    """These tests cover op-based publications; learned rows are covered in test_agentx_metrics.py."""
+    import scripts.e2e_accuracy.run_agentx_accuracy as runner
+
+    monkeypatch.setattr(runner, "STEP_CAPTURES", {})
+
+
 def observation(key="a", **values):
     return {
         "key": key,
@@ -43,6 +51,20 @@ def observation(key="a", **values):
         "tpot_ms": 10,
         **values,
     }
+
+
+def current(run):
+    """A result as the current driver writes it: op-based, with metrics and CPU-overhead fields."""
+    from scripts.e2e_accuracy.agentx_metrics import request_metrics
+
+    summary = [item for item in run.get("config_summary", []) if item["name"] != "Estimation"]
+    run.update(
+        performance_model="op_level",
+        config_summary=[*summary, {"name": "Estimation", "value": "op_level"}],
+        accuracy_metrics={**request_metrics(run["pairs"]), "step": None},
+        cpu_overhead=None,
+    )
+    return run
 
 
 def result(**changes):
@@ -784,7 +806,7 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
     )
     from scripts.e2e_accuracy.run_agentx_accuracy import qualify
 
-    run = result()
+    run = current(result())
     run["simulation_features"] = simulation_record()
     catalog = silicon_inputs(tmp_path, run)
     snapshot = json.loads(bundle()["summary.json"])["snapshot"]
@@ -792,10 +814,14 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
     snapshot.update(cohort_sha256=catalog["snapshot_id"], driver_sha256=driver_digest())
     args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
     for selected in ([], [run, run], [{**run, "model": "wrong/model"}]):
-        (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": selected}))
+        (tmp_path / "shard-0.json").write_bytes(
+            canonical({"snapshot": snapshot, "learned_fpm": True, "learned_speculative": True, "runs": selected})
+        )
         with pytest.raises(ValueError):
             qualify(args)
-    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [run]}))
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": True, "learned_speculative": True, "runs": [run]})
+    )
     qualify(args)
     files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
     assert validate_bundle(files)["runs"][0]["id"] == run["id"]
@@ -806,17 +832,19 @@ def test_a_campaign_with_a_stated_serving_cpu_qualifies(tmp_path, monkeypatch):
 
     from scripts.e2e_accuracy import run_agentx_accuracy
 
-    run = result()
+    run = current(result())
     run["simulation_features"] = simulation_record()
     silicon_inputs(tmp_path, run)
     cpu = "Intel(R) Xeon(R) Platinum 8559C"
     stated = []
 
-    def run_one(root, source, directory, timeout, context, serving_host_cpu=None):
+    def run_one(root, source, directory, timeout, context, performance_model, learned, workdir, serving_host_cpu=None):
         stated.append(serving_host_cpu)
         return run
 
     monkeypatch.setattr(run_agentx_accuracy, "run_one", run_one)
+    # Op-based only, as on a wheel without the learned FPM, so the shard holds just this result.
+    monkeypatch.setattr(run_agentx_accuracy, "learned_supported", lambda: False)
     shards = tmp_path / "shards"
     common = {
         "inputs": tmp_path,
@@ -831,6 +859,7 @@ def test_a_campaign_with_a_stated_serving_cpu_qualifies(tmp_path, monkeypatch):
         "run_id": "123",
         "run_attempt": 1,
         "preview": True,
+        "learned_workdir": None,
     }
     run_agentx_accuracy.campaign(Namespace(**common, shard_index=0, serving_host_cpu=cpu))
     assert stated == [cpu]
@@ -918,11 +947,13 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
         indexed["cache.g1_prefix"]["evidence"][0].update(
             {"sha256": "f" * 64} if problem == "unretained" else {"pointer": "/missing"}
         )
-    run = result(
-        id=identity,
-        category="self_collected",
-        feature_metadata=features,
-        simulation_features=simulation_record(identity),
+    run = current(
+        result(
+            id=identity,
+            category="self_collected",
+            feature_metadata=features,
+            simulation_features=simulation_record(identity),
+        )
     )
     if problem == "missing_metadata":
         del run["feature_metadata"]
@@ -933,7 +964,9 @@ def test_new_self_collected_publication_requires_retained_complete_receipts(tmp_
     snapshot = json.loads(bundle()["summary.json"])["snapshot"]
     snapshot.update(cohort_sha256=catalog["snapshot_id"], driver_sha256=driver_digest())
     args = Namespace(inputs=tmp_path, shards=tmp_path, shard_count=1, output=tmp_path / "public")
-    (tmp_path / "shard-0.json").write_bytes(canonical({"snapshot": snapshot, "runs": [run]}))
+    (tmp_path / "shard-0.json").write_bytes(
+        canonical({"snapshot": snapshot, "learned_fpm": True, "learned_speculative": True, "runs": [run]})
+    )
     if problem is not None:
         with pytest.raises(ValueError):
             qualify(args)

@@ -858,3 +858,23 @@ dialog::backdrop { background: #0009; }
   #profile-accuracy .agentx-feature-badge { font-size:8px; }
   #profile-accuracy .agentx-feature-badge-key { font-size:7px; }
 }
+
+/* AgentX accuracy metrics: grouped error columns, CPU overhead and per-performance-model row colours. */
+:root{--agentx-op:#e3f0fc;--agentx-op-sub:#f1f8fe;--agentx-learned:#fde9d4;--agentx-learned-sub:#fef5ea}
+:root[data-theme="dark"]{--agentx-op:#1d3550;--agentx-op-sub:#172a40;--agentx-learned:#4a3218;--agentx-learned-sub:#3a2814}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--agentx-op:#1d3550;--agentx-op-sub:#172a40;--agentx-learned:#4a3218;--agentx-learned-sub:#3a2814}}
+.agentx-se{color:var(--muted,#6b7280);font-size:.85em}
+.agentx-unavailable{color:var(--muted,#6b7280);font-style:italic}
+.agentx-cpu{display:block;white-space:nowrap;font-size:12px;line-height:1.5}
+.agentx-table{min-width:1560px}
+.agentx-table th.agentx-group{text-align:center;border-bottom:1px solid var(--border)}
+.agentx-table th.agentx-sub{font-weight:600}
+.agentx-table td.agentx-metric{min-width:118px}
+.agentx-table tr.agentx-model.agentx-op{background:var(--agentx-op)}
+.agentx-table tr.agentx-model.agentx-learned{background:var(--agentx-learned)}
+.agentx-table tr.agentx-op[data-agentx-parent]:not(:hover):not(:focus-visible){background:var(--agentx-op-sub)}
+.agentx-table tr.agentx-learned[data-agentx-parent]:not(:hover):not(:focus-visible){background:var(--agentx-learned-sub)}
+.agentx-metrics-title{margin-top:16px}
+#agentx-quantile-tooltip,#agentx-step-tooltip{position:fixed;inset:auto;margin:0;box-sizing:border-box;width:360px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);overflow:auto;padding:14px 16px;border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--text);box-shadow:0 8px 24px #0003;font-size:12px;line-height:1.6}
+#agentx-quantile-tooltip p,#agentx-step-tooltip p{margin:0 0 10px}
+#agentx-quantile-tooltip p:last-child,#agentx-step-tooltip p:last-child{margin-bottom:0}

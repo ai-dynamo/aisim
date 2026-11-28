@@ -598,7 +598,8 @@ jobs:
             --revision "$AGENTX_RESOLVED_REVISION" --commit "$EXPECTED_SHA" --branch "$EVALUATED_BRANCH" \
             --wheel "${RUNNER_TEMP}"/agentx-wheel/*.whl --wheel-sha256 "$WHEEL_SHA256" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --shard-index "$SHARD_INDEX" --shard-count 2 "${preview_args[@]}"
+            --shard-index "$SHARD_INDEX" --shard-count 2 \
+            --serving-host-cpu "Intel(R) Xeon(R) Platinum 8559C" "${preview_args[@]}"
           cp "${RUNNER_TEMP}/agentx-inputs/catalog/e2e/agentx.json" "${RUNNER_TEMP}/agentx-results/catalog.json"
       - name: Encrypt private AgentX results
         if: always()

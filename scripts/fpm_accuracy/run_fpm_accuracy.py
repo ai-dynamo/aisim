@@ -17,6 +17,7 @@ from time import perf_counter
 from scripts.fpm_accuracy.contract import (
     HF_REPO,
     METHODS,
+    OP_LEVEL_METHODS,
     eligible_branch,
     sha,
     validate_summary,
@@ -43,11 +44,11 @@ def local_selection(root: Path, selection: dict) -> dict:
     return {**selection, "configuration_paths": None}
 
 
-def evaluate_configuration(case, scenarios: bool, include_comparison: bool):
+def evaluate_configuration(case, scenarios: bool, include_comparison: bool, op_level_config=None):
     comparison = {} if include_comparison else None
     details = []
     try:
-        row = evaluate_case(case, comparison=comparison, details=details)
+        row = evaluate_case(case, comparison=comparison, details=details, op_level_config=op_level_config)
         scenario = evaluate_scenario_case(case) if scenarios else None
     except SystemExit as error:
         # A dependency exiting successfully is still an incomplete campaign.
@@ -55,12 +56,12 @@ def evaluate_configuration(case, scenarios: bool, include_comparison: bool):
     return row, details, scenario, comparison
 
 
-def evaluate_isolated(case, scenarios: bool, include_comparison: bool):
+def evaluate_isolated(case, scenarios: bool, include_comparison: bool, op_level_config=None):
     # Native estimators and training libraries may retain process-wide state.
     # Reap that state after every configuration; never qualify a lost worker.
     with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as pool:
         try:
-            return pool.submit(evaluate_configuration, case, scenarios, include_comparison).result()
+            return pool.submit(evaluate_configuration, case, scenarios, include_comparison, op_level_config).result()
         except Exception as error:
             raise RuntimeError(
                 f"FPM configuration did not complete: {case.configuration.configuration_path}"
@@ -87,11 +88,19 @@ def main():
     parser.add_argument("--model", action="append", help="Smoke only: select models (HF IDs) before downloading")
     parser.add_argument("--hardware", action="append", help="Smoke only: select system IDs before downloading")
     parser.add_argument(
+        "--op-level-config",
+        type=Path,
+        help="Also score AISim op-level timing; JSON object of ForwardPassPerfModelConfig overrides ({} for none)",
+    )
+    parser.add_argument(
         "--configuration",
         action="append",
         help="Smoke only: selected configuration paths; cannot qualify for publication",
     )
     args = parser.parse_args()
+    if args.op_level_config and args.comparison_output:
+        # The comparison is written only beside a publication qualification, which local op-level runs skip.
+        parser.error("--op-level-config is local only and cannot write --comparison-output")
     if not eligible_branch(args.branch):
         parser.error("branch must be main or release >= 0.12.0")
     for revision in (args.commit, args.evaluator_sha, args.hf_revision):
@@ -130,6 +139,11 @@ def main():
         # may legitimately drop some; a legacy snapshot has no catalog, so every path must have loaded.
         if dataset.layout == "legacy" and {item.configuration_path for item in configurations} != selected:
             raise ValueError("unknown smoke configuration")
+    op_level_config = None
+    if args.op_level_config:
+        op_level_config = json.loads(args.op_level_config.read_text())
+        if not isinstance(op_level_config, dict):
+            parser.error("--op-level-config must hold a JSON object")
     comparison = {} if args.comparison_output else None
     rows = []
     details = []
@@ -138,7 +152,9 @@ def main():
         started = perf_counter()
         print(f"Evaluating {index}/{len(configurations)}: {configuration.configuration_path}", flush=True)
         case = dataset.measurement_case(configuration.configuration_path, snapshot_id=configuration.snapshot_id)
-        row, case_details, scenario, case_comparison = evaluate_isolated(case, args.scenarios, comparison is not None)
+        row, case_details, scenario, case_comparison = evaluate_isolated(
+            case, args.scenarios, comparison is not None, op_level_config
+        )
         rows.append(row)
         details.extend(case_details)
         if args.scenarios:
@@ -163,7 +179,7 @@ def main():
             "configuration_count": len(configurations),
             "complete": True,
         },
-        "methods": list(METHODS),
+        "methods": list(METHODS if op_level_config is None else OP_LEVEL_METHODS),
         "rows": rows,
     }
     validate_summary(summary)
@@ -184,8 +200,14 @@ def main():
         if len(scenario_data) > MAX_FILE:
             raise ValueError("scenario artifact exceeds the public asset size limit; campaign cannot qualify")
         (args.output / "scenarios.json").write_bytes(scenario_data)
+    if op_level_config is not None:
+        # Requested overrides only; each configuration's remaining settings come from its measured engine config.
+        (args.output / "op-level-config.json").write_text(json.dumps(op_level_config, indent=2, sort_keys=True) + "\n")
     if smoke:
         (args.output / "SMOKE_ONLY.txt").write_text("Partial dataset smoke; not qualified for publication.\n")
+    elif op_level_config is not None:
+        # The public overview accepts only the published method lists; the op-level baseline stays local.
+        (args.output / "LOCAL_ONLY.txt").write_text("Local op-level baseline; not qualified for publication.\n")
     else:
         qualification = {
             "schema_version": 3 if scenario_data is not None else 2,

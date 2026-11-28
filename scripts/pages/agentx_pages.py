@@ -19,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.e2e_accuracy.agentx_contract import (
     SUMMARY_SCHEMA,
     canonical,
+    detail_path,
     driver_digest,
+    result_key,
     validate_public,
     validate_result,
 )
@@ -93,15 +95,15 @@ def validate_bundle(files, *, preview=False):
     summary = strict_json(files["summary.json"])
     if set(summary) != {"schema", "snapshot", "runs"} or not isinstance(summary["runs"], list) or not summary["runs"]:
         raise ValueError("Invalid AgentX summary")
-    ids = [run["id"] for run in summary["runs"]]
-    if len(set(ids)) != len(ids):
+    keys = [result_key(run) for run in summary["runs"]]
+    if len(set(keys)) != len(keys):
         raise ValueError("Duplicate AgentX result")
-    expected = {"summary.json", *(f"details/{identity}.json" for identity in ids)}
+    expected = {"summary.json", *(detail_path(run) for run in summary["runs"])}
     if set(qualification["files"]) != expected:
         raise ValueError("Incomplete AgentX details")
     incomplete_evidence = None
     for run in summary["runs"]:
-        if run["detail_path"] != f"details/{run['id']}.json" or run["outcome"] not in {
+        if run["detail_path"] != detail_path(run) or run["outcome"] not in {
             "completed",
             "unsupported",
             "failed",

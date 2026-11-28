@@ -1305,7 +1305,8 @@ test("AgentX performance-model labels use recorded estimator and prediction data
   const label=runs=>{context.runs=runs;return vm.runInContext("window.AgentX.performanceModel(runs)",context);};
   const run={backend:"vllm",measured_backend_version:"0.30.0",prediction_backend_version:"0.31.0",config_summary:[{name:"Estimation",value:"op_level"}]};
   assert.equal(label([run,run]),"Op-based perf model (vllm 0.31.0)");
-  assert.equal(vm.runInContext("window.AgentX.performanceModel(runs,true)",context),"Op-based (vllm 0.31.0)");
+  assert.equal(vm.runInContext("window.AgentX.performanceModel(runs,true)",context),"Op-based");
+  assert.equal(label([{...run,performance_model:"fpm_learned",config_summary:[{name:"Estimation",value:"fpm_learned"}]}]),"Learned FPM perf model (vllm 0.31.0)");
   assert.equal(label([{...run,config_summary:[]}]),"Unrecorded perf model (vllm 0.31.0)");
   assert.equal(label([{...run,prediction_backend_version:null}]),"Op-based perf model (vllm version unrecorded)");
   const regression={...run,config_summary:[{name:"Estimation",value:"fpm_regression"}]};
@@ -1355,4 +1356,84 @@ test("summary version readers reject unknown and mixed field contracts", () => {
     app.set("input", input);
     assert.throws(() => app.run("validateSummary(input)"), /unexpected field/);
   }
+});
+
+
+test("AgentX agreed metrics pool steps exactly and average request errors over runs", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const request=(e2e,se,n,excluded=0)=>({n,excluded,e2e,e2e_se:se,quantile:e2e/2,quantile_se:se});
+  const step=(n,sum,sq)=>({n,sum_ape:sum,sum_sq_ape:sq});
+  const run=(e2e,se,steps)=>({accuracy_metrics:{tpot_ms:request(e2e,se,10,1),ttft_ms:request(e2e*2,se,10),step:{seed:7,dropped_shifted:2,decode:steps,prefill:step(0,0,0)}}});
+  context.runs=[run(10,3,step(2,4,10)),run(20,4,step(2,8,34))];
+  const {request:agg,steps}=vm.runInContext("({request:window.AgentX.requestAggregate(runs),steps:window.AgentX.stepAggregate(runs)})",context);
+  assert.equal(agg["tpot_ms/e2e"].v,15);
+  assert.equal(agg["tpot_ms/e2e"].se,2.5);
+  assert.equal(agg["tpot_ms/e2e"].req,20);
+  assert.equal(agg.excluded,2);
+  // Pooled APEs 1,3,3,5: mean 3, sample variance 8/3.
+  assert.equal(steps.decode.mape,3);
+  assert.ok(Math.abs(steps.decode.se-Math.sqrt(8/3/4))<1e-12);
+  assert.equal(steps.decode.n,4);
+  assert.equal(steps.prefill,null);
+  assert.equal(steps.dropped,4);
+});
+
+test("AgentX SpecDec shows None only for a recorded disabled state", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const spec=feature=>{context.run=feature===undefined?{}:{simulation_features:{roles:[{features:[{id:"speculation",...feature}]}]}};return vm.runInContext("window.AgentX.specDec(run)",context);};
+  assert.equal(spec(undefined),"Unrecorded");
+  assert.equal(spec({state:"failed_to_record",parameters:{method:null}}),"Unrecorded");
+  assert.equal(spec({state:"disabled",parameters:{method:"off"}}),"None");
+  assert.equal(spec({state:"enabled",parameters:{method:null,draft_length:3}}),"Unrecorded");
+  assert.equal(spec({state:"enabled",parameters:{method:"off"}}),"None");
+  assert.match(spec({state:"enabled",parameters:{method:"mtp",draft_length:3}}),/^MTP<small>3 draft tokens/);
+});
+
+test("AgentX metric cells label historical results and keep exclusions without a score", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const cells=runs=>{context.runs=runs;return vm.runInContext("window.AgentX.cells(runs)",context);};
+  const historical=cells([{id:"old"}]);
+  assert.equal((historical.match(/Not computed/g)||[]).length,6);
+  const empty={n:0,excluded:0,e2e:null,quantile:null,e2e_se:null,quantile_se:null};
+  const burst=cells([{accuracy_metrics:{tpot_ms:{...empty,excluded:3},ttft_ms:empty,step:null}}]);
+  assert.doesNotMatch(burst,/Not computed/);
+  assert.match(burst,/3 excluded &lt;1 ms/);
+});
+
+test("AgentX step error pools each capture set once across variants", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const step={seed:7,dropped_shifted:1,decode:{n:2,sum_ape:4,sum_sq_ape:10},prefill:{n:0,sum_ape:0,sum_sq_ape:0}};
+  const variant=(lanes,perf)=>({model:"m",lanes,performance_model:perf,accuracy_metrics:{step}});
+  context.runs=[variant(8,"op_level"),variant(8,"op_level"),variant(8,"fpm_learned"),variant(14,"op_level")];
+  const steps=vm.runInContext("window.AgentX.stepAggregate(runs)",context);
+  assert.equal(steps.decode.n,6);
+  assert.equal(steps.dropped,3);
+});
+
+test("AgentX detail links select one dashboard configuration", () => {
+  const context=vm.createContext({window:{},URL,URLSearchParams,location:{href:"https://example.test/e2e-accuracy/"}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const run=(id,hardware,backend)=>({id,category:"agentx",model:"m",hardware,backend,precision:"fp4",tensor_parallel:8,lanes:8,performance_model:"op_level"});
+  context.runs=[run("b300","B300","sglang"),run("h200","H200","sglang")];
+  const select=query=>{context.params=new URLSearchParams(query);return vm.runInContext("window.AgentX.pointRuns(runs,params).map(r=>r.id)",context);};
+  const url=new URL(vm.runInContext("window.AgentX.pointUrl(runs[1],'main')",context),"https://example.test/");
+  assert.deepEqual([...select(url.search)],["h200"]);
+  // A link without the identity, as older dashboards wrote, is rejected when it spans configurations.
+  assert.throws(()=>select("category=agentx&model=m&lanes=8"),/more than one configuration/);
+  assert.deepEqual([...select("category=agentx&model=m&lanes=8&hardware=B300")],["b300"]);
+});
+
+test("AgentX TPOT denominator counts scored requests when metrics are recorded", () => {
+  const context=vm.createContext({window:{}});
+  vm.runInContext(readFileSync(new URL("../pages/e2e-accuracy/agentx.js",import.meta.url),"utf8"),context);
+  const point={request_errors:{tpot_ms:{count:10},ttft_ms:{count:10}},accuracy_metrics:{tpot_ms:{n:8,excluded:2},ttft_ms:{n:10,excluded:0}}};
+  context.point=point;
+  assert.equal(vm.runInContext("window.AgentX.denominator(point,'tpot_ms')",context),"8 for e2e and quantile error (2 excluded &lt;1 ms), 10 for request MAPE");
+  assert.equal(vm.runInContext("window.AgentX.denominator(point,'ttft_ms')",context),"10 for e2e and quantile error");
+  context.point={request_errors:point.request_errors};
+  assert.equal(vm.runInContext("window.AgentX.denominator(point,'tpot_ms')",context),"10");
 });

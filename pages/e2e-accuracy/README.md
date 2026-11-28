@@ -713,7 +713,8 @@ as unscored incomplete-campaign evidence. They do not replace active coverage
 or satisfy the complete twelve-replay publication gate.
 
 The **AgentX NEW** tab uses a separate `aisimulate.agentx.accuracy.v1` publication.
-It does not change InfX snapshots or calculate shape errors. The beta notice links
+It does not change InfX snapshots or calculate their curve shape errors. Its
+per-request quantile error compares request latency distributions instead. The beta notice links
 to the [AgentX support matrix](https://ai-dynamo.org/aisim/feature-support-matrix/#agentx).
 
 Initial coverage is explicitly selected in the reviewed private HF catalog
@@ -721,52 +722,96 @@ Initial coverage is explicitly selected in the reviewed private HF catalog
 
 - **AgentX:** B300, SGLang, GLM-5.3 NVFP4, TP8; points 446063, 446068,
   446069, 446060, 446061, 446062 at 1, 4, 8, 10, 13, 14 lanes.
-- **Self-collected:** B300, vLLM, Qwen3.5-397B-A17B BF16, TP8; 4K/32K initial
-  prompts × cold/warm cache × 1/4/16 lanes × three repeats (36 runs).
+- **Self-collected:** B300, vLLM, Qwen3.5-397B-A17B BF16, TP8; one-hour Weka
+  profiles at 1, 4, 8, 10, 13 and 14 lanes. The earlier finite campaign (4K/32K
+  initial prompts × cold/warm cache × 1/4/16 lanes × three repeats, 36 runs) is
+  archived as `finite-v1`.
   The public dataset link is intentionally **coming soon**. TODO: add its public
   HF URL after migration; never expose the private cache URL in the dashboard.
 
 GLM uses the recorded AgentX corpus, its live-trajectory warmup/snapshot, and a
 one-hour profiling run per point. It has no 4K/32K, cold/warm, or repeat sweep.
-Each Qwen run is a finite cohort of eight measured requests per lane: 8, 32, or
-128 requests at 1, 4, or 16 lanes. Its detail selectors choose one of 12 runs per
-concurrency; the concurrency summary still covers all 12.
+Current Qwen Weka runs are one-hour profiles, one concurrency row per lane count
+(six rows). In the archived `finite-v1` campaign, each Qwen run is a finite cohort
+of eight measured requests per lane: 8, 32, or 128 requests at 1, 4, or 16 lanes.
+Its detail selectors choose one of 12 runs per concurrency; the concurrency
+summary still covers all 12.
 
 One table contains both sources, tagged beneath each model name. Model rows are
-expanded by default and remain collapsible. Concurrency rows open details; Qwen has exactly three such
-rows, combining all prompt/cache variants and repeats. Detail selectors default
-to 4K, cold, repeat 0 and persist in the URL. The selected run is labeled separately
+folded by default and expand on click. Concurrency rows open details. In
+`finite-v1`, Qwen has exactly three such rows, combining all prompt/cache variants
+and repeats, and its detail selectors default to 4K, cold, repeat 0 and persist in
+the URL. The selected run is labeled separately
 from the concurrency summary. Branches retain their own evidence, including
 unsupported outcomes; a release never borrows main's AgentX results.
 
 ### Accuracy and accounting
 
-The five columns are point TPOT error, point TTFT error, point output-throughput
-error, request TTFT MAPE, and request TPOT MAPE. Throughput is **output tokens/s**.
+Each model has one entry per performance model: **Op-based** (light blue) and,
+where pinned step captures exist, **Learned FPM** (light orange). Entries are
+folded by default. Columns are SpecDec (the replay's effective speculation;
+`None` only for a recorded disabled state, `Unrecorded` when evidence is missing),
+hardware/backend, performance model, CPU overhead (the replay's queued tokenizer
+and unqueued pre-first-token terms, one per line), then three grouped metrics:
+**Step error** (decode, prefill), **e2e error** (TPOT, TTFT) and **Per-request
+quantile error (p5–p95)** (TPOT, TTFT). Each group has an information popover.
+Concurrency pages are filtered by performance model (`perf=` in the URL; an
+omitted `perf` means Op-based, so older links keep their meaning) and show the
+point comparison plus an accuracy-metrics table. Results recorded before these
+metrics show "Not computed". Learned models retrain with the evaluated wheel on
+every campaign in a removed temporary directory outside the sealed shard tree;
+`--learned-workdir` keeps only the immutable step-capture downloads. A wheel
+without the learned FPM publishes op-based entries only; each shard records
+`learned_fpm` and `learned_speculative`, and qualification expects exactly
+those entries. A wheel that rejects a learned FPM with speculative decoding
+(probed by configuration validation before any replay) omits the learned
+entries of models whose step captures use speculative decoding (GLM MTP); it
+does not publish them as failed. Their op-based entries keep step metrics,
+because the held-out cohort is selected without any model.
 
-The information icon before **Point TPOT error** contrasts per-point and request
-averaging on hover, keyboard focus, or tap. Per-point compares the aggregate result
-across the benchmark's conversation requests; request MAPE averages individual
-matched-request errors. The tooltip explains that TTFT/TPOT exclude tool-call
-waits and that point error can be smaller because over- and under-predictions
-cancel when averaged. Metrics and provenance retain the calculation details.
-
-- Point error is `100 * abs(prediction - silicon) / silicon`, computed separately
-  for every run's mean metric. Model/concurrency rows average those errors equally,
-  not errors derived from averaged latencies. Null errors are not zeroes.
-- Request MAPE pools individual request errors directly across repeats and
-  variants. Each eligible request has equal weight, including in model summaries.
-  TTFT and TPOT have separate denominators; undefined or zero-denominator errors
-  remain unavailable.
+- All errors are unsigned percentages over uniquely matched requests.
+  e2e error is `100 * abs(mean AISim / mean silicon - 1)` of request TTFT or TPOT.
+  Per-request quantile error averages `100 * abs(AISim pN / silicon pN - 1)` over
+  p5, p10, ..., p95, so it compares distribution shape.
+- ± is a standard error: a 1,000-resample bootstrap over requests (fixed seed)
+  for request metrics. Entries average run values equally and combine standard
+  errors as `sqrt(sum se^2) / runs`.
+- Silicon TPOT under 1 ms, including zero, is burst delivery, not decode
+  pacing. Those matched requests are excluded from TPOT and counted under the
+  TPOT e2e cell. A zero AISim TPOT is kept: replay emits zero ITL when tokens
+  share a timestamp.
+- Step error is the MAPE of predicted versus measured forward-pass time on the
+  held-out seed-7 step capture at the same lane count, ± std/√n. Runs publish
+  `n`, `sum_ape` and `sum_sq_ape` so entries pool steps exactly. Variants at one
+  lane count score the same capture, so an entry pools each capture once per
+  lane and performance model. Both performance
+  models price steps through `RustForwardPassPerfModel.best_available` with the
+  replay's compiled timing configuration. Op-based decode steps are packed by
+  verification width `nextn + 1` (`B*v` requests, `B*v*s` KV tokens), as replay
+  packs them, without the logical per-request lists; the learned FPM reads
+  logical counts. Mixed prefill+decode steps are not
+  shown. SGLang 0.5.20 can record a step's device time on the adjacent record.
+  GLM therefore drops each step whose `device_time_s_by_category` lacks its target
+  forward (`extend` for prefill, `target_verify` for MTP decode) and the record
+  before it. The cohort comes from capture evidence alone, never from a scored
+  model's residuals, so both performance models score the same steps
+  (`dropped_shifted` counts the drops). Training drops the same steps.
+- The learned FPM is never stored. `scripts/e2e_accuracy/agentx_learned.py` pins
+  each model's public step captures to an immutable dataset revision. Every
+  evaluation retrains the replay model on seeds 42 and 7 and the step-error model
+  on seed 42 only, with a fixed seed. Replay uses frozen adaptation and
+  `fallback_policy: deny`.
+- The configuration's `Estimation` value is the evaluated performance model.
 - Every measured request has a comparison record. Success, unique identity,
   positive recorded output lengths, equal output lengths, and valid measurements
   determine eligibility. Missing, failed, ambiguous, invalid-output, and
   output-length-mismatched observations retain explicit counts. Different input
   lengths are reported and do not imply identical prompts or cache histories.
-- GLM retains the successful profiling cohort span. Qwen retains the complete
-  finite measured cohort, including between-turn delays. Preparation and warmup
-  remain outside scoring. Qwen additionally requires native cache receipts to
-  match the measured trajectory before publishing accuracy.
+- GLM and the current Qwen Weka profiles retain the successful profiling span.
+  In the archived `finite-v1` campaign only, Qwen retains the complete finite
+  measured cohort, including between-turn delays, and additionally requires
+  native cache receipts to match the measured trajectory before publishing
+  accuracy. Preparation and warmup remain outside scoring.
 
 ### Publication and detail data
 
@@ -776,8 +821,17 @@ lifecycle telemetry. Measured framework versions and prediction database version
 are recorded separately. No historical predictions, timing calibration, or GPU
 collection are used.
 
-`summary.json`, `details/<run-id>.json`, and `qualification.json` form one complete
-campaign. Qualification requires every catalog identity, consistent wheel,
+`summary.json`, `details/<run-id>-<performance-model>.json`, and `qualification.json`
+form one complete campaign. Each result records `performance_model`
+(`op_level` or `fpm_learned`), `accuracy_metrics` (`tpot_ms` and `ttft_ms` with
+`n`, `excluded`, `e2e`, `e2e_se`, `quantile`, `quantile_se`; `step` with `seed`,
+`dropped_shifted` and `decode`/`prefill` sums, or null) and `cpu_overhead`
+(`tokenization` and `extra_cpu_overhead`, or null). Validation recomputes the
+point estimates from the published request pairs. Historical publications without
+these fields remain readable as op-based results under `details/<run-id>.json`;
+qualification of a new campaign rejects any result without them.
+Qualification requires every catalog identity under each applicable performance
+model, consistent wheel,
 dataset, evaluated commit, and driver digests, and reconciled request accounting.
 Raw traces, token arrays, local paths, and logs remain private. Only explicit
 numerical projections and approved source links enter the public payload.
@@ -985,9 +1039,6 @@ cache checks. Two complete imports produced identical catalog checksum
 `02b2b26ff3dbaa1d83ee868903cce64c81dad655f6276d831b9337b8d14c96ec`.
 This validates provenance and arithmetic; accuracy remains advisory. Daily CI must
 generate new predictions. This preview is not a production snapshot.
-
-The AgentX overview displays Request TPOT MAPE before Request TTFT MAPE;
-column values and request denominators follow that order.
 
 Feature badges align left, with each label and value on the same line. Missing feature values display Unrecorded while internal unknown states remain unchanged.
 
