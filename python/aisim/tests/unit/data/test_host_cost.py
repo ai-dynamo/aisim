@@ -87,6 +87,11 @@ def test_a_tampered_table_or_fit_is_refused(tmp_path):
     manifest_file.write_text(json.dumps(document))
     with pytest.raises(ValueError, match="stored fit differs"):
         check_entry(root, path)
+    for value in ("NaN", "Infinity"):
+        document["provenance"]["host_cost"]["fit"]["per_input_token_us"] = value
+        manifest_file.write_text(json.dumps(document).replace(f'"{value}"', value))
+        with pytest.raises(ValueError, match="stored fit differs"):
+            check_entry(root, path)
     table = root / entry_directory("vllm", "0.31.0", "b300_sxm", "qwen2") / "requests.parquet"
     table.write_bytes(table.read_bytes()[:-8] + b"corrupt!")
     with pytest.raises(ValueError):

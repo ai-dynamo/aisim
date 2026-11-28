@@ -5,6 +5,7 @@
 import argparse
 import hashlib
 import importlib.resources
+import inspect
 import json
 import os
 import sys
@@ -47,6 +48,7 @@ def predict(config_path, output):
     config = json.loads(config_path.read_text())
     engine = config["engine"]
     pinned = config.pop("prediction_database_version", None)
+    host_cpu = config.pop("serving_host_cpu", None)
     version = pinned or database.get_latest_database_version(system=engine["hardware"], backend=engine["backend"])
     if not version:
         return {"outcome": "unsupported", "reason": "database_unavailable"}
@@ -69,7 +71,15 @@ def predict(config_path, output):
     if not data_file.is_file():
         return {"outcome": "unsupported", "reason": "database_unavailable", "prediction_backend_version": version}
     parsed = api.CorePredictionConfig.model_validate(config)
-    spec = compiler.prediction_to_replay_spec(parsed)
+    # AgentX replays real chat requests: apply the measured serving-path CPU overhead where the wheel has it, only
+    # when the operator stated the serving nodes' host CPU (no receipt records it; the SKU does not determine it).
+    overhead = (
+        {"cpu_overhead_endpoint": "chat", "cpu_overhead_host_cpu": host_cpu}
+        if host_cpu is not None
+        and "cpu_overhead_host_cpu" in inspect.signature(compiler.prediction_to_replay_spec).parameters
+        else {}
+    )
+    spec = compiler.prediction_to_replay_spec(parsed, **overhead)
     factory = api.EngineReplayRunnerFactory()
     try:
         factory.capabilities().require_compatible(spec)

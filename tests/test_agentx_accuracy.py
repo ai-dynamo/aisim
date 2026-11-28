@@ -266,6 +266,54 @@ def test_reviewed_database_pin_overrides_current_slot_and_never_borrows_data(tmp
     assert "prediction_database_version" not in captured[0]
 
 
+@pytest.mark.parametrize("host_cpu", [None, "Intel(R) Xeon(R) Platinum 8559C"])
+def test_measured_cpu_overhead_needs_the_stated_serving_host_cpu(tmp_path, monkeypatch, host_cpu):
+    config = {
+        "engine": {
+            "backend": "vllm",
+            "backend_version": "measured",
+            "hardware": "b300_sxm",
+        }
+    }
+    if host_cpu is not None:
+        config["serving_host_cpu"] = host_cpu
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({**config, "prediction_database_version": "0.31.0"}))
+    data = tmp_path / "systems/data/b300_sxm/attention/vllm/0.31.0/context_attention_perf.parquet"
+    data.parent.mkdir(parents=True)
+    data.write_bytes(b"fixture data")
+    calls = []
+
+    def compile_spec(value, cpu_overhead_endpoint=None, cpu_overhead_host_cpu=None):
+        calls.append((value, cpu_overhead_endpoint, cpu_overhead_host_cpu))
+        return value
+
+    def unsupported(spec):
+        raise NotImplementedError("stub capability")
+
+    modules = {
+        "aisim": SimpleNamespace(
+            ReplayOutputRequirements=lambda **kwargs: kwargs,
+            CorePredictionConfig=SimpleNamespace(model_validate=lambda value: value),
+            EngineReplayRunnerFactory=lambda: SimpleNamespace(
+                capabilities=lambda: SimpleNamespace(require_compatible=unsupported)
+            ),
+        ),
+        "aisim_core": SimpleNamespace(),
+        "aisim.compiler": SimpleNamespace(prediction_to_replay_spec=compile_spec),
+        "aisim.sdk.perf_database": SimpleNamespace(),
+        "aisim.replay.dashboard": SimpleNamespace(),
+        "aisim_core.data.default_systems": SimpleNamespace(default_systems_path=lambda: tmp_path / "systems"),
+    }
+    monkeypatch.setenv("AIC_ALLOW_UNLISTED_VERSIONS", "0")
+    monkeypatch.setattr(agentx_predict, "runtime_module", modules.__getitem__)
+    assert agentx_predict.predict(path, tmp_path)["reason"] == "replay_capability_unavailable"
+    [(parsed, endpoint, cpu)] = calls
+    assert "serving_host_cpu" not in parsed
+    # The SKU alone never implies a host CPU: without a stated one, nothing is measured in.
+    assert (endpoint, cpu) == ((None, None) if host_cpu is None else ("chat", host_cpu))
+
+
 @pytest.mark.parametrize("missing", ["utils", "common", "lookup"])
 def test_optional_wheel_feature_capabilities_report_unsupported(tmp_path, monkeypatch, missing):
     parsed = SimpleNamespace(engine=SimpleNamespace(model="test/model"), model_dump=lambda **_: {})
@@ -751,6 +799,53 @@ def test_qualification_requires_exact_catalog_identities(tmp_path):
     qualify(args)
     files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
     assert validate_bundle(files)["runs"][0]["id"] == run["id"]
+
+
+def test_a_campaign_with_a_stated_serving_cpu_qualifies(tmp_path, monkeypatch):
+    from argparse import Namespace
+
+    from scripts.e2e_accuracy import run_agentx_accuracy
+
+    run = result()
+    run["simulation_features"] = simulation_record()
+    silicon_inputs(tmp_path, run)
+    cpu = "Intel(R) Xeon(R) Platinum 8559C"
+    stated = []
+
+    def run_one(root, source, directory, timeout, context, serving_host_cpu=None):
+        stated.append(serving_host_cpu)
+        return run
+
+    monkeypatch.setattr(run_agentx_accuracy, "run_one", run_one)
+    shards = tmp_path / "shards"
+    common = {
+        "inputs": tmp_path,
+        "output": shards,
+        "shard_count": 1,
+        "point_timeout": 1,
+        "branch": "main",
+        "commit": "a" * 40,
+        "revision": "b" * 40,
+        "wheel": None,
+        "wheel_sha256": "c" * 64,
+        "run_id": "123",
+        "run_attempt": 1,
+        "preview": True,
+    }
+    run_agentx_accuracy.campaign(Namespace(**common, shard_index=0, serving_host_cpu=cpu))
+    assert stated == [cpu]
+    shard = json.loads((shards / "shard-0.json").read_text())
+    assert shard["snapshot"]["serving_host_cpu"] == cpu
+    args = Namespace(inputs=tmp_path, shards=shards, shard_count=1, output=tmp_path / "public")
+    run_agentx_accuracy.qualify(args)
+    files = {p.relative_to(args.output).as_posix(): p.read_bytes() for p in args.output.rglob("*.json")}
+    assert validate_bundle(files, preview=True)["runs"][0]["id"] == run["id"]
+    assert "serving_host_cpu" not in json.loads(files["summary.json"])["snapshot"]
+    # A shard without the stated CPU cannot merge with one that has it.
+    without = {**shard, "snapshot": {k: v for k, v in shard["snapshot"].items() if k != "serving_host_cpu"}}
+    (shards / "shard-1.json").write_bytes(canonical(without))
+    with pytest.raises(ValueError, match="different revisions"):
+        run_agentx_accuracy.qualify(Namespace(**{**vars(args), "shard_count": 2, "output": tmp_path / "mixed"}))
 
 
 @pytest.mark.parametrize(

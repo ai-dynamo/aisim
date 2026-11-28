@@ -367,7 +367,7 @@ def public_report(payload, observations, category, boundary="complete_finite_coh
     )
 
 
-def run_one(root, run, directory, timeout, context):
+def run_one(root, run, directory, timeout, context, serving_host_cpu=None):
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "feature-context.json").write_bytes(canonical(context))
     observations = read(artifact(root, run, "observations"))
@@ -376,6 +376,10 @@ def run_one(root, run, directory, timeout, context):
     trace = prepare_trace(root, run, directory)
     config = replay_config(root, run)
     config["traffic"]["source"]["paths"] = [str(trace.resolve())]
+    if serving_host_cpu is not None:
+        # No receipt records the serving nodes' CPU; the operator states it, and only then is measured CPU overhead
+        # applied.
+        config["serving_host_cpu"] = serving_host_cpu
     config_path = directory / "input-config.json"
     config_path.write_bytes(canonical(config))
     with (directory / "replay.log").open("w") as log:
@@ -506,6 +510,7 @@ def campaign(args):
                 "evaluated_revision": args.commit,
                 "dataset_revision": args.revision,
             },
+            args.serving_host_cpu,
         )
         for run in selected
     ]
@@ -520,6 +525,9 @@ def campaign(args):
         "cohort_sha256": catalog["snapshot_id"],
         "preview": args.preview,
     }
+    if args.serving_host_cpu is not None:
+        # Bind the opt-in to the snapshot so shards with and without measured CPU overhead cannot merge.
+        snapshot["serving_host_cpu"] = args.serving_host_cpu
     status = args.inputs / "measurement-status.json"
     if status.exists():
         if not args.preview or read(status) != {"measurement_campaign_status": "partial"}:
@@ -553,6 +561,9 @@ def qualify(args):
             raise ValueError("Partial measurement campaigns cannot publish")
     elif status.exists():
         raise ValueError("Measurement campaign status differs from replay")
+    # The stated serving CPU only keeps shards with and without measured CPU overhead apart; the public snapshot
+    # contract has no field for it.
+    snapshot.pop("serving_host_cpu", None)
     snapshot["completed_at"] = datetime.now(UTC).isoformat()
     args.output.mkdir(parents=True, exist_ok=True)
     summaries = []
@@ -621,6 +632,11 @@ if __name__ == "__main__":
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shards", type=Path)
     parser.add_argument("--point-timeout", type=int, default=1200)
+    parser.add_argument(
+        "--serving-host-cpu",
+        help="Host CPU model of the nodes every selected point was served on (as lscpu reports it); enables the "
+        "measured CPU overhead in replay. Omit when any point's serving CPU is not verified.",
+    )
     args = parser.parse_args()
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         parser.error("Invalid shard selection")

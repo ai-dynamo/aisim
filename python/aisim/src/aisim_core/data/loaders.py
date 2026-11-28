@@ -605,4 +605,34 @@ class E2eLoader(Loader):
         return E2eTables(manifest, tables)
 
 
-LOADERS: dict[str, type[Loader]] = {cls.category: cls for cls in (OpLatencyLoader, FpmLoader, E2eLoader)}
+class HostCostLoader(Loader):
+    """Serving-path host-cost entries (tokenizer and unqueued overhead), verified; nothing is materialized.
+
+    The selection names only the system and framework: the framework version reuses the closest collected one and
+    the tokenizer is derived from the model, so :func:`aisim_core.host_cost.lookup.choose` picks the entries.
+    """
+
+    category: ClassVar[Category] = "host-cost"
+    purposes: ClassVar[tuple[str, ...]] = ("host-cost-profile", "host-cost-unqueued")
+
+    def select(self, config: Mapping[str, Any]) -> Selection:
+        selection = Selection(category=self.category, hardware=config.get("system"), framework=config.get("backend"))
+        selection.validate()
+        return selection
+
+    def load(self, root: Path, manifest_path: str, **kwargs: Any) -> Manifest:
+        from aisim_core.data.host_cost import check_entry
+
+        manifest = self.read_manifest(root, manifest_path)
+        try:
+            checked = check_entry(root, manifest_path)
+        except ValueError as exc:
+            raise LoaderError(str(exc)) from exc
+        if checked.model_dump_json() != manifest.model_dump_json():
+            raise LoaderError("manifest changed during verification")
+        return checked
+
+
+LOADERS: dict[str, type[Loader]] = {
+    cls.category: cls for cls in (OpLatencyLoader, FpmLoader, E2eLoader, HostCostLoader)
+}

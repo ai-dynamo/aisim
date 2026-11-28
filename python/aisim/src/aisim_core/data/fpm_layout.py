@@ -18,7 +18,7 @@ LEGACY_PREFIX = "data/"
 PHYSICAL_PREFIX = "data/fpm/"
 # Roots of the other dataset categories. A key under one is never a legacy FPM key, even when the pinned catalog
 # does not declare that category (an execution-profile bundle can reference operation tables by their own path).
-OTHER_CATEGORY_PREFIXES = ("data/op-latency/", "data/e2e/", "data/eval/", "data/systems/")
+OTHER_CATEGORY_PREFIXES = ("data/op-latency/", "data/e2e/", "data/eval/", "data/systems/", "data/host-cost/")
 
 
 def physical_path(logical: str) -> str:

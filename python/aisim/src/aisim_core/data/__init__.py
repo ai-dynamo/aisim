@@ -28,6 +28,7 @@ Purpose = Literal[
     "evaluation-record",
     "system-spec",
     "host-cost-profile",
+    "host-cost-unqueued",
 ]
 # Version 1 hashed only the original Identity fields. Version 2 adds the
 # first-class deployment fields below. Version 3 adds the deployment facts that
