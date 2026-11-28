@@ -711,9 +711,11 @@ The result records completed replay separately from exact/interpolated/unsupport
 queries. A missing query stops execution; the partial report does not audit the
 remaining trace. The supplied file is replayed completely. See
 [AgentX scope and coverage results](implementation.md#validate-fpm-query-coverage-with-agentx-replay).
-This does not qualify unsupported grouped-cache P/D handoff or full multimodal
-execution. Independent prefill/decode plans must be composed separately where
-Replay supports their memory/transfer semantics.
+This does not qualify grouped-cache P/D handoff or full multimodal execution.
+Independent prefill/decode plans must be composed separately where Replay
+supports their memory/transfer semantics. For grouped caches, Replay supports
+P/D only for a hand-made profile of vLLM 0.31.0 or 0.32.0, not 0.33.0; see
+[grouped caches](../../replay/engine/kv-cache.md#other-cache-modes).
 
 The generated synthetic examples preserve the same accepted profile, data root,
 worker width and strict direct-FPM selection:

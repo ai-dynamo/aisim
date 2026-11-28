@@ -420,6 +420,14 @@ impl GroupedPrefixRules {
         }
     }
 
+    /// Whether finalization keeps a state at a hash boundary inside its block.
+    fn keeps_partial_state(&self, prompt: usize, tokens: usize, block: usize) -> bool {
+        self.alignment == self.hash_block
+            && self.hash_block < block
+            && !tokens.is_multiple_of(block)
+            && tokens == self.partial_tail(prompt)
+    }
+
     /// The checkpoint position of a prefill that ends at `prefill_end`, in
     /// units of the hit alignment (v0.32 `single:1745-1749`, `iface:1110-1122`).
     pub(crate) fn checkpoint_position(&self, prefill_end: usize) -> usize {
@@ -962,6 +970,71 @@ impl GroupedPrefixCoordinator {
         hit
     }
 
+    /// The local prefix of a decode rank that loads a P/D handoff. The NIXL
+    /// connector supports divergent hits (V32 `nixl/connector.py:83-85`, V31
+    /// `:80-82`). For a model with Mamba-type state layers the scheduler then
+    /// takes the full-attention hit alone as the local prefix and lets the
+    /// connector supply the lagging groups (V32 `sched:558-568`,
+    /// `mgr:345-366`, V31 `sched:529-539`, `mgr:345-366`, `has_mamba_layers`
+    /// at V32 `vllm/v1/kv_cache_interface.py:1564-1569`). For any other model
+    /// it takes the hit that every group agrees on. This finder takes the
+    /// full-attention hit for every grouped profile. The hit is that of the
+    /// first full-attention spec group, capped at `num_tokens - 1` and floored
+    /// to that group's block: the scheduler presents a block-aligned local hit
+    /// to the connector, and the load covers the sub-block tail of a
+    /// fine-grained hit when the remote tokens go beyond that tail (V32
+    /// `sched:973-981`, `:1007-1018`, V31 `sched:944-952`, `:974-985`). When
+    /// they do not, vLLM keeps the tail and loads nothing (V32 `:1019-1025`,
+    /// V31 `:986-990`). With a hash block smaller than the full-attention
+    /// block, that happens when the first `num_tokens - 1` tokens end on a
+    /// hash block boundary and are all cached, while replay floors the hit to
+    /// the block and moves one attention block and the fixed bytes.
+    /// Every other group gets `GroupHitBlocks::None`, and the junction is 0.
+    /// Without a full-attention group the hit is empty.
+    ///
+    /// On a decode rank vLLM drops each group's hit blocks below its skipped
+    /// tokens before it touches them (V32 `single:292-313`). A Mamba group
+    /// skips all but the last computed token (`single:1954-1959`), so vLLM
+    /// never holds a lagging state hit block. Its admission count still adds
+    /// such a cached block when no request holds it (`single:1775-1778`). A
+    /// window group keeps its hit blocks inside the window, where this finder
+    /// takes new blocks. vLLM also falls back to the hit that every group
+    /// agrees on when a lagging hit is deeper than the full-attention hit
+    /// (V32 and V31 `mgr:360-364`). This finder leaves that out: a lagging group's
+    /// blocks arrive with the transfer.
+    pub(crate) fn find_full_attention_hit(
+        &self,
+        pool: &GroupedBlockPool,
+        lease: &BlockRequestLease,
+        num_tokens: usize,
+    ) -> GroupedHit {
+        let rules = &self.rules;
+        let mut hit = self.empty_hit();
+        let Some(spec) = rules
+            .specs
+            .iter()
+            .find(|spec| spec.kind == GroupRuleKind::FullAttention)
+        else {
+            return hit;
+        };
+        if num_tokens == 0 {
+            return hit;
+        }
+        let max = (num_tokens - 1) / rules.alignment * rules.alignment;
+        let (ends, tokens) = self.full_attention_hit(pool, lease, spec, max);
+        let tokens = tokens / spec.block * spec.block;
+        for &g in &spec.groups {
+            hit.per_group[g] = GroupHitBlocks::Attention(
+                ends.iter()
+                    .take(tokens / spec.block)
+                    .map(|&end| grouped_key(g, lease.prefix_hash_at(end)))
+                    .collect(),
+            );
+        }
+        hit.tokens = tokens;
+        hit
+    }
+
     /// Whether every group of `spec` holds a block keyed at `tokens`, as
     /// vLLM's `get_cached_block` asks for a spec group (`pool:198-224`).
     fn spec_resident(
@@ -1135,7 +1208,68 @@ impl GroupedPrefixCoordinator {
         hit: &GroupedHit,
         prompt_tokens: usize,
     ) -> usize {
-        self.blocks_to_allocate(pool, hit, prompt_tokens, prompt_tokens, true)
+        self.blocks_to_allocate(pool, hit, hit.tokens, prompt_tokens, prompt_tokens, true)
+    }
+
+    /// `admission_blocks` of a decode rank that loads a P/D handoff on top of
+    /// the local `hit`: the loaded tokens count as computed too, as the
+    /// `total_computed_tokens` of vLLM's whole-prompt check (`mgr:519-536`).
+    pub(crate) fn destination_admission_blocks(
+        &self,
+        pool: &GroupedBlockPool,
+        hit: &GroupedHit,
+        loaded_tokens: usize,
+        prompt_tokens: usize,
+    ) -> usize {
+        self.blocks_to_allocate(pool, hit, loaded_tokens, prompt_tokens, prompt_tokens, true)
+    }
+
+    /// The blocks that a decode rank takes for the tokens of a P/D handoff on
+    /// top of the local `hit`: vLLM's second test in `allocate_slots`, for an
+    /// async load with no new tokens (`mgr:558-576`, `sched:1064-1067`).
+    pub(crate) fn destination_load_blocks(
+        &self,
+        pool: &GroupedBlockPool,
+        hit: &GroupedHit,
+        loaded_tokens: usize,
+        prompt_tokens: usize,
+    ) -> usize {
+        self.blocks_to_allocate(
+            pool,
+            hit,
+            loaded_tokens,
+            loaded_tokens,
+            prompt_tokens,
+            false,
+        )
+    }
+
+    /// The extra first-pass blocks for states that activation will publish
+    /// inside their fresh running blocks. Other retained state positions are
+    /// block-aligned and cannot add a producer copy. Count without publishing
+    /// keys or copying the lease, so reservation remains atomic.
+    pub(crate) fn destination_state_copy_blocks(
+        &self,
+        request: &BlockRequestLease,
+        prompt: usize,
+        loaded_tokens: usize,
+    ) -> usize {
+        // Keep the modeled one-token load behavior: it transfers the whole
+        // prompt and only counts the copy once activation publishes it.
+        if loaded_tokens >= prompt || request.prefix_hash_at(loaded_tokens).is_none() {
+            return 0;
+        }
+        self.rules
+            .groups
+            .iter()
+            .filter(|rule| {
+                rule.cacheable
+                    && rule.kind == GroupRuleKind::State
+                    && self
+                        .rules
+                        .keeps_partial_state(prompt, loaded_tokens, rule.block)
+            })
+            .count()
     }
 
     /// The blocks that the first allocation of a request takes for its tokens
@@ -1149,16 +1283,19 @@ impl GroupedPrefixCoordinator {
         prefill_end: usize,
         target: usize,
     ) -> usize {
-        self.blocks_to_allocate(pool, hit, target, prefill_end, false)
+        self.blocks_to_allocate(pool, hit, hit.tokens, target, prefill_end, false)
     }
 
     /// vLLM's `get_num_blocks_to_allocate` for the first `tokens` tokens of a
-    /// request without blocks. Only a chunk that reaches the prefill end
-    /// `prefill_end` takes a checkpoint block (v0.32 `single:1643-1674`).
+    /// request without blocks. `computed` is its `total_computed_tokens`: the
+    /// hit, and on a decode rank the loaded tokens. Only a chunk that reaches
+    /// the prefill end `prefill_end` takes a checkpoint block (v0.32
+    /// `single:1643-1674`).
     fn blocks_to_allocate(
         &self,
         pool: &GroupedBlockPool,
         hit: &GroupedHit,
+        computed: usize,
         tokens: usize,
         prefill_end: usize,
         admission_cap: bool,
@@ -1193,7 +1330,7 @@ impl GroupedPrefixCoordinator {
                                 self.limits.max_model_len,
                             ));
                         }
-                        skipped_blocks = hit.tokens.saturating_sub(window - 1) / block;
+                        skipped_blocks = computed.saturating_sub(window - 1) / block;
                     }
                     let new = required.saturating_sub(skipped_blocks.max(keys.len()));
                     let inactive = keys[skipped_blocks.min(keys.len())..]
@@ -1218,15 +1355,15 @@ impl GroupedPrefixCoordinator {
                     // A valid checkpoint needs two new blocks or more, so one
                     // new block and the checkpoint block below reach the cap.
                     let copy = key.is_some() && !hit.tokens.is_multiple_of(block);
-                    let new = tokens
-                        .div_ceil(block)
-                        .saturating_sub(hit.tokens.div_ceil(block))
-                        .min(1)
+                    // The computed blocks are the group's own hit only. A
+                    // decode rank's state group has none.
+                    let hit_blocks = key.map_or(0, |_| hit.tokens.div_ceil(block));
+                    let new = tokens.div_ceil(block).saturating_sub(hit_blocks).min(1)
                         + usize::from(copy);
                     // v0.32 `single:1750-1758`, `:1770`.
                     let checkpoint = tokens >= prefill_end
                         && rules.checkpoint_valid(
-                            hit.tokens,
+                            computed,
                             tokens,
                             rules.checkpoint_position(tokens),
                         );
@@ -1325,148 +1462,23 @@ impl GroupedPrefixCoordinator {
         target: usize,
         step: u64,
     ) -> bool {
-        let rules = &self.rules;
-        let first = !lease.allocated;
         // The blocks can change here, so the step's `finalize` has to run.
         lease.quiet_until = 0;
-        let mut fresh = 0;
-        let releases = &mut self.releases;
-        releases.clear();
-        // Per group: new blocks, a copy block to take, and for states the
-        // running block, the copy block and the checkpoint position.
-        let plan = &mut self.plan;
-        plan.clear();
-        for (g, rule) in rules.groups.iter().enumerate() {
-            let block = rule.block;
-            let item = match (rule.kind, &mut lease.groups[g]) {
-                (
-                    GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. },
-                    GroupLease::Attention {
-                        copies, first_live, ..
-                    },
-                ) => {
-                    if let GroupRuleKind::SlidingWindow { window } = rule.kind {
-                        let skipped =
-                            (computed_before.saturating_sub(window - 1) / block).min(copies.len());
-                        // Tail first, as `_remove_blocks_in_range` frees the
-                        // range (v0.31 `single:660-685`, v0.32 `:645-670`).
-                        for copy in copies[*first_live..skipped.max(*first_live)]
-                            .iter_mut()
-                            .rev()
-                        {
-                            releases.extend(copy.take());
-                        }
-                        *first_live = (*first_live).max(skipped);
-                    }
-                    let new = target.div_ceil(block).saturating_sub(copies.len());
-                    let copy = first
-                        && !computed_before.is_multiple_of(block)
-                        && copies.len() == computed_before.div_ceil(block)
-                        && copies.last().is_some_and(Option::is_some);
-                    fresh += new + usize::from(copy);
-                    Plan::Attention { new, copy }
-                }
-                (GroupRuleKind::State, GroupLease::State(state)) => {
-                    // A state group skips every token before the last computed
-                    // one (v0.32 `single:1954-1959`). So the next allocation
-                    // first frees every block below the last one, the
-                    // checkpoint block included (v0.32 `single:672-710`,
-                    // `:1592-1641`, `kv_cache_manager.py:546-559`). A request
-                    // allocates once per step, so a held checkpoint block
-                    // comes from an earlier step. A published checkpoint block keeps
-                    // its key until eviction. As for the previous block, the release takes
-                    // one pass, as on the linear path, where vLLM's async
-                    // scheduling waits one more.
-                    if let Some((checkpoint, _)) = state.checkpoint.take() {
-                        releases.push(checkpoint);
-                    }
-                    let crossing = state.running.is_some()
-                        && computed_before > 0
-                        && (computed_before - 1) / block < (target - 1) / block;
-                    // The copy-on-write block of a hit inside a block replaces
-                    // the hit block (`single:454-474`, `:1891-1942`). It is the
-                    // running block when the target stays in that block, and
-                    // otherwise goes at the next allocation like `previous`
-                    // (`single:1658-1675`, `:1868`).
-                    let cow =
-                        first && state.hit.is_some() && !computed_before.is_multiple_of(block);
-                    let cow_is_running =
-                        cow && (computed_before - 1) / block == (target - 1) / block;
-                    // A producer can also have published its own partial
-                    // running state (v0.31 single:1903-1936, v0.32 :1867-1900,
-                    // v0.33 :1884-1917).
-                    // As on the linear path, preserve that immutable copy in
-                    // `previous` and take a fresh writable block, even when
-                    // the next write stays inside the same logical block. A
-                    // release without a next write takes no copy: vLLM copies
-                    // only when it allocates for scheduled tokens, and drops
-                    // the producer when it frees the request (v0.31
-                    // `single:1971-1977`, v0.32 `:1935-1941`).
-                    let producer_cow = target > computed_before
-                        && state.running.is_some_and(|id| !pool.is_private(id));
-                    let running =
-                        (state.running.is_none() || crossing || producer_cow) && !cow_is_running;
-                    let copy = cow && !cow_is_running;
-                    if !first && let Some(copy) = state.copy.take() {
-                        releases.push(copy);
-                    }
-                    // The hit block of a hit on a block boundary leaves once
-                    // the request has computed past it, with the other skipped
-                    // blocks and before the reservation, as vLLM frees it on
-                    // the processed token count (v0.31 `mgr:552-556`,
-                    // `single:1626-1645`, v0.32 `mgr:555-559`,
-                    // `single:1592-1611`, v0.33 `mgr:564-568`,
-                    // `single:1608-1627`). vLLM 0.31.0 turns async scheduling
-                    // on by default and then holds it one more step. A hit
-                    // inside a block left the lease as a copy source in the
-                    // first allocation, so this never applies to it.
-                    if let Some((hit, index)) = state.hit
-                        && computed_before.div_ceil(block).saturating_sub(1) > index
-                    {
-                        releases.push(hit);
-                        state.hit = None;
-                    }
-                    let checkpoint = (target >= prefill_end)
-                        .then(|| rules.checkpoint_position(target))
-                        .filter(|&pos| rules.checkpoint_valid(computed_before, target, pos));
-                    if checkpoint.is_some() {
-                        // The checkpoint index `cdiv(target, B) - 2` lies
-                        // beyond the request's blocks (v0.32 `single:1665-1668`).
-                        debug_assert!(
-                            target.div_ceil(block) - 2 >= computed_before.div_ceil(block),
-                            "the checkpoint block index lies within the request's blocks"
-                        );
-                    }
-                    if let Some((previous, previous_step)) = state.previous
-                        && step > previous_step
-                    {
-                        releases.push(previous);
-                        state.previous = None;
-                    }
-                    fresh +=
-                        usize::from(running) + usize::from(cow) + usize::from(checkpoint.is_some());
-                    Plan::State {
-                        running,
-                        copy,
-                        cow_is_running,
-                        checkpoint,
-                    }
-                }
-                (GroupRuleKind::Ring, GroupLease::Ring { copy }) => {
-                    fresh += usize::from(copy.is_none());
-                    Plan::Ring {
-                        take: copy.is_none(),
-                    }
-                }
-                (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
-            };
-            plan.push(item);
-        }
-        pool.release_all(releases.drain(..));
+        let fresh = Self::plan_allocation(
+            &self.rules,
+            lease,
+            prefill_end,
+            computed_before,
+            target,
+            step,
+            &mut self.plan,
+            &mut self.releases,
+        );
+        pool.release_all(self.releases.drain(..));
         let Some(mut reservation) = pool.reserve(&[], fresh) else {
             return false;
         };
-        for (g, (item, group)) in plan.drain(..).zip(lease.groups.iter_mut()).enumerate() {
+        for (g, (item, group)) in self.plan.drain(..).zip(lease.groups.iter_mut()).enumerate() {
             match (item, group) {
                 (Plan::Attention { new, copy }, GroupLease::Attention { copies, .. }) => {
                     if copy {
@@ -1537,6 +1549,181 @@ impl GroupedPrefixCoordinator {
         pool.cancel(reservation);
         lease.allocated = true;
         true
+    }
+
+    /// The plan of `allocate`: what each group takes into `plan`, the blocks
+    /// that vLLM frees before it allocates into `releases`, and the fresh
+    /// blocks in all as the result. The plan changes the lease but not the
+    /// pool.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_allocation(
+        rules: &GroupedPrefixRules,
+        lease: &mut GroupedBlockLease,
+        prefill_end: usize,
+        computed_before: usize,
+        target: usize,
+        step: u64,
+        plan: &mut Vec<Plan>,
+        releases: &mut Vec<BlockCopyId>,
+    ) -> usize {
+        let first = !lease.allocated;
+        let mut fresh = 0;
+        releases.clear();
+        // Per group: new blocks, a copy block to take, and for states the
+        // running block, the copy block and the checkpoint position.
+        plan.clear();
+        for (g, rule) in rules.groups.iter().enumerate() {
+            let block = rule.block;
+            let item = match (rule.kind, &mut lease.groups[g]) {
+                (
+                    GroupRuleKind::FullAttention | GroupRuleKind::SlidingWindow { .. },
+                    GroupLease::Attention {
+                        copies, first_live, ..
+                    },
+                ) => {
+                    if let GroupRuleKind::SlidingWindow { window } = rule.kind {
+                        let skipped = computed_before.saturating_sub(window - 1) / block;
+                        // Tail first, as `_remove_blocks_in_range` frees the
+                        // range (v0.31 `single:660-685`, v0.32 `:645-670`).
+                        let held = skipped.min(copies.len());
+                        for copy in copies[*first_live..held.max(*first_live)].iter_mut().rev() {
+                            releases.extend(copy.take());
+                        }
+                        // A request that computed its tokens elsewhere, as a
+                        // P/D destination did, holds null blocks below the
+                        // window (v0.31 `single:314`, v0.32 `:311`).
+                        if copies.len() < skipped {
+                            copies.resize(skipped, None);
+                        }
+                        *first_live = (*first_live).max(skipped);
+                    }
+                    let new = target.div_ceil(block).saturating_sub(copies.len());
+                    let copy = first
+                        && !computed_before.is_multiple_of(block)
+                        && copies.len() == computed_before.div_ceil(block)
+                        && copies.last().is_some_and(Option::is_some);
+                    fresh += new + usize::from(copy);
+                    Plan::Attention { new, copy }
+                }
+                (GroupRuleKind::State, GroupLease::State(state)) => {
+                    // A state group skips every token before the last computed
+                    // one (v0.32 `single:1954-1959`). So the next allocation
+                    // first frees every block below the last one, the
+                    // checkpoint block included (v0.32 `single:672-710`,
+                    // `:1592-1641`, `kv_cache_manager.py:546-559`). A request
+                    // allocates once per step, so a held checkpoint block
+                    // comes from an earlier step. A published checkpoint block keeps
+                    // its key until eviction. As for the previous block, the release takes
+                    // one pass, as on the linear path, where vLLM's async
+                    // scheduling waits one more.
+                    if let Some((checkpoint, _)) = state.checkpoint.take() {
+                        releases.push(checkpoint);
+                    }
+                    let crossing = state.running.is_some()
+                        && computed_before > 0
+                        && (computed_before - 1) / block < (target - 1) / block;
+                    // The copy-on-write block of a hit inside a block replaces
+                    // the hit block (`single:454-474`, `:1891-1942`). It is the
+                    // running block when the target stays in that block, and
+                    // otherwise goes at the next allocation like `previous`
+                    // (`single:1658-1675`, `:1868`).
+                    let cow =
+                        first && state.hit.is_some() && !computed_before.is_multiple_of(block);
+                    let cow_is_running =
+                        cow && (computed_before - 1) / block == (target - 1) / block;
+                    // A producer can also have published its own partial
+                    // running state (v0.31 single:1903-1936, v0.32 :1867-1900,
+                    // v0.33 :1884-1917).
+                    // As on the linear path, preserve that immutable copy in
+                    // `previous` and take a fresh writable block, even when
+                    // the next write stays inside the same logical block. A
+                    // release without a next write takes no copy: vLLM copies
+                    // only when it allocates for scheduled tokens, and drops
+                    // the producer when it frees the request (v0.31
+                    // `single:1971-1977`, v0.32 `:1935-1941`).
+                    let producer_cow = target > computed_before && state.published.is_some();
+                    let running =
+                        (state.running.is_none() || crossing || producer_cow) && !cow_is_running;
+                    let copy = cow && !cow_is_running;
+                    if !first && let Some(copy) = state.copy.take() {
+                        releases.push(copy);
+                    }
+                    // The hit block of a hit on a block boundary leaves once
+                    // the request has computed past it, with the other skipped
+                    // blocks and before the reservation, as vLLM frees it on
+                    // the processed token count (v0.31 `mgr:552-556`,
+                    // `single:1626-1645`, v0.32 `mgr:555-559`,
+                    // `single:1592-1611`, v0.33 `mgr:564-568`,
+                    // `single:1608-1627`). vLLM 0.31.0 turns async scheduling
+                    // on by default and then holds it one more step. A hit
+                    // inside a block left the lease as a copy source in the
+                    // first allocation, so this never applies to it.
+                    if let Some((hit, index)) = state.hit
+                        && computed_before.div_ceil(block).saturating_sub(1) > index
+                    {
+                        releases.push(hit);
+                        state.hit = None;
+                    }
+                    let checkpoint = (target >= prefill_end)
+                        .then(|| rules.checkpoint_position(target))
+                        .filter(|&pos| rules.checkpoint_valid(computed_before, target, pos));
+                    if checkpoint.is_some() {
+                        // The checkpoint index `cdiv(target, B) - 2` lies
+                        // beyond the request's blocks (v0.32 `single:1665-1668`).
+                        debug_assert!(
+                            target.div_ceil(block) - 2 >= computed_before.div_ceil(block),
+                            "the checkpoint block index lies within the request's blocks"
+                        );
+                    }
+                    if let Some((previous, previous_step)) = state.previous
+                        && step > previous_step
+                    {
+                        releases.push(previous);
+                        state.previous = None;
+                    }
+                    fresh +=
+                        usize::from(running) + usize::from(cow) + usize::from(checkpoint.is_some());
+                    Plan::State {
+                        running,
+                        copy,
+                        cow_is_running,
+                        checkpoint,
+                    }
+                }
+                (GroupRuleKind::Ring, GroupLease::Ring { copy }) => {
+                    fresh += usize::from(copy.is_none());
+                    Plan::Ring {
+                        take: copy.is_none(),
+                    }
+                }
+                (kind, group) => unreachable!("rule {kind:?} with lease {group:?}"),
+            };
+            plan.push(item);
+        }
+        fresh
+    }
+
+    /// The fresh blocks that `allocate` takes for `computed_before..target`,
+    /// planned on a copy of the lease. The copy and the blocks that the plan
+    /// would free are dropped here: no block of the copy reaches the pool.
+    pub(crate) fn allocation_blocks(
+        &self,
+        lease: &GroupedBlockLease,
+        prompt: usize,
+        computed_before: usize,
+        target: usize,
+        step: u64,
+    ) -> usize {
+        Self::plan_allocation(
+            &self.rules,
+            &mut lease.clone(),
+            prompt,
+            computed_before,
+            target,
+            step,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
     }
 
     /// Publish the blocks that `computed_after` completes and apply the
@@ -1630,7 +1817,6 @@ impl GroupedPrefixCoordinator {
                     }
                 }
                 (GroupRuleKind::State, GroupLease::State(state)) => {
-                    let tail = rules.partial_tail(prompt);
                     // The tail inside a block is kept only with hits inside a
                     // block. Without them vLLM rounds the cached length down
                     // to the scheduler block (v0.31 `coord:796-806`, v0.32
@@ -1640,10 +1826,7 @@ impl GroupedPrefixCoordinator {
                     // `single:2124`). A kept tail makes the next write take a
                     // fresh block.
                     let kept = computed_after == rules.replay_boundary(prompt, block)
-                        || (rules.alignment == rules.hash_block
-                            && rules.hash_block < block
-                            && !tail.is_multiple_of(block)
-                            && computed_after == tail)
+                        || rules.keeps_partial_state(prompt, computed_after, block)
                         || junction.is_some_and(|junction| {
                             computed_after == rules.block_floor(junction, block)
                         });

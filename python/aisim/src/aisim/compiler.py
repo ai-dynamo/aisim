@@ -438,7 +438,11 @@ def _deployment(
     prefill, prefill_state = _resolve_state_cache(engine, prefill, "prefill")
     decode, decode_state = _resolve_state_cache(engine, engine.workers.decode, "decode")
     transfer_bytes_per_token = None
-    if engine.kv_transfer is not None:
+    prefill_deployment = fpm_profile_deployment(engine, prefill, "prefill") if engine.fpm_profile is not None else None
+    # A grouped prefill rank derives its transfer payload from its cache groups.
+    if engine.kv_transfer is not None and (
+        prefill_deployment is None or prefill_deployment.resources.cache_layout != "grouped"
+    ):
         configured = engine.kv_transfer.bytes_per_token
         if configured == "auto" and prefill_state is not None:
             # The state estimate already resolved this role's token KV bytes.
@@ -1050,15 +1054,17 @@ def _worker_engine_args(
         payload["prefix_match_unit"] = cache.prefix_match_unit
     deployment = (
         fpm_profile_deployment(engine, worker, role)
-        if engine.fpm_profile is not None and cache.prefix_caching
+        if engine.fpm_profile is not None and (cache.prefix_caching or role != "aggregated")
         else None
     )
     if deployment is not None and deployment.resources.cache_layout == "grouped":
-        # The rank hashes at the profile's hash_block_size_tokens and follows the grouped rules of the deployment's
-        # backend_version.
-        payload["prefix_match_unit"] = (
-            cache.prefix_match_unit or deployment.resources.runtime_memory.hash_block_size_tokens
-        )
+        if cache.prefix_caching:
+            # The rank hashes at the profile's hash_block_size_tokens.
+            payload["prefix_match_unit"] = (
+                cache.prefix_match_unit or deployment.resources.runtime_memory.hash_block_size_tokens
+            )
+        # The rank follows the grouped rules of the deployment's backend_version: the prefix-caching rules, and on a
+        # prefill or decode rank also the transfer rules.
         payload["vllm_version"] = deployment.backend_version
     if cache.state_cache is not None:
         payload["state_cache"] = {"bytes_per_request": cache.state_cache.bytes_per_request}

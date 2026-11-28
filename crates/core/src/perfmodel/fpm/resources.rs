@@ -68,8 +68,10 @@ pub struct FpmCacheGroup {
     pub blocks_per_request: Option<u32>,
     /// Whether vLLM's manager for this group takes part in prefix caching. A
     /// ring spec does not. A rank with `kv_cache_groups` and
-    /// `enable_prefix_caching` refuses a group that leaves it unset. `None`
-    /// in a profile imported before this field existed.
+    /// `enable_prefix_caching` refuses a group that leaves it unset. The
+    /// grouped P/D transfer rules also read it, so a prefill or decode rank
+    /// with `kv_cache_groups` refuses a group that leaves it unset too.
+    /// `None` in a profile imported before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_cacheable: Option<bool>,
     /// The bytes that vLLM's P/D connector reads for one block of this group in
@@ -78,7 +80,9 @@ pub struct FpmCacheGroup {
     /// share, so the value can be larger than `page_size_bytes`. Positive and at
     /// most 2**53. The probe import of a vLLM 0.33.0 record does not write it:
     /// what the P/D connector of vLLM 0.33.0 reads for a block depends on facts
-    /// that the record does not hold. Sizing does not read it.
+    /// that the record does not hold. Sizing does not read it. The grouped
+    /// P/D transfer rules read it, so a prefill or decode rank with
+    /// `kv_cache_groups` refuses a group that leaves it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_bytes_per_block: Option<u64>,
     /// The `num_prefill_checkpoint_blocks` of a Mamba spec: 0 or 1, and only

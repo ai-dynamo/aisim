@@ -217,8 +217,9 @@ impl ReplayEngineConfig {
                 }
             }
             ReplayTopology::Disaggregated { .. } => {
-                let [prefill, decode] =
-                    [WorkerStage::Prefill, WorkerStage::Decode].map(|stage| self.role(stage).rank);
+                let [prefill_role, decode_role] =
+                    [WorkerStage::Prefill, WorkerStage::Decode].map(|stage| self.role(stage));
+                let (prefill, decode) = (&prefill_role.rank, &decode_role.rank);
                 if prefill.g3_offload.is_some() || decode.g3_offload.is_some() {
                     return Err(ReplayError::InvalidSpec(
                         "g3_offload supports only aggregated replay".to_string(),
@@ -228,6 +229,34 @@ impl ReplayEngineConfig {
                 if prefill.state_cache.is_some() != decode.state_cache.is_some() {
                     return Err(ReplayError::InvalidSpec(
                         "state_cache must be set on both prefill and decode roles".to_string(),
+                    ));
+                }
+                // A grouped rank counts the handoff in full-attention blocks of
+                // its groups and a linear rank in tokens, so both roles need
+                // the same groups. Two linear roles have none.
+                if prefill.kv_cache_groups != decode.kv_cache_groups {
+                    return Err(ReplayError::InvalidSpec(
+                        "kv_cache_groups must be identical on the prefill and decode roles"
+                            .to_string(),
+                    ));
+                }
+                // Grouped transfer bytes describe one TP rank; the handoff
+                // does not reshard the cache between different TP sizes.
+                if !prefill.kv_cache_groups.is_empty()
+                    && prefill_role.tensor_parallel_size != decode_role.tensor_parallel_size
+                {
+                    return Err(ReplayError::InvalidSpec(
+                        "grouped prefill and decode roles require equal tensor_parallel_size"
+                            .to_string(),
+                    ));
+                }
+                // One handoff follows the transfer rules of one vLLM version.
+                if !prefill.kv_cache_groups.is_empty()
+                    && prefill.vllm_version != decode.vllm_version
+                {
+                    return Err(ReplayError::InvalidSpec(
+                        "vllm_version must be identical on the prefill and decode roles"
+                            .to_string(),
                     ));
                 }
             }

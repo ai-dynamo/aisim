@@ -675,6 +675,44 @@ fn full_attention_hit_is_capped_below_the_prompt() {
 }
 
 #[test]
+fn decode_side_hit_takes_full_attention_alone_floored_to_its_block() {
+    // A state group above the hash block turns fine-grained hits on, so the
+    // alignment is 4 while the attention block is 16. The decode side keeps
+    // whole attention blocks only (V32 `sched:973-981`) and ignores the state
+    // group's key.
+    let groups = [attention("a", 16, None), state("s", 16, true, false)];
+    let coordinator = with_limits(rules(&groups, 4));
+    assert_eq!(coordinator.rules.alignment, 4);
+    let mut kv = kv_pool(&groups, 16);
+    let pool = kv.block_pool_mut().unwrap();
+    seed_many(pool, 0, 4, &[16, 32]);
+    seed_inside(pool, &[0, 1], 4, 16, 36);
+    let request = lease(64, 4);
+    // The fine-grained lookup reaches the sub-block tail at 36.
+    let (ends, tokens) =
+        coordinator.full_attention_hit(pool, &request, &coordinator.rules.specs[0], 60);
+    assert_eq!((ends, tokens), (vec![16, 32, 36], 36));
+    let hit = coordinator.find_full_attention_hit(pool, &request, 64);
+    assert_eq!(hit.tokens, 32);
+    assert_eq!(hit.junction_tokens, 0);
+    assert!(matches!(&hit.per_group[0], GroupHitBlocks::Attention(keys) if keys.len() == 2));
+    assert_eq!(hit.per_group[1], GroupHitBlocks::None);
+    // The cap at `num_tokens - 1` applies before the floor.
+    assert_eq!(
+        coordinator
+            .find_full_attention_hit(pool, &lease(33, 4), 33)
+            .tokens,
+        32
+    );
+    assert_eq!(
+        coordinator
+            .find_full_attention_hit(pool, &lease(32, 4), 32)
+            .tokens,
+        16
+    );
+}
+
+#[test]
 fn sliding_window_hits_need_a_contiguous_run_before_an_aligned_end() {
     // single:960-1069: `cdiv(32, 16) == 2` contiguous blocks before an
     // aligned end, or a run from block 0.
@@ -1818,6 +1856,46 @@ fn producer_copy_defers_hits_on_its_state_in_the_step_of_the_copy() {
         assert_eq!(
             coordinator.find_longest_hit(pool, &sibling, 60).tokens,
             48,
+            "{version:?}"
+        );
+        coordinator.release_request(pool, &mut block_lease);
+    }
+}
+
+#[test]
+fn the_plan_of_an_allocation_counts_the_producer_copy() {
+    // The plan reads from the lease that the running state block is
+    // published inside the block, so the planned fresh blocks equal what
+    // the allocation takes: one block for the copy (v0.31
+    // single:1891-1936, v0.32 single:1855-1900).
+    for version in [VllmRuleVersion::V0_31_0, VllmRuleVersion::V0_32_0] {
+        let groups = [attention("full", 32, None), state("s", 32, true, false)];
+        let mut coordinator = with_limits(GroupedPrefixRules::new(&groups, 4, version).unwrap());
+        let mut kv = kv_pool(&groups, 8);
+        let pool = kv.block_pool_mut().unwrap();
+        let request = lease(50, 4);
+        let hit = coordinator.find_longest_hit(pool, &request, 50);
+        let mut block_lease = coordinator.new_lease();
+        let mut before = 0;
+        for (step, target) in [(1, 32), (2, 48)] {
+            coordinator.begin_step();
+            assert!(coordinator.allocate(pool, &mut block_lease, 50, before, target, step));
+            coordinator.finalize(pool, &mut block_lease, &request, 50, target, &hit, step);
+            before = target;
+        }
+        assert!(
+            state_lease(&block_lease, 1).published.is_some(),
+            "{version:?}"
+        );
+        let planned = coordinator.allocation_blocks(&block_lease, 50, 48, 50, 3);
+        assert_eq!(planned, 1, "{version:?}");
+        let active = pool.active_blocks();
+        coordinator.begin_step();
+        assert!(coordinator.allocate(pool, &mut block_lease, 50, 48, 50, 3));
+        // The previous block of the boundary at 32 goes first.
+        assert_eq!(pool.active_blocks(), active - 1 + planned, "{version:?}");
+        assert!(
+            state_lease(&block_lease, 1).published.is_none(),
             "{version:?}"
         );
         coordinator.release_request(pool, &mut block_lease);

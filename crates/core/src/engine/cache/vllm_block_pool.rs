@@ -232,6 +232,18 @@ struct GroupedIndex {
     /// and the block's first hash. A hit search probes each position once,
     /// even when different keys or multiple copies share that position.
     in_block: FxHashMap<(u16, SequenceHash), Vec<(u32, usize)>>,
+    /// The XOR of `grouped_key_mix` over the keys of `by_key`.
+    fingerprint: u64,
+}
+
+/// Mixes a grouped key into 64 bits, so that the XOR over a set of keys does
+/// not depend on their order and almost never matches another set.
+fn grouped_key_mix(group: u16, hash: SequenceHash) -> u64 {
+    // The finalizer of splitmix64.
+    let mut z = hash.wrapping_add(u64::from(group).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 enum CopyRemoval {
@@ -981,6 +993,9 @@ impl VllmBlockPool {
                 let (became_visible, became_redundant) =
                     Self::index_copy(&mut index.by_key, (group, hash), id);
                 self.grouped_key_generation += u64::from(became_visible);
+                if became_visible {
+                    index.fingerprint ^= grouped_key_mix(group, hash);
+                }
                 (became_visible, became_redundant)
             }
         };
@@ -1131,6 +1146,14 @@ impl VllmBlockPool {
 
     pub(crate) fn num_active(&self) -> usize {
         self.copies.len() + self.group_extra_blocks - self.inactive_len + self.reserved
+    }
+
+    /// The count of the visible grouped keys and their fingerprint, which does
+    /// not depend on the order in which keys became visible or left.
+    pub(crate) fn grouped_keys(&self) -> (usize, u64) {
+        self.grouped_index
+            .as_deref()
+            .map_or((0, 0), |index| (index.by_key.len(), index.fingerprint))
     }
 
     pub(crate) fn num_inactive(&self) -> usize {
@@ -1467,6 +1490,9 @@ impl VllmBlockPool {
                 }
                 let removed = Self::remove_from_index(&mut index.by_key, (group, hash), id);
                 self.grouped_key_generation += u64::from(removed);
+                if removed {
+                    index.fingerprint ^= grouped_key_mix(group, hash);
+                }
                 removed
             }
         };
@@ -1901,6 +1927,15 @@ impl VllmBlockPool {
             for id in index.by_copy.keys() {
                 assert!(indexed.contains(id), "grouped identity is not indexed");
             }
+            assert_eq!(
+                index.fingerprint,
+                index
+                    .by_key
+                    .keys()
+                    .fold(0, |fingerprint, &(group, hash)| fingerprint
+                        ^ grouped_key_mix(group, hash)),
+                "grouped key fingerprint is stale"
+            );
         }
 
         for (id, copy) in self.copies.iter() {
