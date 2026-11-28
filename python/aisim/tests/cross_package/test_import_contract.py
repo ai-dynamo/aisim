@@ -172,6 +172,63 @@ def test_import_contract_covers_every_core_sdk_leaf() -> None:
     assert set(CORE_SDK_LEAF_MODULES) == _discover_python_leaves(core_sdk_root)
 
 
+# Real modules that exist only in aisim.sdk. Every other aisim.sdk leaf is an
+# alias of the same-named CORE_SDK_LEAF_MODULES entry.
+UPPER_LAYER_SDK_LEAF_MODULES = [
+    "_compat",
+    "afd_memory",
+    "config_adapter.api",
+    "config_adapter.dynamo",
+    "config_adapter.dynamo_ci",
+    "config_adapter.inferencex",
+    "config_adapter.resolved",
+    "config_adapter.schema",
+    "inference_session",
+    "moe_comm_resolver",
+    "pareto_analysis",
+    "picking",
+    "predict",
+    "predictor",
+    "speculative",
+    "sweep",
+    "task_v1_compat",
+    "task_v2",
+]
+
+
+def test_sdk_leaves_are_core_aliases_or_listed_upper_layer_modules() -> None:
+    """Freeze the aisim.sdk leaf inventory so no dangling alias or stray module lands.
+
+    aisim.sdk and aisim.sdk.backends have no __init__.py, and
+    pkgutil.walk_packages skips namespace subdirectories, so walk the files.
+    """
+    import aisim.sdk
+
+    discovered: set[str] = set()
+    for entry in aisim.sdk.__path__:
+        discovered |= _discover_python_leaves(Path(entry))
+    core_aliases = set(CORE_SDK_LEAF_MODULES)
+    upper_layer = set(UPPER_LAYER_SDK_LEAF_MODULES)
+
+    unexpected = discovered - core_aliases - upper_layer
+    assert not unexpected, (
+        f"Unlisted aisim.sdk modules: {sorted(unexpected)}. An alias must target an "
+        "aisim_core.sdk leaf in CORE_SDK_LEAF_MODULES; delete an alias whose target is gone. "
+        "Put estimator code in aisim_core.sdk and alias it here. aisim/sdk is an aiconfigurator "
+        "mirror boundary (scripts/aic_sync/aic_sync.toml): keep AISim-only code outside it, "
+        "and list a module synced from upstream in UPPER_LAYER_SDK_LEAF_MODULES."
+    )
+    missing = (core_aliases | upper_layer) - discovered
+    assert not missing, (
+        f"Listed aisim.sdk modules have no source file: {sorted(missing)}. Add the alias for a "
+        "new CORE_SDK_LEAF_MODULES entry, or drop a removed module from UPPER_LAYER_SDK_LEAF_MODULES."
+    )
+    for suffix in UPPER_LAYER_SDK_LEAF_MODULES:
+        name = f"aisim.sdk.{suffix}"
+        resolved = importlib.import_module(name).__name__
+        assert resolved == name, f"{name} is listed as a real module but resolves to {resolved}."
+
+
 @pytest.mark.parametrize("module_suffix", CORE_SDK_LEAF_MODULES)
 def test_legacy_leaf_module_is_canonical_module(module_suffix: str) -> None:
     """Every compatibility leaf must share caches and private module state."""
